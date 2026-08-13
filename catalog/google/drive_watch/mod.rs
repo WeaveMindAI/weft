@@ -16,37 +16,35 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::signal::{Predicate, PredicateOp, ProviderEvents};
+use weft::signal::{Predicate, ProviderEvents};
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GoogleDriveWatchNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for GoogleDriveWatchNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let target: String = ctx.inputs.get("target")?;
         let changes: String = ctx.inputs.get("changes")?;
 
-        let mut filters = vec![
-            // The provider's first push after subscribing is a plain
-            // "the channel is live" confirmation, not a change.
-            Predicate {
-                field: "state".into(),
-                op: PredicateOp::Neq,
-                value: Some("sync".into()),
-            },
-        ];
+        // The provider's first push after subscribing is a plain
+        // "the channel is live" confirmation, not a change.
+        let mut filters = vec![Predicate::neq("state", "sync")];
         // The `changed` header carries a comma list of what changed
         // (content, properties, children, ...); narrow with a
         // contains filter when the user asked for one kind.
         if changes != "any" {
-            filters.push(Predicate {
-                field: "changed".into(),
-                op: PredicateOp::Contains,
-                value: Some(changes),
-            });
+            filters.push(Predicate::contains("changed", changes));
         }
 
         ctx.register_signal(
@@ -59,17 +57,15 @@ impl Node for GoogleDriveWatchNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // The push carries only headers (state, what changed, the
         // resource id); the file's current shape is a follow-up read.
-        let data = Value::Object(ctx.wake.object()?.clone());
-        let mut out = ctx.fan_declared(&data);
+        let mut out = ctx.fan_declared(&ctx.wake.record()?);
 
         let target: String = ctx.inputs.get("target")?;
         let account: Access = ctx.inputs.get("account")?;
         let http = ctx.client(&account).await?;
-        let file = weft::access::client::get_json(
+        let file = super::drive::file_meta(
             &http,
-            &format!(
-                "https://www.googleapis.com/drive/v3/files/{target}?fields=id,name,mimeType,modifiedTime,lastModifyingUser(displayName)&supportsAllDrives=true"
-            ),
+            &target,
+            "id,name,mimeType,modifiedTime,lastModifyingUser(displayName)",
             "read the changed file",
         )
         .await?;

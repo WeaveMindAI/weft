@@ -14,8 +14,16 @@ use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct SendEmailNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for SendEmailNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let to: String = ctx.inputs.get("to")?;
@@ -26,15 +34,10 @@ impl Node for SendEmailNode {
         let reply_to: Option<String> = ctx.inputs.opt("replyToMessageId")?;
 
         let conn = ctx.open(&account).await?;
-        let user = conn.value("user")?.to_string();
-        // The address the message says it is FROM: the connection's
-        // alias when it set one (a mailbox often sends as an address
-        // other than the one it signs in with), else the account.
-        let sender = conn.opt_value("send_as").map(str::trim).unwrap_or("");
-        let sender = if sender.is_empty() { user.as_str() } else { sender };
+        let server = super::mailbox::smtp(&conn)?;
 
         let mut builder = Message::builder()
-            .from(mailbox(sender, "the connection's send-as address")?)
+            .from(mailbox(&server.sender, "the connection's send-as address")?)
             .subject(subject);
         for addr in list(&to) {
             builder = builder.to(mailbox(addr, "a To address")?);
@@ -60,22 +63,16 @@ impl Node for SendEmailNode {
             .unwrap_or_default()
             .to_string();
 
-        let host = conn.value("smtp_host")?.to_string();
-        let port: u16 = conn
-            .value("smtp_port")?
-            .trim()
-            .parse()
-            .map_err(|_| weft::WeftError::Input("the connection's SMTP port is not a number; reconnect it with a numeric port".to_string()))?;
         // 587 is the STARTTLS submission port; everything else
         // (465, a custom port) speaks TLS from the first byte.
-        let transport = if port == 587 {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)
+        let transport = if server.port == 587 {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&server.host)
         } else {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&host)
+            AsyncSmtpTransport::<Tokio1Executor>::relay(&server.host)
         }
         .map_err(|e| weft::WeftError::NodeExecution(format!("the SMTP server address is unusable: {e}")))?
-        .port(port)
-        .credentials(Credentials::new(user, conn.value("password")?.to_string()))
+        .port(server.port)
+        .credentials(Credentials::new(server.user, server.password))
         .build();
 
         transport

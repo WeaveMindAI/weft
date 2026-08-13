@@ -16,8 +16,16 @@ use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct LlmToolNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for LlmToolNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let name: String = ctx.inputs.get("name")?;
         let description: Option<String> = ctx.inputs.opt("description")?;

@@ -86,8 +86,16 @@ fn record_segment(bus: &weft::bus::BusHandle, full: &mut String, text: String) -
     Ok(())
 }
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for ElevenLabsTranscribeNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account = ctx.inputs.get("account")?;
         let language: Option<String> =
@@ -199,74 +207,4 @@ impl Node for ElevenLabsTranscribeNode {
         ctx.pulse_downstream(NodeOutput::new().set("text", full)).await?;
         Ok(())
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A committed frame forwards its text.
-    #[test]
-    fn a_committed_frame_forwards_its_text() {
-        let word = classify_server_frame(
-            r#"{"message_type": "committed_transcript", "text": "hello there"}"#,
-        );
-        assert!(matches!(word, ServerWord::Committed(t) if t == "hello there"));
-    }
-
-    /// Both timestamped variants: the committed one forwards, the
-    /// final (still-revising family) one is ignored.
-    #[test]
-    fn timestamped_variants_classify_by_commitment() {
-        let committed = classify_server_frame(
-            r#"{"message_type": "committed_transcript_with_timestamps", "text": "so"}"#,
-        );
-        assert!(matches!(committed, ServerWord::Committed(t) if t == "so"));
-        let final_ts = classify_server_frame(
-            r#"{"message_type": "final_transcript_with_timestamps", "text": "so"}"#,
-        );
-        assert!(matches!(final_ts, ServerWord::Ignore));
-    }
-
-    /// Every explicitly-ignored bookkeeping message type.
-    #[test]
-    fn bookkeeping_frames_are_ignored() {
-        for kind in [
-            "session_started",
-            "partial_transcript",
-            "final_transcript",
-            "committed_transcript_entities",
-        ] {
-            let word = classify_server_frame(&format!(r#"{{"message_type": "{kind}"}}"#));
-            assert!(matches!(word, ServerWord::Ignore), "{kind} not ignored");
-        }
-    }
-
-    /// "Nothing left to transcribe" is the benign end, not a failure.
-    #[test]
-    fn insufficient_audio_activity_is_the_benign_end() {
-        let word =
-            classify_server_frame(r#"{"message_type": "insufficient_audio_activity"}"#);
-        assert!(matches!(word, ServerWord::NothingLeft));
-    }
-
-    /// A body that is not JSON refuses with the payload quoted.
-    #[test]
-    fn an_unparseable_body_refuses() {
-        let word = classify_server_frame("not json at all");
-        assert!(matches!(word, ServerWord::Refused(why) if why.contains("unparseable")));
-    }
-
-    /// An unknown message_type refuses with the provider's own detail.
-    #[test]
-    fn an_unknown_type_refuses_with_its_error_detail() {
-        let word = classify_server_frame(
-            r#"{"message_type": "quota_exceeded", "error": "out of credits"}"#,
-        );
-        assert!(
-            matches!(word, ServerWord::Refused(why) if why.contains("quota_exceeded")
-                && why.contains("out of credits"))
-        );
-    }
-
 }

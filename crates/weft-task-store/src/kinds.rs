@@ -48,6 +48,11 @@ pub enum TaskKind {
     /// Dispatcher: journal a `LogLine` event on behalf of a worker.
     /// Same durability rationale as `RecordCost`.
     RecordLog,
+    /// Dispatcher: persist a signal kind's evolving durable state (a
+    /// delta-poll cursor) onto its signal row. Producer = listener
+    /// (via broker), same trust seam as `FireSignal`: the listener
+    /// never opens an HTTP connection to the dispatcher.
+    UpdateSignalKindState,
 }
 
 // This enum holds only the kinds the dispatcher itself ships. A runtime that
@@ -66,6 +71,7 @@ impl TaskKind {
             Self::CancelExecution => "cancel_execution",
             Self::RecordCost => "record_cost",
             Self::RecordLog => "record_log",
+            Self::UpdateSignalKindState => "update_signal_kind_state",
         }
     }
 }
@@ -110,6 +116,21 @@ pub struct ExecutionPayload {
 pub struct FireSignalPayload {
     pub token: String,
     pub payload: serde_json::Value,
+}
+
+/// Payload for `TaskKind::UpdateSignalKindState`. Producer =
+/// listener; consumer = the dispatcher's executor, which writes the
+/// signal row. Two fences make the write safe against reordering:
+/// `placement_generation` (a drained pod's write is rejected once the
+/// signal re-placed) and `seq` (a strictly increasing per-holder
+/// counter, persisted as the row's own `kind_state_seq` column; an
+/// older update arriving late can never regress a newer cursor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSignalKindStatePayload {
+    pub token: String,
+    pub kind_state: serde_json::Value,
+    pub seq: i64,
+    pub placement_generation: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

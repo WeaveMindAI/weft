@@ -59,6 +59,12 @@ pub fn emit(
     crate_name: &str,
 ) -> CompileResult<PathBuf> {
     let crate_root = target_root.to_path_buf();
+    // A pure function of its inputs: wipe any previous emission so a
+    // renamed package or dropped node never leaves stale files in the
+    // crate (the staged docker context would faithfully copy them).
+    if crate_root.exists() {
+        std::fs::remove_dir_all(&crate_root).map_err(CompileError::Io)?;
+    }
     let src_dir = crate_root.join("src");
     std::fs::create_dir_all(&src_dir).map_err(CompileError::Io)?;
 
@@ -81,18 +87,83 @@ pub fn emit(
     // every package).
     let packages = group_by_package(catalog, &referenced)?;
 
-    write_worker_cargo_toml(&crate_root, &packages, crate_name)?;
+    write_worker_cargo_toml(&crate_root, catalog, &packages, crate_name)?;
     write_rust_toolchain(&crate_root, &weft_root)?;
     // The `ProjectDefinition` is NOT baked into the binary anymore;
     // workers fetch it from the broker at execution claim time keyed
     // by `definition_hash`. A pure-config or pure-topology edit
     // therefore no longer re-bakes any source file into the worker
     // crate, and the docker image hash stays cache-hit.
-    write_package_crates(&crate_root, project_root, catalog, &packages)?;
+    write_package_crates(
+        &crate_root,
+        catalog,
+        &packages,
+        &EmitPaths::Container { nodes_root: project_root.join("nodes") },
+    )?;
     write_registry_rs(&src_dir, &packages)?;
     write_main_rs(&src_dir, catalog)?;
 
     Ok(crate_root)
+}
+
+/// Where an emitted crate's references point. The SAME shim/deps
+/// emission serves two homes:
+///   - `Container`: the crate compiles inside a docker build whose
+///     context mounts the weft workspace at `WEFT_MOUNT` and the
+///     project's nodes at `NODES_MOUNT` (the worker image, and a
+///     staged test image). `#[path]` includes and path deps use the
+///     mount layout; `nodes_root` is the on-disk `nodes/` dir the
+///     includes are rebased against.
+///   - `Local`: the crate compiles on the host with plain cargo (the
+///     local node-test binary). `#[path]` includes are the real
+///     absolute node paths; path deps point at the real weft checkout.
+pub enum EmitPaths {
+    Container { nodes_root: PathBuf },
+    Local { weft_root: PathBuf },
+}
+
+impl EmitPaths {
+    /// The `#[path = "..."]` string for a real source file under the
+    /// project's `nodes/` root.
+    fn include_path(&self, abs: &Path) -> CompileResult<String> {
+        match self {
+            EmitPaths::Container { nodes_root } => {
+                let rel = abs.strip_prefix(nodes_root).map_err(|_| {
+                    CompileError::Build(format!(
+                        "source file {} is not under project nodes root {}",
+                        abs.display(),
+                        nodes_root.display()
+                    ))
+                })?;
+                Ok(format!(
+                    "{}/{}",
+                    crate::worker_image::NODES_MOUNT,
+                    rel.display().to_string().replace('\\', "/"),
+                ))
+            }
+            EmitPaths::Local { .. } => Ok(abs.display().to_string().replace('\\', "/")),
+        }
+    }
+
+    /// A path-dep spec for a weft workspace crate, from a crate that
+    /// sits `depth` directories below the emitted root (the root crate
+    /// itself is depth 1 relative to the context, a `pkg_<name>/`
+    /// crate is depth 2).
+    fn weft_crate_dep(&self, crate_dir: &str, depth: usize) -> toml::Table {
+        match self {
+            EmitPaths::Container { .. } => {
+                path_table(&format!("{}weft/crates/{crate_dir}", "../".repeat(depth)))
+            }
+            EmitPaths::Local { weft_root } => path_table(
+                &weft_root
+                    .join("crates")
+                    .join(crate_dir)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/"),
+            ),
+        }
+    }
 }
 
 /// Mapping from a package (identified by root dir) to the list of
@@ -141,17 +212,10 @@ fn group_by_package<'a>(
 }
 
 fn sanitize_pkg_ident(raw: &str) -> String {
-    let lowered = raw.to_ascii_lowercase();
-    let mut out = String::with_capacity(lowered.len() + 4);
-    out.push_str("pkg_");
-    for ch in lowered.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    out
+    // Delegates to the one sanitizer (collision-free by construction)
+    // so a package's module ident, crate name, and staging paths can
+    // never disagree or collide.
+    format!("pkg_{}", crate::build::sanitize_crate_name(raw))
 }
 
 /// The set of CATALOG node types this project references, sorted.
@@ -178,12 +242,89 @@ pub fn collect_node_types(project: &ProjectDefinition) -> BTreeSet<String> {
 /// inside each package crate's own `Cargo.toml`, NOT here: a node
 /// that pulls in pyo3 stays a recompile-target of its OWN crate,
 /// while the worker keeps cache-hitting on every other build.
+/// The binary crate's build-script contribution. A package may ship a
+/// `build.rs` at its root (declaring `pub fn main()`) plus
+/// `[build-dependencies]` in its nodes' `deps.toml`; linker arguments
+/// only take effect on the crate being LINKED, so these run on the
+/// emitted BINARY crate (worker / test runner), never on the package
+/// lib. Copies each contributing script in as `build_<ident>.rs`,
+/// writes one synthesized `build.rs` calling each, and returns the
+/// `[package]` build line + the `[build-dependencies]` section
+/// (both empty when no package contributes).
+fn write_binary_build_script(
+    crate_root: &Path,
+    catalog: &FsCatalog,
+    packages: &[PackageEmit<'_>],
+) -> CompileResult<(String, String)> {
+    let mut build_deps: BTreeMap<String, toml::Value> = BTreeMap::new();
+    let mut contributors: Vec<&PackageEmit<'_>> = Vec::new();
+    for pkg in packages {
+        if pkg.package.root.join("build.rs").is_file() {
+            contributors.push(pkg);
+        }
+        for node_type in &pkg.node_types {
+            let node_deps = catalog
+                .deps(node_type)
+                .map_err(|e| CompileError::Build(format!("deps for '{node_type}': {e}")))?;
+            let Some(node_deps) = node_deps else { continue };
+            for (name, value) in node_deps.build_dependencies {
+                add_dep(
+                    &mut build_deps,
+                    &pkg.package.name,
+                    name,
+                    value,
+                    &format!("node {node_type} (build-dependencies)"),
+                )?;
+            }
+        }
+    }
+    if contributors.is_empty() {
+        if let Some(name) = build_deps.keys().next() {
+            return Err(CompileError::Build(format!(
+                "a deps.toml declares build-dependency '{name}' but no referenced \
+                 package ships a build.rs at its root; build-dependencies exist only \
+                 for a package build script"
+            )));
+        }
+        return Ok((String::new(), String::new()));
+    }
+
+    let mut body = String::from(
+        "// Emitted by weft codegen: runs each referenced package's own\n\
+         // build script (`<package root>/build.rs`, `pub fn main()`).\n\n",
+    );
+    for pkg in &contributors {
+        let file = format!("build_{}.rs", pkg.module_ident);
+        std::fs::copy(pkg.package.root.join("build.rs"), crate_root.join(&file))
+            .map_err(CompileError::Io)?;
+        body.push_str(&format!(
+            "#[path = \"{file}\"]\nmod {ident}_build;\n",
+            ident = pkg.module_ident
+        ));
+    }
+    body.push_str("\nfn main() {\n");
+    for pkg in &contributors {
+        body.push_str(&format!("    {ident}_build::main();\n", ident = pkg.module_ident));
+    }
+    body.push_str("}\n");
+    std::fs::write(crate_root.join("build.rs"), body).map_err(CompileError::Io)?;
+
+    let mut build_deps_fragment = String::from("\n[build-dependencies]\n");
+    for (name, value) in build_deps {
+        build_deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
+    }
+    Ok(("build = \"build.rs\"\n".to_string(), build_deps_fragment))
+}
+
 fn write_worker_cargo_toml(
     crate_root: &Path,
+    catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
     crate_name: &str,
 ) -> CompileResult<()> {
     let package_name = crate::build::sanitize_crate_name(crate_name);
+    let (build_line, build_deps_fragment) =
+        write_binary_build_script(crate_root, catalog, packages)?;
 
     let mut deps = fixed_worker_deps();
     // One path dep per referenced package crate. These are the ONLY
@@ -207,19 +348,26 @@ fn write_worker_cargo_toml(
         r#"# Emitted by weft codegen. Do not edit by hand; regenerated on
 # every `weft build`.
 
+# Self-contained: without this, an emission living under some other
+# cargo workspace (a project inside a workspace dir) would be claimed
+# by it and refuse to build. Path-dep subcrates auto-join this
+# workspace.
+[workspace]
+
 [package]
 name = "{name}"
 version = "0.1.0"
 edition = "2021"
-
+{build_line}
 [[bin]]
 name = "{name}"
 path = "src/main.rs"
 
 [dependencies]
-{deps}"#,
+{deps}{build_deps}"#,
         name = package_name,
         deps = deps_fragment,
+        build_deps = build_deps_fragment,
     );
     std::fs::write(crate_root.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
     Ok(())
@@ -236,17 +384,16 @@ path = "src/main.rs"
 /// Per-package and per-node cargo deps land here, not on the worker.
 fn write_package_crates(
     crate_root: &Path,
-    project_root: &Path,
     catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
+    paths: &EmitPaths,
 ) -> CompileResult<()> {
-    let nodes_root = project_root.join("nodes");
     for pkg in packages {
         let pkg_dir = crate_root.join(&pkg.module_ident);
         let pkg_src = pkg_dir.join("src");
         std::fs::create_dir_all(&pkg_src).map_err(CompileError::Io)?;
-        write_package_cargo_toml(&pkg_dir, catalog, pkg)?;
-        write_package_lib_rs(&pkg_src, &nodes_root, catalog, pkg)?;
+        write_package_cargo_toml(&pkg_dir, catalog, pkg, paths)?;
+        write_package_lib_rs(&pkg_src, catalog, pkg, paths)?;
     }
     Ok(())
 }
@@ -255,11 +402,12 @@ fn write_package_cargo_toml(
     pkg_dir: &Path,
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
+    paths: &EmitPaths,
 ) -> CompileResult<()> {
     // Runtime essentials shared with the worker, plus the workspace
-    // surface every node body uses. The relative path
-    // (`../../weft/...`) is one level deeper than the worker's
-    // (`../weft/...`) because we live under `pkg_<name>/`.
+    // surface every node body uses. `paths` places the weft crates
+    // (`../../weft/...` inside a build container, the real checkout
+    // for a host build); depth 2 because we live under `pkg_<name>/`.
     let mut deps = base_runtime_deps();
     // The node-author surface is the `weft` crate: an ALIAS of
     // weft-core, so bodies write `use weft::{...}` (the friendly name)
@@ -267,7 +415,7 @@ fn write_package_cargo_toml(
     // (the NodeManifest derive) resolves whatever name the crate gave
     // weft-core, so the alias is the ONLY name a package crate needs.
     insert_dep(&mut deps, "weft", {
-        let mut t = path_table("../../weft/crates/weft-core");
+        let mut t = paths.weft_crate_dep("weft-core", 2);
         t.insert("package".into(), toml::Value::String("weft-core".into()));
         toml::Value::Table(t)
     });
@@ -279,7 +427,7 @@ fn write_package_cargo_toml(
     insert_dep(
         &mut deps,
         "weft-providers",
-        toml::Value::Table(path_table("../../weft/crates/weft-providers")),
+        toml::Value::Table(paths.weft_crate_dep("weft-providers", 2)),
     );
 
     if let Some(pkg_deps) = &pkg.package.package_deps {
@@ -320,6 +468,14 @@ edition = "2021"
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Compiles each node's `tests.rs` (gated in mod.rs behind
+# `#[cfg(feature = "node-tests")]`). Enabled ONLY by the per-package
+# test crate; the worker leaves it off, so the worker binary never
+# contains tests. Declared here unconditionally so the cfg name is
+# always a known feature.
+node-tests = []
+
 [dependencies]
 {deps}"#,
         pkg_name = pkg.package.name,
@@ -337,9 +493,9 @@ path = "src/lib.rs"
 /// compiles to a standalone `.rlib`.
 fn write_package_lib_rs(
     pkg_src: &Path,
-    nodes_root: &Path,
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
+    paths: &EmitPaths,
 ) -> CompileResult<()> {
     let mut body = String::new();
     body.push_str(&format!(
@@ -357,40 +513,30 @@ fn write_package_lib_rs(
                     shared_path.display()
                 ))
             })?;
-        let rel = shared_path.strip_prefix(nodes_root).map_err(|_| {
-            CompileError::Build(format!(
-                "shared file {} is not under project nodes root {}",
-                shared_path.display(),
-                nodes_root.display()
-            ))
-        })?;
-        let in_container = format!(
-            "{}/{}",
-            crate::worker_image::NODES_MOUNT,
-            rel.display().to_string().replace('\\', "/"),
-        );
+        // The stem becomes a generated `pub mod {mod_name};`, so a
+        // stem that is not a plain identifier must fail here, naming
+        // the file, instead of as a rustc error inside the crate.
+        if !weft_catalog::is_rust_identifier(mod_name) {
+            return Err(CompileError::Build(format!(
+                "package {}: shared file {} would become module `{mod_name}`, \
+                 which is not a valid Rust identifier ([A-Za-z_][A-Za-z0-9_]*); \
+                 rename the file",
+                pkg.package.name,
+                shared_path.display()
+            )));
+        }
+        let include = escape_quoted_str(&paths.include_path(shared_path)?);
         body.push_str(&format!(
-            "#[path = \"{in_container}\"]\npub mod {mod_name};\n\n"
+            "#[path = \"{include}\"]\npub mod {mod_name};\n\n"
         ));
     }
     for node_type in &pkg.node_types {
         let entry = catalog.entry(node_type).expect("collected from catalog");
         let mod_rs = entry.source_dir.join("mod.rs");
-        let rel = mod_rs.strip_prefix(nodes_root).map_err(|_| {
-            CompileError::Build(format!(
-                "node source {} is not under project nodes root {}",
-                mod_rs.display(),
-                nodes_root.display()
-            ))
-        })?;
-        let in_container = format!(
-            "{}/{}",
-            crate::worker_image::NODES_MOUNT,
-            rel.display().to_string().replace('\\', "/"),
-        );
+        let include = escape_quoted_str(&paths.include_path(&mod_rs)?);
         let mod_name = ident_for_node_type(node_type);
         body.push_str(&format!(
-            "#[path = \"{in_container}\"]\npub mod {mod_name};\n\n"
+            "#[path = \"{include}\"]\npub mod {mod_name};\n\n"
         ));
     }
     std::fs::write(pkg_src.join("lib.rs"), body).map_err(CompileError::Io)?;
@@ -417,7 +563,7 @@ fn write_rust_toolchain(crate_root: &Path, weft_root: &Path) -> Result<(), Compi
 /// `[dependencies]`. Tables become `{ k = v, ... }`.
 fn toml_inline(v: &toml::Value) -> String {
     match v {
-        toml::Value::String(s) => format!("\"{}\"", escape_toml_str(s)),
+        toml::Value::String(s) => format!("\"{}\"", escape_quoted_str(s)),
         toml::Value::Integer(i) => i.to_string(),
         toml::Value::Float(f) => f.to_string(),
         toml::Value::Boolean(b) => b.to_string(),
@@ -436,7 +582,12 @@ fn toml_inline(v: &toml::Value) -> String {
     }
 }
 
-fn escape_toml_str(s: &str) -> String {
+/// Escape a string for interpolation into a generated double-quoted
+/// literal. Serves BOTH the TOML side (`toml_inline`'s string values)
+/// and the Rust side (`#[path = "..."]` includes): the escape rules
+/// coincide (backslash and double quote), so one function covers
+/// both, e.g. a checkout path containing a double quote.
+fn escape_quoted_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -903,8 +1054,13 @@ fn ident_for_node_type(node_type: &str) -> String {
 // `#[derive(NodeManifest)]` holds bare declared names (`ChatHistory`),
 // so the process-wide registry must be installed before any manifest
 // parse. The baked table is the catalog's resolved nominal entries.
-fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
-    let type_decls: String = catalog
+/// The baked type-declaration rows a generated `main.rs` installs into
+/// the process-wide `TypeRegistry` before anything parses embedded
+/// node metadata. Shared by the worker main and the test-runner main:
+/// both host `#[derive(NodeManifest)]` expansions whose port types may
+/// name declared types.
+fn baked_type_decls(catalog: &FsCatalog) -> String {
+    catalog
         .type_registry()
         .nominal_entries()
         .iter()
@@ -913,7 +1069,11 @@ fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
                 "        ({name:?}.to_string(), {body:?}.to_string(), \"baked\".to_string()),\n"
             )
         })
-        .collect();
+        .collect()
+}
+
+fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
+    let type_decls = baked_type_decls(catalog);
     let contents = format!(
         r#"//! Project worker binary. Spawned by the dispatcher as part of
 //! a per-project pool. Claims `target=worker` tasks for its own
@@ -1068,6 +1228,177 @@ impl NodeCatalog for CatalogRef {{
     Ok(())
 }
 
+
+/// What [`emit_test_crate`] produced: the crate root to `cargo build`
+/// (or stage into an image build context) and the identities the
+/// caller needs to run/report.
+#[derive(Debug, Clone)]
+pub struct TestCrate {
+    pub crate_root: PathBuf,
+    /// The emitted binary's name (`<package>_tests`).
+    pub binary_name: String,
+    /// The package's on-disk root (for content hashing).
+    pub package_root: PathBuf,
+    /// Every node type the package declares (the test registry's set).
+    pub node_types: Vec<String>,
+}
+
+/// Emit the per-PACKAGE node-test crate at `target_root`:
+///
+/// ```text
+/// target_root/
+///   Cargo.toml            test-runner deps + the one pkg dep, with
+///                         the `node-tests` feature ENABLED
+///   rust-toolchain.toml
+///   src/main.rs           installs the baked type registry, then
+///                         hands off to weft_engine::test_runner
+///   src/registry.rs       NodeCatalog over the package's nodes
+///   pkg_<name>/           the package crate (same shim shape as the
+///                         worker's, compiled WITH `node-tests`)
+/// ```
+///
+/// Needs ONLY the catalog walk: no `ProjectDefinition`, no graph
+/// parse, no validation of other packages. A broken `main.weft` or a
+/// broken sibling package never blocks testing the package under
+/// work. Packages must not depend on other packages; a violation
+/// fails this crate's compile, which is the loud failure we want.
+pub fn emit_test_crate(
+    target_root: &Path,
+    catalog: &FsCatalog,
+    package_name: &str,
+    paths: &EmitPaths,
+) -> CompileResult<TestCrate> {
+    let Some(package) = catalog.packages().find(|p| p.name == package_name) else {
+        let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
+        known.sort();
+        return Err(CompileError::Build(format!(
+            "no package named '{package_name}' in this project's nodes/ (known: {})",
+            known.join(", ")
+        )));
+    };
+    let mut node_types = package.node_types.clone();
+    node_types.sort();
+    let pkg = PackageEmit {
+        package,
+        node_types: node_types.clone(),
+        module_ident: sanitize_pkg_ident(&package.name),
+    };
+
+    // The emitted crate is a pure function of its inputs: wipe any
+    // previous emission first so a renamed package or a dropped node
+    // can never leave stale files (an old Cargo.toml, an orphaned
+    // package dir) inside the crate cargo compiles.
+    if target_root.exists() {
+        std::fs::remove_dir_all(target_root).map_err(CompileError::Io)?;
+    }
+    let src_dir = target_root.join("src");
+    std::fs::create_dir_all(&src_dir).map_err(CompileError::Io)?;
+    let weft_root = crate::build::resolve_weft_root()?;
+    write_rust_toolchain(target_root, &weft_root)?;
+
+    // Seed the workspace's Cargo.lock so the host build resolves the
+    // versions the workspace already pins for every dep the lock
+    // covers (a node dep OUTSIDE the lock still resolves fresh; only
+    // the shared engine graph is pinned). The container path gets the
+    // same seed from the Dockerfile's `cp /weft/Cargo.lock`.
+    if matches!(paths, EmitPaths::Local { .. }) {
+        let lock_src = weft_root.join("Cargo.lock");
+        std::fs::copy(&lock_src, target_root.join("Cargo.lock")).map_err(|e| {
+            CompileError::Build(format!("seed Cargo.lock from {}: {e}", lock_src.display()))
+        })?;
+    }
+
+    let binary_name = format!("{}_tests", crate::build::sanitize_crate_name(&package.name));
+    let (build_line, build_deps_fragment) =
+        write_binary_build_script(target_root, catalog, std::slice::from_ref(&pkg))?;
+
+    // Root Cargo.toml: only what the generated main names directly
+    // (weft-core for the registry, weft-engine for the runner) plus
+    // the package crate with its tests compiled in. Everything else
+    // arrives transitively with the workspace's unified versions.
+    let mut deps: BTreeMap<String, toml::Value> = BTreeMap::new();
+    insert_dep(&mut deps, "weft-core", toml::Value::Table(paths.weft_crate_dep("weft-core", 1)));
+    insert_dep(&mut deps, "weft-engine", {
+        let mut t = paths.weft_crate_dep("weft-engine", 1);
+        t.insert(
+            "features".into(),
+            toml::Value::Array(vec![toml::Value::String("node-tests".into())]),
+        );
+        toml::Value::Table(t)
+    });
+    insert_dep(&mut deps, &pkg.module_ident, {
+        let mut t = path_table(&format!("./{}", pkg.module_ident));
+        t.insert(
+            "features".into(),
+            toml::Value::Array(vec![toml::Value::String("node-tests".into())]),
+        );
+        toml::Value::Table(t)
+    });
+    let mut deps_fragment = String::new();
+    for (name, value) in deps {
+        deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
+    }
+    let cargo_toml = format!(
+        r#"# Emitted by weft codegen: the `{pkg_name}` package's node-test
+# crate. Do not edit by hand; regenerated on every test build.
+
+# Self-contained: without this, an emission living under some other
+# cargo workspace (a project inside a workspace dir) would be claimed
+# by it and refuse to build. Path-dep subcrates auto-join this
+# workspace.
+[workspace]
+
+[package]
+name = "{binary_name}"
+version = "0.1.0"
+edition = "2021"
+{build_line}
+[[bin]]
+name = "{binary_name}"
+path = "src/main.rs"
+
+[dependencies]
+{deps}{build_deps}"#,
+        pkg_name = package.name,
+        deps = deps_fragment,
+        build_deps = build_deps_fragment,
+    );
+    std::fs::write(target_root.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
+
+    write_package_crates(target_root, catalog, std::slice::from_ref(&pkg), paths)?;
+    write_registry_rs(&src_dir, std::slice::from_ref(&pkg))?;
+
+    let type_decls = baked_type_decls(catalog);
+    let main_rs = format!(
+        r#"//! Per-package node-test binary. All runner logic lives in
+//! `weft_engine::test_runner`; this file only bakes the project's
+//! type declarations and the package's node registry.
+
+mod registry;
+
+fn main() -> std::process::ExitCode {{
+    // Embedded node metadata may name declared types; the registry
+    // must be installed before any manifest parses.
+    weft_core::weft_type::TypeRegistry::install(
+        weft_core::weft_type::TypeRegistry::build(&[
+{type_decls}    ])
+        .expect("baked type declarations were validated at emit time"),
+    )
+    .expect("first registry install in this process");
+
+    weft_engine::test_runner::main(&registry::PROJECT_CATALOG)
+}}
+"#,
+    );
+    std::fs::write(src_dir.join("main.rs"), main_rs).map_err(CompileError::Io)?;
+
+    Ok(TestCrate {
+        crate_root: target_root.to_path_buf(),
+        binary_name,
+        package_root: package.root.clone(),
+        node_types,
+    })
+}
 
 #[cfg(test)]
 mod tests {

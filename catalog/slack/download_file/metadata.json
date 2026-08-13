@@ -1,0 +1,63 @@
+{
+  "type": "SlackDownloadFile",
+  "label": "Slack: Download File",
+  "description": "Pull a Slack-hosted file (an F... id, e.g. from the file-shared trigger) into storage and emit the stored-file reference for downstream nodes.",
+  "tags": [
+    "slack",
+    "file"
+  ],
+  "icon": "Download",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "files:read"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the files:read scope."
+    },
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": true,
+      "label": "File id",
+      "placeholder": "F0123456789"
+    },
+    {
+      "name": "keep",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Keep after the run",
+      "description": "Keep the downloaded file in storage after the execution finishes."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "File",
+      "required": false,
+      "description": "The stored file reference."
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

@@ -46,11 +46,16 @@ impl ProviderMeter for ProjectMeter {
         Ok(0.01)
     }
 
-    fn observe(&self) -> Box<dyn CallObservation> {
+    fn observe(&self, _path: &str) -> Box<dyn CallObservation> {
         Box::new(NoopObservation)
     }
 
-    async fn resolve(&self, _observed: ObservedCall, _follow_up: FollowUp<'_>) -> MeasuredCost {
+    async fn resolve(
+        &self,
+        _path: &str,
+        _observed: ObservedCall,
+        _follow_up: FollowUp<'_>,
+    ) -> MeasuredCost {
         MeasuredCost {
             amount_usd: Some(0.01),
             model: None,
@@ -67,6 +72,7 @@ impl CallObservation for NoopObservation {
     fn end(self: Box<Self>, interrupted: bool) -> ObservedCall {
         ObservedCall {
             interrupted,
+            status: 200,
             data: json!({}),
         }
     }

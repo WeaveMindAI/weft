@@ -32,16 +32,18 @@ const FETCH_LIMIT: i64 = 500;
 /// safety poll catches missed wakes.
 pub const INFRA_EVENT_CHANNEL: &str = "weft_infra_event";
 
-pub async fn migrate(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    sqlx::query(
-        "INSERT INTO dispatcher_cursor (key, last_id) VALUES ($1, 0) \
+/// Seed this bridge's cursor row in `dispatcher_cursor` (the table is
+/// `journal_bridge::GROUP`'s, ordered before this group at boot). Creates
+/// no table of its own, so `tables` is empty. The seed row's key literal
+/// is `CURSOR_KEY` (static DDL cannot bind).
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "infra_event_bridge_cursor",
+    tables: &[],
+    ddl: &[
+        "INSERT INTO dispatcher_cursor (key, last_id) VALUES ('infra_event_bridge', 0) \
          ON CONFLICT (key) DO NOTHING",
-    )
-    .bind(CURSOR_KEY)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+    ],
+};
 
 pub async fn run(state: DispatcherState) {
     pg_wake::run(

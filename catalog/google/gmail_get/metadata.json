@@ -1,0 +1,92 @@
+{
+  "type": "GmailGet",
+  "label": "Gmail: Get Message",
+  "description": "Fetch one message by id and decompose it: subject/from/to/date, the text body, labels, and every attachment pulled into storage as file references.",
+  "tags": [
+    "google",
+    "gmail",
+    "email"
+  ],
+  "icon": "Mail",
+  "color": "#EA4335",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/gmail.readonly"
+      ],
+      "description": "A Google account with the read-mail permission."
+    },
+    {
+      "name": "id",
+      "type": "String",
+      "required": true,
+      "label": "Message id"
+    },
+    {
+      "name": "includeAttachments",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": true,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Download attachments"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "subject",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "from",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "to",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "date",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "body",
+      "type": "String",
+      "required": false,
+      "description": "The message text (plain when available, else the HTML)."
+    },
+    {
+      "name": "bodyIsHtml",
+      "type": "Boolean",
+      "required": false
+    },
+    {
+      "name": "threadId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "snippet",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "labels",
+      "type": "List[String]",
+      "required": false
+    },
+    {
+      "name": "attachments",
+      "type": "List[File]",
+      "required": false
+    }
+  ]
+}

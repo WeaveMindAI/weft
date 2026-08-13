@@ -1,0 +1,75 @@
+{
+  "type": "TelegramReceiveMessage",
+  "label": "Telegram: Receive Message",
+  "description": "Fires once per message sent to the bot, optionally filtered to one chat and a contained keyword. Activation starts from now; restarts never re-fire history.",
+  "tags": [
+    "telegram",
+    "message",
+    "chat"
+  ],
+  "icon": "MessageCircle",
+  "color": "#229ED9",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Telegram bot access (wire a TelegramAccess node)."
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Chat id",
+      "description": "Only fire on messages in this chat. Empty = every chat the bot is in."
+    },
+    {
+      "name": "keyword",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Contains",
+      "description": "Only fire when the text contains this."
+    },
+    {
+      "name": "intervalSecs",
+      "type": "Number",
+      "exposure": "config",
+      "default": 5,
+      "label": "Check every (seconds)"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false,
+      "description": "The sender's username."
+    },
+    {
+      "name": "messageId",
+      "type": "Number",
+      "required": false
+    },
+    {
+      "name": "message",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The full Telegram message object."
+    }
+  ],
+  "features": {
+    "isTrigger": true
+  }
+}

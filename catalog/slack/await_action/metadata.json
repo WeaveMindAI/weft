@@ -1,0 +1,97 @@
+{
+  "type": "SlackAwaitAction",
+  "label": "Slack: Await Action",
+  "description": "The approval pattern: post a message with buttons, pause the workflow until someone clicks, then continue with which button was chosen and by whom. The message is edited once decided so the buttons cannot be clicked twice. Works through the app's interactivity delivery (the shared app's configured interactivity URL, or your own app's Socket Mode).",
+  "tags": [
+    "slack",
+    "approval",
+    "human"
+  ],
+  "icon": "MousePointerClick",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "chat:write"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the chat:write scope."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          }
+        ]
+      },
+      "label": "Channel",
+      "placeholder": "Pick a channel or paste its id"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "label": "Text",
+      "description": "The question or context shown above the buttons (mrkdwn)."
+    },
+    {
+      "name": "buttons",
+      "type": "List[JsonDict]",
+      "required": true,
+      "label": "Buttons",
+      "description": "The choices, e.g. [{\"id\": \"approve\", \"label\": \"Approve\", \"style\": \"primary\"}, {\"id\": \"reject\", \"label\": \"Reject\", \"style\": \"danger\"}]. The clicked button's id comes out the action output."
+    },
+    {
+      "name": "confirmedText",
+      "type": "String",
+      "required": false,
+      "label": "Text after the decision",
+      "description": "What the message becomes once someone clicked. Defaults to the original text plus who chose what."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "action",
+      "type": "String",
+      "required": false,
+      "description": "The clicked button's id."
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false,
+      "description": "Who clicked (their Slack user id)."
+    },
+    {
+      "name": "userName",
+      "type": "String",
+      "required": false,
+      "description": "Who clicked (their Slack username)."
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": false,
+      "description": "The posted message's timestamp id."
+    }
+  ]
+}

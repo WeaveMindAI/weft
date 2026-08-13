@@ -59,7 +59,7 @@
   },
   "inputs": [
     {
-      "name": "connection",
+      "name": "account",
       "type": "Access",
       "exposure": "config",
       "widget": {
@@ -82,13 +82,13 @@
         "kind": "not",
         "of": {
           "kind": "config_nonempty",
-          "field": "connection"
+          "field": "account"
         }
       },
       "then": {
         "message": "ElevenLabsAccess '{id}' has no connection picked; pick one on the node.",
         "level": "runtime",
-        "field": "connection"
+        "field": "account"
       }
     }
   ],

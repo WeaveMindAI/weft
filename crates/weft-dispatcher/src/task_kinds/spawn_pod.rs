@@ -95,7 +95,9 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
             &payload.project_id,
             &payload.namespace,
             &payload.owner_dispatcher,
-            &want_hash,
+            Some(&want_hash),
+            "worker",
+            None,
         )
         .await?;
 

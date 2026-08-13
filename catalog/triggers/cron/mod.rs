@@ -13,11 +13,19 @@ use weft::node::NodeOutput;
 use weft::signal::{Timer, TimerSpec};
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[derive(NodeManifest)]
 pub struct CronNode;
 
 #[async_trait]
 impl Node for CronNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // `cron` declares a metadata default, so the bag always holds
         // an expression.

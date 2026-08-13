@@ -44,10 +44,41 @@ pub const SPAWN_BOOT_DEADLINE_SECS: i64 = 1800;
 ///
 /// The fencing trigger lets `spawning` and `alive` rows write to
 /// `exec_event`. Anything else is rejected.
-const STATUS_SPAWNING: &str = "spawning";
-const STATUS_ALIVE: &str = "alive";
-const STATUS_DONE: &str = "done";
-const STATUS_DEAD: &str = "dead";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PodStatus {
+    Spawning,
+    Alive,
+    Done,
+    Dead,
+}
+
+impl PodStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawning => "spawning",
+            Self::Alive => "alive",
+            Self::Done => "done",
+            Self::Dead => "dead",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "spawning" => Ok(Self::Spawning),
+            "alive" => Ok(Self::Alive),
+            "done" => Ok(Self::Done),
+            "dead" => Ok(Self::Dead),
+            other => anyhow::bail!("worker_pod status column holds unknown value '{other}'"),
+        }
+    }
+
+    /// `done` and `dead` are terminal: the row never leaves them, the
+    /// fencing trigger rejects the pod's journal writes, and the pod-GC
+    /// sweep retires the row.
+    pub fn terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Dead)
+    }
+}
 
 /// Minimal projection of the `worker_pod` table: only the columns the stale /
 /// terminal reapers act on. The e2e rig reads a DIFFERENT projection of the same
@@ -64,8 +95,13 @@ pub struct WorkerPodRow {
     pub created_at_unix: i64,
 }
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let stmts = [
+/// The `worker_pod` table + its triggers, applied at boot via
+/// `schema_guard::apply_groups`. The fencing trigger attaches to
+/// `exec_event`, so the journal's group must be applied first.
+pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
+    name: "worker_pod",
+    tables: &["worker_pod"],
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS worker_pod (
             pod_name TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -85,14 +121,17 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             -- attempt: a mismatch means the alive pod has a stale
             -- binary (e.g. user changed a node implementation since
             -- it spawned). The dispatcher kills the stale pod and
-            -- proceeds with a fresh spawn.
+            -- proceeds with a fresh spawn. NULL for a role='node-test'
+            -- row: a test pod has no worker binary (its image travels
+            -- on the task payload), and NULL never compares equal to
+            -- a real hash, so no worker query can ever match it.
             -- NOTE: capacity is governed by MEMORY pressure, not a task
             -- count. A pod's `mem_pressure` (below) is what placement and
             -- scale-down read; idle-exit (`mark_done_if_idle`) is gated by
             -- its pending/claimed-task `NOT EXISTS` check (any in-flight
             -- execution, live or not, is a worker task and so blocks
             -- idle-exit).
-            binary_hash TEXT NOT NULL DEFAULT '',
+            binary_hash TEXT,
             -- The worker's last self-reported memory pressure
             -- (usage/limit, [0,1]), written on each heartbeat tick. The
             -- dispatcher's worker placement + scale-down read this (the
@@ -118,7 +157,23 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             -- scaledown sweep logs elapsed-since-drain + the pod's
             -- remaining in-flight work as a periodic breadcrumb, so a pod
             -- stuck draining is visible rather than silent.
-            drained_at_unix BIGINT
+            drained_at_unix BIGINT,
+            -- What the pod IS: 'worker' (runs the project's compiled
+            -- graph and claims work) or 'node-test' (a short-lived
+            -- test pod holding a broker identity, driven by its
+            -- enqueuing task). Worker capacity, placement,
+            -- reconciliation, and scale-down read ONLY role='worker';
+            -- identity resolution (the broker's pod->tenant lookup)
+            -- reads both.
+            role TEXT NOT NULL DEFAULT 'worker',
+            -- The task that owns this pod's lifecycle, for pods driven
+            -- by a task executor rather than by their own claim loop
+            -- (role='node-test'). The orphan sweep reaps a non-terminal
+            -- node-test row once its owning task is gone or has been
+            -- terminal past a grace window (see list_orphaned_node_test).
+            -- NULL for role='worker' rows (a worker outlives any one
+            -- task).
+            owner_task_id UUID
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_worker_pod_project_alive
             ON worker_pod(project_id)
@@ -171,8 +226,11 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         // somehow does not the UPDATE matches zero rows and the
         // broker's journal-write owner check then refuses the pod
         // loudly (no silent mis-bind).
-        // SYNC: this is the ONLY writer of execution_color.owner_pod_name;
-        // the reader is crates/weft-broker/src/handlers.rs journal_record.
+        // SYNC: execution_color.owner_pod_name has exactly two writers,
+        // this trigger and `bind_color_owner` below (the appointed-driver
+        // path for pods that never claim a task); the readers are
+        // crates/weft-broker/src/handlers.rs journal_record and
+        // crates/weft-broker/src/auth.rs resolve_storage_caller.
         r#"CREATE OR REPLACE FUNCTION weft_bind_color_owner() RETURNS trigger AS $$
             BEGIN
                 IF NEW.color IS NOT NULL AND NEW.claimed_by IS NOT NULL THEN
@@ -205,52 +263,93 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
                   AND NEW.claimed_by IS DISTINCT FROM OLD.claimed_by
                   AND NEW.kind IN ('execute', 'resume'))
             EXECUTE FUNCTION weft_bind_color_owner()"#,
-    ];
-    for sql in stmts {
-        sqlx::query(sql).execute(pool).await?;
+    ],
+};
+
+/// Appoint `pod_name` as the driver of `color`. Ownership normally
+/// follows the task claim (the `task_claim_binds_color_owner` trigger
+/// above), but a pod that never claims a task (a node-test pod: the
+/// dispatcher holds the task and spawns the pod directly) gets its
+/// driver appointed here at spawn time, before the pod exists.
+/// Idempotent: a lease-loss re-claim re-stamps the same pod name. A
+/// missing color row matches zero rows and fails loudly (the color is
+/// always seeded at ExecutionStarted first).
+/// SYNC: writer of execution_color.owner_pod_name, see the trigger
+/// comment in `GROUP` above for the full writer/reader chain.
+pub async fn bind_color_owner(pool: &PgPool, color: &str, pod_name: &str) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE execution_color SET owner_pod_name = $2 WHERE color = $1",
+    )
+    .bind(color)
+    .bind(pod_name)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        anyhow::bail!("color {color} has no execution_color row to bind an owner onto");
     }
     Ok(())
 }
 
-/// Worker flips its pre-inserted row to `alive` and stamps the
-/// first heartbeat. The dispatcher's `insert_spawning` always runs
-/// before the kubectl apply that creates the pod, so the row is
-/// guaranteed to exist by the time the worker calls this. If it
-/// doesn't (e.g. a forged pod_name from a compromised caller), the
-/// UPDATE affects zero rows and we surface that as an error: there
-/// is no INSERT fallback so tenant-supplied namespace/owner data
-/// never reaches the row.
+/// Which prior statuses a `register_alive` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliveTransition {
+    /// The worker's BOOT registration: only a `spawning` row flips.
+    /// Load-bearing for generation fencing: a dead-marked row (the
+    /// reaper called `mark_dead` between the worker's boot and its
+    /// first heartbeat) can never be flipped back to `alive`, and a
+    /// crashed-then-restarted container (already-`alive` row) bails
+    /// instead of resurrecting itself.
+    FromSpawning,
+    /// The EXECUTOR-side registration for pods whose lifecycle a task
+    /// executor drives (a node-test pod), idempotently: a `spawning`
+    /// row registers, an already-`alive` row just refreshes its
+    /// heartbeat (a task re-claim runs this again), and a terminal
+    /// row still bails loudly (dead stays dead).
+    FromSpawningOrAlive,
+}
+
+/// Flip a pre-inserted row to `alive` and stamp the heartbeat.
+/// `transition` picks the acceptable prior statuses (see
+/// [`AliveTransition`]). The dispatcher's `insert_spawning` always
+/// runs before the kubectl apply that creates the pod, so the row is
+/// guaranteed to exist by the time this is called. If it doesn't
+/// (e.g. a forged pod_name from a compromised caller), the UPDATE
+/// affects zero rows and we surface that as an error: there is no
+/// INSERT fallback so tenant-supplied namespace/owner data never
+/// reaches the row.
 pub async fn register_alive(
     pool: &PgPool,
     pod_name: &str,
     project_id: &str,
+    transition: AliveTransition,
 ) -> Result<()> {
-    let now = unix_now();
-    // `AND status = 'spawning'` is load-bearing: without it a dead-
-    // marked row (the reaper called `mark_dead` between this worker's
-    // boot and its first heartbeat) could be flipped back to `alive`
-    // by the worker, defeating the generation fencing. With the
-    // guard, a dead row stays dead; rows_affected = 0 surfaces the
-    // condition and the worker exits via `bail!` instead of
-    // resurrecting itself.
-    let res = sqlx::query(
-        r#"UPDATE worker_pod
-           SET status = $3, last_heartbeat_unix = $4
-           WHERE pod_name = $1 AND project_id = $2 AND status = $5"#,
-    )
-    .bind(pod_name)
-    .bind(project_id)
-    .bind(STATUS_ALIVE)
-    .bind(now)
-    .bind(STATUS_SPAWNING)
-    .execute(pool)
-    .await?;
+    let sql = match transition {
+        AliveTransition::FromSpawning => {
+            r#"UPDATE worker_pod
+               SET status = $3, last_heartbeat_unix = $4
+               WHERE pod_name = $1 AND project_id = $2 AND status = $5"#
+        }
+        AliveTransition::FromSpawningOrAlive => {
+            r#"UPDATE worker_pod
+               SET status = $3, last_heartbeat_unix = $4
+               WHERE pod_name = $1 AND project_id = $2 AND status IN ($5, $3)"#
+        }
+    };
+    let res = sqlx::query(sql)
+        .bind(pod_name)
+        .bind(project_id)
+        .bind(PodStatus::Alive.as_str())
+        .bind(unix_now())
+        .bind(PodStatus::Spawning.as_str())
+        .execute(pool)
+        .await?;
     if res.rows_affected() == 0 {
         anyhow::bail!(
-            "no spawning worker_pod row for pod_name='{pod_name}' \
+            "no registrable worker_pod row for pod_name='{pod_name}' \
              project_id='{project_id}'; the row was either never \
-             inserted by the dispatcher or was marked dead before \
-             this worker registered"
+             inserted by the dispatcher or already left the \
+             registrable state (marked dead, or done)"
         );
     }
     Ok(())
@@ -265,23 +364,28 @@ pub async fn insert_spawning(
     project_id: &str,
     namespace: &str,
     owner_dispatcher: &str,
-    binary_hash: &str,
+    binary_hash: Option<&str>,
+    role: &str,
+    owner_task_id: Option<uuid::Uuid>,
 ) -> Result<()> {
     let now = unix_now();
     sqlx::query(
         r#"INSERT INTO worker_pod (
             pod_name, project_id, namespace, status, owner_dispatcher,
-            last_heartbeat_unix, created_at_unix, binary_hash
-        ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
+            last_heartbeat_unix, created_at_unix, binary_hash, role,
+            owner_task_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $6, $7, $8, $9)
         ON CONFLICT (pod_name) DO NOTHING"#,
     )
     .bind(pod_name)
     .bind(project_id)
     .bind(namespace)
-    .bind(STATUS_SPAWNING)
+    .bind(PodStatus::Spawning.as_str())
     .bind(owner_dispatcher)
     .bind(now)
     .bind(binary_hash)
+    .bind(role)
+    .bind(owner_task_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -334,7 +438,7 @@ pub async fn mark_done(pool: &PgPool, pod_name: &str) -> Result<()> {
            SET status = $1, terminal_at_unix = $3
            WHERE pod_name = $2 AND status IN ('spawning', 'alive')"#,
     )
-    .bind(STATUS_DONE)
+    .bind(PodStatus::Done.as_str())
     .bind(pod_name)
     .bind(crate::tasks::unix_now())
     .execute(pool)
@@ -348,7 +452,7 @@ pub async fn mark_dead(pool: &PgPool, pod_name: &str) -> Result<()> {
            SET status = $1, terminal_at_unix = $3
            WHERE pod_name = $2 AND status IN ('spawning', 'alive')"#,
     )
-    .bind(STATUS_DEAD)
+    .bind(PodStatus::Dead.as_str())
     .bind(pod_name)
     .bind(crate::tasks::unix_now())
     .execute(pool)
@@ -401,7 +505,7 @@ pub async fn mark_done_if_idle(pool: &PgPool, pod_name: &str) -> Result<bool> {
              END"#,
     )
     .bind(pod_name)
-    .bind(STATUS_DONE)
+    .bind(PodStatus::Done.as_str())
     .bind(crate::tasks::unix_now())
     .execute(pool)
     .await?;
@@ -423,6 +527,7 @@ pub async fn has_live_for_project(
     let row: Option<(i64,)> = sqlx::query_as(
         r#"SELECT 1::bigint FROM worker_pod
            WHERE project_id = $1 AND status IN ('spawning', 'alive')
+             AND role = 'worker'
              AND ($2::TEXT IS NULL OR (binary_hash = $2 AND NOT draining))
            LIMIT 1"#,
     )
@@ -445,6 +550,7 @@ pub async fn alive_pod_for_project_full(
     let row: Option<(String, String, String)> = sqlx::query_as(
         r#"SELECT pod_name, namespace, binary_hash FROM worker_pod
            WHERE project_id = $1 AND status IN ('spawning', 'alive')
+             AND role = 'worker'
            ORDER BY created_at_unix ASC
            LIMIT 1"#,
     )
@@ -465,6 +571,7 @@ pub async fn alive_pods_for_project_full(
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         r#"SELECT pod_name, namespace, binary_hash FROM worker_pod
            WHERE project_id = $1 AND status IN ('spawning', 'alive')
+             AND role = 'worker'
            ORDER BY created_at_unix ASC"#,
     )
     .bind(project_id)
@@ -513,6 +620,7 @@ pub async fn pick_admittable_for_project(
         r#"SELECT pod_name, namespace FROM worker_pod
            WHERE project_id = $1
              AND status IN ('spawning', 'alive')
+             AND role = 'worker'
              AND NOT draining
              AND mem_pressure < $2
              AND ($3::TEXT IS NULL OR binary_hash = $3)
@@ -540,7 +648,8 @@ pub async fn pod_loads_for_project(
 ) -> Result<Vec<(String, f64)>> {
     let rows: Vec<(String, f64)> = sqlx::query_as(
         r#"SELECT pod_name, mem_pressure FROM worker_pod
-           WHERE project_id = $1 AND status = 'alive' AND NOT draining"#,
+           WHERE project_id = $1 AND status = 'alive'
+             AND role = 'worker' AND NOT draining"#,
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -561,7 +670,7 @@ pub async fn pod_loads_for_project(
 pub async fn projects_with_multiple_workers(pool: &PgPool) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         r#"SELECT project_id FROM worker_pod
-           WHERE status = 'alive' AND NOT draining
+           WHERE status = 'alive' AND role = 'worker' AND NOT draining
            GROUP BY project_id
            HAVING COUNT(*) > 1"#,
     )
@@ -616,11 +725,16 @@ pub async fn draining_breadcrumbs(pool: &PgPool) -> Result<Vec<(String, String, 
         .collect())
 }
 
+/// Worker rows only: a node-test row's liveness is owned by its
+/// task executor (which heartbeats it and cleans it up on every exit
+/// path, including a lease-loss re-claim), and the task lease outlives
+/// the heartbeat staleness window, so a reaper kill here would race a
+/// sibling's re-claim and destroy a still-running test.
 pub async fn list_stale(pool: &PgPool, threshold_unix: i64) -> Result<Vec<WorkerPodRow>> {
     let rows = sqlx::query(
         r#"SELECT pod_name, project_id, namespace, last_heartbeat_unix, created_at_unix
            FROM worker_pod
-           WHERE status = 'alive' AND last_heartbeat_unix < $1"#,
+           WHERE status = 'alive' AND last_heartbeat_unix < $1 AND role = 'worker'"#,
     )
     .bind(threshold_unix)
     .fetch_all(pool)
@@ -634,15 +748,51 @@ pub async fn list_stale(pool: &PgPool, threshold_unix: i64) -> Result<Vec<Worker
 /// The reaper marks these dead so a failed boot stops being counted as
 /// capacity by the scale-up check (which treats `spawning` as
 /// admittable). Keyed on `created_at_unix` (a spawning row has no
-/// heartbeat yet). Returns the rows oldest-first.
+/// heartbeat yet). Returns the rows oldest-first. Worker rows only,
+/// for the same reason as [`list_stale`].
 pub async fn list_stale_spawning(pool: &PgPool, threshold_unix: i64) -> Result<Vec<WorkerPodRow>> {
     let rows = sqlx::query(
         r#"SELECT pod_name, project_id, namespace, last_heartbeat_unix, created_at_unix
            FROM worker_pod
-           WHERE status = 'spawning' AND created_at_unix < $1
+           WHERE status = 'spawning' AND created_at_unix < $1 AND role = 'worker'
            ORDER BY created_at_unix ASC"#,
     )
     .bind(threshold_unix)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(parse_row).collect()
+}
+
+/// Non-terminal node-test rows whose owning task is gone, or has been
+/// terminal since before `terminal_before_unix` (pass
+/// `now - CLAIM_DURATION_SECS`): the executor that drives such a pod
+/// cleans it up on every exit path, but a cleanup step can itself
+/// fail (a pod delete or the row's `mark_done` erroring out after the
+/// task already went terminal), and nothing re-runs it. The reaper
+/// sweeps these through the same reap path as failed workers.
+///
+/// A live (pending/claimed) owning task keeps its row untouched: the
+/// executor is still driving (or a later claim will), and a reap here
+/// would destroy a pod whose logs that claim needs. The grace window
+/// on RECENTLY terminal tasks protects the executor's own in-flight
+/// cleanup for the same reason: only a task terminal past a full
+/// claim duration can have no cleanup still running against its pod.
+pub async fn list_orphaned_node_test(
+    pool: &PgPool,
+    terminal_before_unix: i64,
+) -> Result<Vec<WorkerPodRow>> {
+    let rows = sqlx::query(
+        r#"SELECT pod_name, project_id, namespace, last_heartbeat_unix, created_at_unix
+           FROM worker_pod wp
+           WHERE wp.status IN ('spawning', 'alive') AND wp.role = 'node-test'
+             AND NOT EXISTS (
+                 SELECT 1 FROM task t
+                 WHERE t.id = wp.owner_task_id
+                   AND (t.status IN ('pending', 'claimed')
+                        OR t.completed_at_unix >= $1)
+             )"#,
+    )
+    .bind(terminal_before_unix)
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(parse_row).collect()

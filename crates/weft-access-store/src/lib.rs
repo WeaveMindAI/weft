@@ -33,7 +33,7 @@ pub use subscriptions::{
     run_connect_call, subscription_by_id, EnsureSubscription, EnsuredSubscription, Subscription,
 };
 pub use resolve::{
-    connections_for_event, events_recipe_hash, events_recipes_of, granted_items, lookup,
+    connections_for_event, events_recipe_hash, events_recipes_of, granted_items, lookup, lookup_url,
     recipe_value_names, record_events_recipes, resolve_event_source, resolve_for_worker,
     EventTarget, GrantedQuery, LookupItem, LookupPage, LookupRequest, RecordedEventsRecipe,
     ResolvedAccess,
@@ -138,11 +138,20 @@ pub fn client_status(e: &anyhow::Error) -> Option<(u16, String)> {
     }
 }
 
-/// Create the store's tables. Registered in the dispatcher's
-/// `run_core_migrations_locked`; idempotent, guarded by the caller's
-/// advisory lock.
-pub async fn migrate(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    sqlx::raw_sql(
+/// The store's schema, applied at boot via
+/// `weft_task_store::schema_guard::apply_groups` alongside every other
+/// module's group.
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "access_grant",
+    tables: &[
+        "access_grant",
+        "access_connect",
+        "access_picker",
+        "access_connect_result",
+        "signal_subscription",
+        "service_events_recipe",
+    ],
+    ddl: &[
         r#"
         CREATE TABLE IF NOT EXISTS access_grant (
             id UUID PRIMARY KEY,
@@ -329,11 +338,8 @@ pub async fn migrate(pool: &sqlx::PgPool) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS signal_subscription_signal
             ON signal_subscription (signal_token);
         "#,
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+    ],
+};
 
 /// Parse a grant row's spec snapshot back into the typed recipe. A
 /// snapshot that no longer parses is a real bug (the spec vocabulary

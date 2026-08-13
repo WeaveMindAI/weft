@@ -1,0 +1,44 @@
+{
+  "type": "LlmModerate",
+  "label": "Moderate",
+  "description": "Content-safety classification through OpenAI's moderation endpoint (free, no usage caps): wire an OpenAIProvider. Emits whether the text flags, which categories, and the per-category scores.",
+  "tags": [
+    "ai",
+    "moderation",
+    "llm"
+  ],
+  "icon": "ShieldAlert",
+  "color": "#7C3AED",
+  "inputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": true,
+      "description": "Wire an OpenAIProvider (moderation is an OpenAI endpoint; the provider's chat model is ignored)."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "label": "Text"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "flagged",
+      "type": "Boolean",
+      "required": false
+    },
+    {
+      "name": "categories",
+      "type": "List[String]",
+      "required": false,
+      "description": "The categories that flagged."
+    },
+    {
+      "name": "scores",
+      "type": "JsonDict",
+      "required": false
+    }
+  ]
+}

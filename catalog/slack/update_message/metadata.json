@@ -1,0 +1,58 @@
+{
+  "type": "SlackUpdateMessage",
+  "label": "Slack: Update Message",
+  "description": "Rewrite a message this app posted earlier (Slack only lets an app edit its own messages). Address it by channel + ts, replace text and/or blocks.",
+  "tags": [
+    "slack",
+    "message",
+    "chat"
+  ],
+  "icon": "Hash",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "chat:write"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the chat:write scope."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "label": "Channel",
+      "placeholder": "The channel id the message lives in"
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": true,
+      "label": "Message ts",
+      "placeholder": "The message's timestamp id (from Send Message)"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": false,
+      "label": "New text"
+    },
+    {
+      "name": "blocks",
+      "type": "List[JsonDict]",
+      "required": false,
+      "label": "New blocks",
+      "description": "Replacement Block Kit blocks. Text and/or blocks must be provided."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "ts",
+      "type": "String",
+      "required": false,
+      "description": "The updated message's timestamp id."
+    }
+  ]
+}

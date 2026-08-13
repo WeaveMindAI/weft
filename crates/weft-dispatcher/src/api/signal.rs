@@ -1050,7 +1050,7 @@ impl TokenScope {
                     s.spec_json, s.access_id, s.consumer_kind, s.tags, s.port_snapshot, \
                     s.consumer_payload, \
                     s.surface_kind, s.mount_path, s.auth_kind, s.auth_config, \
-                    s.kind_state \
+                    s.kind_state, s.kind_state_seq \
              FROM signal s \
              LEFT JOIN project p ON p.id::text = s.project_id \
              WHERE COALESCE(p.fires_visible_to_consumers, FALSE) = TRUE \
@@ -1104,6 +1104,7 @@ impl TokenScope {
                 auth_kind: r.try_get("auth_kind")?,
                 auth_config: r.try_get("auth_config")?,
                 kind_state: r.try_get("kind_state")?,
+                kind_state_seq: r.try_get("kind_state_seq")?,
             });
         }
         Ok(out)
@@ -1539,7 +1540,8 @@ async fn prepare_live_execution(
         project_id: project_id.to_string(),
         entry_node: node_id.to_string(),
         phase: weft_core::context::Phase::Fire,
-        definition_hash: definition_hash.clone(),
+        definition_hash: Some(definition_hash.clone()),
+        node_test: false,
         at_unix: now,
     };
     let kick_events: Vec<weft_journal::ExecEvent> = kicks
@@ -2026,6 +2028,7 @@ mod public_url_tests {
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
+            kind_state_seq: 0,
         }
     }
 
@@ -2194,6 +2197,7 @@ mod can_cancel_tests {
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
+            kind_state_seq: 0,
         }
     }
 

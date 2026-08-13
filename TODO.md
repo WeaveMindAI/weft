@@ -360,6 +360,42 @@ When this flips ON, revisit alongside setup.sh's flag set and the
 image/tag + manifest + project-layout conventions; the migration logic
 lives wherever setup.sh sequences install/upgrade.
 
+## E2e parallelization: one cluster per e2e, keep failed clusters
+
+**Problem.** The e2e suite runs sequentially against ONE shared kind
+cluster, so tests cannot overlap (they share the dispatcher, the
+project namespace pool, the ingress/seaweed ports) and a failing test's
+cluster state is torn down or reused before it can be inspected.
+
+**Direction (agreed shape, not yet designed in detail).**
+- Each e2e gets its OWN kind cluster. The knobs already exist as env
+  vars (`WEFT_CLUSTER_NAME`, `WEFT_INGRESS_PORT`, `WEFT_SEAWEED_PORT`,
+  `WEFT_DISPATCHER_URL`), so a per-test cluster is "pick a unique name
+  + unique ports, export, run"; no code seam needed, the work is in the
+  runner.
+- `run-e2e.sh` grows the same `--parallel [N]` contract as
+  `run-node-tests.sh`: bare = all at once, N = batches of N, outputs
+  buffered per test and printed in suite order, a failure stops after
+  its whole batch (every failure in that batch visible). Realistic
+  batch size is 3-5 (each cluster is a full control plane; RAM/CPU
+  bound).
+- **A failed test's cluster is KEPT for inspection** (named after the
+  test, printed in the failure banner with the kubectl context to poke
+  it and the delete command); passing tests' clusters are deleted as
+  soon as they pass. A sweep must never leave passing clusters behind.
+- Node-test and e2e suites already share nothing (own scratch projects,
+  own build dirs, own cluster projects), so they stay runnable
+  simultaneously; per-e2e clusters only strengthen that.
+
+**Why deferred.** Quentin parked it explicitly ("let's wait for the e2e
+parallelization and having their own cluster after we are done with the
+other stuff") after the node-test `--parallel` work landed. Pick it up
+when he calls for it.
+
+[Update Notice Warning] If we touch `run-e2e.sh`, the e2e harness's
+cluster bootstrap, or the WEFT_CLUSTER_NAME/port env knobs, revisit
+this entry.
+
 ## Project-scoped meta log (observability outside the journal)
 
 Design a per-project log surface for everything that is ABOUT a project
@@ -386,3 +422,87 @@ writes only to the project the signal belongs to), and rate-limiting
 so a chatty loop cannot flood it. Related: "Note Q" above (ephemeral
 journal buffering) and the unified error-surfacing entry; a design
 should look at all three together before building any one of them.
+
+## Delegated end-customer connections (embed weft in someone else's product)
+
+**Problem.** An operator builds a product on top of weft (say a
+sheet-analysis workflow) and serves it to THEIR end customers from
+their own website. Each end customer needs to connect their own
+third-party account (their Google, their Slack) and run the workflow
+against it: pick their sheet, run on their data, on their behalf. The
+access system today has no seam for this: connections belong to the
+tenant who owns the project (the operator), created through the
+editor's connect flow by that tenant. There is no way for the
+operator's website to mint a connection FOR one of its end customers,
+no way to keep two end customers' grants apart inside one project, and
+no way to point a run at "customer X's connection" at fire time.
+
+**Direction (rough, needs a real design pass).**
+- The operator registers their own OAuth app once (that part exists:
+  it is an app entry, the operator's client id/secret).
+- Their website drives a connect flow for a LOGGED-IN end customer:
+  the operator's backend asks weft (server-to-server, operator
+  credential) to mint a consent link scoped to an operator-chosen
+  subject id ("customer-123"); the end customer approves at the
+  provider; the resulting grant lands in weft tagged with that
+  subject, not as an operator-wide connection.
+- Credential custody stays in weft the whole way: the end customer's
+  tokens are held and resolved by weft like any grant, never returned
+  to the operator's backend and never exposed to the end customer's
+  browser, so neither side can exfiltrate the other's credentials.
+  The operator can list/revoke by subject, never read.
+- A run then names its subject (fire-time input or signal payload) and
+  the access resolution picks that subject's grant for the service,
+  instead of "the project's connection". Remote-select pickers (pick a
+  sheet) need the same subject-scoped resolution to work in the
+  operator's embedded UI.
+
+**Requirements.**
+- The subject is an OPAQUE operator-chosen string; weft does not know
+  or care about the operator's user model.
+- Per-subject isolation is enforced by weft, not by operator
+  discipline: a run bound to subject A can never resolve subject B's
+  grant.
+- The existing single-tenant flow stays untouched: a project with no
+  subjects behaves exactly as today (the substitution test says extend
+  the grant concept with an optional subject, not fork a sibling
+  concept).
+
+**Why deferred.** Real design pass across the access store (grant
+shape), the consent flow (embeddable, operator-driven), fire-time
+binding, and the picker path. Surfaced by a real ask from a potential
+operator; recorded so the access system's next design round takes it
+as a first-class use case.
+
+[Update Notice Warning] If we touch the access grant schema, the
+connect/consent flow, or fire-time access resolution, revisit this
+entry.
+
+## Model-list filtering by capability (inference vs embeddings vs rerank)
+
+**Problem.** The provider nodes' `model` input is now a `remote_select`
+fetching the provider's model list (free-typing allowed). The list is
+unfiltered: OpenRouter's `/models` answers every model (chat,
+embedding, rerank alike) with the capability as fields on each item,
+and there is no server-side "only embedding models" parameter. An
+inference provider suggesting embedding models (and the reverse) is
+noise, and today one shared provider node feeds inference, embed,
+rerank, and moderate, so a single model field cannot carry
+per-consumer filters anyway.
+
+**Direction.** Add an optional declarative per-item filter to the
+`remote_select` `list` source (a dotted field path plus an expected or
+contained value, applied store-side while paging, same vocabulary as
+`Lookup`'s label/value paths). Then decide where differently-filtered
+lists live: either the endpoint nodes (LlmEmbed, LlmRerank) get their
+own model input with their own filtered widget, or per-capability
+provider nodes. The filter mechanism is generic (any listing service
+whose items carry a type field); the split question is the real design
+call.
+
+**Why deferred.** The filter needs the split decision to be useful,
+and free-typing already unblocks every model today.
+
+[Update Notice Warning] If we touch the remote_select widget, the
+Lookup shape, or split the LLM provider nodes per capability, revisit
+this entry.

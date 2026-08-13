@@ -105,8 +105,17 @@ async fn register(
             placement_generation: req.placement_generation,
             spec: req.spec,
         },
-        kinds::RoutingSource::Mint {
-            secret_cache: state.secret_cache.clone(),
+        match req.source {
+            crate::protocol::RegisterSource::Fresh { prior_kind_state, prior_seq } => {
+                kinds::RoutingSource::Mint {
+                    secret_cache: state.secret_cache.clone(),
+                    prior_kind_state,
+                    prior_seq,
+                }
+            }
+            crate::protocol::RegisterSource::Restore { routing, kind_state, seq } => {
+                kinds::RoutingSource::Restore { routing, kind_state, seq }
+            }
         },
         state.registry.clone(),
         state.fire_sink.clone(),

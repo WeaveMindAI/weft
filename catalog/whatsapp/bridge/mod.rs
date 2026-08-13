@@ -22,15 +22,22 @@ use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag
 #[derive(NodeManifest)]
 pub struct WhatsAppBridgeNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for WhatsAppBridgeNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn provision_infra(
         &self,
         _ctx: InfraProvisionContext,
         _input: ValueBag,
     ) -> WeftResult<InfraSpec> {
-        // No programmatic inputs today; the bridge is parameterless.
-        // Future: a `device_label` input could be threaded into env.
+        // No programmatic inputs; the bridge is parameterless.
         Ok(InfraSpec {
             units: vec![Unit {
                 name: "bridge".into(),

@@ -14,6 +14,11 @@ weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+# The node-test runner (`test_runner`, behind the `node-tests`
+# feature): argument surface of the per-package test binary and its
+# stderr log wiring. Optional so a worker binary carries none of it.
+clap = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -50,6 +55,10 @@ parking_lot = { workspace = true }
 
 [features]
 test-helpers = []
+# The node-test rig + runner (`test_rig`, `test_runner`): enabled only
+# by the emitted per-package test crate, so a worker binary carries
+# none of it.
+node-tests = ["dep:clap", "dep:tracing-subscriber"]
 
 [dev-dependencies]
 weft-core = { workspace = true, features = ["test-helpers"] }

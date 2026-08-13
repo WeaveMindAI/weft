@@ -1,0 +1,69 @@
+{
+  "type": "GoogleDriveDownload",
+  "label": "Google Drive: Download",
+  "description": "Pull a Drive file into storage. Google-native files (Docs, Sheets, Slides) are exported: Docs/Slides as PDF and Sheets as CSV by default, or any export mime you set.",
+  "tags": [
+    "google",
+    "drive",
+    "file"
+  ],
+  "icon": "Download",
+  "color": "#1FA463",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/drive.file"
+      ],
+      "description": "A Google account that can read the file."
+    },
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": true,
+      "label": "File id"
+    },
+    {
+      "name": "exportFormat",
+      "type": "String",
+      "required": false,
+      "label": "Export as (mime)",
+      "placeholder": "application/pdf",
+      "description": "Only for Google-native files: the export mime type. Empty = PDF for Docs/Slides, CSV for Sheets."
+    },
+    {
+      "name": "keep",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Keep after the run"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "File",
+      "required": false
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

@@ -19,7 +19,6 @@ use sqlx::PgPool;
 use weft_access_store::{
     begin_oauth, complete_oauth, connect_direct, delete_grant, list_grants, lookup,
     resolve_for_worker, take_connect_result, AccessError, BeginOAuth, ConnectDirect,
-    LookupRequest,
 };
 use weft_core::access::spec::Door;
 use weft_core::{AccessSpec, AppRegistration, CredentialOwner};
@@ -110,8 +109,9 @@ impl FakeProvider {
             )
             .route(
                 "/channels",
-                get(|State(s): State<Arc<FakeProvider>>, Query(q): Query<BTreeMap<String, String>>| async move {
-                    s.calls.lock().unwrap().push(format!("/channels {q:?}"));
+                get(|State(s): State<Arc<FakeProvider>>, headers: axum::http::HeaderMap, Query(q): Query<BTreeMap<String, String>>| async move {
+                    let auth = if headers.contains_key("authorization") { "authed" } else { "bare" };
+                    s.calls.lock().unwrap().push(format!("/channels {auth} {q:?}"));
                     let page2 = q.get("cursor").map(String::as_str) == Some("next-1");
                     let items = if page2 {
                         json!([{ "id": "C3", "name": "three" }])
@@ -239,7 +239,7 @@ async fn full_consent(
 /// through an app.
 #[sqlx::test]
 async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let mut spec = oauth_spec(&base, "coexisting");
@@ -305,7 +305,7 @@ async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: PgPo
 
 #[sqlx::test]
 async fn static_connect_runs_the_test_call_and_stores_identity(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
 
@@ -354,7 +354,7 @@ async fn static_connect_runs_the_test_call_and_stores_identity(pool: PgPool) {
 
 #[sqlx::test]
 async fn the_tenant_wall_holds_on_every_surface(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let done = connect_direct(
@@ -375,26 +375,11 @@ async fn the_tenant_wall_holds_on_every_surface(pool: PgPool) {
     .unwrap();
     let id = done.grant.id;
 
-    // Another tenant cannot list, resolve, look up, or delete the
-    // grant; resolution answers NOT FOUND (no existence leak).
+    // Another tenant cannot list, resolve, or delete the grant;
+    // resolution answers NOT FOUND (no existence leak). A lookup
+    // starts from that same resolve, so the wall covers it too.
     assert!(list_grants(&pool, TENANT_B, None).await.unwrap().is_empty());
     let err = resolve_for_worker(&pool, TENANT_B, id, "fakestatic", &[], &[]).await.unwrap_err();
-    assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)), "{err}");
-    let lookup_spec: weft_core::node::Lookup = serde_json::from_value(json!({
-        "get": format!("{base}/channels?q={{query}}"),
-        "items": "channels", "label": "name", "value": "id"
-    }))
-    .unwrap();
-    let err = lookup(&pool, TENANT_B, &LookupRequest {
-        access_id: id,
-        service: "fakestatic".into(),
-        lookup: lookup_spec.clone(),
-        query: String::new(),
-        parents: BTreeMap::new(),
-        cursor: None,
-    })
-    .await
-    .unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)), "{err}");
     assert!(delete_grant(&pool, TENANT_B, id).await.is_err());
 
@@ -418,7 +403,7 @@ async fn the_tenant_wall_holds_on_every_surface(pool: PgPool) {
 
 #[sqlx::test]
 async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "coexisting");
@@ -485,7 +470,7 @@ async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool
 
 #[sqlx::test]
 async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "exclusive");
@@ -577,7 +562,7 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool)
 
 #[sqlx::test]
 async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "coexisting");
@@ -630,7 +615,7 @@ async fn refresh_is_lazy_single_flight_and_writes_back_rotated_tokens(pool: PgPo
 /// token back, and the answer's expires_in sets the next expiry.
 #[sqlx::test]
 async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let mut spec = oauth_spec(&base, "coexisting");
@@ -681,7 +666,7 @@ async fn a_declared_renewal_call_replaces_the_standard_refresh(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "coexisting");
@@ -701,7 +686,7 @@ async fn a_revoked_refresh_fails_loud_with_the_reconnect_affordance(pool: PgPool
 
 #[sqlx::test]
 async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let done = connect_direct(
@@ -729,38 +714,41 @@ async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
     .unwrap();
     let parents: BTreeMap<String, String> =
         [("team".to_string(), "T1".to_string())].into_iter().collect();
-    let page = lookup(&pool, TENANT_A, &LookupRequest {
-        access_id: done.grant.id,
-        service: "fakestatic".into(),
-        lookup: lookup_spec.clone(),
-        query: "gen".into(),
-        parents: parents.clone(),
-        cursor: None,
-    })
-    .await
-    .unwrap();
+    let resolved =
+        resolve_for_worker(&pool, TENANT_A, done.grant.id, "fakestatic", &[], &[]).await.unwrap();
+    let url = weft_access_store::lookup_url(&lookup_spec, "gen", &parents).unwrap();
+    let page = lookup(Some(&resolved), &lookup_spec, None, &url).await.unwrap();
     assert_eq!(page.items.len(), 2);
     assert_eq!(page.items[0].id, "C1");
     assert_eq!(page.items[0].label, "one");
     assert_eq!(page.next_cursor.as_deref(), Some("next-1"));
 
-    let page2 = lookup(&pool, TENANT_A, &LookupRequest {
-        access_id: done.grant.id,
-        service: "fakestatic".into(),
-        lookup: lookup_spec.clone(),
-        query: "gen".into(),
-        parents: parents.clone(),
-        cursor: page.next_cursor.clone(),
-    })
-    .await
-    .unwrap();
+    let page2 =
+        lookup(Some(&resolved), &lookup_spec, page.next_cursor.as_deref(), &url).await.unwrap();
     assert_eq!(page2.items.len(), 1);
     assert_eq!(page2.next_cursor, None, "an empty cursor ends the pages");
 
     // Substitution really happened, and the call was authenticated.
     let calls = fake.calls.lock().unwrap().clone();
     let ch = calls.iter().find(|c| c.starts_with("/channels")).unwrap();
+    assert!(ch.contains("authed"), "a signed lookup must carry auth: {ch}");
     assert!(ch.contains("\"q\": \"gen\"") && ch.contains("\"team\": \"T1\""), "{ch}");
+
+    // A `public` lookup runs with no access at all: the same URL
+    // machinery, a BARE client (the whole point: assert the call
+    // arrived with no auth header).
+    let public_spec: weft_core::node::Lookup = serde_json::from_value(json!({
+        "get": format!("{base}/channels?q={{query}}"),
+        "items": "channels", "label": "name", "value": "id",
+        "public": true
+    }))
+    .unwrap();
+    let url = weft_access_store::lookup_url(&public_spec, "pub", &BTreeMap::new()).unwrap();
+    let page = lookup(None, &public_spec, None, &url).await.unwrap();
+    assert_eq!(page.items.len(), 2);
+    let calls = fake.calls.lock().unwrap().clone();
+    let public_call = calls.iter().find(|c| c.contains("\"q\": \"pub\"")).unwrap();
+    assert!(public_call.contains("bare"), "a public lookup must not sign: {public_call}");
 
     // An unknown parent placeholder is loud, never a literal brace
     // sent upstream.
@@ -769,16 +757,7 @@ async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
         "items": "channels", "label": "name", "value": "id"
     }))
     .unwrap();
-    let err = lookup(&pool, TENANT_A, &LookupRequest {
-        access_id: done.grant.id,
-        service: "fakestatic".into(),
-        lookup: bad,
-        query: String::new(),
-        parents: BTreeMap::new(),
-        cursor: None,
-    })
-    .await
-    .unwrap_err();
+    let err = weft_access_store::lookup_url(&bad, "", &BTreeMap::new()).unwrap_err();
     assert!(err.to_string().contains("nope"), "{err}");
 }
 
@@ -788,7 +767,7 @@ async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
 /// `ours` owner every cost record will carry.
 #[sqlx::test]
 async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let mut spec = static_spec(&base);
@@ -845,7 +824,7 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: PgPool) {
 /// whatever a consumer requires (nobody actually knows what it holds).
 #[sqlx::test]
 async fn a_claimed_shortfall_is_let_through_at_resolution(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let done = connect_direct(
@@ -884,7 +863,7 @@ async fn a_claimed_shortfall_is_let_through_at_resolution(pool: PgPool) {
 /// (the worker-handoff filter would drop a captured list).
 #[sqlx::test]
 async fn granted_items_read_the_stored_list_behind_the_wall(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let mut spec = static_spec(&base);
@@ -1003,7 +982,7 @@ fn events_spec(base: &str) -> AccessSpec {
 /// through the app that made it (the client_id containment pin).
 #[sqlx::test]
 async fn a_connect_records_the_provider_account_for_event_routing(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = events_spec(&base);
@@ -1053,7 +1032,7 @@ async fn a_connect_records_the_provider_account_for_event_routing(pool: PgPool) 
 /// one spec records can never answer for another spec's connections.
 #[sqlx::test]
 async fn a_push_routes_only_to_connections_carrying_the_verifying_recipe(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
 
@@ -1110,7 +1089,7 @@ async fn a_push_routes_only_to_connections_carrying_the_verifying_recipe(pool: P
 /// at the provider and forgets the row.
 #[sqlx::test]
 async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = events_spec(&base);
@@ -1209,7 +1188,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
 /// deliver.
 #[sqlx::test]
 async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = events_spec(&base);
@@ -1243,7 +1222,7 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool
 /// topic is refused by its own topic lookup, not here.
 #[sqlx::test]
 async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let done = connect_direct(
@@ -1280,7 +1259,7 @@ async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: PgPool) {
 /// APP-WIDE socket and hear every other install's events.
 #[sqlx::test]
 async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
 
@@ -1357,7 +1336,7 @@ async fn a_shared_door_grant_never_serves_events_with_the_operators_app_values(p
 /// resolution hands over, and the door split on app values.
 #[sqlx::test]
 async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "coexisting");
@@ -1429,7 +1408,7 @@ async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Pg
 /// refused at resolution naming the missing value.
 #[sqlx::test]
 async fn optional_field_groups_gate_what_a_connection_can_do(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec: AccessSpec = serde_json::from_value(json!({
@@ -1538,7 +1517,7 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: PgPool) {
 /// shortfall check (which reads the summary's scopes) sees them.
 #[sqlx::test]
 async fn a_finished_pick_lands_its_grants_on_the_row(pool: PgPool) {
-    weft_access_store::migrate(&pool).await.unwrap();
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
 

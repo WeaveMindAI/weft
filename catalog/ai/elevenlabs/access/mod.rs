@@ -3,4 +3,4 @@
 //! nodes open it at call time. The service name lives once, in
 //! metadata.json.
 
-weft::access_node!(ElevenLabsAccessNode, "connection");
+weft::access_node!(ElevenLabsAccessNode);

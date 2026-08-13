@@ -38,6 +38,16 @@ pub fn bytes_stream(bytes: bytes::Bytes) -> ByteStream {
     Box::pin(futures::stream::once(async move { Ok(bytes) }))
 }
 
+/// Wrap an HTTP response body as a [`ByteStream`], so a node can pipe
+/// an authenticated download straight into `StorageHandle::put_stream`
+/// without buffering it (the connection-client twin of
+/// `put_from_url`, which only covers unauthenticated fetches).
+#[cfg(feature = "runtime")]
+pub fn response_stream(resp: reqwest::Response) -> ByteStream {
+    use futures::StreamExt;
+    Box::pin(resp.bytes_stream().map(|chunk| chunk.map_err(std::io::Error::other)))
+}
+
 /// Extension -> mime guess for a name/URL with no served Content-Type (an
 /// asset ref at compile time, a pasted URL). Display + marker-kind selection
 /// only: whenever real bytes are fetched, the response's own Content-Type is
@@ -553,9 +563,9 @@ pub struct PresignRequest {
 }
 
 /// `POST /v1/storage/public-link`: mint a temporary URL the OPEN
-/// INTERNET can fetch the file from. `url: None` = this deployment
-/// cannot serve one (private store, no public relay); the caller falls
-/// back to inline bytes. Same request shape as presign.
+/// INTERNET can fetch the file from. `url: None` = no publicly
+/// addressable store and no public relay, so no such URL exists; the
+/// caller falls back to inline bytes. Same request shape as presign.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicLinkResponse {
     pub url: Option<String>,

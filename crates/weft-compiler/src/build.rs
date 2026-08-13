@@ -10,6 +10,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::codegen;
 use crate::error::{CompileError, CompileResult};
 use crate::project::Project;
@@ -17,27 +19,24 @@ use crate::validate::ValidationMode;
 use crate::worker_image;
 use weft_catalog::FsCatalog;
 
-/// Build-phase artifact. The host never holds a compiled binary
-/// (cargo runs inside the builder container). What we return is
-/// the staged docker build context + metadata the CLI uses to
-/// call `docker build` and surface package info to the user.
-pub struct BuildResult {
-    /// Absolute path to the docker build context the CLI should
-    /// feed to `docker build`. Contains `Dockerfile`, `build/`
-    /// (the generated cargo crate), and, when the pre-built builder
-    /// base is not in play, `weft/` (the worker-linked slice of the
-    /// weft workspace, see `stage_worker_workspace`).
+/// One staged docker image build, whichever binary it compiles (the
+/// project's worker or a package's node-test runner). The host never
+/// holds a compiled binary (cargo runs inside the docker build); what
+/// a build hands back is the staged context plus the content hash
+/// that NAMES the image, so the caller can build it or recognize it
+/// as already present.
+pub struct StagedImageBuild {
+    /// Absolute path to the docker build context. Contains
+    /// `Dockerfile`, `build/` (the generated cargo crate), and, when
+    /// the pre-built builder base is not in play, `weft/` (the
+    /// worker-linked slice of the weft workspace, see
+    /// `stage_worker_workspace`).
     pub build_context: PathBuf,
-    /// Path to the generated Dockerfile inside the build context.
-    /// Convenience for CLI callers that pass `-f` explicitly.
-    pub dockerfile: PathBuf,
-    /// Node types this project references, for CLI diagnostics.
-    pub referenced_nodes: BTreeSet<String>,
-    /// Summary of the generated Dockerfile for user-facing logs.
-    pub dockerfile_summary: worker_image::WorkerDockerfile,
-    /// Sanitized crate name; the CLI uses this to tag the worker
-    /// image and to know what binary path the Dockerfile produces.
-    pub binary_name: String,
+    /// Content hash naming the image: the binary hash for a worker
+    /// build ([`crate::hash::compute_binary_hash`]), the node-test
+    /// hash for a test build
+    /// ([`crate::hash::compute_node_test_hash`]).
+    pub content_hash: String,
 }
 
 /// Validate + codegen + stage from an ALREADY-COMPILED definition. Pipeline:
@@ -77,7 +76,7 @@ pub fn build_project(
     catalog: &FsCatalog,
     _release: bool,
     builder_base_tag: &str,
-) -> CompileResult<BuildResult> {
+) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     crate::bail_on_errors(crate::validate::validate_with_mode(
         definition,
@@ -116,6 +115,7 @@ pub fn build_project(
     // tarball for the docker build).
     let stage_weft = dockerfile_summary.builder_base.is_none();
     let build_context = stage_build_context(
+        &project_root.join(".weft").join("target").join("worker-image"),
         project_root,
         &crate_root,
         &weft_root,
@@ -125,13 +125,11 @@ pub fn build_project(
         stage_weft,
     )?;
 
-    Ok(BuildResult {
-        build_context,
-        dockerfile: dockerfile_path,
-        referenced_nodes,
-        dockerfile_summary,
-        binary_name,
-    })
+    let content_hash =
+        crate::hash::compute_binary_hash(definition, project, &weft_root, catalog)
+            .map_err(|e| CompileError::Build(format!("compute binary hash: {e}")))?;
+
+    Ok(StagedImageBuild { build_context, content_hash })
 }
 
 /// Stage the docker build context under
@@ -160,7 +158,9 @@ pub fn build_project(
 /// walker (discovery) and nothing for a second walker to disagree
 /// with (e.g. on symlink handling). Unreferenced nodes never enter the
 /// build context.
+#[allow(clippy::too_many_arguments)]
 fn stage_build_context(
+    ctx: &Path,
     project_root: &Path,
     crate_root: &Path,
     weft_root: &Path,
@@ -169,7 +169,7 @@ fn stage_build_context(
     referenced_nodes: &BTreeSet<String>,
     stage_weft: bool,
 ) -> CompileResult<PathBuf> {
-    let ctx = project_root.join(".weft").join("target").join("worker-image");
+    let ctx = ctx.to_path_buf();
     if ctx.exists() {
         std::fs::remove_dir_all(&ctx).map_err(CompileError::Io)?;
     }
@@ -212,6 +212,112 @@ fn stage_build_context(
     }
 
     Ok(ctx)
+}
+
+/// The bare content-addressed node-test image tag,
+/// `weft-node-tests:<test_hash>`. Single source of truth shared by the
+/// CLI (build + load) and whoever spawns the test pod, like
+/// [`worker_image_tag`].
+pub const NODE_TEST_IMAGE_REPO: &str = "weft-node-tests";
+
+pub fn node_test_image_tag(test_hash: &str) -> String {
+    format!("{NODE_TEST_IMAGE_REPO}:{test_hash}")
+}
+
+/// Emit + stage the per-package node-test IMAGE build. The image-bound
+/// twin of the local test build: same emitted crate shape
+/// ([`codegen::emit_test_crate`]) with container mount paths, the same
+/// multi-stage Dockerfile machinery as the worker (`worker_image::emit`
+/// with the package's own node set, so the package's system deps land
+/// in the image), the same context staging. Needs only the catalog:
+/// no project parse, no validation of other packages.
+pub fn build_test_artifact(
+    project: &Project,
+    catalog: &FsCatalog,
+    package_name: &str,
+    builder_base_tag: &str,
+) -> CompileResult<StagedImageBuild> {
+    let project_root = project.root.as_path();
+    let weft_root = resolve_weft_root()?;
+
+    // Every staged path is per-package (crate root, Dockerfile,
+    // context): a project's packages build test images side by side,
+    // so a shared path would have one package's staging clobber
+    // another's mid-build.
+    let stem = sanitize_crate_name(package_name);
+    let crate_root = project_root
+        .join(".weft")
+        .join("target")
+        .join("test-build")
+        .join(&stem);
+    let test_crate = codegen::emit_test_crate(
+        &crate_root,
+        catalog,
+        package_name,
+        &codegen::EmitPaths::Container { nodes_root: project_root.join("nodes") },
+    )?;
+
+    let referenced: BTreeSet<String> = test_crate.node_types.iter().cloned().collect();
+    let dockerfile_summary = worker_image::emit(
+        &project.manifest.build.worker,
+        project_root,
+        catalog,
+        &referenced,
+        &test_crate.binary_name,
+        builder_base_tag,
+    )?;
+    let dockerfile_path = project_root
+        .join(".weft")
+        .join("target")
+        .join(format!("Dockerfile.node-tests.{stem}"));
+    if let Some(parent) = dockerfile_path.parent() {
+        std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
+    }
+    std::fs::write(&dockerfile_path, &dockerfile_summary.body).map_err(CompileError::Io)?;
+
+    let stage_weft = dockerfile_summary.builder_base.is_none();
+    let build_context = stage_build_context(
+        &project_root
+            .join(".weft")
+            .join("target")
+            .join("test-image")
+            .join(&stem),
+        project_root,
+        &test_crate.crate_root,
+        &weft_root,
+        &dockerfile_path,
+        catalog,
+        &referenced,
+        stage_weft,
+    )?;
+
+    let content_hash = node_test_content_hash(project, catalog, package_name)?;
+
+    Ok(StagedImageBuild { build_context, content_hash })
+}
+
+/// The content hash naming a package's node-test build. One function
+/// answers both consumers: the test-image tag (`build_test_artifact`)
+/// and `weft node-test-hash`, whose printed value a scripted runner
+/// records to skip re-running a package's already-passed live tests.
+/// Covers the package's own files, the image recipe, the full catalog
+/// type registry (a sibling's type edit changes this package's test
+/// binary), and the worker build environment.
+pub fn node_test_content_hash(
+    project: &Project,
+    catalog: &FsCatalog,
+    package_name: &str,
+) -> CompileResult<crate::hash::SourceHash> {
+    let weft_root = resolve_weft_root()?;
+    let package_root = catalog
+        .packages()
+        .find(|p| p.name == package_name)
+        .map(|p| p.root.clone())
+        .ok_or_else(|| {
+            CompileError::Build(format!("no package named '{package_name}' in this project's nodes/"))
+        })?;
+    crate::hash::compute_node_test_hash(&package_root, project, &weft_root, catalog)
+        .map_err(|e| CompileError::Build(format!("compute node-test hash: {e}")))
 }
 
 /// Top-level entries of a closure crate that enter the worker slice:
@@ -491,9 +597,12 @@ pub fn worker_image_tag(binary_hash: &str) -> String {
     format!("{WORKER_IMAGE_REPO}:{binary_hash}")
 }
 
-/// Sanitize a project name to a valid cargo crate + binary name.
-/// Used by both codegen and the CLI so the two agree on what
-/// binary the Dockerfile produces.
+/// Sanitize a project/package name to a valid cargo crate + binary
+/// name. Used by both codegen and the CLI so the two agree on what
+/// binary the Dockerfile produces. Collision-free by construction: a
+/// LOSSY sanitization (any character was replaced or prepended)
+/// appends a short digest of the raw name, so `my-pkg` and `my.pkg`
+/// can never sanitize to the same crate, directory, or binary name.
 pub fn sanitize_crate_name(raw: &str) -> String {
     let lowered = raw.to_ascii_lowercase();
     let mut out = String::with_capacity(lowered.len());
@@ -507,7 +616,97 @@ pub fn sanitize_crate_name(raw: &str) -> String {
     if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit()) {
         out.insert(0, 'p');
     }
+    // Lossiness is judged against the RAW name: lowercasing is itself
+    // lossy (`Slack` and `slack` must never land on the same crate,
+    // directory, staging path, and image tag), so comparing against
+    // the lowered form would miss exactly the case-only collisions.
+    if out != raw {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(raw.as_bytes());
+        out.push('_');
+        for b in digest.iter().take(8) {
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
     out
+}
+
+/// Emit + cargo-build one package's node-test binary on the host and
+/// return the built artifact's path. `build_root` is the caller's
+/// dedicated test-build directory (`.weft/target/test/` for a
+/// project): the emitted crates live under `crates/` and the shared
+/// cargo cache under a SIBLING `target/`, so no package name (not
+/// even "target") can ever land on top of the cache, and every
+/// package built under one `build_root` reuses it (the engine
+/// compiles once and stays cached across packages and runs). The
+/// artifact path is read from cargo's
+/// `--message-format=json-render-diagnostics` output, never guessed
+/// (a configured default target triple or profile would move it);
+/// the rendered diagnostics still stream to the terminal via stderr.
+pub fn build_node_test_binary(
+    catalog: &FsCatalog,
+    package: &str,
+    build_root: &Path,
+) -> CompileResult<PathBuf> {
+    let weft_root = resolve_weft_root()?;
+    let crate_root = build_root.join("crates").join(sanitize_crate_name(package));
+    let test_crate = codegen::emit_test_crate(
+        &crate_root,
+        catalog,
+        package,
+        &codegen::EmitPaths::Local { weft_root },
+    )
+    .map_err(|e| CompileError::Build(format!("emit test crate for '{package}': {e}")))?;
+
+    let target_dir = build_root.join("target");
+    eprintln!("building tests for package '{package}'...");
+    let out = std::process::Command::new("cargo")
+        .args(["build", "--message-format=json-render-diagnostics"])
+        .current_dir(&test_crate.crate_root)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| {
+            CompileError::Build(format!(
+                "run cargo (is a Rust toolchain installed? local test runs compile \
+                 on the host): {e}"
+            ))
+        })?;
+    if !out.status.success() {
+        return Err(CompileError::Build(format!(
+            "test build for package '{package}' failed (see cargo's output above)"
+        )));
+    }
+    #[derive(Deserialize)]
+    struct CargoMessage {
+        reason: String,
+        #[serde(default)]
+        executable: Option<PathBuf>,
+        #[serde(default)]
+        target: Option<CargoTarget>,
+    }
+    #[derive(Deserialize)]
+    struct CargoTarget {
+        name: String,
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Cargo names targets with `-`; the crate name uses `_`.
+    let want = test_crate.binary_name.replace('_', "-");
+    let executable = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<CargoMessage>(l).ok())
+        .filter(|m| m.reason == "compiler-artifact")
+        .find_map(|m| {
+            let name = m.target.as_ref()?.name.clone();
+            (name == test_crate.binary_name || name == want).then_some(m.executable)?
+        });
+    executable.ok_or_else(|| {
+        CompileError::Build(format!(
+            "cargo built package '{package}' but reported no executable named \
+             '{}'; the emitted test crate's binary target is missing",
+            test_crate.binary_name
+        ))
+    })
 }
 
 /// Build the catalog for a project: discover every node under its
@@ -517,4 +716,32 @@ pub fn sanitize_crate_name(raw: &str) -> String {
 pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
     FsCatalog::discover(&project_root.join("nodes"))
         .map_err(|e| CompileError::Enrich(format!("catalog: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_crate_name;
+
+    /// The names cargo/docker/staging key on must never collide: every
+    /// pair that differs only by case, punctuation, or the lossy `_`
+    /// replacement has to sanitize to DIFFERENT names.
+    #[test]
+    fn sanitize_crate_name_is_collision_free() {
+        for (a, b) in [("slack", "Slack"), ("my-pkg", "my.pkg"), ("my-pkg", "my_pkg")] {
+            assert_ne!(
+                sanitize_crate_name(a),
+                sanitize_crate_name(b),
+                "'{a}' and '{b}' must sanitize apart"
+            );
+        }
+        // A lossless name stays bare (no digest suffix).
+        assert_eq!(sanitize_crate_name("slack"), "slack");
+        assert_eq!(sanitize_crate_name("my_pkg"), "my_pkg");
+        // The empty and digit-leading paths get the `p` prefix, count
+        // as lossy, and stay distinct from names that already look
+        // like their prefixed form.
+        assert!(sanitize_crate_name("").starts_with("p_"));
+        assert!(sanitize_crate_name("1pkg").starts_with("p1pkg_"));
+        assert_ne!(sanitize_crate_name("1pkg"), sanitize_crate_name("p1pkg"));
+    }
 }

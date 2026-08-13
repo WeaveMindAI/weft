@@ -70,6 +70,12 @@ struct Inner {
     /// no reason (running / not waiting). Seeded by tests via
     /// `set_pod_waiting_reason`.
     pod_waiting_reasons: HashMap<(String, String), String>,
+    /// Per-(namespace, pod_name) pod phase, seeded via `set_pod_phase`.
+    /// Absent = pod not visible (`pod_phase` answers `None`).
+    pod_phases: HashMap<(String, String), String>,
+    /// Per-(namespace, pod_name) pod logs, seeded via `set_pod_logs`.
+    /// Absent = `pod_logs` errors ("no logs").
+    pod_logs: HashMap<(String, String), String>,
     /// When > 0, the next N `apply` / `apply_yaml` calls return an
     /// error (still recorded in the log). Lets tests exercise the
     /// apply-failure branch. Decremented per failed call.
@@ -112,6 +118,22 @@ impl FakeKube {
             (namespace.to_string(), pod_name.to_string()),
             reason.to_string(),
         );
+    }
+
+    /// Seed a pod's `status.phase` for `pod_phase`.
+    pub fn set_pod_phase(&self, namespace: &str, pod_name: &str, phase: &str) {
+        self.inner
+            .lock()
+            .pod_phases
+            .insert((namespace.to_string(), pod_name.to_string()), phase.to_string());
+    }
+
+    /// Seed a pod's logs for `pod_logs`.
+    pub fn set_pod_logs(&self, namespace: &str, pod_name: &str, logs: &str) {
+        self.inner
+            .lock()
+            .pod_logs
+            .insert((namespace.to_string(), pod_name.to_string()), logs.to_string());
     }
 
     /// Make the next `apply` / `apply_yaml` return an error (still
@@ -243,6 +265,24 @@ impl KubeReader for FakeKube {
             .pod_waiting_reasons
             .get(&(namespace.to_string(), pod_name.to_string()))
             .cloned())
+    }
+
+    async fn pod_phase(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .pod_phases
+            .get(&(namespace.to_string(), pod_name.to_string()))
+            .cloned())
+    }
+
+    async fn pod_logs(&self, namespace: &str, pod_name: &str, _container: &str) -> Result<String> {
+        self.inner
+            .lock()
+            .pod_logs
+            .get(&(namespace.to_string(), pod_name.to_string()))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no logs seeded for {namespace}/{pod_name}"))
     }
 }
 

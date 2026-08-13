@@ -17,8 +17,16 @@ use weft::node::NodeOutput;
 #[derive(NodeManifest)]
 pub struct RangeNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for RangeNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // `from`/`step` declare metadata defaults, so the bag always
         // holds values; required reads keep each default in ONE place.

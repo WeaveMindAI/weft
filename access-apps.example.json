@@ -40,7 +40,16 @@
       "covers": [
         "chat:write",
         "channels:read",
-        "channels:history"
+        "channels:history",
+        "groups:read",
+        "groups:history",
+        "im:write",
+        "reactions:read",
+        "reactions:write",
+        "files:read",
+        "files:write",
+        "users:read",
+        "users:read.email"
       ],
       "auth_url": "https://slack.com/oauth/v2/authorize",
       "token_url": "https://slack.com/api/oauth.v2.access",
@@ -49,38 +58,101 @@
       "events": {
         "signing_secret": "REPLACE_WITH_SLACK_SIGNING_SECRET"
       },
-      "_setup_events": "For event triggers via pushes: under Event Subscriptions, enable events, set the Request URL to <your public weft>/events/slack/messages, subscribe the bot to message.channels, and copy the Signing Secret (Basic Information) here.",
+      "_setup_events": "For event triggers via pushes: under Event Subscriptions, enable events, set the Request URL to <your public weft>/events/slack/messages, subscribe the bot to message.channels (plus reaction_added/reaction_removed and file_shared for those triggers), and copy the Signing Secret (Basic Information) here. For button approvals (Slack: Await Action), also enable Interactivity and set its Request URL to <your public weft>/events/slack/interactions.",
       "kind": "oauth_app"
     }
   ],
   "google": [
     {
-      "_setup": "console.cloud.google.com -> APIs & Services -> Credentials -> Create OAuth client ID (Web application), enable the Drive API, add the callback URL as an Authorized redirect URI.",
-      "label": "Google Drive",
+      "_setup": "Uses ONE OAuth client in your Google Cloud project. Enable each API a listed app touches (Drive, Sheets, Docs, Calendar, Gmail), add the callback URL as an Authorized redirect URI, and add every scope any app's `covers` lists to the OAuth consent screen. Google grants are project-wide, so these apps share one client id; each only REQUESTS its own `covers`, so the consent screen shows just that app's scopes.",
+      "label": "Google (all)",
       "covers": [
-        "https://www.googleapis.com/auth/drive.file"
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/documents",
+        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.modify"
       ],
       "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
       "token_url": "https://oauth2.googleapis.com/token",
       "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
       "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET",
       "events": {},
-      "_setup_events": "Drive watch channels are pushed straight to weft, but Google only pushes to DOMAINS VERIFIED in this app's console: verify your weft's public domain there first.",
-      "kind": "oauth_app"
+      "kind": "oauth_app",
+      "_setup_events": "Drive watch channels are pushed straight to weft, but Google only pushes to DOMAINS VERIFIED in this app's console: verify your weft's public domain there first."
     },
     {
-      "_setup": "The same console; a second client kept broad. Google classes drive.readonly as restricted (review + audit), which is exactly why it is a SEPARATE app: the narrow one above ships without review.",
-      "label": "Google Drive (full read)",
+      "_setup": "Uses ONE OAuth client in your Google Cloud project. Enable each API a listed app touches (Drive, Sheets, Docs, Calendar, Gmail), add the callback URL as an Authorized redirect URI, and add every scope any app's `covers` lists to the OAuth consent screen. Google grants are project-wide, so these apps share one client id; each only REQUESTS its own `covers`, so the consent screen shows just that app's scopes.",
+      "label": "Google Drive",
       "covers": [
         "https://www.googleapis.com/auth/drive.file",
         "https://www.googleapis.com/auth/drive.readonly"
       ],
       "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
       "token_url": "https://oauth2.googleapis.com/token",
-      "client_id": "REPLACE_WITH_GOOGLE_FULL_READ_CLIENT_ID",
-      "client_secret": "REPLACE_WITH_GOOGLE_FULL_READ_CLIENT_SECRET",
+      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET",
       "events": {},
-      "_setup_events": "Drive watch channels are pushed straight to weft, but Google only pushes to DOMAINS VERIFIED in this app's console: verify your weft's public domain there first.",
+      "kind": "oauth_app"
+    },
+    {
+      "_setup": "Uses ONE OAuth client in your Google Cloud project. Enable each API a listed app touches (Drive, Sheets, Docs, Calendar, Gmail), add the callback URL as an Authorized redirect URI, and add every scope any app's `covers` lists to the OAuth consent screen. Google grants are project-wide, so these apps share one client id; each only REQUESTS its own `covers`, so the consent screen shows just that app's scopes.",
+      "label": "Google Sheets",
+      "covers": [
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/drive.readonly",
+        "https://www.googleapis.com/auth/spreadsheets"
+      ],
+      "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET",
+      "events": {},
+      "kind": "oauth_app"
+    },
+    {
+      "_setup": "Uses ONE OAuth client in your Google Cloud project. Enable each API a listed app touches (Drive, Sheets, Docs, Calendar, Gmail), add the callback URL as an Authorized redirect URI, and add every scope any app's `covers` lists to the OAuth consent screen. Google grants are project-wide, so these apps share one client id; each only REQUESTS its own `covers`, so the consent screen shows just that app's scopes.",
+      "label": "Google Docs",
+      "covers": [
+        "https://www.googleapis.com/auth/drive.file",
+        "https://www.googleapis.com/auth/documents"
+      ],
+      "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET",
+      "events": {},
+      "kind": "oauth_app"
+    },
+    {
+      "_setup": "Uses ONE OAuth client in your Google Cloud project. Enable each API a listed app touches (Drive, Sheets, Docs, Calendar, Gmail), add the callback URL as an Authorized redirect URI, and add every scope any app's `covers` lists to the OAuth consent screen. Google grants are project-wide, so these apps share one client id; each only REQUESTS its own `covers`, so the consent screen shows just that app's scopes.",
+      "label": "Google Calendar",
+      "covers": [
+        "https://www.googleapis.com/auth/calendar.events"
+      ],
+      "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET",
+      "events": {},
+      "kind": "oauth_app"
+    },
+    {
+      "_setup": "Uses ONE OAuth client in your Google Cloud project. Enable each API a listed app touches (Drive, Sheets, Docs, Calendar, Gmail), add the callback URL as an Authorized redirect URI, and add every scope any app's `covers` lists to the OAuth consent screen. Google grants are project-wide, so these apps share one client id; each only REQUESTS its own `covers`, so the consent screen shows just that app's scopes.",
+      "label": "Gmail",
+      "covers": [
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.modify"
+      ],
+      "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "client_id": "REPLACE_WITH_GOOGLE_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_GOOGLE_CLIENT_SECRET",
+      "events": {},
       "kind": "oauth_app"
     }
   ],
@@ -96,6 +168,30 @@
       "kind": "api_key",
       "label": "Runtime key",
       "key": "sk_..."
+    }
+  ],
+  "exa": [
+    {
+      "_setup": "dashboard.exa.ai -> API Keys. Serves the Web Search node's shared door.",
+      "kind": "api_key",
+      "label": "Runtime key",
+      "key": "REPLACE_WITH_EXA_KEY"
+    }
+  ],
+  "firecrawl": [
+    {
+      "_setup": "firecrawl.dev -> app -> API Keys. Serves the Fetch Page / Crawl Site shared door.",
+      "kind": "api_key",
+      "label": "Runtime key",
+      "key": "fc-REPLACE"
+    }
+  ],
+  "mistral": [
+    {
+      "_setup": "console.mistral.ai -> API Keys. Serves the Parse Document (OCR) shared door.",
+      "kind": "api_key",
+      "label": "Runtime key",
+      "key": "REPLACE_WITH_MISTRAL_KEY"
     }
   ]
 }

@@ -79,18 +79,24 @@ It starts two small pieces inside your local weft cluster:
   - `/signal/...`: the per-signal fire links weft mints, each
     protected by its own unguessable token.
 
-  Everything else (your projects, executions, files, settings)
-  answers "not found". The tunnel cannot be used to browse or operate
-  your weft.
+  The bare root shows a small weft page; everything else (your
+  projects, executions, files, settings) answers "not found". The
+  tunnel cannot be used to browse or operate your weft.
 
 The address is printed when the install finishes, and
 `weft daemon status` prints it any time after.
 
 Two honest caveats:
 
-- The address is **random and changes when the tunnel restarts**. If
-  it does (a reboot, a cluster restart), run `./setup.sh --public-url`
-  again so active triggers are re-pointed at the new address.
+- The address is **random and changes when the tunnel reconnects**
+  (a reboot, a cluster restart, even a dropped connection). Anything
+  registered against the old address at a provider (Slack's event
+  request URL, an OAuth redirect URL) stops working until you
+  re-register it. If that happens, run `./setup.sh --public-url`
+  again so active triggers are re-pointed at the new address, and
+  update the provider-side registrations. This gets annoying fast for
+  services like Slack; if you have any domain, use a stable
+  hostname instead (next section).
 - A public address is a public address: anyone who knows it can send
   requests at those two surfaces. They are built for that (verified
   pushes, unguessable tokens), but if you no longer need triggers
@@ -100,7 +106,12 @@ Two honest caveats:
   ./setup.sh --no-public-url
   ```
 
-## Per-service setup notes
+## A stable public address (recommended)
+
+If you own any domain on Cloudflare, a named tunnel gives your weft a
+permanent address instead of the rotating random one, so provider-side
+registrations never rot. The walkthrough lives in
+[stable-public-address.md](stable-public-address.md).
 
 **Slack, through your own app** (no public address needed): in your
 app's settings, enable Socket Mode and mint an app-level token with

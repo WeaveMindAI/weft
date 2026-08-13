@@ -404,6 +404,19 @@ pub struct TaskCompleteRequest {
 pub struct TaskCompleteResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRequeueRequest {
+    pub task_id: Uuid,
+    pub pod_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRequeueResponse {
+    /// True when the surrender landed (the row was still ours and is
+    /// now pending again); false when the row had already moved on.
+    pub requeued: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskFailRequest {
     pub task_id: Uuid,
     pub pod_id: String,
@@ -1427,31 +1440,42 @@ impl SignalRowWire {
     /// so reaching this branch means the writer drifted from the
     /// schema. Fail loud rather than silently mounting at `""`.
     pub fn to_routing(&self) -> Result<weft_core::primitive::SignalRouting, &'static str> {
-        use weft_core::primitive::{SignalAuth, SignalRouting, SignalSurface};
-        let surface = match self.surface_kind {
-            SignalSurfaceKind::PublicEntry => {
-                let raw = self
-                    .mount_path
-                    .as_deref()
-                    .ok_or("SignalRowWire: PublicEntry with NULL mount_path")?;
-                // Stored mount_path has a leading `/`; the surface
-                // field doesn't carry it.
-                let path = raw.strip_prefix('/').unwrap_or(raw).to_string();
-                SignalSurface::PublicEntry { path }
-            }
-            SignalSurfaceKind::TaskCallback => SignalSurface::TaskCallback,
-            SignalSurfaceKind::Internal => SignalSurface::Internal,
-        };
-        let auth = match self.auth_kind {
-            SignalAuthKind::None => SignalAuth::None,
-            SignalAuthKind::ApiKey => SignalAuth::ApiKey,
-        };
-        Ok(SignalRouting {
-            surface,
-            auth,
-            auth_config: self.auth_config.clone().unwrap_or(Value::Null),
-        })
+        routing_from_columns(
+            self.surface_kind,
+            self.mount_path.as_deref(),
+            self.auth_kind,
+            self.auth_config.clone(),
+        )
     }
+}
+
+/// The one row-columns -> [`SignalRouting`] projection, shared by the
+/// listener's rehydrate (via [`SignalRowWire::to_routing`]) and the
+/// dispatcher's pod-move restore, so the two readers of the same
+/// columns can never drift.
+pub fn routing_from_columns(
+    surface_kind: SignalSurfaceKind,
+    mount_path: Option<&str>,
+    auth_kind: SignalAuthKind,
+    auth_config: Option<Value>,
+) -> Result<weft_core::primitive::SignalRouting, &'static str> {
+    use weft_core::primitive::{SignalAuth, SignalRouting, SignalSurface};
+    let surface = match surface_kind {
+        SignalSurfaceKind::PublicEntry => {
+            let raw = mount_path.ok_or("signal row: PublicEntry with NULL mount_path")?;
+            // Stored mount_path has a leading `/`; the surface
+            // field doesn't carry it.
+            let path = raw.strip_prefix('/').unwrap_or(raw).to_string();
+            SignalSurface::PublicEntry { path }
+        }
+        SignalSurfaceKind::TaskCallback => SignalSurface::TaskCallback,
+        SignalSurfaceKind::Internal => SignalSurface::Internal,
+    };
+    let auth = match auth_kind {
+        SignalAuthKind::None => SignalAuth::None,
+        SignalAuthKind::ApiKey => SignalAuth::ApiKey,
+    };
+    Ok(SignalRouting { surface, auth, auth_config: auth_config.unwrap_or(Value::Null) })
 }
 
 /// Wire shape for a row of the signal table that the listener
@@ -1481,6 +1505,11 @@ pub struct SignalRowWire {
     /// `JSONB NOT NULL DEFAULT '{}'::jsonb`, so the broker always
     /// emits a value; missing on the wire is schema drift.
     pub kind_state: Value,
+    /// The kind_state write-fence version the row is at (the
+    /// `signal.kind_state_seq` column). The rehydrating pod resumes
+    /// its durable cursor writes at `seq + 1` so a restart can never
+    /// regress the fence.
+    pub kind_state_seq: i64,
     /// The signal's current placement generation. On rehydrate the pod
     /// re-arms the signal under this generation and stamps it on the
     /// held-event fires it enqueues, so the broker's stale-fire fence
@@ -2142,6 +2171,7 @@ mod supervisor_protocol_tests {
             token: "t".into(),
             tenant_id: "tenant-a".into(),
             node_id: "n".into(),
+            kind_state_seq: 0,
             spec_json: "{}".into(),
             is_resume: false,
             color: None,

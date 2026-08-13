@@ -29,6 +29,35 @@
       "type": "String",
       "required": true,
       "label": "Text"
+    },
+    {
+      "name": "parseMode",
+      "type": "String",
+      "exposure": "config",
+      "default": "plain",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "plain",
+          "MarkdownV2",
+          "HTML"
+        ]
+      },
+      "label": "Formatting",
+      "description": "How Telegram renders the text."
+    },
+    {
+      "name": "buttons",
+      "type": "List[JsonDict]",
+      "required": false,
+      "label": "Link buttons",
+      "description": "Link buttons under the message: [{\"label\": \"Open\", \"url\": \"https://...\"}]."
+    },
+    {
+      "name": "replyTo",
+      "type": "Number",
+      "required": false,
+      "label": "Reply to message id"
     }
   ],
   "outputs": [

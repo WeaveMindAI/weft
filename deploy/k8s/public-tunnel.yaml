@@ -8,17 +8,25 @@
 #     dispatcher: the provider-events receiver (`/events/...`), the
 #     token-authenticated per-signal fire door (`/signal/...`), and the
 #     token-credentialed file relay (`/public/files/...`, minted
-#     expiring media links). Everything else answers 404, so the
-#     tunnel never exposes the project/admin API, the dashboard, or
-#     the storage plane itself.
+#     expiring media links). The bare root serves a tiny static page;
+#     everything else answers 404, so the tunnel never exposes the
+#     project/admin API, the dashboard, or the storage plane itself.
 #
-#   - weft-tunnel: a cloudflared quick tunnel dialing OUT to
-#     Cloudflare's edge and forwarding what arrives to the proxy. The
-#     public https address it minted is printed in its logs; the
-#     daemon reads it there and wires it in as the deployment's public
-#     base URL. Quick-tunnel addresses are RANDOM PER START: a tunnel
-#     pod restart mints a new one, and the daemon must run again to
-#     re-wire it (documented in docs/event-triggers.md).
+#   - weft-tunnel: a cloudflared tunnel dialing OUT to Cloudflare's
+#     edge and forwarding what arrives to the proxy. Two modes, chosen
+#     by `${TUNNEL_ARGS}` at apply time (docs/stable-public-address.md):
+#       - quick (default): a free tunnel minting a RANDOM public
+#         address per connection; the daemon reads it from the pod's
+#         logs. A reconnect mints a new one, so anything registered
+#         against the old address (a provider's event push URL) rots
+#         until re-registered.
+#       - named: `WEFT_PUBLIC_TUNNEL_TOKEN` + `WEFT_PUBLIC_TUNNEL_HOSTNAME`
+#         run a Cloudflare named tunnel under the operator's own STABLE
+#         hostname (the token rides the weft-tunnel-token Secret). The
+#         hostname -> proxy routing lives in the tunnel's Cloudflare
+#         dashboard config.
+# SYNC: weft-public-proxy locations <-> weavemind/setup-cloud.sh
+#       ensure_public_tunnel (the same allowlist, host-container form)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -31,13 +39,20 @@ data:
       # Provider pushes can be sizeable (a queue envelope with an
       # encoded event); match the dispatcher's own public fire cap.
       client_max_body_size 2m;
+      # X-Forwarded-For/Proto on every proxied location so the
+      # dispatcher sees the real client and the tunnel's https, not
+      # "the proxy pod over http".
       location /events/ {
         proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
       }
       location /signal/ {
         proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
       }
       # The public file relay: minted expiring media links an external
       # consumer (a model provider) fetches. The unguessable token in
@@ -46,6 +61,37 @@ data:
       location /public/files/ {
         proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+      }
+      # The OAuth callback: a provider redirects the user's browser here
+      # with the authorization code after they approve a connection.
+      # Exact-match (not a prefix), so nothing else under /access is
+      # reachable from outside; the code in the query is a one-time
+      # single-use grant the dispatcher validates.
+      location = /access/oauth/callback {
+        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+      }
+      # The bare root gets a small static page (deploy/public-page/,
+      # shipped by the daemon as the weft-public-page ConfigMap and
+      # mounted below) instead of a naked 404, so a human checking the
+      # address sees something deliberate. Exact matches only, the
+      # allowlist discipline of every other location: the page's few
+      # files are each named, and every other unlisted path still
+      # answers 404. The exact-match `/` resolves through the index
+      # directive to /index.html, so that path gets its own location.
+      location = / {
+        root /weft/public-page;
+        index index.html;
+      }
+      location = /index.html {
+        root /weft/public-page;
+      }
+      location = /logo.png {
+        root /weft/public-page;
       }
       location / {
         return 404;
@@ -77,6 +123,8 @@ spec:
           volumeMounts:
             - name: config
               mountPath: /etc/nginx/conf.d
+            - name: public-page
+              mountPath: /weft/public-page
           resources:
             requests:
               cpu: 10m
@@ -87,6 +135,11 @@ spec:
         - name: config
           configMap:
             name: weft-public-proxy-config
+        # The root page's files (deploy/public-page/), shipped by the
+        # daemon as a ConfigMap on every start.
+        - name: public-page
+          configMap:
+            name: weft-public-page
 ---
 apiVersion: v1
 kind: Service
@@ -121,11 +174,16 @@ spec:
       containers:
         - name: cloudflared
           image: cloudflare/cloudflared:latest
-          args:
-            - tunnel
-            - --no-autoupdate
-            - --url
-            - http://weft-public-proxy.weft-system.svc.cluster.local:8080
+          # Named mode reads the tunnel token from this Secret; absent
+          # (and ignored) in quick mode.
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: weft-tunnel-token
+                  key: TUNNEL_TOKEN
+                  optional: true
+          args: ${TUNNEL_ARGS}
           resources:
             requests:
               cpu: 10m

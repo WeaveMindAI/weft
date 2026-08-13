@@ -34,6 +34,42 @@ pub struct Predicate {
     pub value: Option<String>,
 }
 
+impl Predicate {
+    fn with_value(field: &str, op: PredicateOp, value: impl Into<String>) -> Self {
+        Self { field: field.into(), op, value: Some(value.into()) }
+    }
+
+    /// `field == value`.
+    pub fn eq(field: &str, value: impl Into<String>) -> Self {
+        Self::with_value(field, PredicateOp::Eq, value)
+    }
+
+    /// `field != value`.
+    pub fn neq(field: &str, value: impl Into<String>) -> Self {
+        Self::with_value(field, PredicateOp::Neq, value)
+    }
+
+    /// `field` contains `value` as a substring.
+    pub fn contains(field: &str, value: impl Into<String>) -> Self {
+        Self::with_value(field, PredicateOp::Contains, value)
+    }
+
+    /// `field` matches the regex `value`.
+    pub fn regex(field: &str, value: impl Into<String>) -> Self {
+        Self::with_value(field, PredicateOp::Regex, value)
+    }
+
+    /// The field is present, whatever its value.
+    pub fn exists(field: &str) -> Self {
+        Self { field: field.into(), op: PredicateOp::Exists, value: None }
+    }
+
+    /// The field is absent.
+    pub fn not_exists(field: &str) -> Self {
+        Self { field: field.into(), op: PredicateOp::NotExists, value: None }
+    }
+}
+
 /// The predicate operators. Comparisons are over the field's DISPLAY
 /// string (a JSON string compares as itself, a number/bool as its JSON
 /// text), so one operand shape serves every payload type and a
@@ -55,6 +91,30 @@ impl PredicateOp {
     /// config mistake worth refusing.
     fn takes_value(self) -> bool {
         !matches!(self, Self::Exists | Self::NotExists)
+    }
+}
+
+#[cfg(test)]
+mod constructor_tests {
+    use super::*;
+
+    #[test]
+    fn constructors_build_the_exact_struct_shapes() {
+        assert_eq!(
+            Predicate::eq("type", "message"),
+            Predicate { field: "type".into(), op: PredicateOp::Eq, value: Some("message".into()) }
+        );
+        assert_eq!(
+            Predicate::not_exists("bot"),
+            Predicate { field: "bot".into(), op: PredicateOp::NotExists, value: None }
+        );
+        assert_eq!(
+            Predicate::exists("thread"),
+            Predicate { field: "thread".into(), op: PredicateOp::Exists, value: None }
+        );
+        assert_eq!(Predicate::contains("text", "hi").op, PredicateOp::Contains);
+        assert_eq!(Predicate::regex("type", "^a$").op, PredicateOp::Regex);
+        assert_eq!(Predicate::neq("state", "sync").op, PredicateOp::Neq);
     }
 }
 

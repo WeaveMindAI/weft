@@ -1,0 +1,63 @@
+<!doctype html>
+<!-- The page the public trigger surface serves on its bare root
+     (deploy/k8s/public-tunnel.yaml routes `/`, `/index.html`, and
+     `/logo.png` here; every other unlisted path answers 404). The
+     daemon ships this directory into the cluster as the
+     weft-public-page ConfigMap on every start, so editing these files
+     and re-running `weft daemon start` redeploys the page. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>weft</title>
+  <link rel="icon" type="image/png" href="/logo.png">
+  <style>
+    :root { color-scheme: light dark }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #fafaf8;
+      color: #1a1a1a;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #101014; color: #ececf0 }
+    }
+    main {
+      text-align: center;
+      padding: 2rem;
+      animation: rise .45s ease-out both;
+    }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(10px) }
+      to { opacity: 1; transform: none }
+    }
+    img.logo {
+      width: 96px;
+      height: auto;
+      display: block;
+      margin: 0 auto 1.25rem;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 650;
+      letter-spacing: .04em;
+      margin: 0 0 .45rem;
+    }
+    p {
+      margin: 0;
+      opacity: .55;
+      font-size: .95rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <img class="logo" src="/logo.png" alt="weft logo">
+    <h1>weft</h1>
+    <p>This address only receives workflow triggers.</p>
+  </main>
+</body>
+</html>

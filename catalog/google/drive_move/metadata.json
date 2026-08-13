@@ -1,0 +1,49 @@
+{
+  "type": "GoogleDriveMove",
+  "label": "Google Drive: Move",
+  "description": "Move a file into a folder (replacing where it currently lives), optionally renaming it.",
+  "tags": [
+    "google",
+    "drive",
+    "file"
+  ],
+  "icon": "FolderInput",
+  "color": "#1FA463",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/drive.file"
+      ],
+      "description": "A Google account that can edit the file."
+    },
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": true,
+      "label": "File id"
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "required": true,
+      "label": "Folder id",
+      "description": "The destination folder's id."
+    },
+    {
+      "name": "rename",
+      "type": "String",
+      "required": false,
+      "label": "Rename to"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
+  ]
+}

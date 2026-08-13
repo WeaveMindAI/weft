@@ -104,8 +104,6 @@ pub fn plan_build_from(
 ) -> CompileResult<BuildPlan> {
     let weft_root = crate::build::resolve_weft_root()?;
 
-    let binary_hash = crate::hash::compute_binary_hash(definition, project, &weft_root, catalog)
-        .map_err(|e| e.context("compute binary hash"))?;
     let definition_hash = crate::hash::compute_definition_hash(definition)
         .map_err(|e| e.context("compute definition hash"))?;
     let infra_hash =
@@ -119,6 +117,7 @@ pub fn plan_build_from(
     // from source: it validates + codegens this definition, whose `@asset`
     // refs the caller already resolved into concrete file values.
     let staged = crate::build::build_project(project, definition, catalog, true, builder_base_image)?;
+    let binary_hash = staged.content_hash.clone();
 
     let mut images = vec![PlannedImage {
         kind: ImageKind::Worker,

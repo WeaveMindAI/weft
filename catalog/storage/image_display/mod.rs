@@ -17,13 +17,17 @@ use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct ImageDisplayNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for ImageDisplayNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        // The `Image` port type already guarantees this is an image; the
-        // only thing left to enforce is that it carries a handle the
-        // preview can resolve (a storage key or an external URL), which
-        // is exactly what parsing into a FileHandle checks.
         // The `Image` port type already guarantees this is an image; the
         // only thing left to enforce is that it carries a handle the
         // preview can resolve (a storage key or an external URL), which

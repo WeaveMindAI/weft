@@ -16,11 +16,17 @@ use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct DownloadLinkNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for DownloadLinkNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        // Validate the value carries a resolvable handle (key or url),
-        // which is exactly what parsing into a FileHandle checks.
         // Validate the value carries a resolvable handle (key or url),
         // which is exactly what parsing into a FileHandle checks.
         let _handle: FileHandle = ctx.inputs.get("file")?;

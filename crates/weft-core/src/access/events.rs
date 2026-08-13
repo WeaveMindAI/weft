@@ -445,7 +445,9 @@ pub enum RouteBy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Decode {
-    /// Where the encoded event sits in the envelope.
+    /// Where the encoded event sits in the envelope: a body path for
+    /// `base64_json`, a FORM FIELD NAME for `form_json` (that body is
+    /// urlencoded form data, not JSON, so there is no path to walk).
     pub path: String,
     pub encoding: Encoding,
 }
@@ -455,6 +457,10 @@ pub struct Decode {
 pub enum Encoding {
     /// Base64 (standard or url-safe) of JSON text.
     Base64Json,
+    /// The raw body is `application/x-www-form-urlencoded`; the field
+    /// named by `path` holds JSON text (Slack's interactivity
+    /// `payload=` shape).
+    FormJson,
 }
 
 /// Asking the provider to send, and keeping that arrangement alive.

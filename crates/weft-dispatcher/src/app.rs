@@ -35,63 +35,47 @@ use crate::DispatcherState;
 pub use weft_platform_traits::object_store_from_env;
 
 /// Run the core dispatcher schema migrations against `pool`. Every table the
-/// dispatcher itself owns is created here, in dependency order (the `project`
-/// table last among the FK-able ones so later tables can reference it).
-///
-/// The whole run holds the cluster-wide schema advisory lock: `IF NOT EXISTS`
-/// makes re-runs idempotent but is NOT concurrency-safe in Postgres (two
-/// backends racing the same CREATE on a fresh DB both pass the existence check,
-/// then one fails on a duplicate catalog key). Under the lock, replicas
-/// serialize and the losers see the tables already present.
+/// dispatcher itself owns is created here, in dependency order.
+/// Serialization across racing replicas is the guard's own job:
+/// `apply_groups` runs everything in one transaction under its advisory lock.
 pub async fn run_core_migrations(pool: &sqlx::PgPool) -> anyhow::Result<crate::ProjectStore> {
-    crate::lease::with_advisory_lock_blocking(pool, crate::lease::advisory_key("migrate", "schema"), || async {
-        run_core_migrations_locked(pool).await
-    })
+    // One guarded pass over every core group, in dependency order. The
+    // journal's `exec_event` group ran earlier, at journal connect; the
+    // `worker_pod` group's fencing triggers attach to `exec_event` and
+    // `task`, so it must stay AFTER the journal connect and after
+    // `tasks::GROUP`: a reset of either table drops the attached trigger,
+    // and this ordering is what recreates it in the same boot (matching
+    // stamps re-run their DDL). The `dispatcher_cursor` table group
+    // precedes the `infra_event_bridge_cursor` seed that writes into it.
+    // The guard refuses to run any group whose stamped fingerprint no
+    // longer matches its DDL, naming the tables to drop.
+    weft_task_store::apply_groups(
+        pool,
+        &[
+            &crate::listener::GROUP,
+            &crate::supervisor_pool::GROUP,
+            &crate::namespace_registry::GROUP,
+            &weft_task_store::tasks::GROUP,
+            &weft_task_store::worker_pod::GROUP,
+            &weft_access_store::GROUP,
+            &crate::infra_node::GROUP,
+            &crate::infra_event::GROUP,
+            &crate::infra_lifecycle_command::GROUP,
+            &crate::journal_bridge::GROUP,
+            &crate::infra_event_bridge::GROUP,
+            // The durable terminate-sweep queue (no FK; the dispatcher owns
+            // it and the reaper drains it by asking the broker to sweep a
+            // terminated color's files).
+            &crate::storage::GROUP,
+            // In the one list with everything else, so a mismatch
+            // anywhere surfaces in ONE error naming every stale group
+            // together.
+            &crate::project_store::GROUP,
+        ],
+    )
     .await
-}
-
-async fn run_core_migrations_locked(pool: &sqlx::PgPool) -> anyhow::Result<crate::ProjectStore> {
-    crate::listener::migrate(pool)
-        .await
-        .context("apply listener_pod migrations")?;
-    crate::supervisor_pool::migrate(pool)
-        .await
-        .context("apply supervisor_pod + infra_owner migrations")?;
-    crate::namespace_registry::migrate(pool)
-        .await
-        .context("apply namespace_registry migrations")?;
-    weft_task_store::migrate(pool)
-        .await
-        .context("apply task-store migrations")?;
-    weft_access_store::migrate(pool)
-        .await
-        .context("apply access-store migrations")?;
-    crate::infra_node::migrate(pool)
-        .await
-        .context("apply infra_node migrations")?;
-    crate::infra_event::migrate(pool)
-        .await
-        .context("apply infra_event migrations")?;
-    crate::infra_lifecycle_command::migrate(pool)
-        .await
-        .context("apply infra_lifecycle_command migrations")?;
-    crate::journal_bridge::migrate(pool)
-        .await
-        .context("apply journal_bridge cursor migrations")?;
-    crate::infra_event_bridge::migrate(pool)
-        .await
-        .context("apply infra_event_bridge cursor migrations")?;
-    // The durable terminate-sweep queue (no FK; the dispatcher owns it and the
-    // reaper drains it by asking the broker to sweep a terminated color's files).
-    crate::storage::migrate(pool)
-        .await
-        .context("apply storage_sweep migrations")?;
-    let projects: crate::ProjectStore = std::sync::Arc::new(
-        crate::PostgresProjectStore::new(pool.clone())
-            .await
-            .context("init project store")?,
-    );
-    Ok(projects)
+    .context("apply core schema groups")?;
+    Ok(std::sync::Arc::new(crate::PostgresProjectStore::new(pool.clone())))
 }
 
 /// The construction-time policies threaded into `build_state`: who a request
@@ -209,7 +193,7 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         kube.clone(),
         Arc::new(weft_platform_traits::clock::SystemClock),
         sandbox.clone(),
-        registry_config.clone(),
+        registry_config,
     ));
 
     // Cluster CIDR knobs. Required in-cluster so the dispatcher can render
@@ -382,6 +366,14 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
         .register(TaskKind::FireSignal, Arc::new(crate::task_kinds::FireSignalExecutor))
         .register(TaskKind::RecordCost, Arc::new(crate::task_kinds::RecordCostExecutor))
         .register(TaskKind::RecordLog, Arc::new(crate::task_kinds::RecordLogExecutor))
+        .register(
+            TaskKind::UpdateSignalKindState,
+            Arc::new(crate::task_kinds::UpdateSignalKindStateExecutor),
+        )
+        .register_str(
+            crate::task_kinds::run_node_test::RUN_NODE_TEST_KIND,
+            Arc::new(crate::task_kinds::RunNodeTestExecutor),
+        )
 }
 
 /// Spawn a core background loop under supervision: a core loop is an infinite

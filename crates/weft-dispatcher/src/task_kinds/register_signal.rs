@@ -125,6 +125,12 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         };
         let tenant = state.tenant_router.tenant_for_project(&project_id).await?;
 
+        // The reused entry token's previously-persisted kind_state, when
+        // the row already exists (reactivate). Handed to the kind's
+        // compute_initial_state so cursor-bearing kinds carry their
+        // feed position forward instead of re-priming.
+        let mut prior_kind_state: Option<Value> = None;
+        let mut prior_seq: i64 = 0;
         let token = if payload.is_resume {
             // Derive resume token from the suspension identity so a
             // retry of this task converges on the same token. The
@@ -145,8 +151,8 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             buf.copy_from_slice(&bytes[..16]);
             uuid::Uuid::from_bytes(buf).to_string()
         } else {
-            let existing: Option<(String,)> = sqlx::query_as(
-                "SELECT token FROM signal \
+            let existing: Option<(String, Value, i64)> = sqlx::query_as(
+                "SELECT token, kind_state, kind_state_seq FROM signal \
                  WHERE project_id = $1 AND node_id = $2 AND is_resume = FALSE",
             )
             .bind(&project_id)
@@ -154,7 +160,11 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             .fetch_optional(&state.pg_pool)
             .await?;
             match existing {
-                Some((t,)) => t,
+                Some((t, state, seq)) => {
+                    prior_kind_state = Some(state);
+                    prior_seq = seq;
+                    t
+                }
                 None => uuid::Uuid::new_v4().to_string(),
             }
         };
@@ -166,6 +176,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         };
 
         let token_call = token.clone();
+        let prior_state_call = prior_kind_state;
         let project_id_call = project_id.clone();
         let node_id_call = payload.node_id.clone();
         let spec_call = payload.spec.clone();
@@ -201,6 +212,10 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                         payload.is_resume,
                         resume_color_owned.as_deref(),
                         placement_generation,
+                        weft_listener::protocol::RegisterSource::Fresh {
+                            prior_kind_state: prior_state_call,
+                            prior_seq,
+                        },
                     )
                     .await?;
 
@@ -344,6 +359,10 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 auth_kind: auth_kind_str,
                 auth_config: auth_config_value,
                 kind_state,
+                // The state carried forward keeps the seq it was read
+                // at, so the insert's fence lets any newer in-flight
+                // cursor write win instead of being rewound.
+                kind_state_seq: prior_seq,
             },
             // Born with its holder + generation so the row is never
             // committed with a NULL holder while the pod already holds it

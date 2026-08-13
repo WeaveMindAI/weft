@@ -36,6 +36,7 @@ mod dashboard;
 mod infra;
 pub(crate) mod signal;
 pub mod access;
+pub mod node_tests;
 pub mod storage;
 
 /// The dispatcher routes, not yet bound to state. Additional routes can be
@@ -148,6 +149,12 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/access/lookup", post(access::lookup))
         .route("/access/granted", post(access::granted))
         .route("/access/picker/begin", post(access::picker_begin))
+        // Node self-test runs (a short-lived test pod per run).
+        .route("/projects/{id}/node-tests/run", post(node_tests::run))
+        .route(
+            "/projects/{id}/node-tests/runs/{task}",
+            get(node_tests::status),
+        )
         // Inspector proxy: project-scoped read of signal display
         // info (mount_path, plaintext key while listener still
         // holds it, etc). Project-token gated.

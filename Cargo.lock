@@ -3618,6 +3618,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4393,6 +4403,7 @@ dependencies = [
  "url",
  "uuid",
  "weft-core",
+ "weft-task-store",
 ]
 
 [[package]]
@@ -4444,6 +4455,7 @@ dependencies = [
  "weft-infra",
  "weft-journal",
  "weft-platform-traits",
+ "weft-providers",
  "weft-task-store",
 ]
 
@@ -4487,6 +4499,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "dotenvy",
  "eventsource-client",
@@ -4497,9 +4510,12 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "terminal_size",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "weft-assets",
  "weft-catalog",
@@ -4544,6 +4560,7 @@ dependencies = [
  "http 1.4.0",
  "inventory",
  "p256",
+ "percent-encoding",
  "regex",
  "reqwest",
  "reqwest-middleware",
@@ -4638,6 +4655,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "clap",
  "futures",
  "http 1.4.0",
  "parking_lot",
@@ -4650,6 +4668,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.24.0",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "weft-broker-client",
@@ -4798,6 +4817,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tokio",
  "tokio-util",

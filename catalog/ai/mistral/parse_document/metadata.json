@@ -1,0 +1,44 @@
+{
+  "type": "MistralParseDocument",
+  "label": "Parse Document",
+  "description": "A PDF, scan, or image to clean markdown through Mistral's OCR: tables, layout, and 100+ languages. Emits the whole document's markdown and the per-page breakdown.",
+  "tags": [
+    "ai",
+    "document",
+    "ocr"
+  ],
+  "icon": "ScanText",
+  "color": "#FF7000",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Mistral access (wire a MistralAccess node)."
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "required": true,
+      "description": "The stored document (PDF, image, scan)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "markdown",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "pages",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each page: index and markdown."
+    },
+    {
+      "name": "pageCount",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

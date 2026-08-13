@@ -5,8 +5,10 @@
 //!   natively in `usage.cost` (plus `usage.cost_details.upstream_inference_cost`
 //!   when the route is served on the account's own upstream key), delivered
 //!   in the response body (non-streaming) or in the final SSE chunk
-//!   (streaming). `prepare` forces the `usage: {include: true}` accounting
-//!   opt-in so the charge is always reported.
+//!   (streaming). The accounting block is included in every response
+//!   automatically (the old `usage: {include: true}` opt-in is
+//!   deprecated); `prepare` only sheds internal media-estimation
+//!   metadata from chat bodies.
 //! - `GET generation` is FREE: it is the cost LOOKUP (`?id=gen-...`). Free
 //!   is what makes the double-charge trap structurally impossible: this
 //!   meter's own follow-up query and a node re-querying its cost by hand
@@ -123,7 +125,9 @@ impl ProviderMeter for OpenRouterMeter {
 
     fn classify(&self, method: &str, path: &str) -> RouteClass {
         match (method, path) {
-            ("POST", "chat/completions") => RouteClass::Billable(Pricing::Metered),
+            ("POST", "chat/completions")
+            | ("POST", "embeddings")
+            | ("POST", "rerank") => RouteClass::Billable(Pricing::Metered),
             ("GET", "generation") => RouteClass::Free,
             ("GET", "models") => RouteClass::Free,
             _ => RouteClass::Unknown,
@@ -131,22 +135,24 @@ impl ProviderMeter for OpenRouterMeter {
     }
 
     fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        // The rewrite below is chat/completions-shaped; running it on any
-        // other route would silently mangle a body, so refuse loud (in
-        // release too) rather than assume the caller classified first.
-        if path != "chat/completions" {
-            anyhow::bail!("prepare called on unexpected route '{path}'");
+        // OpenRouter includes the `usage` accounting block (with the
+        // inline cost) in EVERY response automatically (the old
+        // `usage: {include: true}` opt-in is deprecated on chat and not
+        // an accepted field on embeddings/rerank at all, docs checked
+        // 2026-08), so no route needs a cost opt-in rewrite. Only chat
+        // rewrites: it sheds the media estimation metadata the caller's
+        // wire carried for the ceiling (`ceiling_inputs` has read it by
+        // now); internal breadcrumbs have no business riding upstream.
+        // Any route this meter never classified billable refuses loud
+        // (in release too) rather than assume the caller classified
+        // first.
+        match path {
+            "chat/completions" => {}
+            "embeddings" | "rerank" => return Ok(None),
+            _ => anyhow::bail!("prepare called on unexpected route '{path}'"),
         }
         let mut parsed: Value = serde_json::from_slice(body)
-            .map_err(|e| anyhow::anyhow!("chat/completions body is not JSON: {e}"))?;
-        // Force the accounting opt-in, overriding whatever the caller set:
-        // without it a streaming response carries no cost at all, and the
-        // whole point of this meter is that the cost is always reportable.
-        parsed["usage"] = json!({ "include": true });
-        // Shed the media estimation metadata the caller's wire carried for
-        // the ceiling (`ceiling_inputs` has read it by now): OpenRouter
-        // tolerates the keys, but internal breadcrumbs have no business
-        // riding upstream.
+            .map_err(|e| anyhow::anyhow!("{path} body is not JSON: {e}"))?;
         if let Some(messages) = parsed["messages"].as_array_mut() {
             for message in messages {
                 let Some(parts) = message["content"].as_array_mut() else { continue };
@@ -168,10 +174,48 @@ impl ProviderMeter for OpenRouterMeter {
 
     async fn ceiling_usd(
         &self,
-        _path: &str,
+        path: &str,
         body: &[u8],
         _http: &reqwest::Client,
     ) -> anyhow::Result<f64> {
+        // Embeddings and rerank estimate from the request's own text at
+        // the REQUEST MODEL's published input rate (the same catalog the
+        // chat estimator prices from), over-counting tokens at one per 3
+        // characters. A per-search-priced rerank model (Cohere: $2.50 per
+        // 1k searches) is covered by the flat per-search component.
+        // `usage.cost` in the response settles the truth.
+        if path == "embeddings" || path == "rerank" {
+            let parsed: Value = serde_json::from_slice(body)
+                .map_err(|e| anyhow::anyhow!("{path} body is not JSON: {e}"))?;
+            let model = parsed
+                .get("model")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("{path} body names no model"))?
+                .to_string();
+            let mut chars = 0usize;
+            let mut count = |v: &Value| match v {
+                Value::String(s) => chars += s.len(),
+                Value::Array(items) => {
+                    for i in items {
+                        if let Some(s) = i.as_str() {
+                            chars += s.len();
+                        }
+                    }
+                }
+                _ => {}
+            };
+            count(parsed.get("input").unwrap_or(&Value::Null));
+            count(parsed.get("query").unwrap_or(&Value::Null));
+            count(parsed.get("documents").unwrap_or(&Value::Null));
+            let rates = self
+                .generator_for(&model)
+                .model_rates_served_by(None)
+                .await
+                .map_err(|e| anyhow::anyhow!("cannot price model '{model}': {e}"))?;
+            const PER_SEARCH_USD: f64 = 0.0025;
+            let tokens = chars as f64 / 3.0;
+            return Ok(PER_SEARCH_USD + tokens * rates.price.input_per_mtok / 1_000_000.0);
+        }
         let (model, messages, params, billing_provider) = ceiling_inputs(body)?;
         let rates = self
             .generator_for(&model)
@@ -181,11 +225,22 @@ impl ProviderMeter for OpenRouterMeter {
         Ok(estimate_cost_usd(&messages, &params, &rates))
     }
 
-    fn observe(&self) -> Box<dyn CallObservation> {
+    fn observe(&self, _path: &str) -> Box<dyn CallObservation> {
+        // Every billable route answers the same envelope (an id + a
+        // `usage` block with the inline charge), streaming or not, so
+        // one observation shape serves chat, embeddings, and rerank.
         Box::new(OpenRouterObservation::new())
     }
 
-    async fn resolve(&self, observed: ObservedCall, follow_up: FollowUp<'_>) -> MeasuredCost {
+    // One resolve pipeline for every billable route: the inline
+    // `usage.cost` answers first, the generation ledger (which records
+    // chat, embeddings, and rerank alike) is the fallback.
+    async fn resolve(
+        &self,
+        _path: &str,
+        observed: ObservedCall,
+        follow_up: FollowUp<'_>,
+    ) -> MeasuredCost {
         let data = &observed.data;
         let status = data["status"].as_u64().unwrap_or(0);
         let model = data["model"].as_str().map(str::to_string);
@@ -453,6 +508,7 @@ impl CallObservation for OpenRouterObservation {
         let sse_overflow = matches!(&self.mode, Mode::Sse(s) if s.overflowed());
         ObservedCall {
             interrupted,
+            status: self.status.unwrap_or(0),
             data: serde_json::json!({
                 "status": self.status,
                 "id": self.id,
@@ -496,9 +552,11 @@ mod tests {
         );
         assert_eq!(m.classify("GET", "generation"), RouteClass::Free);
         assert_eq!(m.classify("GET", "models"), RouteClass::Free);
+        assert_eq!(m.classify("POST", "embeddings"), RouteClass::Billable(Pricing::Metered));
+        assert_eq!(m.classify("POST", "rerank"), RouteClass::Billable(Pricing::Metered));
         assert_eq!(m.classify("GET", "chat/completions"), RouteClass::Unknown);
+        assert_eq!(m.classify("GET", "embeddings"), RouteClass::Unknown);
         assert_eq!(m.classify("POST", "generation"), RouteClass::Unknown);
-        assert_eq!(m.classify("POST", "embeddings"), RouteClass::Unknown);
         assert_eq!(m.classify("POST", ""), RouteClass::Unknown);
     }
 
@@ -533,14 +591,17 @@ mod tests {
         }
     }
 
-    // ---- L1: prepare forces the accounting opt-in ----------------------
+    // ---- L1: prepare touches nothing but the media metadata ------------
 
     #[test]
-    fn prepare_forces_usage_accounting_even_when_the_caller_opted_out() {
+    fn prepare_leaves_the_caller_body_alone_beyond_media_metadata() {
+        // The accounting block arrives automatically on every response;
+        // whatever the caller wrote (even a deprecated opt-out) passes
+        // through untouched.
         let body = br#"{"model":"m","messages":[],"usage":{"include":false}}"#;
         let prepared = meter().prepare("chat/completions", body).unwrap().unwrap();
         let parsed: Value = serde_json::from_slice(&prepared).unwrap();
-        assert_eq!(parsed["usage"]["include"], true);
+        assert_eq!(parsed["usage"]["include"], false, "caller bytes pass through");
         assert_eq!(parsed["model"], "m", "the rest of the body is untouched");
 
         let garbage = meter().prepare("chat/completions", b"not json");
@@ -548,6 +609,27 @@ mod tests {
 
         let wrong_route = meter().prepare("generation", br#"{"model":"m"}"#);
         assert!(wrong_route.is_err(), "prepare on a route it was not written for refuses loud");
+    }
+
+    /// Embeddings and rerank get the same accounting opt-in, and the
+    /// chat-shaped media shedding never touches their bodies.
+    #[test]
+    fn prepare_covers_every_billable_route_and_sheds_media_only_on_chat() {
+        // Embeddings and rerank bodies go out UNTOUCHED: `usage` is not
+        // an accepted request field on either (an injected unknown
+        // field could refuse the whole call), and OpenRouter includes
+        // the cost accounting in every response automatically.
+        for path in ["embeddings", "rerank"] {
+            let body = br#"{"model":"m","input":["hello"],"messages":[{"content":[{"image_url":{"url":"u","width":800}}]}]}"#;
+            assert!(
+                meter().prepare(path, body).unwrap().is_none(),
+                "{path} bodies are never rewritten"
+            );
+        }
+        assert!(
+            meter().prepare("generation", b"{}").is_err(),
+            "a route the meter never classified billable refuses loud"
+        );
     }
 
     #[test]
@@ -637,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_recorded_json_response_resolves_to_its_inline_cost() {
-        let mut obs = meter().observe();
+        let mut obs = meter().observe("chat/completions");
         obs.on_status(200);
         // Feed in awkward pieces to prove reassembly.
         let bytes = RECORDED_JSON_RESPONSE.as_bytes();
@@ -648,9 +730,53 @@ mod tests {
 
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let follow_up = FollowUp { http: &http, base_url: "http://unused.test" };
-        let cost = meter().resolve(observed, follow_up).await;
+        let cost = meter().resolve("chat/completions", observed, follow_up).await;
         assert_eq!(cost.amount_usd, Some(0.000096));
         assert_eq!(cost.model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
+        assert_eq!(cost.metadata["resolution"], "inline usage accounting");
+    }
+
+    /// An embeddings response (documented shape: `id` + a `usage` block
+    /// with the inline `cost`, delivered automatically) resolves to its
+    /// inline figure; no ledger poll.
+    #[tokio::test]
+    async fn an_embeddings_response_resolves_to_its_inline_cost() {
+        let body = r#"{
+            "id": "emb-1", "object": "list", "model": "openai/text-embedding-3-small",
+            "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+            "usage": {"prompt_tokens": 12, "total_tokens": 12, "cost": 0.0000006}
+        }"#;
+        let mut obs = meter().observe("embeddings");
+        obs.on_status(200);
+        obs.on_chunk(body.as_bytes());
+        let observed = obs.end(false);
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test" };
+        let cost = meter().resolve("embeddings", observed, follow_up).await;
+        assert_eq!(cost.amount_usd, Some(0.0000006));
+        assert_eq!(cost.model.as_deref(), Some("openai/text-embedding-3-small"));
+        assert_eq!(cost.metadata["resolution"], "inline usage accounting");
+    }
+
+    /// A rerank response (documented shape: `id` + `usage.cost` in
+    /// credits, plus Cohere `search_units`) resolves to its inline
+    /// figure; no ledger poll.
+    #[tokio::test]
+    async fn a_rerank_response_resolves_to_its_inline_cost() {
+        let body = r#"{
+            "id": "orid-1", "model": "cohere/rerank-3.5",
+            "results": [{"index": 2, "relevance_score": 0.98}],
+            "usage": {"total_tokens": 340, "cost": 0.0025, "search_units": 1}
+        }"#;
+        let mut obs = meter().observe("rerank");
+        obs.on_status(200);
+        obs.on_chunk(body.as_bytes());
+        let observed = obs.end(false);
+        let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test" };
+        let cost = meter().resolve("rerank", observed, follow_up).await;
+        assert_eq!(cost.amount_usd, Some(0.0025));
+        assert_eq!(cost.model.as_deref(), Some("cohere/rerank-3.5"));
         assert_eq!(cost.metadata["resolution"], "inline usage accounting");
     }
 
@@ -664,12 +790,12 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6,
                       "cost": 0.0, "cost_details": {"upstream_inference_cost": 0.00042}}
         }"#;
-        let mut obs = meter().observe();
+        let mut obs = meter().observe("chat/completions");
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, Some(0.00042));
     }
@@ -684,7 +810,7 @@ mod tests {
             "data: {\"id\":\"gen-3\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11,\"cost\":0.000031,\"cost_details\":{\"upstream_inference_cost\":null}}}\n\n",
             "data: [DONE]\n\n",
         );
-        let mut obs = meter().observe();
+        let mut obs = meter().observe("chat/completions");
         obs.on_status(200);
         // Split mid-line to prove the scanner reassembles across chunks.
         let bytes = stream.as_bytes();
@@ -695,7 +821,7 @@ mod tests {
 
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(observed, FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", observed, FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, Some(0.000031));
         assert_eq!(cost.model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
@@ -704,12 +830,12 @@ mod tests {
     /// A refused call (non-2xx, no generation minted) is a KNOWN zero.
     #[tokio::test]
     async fn a_refused_call_is_a_known_zero() {
-        let mut obs = meter().observe();
+        let mut obs = meter().observe("chat/completions");
         obs.on_status(401);
         obs.on_chunk(br#"{"error":{"message":"invalid key","code":401}}"#);
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, Some(0.0));
     }
@@ -718,10 +844,10 @@ mod tests {
     /// never a fake $0.
     #[tokio::test]
     async fn an_unanchored_interrupt_is_unknown_not_zero() {
-        let obs = meter().observe();
+        let obs = meter().observe("chat/completions");
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
-            .resolve(obs.end(true), FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", obs.end(true), FollowUp { http: &http, base_url: "http://u.test" })
             .await;
         assert_eq!(cost.amount_usd, None);
         assert!(cost.metadata["resolution"].as_str().unwrap().starts_with("unknown"));

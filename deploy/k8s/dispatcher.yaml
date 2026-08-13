@@ -40,6 +40,11 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, create, patch, delete]
+  # Pod logs: the node-test task kind reads a finished test pod's log
+  # to report the run's output.
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
   - apiGroups: [""]
     resources: [services]
     verbs: [get, list, watch, create, update, patch, delete]

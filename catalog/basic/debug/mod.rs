@@ -19,8 +19,16 @@ use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct DebugNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for DebugNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let data = ctx.inputs.raw("data").cloned().unwrap_or(Value::Null);
         let label = ctx.node_label.as_deref().unwrap_or(&ctx.node_id).to_string();

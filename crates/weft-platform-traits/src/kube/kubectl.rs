@@ -163,6 +163,46 @@ impl KubeReader for KubectlClient {
         let reason = String::from_utf8_lossy(&out.stdout).trim().to_string();
         Ok(if reason.is_empty() { None } else { Some(reason) })
     }
+
+    async fn pod_phase(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
+        // `--ignore-not-found` makes absence a SUCCESS with empty
+        // output, so `None` means exactly "the pod does not exist".
+        // Any other kubectl failure (apiserver error, expired
+        // credentials, network partition) propagates as an error: a
+        // caller acting on "the pod vanished" must never be fed a
+        // transient infra failure dressed up as absence.
+        let out = Command::new("kubectl")
+            .args([
+                "-n", namespace,
+                "get", "pod", pod_name,
+                "--ignore-not-found",
+                "-o", "jsonpath={.status.phase}",
+            ])
+            .output()
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "kubectl get pod {pod_name} (ns {namespace}) failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let phase = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Ok(if phase.is_empty() { None } else { Some(phase) })
+    }
+
+    async fn pod_logs(&self, namespace: &str, pod_name: &str, container: &str) -> Result<String> {
+        let out = Command::new("kubectl")
+            .args(["-n", namespace, "logs", pod_name, "-c", container])
+            .output()
+            .await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "kubectl logs {pod_name} (ns {namespace}) failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
 }
 
 #[async_trait]

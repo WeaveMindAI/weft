@@ -21,6 +21,8 @@ pub mod frames;
 #[cfg(feature = "runtime")]
 pub mod net;
 pub mod node;
+#[cfg(feature = "runtime")]
+pub mod node_test;
 pub mod primitive;
 pub mod project;
 pub mod pulse;
@@ -85,6 +87,12 @@ pub use serde_json;
 #[cfg(feature = "runtime")]
 pub use reqwest_middleware;
 
+// Same reason for `reqwest` itself: a helper taking the RESPONSE type
+// (`weft::reqwest::Response`) must be nameable without every node
+// package declaring the dep.
+#[cfg(feature = "runtime")]
+pub use reqwest;
+
 #[cfg(feature = "runtime")]
 pub use bus::{
     BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusMode, BusOptions,
@@ -124,6 +132,11 @@ pub use weft_node_derive::NodeManifest;
 // the parse/validate path uses only `MetadataCatalog` above.
 #[cfg(feature = "runtime")]
 pub use node::{Node, NodeCatalog};
+#[cfg(feature = "runtime")]
+pub use node_test::{
+    fixture_spec, fixture_spec_like, with_cleanup, FakeRig, LiveRig, NodeTest, NodeTestInfo,
+    RunOutcome, SentRequest, TestTier,
+};
 pub use primitive::{
     AwaitedEntry, AwaitedEntryKind, ExecutionSnapshot, KickedNode, SignalAuth,
     SignalRouting, SignalSpec, SignalSurface, SuspensionInfo,

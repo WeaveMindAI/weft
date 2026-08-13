@@ -55,6 +55,13 @@ impl KindHandler for ProviderEventsHandler {
         ProviderEvents::TAG
     }
 
+    fn broad_push_routed(&self) -> bool {
+        // Account-routed pushes match provider_events signals by
+        // connection + topic, so a resume must carry a pinning
+        // predicate (enforced at registration).
+        true
+    }
+
     fn compute_routing(
         &self,
         _token: &str,
@@ -510,7 +517,9 @@ fn spawn_shared_engine(
                         }
                     }
                 }
-                sub.fire.fire(named.clone(), "provider_events").await;
+                // A pushed event has no replay cursor; the delivery
+                // outcome is already logged by the fire path.
+                let _ = sub.fire.fire(named.clone(), "provider_events").await;
             }
         }
         .boxed()

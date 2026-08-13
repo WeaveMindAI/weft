@@ -34,7 +34,7 @@ struct MockState {
     /// `list_non_terminal_colors_for_project`, `delete_execution`
     /// cleanup, or tenant-scoped `list_executions` depend on this
     /// matching real-DB semantics.
-    execution_colors: HashMap<Color, (String, String)>,
+    execution_colors: HashMap<Color, ExecutionColorRow>,
     /// project_id -> tenant_id, mirroring the `project` table the Postgres
     /// seed reads. Tests register a project's tenant here (via
     /// `set_project_tenant`) so the execution_color seed stamps the right
@@ -109,8 +109,11 @@ impl MockJournal {
                 .iter()
                 .filter_map(|e| match e {
                     ExecEvent::ExecutionStarted { color, .. } => {
-                        let owner = g.execution_colors.get(color).map(|(_, t)| t.as_str());
-                        (owner == Some(tenant)).then_some(*color)
+                        // Same tenant + kind filter as the Postgres
+                        // listing: node-test colors never enumerate.
+                        let row = g.execution_colors.get(color);
+                        (row.is_some_and(|r| r.tenant_id == tenant && r.kind == "execution"))
+                            .then_some(*color)
                     }
                     _ => None,
                 })
@@ -151,10 +154,23 @@ impl MockJournal {
 /// that starts an execution for a project it never registered would pass on the
 /// mock while the identical sequence 500s in production. Register the project's
 /// tenant first via `set_project_tenant`.
+/// One `execution_color` row's mirror. A named struct (not a tuple)
+/// so adding a column is a compile error at every read site instead
+/// of a silently-unread field.
+#[derive(Clone)]
+struct ExecutionColorRow {
+    project_id: String,
+    tenant_id: String,
+    /// 'execution' | 'node_test', mirroring the Postgres `kind`
+    /// column: the lifecycle sweeps read only 'execution'.
+    kind: &'static str,
+}
+
 fn seed_execution_color(
     state: &mut MockState,
     color: Color,
     project_id: &str,
+    node_test: bool,
 ) -> anyhow::Result<()> {
     // Already-seeded first, EXACTLY like Postgres: an idempotent
     // re-ExecutionStarted for a seeded color succeeds even if the project row
@@ -170,7 +186,14 @@ fn seed_execution_color(
              when the project has no row"
         )
     })?;
-    state.execution_colors.insert(color, (project_id.to_string(), tenant));
+    state.execution_colors.insert(
+        color,
+        ExecutionColorRow {
+            project_id: project_id.to_string(),
+            tenant_id: tenant,
+            kind: if node_test { "node_test" } else { "execution" },
+        },
+    );
     Ok(())
 }
 
@@ -178,8 +201,8 @@ fn seed_execution_color(
 impl Journal for MockJournal {
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        if let ExecEvent::ExecutionStarted { color, project_id, .. } = event {
-            seed_execution_color(&mut g, *color, project_id)?;
+        if let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = event {
+            seed_execution_color(&mut g, *color, project_id, *node_test)?;
         }
         g.events.push(event.clone());
         Ok(())
@@ -192,8 +215,8 @@ impl Journal for MockJournal {
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         if g.dedup_keys.insert(dedup_key.to_string()) {
-            if let ExecEvent::ExecutionStarted { color, project_id, .. } = event {
-                seed_execution_color(&mut g, *color, project_id)?;
+            if let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = event {
+                seed_execution_color(&mut g, *color, project_id, *node_test)?;
             }
             g.events.push(event.clone());
         }
@@ -207,10 +230,10 @@ impl Journal for MockJournal {
         task: weft_task_store::tasks::NewTask,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let ExecEvent::ExecutionStarted { color, project_id, .. } = start else {
+        let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = start else {
             anyhow::bail!("start_execution requires an ExecutionStarted event");
         };
-        seed_execution_color(&mut g, *color, project_id)?;
+        seed_execution_color(&mut g, *color, project_id, *node_test)?;
         g.events.push(start.clone());
         g.events.extend(kicks.iter().cloned());
         g.tasks.push(task);
@@ -231,10 +254,10 @@ impl Journal for MockJournal {
             namespace: "mock-ns".into(),
         };
         let mut g = self.inner.lock().unwrap();
-        let ExecEvent::ExecutionStarted { color, project_id, .. } = start else {
+        let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = start else {
             anyhow::bail!("start_live_execution requires an ExecutionStarted event");
         };
-        seed_execution_color(&mut g, *color, project_id)?;
+        seed_execution_color(&mut g, *color, project_id, *node_test)?;
         g.events.push(start.clone());
         g.events.extend(kicks.iter().cloned());
         task.target_pod_name = Some(pod.pod_name.clone());
@@ -365,7 +388,7 @@ impl Journal for MockJournal {
             .unwrap()
             .execution_colors
             .get(&color)
-            .map(|(_project, tenant)| tenant.clone())
+            .map(|r| r.tenant_id.clone())
             .map_or(ColorLookup::NotFound, ColorLookup::Found))
     }
 
@@ -380,8 +403,10 @@ impl Journal for MockJournal {
             .events
             .iter()
             .find_map(|e| match e {
+                // A definition-less start (a node self-test) answers
+                // NotFound, mirroring the postgres impl.
                 ExecEvent::ExecutionStarted { color: c, definition_hash, .. } if *c == color => {
-                    Some(definition_hash.clone())
+                    definition_hash.clone()
                 }
                 _ => None,
             })
@@ -450,8 +475,11 @@ impl Journal for MockJournal {
         // non-terminal.
         let g = self.inner.lock().unwrap();
         let mut out = Vec::new();
-        for (color, (pid, _tenant)) in g.execution_colors.iter() {
-            if pid != project_id {
+        for (color, row) in g.execution_colors.iter() {
+            // PROJECT EXECUTIONS only, mirroring the Postgres
+            // `kind = 'execution'` filter: a node-test color's
+            // lifecycle is owned by its task, never by the project's.
+            if row.project_id != project_id || row.kind != "execution" {
                 continue;
             }
             let terminal = g.events.iter().any(|e2| {
@@ -476,8 +504,8 @@ impl Journal for MockJournal {
     ) -> anyhow::Result<std::collections::HashSet<Color>> {
         let g = self.inner.lock().unwrap();
         let mut out = std::collections::HashSet::new();
-        for (color, (pid, _tenant)) in g.execution_colors.iter() {
-            if pid != project_id {
+        for (color, row) in g.execution_colors.iter() {
+            if row.project_id != project_id {
                 continue;
             }
             let terminal = g.events.iter().any(|e2| {
@@ -534,7 +562,18 @@ impl Journal for MockJournal {
                 );
             }
         }
-        inner.signals.insert(sig.token.clone(), sig.clone());
+        // Mirror the Postgres conflict fence on kind_state: a write
+        // carrying an older (lower-seq) state loses to the stored one
+        // (a reactivate must never rewind an in-flight cursor write),
+        // and the row keeps the higher seq either way.
+        let mut fenced = sig.clone();
+        if let Some(existing) = inner.signals.get(&fenced.token) {
+            if existing.kind_state_seq > fenced.kind_state_seq {
+                fenced.kind_state = existing.kind_state.clone();
+            }
+            fenced.kind_state_seq = existing.kind_state_seq.max(fenced.kind_state_seq);
+        }
+        inner.signals.insert(fenced.token.clone(), fenced);
         inner
             .signal_placements
             .insert(sig.token.clone(), placement.clone());
@@ -543,6 +582,33 @@ impl Journal for MockJournal {
 
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
         Ok(self.inner.lock().unwrap().signals.get(token).cloned())
+    }
+
+    async fn signal_update_kind_state(
+        &self,
+        token: &str,
+        kind_state: &serde_json::Value,
+        seq: i64,
+        placement_generation: i64,
+    ) -> anyhow::Result<bool> {
+        let mut g = self.inner.lock().unwrap();
+        // Read the placement generation BEFORE taking the mutable
+        // signal borrow (both live on `g`).
+        let row_generation = g
+            .signal_placements
+            .get(token)
+            .map(|p| p.generation)
+            .unwrap_or(0);
+        if row_generation > placement_generation {
+            return Ok(false);
+        }
+        let Some(sig) = g.signals.get_mut(token) else { return Ok(false) };
+        if sig.kind_state_seq >= seq {
+            return Ok(false);
+        }
+        sig.kind_state = kind_state.clone();
+        sig.kind_state_seq = seq;
+        Ok(true)
     }
 
     async fn signal_remove_many(
@@ -637,6 +703,7 @@ mod tests {
             auth_kind: "none".into(),
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
+            kind_state_seq: 0,
         }
     }
 
@@ -663,13 +730,72 @@ mod tests {
         assert!(j.signal_get("tok-1").await.unwrap().is_some());
     }
 
+    /// The kind_state conflict fence mirrors Postgres: a re-insert
+    /// carrying an OLDER seq keeps the newer stored state (a
+    /// reactivate can never rewind an in-flight cursor write), and
+    /// the row keeps the higher seq.
+    #[tokio::test]
+    async fn signal_insert_never_rewinds_a_newer_kind_state() {
+        let j = MockJournal::new();
+        let placement =
+            SignalPlacement { listener_pod: "listener-abc".into(), generation: 1 };
+        let mut fresh = registration("tok-1");
+        fresh.kind_state = serde_json::json!({ "cursor": 10 });
+        fresh.kind_state_seq = 5;
+        j.signal_insert(&fresh, &placement).await.unwrap();
+
+        // A rewind (older seq) loses the state...
+        let mut stale = registration("tok-1");
+        stale.kind_state = serde_json::json!({ "cursor": 3 });
+        stale.kind_state_seq = 2;
+        j.signal_insert(&stale, &placement).await.unwrap();
+        let row = j.signal_get("tok-1").await.unwrap().unwrap();
+        assert_eq!(row.kind_state, serde_json::json!({ "cursor": 10 }));
+        assert_eq!(row.kind_state_seq, 5);
+
+        // ...an equal-or-newer seq wins (the deliberate overwrite).
+        let mut newer = registration("tok-1");
+        newer.kind_state = serde_json::json!({ "cursor": 12 });
+        newer.kind_state_seq = 5;
+        j.signal_insert(&newer, &placement).await.unwrap();
+        let row = j.signal_get("tok-1").await.unwrap().unwrap();
+        assert_eq!(row.kind_state, serde_json::json!({ "cursor": 12 }));
+        assert_eq!(row.kind_state_seq, 5);
+    }
+
+    /// A node-test start seeds the color mirror as `node_test`, and
+    /// the project-lifecycle reads (`list_non_terminal_colors_for_project`)
+    /// skip it, exactly like the Postgres `kind = 'execution'` filter.
+    #[tokio::test]
+    async fn node_test_colors_stay_out_of_lifecycle_reads() {
+        let j = MockJournal::new();
+        j.set_project_tenant("p", "t");
+        let run = weft_core::Color::new_v4();
+        let test = weft_core::Color::new_v4();
+        j.record_event(&started(run, "p")).await.unwrap();
+        j.record_event(&ExecEvent::ExecutionStarted {
+            color: test,
+            project_id: "p".into(),
+            entry_node: "node-test:MyNode::t".into(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: None,
+            node_test: true,
+            at_unix: 0,
+        })
+        .await
+        .unwrap();
+        let live = j.list_non_terminal_colors_for_project("p").await.unwrap();
+        assert_eq!(live, vec![run], "the node-test color never counts as a project run");
+    }
+
     fn started(color: weft_core::Color, project_id: &str) -> ExecEvent {
         ExecEvent::ExecutionStarted {
             color,
             project_id: project_id.into(),
             entry_node: "entry".into(),
             phase: weft_core::context::Phase::Fire,
-            definition_hash: "h".into(),
+            definition_hash: Some("h".into()),
+            node_test: false,
             at_unix: 0,
         }
     }
@@ -730,7 +856,8 @@ mod tests {
             project_id: project_id.into(),
             entry_node: "entry".into(),
             phase: weft_core::context::Phase::Fire,
-            definition_hash: "h".into(),
+            definition_hash: Some("h".into()),
+            node_test: false,
             at_unix,
         }
     }

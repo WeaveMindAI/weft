@@ -57,8 +57,10 @@ pub struct InfraNodeRow {
     pub units: BTreeMap<String, UnitRuntime>,
 }
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let stmts = [
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "infra_node",
+    tables: &["infra_node"],
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_node (
             project_id          TEXT NOT NULL,
             node_id             TEXT NOT NULL,
@@ -81,12 +83,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_project   ON infra_node(project_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_namespace ON infra_node(namespace)"#,
-    ];
-    for sql in stmts {
-        sqlx::query(sql).execute(pool).await?;
-    }
-    Ok(())
-}
+    ],
+};
 
 /// Upsert a row in `infra_node`. Used by the apply task's status
 /// transitions and by the supervisor's lifecycle commands. The

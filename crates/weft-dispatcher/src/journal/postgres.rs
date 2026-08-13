@@ -101,15 +101,11 @@ impl PostgresJournal {
     /// provisions; `connect` delegates here so production and the rig run
     /// the same migration path.
     pub async fn from_pool(pool: PgPool) -> anyhow::Result<Self> {
-        // Under the cluster-wide schema lock: `IF NOT EXISTS` is idempotent but
-        // not concurrency-safe (racing replicas can hit duplicate catalog-key
-        // errors on a fresh DB), so all schema creation serializes on one key.
-        crate::lease::with_advisory_lock_blocking(
-            &pool,
-            crate::lease::advisory_key("migrate", "schema"),
-            || async { migrate(&pool).await },
-        )
-        .await?;
+        // Racing replicas serialize inside the guard itself: apply_groups
+        // runs under its own advisory lock, so no outer lock is layered
+        // here (an outer lock on the same pool would pin one connection
+        // while the guard opens a second, hanging a size-one pool).
+        weft_task_store::apply_groups(&pool, &[&GROUP]).await?;
         Ok(Self { pool })
     }
 
@@ -187,21 +183,24 @@ impl PostgresJournal {
         event: &ExecEvent,
         dedup_key: Option<&str>,
     ) -> anyhow::Result<()> {
-        let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, .. } = event else {
+        let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, node_test, .. } =
+            event
+        else {
             anyhow::bail!("write_started_in requires an ExecutionStarted event");
         };
         weft_journal::record_event_in(&mut *tx, event, None, dedup_key)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let rows = sqlx::query(
-            "INSERT INTO execution_color (color, project_id, tenant_id, started_at_unix, phase) \
-             SELECT $1, $2, p.tenant_id, $3, $4 FROM project p WHERE p.id = $2::uuid \
+            "INSERT INTO execution_color (color, project_id, tenant_id, started_at_unix, phase, kind) \
+             SELECT $1, $2, p.tenant_id, $3, $4, $5 FROM project p WHERE p.id = $2::uuid \
              ON CONFLICT (color) DO NOTHING",
         )
         .bind(color.to_string())
         .bind(project_id)
         .bind(*at_unix as i64)
         .bind(phase.as_str())
+        .bind(if *node_test { "node_test" } else { "execution" })
         .execute(&mut *tx)
         .await?;
         if rows.rows_affected() == 0 {
@@ -242,8 +241,12 @@ impl PostgresJournal {
     }
 }
 
-async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
-    let stmts = [
+/// The journal's schema, applied at journal connect (before every other
+/// group: the `worker_pod` group's fencing trigger attaches to `exec_event`).
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "exec_event",
+    tables: &["exec_event", "signal_token", "signal", "execution_color"],
+    ddl: &[
         // exec_event: append-only journal. `dedup_key` is the
         // idempotency knob writers that may retry (dispatcher tasks
         // that crash mid-execution) populate; the partial UNIQUE
@@ -308,6 +311,15 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             -- SSE last-event-id, socket reconnect token) use the
             -- same column.
             kind_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+            -- The kind_state write fence: a strictly-increasing
+            -- per-signal version stamped by the holder's durable
+            -- cursor writes. An update whose seq is not above the
+            -- stored one is dropped (the newer state stands), and a
+            -- register that carries prior state forward loses to any
+            -- newer in-flight write the same way. A REAL column, so
+            -- the version can never be lost by handling the state
+            -- blob (the blob stays purely the kind's own state).
+            kind_state_seq BIGINT NOT NULL DEFAULT 0,
             -- FIFO queue of fires that landed while the project was
             -- not Active (Activating / park / hibernate-in-grace /
             -- Deactivating). Each element is { "payload": <json>,
@@ -415,16 +427,19 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             -- now that a project can run more than one worker; see
             -- `task_kinds::execute::enqueue_resume`.
             -- NULL also covers dispatcher-orchestrated writes (no pod).
-            owner_pod_name TEXT
+            owner_pod_name TEXT,
+            -- What this color IS: 'execution' (a project run; the
+            -- project-lifecycle sweeps, cancel, wipe, and drain
+            -- counting operate on these) or 'node_test' (a node
+            -- self-test's identity: real cost attribution and broker
+            -- scoping, but its lifecycle is owned by its task, so the
+            -- project sweeps must never cancel it or wait on it).
+            kind TEXT NOT NULL DEFAULT 'execution'
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_tenant ON execution_color(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_project ON execution_color(project_id)"#,
-    ];
-    for sql in stmts {
-        sqlx::query(sql).execute(pool).await?;
-    }
-    Ok(())
-}
+    ],
+};
 
 #[async_trait]
 impl Journal for PostgresJournal {
@@ -676,9 +691,13 @@ impl Journal for PostgresJournal {
         color: Color,
     ) -> anyhow::Result<ColorLookup<String>> {
         Ok(match self.execution_started(color).await? {
-            ColorLookup::Found(ExecEvent::ExecutionStarted { definition_hash, .. }) => {
-                ColorLookup::Found(definition_hash)
-            }
+            // A definition-less start (a node self-test) answers
+            // NotFound: nothing may resume against it, and the
+            // caller's existing unknown-color bail is the loud path.
+            ColorLookup::Found(ExecEvent::ExecutionStarted {
+                definition_hash: Some(hash),
+                ..
+            }) => ColorLookup::Found(hash),
             ColorLookup::Found(_) => ColorLookup::NotFound,
             ColorLookup::NotFound => ColorLookup::NotFound,
             ColorLookup::Corrupt => ColorLookup::Corrupt,
@@ -730,7 +749,13 @@ impl Journal for PostgresJournal {
         let project = query.project_id.as_deref();
         let after = query.started_after.map(|v| v as i64);
         let before = query.started_before.map(|v| v as i64);
+        // PROJECT EXECUTIONS only: this list is the user's record of
+        // their project running. A node-test color is a real identity
+        // (its cost trail is addressed by color from the test report),
+        // but it has no definition, no graph, and no resume, so it
+        // never belongs in this listing.
         let where_clause = "ec.tenant_id = $1 \
+             AND ec.kind = 'execution' \
              AND ($2::text IS NULL OR ec.project_id = $2) \
              AND ($3::bigint IS NULL OR ec.started_at_unix >= $3) \
              AND ($4::bigint IS NULL OR ec.started_at_unix < $4)";
@@ -820,10 +845,15 @@ impl Journal for PostgresJournal {
         // is the denormalized (color, project_id) index seeded at
         // ExecutionStarted time, so we get the project filter as an
         // indexed equality lookup rather than parsing JSON. NOT
-        // EXISTS lets Postgres short-circuit per row.
+        // EXISTS lets Postgres short-circuit per row. PROJECT
+        // EXECUTIONS only (`kind = 'execution'`): this is the one
+        // read behind the cancel/wipe sweeps and the drain count, and
+        // a node-test color's lifecycle is owned by its task, never by
+        // the project's.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT ec.color FROM execution_color ec \
              WHERE ec.project_id = $1 \
+               AND ec.kind = 'execution' \
                AND NOT EXISTS ( \
                    SELECT 1 FROM exec_event t \
                    WHERE t.color = ec.color \
@@ -940,6 +970,13 @@ impl Journal for PostgresJournal {
         // nothing would ever fire). A zero-row result means the pod was
         // reaped between placement's pick and this write; fail loud, the
         // register task's retry re-places onto a live pod.
+        //
+        // kind_state on conflict is seq-FENCED: the register carries
+        // the prior state forward at the seq it read, and a cursor
+        // write that landed in between carries a higher seq, so the
+        // reactivate loses to it instead of rewinding a live cursor.
+        // Equal seq = the register's (possibly recomputed) state wins,
+        // which is the deliberate overwrite (a timer's fresh schedule).
         let mut tx = self.pool.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(crate::listener::pod_lock_key(&placement.listener_pod))
@@ -951,10 +988,10 @@ impl Journal for PostgresJournal {
               spec_json, access_id, created_at, consumer_kind, tags, port_snapshot, \
               consumer_payload, \
               surface_kind, mount_path, auth_kind, auth_config, kind_state, \
-              listener_pod, placement_generation) \
+              kind_state_seq, listener_pod, placement_generation) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                    $17, $18, $19, $20 \
-             WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $19) \
+                    $17, $18, $19, $20, $21 \
+             WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $20) \
              ON CONFLICT (token) DO UPDATE SET \
                  spec_json = EXCLUDED.spec_json, \
                  access_id = EXCLUDED.access_id, \
@@ -966,7 +1003,11 @@ impl Journal for PostgresJournal {
                  mount_path = EXCLUDED.mount_path, \
                  auth_kind = EXCLUDED.auth_kind, \
                  auth_config = EXCLUDED.auth_config, \
-                 kind_state = EXCLUDED.kind_state, \
+                 kind_state = CASE \
+                     WHEN signal.kind_state_seq <= EXCLUDED.kind_state_seq \
+                         THEN EXCLUDED.kind_state \
+                     ELSE signal.kind_state END, \
+                 kind_state_seq = GREATEST(signal.kind_state_seq, EXCLUDED.kind_state_seq), \
                  listener_pod = EXCLUDED.listener_pod, \
                  placement_generation = EXCLUDED.placement_generation",
         )
@@ -988,6 +1029,7 @@ impl Journal for PostgresJournal {
         .bind(&sig.auth_kind)
         .bind(sig.auth_config.as_ref())
         .bind(&sig.kind_state)
+        .bind(sig.kind_state_seq)
         .bind(&placement.listener_pod)
         .bind(placement.generation)
         .execute(&mut *tx)
@@ -1010,6 +1052,32 @@ impl Journal for PostgresJournal {
             .fetch_optional(&self.pool)
             .await?;
         row.map(row_to_signal).transpose()
+    }
+
+    async fn signal_update_kind_state(
+        &self,
+        token: &str,
+        kind_state: &serde_json::Value,
+        seq: i64,
+        placement_generation: i64,
+    ) -> anyhow::Result<bool> {
+        // Both fences live in the WHERE so the write is atomic (no
+        // read-then-write window); the seq is a real column, so the
+        // state blob stays purely the kind's own state.
+        let res = sqlx::query(
+            "UPDATE signal
+             SET kind_state = $2::jsonb, kind_state_seq = $3
+             WHERE token = $1
+               AND placement_generation <= $4
+               AND kind_state_seq < $3",
+        )
+        .bind(token)
+        .bind(kind_state)
+        .bind(seq)
+        .bind(placement_generation)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn signal_remove_many(
@@ -1063,32 +1131,32 @@ impl Journal for PostgresJournal {
 const SIGNAL_SELECT_WHERE_TOKEN: &str =
     "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
      spec_json, access_id, consumer_kind, tags, port_snapshot, consumer_payload, \
-     surface_kind, mount_path, auth_kind, auth_config, kind_state \
+     surface_kind, mount_path, auth_kind, auth_config, kind_state, kind_state_seq \
      FROM signal WHERE token = $1";
 
 const SIGNAL_SELECT_WHERE_PROJECT: &str =
     "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
      spec_json, access_id, consumer_kind, tags, port_snapshot, consumer_payload, \
-     surface_kind, mount_path, auth_kind, auth_config, kind_state \
+     surface_kind, mount_path, auth_kind, auth_config, kind_state, kind_state_seq \
      FROM signal WHERE project_id = $1";
 
 const SIGNAL_DELETE_BY_COLOR_RETURNING: &str =
     "DELETE FROM signal WHERE color = $1 RETURNING token, tenant_id, project_id, color, \
      node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
-     auth_kind, auth_config, kind_state";
+     auth_kind, auth_config, kind_state, kind_state_seq";
 
 const SIGNAL_DELETE_BY_PROJECT_RETURNING: &str =
     "DELETE FROM signal WHERE project_id = $1 RETURNING token, tenant_id, project_id, color, \
      node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
-     auth_kind, auth_config, kind_state";
+     auth_kind, auth_config, kind_state, kind_state_seq";
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     "DELETE FROM signal WHERE token = ANY($1) RETURNING token, tenant_id, project_id, color, \
      node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
      consumer_payload, surface_kind, mount_path, \
-     auth_kind, auth_config, kind_state";
+     auth_kind, auth_config, kind_state, kind_state_seq";
 
 /// Row shape for signal SELECTs. `FromRow` (not a tuple) because
 /// the row exceeds sqlx's 16-tuple cap.
@@ -1111,6 +1179,7 @@ struct SignalRow {
     auth_kind: String,
     auth_config: Option<serde_json::Value>,
     kind_state: serde_json::Value,
+    kind_state_seq: i64,
 }
 
 fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
@@ -1150,6 +1219,7 @@ fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
         auth_kind: row.auth_kind,
         auth_config: row.auth_config,
         kind_state: row.kind_state,
+        kind_state_seq: row.kind_state_seq,
     })
 }
 

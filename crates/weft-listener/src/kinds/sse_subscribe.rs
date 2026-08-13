@@ -237,7 +237,9 @@ fn spawn_loop(
                         continue;
                     }
                     let payload = super::event_source::coerce_text_payload(msg.data);
-                    ctx.fire.fire(payload, "sse_subscribe").await;
+                    // An SSE event has no replay cursor; the delivery
+                    // outcome is already logged by the fire path.
+                    let _ = ctx.fire.fire(payload, "sse_subscribe").await;
                 }
             }
 

@@ -371,6 +371,7 @@ pub async fn register_signal(
     is_resume: bool,
     color: Option<&str>,
     placement_generation: i64,
+    source: weft_listener::protocol::RegisterSource,
 ) -> Result<(weft_core::primitive::SignalRouting, Value)> {
     let client = reqwest::Client::new();
     let url = format!("{}/register", handle.admin_url.trim_end_matches('/'));
@@ -385,6 +386,7 @@ pub async fn register_signal(
         is_resume,
         color: color.map(str::to_string),
         placement_generation,
+        source,
     };
     let resp = client.post(&url).json(&req).send().await?;
     let resp = bail_unless_ok(resp, "/register").await?;
@@ -489,30 +491,26 @@ async fn load_report(handle: &ListenerHandle) -> Result<weft_listener::protocol:
 // Pod registry schema
 // =============================================================
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    // The registry of live listener pods. Keyed by pod (the placement
-    // target), NOT tenant: a pooled listener holds many tenants'
-    // signals. `owner_pod_id` + `leased_until_unix` say which
-    // dispatcher pod is authoritative for this listener's lifecycle.
-    // `grace_until_unix` is the spawn grace: until it passes, the idle
-    // reaper leaves the pod alone even with zero signals placed, so a
-    // freshly-spawned pod is not torn down in the window before its
-    // first placement row is written.
-    sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS listener_pod (
+// The registry of live listener pods. Keyed by pod (the placement
+// target), NOT tenant: a pooled listener holds many tenants'
+// signals. `owner_pod_id` + `leased_until_unix` say which
+// dispatcher pod is authoritative for this listener's lifecycle.
+// `grace_until_unix` is the spawn grace: until it passes, the idle
+// reaper leaves the pod alone even with zero signals placed, so a
+// freshly-spawned pod is not torn down in the window before its
+// first placement row is written.
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "listener_pod",
+    tables: &["listener_pod"],
+    ddl: &[r#"CREATE TABLE IF NOT EXISTS listener_pod (
             pod_name          TEXT PRIMARY KEY,
             admin_url         TEXT NOT NULL,
             namespace         TEXT NOT NULL,
             owner_pod_id      TEXT NOT NULL,
             leased_until_unix BIGINT NOT NULL,
             grace_until_unix  BIGINT NOT NULL
-        )"#,
-    )
-    .execute(pool)
-    .await
-    .context("create listener_pod table")?;
-    Ok(())
-}
+        )"#],
+};
 
 // =============================================================
 // ListenerPool: load-based placement
@@ -642,14 +640,48 @@ impl ListenerPool {
         pod_id: &str,
         exclude: Option<&str>,
     ) -> Result<(String, i64, ListenerHandle)> {
-        let row: Option<(String, String, String, bool, Option<String>)> = sqlx::query_as(
-            "SELECT tenant_id, node_id, spec_json, is_resume, color \
+        // The full identity + routing + state columns: a pod move
+        // RESTORES the signal verbatim (routing and kind_state from
+        // the row). Recomputing routing would mint a fresh API key and
+        // silently invalidate the user's existing one; recomputing
+        // kind_state would reset a timer's clock or a poll cursor
+        // mid-flight. A move is not a user action; nothing may change.
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            Option<Value>,
+            Value,
+            i64,
+        )> = sqlx::query_as(
+            "SELECT tenant_id, node_id, spec_json, is_resume, color, \
+                    surface_kind, mount_path, auth_kind, auth_config, kind_state, \
+                    kind_state_seq \
              FROM signal WHERE token = $1",
         )
         .bind(token)
         .fetch_optional(pg_pool)
         .await?;
-        let Some((tenant_id, node_id, spec_json, is_resume, color)) = row else {
+        let Some((
+            tenant_id,
+            node_id,
+            spec_json,
+            is_resume,
+            color,
+            surface_kind,
+            mount_path,
+            auth_kind,
+            auth_config,
+            kind_state,
+            kind_state_seq,
+        )) = row
+        else {
             anyhow::bail!(
                 "token '{token}' has no durable signal row; \
                  cannot place a listener for a signal that does not exist"
@@ -657,6 +689,21 @@ impl ListenerPool {
         };
         let spec: SignalSpec = serde_json::from_str(&spec_json)
             .with_context(|| format!("parse spec_json for re-placing signal {token}"))?;
+        let routing = {
+            let surface: weft_broker_client::protocol::SignalSurfaceKind =
+                serde_json::from_value(Value::String(surface_kind))
+                    .with_context(|| format!("parse surface_kind for signal {token}"))?;
+            let auth: weft_broker_client::protocol::SignalAuthKind =
+                serde_json::from_value(Value::String(auth_kind))
+                    .with_context(|| format!("parse auth_kind for signal {token}"))?;
+            weft_broker_client::protocol::routing_from_columns(
+                surface,
+                mount_path.as_deref(),
+                auth,
+                auth_config,
+            )
+            .map_err(|e| anyhow::anyhow!("reassemble routing for signal {token}: {e}"))?
+        };
         // The next generation (current + 1), a PURE READ. It is committed
         // only by `set_placement` at the end of this method; if register
         // fails before then, the row's generation is untouched so the
@@ -670,6 +717,8 @@ impl ListenerPool {
                 let node_id = node_id.clone();
                 let tenant_id = tenant_id.clone();
                 let color = color.clone();
+                let routing = routing.clone();
+                let kind_state = kind_state.clone();
                 async move {
                     register_signal(
                         &handle,
@@ -680,6 +729,11 @@ impl ListenerPool {
                         is_resume,
                         color.as_deref(),
                         generation,
+                        weft_listener::protocol::RegisterSource::Restore {
+                            routing,
+                            kind_state,
+                            seq: kind_state_seq,
+                        },
                     )
                     .await?;
                     Ok(handle)

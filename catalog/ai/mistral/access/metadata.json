@@ -1,0 +1,89 @@
+{
+  "type": "MistralAccess",
+  "label": "Mistral Access",
+  "description": "Sign in to Mistral, the document-parsing (OCR) API the Parse Document node speaks. Pick an existing connection or paste an API key.",
+  "tags": [
+    "ai",
+    "mistral",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#FF7000",
+  "service": {
+    "service": "mistral",
+    "label": "Mistral",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.mistral.ai/v1/models"
+    },
+    "identity": "mistral",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://console.mistral.ai/api-keys",
+        "steps": [
+          "Open console.mistral.ai, API Keys, and create a key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The Mistral access: wire it into Parse Document."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "MistralAccess '{id}' has no connected account; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

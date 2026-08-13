@@ -6,13 +6,21 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct GoogleDriveListFilesNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for GoogleDriveListFilesNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get_or("query", String::new())?;
@@ -21,25 +29,24 @@ impl Node for GoogleDriveListFilesNode {
         let page_size: f64 = ctx.inputs.get("pageSize")?;
 
         let drive = ctx.client(&access).await?;
-        let mut req = drive
-            .get("https://www.googleapis.com/drive/v3/files")
-            .query(&[
-                ("pageSize", (page_size as u64).to_string()),
-                ("fields", "files(id,name,mimeType)".to_string()),
-            ]);
+        // Drive may answer FEWER than pageSize per page even when more
+        // match, so honoring the cap takes paging until it fills (or
+        // the listing ends), never trusting one page.
+        let wanted = page_size as usize;
+        let mut base = format!(
+            "{}/files?pageSize={}&fields=nextPageToken,files(id,name,mimeType)",
+            super::drive::API,
+            page_size as u64,
+        );
         if !query.trim().is_empty() {
-            req = req.query(&[("q", query.trim())]);
+            base.push_str(&format!("&q={}", urlencoding::encode(query.trim())));
         }
-        let resp = req.send().await.node_err("google drive: list files")?;
-        let status = resp.status();
-        let answer: Value = resp.json().await.node_err("google drive: read list response")?;
-        if !status.is_success() {
-            weft::node_bail!(
-                "google drive answered {status} listing files: {}",
-                answer.pointer("/error/message").and_then(Value::as_str).unwrap_or("no detail")
-            );
-        }
-        let files = answer.get("files").cloned().unwrap_or(Value::Array(Vec::new()));
-        ctx.pulse_downstream(NodeOutput::new().set("files", files)).await
+        let mut files =
+            super::api::paged(&drive, &base, "files", "list the files", |got| {
+                got.len() >= wanted
+            })
+            .await?;
+        files.truncate(wanted);
+        ctx.pulse_downstream(NodeOutput::new().set("files", Value::Array(files))).await
     }
 }

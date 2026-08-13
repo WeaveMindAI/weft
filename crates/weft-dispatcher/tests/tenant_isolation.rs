@@ -160,7 +160,8 @@ fn started(color: Uuid, project_id: &str) -> weft_journal::ExecEvent {
         project_id: project_id.to_string(),
         entry_node: "entry".to_string(),
         phase: weft_core::context::Phase::Fire,
-        definition_hash: "h".to_string(),
+        definition_hash: Some("h".to_string()),
+        node_test: false,
         at_unix: 0,
     }
 }

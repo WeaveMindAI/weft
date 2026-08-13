@@ -138,30 +138,18 @@ impl SocketDial for ConnectionSocketDial {
                          registered to route them by; connect your own credential on the node",
                     ));
                 };
+                // The shared relay rebuild (same one HTTP rides), on the
+                // session's https spelling; the ws twin is swapped in
+                // after, since the joined URL keeps the relay's scheme.
                 let https = https_form(&parsed);
-                let Some(route) = weft_providers::route_under(meter.base_url(), &https) else {
-                    return Err(dial_err(
-                        service,
-                        format!(
-                            "this session ({url}) is not under the service's API ({}); \
-                             sessions on a runtime-supplied credential must address the \
-                             service's own API",
-                            meter.base_url(),
-                        ),
-                    ));
-                };
-                let relay: url::Url = relay
-                    .parse()
-                    .map_err(|e| dial_err(service, format!("bad relay URL: {e}")))?;
-                let scheme = ws_scheme(relay.scheme()).map_err(|e| dial_err(service, e))?;
-                let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
-                let target = format!(
-                    "{scheme}://{}{}/{route}{query}",
-                    relay.authority(),
-                    relay.path().trim_end_matches('/'),
-                );
-                let target: url::Url =
-                    target.parse().map_err(|e| dial_err(service, format!("relay URL: {e}")))?;
+                let joined = weft_providers::relay_join(meter.base_url(), relay, &https)
+                    .map_err(|e| dial_err(service, e))?;
+                let mut target: url::Url =
+                    joined.parse().map_err(|e| dial_err(service, format!("relay URL: {e}")))?;
+                let scheme = ws_scheme(target.scheme()).map_err(|e| dial_err(service, e))?;
+                target
+                    .set_scheme(scheme)
+                    .map_err(|_| dial_err(service, "relay URL scheme rewrite refused"))?;
                 (target, None)
             }
             None => {
@@ -458,6 +446,9 @@ mod tests {
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
+        async fn requeue(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
         async fn heartbeat(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
@@ -531,7 +522,7 @@ mod tests {
         fn prepare(&self, _path: &str, _body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
             Ok(None)
         }
-        fn observe(&self) -> Box<dyn weft_providers::CallObservation> {
+        fn observe(&self, _path: &str) -> Box<dyn weft_providers::CallObservation> {
             unreachable!("no one-shot routes")
         }
         fn observe_session(
@@ -543,6 +534,7 @@ mod tests {
         }
         async fn resolve(
             &self,
+            _path: &str,
             _observed: weft_providers::ObservedCall,
             _follow_up: weft_providers::FollowUp<'_>,
         ) -> MeasuredCost {

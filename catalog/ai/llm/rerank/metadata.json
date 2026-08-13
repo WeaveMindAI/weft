@@ -1,0 +1,52 @@
+{
+  "type": "LlmRerank",
+  "label": "Rerank",
+  "description": "Reorder documents by relevance to a query through the wired OpenRouter connection: pick the rerank model on the provider node (cohere/rerank-4-pro, ...). Emits the documents best-first plus each one's score.",
+  "tags": [
+    "ai",
+    "rerank",
+    "llm"
+  ],
+  "icon": "ArrowDownWideNarrow",
+  "color": "#7C3AED",
+  "inputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": true,
+      "description": "Wire an OpenRouterProvider whose model names a rerank model."
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": true,
+      "label": "Query"
+    },
+    {
+      "name": "documents",
+      "type": "List[String]",
+      "required": true
+    },
+    {
+      "name": "topN",
+      "type": "Number",
+      "required": false,
+      "label": "Top N",
+      "description": "Only return the best N. Empty = all, reordered."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "documents",
+      "type": "List[String]",
+      "required": false,
+      "description": "The documents, best match first."
+    },
+    {
+      "name": "scores",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each entry: the original index and its relevance score, best first."
+    }
+  ]
+}

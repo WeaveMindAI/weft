@@ -8,8 +8,9 @@
 //! is unset the macro skips the test, so a dev box without Postgres still
 //! builds and `cargo test` passes; CI sets `DATABASE_URL` to run them.
 //!
-//! The schema is the crate's own `migrate()` (no sqlx migration files), so
-//! every test runs both `tasks::migrate` and `worker_pod::migrate` first.
+//! The schema is the crate's own `SchemaGroup`s applied via `apply_groups`
+//! (no sqlx migration files), so every test applies both the `task` and
+//! `worker_pod` groups first.
 //!
 //! Gated behind the `db-tests` feature (off by default) so a plain
 //! `cargo test --workspace` needs no Postgres; CI runs
@@ -27,6 +28,7 @@ use weft_task_store::tasks::{
 use weft_task_store::worker_pod::{
     self, has_live_for_project, mark_dead, mark_done_if_idle, pick_admittable_for_project,
     pod_loads_for_project, projects_with_multiple_workers, register_alive, set_draining,
+    AliveTransition,
 };
 use weft_task_store::{TaskKind, TaskTarget};
 
@@ -37,10 +39,12 @@ const TENANT: Option<&str> = Some("tenant-1");
 const SAT: f64 = weft_platform_traits::SATURATION_MEM_FRACTION;
 
 async fn setup(pool: &PgPool) {
-    tasks::migrate(pool).await.expect("tasks schema");
-    // `worker_pod::migrate` creates a fencing trigger ON `exec_event`, a
+    weft_task_store::apply_groups(pool, &[&tasks::GROUP])
+        .await
+        .expect("tasks schema");
+    // `worker_pod::GROUP` creates a fencing trigger ON `exec_event`, a
     // table owned by the dispatcher's journal layer (created at journal
-    // connect, which runs before task-store migrate in production). These
+    // connect, which runs before the task-store groups in production). These
     // task-store tests never touch the journal, so we stand up a minimal
     // `exec_event` table (matching the dispatcher's columns) purely so the
     // trigger DDL has a table to attach to. SYNC: keep these columns in step
@@ -59,7 +63,7 @@ async fn setup(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("exec_event stub");
-    // `worker_pod::migrate` also creates a trigger ON `task` that stamps
+    // `worker_pod::GROUP` also creates a trigger ON `task` that stamps
     // `execution_color.owner_pod_name` on claim (ownership-follows-claim).
     // Same situation as exec_event: the table is the dispatcher journal's,
     // created before task-store migrate in production. Stand up a minimal
@@ -80,15 +84,17 @@ async fn setup(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("execution_color stub");
-    worker_pod::migrate(pool).await.expect("worker_pod schema");
+    weft_task_store::apply_groups(pool, &[&worker_pod::GROUP])
+        .await
+        .expect("worker_pod schema");
 }
 
 /// Insert an alive worker pod for the project (pressure 0 until set).
 async fn alive_pod(pool: &PgPool, pod: &str) {
-    worker_pod::insert_spawning(pool, pod, PROJECT, "ns-1", "disp-1", "bin-1")
+    worker_pod::insert_spawning(pool, pod, PROJECT, "ns-1", "disp-1", Some("bin-1"), "worker", None)
         .await
         .expect("insert_spawning");
-    register_alive(pool, pod, PROJECT)
+    register_alive(pool, pod, PROJECT, AliveTransition::FromSpawning)
         .await
         .expect("register_alive");
 }
@@ -411,11 +417,11 @@ async fn scaledown_excludes_draining_from_candidate_and_loads(pool: PgPool) {
 async fn stale_spawning_lists_only_past_threshold(pool: PgPool) {
     setup(&pool).await;
     // A pod that JUST started spawning (never registered alive): too young.
-    worker_pod::insert_spawning(&pool, "pod-fresh", PROJECT, "ns-1", "disp-1", "bin-1")
+    worker_pod::insert_spawning(&pool, "pod-fresh", PROJECT, "ns-1", "disp-1", Some("bin-1"), "worker", None)
         .await
         .expect("insert fresh");
     // A pod older than the grace: backdate its created_at to the epoch.
-    worker_pod::insert_spawning(&pool, "pod-old", PROJECT, "ns-1", "disp-1", "bin-1")
+    worker_pod::insert_spawning(&pool, "pod-old", PROJECT, "ns-1", "disp-1", Some("bin-1"), "worker", None)
         .await
         .expect("insert old");
     sqlx::query("UPDATE worker_pod SET created_at_unix = $2 WHERE pod_name = $1")
@@ -438,6 +444,205 @@ async fn stale_spawning_lists_only_past_threshold(pool: PgPool) {
     mark_dead(&pool, "pod-old").await.expect("mark_dead");
     let after = worker_pod::list_stale_spawning(&pool, threshold).await.expect("list");
     assert!(after.is_empty(), "a dead row is not re-listed");
+}
+
+/// Seconds since the unix epoch, the same clock the store stamps
+/// `completed_at_unix` with.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock past epoch")
+        .as_secs() as i64
+}
+
+/// A `run_node_test`-shaped dispatcher task spec.
+fn node_test_task(dedup: &str) -> tasks::NewTask {
+    tasks::NewTask {
+        kind: "run_node_test".to_string(),
+        target: TaskTarget::Dispatcher,
+        project_id: Some(PROJECT.to_string()),
+        dedup_key: Some(dedup.to_string()),
+        color: None,
+        tenant_id: TENANT.map(str::to_string),
+        target_pod_name: None,
+        binary_hash: None,
+        payload: json!({}),
+    }
+}
+
+/// The node-test orphan sweep's grace behavior: a non-terminal
+/// node-test row is listed only when its owning task is GONE or has
+/// been terminal since before the threshold. A live task, or one
+/// terminal within the grace (its finishing claim may still be
+/// cleaning up, or a re-claim may still need the pod's logs), keeps
+/// the row protected. Worker rows never appear.
+#[sqlx::test]
+async fn node_test_orphan_listing_has_grace(pool: PgPool) {
+    setup(&pool).await;
+    let threshold = now_unix() - tasks::CLAIM_DURATION_SECS;
+
+    // A LIVE (pending) owning task keeps its pod row out of the orphan list.
+    let live_task = tasks::enqueue(&pool, node_test_task("live")).await.expect("enqueue live");
+    worker_pod::insert_spawning(
+        &pool, "nt-live", PROJECT, "ns-1", "disp-1", None, "node-test", Some(live_task),
+    )
+    .await
+    .expect("insert nt-live");
+    register_alive(&pool, "nt-live", PROJECT, AliveTransition::FromSpawningOrAlive)
+        .await
+        .expect("register nt-live");
+    // The executor-side transition is idempotent: a re-claim re-runs it.
+    register_alive(&pool, "nt-live", PROJECT, AliveTransition::FromSpawningOrAlive)
+        .await
+        .expect("re-register nt-live");
+    // A RECENTLY terminal owning task (within one claim duration) still
+    // protects its pod row: an in-flight cleanup or re-harvest wins.
+    let fresh_failed = tasks::enqueue(&pool, node_test_task("fresh-failed"))
+        .await
+        .expect("enqueue fresh-failed");
+    assert!(tasks::fail_pending(&pool, fresh_failed, "boom").await.expect("fail"));
+    worker_pod::insert_spawning(
+        &pool, "nt-fresh", PROJECT, "ns-1", "disp-1", None, "node-test", Some(fresh_failed),
+    )
+    .await
+    .expect("insert nt-fresh");
+    // A task terminal since BEFORE the threshold orphans its pod row.
+    let old_failed = tasks::enqueue(&pool, node_test_task("old-failed"))
+        .await
+        .expect("enqueue old-failed");
+    assert!(tasks::fail_pending(&pool, old_failed, "boom").await.expect("fail"));
+    sqlx::query("UPDATE task SET completed_at_unix = $2 WHERE id = $1")
+        .bind(old_failed)
+        .bind(threshold - 1)
+        .execute(&pool)
+        .await
+        .expect("backdate terminal");
+    worker_pod::insert_spawning(
+        &pool, "nt-orphan", PROJECT, "ns-1", "disp-1", None, "node-test", Some(old_failed),
+    )
+    .await
+    .expect("insert nt-orphan");
+    // A MISSING owning task (deleted / never existed) also orphans.
+    worker_pod::insert_spawning(
+        &pool, "nt-missing", PROJECT, "ns-1", "disp-1", None, "node-test", Some(Uuid::new_v4()),
+    )
+    .await
+    .expect("insert nt-missing");
+    // Worker rows never appear regardless of owner_task_id (NULL).
+    alive_pod(&pool, "wp-1").await;
+
+    let mut orphans: Vec<String> = worker_pod::list_orphaned_node_test(&pool, threshold)
+        .await
+        .expect("list orphans")
+        .into_iter()
+        .map(|r| r.pod_name)
+        .collect();
+    orphans.sort();
+    assert_eq!(orphans, vec!["nt-missing", "nt-orphan"]);
+
+    // A terminal row no longer registers (dead stays dead / done stays done).
+    worker_pod::mark_done(&pool, "nt-live").await.expect("mark done");
+    assert!(
+        register_alive(&pool, "nt-live", PROJECT, AliveTransition::FromSpawningOrAlive)
+            .await
+            .is_err()
+    );
+}
+
+/// The partial-result surface a non-re-runnable executor uses: a
+/// still-claimed row records its harvested result without completing,
+/// guarded on the claimant; a later read returns it; a write from a
+/// pod that no longer holds the claim fails loudly.
+#[sqlx::test]
+async fn partial_result_round_trips_on_the_task_row(pool: PgPool) {
+    setup(&pool).await;
+    let task_id = tasks::enqueue(&pool, node_test_task("t1")).await.expect("enqueue");
+    assert_eq!(tasks::stored_result(&pool, task_id).await.expect("read"), None);
+
+    let report = json!({"passed": true, "node": "X", "test": "t"});
+    // Unclaimed row: nothing to record on, fail loud.
+    assert!(tasks::store_result_partial(&pool, task_id, "disp-1", &report).await.is_err());
+
+    let claimed = claim_one(&pool, "disp-1", ClaimFilter::Dispatcher)
+        .await
+        .expect("claim")
+        .expect("the task");
+    assert_eq!(claimed.id, task_id);
+    assert_eq!(claimed.attempts, 1, "first claim");
+
+    // The wrong pod cannot record over someone else's claim.
+    assert!(tasks::store_result_partial(&pool, task_id, "disp-2", &report).await.is_err());
+    tasks::store_result_partial(&pool, task_id, "disp-1", &report)
+        .await
+        .expect("store partial");
+    assert_eq!(
+        tasks::stored_result(&pool, task_id).await.expect("read"),
+        Some(report.clone())
+    );
+    // The row is still claimed (recording is not completing).
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM task WHERE id = $1")
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row");
+    assert_eq!(status, "claimed");
+    // A missing row reads as None, never an error.
+    assert_eq!(tasks::stored_result(&pool, Uuid::new_v4()).await.expect("read"), None);
+}
+
+/// Surrender-requeue: the claimer that can no longer renew its lease
+/// puts the row back to `pending` (claim guard held), and a requeue
+/// from a pod that lost the row to a thief is a no-op that never
+/// clobbers the thief's claim.
+#[sqlx::test]
+async fn surrender_requeues_only_while_claim_is_ours(pool: PgPool) {
+    setup(&pool).await;
+    let task_id = tasks::enqueue(&pool, node_test_task("t1")).await.expect("enqueue");
+    let claimed = claim_one(&pool, "disp-1", ClaimFilter::Dispatcher)
+        .await
+        .expect("claim")
+        .expect("the task");
+    assert_eq!(claimed.attempts, 1);
+
+    // A pod that does not hold the claim cannot requeue it.
+    assert!(!tasks::requeue(&pool, task_id, "disp-2").await.expect("requeue"));
+    let (status, claimed_by): (String, Option<String>) =
+        sqlx::query_as("SELECT status, claimed_by FROM task WHERE id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+    assert_eq!((status.as_str(), claimed_by.as_deref()), ("claimed", Some("disp-1")));
+
+    // The claim holder surrenders: back to pending, no claimant.
+    assert!(tasks::requeue(&pool, task_id, "disp-1").await.expect("requeue"));
+    let (status, claimed_by): (String, Option<String>) =
+        sqlx::query_as("SELECT status, claimed_by FROM task WHERE id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+    assert_eq!((status.as_str(), claimed_by), ("pending", None));
+
+    // The next claim sees a second attempt (how a non-re-runnable
+    // executor tells a re-claim from a fresh run).
+    let reclaimed = claim_one(&pool, "disp-2", ClaimFilter::Dispatcher)
+        .await
+        .expect("claim")
+        .expect("the requeued task");
+    assert_eq!(reclaimed.id, task_id);
+    assert_eq!(reclaimed.attempts, 2);
+
+    // And a late requeue from the ORIGINAL claimer (its own claim long
+    // surrendered) never clobbers the new claim.
+    assert!(!tasks::requeue(&pool, task_id, "disp-1").await.expect("requeue"));
+    let (status, claimed_by): (String, Option<String>) =
+        sqlx::query_as("SELECT status, claimed_by FROM task WHERE id = $1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+    assert_eq!((status.as_str(), claimed_by.as_deref()), ("claimed", Some("disp-2")));
 }
 
 // ----- draining-aware claiming ---------------------------------------------
@@ -936,10 +1141,12 @@ async fn stale_image_pod_cannot_claim_stamped_task(pool: PgPool) {
     );
 
     // A pod on the CURRENT image claims it.
-    worker_pod::insert_spawning(&pool, "pod-fresh", PROJECT, "ns-1", "disp-1", "bin-2")
+    worker_pod::insert_spawning(&pool, "pod-fresh", PROJECT, "ns-1", "disp-1", Some("bin-2"), "worker", None)
         .await
         .expect("insert fresh");
-    register_alive(&pool, "pod-fresh", PROJECT).await.expect("alive");
+    register_alive(&pool, "pod-fresh", PROJECT, AliveTransition::FromSpawning)
+        .await
+        .expect("alive");
     let fresh_claim = claim_one(
         &pool,
         "pod-fresh",

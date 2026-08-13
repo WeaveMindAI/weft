@@ -77,8 +77,8 @@ impl ProviderMeter for MyProviderMeter {
     fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
     async fn ceiling_usd(&self, path: &str, body: &[u8], http: &reqwest::Client)
         -> anyhow::Result<f64>;
-    fn observe(&self) -> Box<dyn CallObservation>;
-    async fn resolve(&self, observed: ObservedCall, follow_up: FollowUp<'_>)
+    fn observe(&self, path: &str) -> Box<dyn CallObservation>;
+    async fn resolve(&self, path: &str, observed: ObservedCall, follow_up: FollowUp<'_>)
         -> MeasuredCost;
     fn observe_session(&self, path: &str, query: &str)
         -> anyhow::Result<Box<dyn SessionObservation>>;
@@ -111,7 +111,7 @@ impl ProviderMeter for MyProviderMeter {
   understate what it is about to spend). Lean high; the measured actual is
   the figure that counts. A call that cannot be priced (unknown model, no
   output bound) is a loud error, never a guess.
-- **`observe`** mints a fresh per-call tap for the response. The tap sees
+- **`observe`** mints a fresh per-call tap for the call's route. The tap sees
   every byte AS IT FLOWS THROUGH to the real consumer: it must never
   buffer, delay, or reorder chunks, and it must stay O(small) in memory no
   matter how long the stream runs (see `sse::DataLineScanner` for the
@@ -162,9 +162,12 @@ A `Billable` route also declares HOW it prices, which doubles as the
 policy for a cost that genuinely cannot be resolved:
 
 - **`Pricing::Fixed { usd }`** (one search = one credit): the price is
-  known without measurement. If the call confirmably went out but the
-  figure could not be resolved, the fixed price stands: exact, not a
-  guess.
+  known without measurement, but whether the call was actually CHARGED
+  is provider knowledge (a provider may answer 200 with a failure body
+  it never bills). Fixed routes therefore still resolve through the
+  meter: `resolve` reads the observed status/body and answers the
+  declared price, zero for an unbilled failure, or unknown when the
+  outcome was unreadable (see the Firecrawl scrape for the pattern).
 - **`Pricing::Metered`** (LLM tokens): there is no honest number without
   measurement. An unresolvable metered cost is recorded as unknown,
   never guessed.
@@ -229,3 +232,50 @@ beyond your own rate caches, no environment reads beyond what `FollowUp`
 hands you (an already-signed-in client and the base URL; a meter never
 touches a credential, which is exactly why the same meter works on a
 pasted key and on a sign-in).
+
+## The runtime-credential allowlist
+
+A runtime-supplied credential (a shared door's api_key entry; origin
+`Ours`) only ever travels on routes its meter EXPLICITLY classifies:
+billable (metered, fixed, or session) or declared `Free`. An `Unknown`
+route, or a URL outside the meter's `base_url`, is refused loudly
+before the credential is attached; nothing is sent. Consequences:
+
+- A service cannot open a shared door without a registered meter: the
+  meter IS the allowlist. A service whose calls all cost nothing still
+  registers a meter that classifies its routes `Free`.
+- Adding a node that calls a new provider route on a shared door means
+  adding that route to the meter first, with its pricing (or `Free`).
+- A key the USER pasted is theirs: unknown routes pass through
+  unmeasured, exactly as before. The gate keys off the credential's
+  origin, never off the service.
+
+Enforced in `weft-engine`'s connection middleware (the direct lane)
+and mirrored by the relay (the relayed lane refuses off-API URLs on
+this side already). Meters receive the route as a FACT through the
+whole lifecycle (`classify`, `prepare`, `ceiling_usd`, `observe`,
+`resolve`): a multi-route meter opens each method with a match on the
+route and delegates to per-route functions, never inferring the route
+from a response's shape.
+
+## Ceilings are estimates, not blanket caps
+
+`ceiling_usd` must be the TIGHTEST bound the request's own information
+allows, because a prepaid balance admits a call only if it can cover
+the ceiling: a lazy worst-case cap blocks users whose budget would
+comfortably cover the real cost. Squeeze every pre-call signal before
+falling back to a provider-wide maximum:
+
+- Price at the REQUEST's model/tier rate (fetched from the provider's
+  own catalog), never at "the dearest model we carry".
+- Count what the request actually asks for: its token estimate, its
+  result count, its page selection, its crawl limit, the content
+  types it enables.
+- When the priced quantity is only in the response, look for a cheap
+  pre-call proxy (a HEAD for the document's byte size) before reaching
+  for the provider's per-call cap; the cap is the LAST resort, used
+  only when nothing about the request bounds it tighter.
+
+Over-estimation is still correct (the measured figure settles the
+charge); the rule is that the overshoot must shrink as the request
+tells you more.

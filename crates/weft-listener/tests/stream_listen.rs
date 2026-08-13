@@ -52,6 +52,9 @@ impl weft_task_store::TaskStoreClient for FakeTasks {
     async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
         unreachable!()
     }
+    async fn requeue(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
+        unreachable!()
+    }
     async fn complete(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<()> {
         unreachable!()
     }
@@ -238,6 +241,7 @@ async fn run_scenario() {
                 auth_config: Value::Null,
             },
             kind_state: json!({}),
+            seq: 0,
         },
         registry.clone(),
         weft_listener::fire_sink::FireSignalSink::new(tasks.clone()),

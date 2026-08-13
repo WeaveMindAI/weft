@@ -10,50 +10,31 @@ use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct WhatsAppSendNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for WhatsAppSendNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
         let to: String = ctx.inputs.get("to")?;
         let message: String = ctx.inputs.get("message")?;
 
-        let body = serde_json::json!({
-            "action": "sendMessage",
-            "payload": { "to": to, "text": message },
-        });
-        // The bridge mounts the action router at `/action`. The
-        // contract for `endpointUrl` (WhatsAppBridge's output) is
-        // bare service DNS, so we append the path here. No
-        // defensive trim: a contract violation should surface, not
-        // be papered over.
-        let action_url = format!("{}/action", endpoint_url.trim_end_matches('/'));
-        let resp = ctx
-            .http()
-            .post(&action_url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .node_err(format!("POST {action_url}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            weft::node_bail!("bridge returned {status}: {text}");
-        }
-        let parsed: serde_json::Value = resp.json().await.node_err("parse bridge response")?;
-        // The bridge signals SOFT failures (e.g. "WhatsApp not
-        // connected" when the phone isn't paired) as a 200 with
-        // `result.error` (only THROWN errors become non-2xx, handled
-        // above). Surface that reason loudly instead of letting it fall
-        // through to a misleading "missing messageId".
-        let result = parsed.get("result");
-        if let Some(err) = result.and_then(|r| r.get("error")).and_then(|v| v.as_str()) {
-            weft::node_bail!("bridge: {err}");
-        }
-        let message_id = result
-            .and_then(|r| r.get("messageId"))
-            .and_then(|v| v.as_str())
-            .node_err(format!("bridge send response missing result.messageId: {parsed}"))?;
+        let result = super::bridge_api::action(
+            &ctx,
+            &endpoint_url,
+            "sendMessage",
+            serde_json::json!({ "to": to, "text": message }),
+        )
+        .await?;
+        let message_id = result["messageId"]
+            .as_str()
+            .node_err(format!("bridge send response missing result.messageId: {result}"))?;
         // Only emit `messageId`. The previous `success: true` port was
         // an always-true constant (every failure path errors above), so
         // its mere presence on the wire was the meaningful signal. The

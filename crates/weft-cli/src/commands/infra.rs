@@ -460,7 +460,7 @@ async fn build_infra_images(
                 &tag,
                 &dockerfile,
                 &img.context_dir,
-                Some(&label),
+                &[label],
             )
             .await?;
             progress.build_done(&tag);
@@ -470,6 +470,21 @@ async fn build_infra_images(
             progress.image_push_start(&tag);
             images::kind_load(&cfg.cluster_name, &tag).await?;
             progress.image_push_done(&tag);
+        }
+        // Same content-addressed accumulation as worker images: drop
+        // this project's prior tags of this infra repo now that the
+        // fresh one is ensured. Infra pods are long-lived (never
+        // scale-to-zero), so beyond the fresh tag nothing is
+        // referenced by design: an old tag a not-yet-synced pod still
+        // runs refuses its node-side remove and survives.
+        if let Some((repo, _)) = tag.rsplit_once(':') {
+            crate::commands::build::gc_stale_images(
+                repo,
+                &tag,
+                &[format!("weft.dev/project={project_id}")],
+                Some(&std::collections::BTreeSet::new()),
+            )
+            .await;
         }
     }
     Ok(out)

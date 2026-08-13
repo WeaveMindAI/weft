@@ -44,6 +44,36 @@
         "id": "https://www.googleapis.com/auth/drive.readonly",
         "label": "Read all of Drive",
         "description": "Read every file the account can see (needed to browse or search Drive)."
+      },
+      {
+        "id": "https://www.googleapis.com/auth/spreadsheets",
+        "label": "Read and write all spreadsheets",
+        "description": "Read and edit every spreadsheet the account can see (the files-you-pick grant already covers picked sheets; this one covers sheets chosen from the list)."
+      },
+      {
+        "id": "https://www.googleapis.com/auth/gmail.send",
+        "label": "Send mail",
+        "description": "Send email as this account."
+      },
+      {
+        "id": "https://www.googleapis.com/auth/gmail.readonly",
+        "label": "Read mail",
+        "description": "Read the account's email (needed by the new-email trigger and message reads)."
+      },
+      {
+        "id": "https://www.googleapis.com/auth/gmail.modify",
+        "label": "Organize mail",
+        "description": "Add and remove labels on the account's email."
+      },
+      {
+        "id": "https://www.googleapis.com/auth/calendar.events",
+        "label": "Manage calendar events",
+        "description": "Read and create events on the account's calendars."
+      },
+      {
+        "id": "https://www.googleapis.com/auth/documents",
+        "label": "Read and write documents",
+        "description": "Create and edit Google Docs (the files-you-pick grant already covers picked docs)."
       }
     ],
     "all_permissions_url": "https://developers.google.com/identity/protocols/oauth2/scopes",
@@ -73,7 +103,7 @@
         "link": "https://console.cloud.google.com/apis/credentials",
         "steps": [
           "Open the Google Cloud Console credentials page and create an OAuth 2.0 Client ID (Web application).",
-          "Enable the APIs your permissions need (Drive, Sheets, Calendar) under APIs & Services.",
+          "Enable the APIs your permissions need (Drive, Sheets, Docs, Gmail, Calendar) under APIs & Services.",
           "Add the callback URL shown here as an Authorized redirect URI.",
           "On the consent screen, allow these scopes: {permissions}.",
           "Copy the Client ID and Client Secret into the fields below."

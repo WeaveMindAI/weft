@@ -5,7 +5,7 @@
 //! demands a concrete declaration). The conversion itself is
 //! `WeftType::cast_value`: the same rules the compiler's literal
 //! lenience applies, so text parses into scalars and JSON structures,
-//! scalars and structures stringify, and an object claiming a declared
+//! scalars stringify, and an object claiming a declared
 //! custom type is validated against its structure with a field-level
 //! error when it does not fit. Impossible pairs never reach this body
 //! (the compiler's `cast-not-allowed` check refuses them).
@@ -18,8 +18,16 @@ use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct CastNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for CastNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let value: serde_json::Value = ctx.inputs.get("value")?;
         // The metadata ships MustOverride and the compiler refuses an

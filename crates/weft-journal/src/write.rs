@@ -4,7 +4,7 @@
 //! through one canonical INSERT.
 //!
 //! Schema invariant: the `exec_event` table layout matches the one
-//! created by `weft-dispatcher::journal::postgres::migrate`. Both
+//! created by `weft-dispatcher::journal::postgres::GROUP`. Both
 //! crates write the same row shape; only one side owns the
 //! migration (the dispatcher, on startup), and the engine + listener
 //! piggyback on it.

@@ -19,43 +19,38 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use weft::signal::{Predicate, PredicateOp, ProviderEvents};
+use weft::signal::{Predicate, ProviderEvents};
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct SlackAppMessagesNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for SlackAppMessagesNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let keyword: Option<String> = ctx.inputs.opt("keyword")?;
         let include_bots: bool = ctx.inputs.get("includeBots")?;
 
-        let mut filters = vec![Predicate {
-            field: "type".into(),
-            op: PredicateOp::Eq,
-            value: Some("message".into()),
-        }];
+        let mut filters = vec![Predicate::eq("type", "message")];
         if let Some(k) = keyword.filter(|k| !k.trim().is_empty()) {
-            filters.push(Predicate {
-                field: "text".into(),
-                op: PredicateOp::Contains,
-                value: Some(k),
-            });
+            filters.push(Predicate::contains("text", k));
         }
         if !include_bots {
-            filters.push(Predicate {
-                field: "bot".into(),
-                op: PredicateOp::NotExists,
-                value: None,
-            });
+            filters.push(Predicate::not_exists("bot"));
         }
         ctx.register_signal(ProviderEvents::new(&account, "messages", filters).app_wide()).await
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let data = Value::Object(ctx.wake.object()?.clone());
-        ctx.pulse_downstream(ctx.fan_declared(&data)).await
+        ctx.pulse_downstream(ctx.fan_declared(&ctx.wake.record()?)).await
     }
 }

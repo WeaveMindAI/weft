@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid"] }
 tokio = { workspace = true }
 tokio-util = { version = "0.7" }

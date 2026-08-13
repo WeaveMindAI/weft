@@ -58,6 +58,10 @@ reqwest = { workspace = true, optional = true }
 # The personal-access auth pipeline (`access::client`): URL surgery for
 # query/path transforms, and the middleware's Extensions type.
 url = { workspace = true, optional = true }
+# Byte-exact percent decoding for the node-test rig's canonical query
+# keys (the URL stack's pair parser decodes lossily to UTF-8, which
+# would merge distinct binary tokens).
+percent-encoding = { version = "2", optional = true }
 http = { version = "1", optional = true }
 # Raw outbound pipes (`net`): TLS over TCP with the system's trust roots,
 # for everything that holds a non-HTTP connection (the listener's raw-pipe
@@ -84,6 +88,7 @@ runtime = [
     "dep:reqwest-middleware",
     "dep:reqwest",
     "dep:url",
+    "dep:percent-encoding",
     "dep:http",
     "dep:tokio-rustls",
     "dep:rustls-native-certs",

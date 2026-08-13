@@ -321,13 +321,84 @@ async fn oauth_complete(
 
 /// POST /v1/access/admin/lookup: run a `remote_select` list source
 /// through the stored connection; the editor sees label/id pairs only.
+/// An ours-owned connection stores no credential of its own, so the
+/// runtime's credential source is asked for a design-time key,
+/// through the same meter allowlist the execution path enforces.
 async fn lookup(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
     Json(req): Json<Tenanted<weft_access_store::LookupRequest>>,
 ) -> Result<Json<weft_access_store::LookupPage>, ApiError> {
     control_plane(&state, &headers).await?;
-    weft_access_store::lookup(&state.pool, &req.tenant, &req.inner)
+    let inner = &req.inner;
+    let url = weft_access_store::lookup_url(&inner.lookup, &inner.query, &inner.parents)
+        .map_err(access_err)?;
+    let cursor = inner.cursor.as_deref();
+    // A `public` source is credential-free by declaration: no resolve,
+    // no signing, whatever connection the node may hold. https only:
+    // the call carries no secret, but its answer feeds a picker, and a
+    // cleartext-tampered list is a hole nothing else would catch.
+    if inner.lookup.public {
+        if !url.starts_with("https://") {
+            return Err(shared_app_err(anyhow::anyhow!(
+                "a public list source must use https (got {url})"
+            )));
+        }
+        return weft_access_store::lookup(None, &inner.lookup, cursor, &url)
+            .await
+            .map(Json)
+            .map_err(access_err);
+    }
+    let Some(access_id) = inner.access_id else {
+        return Err(shared_app_err(anyhow::anyhow!(
+            "this list source signs with a connection, but none was given; pick one on the node"
+        )));
+    };
+    let mut resolved = weft_access_store::resolve_for_worker(
+        &state.pool,
+        &req.tenant,
+        access_id,
+        &inner.service,
+        &[],
+        &[],
+    )
+    .await
+    .map_err(access_err)?;
+    if resolved.owner == weft_core::CredentialOwner::Ours {
+        // A REFUSAL is policy text the editor shows verbatim; an
+        // internal failure answers opaquely (its message may quote
+        // configuration internals that must never travel).
+        let grant = crate::credential::design_sign(
+            state.credentials.as_ref(),
+            &state.pool,
+            &req.tenant,
+            &mut resolved,
+            url,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::credential::DesignError::Refused(m) => shared_app_err(anyhow::anyhow!(m)),
+            crate::credential::DesignError::Internal(e) => {
+                tracing::error!(target: "weft_broker::access_admin", "design signing: {e:#}");
+                (StatusCode::INTERNAL_SERVER_ERROR, "access store error".into())
+            }
+        })?;
+        let page =
+            weft_access_store::lookup(Some(&resolved), &inner.lookup, cursor, &grant.url).await;
+        // Retire the design credential whatever the call's outcome, so
+        // a source that mints short-lived credentials never leaks one
+        // per lookup. Best effort; a static key's close is a no-op.
+        if let Err(e) =
+            state.credentials.close(&state.pool, &grant.credential, &req.tenant).await
+        {
+            tracing::warn!(
+                target: "weft_broker::access_admin",
+                "closing a design-time credential failed: {e:#}"
+            );
+        }
+        return page.map(Json).map_err(access_err);
+    }
+    weft_access_store::lookup(Some(&resolved), &inner.lookup, cursor, &url)
         .await
         .map(Json)
         .map_err(access_err)

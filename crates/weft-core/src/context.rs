@@ -442,7 +442,7 @@ impl ExecutionContext {
     ) -> WeftResult<reqwest_middleware::ClientWithMiddleware> {
         match access.into() {
             Some(access) => Ok(self.open(access).await?.client().clone()),
-            None => Ok(crate::access::client::plain_client()),
+            None => Ok(self.handle.plain_http()),
         }
     }
 
@@ -580,18 +580,11 @@ impl ExecutionContext {
     /// client per process; a node never constructs its own. The one
     /// rule for outbound HTTP: a call on a CONNECTION goes through
     /// [`Self::open`] / [`Self::client`] (that is what signs it and
-    /// records its cost); everything else goes through here.
-    pub fn http(&self) -> &'static reqwest::Client {
-        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-        CLIENT.get_or_init(|| {
-            reqwest::Client::builder()
-                // Bound connection ESTABLISHMENT only. No overall request
-                // timeout: a node may legitimately stream a response for
-                // a long time, and user-facing waits take no deadline.
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("default reqwest client always builds")
-        })
+    /// records its cost); everything else goes through here. Served
+    /// by the handle so every outbound byte a node sends flows
+    /// through the same seam.
+    pub fn http(&self) -> reqwest_middleware::ClientWithMiddleware {
+        self.handle.plain_http()
     }
 }
 
@@ -655,6 +648,14 @@ impl ValueBag {
         }
     }
 
+    /// [`Self::object`] as one OWNED record value, for the sites that
+    /// hand the whole bag onward (fanning a wake payload out, seeding a
+    /// form's prefill). Same loudness as `object` on a wake bag whose
+    /// firing delivered a missing or non-object payload.
+    pub fn record(&self) -> WeftResult<Value> {
+        Ok(Value::Object(self.object()?.clone()))
+    }
+
     /// The side's word for one named value, used in every error message.
     fn noun(&self) -> &'static str {
         match self.side {
@@ -699,6 +700,27 @@ impl ValueBag {
     /// which would swallow a real type error into the default.
     pub fn get_or<T: DeserializeOwned>(&self, name: &str, default: T) -> WeftResult<T> {
         Ok(self.opt(name)?.unwrap_or(default))
+    }
+
+    /// Read `name` as a LIST, accepting the one-or-many wire shapes:
+    /// absent or null is an empty list, an array is itself, and a
+    /// single value is a one-item list. Each element deserializes into
+    /// `T`, and a wrong-typed element errors loud, never a silent drop.
+    /// The one normalizer for every input that means "one or more X"
+    /// (recipients, labels, attachments).
+    pub fn list<T: DeserializeOwned>(&self, name: &str) -> WeftResult<Vec<T>> {
+        let elems: Vec<Value> = match self.values.get(name) {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items.clone(),
+            Some(single) => vec![single.clone()],
+        };
+        elems
+            .into_iter()
+            .map(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| self.err(format!("{} '{name}': {e}", self.noun())))
+            })
+            .collect()
     }
 
     /// The raw value behind `name`, if any. For pass-through reads that
@@ -869,25 +891,12 @@ pub fn node_input_bag(
             }
             _ => {}
         }
-        // A consumer input declaring `requiresScopes` stamps them onto
-        // whatever access marker arrived (wired from an access node),
-        // so resolution can hold a VERIFIED connection to them. A
-        // non-marker value is left alone; the read fails loud there.
-        let required_scopes = input.requires_scopes.as_deref().unwrap_or_default();
-        let required_values = input.requires_values.as_deref().unwrap_or_default();
-        if !required_scopes.is_empty() || !required_values.is_empty() {
-            if let Some(value) = delivered.get(&input.name) {
-                if let Ok(access) = crate::access::Access::from_value(value) {
-                    delivered.insert(
-                        input.name.clone(),
-                        access
-                            .with_required_permissions(required_scopes.to_vec())
-                            .with_required_values(required_values.to_vec())
-                            .to_value(),
-                    );
-                }
-            }
-        }
+        stamp_required_access(
+            &input.name,
+            input.requires_scopes.as_deref().unwrap_or_default(),
+            input.requires_values.as_deref().unwrap_or_default(),
+            &mut delivered,
+        );
     }
 
     let spec_names = node
@@ -897,6 +906,32 @@ pub fn node_input_bag(
         .map(|i| i.name.clone())
         .collect();
     Ok(ValueBag::inputs(delivered, spec_names))
+}
+
+/// A consumer input declaring `requiresScopes`/`requiresValues` stamps
+/// them onto whatever access marker arrived on it (wired from an
+/// access node), so resolution can hold a VERIFIED connection to
+/// them. A non-marker value is left alone; the read fails loud there.
+pub(crate) fn stamp_required_access(
+    name: &str,
+    required_scopes: &[String],
+    required_values: &[String],
+    delivered: &mut serde_json::Map<String, Value>,
+) {
+    if required_scopes.is_empty() && required_values.is_empty() {
+        return;
+    }
+    if let Some(value) = delivered.get(name) {
+        if let Ok(access) = crate::access::Access::from_value(value) {
+            delivered.insert(
+                name.to_string(),
+                access
+                    .with_required_permissions(required_scopes.to_vec())
+                    .with_required_values(required_values.to_vec())
+                    .to_value(),
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1020,6 +1055,46 @@ impl StorageHandle {
         self.handle
             .storage_put(&self.scope, stream, mime_type, filename, keep, None)
             .await
+    }
+
+    /// Stream an already-sent HTTP response's body into this handle's
+    /// scope: the AUTHENTICATED twin of [`Self::put_from_url`], for the
+    /// download a node performs on a connection's client. Refuses a
+    /// non-success status loudly (quoting the body, truncated). `mime`
+    /// Some when the caller already knows the type from richer metadata
+    /// (a file-info call, an export's chosen format); None takes the
+    /// response Content-Type (octet-stream when it serves none).
+    /// Returns the parsed [`crate::storage::StoredFile`] so the caller
+    /// emits [`crate::node::NodeOutput::stored_file`].
+    pub async fn put_response(
+        &self,
+        resp: reqwest::Response,
+        what: &str,
+        mime: Option<&str>,
+        filename: &str,
+        keep: Option<crate::storage::KeepTtl>,
+    ) -> WeftResult<crate::storage::StoredFile> {
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::node_error(format!(
+                "the service answered {status} trying to {what}: {}",
+                crate::truncate_user_string(&body, 500)
+            )));
+        }
+        let mime = match mime {
+            Some(m) => m.to_string(),
+            None => resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string(),
+        };
+        let stored = self
+            .put_stream(crate::storage::response_stream(resp), &mime, filename, keep)
+            .await?;
+        crate::storage::StoredFile::from_value(&stored)
     }
 
     /// Fetch an HTTP(S) URL straight into this handle's scope and
@@ -1147,9 +1222,9 @@ impl StorageHandle {
     }
 
     /// Mint a temporary URL the OPEN INTERNET can fetch this file from,
-    /// or `None` when this deployment cannot serve one. `Some` is a
-    /// publicly addressable store's own presigned URL, or a relay link
-    /// under the deployment's public base; `None` means the store is
+    /// or `None` when there is no publicly addressable store behind
+    /// this storage. `Some` is the store's own presigned URL, or a
+    /// relay link under a public base; `None` means the store is
     /// private and no public relay is up, and the caller should hand
     /// out the bytes instead. A url-backed file value is already an
     /// external URL and answers itself.
@@ -1194,8 +1269,8 @@ impl StorageHandle {
             let external = match policy.form(kind) {
                 // Url is a PREFERENCE: a link only helps the consumer
                 // when the open internet can fetch it, so the slot
-                // falls back to inline bytes on a deployment that
-                // cannot serve a public link (private store, no relay).
+                // falls back to inline bytes when no public link can
+                // be served (private store, no relay).
                 MediaForm::Url => match self.public_link(&handle, None).await? {
                     Some(url) => url,
                     None => {
@@ -1272,6 +1347,15 @@ impl StorageHandle {
 /// delegates to an implementation.
 #[async_trait::async_trait]
 pub trait ContextHandle: Send + Sync {
+    /// The plain (unsigned) outbound HTTP client behind `ctx.http()`
+    /// and a connection-less `ctx.client(None)`. Defaulted to the
+    /// process-wide plain client; a handle that answers HTTP itself
+    /// (the fake test rig) overrides it, which is what makes the
+    /// node's EVERY outbound byte flow through one seam.
+    fn plain_http(&self) -> reqwest_middleware::ClientWithMiddleware {
+        crate::access::client::plain_client()
+    }
+
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value>;
     /// Register an entry signal. `port_snapshot` is the trigger's
     /// delivered port values at registration time (built by
@@ -1453,8 +1537,8 @@ pub trait ContextHandle: Send + Sync {
     async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
 
     /// Mint a temporary INTERNET-reachable URL for `key`, or `None`
-    /// when this deployment cannot serve one (no publicly addressable
-    /// store and no public relay); callers fall back to inline bytes.
+    /// when there is no publicly addressable store and no public
+    /// relay behind this storage; callers fall back to inline bytes.
     async fn storage_public_link(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<Option<String>>;
 
     /// The wake event's payload for this firing. `Some(value)` only
@@ -1485,6 +1569,35 @@ mod value_bag_tests {
 
     fn inputs_bag(values: serde_json::Value) -> ValueBag {
         ValueBag::inputs(values.as_object().unwrap().clone(), Default::default())
+    }
+
+    /// `list` normalizes the one-or-many wire shapes: absent/null =
+    /// empty, single = one-item, array = itself; a wrong-typed element
+    /// errors loud instead of vanishing.
+    #[test]
+    fn list_reads_one_or_many() {
+        let bag = inputs_bag(json!({
+            "one": "a",
+            "many": ["a", "b"],
+            "none": null,
+            "mixed": ["a", 7],
+        }));
+        assert_eq!(bag.list::<String>("absent").unwrap(), Vec::<String>::new());
+        assert_eq!(bag.list::<String>("none").unwrap(), Vec::<String>::new());
+        assert_eq!(bag.list::<String>("one").unwrap(), vec!["a"]);
+        assert_eq!(bag.list::<String>("many").unwrap(), vec!["a", "b"]);
+        let err = bag.list::<String>("mixed").unwrap_err().to_string();
+        assert!(err.contains("mixed"), "{err}");
+    }
+
+    /// `record` is `object` as one owned value, with the same loudness
+    /// on a wake bag whose firing delivered no usable payload.
+    #[test]
+    fn record_hands_the_whole_bag_and_fails_on_a_broken_wake() {
+        let bag = inputs_bag(json!({ "k": 1 }));
+        assert_eq!(bag.record().unwrap(), json!({ "k": 1 }));
+        let broken = ValueBag::wake(Some(&json!("not an object")));
+        assert!(broken.record().is_err());
     }
 
     /// A ContextHandle for accessor tests: every runtime capability is
@@ -1569,7 +1682,7 @@ mod value_bag_tests {
         fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
     }
 
-    /// `MediaForm::Url` is a preference: the slot takes the deployment's
+    /// `MediaForm::Url` is a preference: the slot takes the storage's
     /// public link when one exists and falls back to inline bytes when
     /// it does not; `Inline` always embeds.
     #[tokio::test]
@@ -1596,7 +1709,7 @@ mod value_bag_tests {
             )
         };
 
-        // A deployment that serves public links: the slot IS the link.
+        // A storage that serves public links: the slot IS the link.
         let ctx = with_link(Some("https://pub.example/files/tok1"));
         let out = ctx
             .storage(crate::storage::StorageScope::Project)

@@ -1,0 +1,109 @@
+{
+  "type": "GmailNewEmail",
+  "label": "Gmail: On New Email",
+  "description": "Fires once per new message matching a Gmail search query (e.g. 'label:inbox -from:me', 'has:attachment invoice'). Activation starts from the current mailbox (history never replays); each fire carries the decomposed message, attachments included.",
+  "tags": [
+    "google",
+    "gmail",
+    "email"
+  ],
+  "icon": "MailPlus",
+  "color": "#EA4335",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/gmail.readonly"
+      ],
+      "description": "A Google account with the read-mail permission."
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Search query",
+      "placeholder": "label:inbox",
+      "description": "A Gmail search query filtering which messages fire. Empty = every new message."
+    },
+    {
+      "name": "intervalSecs",
+      "type": "Number",
+      "exposure": "config",
+      "default": 60,
+      "label": "Check every (seconds)"
+    },
+    {
+      "name": "includeAttachments",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": true,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Download attachments"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "id",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "subject",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "from",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "to",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "date",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "body",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "bodyIsHtml",
+      "type": "Boolean",
+      "required": false
+    },
+    {
+      "name": "threadId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "snippet",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "labels",
+      "type": "List[String]",
+      "required": false
+    },
+    {
+      "name": "attachments",
+      "type": "List[File]",
+      "required": false
+    }
+  ],
+  "features": {
+    "isTrigger": true
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "type": "GoogleCalendarListEvents",
+  "label": "Google Calendar: List Events",
+  "description": "The events in a time window (recurring events expanded to their instances, ordered by start), optionally filtered by a search term.",
+  "tags": [
+    "google",
+    "calendar"
+  ],
+  "icon": "CalendarSearch",
+  "color": "#4285F4",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/calendar.events"
+      ],
+      "description": "A Google account with the calendar permission."
+    },
+    {
+      "name": "calendar",
+      "type": "String",
+      "default": "primary",
+      "label": "Calendar"
+    },
+    {
+      "name": "timeMin",
+      "type": "String",
+      "required": true,
+      "label": "From",
+      "placeholder": "2026-08-06T00:00:00Z"
+    },
+    {
+      "name": "timeMax",
+      "type": "String",
+      "required": true,
+      "label": "To"
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": false,
+      "label": "Search"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "events",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each event: id, summary, start, end, location, description, link."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

@@ -64,8 +64,16 @@ multi = SomeNode {
 }
 ```
 
-A special config key, `_label: "..."`, sets a display label without affecting
-behavior. `_tags: ["a", "b"]` attaches tags (used by signal scoping).
+Keys starting with `_` are reserved, through two distinct mechanisms.
+`_label: "..."` is a body field, not a config value: it sets the node's
+display label (a quoted string; setting it twice, or via a connection
+`node._label = ...`, is an error). Two reserved CONFIG keys exist:
+`_tags: ["a", "b"]` attaches tags (a list of strings, used by signal
+scoping), and `_is_output: true/false` overrides whether the node counts
+as a production target (a run executes the subgraph needed to feed the
+output nodes, so flipping this changes what gets run; each node type
+carries a default). Any other leading-underscore config key is a compile
+error.
 
 ### Multi-line string config
 
@@ -158,6 +166,11 @@ Port types the compiler understands:
   nodes. A `Bus` output connects only to a `Bus` input; message payloads are
   not type-checked by the language. Wired-only: the value is a live runtime
   handle, never a config literal.
+- **`Access`**: the authorized ability to call a third-party service, the
+  value emitted by a node that holds a connection to that service. One
+  general type for every service (wiring the wrong service's access fails
+  loud at run time, not in the type system). Wired-only, like `Bus`: the
+  value is minted at run time, never typed as a literal.
 - **Type variables**: a bare capitalized name like `T` is a generic that unifies
   across the node's ports. A node with input `T` and output `T` carries whatever
   concrete type flows in. A type variable must be pinned to something concrete
@@ -267,7 +280,9 @@ Every port on a loop is in exactly one of four roles, derived from the config:
 
 1. **Iter input** (named in `over`). Outside type is `List[T]`, inside type is
    `T`; the body sees one element per iteration via `self.<port>`. Multiple
-   ports in `over` zip together in lockstep.
+   ports in `over` zip together in lockstep; their lists must be the same
+   length at run time (a mismatch fails the loop loudly) unless
+   `trim_on_mismatch: true` is set, which zips to the shortest list.
 2. **Carry port** (named in `carry`). Declared on the OUTPUT side of the
    signature; the compiler auto-creates a matching input port (same name, same
    type) for the initial value. Inside the body, reading `self.<port>` gives
@@ -291,11 +306,14 @@ sequential mode only). `index` and `done` are reserved port names
 
 `parallel` defaults to `false` (sequential: carry and `self.done` work, no
 ordering surprises). `over` / `carry` default to empty lists; no `max_iters`
-means no cap. A non-boolean `parallel` is a compile error
-(`loop-parallel-not-boolean`); unknown config keys are rejected
-(`loop-unknown-config-field`). A loop terminates on whichever comes first: the
-`over` lists are exhausted, the body wrote `self.done = true` (sequential
-only), or `max_iters` is reached.
+means no cap; `trim_on_mismatch` defaults to `false`. A non-boolean
+`parallel` or `trim_on_mismatch` is a compile error
+(`loop-parallel-not-boolean` / `loop-trim-not-boolean`), and unknown config
+keys are rejected (`loop-unknown-config-field`).
+
+A loop terminates on whichever comes first: the `over` lists are exhausted,
+the body wrote `self.done = true` (sequential only), or `max_iters` is
+reached.
 
 Invalid combinations, all compile errors: `parallel: true` with a non-empty
 `carry` (carry implies sequential), `parallel: true` with an empty `over` (the
@@ -394,10 +412,20 @@ when the form is answered. (Suspension / resume is a framework capability, see
 
 ## Reusing other files
 
-- `@include("path.weft")` pulls another `.weft` file in as a group (its graph
-  becomes a subgraph under the including node's name).
+- `name = @include("path.weft")` pulls another `.weft` file in as a group
+  under `name`. The included file must be exactly one anonymous top-level
+  group (`Group(in: T) -> (out: U) { ... }`); its ports become `name`'s
+  ports and you wire them like any node's.
 - `@file("path")` / `@file("path", Type)` reads a file's contents as a config
-  value (optionally cast to a type).
+  value (optionally cast to a type). `@file` is bidirectional: editing the
+  compiled value in tooling writes back to the file, so it only accepts
+  types that support that round-trip.
+- `@asset("path", Type)` is the pull-only twin: the file is read in,
+  nothing ever writes back. With a FILE type (`Image`, `Video`, `Audio`,
+  `Blob`, or the `Media`/`File` aliases) the file resolves through the
+  build's asset sync and its bytes never ride the compile. With no type,
+  or a text type, `@asset` reads inline exactly like `@file` and differs
+  only in being read-only.
 
 ## Validation the compiler enforces
 
@@ -406,8 +434,16 @@ when the form is answered. (Suspension / resume is a framework capability, see
 - **Unique names** per scope (duplicate node ids in the same scope are an error).
 - **Node self-validation**: each node checks its own config (required fields,
   shapes) at compile time.
-- **`@require_one_of`**: a node can require that at least one of a set of
-  all-optional inputs is wired.
+- **`@require_one_of(a, b)`**: at least one of the named inputs must be
+  satisfied (wired, or set as a non-null config literal), or the compile
+  fails (`require-one-of-unmet`). Written as a directive line inside a
+  node or group body, or inside the inline port signature; catalog nodes
+  declare the same thing as `oneOfRequired` in their metadata (see
+  `authoring-nodes.md`). It also governs runtime skipping: the node is
+  skipped when every port in the group arrives closed. The dual warning
+  (`no-required-skip`): a node whose wireable inputs are all optional
+  with no `@require_one_of` runs even when every upstream is null, so
+  the compiler suggests adding one.
 - Unresolved type variables, reserved-name misuse (`self`, type keywords,
   loop-reserved `index`/`done`), and malformed config are all compile errors.
 

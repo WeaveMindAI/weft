@@ -38,6 +38,32 @@ pub trait JournalClient: Send + Sync {
     async fn has_terminal_event(&self, color: weft_core::Color) -> anyhow::Result<bool>;
 }
 
+/// The no-write implementation: every write vanishes, every read
+/// answers empty. For runtimes that drive a node body OUTSIDE an
+/// execution (a node self-test run has no journal to fold and must
+/// not fabricate execution rows), and for tests exercising code that
+/// only incidentally holds a journal client.
+pub struct NoopJournal;
+
+#[async_trait]
+impl JournalClient for NoopJournal {
+    async fn record_event(
+        &self,
+        _event: &ExecEvent,
+        _pod_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn events_for_color(&self, _color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn has_terminal_event(&self, _color: weft_core::Color) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+}
+
 /// Direct-DB implementation. Used by the dispatcher and by the
 /// broker (the broker calls into this after its scope check).
 pub struct PostgresJournalClient {

@@ -79,7 +79,9 @@ fn big() -> TestEntitlements {
 }
 
 async fn store(pool: &PgPool) -> (Arc<RuntimeStore>, Arc<FakeObjectStore>, Arc<FakeClock>) {
-    weft_broker::runtime_store::migrate(pool).await.unwrap();
+    weft_task_store::apply_groups(pool, &[&weft_broker::runtime_store::GROUP])
+        .await
+        .unwrap();
     let clock = FakeClock::new();
     let bucket = Arc::new(FakeObjectStore::new());
     (
@@ -591,7 +593,9 @@ async fn no_expiry_write_shortens_a_file_below_its_live_link(pool: PgPool) {
         .await
         .unwrap();
     let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
-    let token = s.mint_public_link(&parsed, Some(3600)).await.unwrap();
+    // The token itself is unused: this test is about the expiry floor the
+    // mint leaves on the file row, not about resolving the link.
+    let _token = s.mint_public_link(&parsed, Some(3600)).await.unwrap();
     let link_expiry = clock.now_unix() + 3600;
     assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, Some(link_expiry), "mint covered");
 

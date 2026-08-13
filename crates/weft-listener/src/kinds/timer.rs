@@ -47,7 +47,9 @@ impl KindHandler for TimerHandler {
     /// wall-clock-absolute in the spec, and `Cron` recomputes the
     /// next tick from "now" on every iteration (each fire is its
     /// own deadline), so neither needs persisted state.
-    fn compute_initial_state(&self, spec: &SignalSpec) -> Result<Value> {
+    // `_prior` is deliberately ignored: reactivate IS a fresh schedule
+    // (an After-timer restarts its countdown from the activation).
+    fn compute_initial_state(&self, spec: &SignalSpec, _prior: Option<&Value>) -> Result<Value> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
         if let TimerSpec::After { duration_ms } = timer.spec {
@@ -125,7 +127,9 @@ fn spawn_loop(
                 "scheduledTime": deadline.to_rfc3339(),
                 "actualTime": Utc::now().to_rfc3339(),
             });
-            fire.fire(payload, "timer").await;
+            // A timer tick has no replay cursor; the delivery outcome
+            // is already logged by the fire path.
+            let _ = fire.fire(payload, "timer").await;
 
             if matches!(spec, TimerSpec::After { .. } | TimerSpec::At { .. }) {
                 return;

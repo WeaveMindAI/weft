@@ -1,0 +1,31 @@
+{
+  "type": "AwaitInteraction",
+  "label": "Await Interaction (e2e)",
+  "description": "Parks on the slack interactions topic with the fixed correlation id cb-e2e and emits the clicked action on resume.",
+  "tags": [
+    "e2e"
+  ],
+  "icon": "MousePointerClick",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The seeded Slack access."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "action",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false
+    }
+  ],
+  "requires_infra": false
+}

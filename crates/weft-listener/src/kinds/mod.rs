@@ -71,6 +71,11 @@ pub struct SpawnCtx {
     pub config: Arc<ListenerConfig>,
     pub events_broker: Arc<weft_broker_client::BrokerEventsClient>,
     pub fresh: bool,
+    /// The kind_state write-fence version the spawned task starts
+    /// from: its durable cursor writes continue at `state_seq + 1`.
+    /// Carried OUTSIDE the state blob so no handling of the kind's
+    /// own state can ever lose the fence version.
+    pub state_seq: i64,
     /// The signal's live serving state, shared with the registry
     /// entry so status a serving task writes lands where /display
     /// reads it.
@@ -101,6 +106,17 @@ pub trait KindHandler: Send + Sync {
         secret_cache: &Arc<DashMap<String, String>>,
     ) -> Result<SignalRouting>;
 
+    /// True for kinds whose fires can arrive as BROAD account-routed
+    /// pushes (matched by connection + topic rather than by an exact
+    /// signal token). A RESUME registration of such a kind must carry
+    /// at least one predicate: with none, the first push on the
+    /// connection's topic would resume the wait, whoever caused it.
+    /// Registration enforces this; the default is false (every other
+    /// kind's fires address an exact token).
+    fn broad_push_routed(&self) -> bool {
+        false
+    }
+
     /// Compute the initial opaque state to persist on the signal row
     /// at register time. Default: empty object. Kinds that need to
     /// survive a listener restart return values keyed by their own
@@ -110,14 +126,14 @@ pub trait KindHandler: Send + Sync {
     /// **Persistence policy**: `signal_insert`'s UPSERT runs
     /// `kind_state = EXCLUDED.kind_state` on conflict (entry-row
     /// re-register on reactivate). Whatever this method returns
-    /// REPLACES the previously-persisted state. For Timer's
-    /// After-schedule pinning this is intended (reactivate is a
-    /// fresh schedule). For a hypothetical future kind that wants
-    /// to preserve a cursor across reactivates (e.g. SSE
-    /// "last-event-id"), this method must read the current row's
-    /// state via the broker and merge before returning. Today no
-    /// kind needs that; the contract is "register-time overwrite".
-    fn compute_initial_state(&self, _spec: &SignalSpec) -> Result<Value> {
+    /// REPLACES the previously-persisted state. `prior` is that
+    /// previously-persisted state when the reused entry token already
+    /// has a row (None on first registration). Timer IGNORES it
+    /// (reactivate is a fresh schedule by design); a kind whose state
+    /// is a feed cursor (poll_endpoint) returns it forward so a
+    /// deactivate/activate cycle never re-primes and silently
+    /// discards what arrived in between.
+    fn compute_initial_state(&self, _spec: &SignalSpec, _prior: Option<&Value>) -> Result<Value> {
         Ok(Value::Object(serde_json::Map::new()))
     }
 
@@ -200,18 +216,25 @@ fn handler_or_err(tag: &str) -> Result<&'static dyn KindHandler> {
 
 /// What the routing and kind_state come from. `Mint` is the register
 /// path: compute routing fresh (may mint a secret into the cache) and
-/// compute the initial kind_state. `Restore` is the rehydrate path:
-/// both values came back from the durable row, never recompute (a
-/// fresh `compute_routing` would mint a new API key and silently
-/// invalidate the user's existing one; a fresh `compute_initial_state`
-/// would reset a Timer's clock).
+/// compute the initial kind_state, handing the kind the token's
+/// previously-persisted state (entry tokens are reused across
+/// reactivates) so cursor-bearing kinds carry it forward. `Restore`
+/// is the rehydrate / pod-move path: both values came back from the
+/// durable row, never recompute (a fresh `compute_routing` would mint
+/// a new API key and silently invalidate the user's existing one; a
+/// fresh `compute_initial_state` would reset a Timer's clock).
 pub enum RoutingSource {
     Mint {
         secret_cache: Arc<DashMap<String, String>>,
+        prior_kind_state: Option<Value>,
+        /// The write-fence version the prior state was read at.
+        prior_seq: i64,
     },
     Restore {
         routing: SignalRouting,
         kind_state: Value,
+        /// The row's `kind_state_seq` at restore time.
+        seq: i64,
     },
 }
 
@@ -256,14 +279,25 @@ pub async fn register_in_registry(
         spec,
     } = identity;
     let handler = handler_or_err(&spec.kind)?;
+    // A resume wait fed by broad account-routed pushes must pin
+    // itself with a predicate (its minted correlation id): with none,
+    // ANY push on the connection's topic would resume it.
+    if is_resume && handler.broad_push_routed() && spec.match_predicates.is_empty() {
+        anyhow::bail!(
+            "a resume '{}' signal needs at least one predicate pinning it to its own \
+             correlation id; without one, any event on the connection's topic would \
+             resume this wait",
+            spec.kind,
+        );
+    }
     let fresh = matches!(source, RoutingSource::Mint { .. });
-    let (routing, kind_state_owned) = match source {
-        RoutingSource::Mint { secret_cache } => {
+    let (routing, kind_state_owned, state_seq) = match source {
+        RoutingSource::Mint { secret_cache, prior_kind_state, prior_seq } => {
             let r = handler.compute_routing(&token, &spec, &secret_cache)?;
-            let s = handler.compute_initial_state(&spec)?;
-            (r, s)
+            let s = handler.compute_initial_state(&spec, prior_kind_state.as_ref())?;
+            (r, s, prior_seq)
         }
-        RoutingSource::Restore { routing, kind_state } => (routing, kind_state),
+        RoutingSource::Restore { routing, kind_state, seq } => (routing, kind_state, seq),
     };
     // The held-event loops (Timer, SSE, poll, socket) capture the
     // signal's tenant AND its placement generation so the fire they
@@ -284,6 +318,7 @@ pub async fn register_in_registry(
         config: config.clone(),
         events_broker,
         fresh,
+        state_seq,
         serving: serving.clone(),
     };
     let task = handler

@@ -44,11 +44,16 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
         let worker = worker_planned_image(&plan)?;
+        // What must survive the post-ensure GC beyond the fresh tag
+        // (idle projects' current images, draining pods). Unreachable
+        // daemon = no answer = the GC is skipped, never guessed.
+        let referenced = crate::images::referenced_image_hashes(&client).await.ok();
         ensure_worker_image_with_progress(
             &progress,
             &project.id().to_string(),
             &worker.image_ref,
             &worker.context_dir,
+            referenced.as_ref(),
         )
         .await?;
         progress.complete(&format!("worker image {}", short_hash(&plan.binary_hash)));
@@ -96,6 +101,7 @@ pub async fn ensure_worker_image_with_progress(
     project_id: &str,
     image_tag: &str,
     worker_context_dir: &std::path::Path,
+    referenced: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     if crate::images::image_present(image_tag).await? {
         progress.build_skip(image_tag, "hash_match");
@@ -109,6 +115,13 @@ pub async fn ensure_worker_image_with_progress(
             ClusterBackend::Kind => {}
             ClusterBackend::K8s => return Err(bail_k8s_push_needed(image_tag)),
         }
+        gc_stale_images(
+            weft_compiler::build::WORKER_IMAGE_REPO,
+            image_tag,
+            &[format!("weft.dev/project={project_id}")],
+            referenced,
+        )
+        .await;
         return Ok(());
     }
 
@@ -120,7 +133,8 @@ pub async fn ensure_worker_image_with_progress(
     crate::images::ensure_worker_builder_base().await?;
 
     progress.build_start(image_tag);
-    docker_build_and_kind_load(progress, image_tag, project_id, worker_context_dir).await?;
+    docker_build_and_kind_load(progress, image_tag, project_id, worker_context_dir, referenced)
+        .await?;
     progress.build_done(image_tag);
     Ok(())
 }
@@ -152,9 +166,10 @@ pub fn short_hash(hash: &str) -> String {
 
 /// One source of truth for the "K8s backend selected, image is
 /// local-only, push it yourself" failure. Used by every CLI step
-/// that would otherwise let a subsequent `weft activate` spawn a
-/// pod that ImagePullBackOffs with no breadcrumb back to the CLI.
-fn bail_k8s_push_needed(tag: &str) -> anyhow::Error {
+/// (worker, infra, and node-test images alike) that would otherwise
+/// let a subsequent spawn ImagePullBackOff with no breadcrumb back to
+/// the CLI.
+pub(crate) fn bail_k8s_push_needed(tag: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "K8s backend selected but image '{tag}' is only in local docker. \
          Push it to your registry before activating, e.g.:\n\
@@ -175,16 +190,9 @@ async fn docker_build_and_kind_load(
     tag: &str,
     project_id: &str,
     context_dir: &std::path::Path,
+    referenced: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     docker_build(tag, context_dir, project_id).await?;
-    // Stamp the build with the project that triggered it (the
-    // `weft.dev/project` label, still read by `weft clean --images`)
-    // and prune that project's dangling `<none>:<none>` leftovers. The
-    // worker tag is content-addressed (`weft-worker:<hash>`) and shared
-    // across projects, so the project id rides on the LABEL, not the
-    // tag. Cargo build cache (the heavy part) lives in the baked base +
-    // BuildKit and survives this.
-    prune_dangling_for_project(project_id).await;
     let cfg = cluster_config();
     match cfg.backend {
         ClusterBackend::Kind if kind_available(&cfg.cluster_name).await => {
@@ -199,6 +207,21 @@ async fn docker_build_and_kind_load(
         }
         ClusterBackend::K8s => return Err(bail_k8s_push_needed(tag)),
     }
+    // GC only once the fresh tag is fully in place everywhere (same
+    // rule as the infra and node-test paths): the build stamped the
+    // `weft.dev/project` label, so the project's now-stale prior
+    // worker tags and dangling leftovers can go. The worker tag is
+    // content-addressed (`weft-worker:<hash>`) and shared across
+    // projects, so the project id rides on the LABEL, not the tag.
+    // Cargo build cache (the heavy part) lives in the baked base +
+    // BuildKit and survives this.
+    gc_stale_images(
+        weft_compiler::build::WORKER_IMAGE_REPO,
+        tag,
+        &[format!("weft.dev/project={project_id}")],
+        referenced,
+    )
+    .await;
     Ok(())
 }
 
@@ -208,23 +231,23 @@ async fn docker_build(
     project_id: &str,
 ) -> Result<()> {
     let label = format!("weft.dev/project={project_id}");
-    docker_build_image(tag, &ctx_dir.join("Dockerfile"), ctx_dir, Some(&label)).await
+    docker_build_image(tag, &ctx_dir.join("Dockerfile"), ctx_dir, &[label]).await
 }
 
-/// Single docker build entrypoint used by both worker images and
-/// infra images. The `label` arg lets callers stamp the
-/// `weft.dev/project=<id>` filter so `prune_dangling_for_project`
-/// can find their leftovers later. Other callers can pass `None`
-/// or a different domain label.
+/// Single docker build entrypoint used by worker, infra, and
+/// node-test images. The `labels` stamp the `weft.dev/*` filters
+/// (`project=<id>`, plus e.g. `node-test-package=<pkg>`) that
+/// [`gc_stale_images`] later selects on to find a build's stale
+/// leftovers.
 pub async fn docker_build_image(
     tag: &str,
     dockerfile: &std::path::Path,
     ctx_dir: &std::path::Path,
-    label: Option<&str>,
+    labels: &[String],
 ) -> Result<()> {
     let mut cmd = Command::new("docker");
     cmd.args(["build", "-t", tag]);
-    if let Some(l) = label {
+    for l in labels {
         cmd.args(["--label", l]);
     }
     cmd.arg("-f").arg(dockerfile).arg(ctx_dir);
@@ -236,22 +259,88 @@ pub async fn docker_build_image(
     Ok(())
 }
 
-/// Remove every dangling image labelled with this project. Best
-/// effort: a transient docker error doesn't fail the build.
-async fn prune_dangling_for_project(project_id: &str) {
-    let label_filter = format!("label=weft.dev/project={project_id}");
-    let _ = Command::new("docker")
-        .args([
-            "image",
-            "prune",
-            "--force",
-            "--filter",
-            "dangling=true",
-            "--filter",
-            &label_filter,
-        ])
-        .status()
-        .await;
+/// Drop STALE content-addressed images: every tag of `repo` carrying
+/// ALL the given `weft.dev/*` labels except `fresh` and except any tag
+/// whose hash is in `referenced`, on host docker and (matched through
+/// the shared node-ref matcher) in the kind node's containerd, then
+/// the matching dangling leftovers. Content-addressed tags mint one
+/// image per source version and nothing ever untags the old ones, so
+/// each successful ensure ends here or the pile grows without bound.
+///
+/// `referenced` is the dispatcher's answer for what must SURVIVE
+/// beyond the fresh tag (an idle project's current image, a draining
+/// pod's image; see `images::referenced_image_hashes`). `None` means
+/// the answer could not be learned, and the whole GC is skipped: an
+/// unbounded pile is a disk problem, a deleted live image is a broken
+/// cluster. Repos whose images only ever back live-tracked containers
+/// (infra, node tests) pass an empty set: their old tags are condemned
+/// by construction, and one still in use refuses its node-side remove.
+///
+/// Best effort throughout (a transient docker error never fails a
+/// build), and the shared BuildKit layer cache is untouched, so
+/// rebuilding a dropped tag stays warm.
+pub async fn gc_stale_images(
+    repo: &str,
+    fresh: &str,
+    labels: &[String],
+    referenced: Option<&std::collections::BTreeSet<String>>,
+) {
+    let Some(referenced) = referenced else { return };
+    let filters: Vec<String> = labels.iter().map(|l| format!("label={l}")).collect();
+    let mut list = Command::new("docker");
+    list.arg("images");
+    for f in &filters {
+        list.args(["--filter", f]);
+    }
+    list.args(["--format", "{{.Repository}}:{{.Tag}}"]);
+    let Ok(out) = list.output().await else { return };
+    if !out.status.success() {
+        return;
+    }
+    let stale: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.rsplit_once(':').is_some_and(|(r, _)| r == repo))
+        .filter(|line| *line != fresh)
+        .filter(|line| {
+            line.rsplit_once(':').is_none_or(|(_, hash)| !referenced.contains(hash))
+        })
+        .map(str::to_string)
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    // No `-f`: a tag docker refuses to drop (an image a host container
+    // still runs) is information, and force would untag it anyway and
+    // strand the container's restart.
+    let _ = Command::new("docker").args(["rmi"]).args(&stale).status().await;
+    // The kind node's containerd holds its own copy of every loaded
+    // tag (with no labels); condemn exactly the host-stale hash set
+    // there, through the one matcher every node cleanup uses (bare,
+    // docker-canonical, and registry-qualified spellings). A tag a
+    // live pod still runs refuses the rmi and survives.
+    let stale_hashes: std::collections::BTreeSet<&str> =
+        stale.iter().filter_map(|s| s.rsplit_once(':').map(|(_, h)| h)).collect();
+    let cfg = cluster_config();
+    if cfg.backend == ClusterBackend::Kind && kind_available(&cfg.cluster_name).await {
+        if let Ok(node_tags) = images::kind_node_repo_tags(&cfg.cluster_name).await {
+            let node = format!("{}-control-plane", cfg.cluster_name);
+            let node_stale =
+                images::node_refs_matching(repo, &node_tags, |h| stale_hashes.contains(h));
+            if !node_stale.is_empty() {
+                let _ = Command::new("docker")
+                    .args(["exec", &node, "crictl", "rmi"])
+                    .args(&node_stale)
+                    .status()
+                    .await;
+            }
+        }
+    }
+    let mut prune = Command::new("docker");
+    prune.args(["image", "prune", "--force", "--filter", "dangling=true"]);
+    for f in &filters {
+        prune.args(["--filter", f]);
+    }
+    let _ = prune.status().await;
 }
 
 pub async fn kind_available(cluster_name: &str) -> bool {

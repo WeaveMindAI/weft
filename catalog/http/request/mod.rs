@@ -13,8 +13,16 @@ use weft::node::NodeOutput;
 #[derive(NodeManifest)]
 pub struct HttpRequestNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for HttpRequestNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("url")?;
         let method_str: String = ctx.inputs.get("method")?;

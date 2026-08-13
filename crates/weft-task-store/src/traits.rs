@@ -43,6 +43,12 @@ pub trait TaskStoreClient: Send + Sync {
 
     async fn heartbeat(&self, task_id: Uuid, pod_id: &str) -> Result<bool>;
 
+    /// Surrender a claim back to `pending` (no claimant), guarded on
+    /// `claimed_by = pod_id` so a row already re-claimed elsewhere is
+    /// never clobbered. Returns true when the requeue landed. See
+    /// `tasks::requeue`.
+    async fn requeue(&self, task_id: Uuid, pod_id: &str) -> Result<bool>;
+
     async fn complete(&self, task_id: Uuid, pod_id: &str, result: Value) -> Result<()>;
 
     async fn fail(&self, task_id: Uuid, pod_id: &str, error: String) -> Result<()>;
@@ -105,6 +111,10 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         crate::tasks::heartbeat(&self.pool, task_id, pod_id).await
     }
 
+    async fn requeue(&self, task_id: Uuid, pod_id: &str) -> Result<bool> {
+        crate::tasks::requeue(&self.pool, task_id, pod_id).await
+    }
+
     async fn complete(&self, task_id: Uuid, pod_id: &str, result: Value) -> Result<()> {
         crate::tasks::complete(&self.pool, task_id, pod_id, result).await
     }
@@ -131,7 +141,13 @@ impl WorkerPodClient for PostgresWorkerPodClient {
         pod_name: &str,
         project_id: &str,
     ) -> Result<()> {
-        crate::worker_pod::register_alive(&self.pool, pod_name, project_id).await
+        crate::worker_pod::register_alive(
+            &self.pool,
+            pod_name,
+            project_id,
+            crate::worker_pod::AliveTransition::FromSpawning,
+        )
+        .await
     }
 
     async fn heartbeat(&self, pod_name: &str, mem_pressure: f64) -> Result<bool> {

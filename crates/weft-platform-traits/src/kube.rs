@@ -129,6 +129,20 @@ pub trait KubeReader: Send + Sync {
         namespace: &str,
         pod_name: &str,
     ) -> Result<Option<String>>;
+
+    /// The pod's `status.phase` (`Pending` / `Running` / `Succeeded` /
+    /// `Failed`), or `None` when the pod is not visible (deleted, not
+    /// yet applied, transient apiserver miss). Callers poll; the
+    /// node-test executor watches a run-to-completion pod through
+    /// this.
+    async fn pod_phase(&self, namespace: &str, pod_name: &str) -> Result<Option<String>>;
+
+    /// One named container's logs (full stdout+stderr as kubectl
+    /// serves them). Named explicitly so a pod that grows a second
+    /// container keeps this call unambiguous. Errors when the pod has
+    /// no readable logs; the node-test executor reads a completed
+    /// pod's report through this.
+    async fn pod_logs(&self, namespace: &str, pod_name: &str, container: &str) -> Result<String>;
 }
 
 #[async_trait]

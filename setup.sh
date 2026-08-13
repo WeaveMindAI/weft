@@ -574,12 +574,12 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       #           (infra_image_repo). Sidecar images are a REMOVED concept; the
       #           current code builds no `weft-sidecar-*`, so none is matched here.
       bp_ids="$(docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
-        | awk '$1=="weft-worker" || $1=="weft-builder-base" || $1 ~ /^weft-infra-/ {print $2}' \
+        | awk '$1=="weft-worker" || $1=="weft-builder-base" || $1=="weft-node-tests" || $1 ~ /^weft-infra-/ {print $2}' \
         | sort -u)"
       if [[ -n "${bp_ids}" ]]; then
         echo "${bp_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
       fi
-      ok "removed every weft-worker + weft-builder-base + weft-infra-* image"
+      ok "removed every weft-worker + weft-builder-base + weft-node-tests + weft-infra-* image"
 
       # Shared base images, gated.
       if [[ $purge_postgres -eq 1 ]]; then
@@ -613,10 +613,23 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       ok "removed ${C_DIM}.weft-base-context/${C_RESET}"
     fi
 
-    # 4. Daemon-local state.
+    # 4. Daemon-local state. Docker may have auto-created root-owned
+    # entries under it (a missing bind-mount source becomes a root
+    # directory); the plain rm fails on those, so docker itself (root)
+    # cleans them first.
     if [[ -d "${HOME}/.local/share/weft" ]]; then
-      rm -rf "${HOME}/.local/share/weft"
-      ok "removed ${C_DIM}~/.local/share/weft/${C_RESET}"
+      if ! rm -rf "${HOME}/.local/share/weft" 2>/dev/null; then
+        docker run --rm -v "${HOME}/.local/share/weft:/heal" alpine:3 \
+          sh -c "rm -rf /heal/* /heal/.[!.]*" >/dev/null 2>&1 || true
+        rm -rf "${HOME}/.local/share/weft" 2>/dev/null || true
+      fi
+      # Both attempts can fail (root-owned entries with docker itself
+      # unavailable); only claim success when the directory is gone.
+      if [[ -d "${HOME}/.local/share/weft" ]]; then
+        warn "could not remove ${C_DIM}~/.local/share/weft/${C_RESET}; remove it manually: sudo rm -rf ~/.local/share/weft"
+      else
+        ok "removed ${C_DIM}~/.local/share/weft/${C_RESET}"
+      fi
     fi
 
     # 5. Browser-extension build artifacts. WXT writes everything
@@ -674,6 +687,45 @@ if [[ $build_cli -eq 1 ]]; then
   section "CLI"
   hint "${C_DIM}cargo's incremental cache makes re-runs near-instant${C_RESET}"
   mkdir -p "${bin_dir}"
+
+  # ---- disk hygiene, BEFORE the build -------------------------------
+  #
+  # Two unbounded caches live on this machine and both once grew to
+  # ~100GB each before anyone noticed:
+  #   - the cargo target/ dir (incremental artifacts accumulate across
+  #     dep bumps and crate renames and are never evicted), and
+  #   - docker's BuildKit layer cache (every worker/infra/test image
+  #     build adds entries; nothing prunes them).
+  # Bound both on every install. The target/ bound is a cap, not a
+  # wipe: under the cap the incremental cache is untouched and rebuilds
+  # stay fast; over it we clean and pay one cold build now instead of
+  # filling the disk later. Override with WEFT_TARGET_CAP_GB.
+  target_cap_gb="${WEFT_TARGET_CAP_GB:-60}"
+  if [[ ! "${target_cap_gb}" =~ ^[0-9]+$ ]]; then
+    fail "WEFT_TARGET_CAP_GB must be a whole number of gigabytes, got '${target_cap_gb}'"
+    exit 1
+  fi
+  if [[ -d "${here}/target" ]]; then
+    # -L: a target/ symlinked onto a scratch disk (a normal cargo
+    # setup, and the case where the cap matters most) measures as 0
+    # without it. A non-numeric measurement skips the cap (wiping on
+    # an unreadable measurement is the dangerous direction).
+    target_gb="$(du -sBG -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1 | tr -d 'G')"
+    if [[ ! "${target_gb}" =~ ^[0-9]+$ ]]; then
+      warn "could not measure target/; skipping the size cap"
+    elif [[ "${target_gb}" -gt "${target_cap_gb}" ]]; then
+      warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); cleaning before the build"
+      rm -rf "${here}/target"
+      ok "removed ${C_DIM}target/${C_RESET} ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}"
+    fi
+  fi
+  # Gate on daemon REACHABILITY, not binary presence: a --cli install
+  # on a machine whose docker isn't running must still produce a
+  # binary. With a live daemon, a failed prune fails loud.
+  if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+    spin "bound BuildKit cache to 20GB (LRU)" \
+      docker builder prune --force --max-used-space 20GB
+  fi
   if [[ "${profile}" == "release" ]]; then
     target_dir="${here}/target/release"
   else
@@ -736,10 +788,27 @@ if [[ $build_cli -eq 1 ]]; then
     # (the `weft-worker:<hash>` form has no hyphen, so the old `weft-worker-*`
     # glob silently matched nothing).
     stale_bp_ids="$(docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
-      | awk '$1=="weft-worker" || $1=="weft-builder-base" {print $2}' | sort -u)"
+      | awk '$1=="weft-worker" || $1=="weft-builder-base" || $1=="weft-node-tests" {print $2}' \
+      | sort -u)"
     if [[ -n "${stale_bp_ids}" ]]; then
       echo "${stale_bp_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
-      ok "removed stale weft-worker + weft-builder-base images on host docker"
+      ok "removed stale weft-worker + weft-builder-base + weft-node-tests images on host docker"
+    fi
+    # A changed engine invalidates nearly every BuildKit cache entry
+    # (the cargo layers of worker/infra/test builds all bake it), so a
+    # bounded prune would just keep 20GB of dead weight: drop it all.
+    # Best effort like the rest of this sweep: a --cli install must
+    # finish even with the docker daemon down, and the bounded prune
+    # at the top (which runs only against a live daemon) is the loud
+    # one.
+    docker builder prune --force >/dev/null 2>&1 || true
+    ok "dropped the BuildKit cache (stale against the new engine)"
+    # Same for the node-test sweep's cargo cache under target/tmp: it
+    # compiles the emitted crates against the OLD engine, so keeping it
+    # only makes the next sweep re-verify 25GB of stale artifacts.
+    if [[ -d "${here}/target/tmp" ]]; then
+      rm -rf "${here}/target/tmp"
+      ok "removed ${C_DIM}target/tmp${C_RESET} ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}"
     fi
     if command -v kind >/dev/null 2>&1; then
       kind_node=""
@@ -755,16 +824,19 @@ if [[ $build_cli -eq 1 ]]; then
         # `repo:tag`; the bare repo is everything before the last ':'). The new
         # worker form `weft-worker:<hash>` has no hyphen, so the old
         # `weft-worker-` substring matched nothing.
+        # Registry prefix FIRST, then any tag remnant: the other order
+        # eats a registry's port (`registry:5000/...` -> `registry`)
+        # and silently skips every registry-qualified ref.
         kind_worker_tags="$(
           docker exec "${kind_node}" crictl images 2>/dev/null \
-            | awk 'NR>1 {n=split($1,p,":"); repo=$1; sub(/:[^:]*$/,"",repo); \
-                   if (repo=="weft-worker" || repo=="weft-builder-base") print $1":"$2}' \
+            | awk 'NR>1 {repo=$1; sub(/^.*\//,"",repo); sub(/:[^:]*$/,"",repo); \
+                   if (repo=="weft-worker" || repo=="weft-builder-base" || repo=="weft-node-tests") print $1":"$2}' \
             | sort -u
         )"
         if [[ -n "${kind_worker_tags}" ]]; then
           # shellcheck disable=SC2086
           docker exec "${kind_node}" crictl rmi ${kind_worker_tags} >/dev/null 2>&1 || true
-          ok "removed cached weft-worker + weft-builder-base images in kind containerd"
+          ok "removed cached weft-worker + weft-builder-base + weft-node-tests images in kind containerd"
         fi
       fi
     fi

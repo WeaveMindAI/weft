@@ -146,26 +146,10 @@ pub async fn clean(
 async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     use tokio::process::Command;
 
-    // Referenced set: the dispatcher's authoritative answer, across all
-    // tenants: every project's running binary hash UNION every
-    // non-terminal worker pod's hash (a pod draining in-flight work may
-    // still run an image its project no longer points at, and deleting
-    // that image would strand a restart). Loud error if the daemon is
+    // Referenced set: the dispatcher's authoritative answer (see
+    // `images::referenced_image_hashes`). Loud error if the daemon is
     // down; guessing "nothing is referenced" would nuke live images.
-    // SYNC: response shape (JSON array of bare hash strings) <->
-    //       crates/weft-dispatcher/src/api/project.rs referenced_images
-    let referenced_json = ctx
-        .client()
-        .get_json("/images/referenced")
-        .await
-        .map_err(|e| anyhow::anyhow!("fetch referenced images (is the daemon up?): {e}"))?;
-    let referenced: std::collections::BTreeSet<String> = referenced_json
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str())
-        .map(str::to_string)
-        .collect();
+    let referenced = crate::images::referenced_image_hashes(&ctx.client()).await?;
 
     // Candidate tags, optionally scoped to the cwd project via the
     // `weft.dev/project` label every worker build stamps.
@@ -211,12 +195,61 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
         // No `--force`: nothing on the host should hold these (workers run
         // in the cluster, not host docker), so a refusal is real
         // information about state we did not expect, not an obstacle to
-        // steamroll.
-        let status = Command::new("docker").arg("rmi").args(&stale).status().await?;
-        if !status.success() {
-            anyhow::bail!("docker rmi exited {status}");
+        // steamroll. One exception is honest: an image that is ALREADY
+        // gone (a concurrent clean between our listing and this delete)
+        // is already reclaimed. That case is detected by OBSERVING the
+        // state (is the image still present?) rather than parsing the
+        // daemon's error prose, which varies across versions and
+        // locales. Per-image so one gone tag cannot abort the others.
+        let mut removed = 0usize;
+        let mut already_gone = 0usize;
+        for image in &stale {
+            let out = Command::new("docker").args(["rmi", image]).output().await?;
+            if out.status.success() {
+                removed += 1;
+                continue;
+            }
+            let present = Command::new("docker")
+                .args(["image", "inspect", image])
+                .output()
+                .await?
+                .status
+                .success();
+            if !present {
+                // "Absent" is only a verdict when the daemon itself
+                // still answers: a daemon that died mid-sweep fails
+                // BOTH the rmi and the inspect, and reporting that as
+                // "already reclaimed" would announce success over a
+                // failure.
+                let daemon_up = Command::new("docker")
+                    .args(["version", "--format", "{{.Server.Version}}"])
+                    .output()
+                    .await?
+                    .status
+                    .success();
+                if daemon_up {
+                    already_gone += 1;
+                    continue;
+                }
+                anyhow::bail!(
+                    "docker stopped answering while removing {image}; check the daemon \
+                     and rerun `weft clean --images`"
+                );
+            }
+            anyhow::bail!(
+                "docker rmi {image} exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
-        println!("removed {} unreferenced worker image(s)", stale.len());
+        println!(
+            "removed {removed} unreferenced worker image(s){}",
+            if already_gone > 0 {
+                format!(", {already_gone} already reclaimed")
+            } else {
+                String::new()
+            }
+        );
     }
 
     // Dangling (untagged) leftovers from rebuilds under the same tag.
@@ -254,54 +287,71 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     if cfg.backend != ClusterBackend::Kind {
         return Ok(());
     }
-    let node_stale = stale_worker_node_refs(
+    let node_stale = crate::images::node_refs_matching(
+        weft_compiler::build::WORKER_IMAGE_REPO,
         &crate::images::kind_node_repo_tags(&cfg.cluster_name).await?,
-        &referenced,
+        |hash| !referenced.contains(hash),
     );
     if !node_stale.is_empty() {
         let node = format!("{}-control-plane", cfg.cluster_name);
-        let out = Command::new("docker")
-            .args(["exec", &node, "crictl", "rmi"])
-            .args(&node_stale)
-            .output()
-            .await?;
-        if !out.status.success() {
+        // Per-ref for the same reason as the host sweep above: a
+        // concurrent clean may have reclaimed a ref between our listing
+        // and this delete, and "already gone" is a success, detected by
+        // observing presence rather than parsing error prose.
+        let mut removed = 0usize;
+        let mut already_gone = 0usize;
+        for image in &node_stale {
+            let out = Command::new("docker")
+                .args(["exec", &node, "crictl", "rmi", image])
+                .output()
+                .await?;
+            if out.status.success() {
+                removed += 1;
+                continue;
+            }
+            let present = Command::new("docker")
+                .args(["exec", &node, "crictl", "inspecti", image])
+                .output()
+                .await?
+                .status
+                .success();
+            if !present {
+                // "Absent" is only a verdict when the node still
+                // answers exec at all: an unreachable node fails BOTH
+                // the rmi and the inspecti through the same transport,
+                // and reporting that as "already reclaimed" would
+                // announce success over a dead node.
+                let node_up = Command::new("docker")
+                    .args(["exec", &node, "crictl", "--version"])
+                    .output()
+                    .await?
+                    .status
+                    .success();
+                if node_up {
+                    already_gone += 1;
+                    continue;
+                }
+                anyhow::bail!(
+                    "the {node} node stopped answering while removing {image}; check \
+                     the kind cluster and rerun `weft clean --images`"
+                );
+            }
             anyhow::bail!(
-                "crictl rmi on {node} failed for some worker images: {}; \
+                "crictl rmi {image} on {node} failed: {}; \
                  rerun `weft clean --images` after checking the node",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
         println!(
-            "removed {} stale worker image(s) from the {node} node",
-            node_stale.len()
+            "removed {removed} stale worker image(s) from the {node} node{}",
+            if already_gone > 0 {
+                format!(", {already_gone} already reclaimed")
+            } else {
+                String::new()
+            }
         );
     }
     Ok(())
-}
-
-/// From the node's image refs, the `weft-worker` repo tags whose hash is not
-/// in `referenced`, ready for `crictl rmi`. Pure so it is unit-testable; only
-/// worker-repo refs are ever returned, which is the guarantee that keeps
-/// system images (listener & co) safe from this cleanup. Handles bare
-/// (`weft-worker:<hash>`), docker-canonical (`docker.io/library/...`), and
-/// registry-qualified (`host:port/path/weft-worker:<hash>`) spellings.
-fn stale_worker_node_refs(
-    node_refs: &[String],
-    referenced: &std::collections::BTreeSet<String>,
-) -> Vec<String> {
-    let worker_prefix = format!("{}:", weft_compiler::build::WORKER_IMAGE_REPO);
-    node_refs
-        .iter()
-        .filter(|full| {
-            let repo_tag = full.rsplit_once('/').map_or(full.as_str(), |(_, t)| t);
-            match repo_tag.strip_prefix(&worker_prefix) {
-                Some(hash) => !referenced.contains(hash),
-                None => false,
-            }
-        })
-        .cloned()
-        .collect()
 }
 
 /// `docker buildx prune` reclaims BuildKit's intermediate layers.
@@ -322,13 +372,11 @@ async fn clean_build_cache() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::stale_worker_node_refs;
-
-    /// Only worker-repo tags leave this function, and only unreferenced ones:
-    /// the system images (listener & co) must NEVER be node-pruned (a
-    /// blanket prune once stranded on-demand listener pods in
-    /// ImagePullBackOff), and a referenced worker must survive. All three
-    /// ref spellings are handled: bare, docker-canonical, and
+    /// Only the named repo's tags leave the shared matcher, and only the
+    /// condemned ones: the system images (listener & co) must NEVER be
+    /// node-pruned (a blanket prune once stranded on-demand listener pods
+    /// in ImagePullBackOff), and a referenced worker must survive. All
+    /// three ref spellings are handled: bare, docker-canonical, and
     /// registry-qualified with a host:port.
     #[test]
     fn node_cleanup_targets_only_unreferenced_worker_tags() {
@@ -343,11 +391,10 @@ mod tests {
         .into_iter()
         .map(str::to_string)
         .collect();
-        let referenced = ["aaa111".to_string(), "ccc333".to_string()]
-            .into_iter()
-            .collect();
+        let referenced: std::collections::BTreeSet<String> =
+            ["aaa111".to_string(), "ccc333".to_string()].into_iter().collect();
         assert_eq!(
-            stale_worker_node_refs(&refs, &referenced),
+            crate::images::node_refs_matching("weft-worker", &refs, |h| !referenced.contains(h)),
             vec![
                 "docker.io/library/weft-worker:bbb222".to_string(),
                 "weft-worker:ddd444".to_string(),

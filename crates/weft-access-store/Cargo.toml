@@ -30,6 +30,9 @@ url = { workspace = true }
 # a worker call.
 reqwest = { workspace = true }
 weft-core = { workspace = true }
+# `SchemaGroup` + `apply_groups`: this crate declares its schema as a group
+# the boot's schema guard applies alongside every other module's.
+weft-task-store = { workspace = true }
 # MintJwt acquisitions (GitHub App class): RS256 over the pasted private
 # key, exchanged for the working token at resolution time.
 jsonwebtoken = "9"

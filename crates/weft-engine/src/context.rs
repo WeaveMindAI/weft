@@ -1493,14 +1493,14 @@ pub struct RunnerHandle {
     /// did not receive a `live_connection` request. Per-execution, not
     /// per-firing: all firings of one color share the one caller.
     caller_connection: Option<Arc<dyn weft_core::caller::CallerConnection>>,
-    /// The resolved value maps of the RUNTIME-OWNED (`Ours`)
+    /// The grant id and resolved value map of the RUNTIME-OWNED (`Ours`)
     /// connections this firing opened (`ctx.open`), released by the
     /// loop driver when the node's body finishes (see
     /// [`Self::close_opened_accesses`]); nothing node-facing releases
     /// one. A their-own connection is never tracked: there is nothing
     /// of the runtime's to retire, and the user's own secrets must
     /// not travel back on a release.
-    opened_accesses: Mutex<Vec<std::collections::BTreeMap<String, String>>>,
+    opened_accesses: Mutex<Vec<(String, std::collections::BTreeMap<String, String>)>>,
 }
 
 impl RunnerHandle {
@@ -1557,11 +1557,13 @@ impl RunnerHandle {
     /// calls this once the node's body has finished (any outcome); a
     /// release that fails is logged loudly rather than failing the
     /// node, because a runtime-supplied credential's own window is the
-    /// backstop.
-    pub async fn close_opened_accesses(&self) {
-        let opened: Vec<std::collections::BTreeMap<String, String>> =
+    /// backstop. Returns one entry per failed release (empty = all
+    /// released), so callers that must surface a leak can.
+    pub async fn close_opened_accesses(&self) -> Vec<String> {
+        let opened: Vec<(String, std::collections::BTreeMap<String, String>)> =
             std::mem::take(&mut *self.opened_accesses.lock().unwrap());
-        for values in opened {
+        let mut failures = Vec::new();
+        for (grant, values) in opened {
             let req = weft_broker_client::protocol::ReleaseConnectionRequest {
                 color: self.color.to_string(),
                 values,
@@ -1570,10 +1572,13 @@ impl RunnerHandle {
                 tracing::error!(
                     target: "weft_engine::metering",
                     node = %self.node_id,
+                    grant = %grant,
                     "releasing a connection failed (its window remains the backstop): {e:#}"
                 );
+                failures.push(format!("grant {grant}: {e:#}"));
             }
         }
+        failures
     }
 
     /// Wire the emission channel. Called by the loop driver before
@@ -2463,7 +2468,10 @@ impl ContextHandle for RunnerHandle {
         // runtime-supplied credential, and a their-own connection's
         // stored values are the user's own and never travel back.
         if resp.owner == weft_core::CredentialOwner::Ours {
-            self.opened_accesses.lock().unwrap().push(resp.values.clone());
+            self.opened_accesses
+                .lock()
+                .unwrap()
+                .push((access.access_id().to_string(), resp.values.clone()));
         }
 
         let steps = weft_core::access::client::resolve_steps(&resp.auth, &resp.values)
@@ -2981,18 +2989,169 @@ mod replay_tests {
     #[tokio::test]
     async fn client_sugar_opens_and_leases() {
         let fake = FakeAccessBroker::new();
-        fake.set_owned_bearer_connection("id-1", "xoxb-1", weft_core::CredentialOwner::Ours);
+        // Ours exercises the lease path (only a runtime credential
+        // releases), and a runtime credential only opens for a METERED
+        // service, so the fixture is a metered one.
+        fake.set_owned_bearer_connection("id-1", "sk-or-1", weft_core::CredentialOwner::Ours);
         let handle = Arc::new(handle_with_access_broker(fake.clone()));
         let ctx = ctx_over_arc(handle.clone());
 
-        let access = weft_core::Access::new("id-1", "slack", Some("Q @ Acme".into()));
+        let access = weft_core::Access::new("id-1", "openrouter", Some("Q @ Acme".into()));
         ctx.client(&access).await.expect("a connected grant resolves to a client");
         let resolved = fake.resolved.lock().unwrap().clone();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].connection_id, "id-1");
-        assert_eq!(resolved[0].service, "slack");
+        assert_eq!(resolved[0].service, "openrouter");
         handle.close_opened_accesses().await;
         assert_eq!(fake.released.lock().unwrap().len(), 1, "the sugar leases too");
+    }
+
+    /// The security invariant that must never be quietly undone: a LIVE
+    /// node test resolves its provider credential through the EXACT same
+    /// path a worker firing does. A node-test pod is not a worker (it
+    /// never claims a task), but on the credential + metering seam it is
+    /// deliberately made to look like one to the broker: same
+    /// `RunnerHandle::open_connection`, so the same broker resolve
+    /// request, so the same tenant/owner gate, proxy, and metering.
+    ///
+    /// This test opens the same connection two ways, once through a
+    /// worker's `RunnerHandle` and once through the live-test rig's
+    /// handle, over identical fake brokers, and asserts the resolve
+    /// request the broker sees is worker-shaped and IDENTICAL in every
+    /// security-carrying field (color, tenant is not on the wire but the
+    /// color maps to it broker-side, project, service, connection id,
+    /// declared permissions/values). If someone ever gives the test path
+    /// a reduced handle, a raw key, or a broker bypass, the two requests
+    /// diverge and this fails.
+    // Gated with the rig itself: `test_rig` compiles only for the
+    // emitted per-package test crate, so this cross-check rides the
+    // same feature.
+    #[cfg(feature = "node-tests")]
+    #[tokio::test]
+    async fn a_live_test_resolves_credentials_exactly_like_a_worker() {
+        use weft_core::node::{Node, NodeManifest, NodeMetadata};
+        use weft_core::ExecutionContext;
+
+        // A node whose whole body is "open the declared connection":
+        // the one act whose plumbing we are pinning.
+        fn opens_manifest() -> &'static NodeMetadata {
+            static M: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            M.get_or_init(|| {
+                serde_json::from_value(serde_json::json!({
+                    "type": "OpensConnection",
+                    "label": "Opens connection",
+                    "description": "test-only node",
+                    "inputs": [{"name": "account", "type": "Access", "required": false}],
+                    "outputs": []
+                }))
+                .expect("manifest")
+            })
+        }
+        struct OpensConnection;
+        impl NodeManifest for OpensConnection {
+            fn manifest(&self) -> &'static NodeMetadata {
+                opens_manifest()
+            }
+        }
+        // The access BOTH paths open, built the same way, so the
+        // resolve-request assertions on scopes/values pin real
+        // propagation rather than comparing two empty vecs. A regression
+        // that dropped declared scopes on the test path would then fail
+        // the test.
+        fn scoped_access() -> weft_core::Access {
+            weft_core::Access::new("id-1", "openrouter", None)
+                .with_required_permissions(vec!["models.read".into()])
+                .with_required_values(vec!["org_id".into()])
+        }
+
+        #[async_trait::async_trait]
+        impl Node for OpensConnection {
+            async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+                ctx.client(&scoped_access()).await?;
+                Ok(())
+            }
+        }
+
+        // Same fixture on both sides: a runtime-owned (Ours) metered
+        // connection, the shape that exercises the proxy/lease path.
+        let make_broker = || {
+            let b = FakeAccessBroker::new();
+            b.set_owned_bearer_connection("id-1", "sk-or-1", weft_core::CredentialOwner::Ours);
+            b
+        };
+
+        // (1) The WORKER path: a plain RunnerHandle opens the connection.
+        let worker_broker = make_broker();
+        let worker_clients = EngineClients {
+            journal: Arc::new(NoopJournal),
+            tasks: Arc::new(NoopTaskStore),
+            infra: Arc::new(NoopInfra),
+            infra_state: Arc::new(NoopInfraState),
+            project: Arc::new(NoopProject),
+            clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
+            access_broker: worker_broker.clone(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
+        };
+        let color = uuid::Uuid::from_u128(0xC0);
+        let worker_handle = Arc::new(RunnerHandle::new(
+            color.to_string(),
+            "project-1".into(),
+            color,
+            "node-x".into(),
+            "OpensConnection".into(),
+            weft_core::frames::LoopFrames::default(),
+            worker_clients,
+            "worker-pod-1".into(),
+            "tenant-1".into(),
+            std::sync::Arc::new(CancellationFlag::new()),
+            BusCoordinator::new(),
+            HashMap::new(),
+        ));
+        ctx_over_arc(worker_handle).client(&scoped_access()).await.expect("worker opens");
+
+        // (2) The LIVE TEST path: the rig builds its handle and runs the
+        // node, going through the production `open_connection` under its
+        // capture layer, over the same clients composition.
+        let test_broker = make_broker();
+        let test_clients = EngineClients {
+            journal: Arc::new(NoopJournal),
+            tasks: Arc::new(NoopTaskStore),
+            infra: Arc::new(NoopInfra),
+            infra_state: Arc::new(NoopInfraState),
+            project: Arc::new(NoopProject),
+            clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
+            access_broker: test_broker.clone(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
+        };
+        let runner = crate::test_rig::LiveTestRunner::new(
+            test_clients,
+            "test-pod-1".into(),
+            "tenant-1".into(),
+            "project-1".into(),
+            Some(color),
+        );
+        let rig = runner.rig("id-1", "openrouter");
+        rig.run(&OpensConnection, serde_json::json!({})).await.ok().expect("rig opens");
+
+        // The two resolve requests must match on every field that
+        // decides which credential the broker hands back. A divergence
+        // here means the test path stopped being a worker to the broker.
+        let w = worker_broker.resolved.lock().unwrap().clone();
+        let t = test_broker.resolved.lock().unwrap().clone();
+        assert_eq!(w.len(), 1, "worker resolves once");
+        assert_eq!(t.len(), 1, "test resolves once");
+        let (w, t) = (&w[0], &t[0]);
+        assert_eq!(w.color, t.color, "same execution color -> same broker tenant/owner gate");
+        assert_eq!(w.project_id, t.project_id, "same project scope");
+        assert_eq!(w.service, t.service, "same service");
+        assert_eq!(w.connection_id, t.connection_id, "same grant");
+        assert_eq!(
+            w.required_permissions, t.required_permissions,
+            "same declared scopes on the wire"
+        );
+        assert_eq!(w.required_values, t.required_values, "same declared values on the wire");
     }
 
     // Layer 3: the ContextHandle storage methods over the fake
@@ -3064,26 +3223,8 @@ mod replay_tests {
         assert!(err.to_string().contains("external URL"), "{err}");
     }
 
-    struct NoopJournal;
-    #[async_trait]
-    impl JournalClient for NoopJournal {
-        async fn record_event(
-            &self,
-            _event: &ExecEvent,
-            _pod_name: Option<&str>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn events_for_color(
-            &self,
-            _color: Color,
-        ) -> anyhow::Result<Vec<ExecEvent>> {
-            Ok(Vec::new())
-        }
-        async fn has_terminal_event(&self, _color: Color) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-    }
+    use weft_journal::NoopJournal;
+
     struct NoopTaskStore;
     #[async_trait]
     impl TaskStoreClient for NoopTaskStore {
@@ -3109,6 +3250,13 @@ mod replay_tests {
             Ok(None)
         }
         async fn heartbeat(
+            &self,
+            _task_id: uuid::Uuid,
+            _pod_id: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn requeue(
             &self,
             _task_id: uuid::Uuid,
             _pod_id: &str,

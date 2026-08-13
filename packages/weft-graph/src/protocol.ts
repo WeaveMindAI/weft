@@ -238,7 +238,10 @@ export type WidgetKind = Widget['kind'];
 export type ResourceSource =
   /// Options recorded on the connection during sign-in; free.
   | { kind: 'granted'; from: string; label: string; value: string }
-  /// Call the service and enumerate; needs `requires` on the connection.
+  /// Call the service and enumerate; needs `requires` on the
+  /// connection, unless the lookup is `public` (credential-free,
+  /// stands with no connection; `public` + `requires` is refused at
+  /// metadata load).
   | ({ kind: 'list'; requires?: string[] } & Lookup)
   /// The provider's own chooser, declared entirely by the NODE: the
   /// chooser script's address and the author's glue, run on a
@@ -261,6 +264,9 @@ export interface Lookup {
   /// Dotted path (per item) for the stored id.
   value: string;
   page?: PageSpec;
+  /// The endpoint is public: called with no credential, so the source
+  /// works with no connection picked (and never signs even with one).
+  public?: boolean;
 }
 
 // SYNC: PageSpec <-> crates/weft-core/src/node.rs PageSpec
@@ -296,7 +302,15 @@ export type Widget =
   /// Pick a resource on the connected service. `access` names this
   /// node's Access input; `sources` are the fill ways in preference
   /// order; `depends_on` are parent inputs for drill-down.
-  | { kind: 'remote_select'; access: string; sources: ResourceSource[]; depends_on?: string[] }
+  | {
+      kind: 'remote_select';
+      access: string;
+      sources: ResourceSource[];
+      depends_on?: string[];
+      /// The user may type a value the sources never listed (the
+      /// fetched list is suggestions, not a closed set).
+      free_text?: boolean;
+    }
   | { kind: 'form_builder' }
   /// Editor file picker. `type` is the declared weft file type
   /// (Image/Audio/Video/Blob/File); `accept` optionally narrows the

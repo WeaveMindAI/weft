@@ -24,10 +24,15 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+url = { workspace = true }
+terminal_size = { workspace = true }
+base64 = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
+# User-level CLI settings file (`~/.config/weft/cli.toml`).
+toml = { workspace = true }
 sha2 = { workspace = true }
 ipnet = { workspace = true }

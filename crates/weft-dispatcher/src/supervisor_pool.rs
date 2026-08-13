@@ -371,10 +371,12 @@ async fn release_ghost_leases(pg_pool: &PgPool) -> Result<()> {
 // Pod registry schema
 // =============================================================
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    // Registry of live supervisor pods (the placement target). Keyed by
-    // pod, NOT tenant. Exact analog of `listener_pod`.
-    sqlx::query(
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "supervisor_pod",
+    tables: &["supervisor_pod", "infra_owner"],
+    ddl: &[
+        // Registry of live supervisor pods (the placement target). Keyed by
+        // pod, NOT tenant. Exact analog of `listener_pod`.
         r#"CREATE TABLE IF NOT EXISTS supervisor_pod (
             pod_name          TEXT PRIMARY KEY,
             admin_url         TEXT NOT NULL,
@@ -402,14 +404,9 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             -- with the row.
             draining          BOOLEAN NOT NULL DEFAULT FALSE
         )"#,
-    )
-    .execute(pool)
-    .await
-    .context("create supervisor_pod table")?;
-    // The EXCLUSIVE ownership lease. One row per project whose infra is
-    // currently owned by a supervisor. Keyed by project (1:1 with its
-    // namespace), carrying the namespace + tenant the kubectl path needs.
-    sqlx::query(
+        // The EXCLUSIVE ownership lease. One row per project whose infra is
+        // currently owned by a supervisor. Keyed by project (1:1 with its
+        // namespace), carrying the namespace + tenant the kubectl path needs.
         r#"CREATE TABLE IF NOT EXISTS infra_owner (
             project_id        TEXT PRIMARY KEY,
             supervisor_pod    TEXT NOT NULL,
@@ -417,19 +414,10 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             tenant_id         TEXT NOT NULL,
             leased_until_unix BIGINT NOT NULL
         )"#,
-    )
-    .execute(pool)
-    .await
-    .context("create infra_owner table")?;
-    sqlx::query(
         r#"CREATE INDEX IF NOT EXISTS idx_infra_owner_pod
              ON infra_owner(supervisor_pod)"#,
-    )
-    .execute(pool)
-    .await
-    .context("create idx_infra_owner_pod")?;
-    Ok(())
-}
+    ],
+};
 
 // =============================================================
 // SupervisorPool: load-based placement with exclusive ownership

@@ -65,7 +65,18 @@
       "required": true,
       "exposure": "config",
       "widget": {
-        "kind": "text"
+        "kind": "remote_select",
+        "access": "connection",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.openai.com/v1/models",
+            "items": "data",
+            "label": "id",
+            "value": "id"
+          }
+        ]
       },
       "label": "Model",
       "placeholder": "gpt-5.6-luna"

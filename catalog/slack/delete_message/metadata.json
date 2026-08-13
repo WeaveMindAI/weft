@@ -1,0 +1,45 @@
+{
+  "type": "SlackDeleteMessage",
+  "label": "Slack: Delete Message",
+  "description": "Delete a message this app posted earlier (Slack only lets an app delete its own messages). Address it by channel + ts.",
+  "tags": [
+    "slack",
+    "message",
+    "chat"
+  ],
+  "icon": "Hash",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "chat:write"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the chat:write scope."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "label": "Channel",
+      "placeholder": "The channel id the message lives in"
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": true,
+      "label": "Message ts",
+      "placeholder": "The message's timestamp id"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false,
+      "description": "True once the message is gone."
+    }
+  ]
+}

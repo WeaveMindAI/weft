@@ -356,9 +356,10 @@ pub async fn upload_abort(
 
 // ---------- durable terminate-sweep queue ----------
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    sqlx::raw_sql(
-        r#"
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "storage_sweep",
+    tables: &["storage_sweep"],
+    ddl: &[r#"
         -- Durable terminate-sweep queue: a row per terminated color whose
         -- un-kept exec files still need sweeping. Inserted by the journal
         -- bridge (the durable observer of terminate), deleted by the sweep
@@ -368,13 +369,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             tenant_id TEXT NOT NULL,
             enqueued_at_unix BIGINT NOT NULL
         );
-        "#,
-    )
-    .execute(pool)
-    .await
-    .context("storage_sweep migrate")?;
-    Ok(())
-}
+        "#],
+};
 
 /// Enqueue a terminate sweep for `color`. Called by the journal bridge when it
 /// observes a terminal exec event; idempotent.

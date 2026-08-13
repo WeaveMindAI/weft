@@ -1,0 +1,4 @@
+[package]
+name = "e2e_llm_stream_tool"
+id = "00000000-0000-0000-0000-000000000048"
+version = "0.1.0"

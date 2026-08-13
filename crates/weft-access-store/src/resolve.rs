@@ -815,7 +815,11 @@ pub struct LookupItem {
 /// ONE definition so the two hops cannot drift.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookupRequest {
-    pub access_id: uuid::Uuid,
+    /// The connection to sign with; `None` for a `public` lookup (no
+    /// connection is involved at all, and `service` may be empty).
+    #[serde(default)]
+    pub access_id: Option<uuid::Uuid>,
+    #[serde(default)]
     pub service: String,
     /// The widget's declarative lookup, verbatim from the node's
     /// (compiler-resolved) metadata.
@@ -890,19 +894,16 @@ pub async fn granted_items(
         .collect())
 }
 
-/// Run a `remote_select` widget's declarative lookup through the
-/// stored access. The broker holds the token and makes the call;
-/// nothing credential-shaped goes back to the editor.
-pub async fn lookup(pool: &PgPool, tenant: &str, req: &LookupRequest) -> anyhow::Result<LookupPage> {
-    let LookupRequest { access_id, service, lookup: spec, query, parents, cursor } = req;
-    let resolved = resolve_for_worker(pool, tenant, *access_id, service, &[], &[]).await?;
-    let steps = resolve_steps(&resolved.auth, &resolved.values).map_err(AccessError::Invalid)?;
-    let client = authed_client(steps);
-    let cursor = cursor.as_deref();
-
-    // `{query}` and `{<parent>}` substitute into the URL template,
-    // percent-encoded. Unknown placeholders are loud: a typo'd parent
-    // name must not silently hit the service with a literal brace.
+/// The URL a lookup will call: the widget's `get` template with
+/// `{query}` and `{<parent>}` substituted, percent-encoded. Unknown
+/// placeholders are loud: a typo'd parent name must not silently hit
+/// the service with a literal brace. Public so the lookup's caller
+/// can name the exact URL when asking a credential policy about it.
+pub fn lookup_url(
+    spec: &Lookup,
+    query: &str,
+    parents: &BTreeMap<String, String>,
+) -> anyhow::Result<String> {
     let mut url = String::with_capacity(spec.get.len());
     let mut rest = spec.get.as_str();
     while let Some(start) = rest.find('{') {
@@ -917,7 +918,7 @@ pub async fn lookup(pool: &PgPool, tenant: &str, req: &LookupRequest) -> anyhow:
         };
         let name = &after[..end];
         let value = if name == "query" {
-            query.as_str()
+            query
         } else {
             parents.get(name).map(String::as_str).ok_or_else(|| {
                 AccessError::Invalid(format!(
@@ -930,8 +931,30 @@ pub async fn lookup(pool: &PgPool, tenant: &str, req: &LookupRequest) -> anyhow:
         rest = &after[end + 1..];
     }
     url.push_str(rest);
+    Ok(url)
+}
 
-    let mut req = client.get(&url);
+/// Run a `remote_select` widget's declarative lookup at `url` (built
+/// by [`lookup_url`]; the caller owns it so a credential policy can
+/// inspect it, and reroute it through a relay, before the call is
+/// made). `resolved` signs the call; `None` is the `public` lookup (a
+/// credential-free endpoint, called bare). The caller also fills the
+/// auth values when the credential is the runtime's. This side holds
+/// the token and makes the call; nothing credential-shaped goes back
+/// to the editor.
+pub async fn lookup(
+    resolved: Option<&ResolvedAccess>,
+    spec: &Lookup,
+    cursor: Option<&str>,
+    url: &str,
+) -> anyhow::Result<LookupPage> {
+    let steps = match resolved {
+        Some(r) => resolve_steps(&r.auth, &r.values).map_err(AccessError::Invalid)?,
+        None => Vec::new(),
+    };
+    let client = authed_client(steps);
+
+    let mut req = client.get(url);
     if let (Some(page), Some(cursor)) = (&spec.page, cursor) {
         req = req.query(&[(page.cursor_param.as_str(), cursor)]);
     }
@@ -1002,6 +1025,36 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// URL templating: `{query}` and `{<parent>}` substitute
+    /// percent-encoded, unknown placeholders and unclosed braces are
+    /// loud, and a substitution inside a query string stays a query.
+    #[test]
+    fn lookup_url_substitutes_encodes_and_refuses() {
+        let spec = |get: &str| -> Lookup {
+            serde_json::from_value(serde_json::json!({
+                "get": get, "items": "data", "label": "id", "value": "id"
+            }))
+            .unwrap()
+        };
+        let parents: BTreeMap<String, String> =
+            [("team".to_string(), "T 1/2".to_string())].into_iter().collect();
+        assert_eq!(
+            lookup_url(&spec("https://x.example/v1/items?q={query}&team={team}"), "a&b", &parents)
+                .unwrap(),
+            "https://x.example/v1/items?q=a%26b&team=T+1%2F2"
+        );
+        assert_eq!(
+            lookup_url(&spec("https://x.example/v1/items"), "ignored", &BTreeMap::new()).unwrap(),
+            "https://x.example/v1/items"
+        );
+        let unknown =
+            lookup_url(&spec("https://x.example/{nope}"), "", &BTreeMap::new()).unwrap_err();
+        assert!(unknown.to_string().contains("nope"), "{unknown}");
+        let unclosed =
+            lookup_url(&spec("https://x.example/{query"), "", &BTreeMap::new()).unwrap_err();
+        assert!(unclosed.to_string().contains("unclosed"), "{unclosed}");
+    }
 
     /// The recipe hash is a stable content address: identical maps
     /// hash identically, any content change re-hashes, and an empty

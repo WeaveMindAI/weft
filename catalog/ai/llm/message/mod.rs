@@ -25,13 +25,21 @@ use super::chat;
 #[derive(NodeManifest)]
 pub struct ChatHistoryAppendNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for ChatHistoryAppendNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let mut history: Vec<Value> = ctx.inputs.opt("history")?.unwrap_or_default();
         let role: String = ctx.inputs.get("role")?;
         let text: Option<String> = ctx.inputs.opt("text")?;
-        let media = chat::one_or_many(ctx.inputs.opt("media")?);
+        let media: Vec<Value> = ctx.inputs.list("media")?;
         let tool_call_id: Option<String> = ctx.inputs.opt("toolCallId")?;
 
         if text.is_none() && media.is_empty() {

@@ -1,0 +1,130 @@
+{
+  "type": "GoogleSheetsLookup",
+  "label": "Google Sheets: Lookup Rows",
+  "description": "Find the rows where a column holds a value: resolve an id to its record, check whether a key is already logged. Needs a header row. Emits the matching rows, their sheet row numbers, and whether anything matched.",
+  "tags": [
+    "google",
+    "sheets",
+    "spreadsheet"
+  ],
+  "icon": "Search",
+  "color": "#1FA463",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/drive.file"
+      ],
+      "description": "A Google account with write access to the sheet (the picker grant covers the file it picked)."
+    },
+    {
+      "name": "spreadsheet",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "https://www.googleapis.com/auth/drive.readonly"
+            ],
+            "get": "https://www.googleapis.com/drive/v3/files?q=mimeType%3D'application%2Fvnd.google-apps.spreadsheet'&pageSize=100",
+            "items": "files",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "pageToken",
+              "cursor_path": "nextPageToken"
+            }
+          },
+          {
+            "kind": "picker",
+            "script": "https://apis.google.com/js/api.js",
+            "code": "await new Promise((resolve) => gapi.load('picker', resolve));\nif (!weft.clientId) throw new Error('this connection has no OAuth app; the Google picker only grants files to an app');\nlet view = new google.picker.DocsView();\nif (weft.mimeTypes.length > 0) view = view.setMimeTypes(weft.mimeTypes.join(','));\nnew google.picker.PickerBuilder()\n  .setOAuthToken(weft.token)\n  .setAppId(weft.clientId.split('-')[0])\n  .addView(view)\n  .setCallback((data) => {\n    const action = data[google.picker.Response.ACTION];\n    if (action === google.picker.Action.PICKED) {\n      const doc = data[google.picker.Response.DOCUMENTS][0];\n      weft.done({ id: doc.id, label: doc.name || doc.id });\n    } else if (action === google.picker.Action.CANCEL) {\n      weft.cancel();\n    }\n  })\n  .build()\n  .setVisible(true);",
+            "grants": [
+              "https://www.googleapis.com/auth/drive.file"
+            ],
+            "mime_types": [
+              "application/vnd.google-apps.spreadsheet"
+            ]
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/spreadsheets/d/([a-zA-Z0-9_-]+)"
+          }
+        ]
+      },
+      "label": "Spreadsheet",
+      "placeholder": "Pick one, or paste its share link"
+    },
+    {
+      "name": "tab",
+      "type": "String",
+      "default": "0",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "spreadsheet"
+        ],
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "https://www.googleapis.com/auth/drive.readonly"
+            ],
+            "get": "https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet}?fields=sheets.properties",
+            "items": "sheets",
+            "label": "properties.title",
+            "value": "properties.sheetId"
+          },
+          {
+            "kind": "from_url",
+            "pattern": "[#&]gid=([0-9]+)"
+          }
+        ]
+      },
+      "label": "Tab",
+      "placeholder": "Pick a tab, or paste a link with #gid="
+    },
+    {
+      "name": "column",
+      "type": "String",
+      "required": true,
+      "label": "Column",
+      "placeholder": "email",
+      "description": "The header column to match on."
+    },
+    {
+      "name": "value",
+      "type": "String",
+      "required": true,
+      "label": "Value",
+      "description": "The exact cell value to match."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "rows",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "The matching rows, keyed by the header."
+    },
+    {
+      "name": "rowNumbers",
+      "type": "List[Number]",
+      "required": false,
+      "description": "Each match's 1-based sheet row number."
+    },
+    {
+      "name": "found",
+      "type": "Boolean",
+      "required": false,
+      "description": "Whether at least one row matched."
+    }
+  ]
+}

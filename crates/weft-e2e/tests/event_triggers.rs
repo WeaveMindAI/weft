@@ -55,6 +55,77 @@ fn slack_signature(signing_secret: &str, timestamp: i64, body: &str) -> String {
     .expect("no unresolvable part in the slack concat")
 }
 
+/// Seed the connection an inbound event routes to: workspace T0E2E,
+/// made through the operator's app (the client_id pin), and the
+/// service recipe the receiver reads (normally recorded when a
+/// project's access node renders; the seed writes it directly).
+async fn seed_slack_grant(
+    pool: &sqlx::PgPool,
+    client_id: &str,
+) -> Result<(uuid::Uuid, SeededGrant)> {
+    let spec = catalog_spec("slack", "access")?;
+    // The recipe hash that scopes routing: computed exactly as the
+    // store computes it (over the typed events map), written on both
+    // the grant and the recipe row so the verified push routes here.
+    let events: std::collections::BTreeMap<String, weft_core::access::events::EventsSpec> =
+        serde_json::from_value(spec.get("events").cloned().unwrap_or(Value::Null))
+            .context("parse the slack recipe's events block")?;
+    let recipe_hash = weft_access_store::events_recipe_hash(&events)
+        .context("the slack recipe declares events")?;
+    let grant_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO access_grant
+           (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
+            events_recipe_hash, values_sealed, granted_scopes, permissions_verified,
+            identity, provider_account)
+         VALUES ($1, 'local', 'slack', $2, $3, NULL, $4, $5, $6, '[]', FALSE, 'events-e2e',
+                 'T0E2E')",
+    )
+    .bind(grant_id)
+    .bind(weft_access_store::seal_json(&json!({ "label": "E2E app", "client_id": client_id }))?)
+    .bind(client_id)
+    .bind(&spec)
+    .bind(&recipe_hash)
+    .bind(weft_access_store::seal_json(
+        &json!({ "token": "xoxb-never-used", "team_id": "T0E2E" }),
+    )?)
+    .execute(pool)
+    .await?;
+    let seeded = SeededGrant::new(pool.clone(), grant_id);
+    sqlx::query(
+        "INSERT INTO service_events_recipe (service, recipe_hash, events_json)
+         VALUES ('slack', $1, $2)
+         ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
+    )
+    .bind(&recipe_hash)
+    .bind(serde_json::to_value(&events)?)
+    .execute(pool)
+    .await?;
+    Ok((grant_id, seeded))
+}
+
+/// POST a body to a topic's events receiver, signed exactly as Slack
+/// signs, and return the response status.
+async fn post_signed(
+    http: &reqwest::Client,
+    events_url: &str,
+    signing_secret: &str,
+    body: &str,
+) -> Result<reqwest::StatusCode> {
+    let timestamp = chrono::Utc::now().timestamp();
+    let signature = slack_signature(signing_secret, timestamp, body);
+    let resp = http
+        .post(events_url)
+        .header("X-Slack-Request-Timestamp", timestamp.to_string())
+        .header("X-Slack-Signature", &signature)
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .context("POST the signed event")?;
+    Ok(resp.status())
+}
+
 /// A signed synthetic Slack event lands at the public events
 /// receiver: it is verified against the operator's app, routed to the
 /// seeded connection's workspace, filtered by the node's channel, and
@@ -82,48 +153,7 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
         .await
         .context("connect WEFT_E2E_DATABASE_URL")?;
 
-    // Seed the connection an inbound event routes to: workspace
-    // T0E2E, made through the operator's app (the client_id pin), and
-    // the service recipe the receiver reads (normally recorded when a
-    // project's access node renders; the seed writes it directly).
-    let spec = catalog_spec("slack", "access")?;
-    // The recipe hash that scopes routing: computed exactly as the
-    // store computes it (over the typed events map), written on both
-    // the grant and the recipe row so the verified push routes here.
-    let events: std::collections::BTreeMap<String, weft_core::access::events::EventsSpec> =
-        serde_json::from_value(spec.get("events").cloned().unwrap_or(Value::Null))
-            .context("parse the slack recipe's events block")?;
-    let recipe_hash = weft_access_store::events_recipe_hash(&events)
-        .context("the slack recipe declares events")?;
-    let grant_id = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO access_grant
-           (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
-            events_recipe_hash, values_sealed, granted_scopes, permissions_verified,
-            identity, provider_account)
-         VALUES ($1, 'local', 'slack', $2, $3, NULL, $4, $5, $6, '[]', FALSE, 'events-e2e',
-                 'T0E2E')",
-    )
-    .bind(grant_id)
-    .bind(weft_access_store::seal_json(&json!({ "label": "E2E app", "client_id": client_id }))?)
-    .bind(&client_id)
-    .bind(&spec)
-    .bind(&recipe_hash)
-    .bind(weft_access_store::seal_json(
-        &json!({ "token": "xoxb-never-used", "team_id": "T0E2E" }),
-    )?)
-    .execute(&pool)
-    .await?;
-    let seeded = SeededGrant::new(pool.clone(), grant_id);
-    sqlx::query(
-        "INSERT INTO service_events_recipe (service, recipe_hash, events_json)
-         VALUES ('slack', $1, $2)
-         ON CONFLICT (service, recipe_hash) DO UPDATE SET updated_at = now()",
-    )
-    .bind(&recipe_hash)
-    .bind(serde_json::to_value(&events)?)
-    .execute(&pool)
-    .await?;
+    let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
 
     // The trigger project: fires on messages in channel C0E2E.
     let mut project = Project::prepare("slack_receive", disp.clone()).await?;
@@ -149,27 +179,12 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
         }
     })
     .to_string();
-    let timestamp = chrono::Utc::now().timestamp();
-    let signature = slack_signature(&signing_secret, timestamp, &body);
     let base = std::env::var("WEFT_DISPATCHER_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:9999".to_string());
     let http = reqwest::Client::new();
     let events_url = format!("{}/events/slack/messages", base.trim_end_matches('/'));
-    let resp = http
-        .post(&events_url)
-        .header("X-Slack-Request-Timestamp", timestamp.to_string())
-        .header("X-Slack-Signature", &signature)
-        .header("content-type", "application/json")
-        .body(body.clone())
-        .send()
-        .await
-        .context("POST the signed event")?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "the signed push was refused: {} {}",
-        resp.status(),
-        resp.text().await.unwrap_or_default()
-    );
+    let status = post_signed(&http, &events_url, &signing_secret, &body).await?;
+    anyhow::ensure!(status.is_success(), "the signed push was refused: {status}");
 
     // The execution fires with the message's named fields.
     let color =
@@ -178,13 +193,15 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
     settled.completed()?;
     settled.assert_input("out", "data", &json!("hello from the events e2e"))?;
 
-    // A tampered copy (one byte changed, same signature) is refused
-    // and fires nothing.
+    // A tampered copy (one byte changed, signature computed over the
+    // ORIGINAL bytes) is refused and fires nothing.
+    let timestamp = chrono::Utc::now().timestamp();
+    let stale_signature = slack_signature(&signing_secret, timestamp, &body);
     let tampered = body.replace("hello", "HELLO");
     let resp = http
         .post(&events_url)
         .header("X-Slack-Request-Timestamp", timestamp.to_string())
-        .header("X-Slack-Signature", &signature)
+        .header("X-Slack-Signature", &stale_signature)
         .header("content-type", "application/json")
         .body(tampered)
         .send()
@@ -210,23 +227,8 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
         }
     })
     .to_string();
-    let timestamp2 = chrono::Utc::now().timestamp();
-    let signature2 = slack_signature(&signing_secret, timestamp2, &body2);
-    let resp = http
-        .post(&events_url)
-        .header("X-Slack-Request-Timestamp", timestamp2.to_string())
-        .header("X-Slack-Signature", &signature2)
-        .header("content-type", "application/json")
-        .body(body2)
-        .send()
-        .await
-        .context("POST the second signed event")?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "the second signed push was refused: {} {}",
-        resp.status(),
-        resp.text().await.unwrap_or_default()
-    );
+    let status = post_signed(&http, &events_url, &signing_secret, &body2).await?;
+    anyhow::ensure!(status.is_success(), "the second signed push was refused: {status}");
     let mut known = before.clone();
     known.insert(color);
     let color2 =
@@ -242,6 +244,108 @@ async fn a_signed_synthetic_slack_event_fires_the_trigger() -> Result<()> {
         after.len(),
         before.len() + 2
     );
+
+    seeded.finish().await?;
+    project.finish().await
+}
+
+/// The awaited-push path end to end: a run parks mid-flow on the
+/// `interactions` topic (a Slack-button wait), a SIGNED synthetic
+/// interactivity payload (form-encoded `payload=`, exactly as Slack
+/// posts it) arrives at the receiver, and the run RESUMES carrying
+/// the clicked action. This is the machinery under SlackAwaitAction.
+#[tokio::test]
+async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
+    let Some(env) = env_group_or_skip(
+        "slack events",
+        &[
+            "WEFT_E2E_SLACK_SIGNING_SECRET",
+            "WEFT_E2E_SLACK_CLIENT_ID",
+            "WEFT_E2E_DATABASE_URL",
+        ],
+    ) else {
+        return Ok(());
+    };
+    let [signing_secret, client_id, db_url] =
+        <[String; 3]>::try_from(env).expect("three vars requested");
+    let disp = ensure::up().await?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&db_url)
+        .await
+        .context("connect WEFT_E2E_DATABASE_URL")?;
+    let (grant_id, seeded) = seed_slack_grant(&pool, &client_id).await?;
+
+    let mut project = Project::prepare("slack_await", disp.clone()).await?;
+    let pid = project.id();
+    project.set_node_config(
+        "ws",
+        "account",
+        &json!({ "id": grant_id.to_string(), "identity": "events-e2e" }).to_string(),
+    )?;
+
+    // Start the run and wait until the node has PARKED: its awaited
+    // resume signal appearing in the project's signal set is exactly
+    // that moment (posting the push before it would race the park).
+    let color = run::start(&mut project).await?;
+    let scope = weft_e2e::signal::SignalScope::open(&disp, &pid).await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if scope.signal_for_node("wait").await?.is_some() {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the run never parked on its awaited interactions signal"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // The synthetic block_actions payload, form-encoded and signed
+    // over the RAW form bytes, exactly as Slack delivers it.
+    let payload = json!({
+        "type": "block_actions",
+        "team": { "id": "T0E2E" },
+        "user": { "id": "U9", "username": "approver" },
+        "channel": { "id": "C0E2E" },
+        "message": {
+            "ts": "1700000000.000400",
+            "metadata": { "event_type": "weft_await_action",
+                          "event_payload": { "callback": "cb-e2e" } }
+        },
+        "actions": [ { "action_id": "approve", "value": "approve" } ],
+        "response_url": "https://hooks.slack.invalid/never-used"
+    });
+    let body: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("payload", &serde_json::to_string(&payload)?)
+        .finish();
+    let base = std::env::var("WEFT_DISPATCHER_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:9999".to_string());
+    let http = reqwest::Client::new();
+    let events_url = format!("{}/events/slack/interactions", base.trim_end_matches('/'));
+    let timestamp = chrono::Utc::now().timestamp();
+    let signature = slack_signature(&signing_secret, timestamp, &body);
+    let resp = http
+        .post(&events_url)
+        .header("X-Slack-Request-Timestamp", timestamp.to_string())
+        .header("X-Slack-Signature", &signature)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .context("POST the signed interactivity payload")?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "the signed interactivity push was refused: {} {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    // The SAME run resumes (no new execution) and completes with the
+    // clicked action mapped through the topic's fields.
+    let settled = SettledRun::observe(&disp, color).await?;
+    settled.completed()?;
+    settled.assert_input("out", "data", &json!("approve"))?;
 
     seeded.finish().await?;
     project.finish().await

@@ -1,0 +1,55 @@
+{
+  "type": "GoogleDriveUpload",
+  "label": "Google Drive: Upload",
+  "description": "Put a stored file into Drive, optionally inside a folder and under a new name. Emits the Drive file id and a view link.",
+  "tags": [
+    "google",
+    "drive",
+    "file"
+  ],
+  "icon": "Upload",
+  "color": "#1FA463",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/drive.file"
+      ],
+      "description": "A Google account. The files-you-pick grant covers files this project creates."
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "required": true,
+      "description": "The stored file to upload."
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": false,
+      "label": "Name",
+      "description": "The Drive filename. Defaults to the stored file's name."
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "required": false,
+      "label": "Folder id",
+      "description": "The destination Drive folder's id (from its URL). Empty = My Drive root."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "link",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

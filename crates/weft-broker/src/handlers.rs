@@ -445,6 +445,22 @@ pub async fn task_heartbeat(
     Ok(Json(TaskHeartbeatResponse { renewed }))
 }
 
+pub async fn task_requeue(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<TaskRequeueRequest>,
+) -> Resp<TaskRequeueResponse> {
+    require_worker(&caller)?;
+    require_pod_name_matches(&caller, &req.pod_id)?;
+    require_task_owned_by(&state, &caller, req.task_id).await?;
+    let requeued = state
+        .tasks
+        .requeue(req.task_id, &req.pod_id)
+        .await
+        .map_err(internal)?;
+    Ok(Json(TaskRequeueResponse { requeued }))
+}
+
 pub async fn task_complete(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -694,16 +710,8 @@ pub async fn resolve_connection(
             // The row's service (already matched against the request)
             // keys the credential source; nothing here trusts a
             // caller-supplied name for anything but that equality.
-            let names = weft_core::access::spec::worker_value_names_of(&resolved.auth)
-                .map_err(|e| internal(anyhow::anyhow!(e)))?;
-            let [name] = names.as_slice() else {
-                return Err(internal(anyhow::anyhow!(
-                    "an ours-owned '{}' connection must authenticate through exactly one \
-                     stored value; its auth steps interpolate {}",
-                    resolved.service,
-                    names.len()
-                )));
-            };
+            let name = crate::credential::single_value_name(&resolved.auth, &resolved.service)
+                .map_err(internal)?;
             let key_req = crate::credential::KeyRequest {
                 tenant,
                 color: req.color.clone(),
@@ -2001,7 +2009,8 @@ pub async fn supervisor_running_count(
         "SELECT COUNT(*)::bigint AS n \
          FROM worker_pod \
          WHERE project_id = $1 \
-           AND status IN ('spawning', 'alive')",
+           AND status IN ('spawning', 'alive') \
+           AND role = 'worker'",
     )
     .bind(&req.project_id)
     .fetch_one(&state.pool)
@@ -2193,7 +2202,7 @@ pub async fn signal_list_for_pod(
     let rows = sqlx::query(
         "SELECT token, tenant_id, node_id, spec_json, is_resume, color, \
                 surface_kind, mount_path, auth_kind, auth_config, \
-                kind_state, placement_generation \
+                kind_state, kind_state_seq, placement_generation \
          FROM signal WHERE listener_pod = $1",
     )
     .bind(&req.pod_name)
@@ -2230,6 +2239,7 @@ pub async fn signal_list_for_pod(
                 auth_kind,
                 auth_config: r.try_get("auth_config")?,
                 kind_state: r.try_get("kind_state")?,
+                kind_state_seq: r.try_get("kind_state_seq")?,
                 placement_generation: r.try_get("placement_generation")?,
             })
         })

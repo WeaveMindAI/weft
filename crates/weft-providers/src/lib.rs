@@ -80,6 +80,9 @@ pub struct ObservedCall {
     /// The response ended before the provider finished (the caller hung up
     /// or the connection died). The generation may still have cost money.
     pub interrupted: bool,
+    /// The response status line. What lets a resolve on a fixed-price
+    /// route tell a refused call (bill nothing) from an accepted one.
+    pub status: u16,
     pub data: Value,
 }
 
@@ -208,8 +211,9 @@ pub trait ProviderMeter: Send + Sync {
         )
     }
 
-    /// A fresh observer for one Billable call's response.
-    fn observe(&self) -> Box<dyn CallObservation>;
+    /// A fresh observer for one Billable call's response, on `path`
+    /// (relative, as [`Self::classify`] receives it).
+    fn observe(&self, path: &str) -> Box<dyn CallObservation>;
 
     /// A fresh observer for one session on a `BillableSession` route.
     /// `query` is the raw query string of the session URL (no leading
@@ -263,12 +267,20 @@ pub trait ProviderMeter: Send + Sync {
         )
     }
 
-    /// Turn an observation into dollars. Pure when the provider reported
-    /// the cost inline; when it only answers out-of-band, THE METER makes
-    /// that follow-up query itself via `follow_up` (its own free route).
-    /// Never errors: a cost that cannot be resolved is an honest
-    /// `amount_usd: None`, recorded as unknown.
-    async fn resolve(&self, observed: ObservedCall, follow_up: FollowUp<'_>) -> MeasuredCost;
+    /// Price one observed call on `path` (relative, as
+    /// [`Self::classify`] received it). The route arrives as a FACT so
+    /// a meter never infers it from the response's shape; a multi-route
+    /// meter opens with a match on it and delegates per route. Pure when
+    /// the provider reported the cost inline; when it only answers
+    /// out-of-band, THE METER makes that follow-up query itself via
+    /// `follow_up` (its own free route). Never errors: a cost that cannot
+    /// be resolved is an honest `amount_usd: None`, recorded as unknown.
+    async fn resolve(
+        &self,
+        path: &str,
+        observed: ObservedCall,
+        follow_up: FollowUp<'_>,
+    ) -> MeasuredCost;
 }
 
 /// One provider meter's self-registration. Each provider file submits one
@@ -326,6 +338,83 @@ pub fn route_under<'a>(base_url: &str, url: &'a str) -> Option<&'a str> {
         Some(b'?') | Some(b'#') => Some(""),
         Some(_) => None,
     }
+}
+
+/// The gate a runtime-supplied ("ours") credential must pass before it
+/// is attached to a request, answering the route relative to the
+/// service's API base. Three refusals, each loud: the service must
+/// have a meter (the meter IS the allowlist; without one no route can
+/// be classified), the URL must be under the meter's base, and the
+/// route must be one the meter declares (billable in any pricing, or
+/// explicitly free). ONE function so every lane that signs with the
+/// runtime's credential enforces the identical allowlist and the
+/// lanes cannot drift.
+pub fn ours_route(service: &str, method: &str, url: &str) -> Result<String, String> {
+    let Some(meter) = meter_for(service) else {
+        return Err(format!(
+            "service '{service}' registers no meter, so a runtime-supplied credential \
+             cannot travel on its calls; connect your own credential"
+        ));
+    };
+    ours_route_on(meter, service, method, url)
+}
+
+/// [`ours_route`] against a CALLER-HELD meter: the seam test rigs
+/// inject through (same pattern as the metering middleware's rig), and
+/// what the middleware itself uses since it already resolved its meter
+/// once at assembly.
+pub fn ours_route_on(
+    meter: &dyn ProviderMeter,
+    service: &str,
+    method: &str,
+    url: &str,
+) -> Result<String, String> {
+    let Some(route) = route_under(meter.base_url(), url) else {
+        return Err(format!(
+            "this call ({url}) is not under service '{service}''s API ({}); a \
+             runtime-supplied credential only travels on the service's own API",
+            meter.base_url(),
+        ));
+    };
+    if matches!(meter.classify(method, route), RouteClass::Unknown) {
+        return Err(format!(
+            "'{route}' is not a route the {service} meter declares, so the runtime's \
+             credential will not be sent on it; connect your own credential to call it"
+        ));
+    }
+    Ok(route.to_string())
+}
+
+/// Rebuild a service-API URL onto a relay: the route relative to
+/// `base_url` joined onto the relay's own base, the original query
+/// carried over. The ONE relay-join every lane uses (HTTP, socket,
+/// design-time), so a relay with a trailing slash or its own path is
+/// handled once, identically. The relay's scheme is kept; a socket
+/// caller swaps it for the ws twin on the parsed result. A relay
+/// carrying a query or fragment cannot host a joined route and is
+/// refused rather than silently mangled.
+pub fn relay_join(base_url: &str, relay: &str, url: &str) -> Result<String, String> {
+    let Some(route) = route_under(base_url, url) else {
+        return Err(format!(
+            "this call ({url}) is not under the service's API ({base_url}), so it \
+             cannot be relayed"
+        ));
+    };
+    let relay: url::Url =
+        relay.parse().map_err(|e| format!("relay URL {relay:?} does not parse: {e}"))?;
+    if relay.query().is_some() || relay.fragment().is_some() {
+        return Err(format!(
+            "relay URL {relay} carries a query or fragment, so a route cannot be \
+             joined onto it"
+        ));
+    }
+    let query = url.split_once('?').map(|(_, q)| format!("?{q}")).unwrap_or_default();
+    Ok(format!(
+        "{}://{}{}/{route}{query}",
+        relay.scheme(),
+        relay.authority(),
+        relay.path().trim_end_matches('/'),
+    ))
 }
 
 #[cfg(test)]
@@ -388,5 +477,41 @@ mod tests {
         assert_eq!(route_under(base, "https://evil.example/api/v1/chat"), None);
         assert_eq!(route_under(base, "https://openrouter.ai/api/v2/chat"), None);
         assert_eq!(route_under(base, "https://openrouter.ai/api/v1evil/chat"), None);
+    }
+
+    #[test]
+    fn ours_route_refuses_each_gap_and_answers_the_route() {
+        let base = meter_for("openrouter").unwrap().base_url();
+        assert_eq!(
+            ours_route("openrouter", "GET", &format!("{base}/models?q=x")).unwrap(),
+            "models"
+        );
+        let no_meter = ours_route("no_such_service", "GET", "https://x.example/y").unwrap_err();
+        assert!(no_meter.contains("registers no meter"), "{no_meter}");
+        let outside =
+            ours_route("openrouter", "GET", "https://attacker.example/collect").unwrap_err();
+        assert!(outside.contains("not under service"), "{outside}");
+        let unknown = ours_route("openrouter", "GET", &format!("{base}/keys")).unwrap_err();
+        assert!(unknown.contains("not a route"), "{unknown}");
+    }
+
+    #[test]
+    fn relay_join_handles_relay_paths_queries_and_slashes() {
+        let base = "https://openrouter.ai/api/v1";
+        let url = format!("{base}/models?q=gen");
+        assert_eq!(
+            relay_join(base, "https://relay.example/v1/provider/openrouter/", &url).unwrap(),
+            "https://relay.example/v1/provider/openrouter/models?q=gen"
+        );
+        assert_eq!(
+            relay_join(base, "https://relay.example", &format!("{base}/chat")).unwrap(),
+            "https://relay.example/chat"
+        );
+        let queried =
+            relay_join(base, "https://relay.example/p?tenant=x", &url).unwrap_err();
+        assert!(queried.contains("query or fragment"), "{queried}");
+        let outside = relay_join(base, "https://relay.example", "https://evil.example/x")
+            .unwrap_err();
+        assert!(outside.contains("cannot be relayed"), "{outside}");
     }
 }

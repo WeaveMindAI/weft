@@ -1,0 +1,26 @@
+# A user-declared custom type (Profile, declared by the project-local
+# ProfileGreet node) harvested from the project and baked into the
+# worker binary: a JsonDict is validated into Profile via Cast (its
+# optional nickname absent), and the Profile value then feeds both a
+# typed node input and a plain JsonDict input (a named type wires
+# freely into JsonDict). The Cast CONVERSION TABLE itself is
+# node-tested in basic/cast, never here.
+
+seed = ExecPython() -> (profile: JsonDict) {
+  code: "return {'profile': {'name': 'Ada', 'age': 36}}"
+}
+
+to_profile = Cast() -> (value: Profile)
+to_profile.value = seed.profile
+
+greet = ProfileGreet
+greet.profile = to_profile.value
+
+summary = ExecPython(profile: JsonDict, greeting: String) -> (result: JsonDict) {
+  code: "return {'result': {'profile_name': profile['name'], 'greeting': greeting}}"
+}
+summary.profile = to_profile.value
+summary.greeting = greet.greeting
+
+out = Debug
+out.data = summary.result

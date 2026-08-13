@@ -1,0 +1,48 @@
+{
+  "type": "FetchPage",
+  "label": "Fetch Page",
+  "description": "One URL to clean markdown (JavaScript rendered, boilerplate stripped), ready for an LLM step. Powered by Firecrawl.",
+  "tags": [
+    "web",
+    "scrape"
+  ],
+  "icon": "FileDown",
+  "color": "#FF713C",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Firecrawl access (wire a FirecrawlAccess node)."
+    },
+    {
+      "name": "url",
+      "type": "String",
+      "required": true,
+      "label": "URL"
+    },
+    {
+      "name": "onlyMainContent",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": true,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Main content only",
+      "description": "Strip navigation, footers, and boilerplate."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "markdown",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "title",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

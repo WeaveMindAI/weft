@@ -70,9 +70,8 @@ fi
 # local-dev identities); reuse it with a dedicated e2e bucket rather
 # than spawning a second store. Pods reach it at the kind docker
 # network's gateway address; the broker's egress denies private
-# ranges, so that address is opened via WEFT_STORE_ALLOW_CIDR (the
-# knob that exists exactly for a private-range object store), applied
-# by the first test's setup.sh run.
+# ranges, and the daemon derives that address's /32 opening from its
+# own object-store endpoint, so nothing is exported here for it.
 if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
   KIND_GATEWAY="$(docker network inspect kind \
     --format '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
@@ -97,7 +96,6 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
       export WEFT_E2E_S3_ACCESS_KEY_ID="weft-local"
       export WEFT_E2E_S3_SECRET_ACCESS_KEY="weft-local-dev-secret"
       export WEFT_E2E_S3_BUCKET="weft-e2e"
-      export WEFT_STORE_ALLOW_CIDR="${WEFT_STORE_ALLOW_CIDR:-$KIND_GATEWAY/32}"
       echo "provisioned: S3 vars pointed at the daemon's SeaweedFS ($WEFT_E2E_S3_ENDPOINT, bucket weft-e2e)"
     else
       echo "SKIP: the weft-e2e bucket does not exist in the daemon's SeaweedFS (list exit $BUCKET_STATUS);" >&2

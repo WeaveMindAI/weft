@@ -1,7 +1,7 @@
 {
   "type": "SlackSendMessage",
   "label": "Slack: Send Message",
-  "description": "Post a message to a channel through the connected workspace's bot. The channel picker lists the workspace's channels live (the lookup runs on the stored access; nothing needs to be running).",
+  "description": "Post a message through the connected workspace's bot: to a channel or as a direct message to a user, plain text and/or Block Kit blocks, optionally as a thread reply or scheduled for later. Emits the posted message's ts, channel, and permalink (or the scheduled id when scheduling).",
   "tags": [
     "slack",
     "message",
@@ -17,12 +17,12 @@
       "requiresScopes": [
         "chat:write"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs the chat:write scope."
+      "description": "The Slack access (wire a SlackAccess node). Needs the chat:write scope; sending to a user also needs im:write."
     },
     {
       "name": "channel",
       "type": "String",
-      "required": true,
+      "required": false,
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -40,17 +40,73 @@
               "cursor_param": "cursor",
               "cursor_path": "response_metadata.next_cursor"
             }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/archives/([A-Z0-9]+)"
           }
         ]
       },
       "label": "Channel",
-      "placeholder": "Pick a channel or paste its id"
+      "placeholder": "Pick a channel or paste its id",
+      "description": "The destination channel. Leave empty when sending a direct message via the user input (exactly one of the two)."
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "users:read"
+            ],
+            "get": "https://slack.com/api/users.list?limit=200",
+            "items": "members",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          }
+        ]
+      },
+      "label": "Direct message user",
+      "placeholder": "Pick a user or paste their id (U...)",
+      "description": "Send as a direct message to this user instead of into a channel (exactly one of the two)."
     },
     {
       "name": "text",
       "type": "String",
-      "required": true,
-      "label": "Text"
+      "required": false,
+      "label": "Text",
+      "description": "The message text. With blocks present, this is the notification fallback text."
+    },
+    {
+      "name": "blocks",
+      "type": "List[JsonDict]",
+      "required": false,
+      "label": "Blocks",
+      "description": "Block Kit blocks (the JSON array from Slack's Block Kit Builder) for rich layout. Text and/or blocks must be provided."
+    },
+    {
+      "name": "threadTs",
+      "type": "String",
+      "required": false,
+      "label": "Reply in thread",
+      "placeholder": "The parent message's ts",
+      "description": "Post as a reply inside this message's thread instead of top-level."
+    },
+    {
+      "name": "postAt",
+      "type": "Number",
+      "required": false,
+      "label": "Schedule (epoch seconds)",
+      "description": "Schedule the message for this Unix time (up to 120 days ahead) instead of posting now. A scheduled message emits scheduledId instead of ts/permalink."
     }
   ],
   "outputs": [
@@ -58,7 +114,25 @@
       "name": "ts",
       "type": "String",
       "required": false,
-      "description": "The posted message's timestamp id."
+      "description": "The posted message's timestamp id (empty when scheduled)."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": false,
+      "description": "The channel the message landed in (the DM conversation id for user sends)."
+    },
+    {
+      "name": "permalink",
+      "type": "String",
+      "required": false,
+      "description": "A link to the posted message (empty when scheduled)."
+    },
+    {
+      "name": "scheduledId",
+      "type": "String",
+      "required": false,
+      "description": "The scheduled message's id when postAt was set."
     }
   ]
 }

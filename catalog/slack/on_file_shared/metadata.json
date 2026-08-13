@@ -1,0 +1,74 @@
+{
+  "type": "SlackOnFileShared",
+  "label": "Slack: On File Shared",
+  "description": "Fires when a file is shared in a channel, optionally filtered to one channel. The event carries the file's id and where it landed, never the bytes; wire Slack: Download File downstream to pull the content.",
+  "tags": [
+    "slack",
+    "trigger",
+    "file"
+  ],
+  "icon": "FileInput",
+  "color": "#4A154B",
+  "features": {
+    "isTrigger": true
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "files:read"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the files:read scope."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          }
+        ]
+      },
+      "label": "Channel",
+      "description": "Only fire on files shared in this channel. Leave empty for the whole workspace."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": false,
+      "description": "The shared file's id (F...)."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": false,
+      "description": "The channel it was shared into."
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false,
+      "description": "Who shared it."
+    }
+  ]
+}

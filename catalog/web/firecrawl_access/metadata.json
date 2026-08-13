@@ -1,0 +1,89 @@
+{
+  "type": "FirecrawlAccess",
+  "label": "Firecrawl Access",
+  "description": "Sign in to Firecrawl, the page-fetching and crawling API the Fetch Page and Crawl Site nodes speak. Pick an existing connection or paste an API key.",
+  "tags": [
+    "web",
+    "scrape",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#FF713C",
+  "service": {
+    "service": "firecrawl",
+    "label": "Firecrawl",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "fc-..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.firecrawl.dev/v1/team/credit-usage"
+    },
+    "identity": "firecrawl",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://www.firecrawl.dev/app/api-keys",
+        "steps": [
+          "Open firecrawl.dev, sign in, and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The Firecrawl access: wire it into Fetch Page / Crawl Site."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "FirecrawlAccess '{id}' has no connected account; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

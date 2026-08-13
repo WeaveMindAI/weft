@@ -156,21 +156,16 @@ enum Reserved {
 
 type StoreResult<T> = Result<T, RuntimeStoreError>;
 
-/// Create the `runtime_file` table. The broker owns this schema (it is the
-/// only reader/writer) and runs this at its own boot. Per the
-/// no-migration-cruft rule the canonical CREATE lives here and is edited in
-/// place (fresh DB on rebuild). The DDL runs in one transaction behind an
-/// advisory lock: `IF NOT EXISTS` is idempotent but NOT concurrency-safe in
-/// Postgres (replicas racing the same CREATE on a fresh DB both pass the
-/// existence check, then one fails on a duplicate catalog key), so concurrent
-/// boots serialize and the losers no-op.
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let mut tx = pool.begin().await.context("runtime_file migrate: begin")?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:schema-migrate', 0))")
-        .execute(&mut *tx)
-        .await
-        .context("runtime_file migrate: schema lock")?;
-    sqlx::raw_sql(
+/// The runtime-file plane's schema. The broker owns it (it is the only
+/// reader/writer) and applies this group at its own boot via
+/// `weft_task_store::schema_guard::apply_groups` (which serializes concurrent
+/// boots behind the shared schema advisory lock). Per the no-migration-cruft
+/// rule the canonical CREATE lives here and is edited in place (fresh DB on
+/// rebuild).
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "runtime_file",
+    tables: &["runtime_file", "runtime_file_part", "public_file_link"],
+    ddl: &[
         r#"
         -- One row per runtime file. `key` is the canonical
         -- `<tenant>/<scope>/<owner>/<id>` string (also the bucket object key
@@ -266,13 +261,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
             expires_at_unix BIGINT NOT NULL
         );
         "#,
-    )
-    .execute(&mut *tx)
-    .await
-    .context("runtime_file migrate")?;
-    tx.commit().await.context("runtime_file migrate: commit")?;
-    Ok(())
-}
+    ],
+};
 
 /// A clock seam so the expiry math is testable without wall-clock. The broker
 /// already carries a `weft_platform_traits::Clock`; the store takes one.

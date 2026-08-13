@@ -569,17 +569,20 @@ pub struct StoredProjectSummary {
 }
 
 impl PostgresProjectStore {
-    pub async fn new(pool: PgPool) -> anyhow::Result<Self> {
-        migrate(&pool).await?;
-        Ok(Self { pool })
+    /// Plain wrap; the schema is the boot's job (`run_core_migrations`
+    /// applies [`GROUP`] with every other core group, so a stale
+    /// `project` table fails the SAME boot error as its siblings).
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 }
 
-/// Create the `project` + `project_definition` tables. The canonical CREATEs
-/// live here (edited in place, fresh DB on rebuild); `PostgresProjectStore::new`
-/// runs this, and any caller that needs `project(id)` present runs it first
-/// (idempotent, safe to repeat).
-pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+/// The `project` + `project_definition` tables. The canonical CREATEs
+/// live here (edited in place, fresh DB on rebuild); the boot's
+/// `run_core_migrations` applies this group via the schema guard.
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "project",
+    tables: &["project", "project_definition"],
     // project: one row per registered project. Lifecycle is the
     // status enum plus three orthogonal axes that the gate,
     // enumeration filter, and reaper read from a single source
@@ -629,7 +632,7 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     // request: a worker / listener / infra token authenticates
     // as a tenant, and any project_id it references must resolve
     // to the same tenant.
-    sqlx::query(
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS project (
                 id UUID PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -711,21 +714,26 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
                 -- every tenant's projects on any Pod restart.
                 transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0
             )"#,
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)")
-        .execute(pool)
-        .await?;
-
-    // Append-only definition-version history. Workers fetch by
-    // (project_id, definition_hash) so a suspended execution
-    // can always resume on the EXACT shape it was started on,
-    // even after the user has edited and re-registered. Without
-    // this, the `project.project_json` column would only carry
-    // the LATEST shape and a resume after edit would run the
-    // wrong topology against the journal's old state.
-    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)",
+        // Append-only definition-version history. Workers fetch by
+        // (project_id, definition_hash) so a suspended execution
+        // can always resume on the EXACT shape it was started on,
+        // even after the user has edited and re-registered. Without
+        // this, the `project.project_json` column would only carry
+        // the LATEST shape and a resume after edit would run the
+        // wrong topology against the journal's old state.
+        //
+        // A project's source lives as a folder on disk, edited via the
+        // CLI / VS Code; the dispatcher tracks no version chain for it.
+        //
+        // NO boot-time status touch-up here. Recovery of a project
+        // interrupted mid-transition (a pod died while activating /
+        // building / deactivating) is the stuck-transition reaper's
+        // job (`reaper::sweep_stuck_transitions`): per-project,
+        // heartbeat-gated, and status-guarded, so it never wipes
+        // another Pod's live state. A constructor-time bulk downgrade
+        // would run in EVERY replica on EVERY boot and reset live
+        // status for all tenants (a multi-Pod correctness bug).
         r#"CREATE TABLE IF NOT EXISTS project_definition (
             project_id UUID NOT NULL,
             definition_hash TEXT NOT NULL,
@@ -734,24 +742,8 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
             PRIMARY KEY (project_id, definition_hash),
             FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
         )"#,
-    )
-    .execute(pool)
-    .await?;
-
-    // A project's source lives as a folder on disk, edited via the CLI / VS
-    // Code; the dispatcher tracks no version chain for it.
-
-    // NO boot-time status touch-up here. Recovery of a project
-    // interrupted mid-transition (a pod died while activating /
-    // building / deactivating) is the stuck-transition reaper's
-    // job (`reaper::sweep_stuck_transitions`): per-project,
-    // heartbeat-gated, and status-guarded, so it never wipes
-    // another Pod's live state. A constructor-time bulk downgrade
-    // would run in EVERY replica on EVERY boot and reset live
-    // status for all tenants (a multi-Pod correctness bug).
-
-    Ok(())
-}
+    ],
+};
 
 /// THE running-hash pointer advance: ONE atomic UPDATE of the trio of hashes
 /// PLUS the complete infra image-tag map, with the definition-history EXISTS

@@ -1,0 +1,64 @@
+{
+  "type": "S3GetObject",
+  "label": "S3: Get Object",
+  "description": "Read an object into storage and emit the file reference (streamed, so large objects stay in bounded memory).",
+  "tags": [
+    "s3",
+    "storage",
+    "object"
+  ],
+  "icon": "Download",
+  "color": "#E25444",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The object store access (wire an S3Access node)."
+    },
+    {
+      "name": "bucket",
+      "type": "String",
+      "required": true,
+      "label": "Bucket"
+    },
+    {
+      "name": "key",
+      "type": "String",
+      "required": true,
+      "label": "Key"
+    },
+    {
+      "name": "keep",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Keep after the run"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "File",
+      "required": false
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

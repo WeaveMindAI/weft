@@ -13,23 +13,18 @@
 use anyhow::Result;
 use sqlx::postgres::PgPool;
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    sqlx::query(
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "weft_namespace_tenant",
+    tables: &["weft_namespace_tenant"],
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS weft_namespace_tenant (
             namespace TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL
         )"#,
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_weft_namespace_tenant_tenant \
          ON weft_namespace_tenant(tenant_id)",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+    ],
+};
 
 /// Register a namespace as belonging to `tenant_id`. Idempotent
 /// (UPSERT). Called from `project_namespace::ensure` so the registry is

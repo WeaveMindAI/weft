@@ -28,25 +28,20 @@ const CURSOR_KEY: &str = "journal_bridge";
 
 /// Persistent cursor table. One row per cursor key. The bridge
 /// reads `last_id` on boot and writes it after every successful
-/// drain so a Pod restart resumes where the cluster left off.
-pub async fn migrate(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    sqlx::query(
+/// drain so a Pod restart resumes where the cluster left off. The
+/// seed row's key literal is `CURSOR_KEY` (static DDL cannot bind).
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "dispatcher_cursor",
+    tables: &["dispatcher_cursor"],
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS dispatcher_cursor (
             key TEXT PRIMARY KEY,
             last_id BIGINT NOT NULL
         )"#,
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO dispatcher_cursor (key, last_id) VALUES ($1, 0) \
+        "INSERT INTO dispatcher_cursor (key, last_id) VALUES ('journal_bridge', 0) \
          ON CONFLICT (key) DO NOTHING",
-    )
-    .bind(CURSOR_KEY)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+    ],
+};
 
 #[derive(Default)]
 struct Cursor {

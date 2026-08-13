@@ -1,0 +1,49 @@
+{
+  "type": "GmailLabel",
+  "label": "Gmail: Label",
+  "description": "Add and/or remove labels on a message, by name. A new add-label is created on the fly; removing a label that does not exist fails loudly (the name is wrong).",
+  "tags": [
+    "google",
+    "gmail",
+    "email"
+  ],
+  "icon": "Tag",
+  "color": "#EA4335",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/gmail.modify"
+      ],
+      "description": "A Google account with the modify-mail permission."
+    },
+    {
+      "name": "id",
+      "type": "String",
+      "required": true,
+      "label": "Message id"
+    },
+    {
+      "name": "add",
+      "type": "String | List[String]",
+      "required": false,
+      "label": "Add labels"
+    },
+    {
+      "name": "remove",
+      "type": "String | List[String]",
+      "required": false,
+      "label": "Remove labels"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "labels",
+      "type": "List[String]",
+      "required": false,
+      "description": "The message's label ids after the change."
+    }
+  ]
+}

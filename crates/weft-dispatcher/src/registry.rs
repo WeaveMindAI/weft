@@ -84,6 +84,15 @@ impl RegistryConfig {
         format!("{}/{}:{}", self.url, WORKER_IMAGE_REPO, binary_hash)
     }
 
+    /// Mint the CONTENT-addressed, registry-qualified NODE-TEST image ref for a
+    /// test hash: `<registry>/weft-node-tests:<test_hash>`. The node-test mirror
+    /// of [`Self::worker_image_ref`], sharing the same registry prefix + the bare
+    /// test-tag suffix (`weft_compiler::build::node_test_image_tag`) so push (the
+    /// builder) and the test-pod spawn agree on the tag.
+    pub fn node_test_image_ref(&self, test_hash: &str) -> String {
+        format!("{}/{}", self.url, weft_compiler::build::node_test_image_tag(test_hash))
+    }
+
     /// Mint the CONTENT-addressed, registry-qualified INFRA image ref for an
     /// `(image_name, content_hash)`: `<registry>/weft-infra-<name>:<content_hash>`.
     /// The infra mirror of `worker_image_ref`, sharing the same registry prefix +
@@ -128,6 +137,10 @@ mod tests {
         assert_eq!(
             r,
             "us-central1-docker.pkg.dev/my-project/weft-images/weft-worker:deadbeef00"
+        );
+        assert_eq!(
+            cfg.node_test_image_ref("deadbeef00"),
+            "us-central1-docker.pkg.dev/my-project/weft-images/weft-node-tests:deadbeef00"
         );
         // Two different projects with the SAME binary hash mint the SAME ref:
         // the tag is purely a function of the hash, so identical builds dedup.

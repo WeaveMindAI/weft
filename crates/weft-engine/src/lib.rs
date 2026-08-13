@@ -12,6 +12,13 @@ pub(crate) mod metering;
 pub(crate) mod socket;
 pub mod run_pod;
 pub mod storage;
+// The node-test rig + runner. Feature-gated so ONLY the emitted
+// per-package test crate compiles them; a worker binary carries no
+// test machinery.
+#[cfg(feature = "node-tests")]
+pub mod test_rig;
+#[cfg(feature = "node-tests")]
+pub mod test_runner;
 
 pub use context::EngineClients;
 pub use run_pod::run_pod;

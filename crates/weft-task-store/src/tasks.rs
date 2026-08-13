@@ -5,8 +5,12 @@
 //! filter.
 //!
 //! Idempotency: every executor MUST be safe to re-run on partial
-//! success (Pod crash mid-task). Cluster ops should treat
-//! "already exists" as success.
+//! success. A row can be run again after a Pod crash (the lease
+//! expires and `claim_one` rescues it) or after a surrender (the
+//! claimer could not renew its lease and `requeue`d the row). Cluster
+//! ops should treat "already exists" as success; executors with a
+//! non-re-runnable side effect persist its outcome via
+//! `store_result_partial` and read it back on a later claim.
 //!
 //! Dedup: a partial unique index on `(tenant_id, kind, dedup_key)`
 //! for live rows lets producers attach to in-flight work via
@@ -85,6 +89,13 @@ pub struct Task {
     pub project_id: Option<String>,
     pub color: Option<String>,
     pub tenant_id: Option<String>,
+    /// How many times this row has been claimed, INCLUDING the claim
+    /// that returned this value. 1 on the first claim; > 1 means a
+    /// prior claim existed (lease expired, or the claimer surrendered
+    /// and requeued), which an executor guarding a non-re-runnable
+    /// side effect reads to tell a fresh run from a retry.
+    #[serde(default)]
+    pub attempts: i32,
     pub payload: Value,
 }
 
@@ -165,9 +176,11 @@ impl DedupOutcome {
     }
 }
 
-/// Apply migrations for `task`.
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let stmts = [
+/// The `task` table's schema, applied at boot via `schema_guard::apply_groups`.
+pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
+    name: "task",
+    tables: &["task"],
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS task (
             id UUID PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -217,12 +230,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         r#"CREATE INDEX IF NOT EXISTS idx_task_terminal_completed
             ON task(completed_at_unix)
             WHERE status IN ('complete', 'failed')"#,
-    ];
-    for sql in stmts {
-        sqlx::query(sql).execute(pool).await?;
-    }
-    Ok(())
-}
+    ],
+};
 
 /// Insert a new task. Returns the minted id. Does NOT enforce dedup
 /// even if `spec.dedup_key` is set; use `enqueue_dedup` for that.
@@ -414,6 +423,7 @@ pub async fn admit_live_execution_in(
            FROM worker_pod wp
            WHERE wp.project_id = $1
              AND wp.status IN ('spawning', 'alive')
+             AND wp.role = 'worker'
              AND NOT wp.draining
              AND wp.mem_pressure < $2
              AND ($3::TEXT IS NULL OR wp.binary_hash = $3)
@@ -540,7 +550,7 @@ pub async fn claim_one(
     // Dispatcher-target claims aren't affected: dispatcher pods have no
     // `worker_pod` row at all, so the EXISTS check is gated on target.
     let row = sqlx::query(
-        r#"SELECT id, kind, status, project_id, color, tenant_id, payload
+        r#"SELECT id, kind, status, project_id, color, tenant_id, attempts, payload
            FROM task
            WHERE target = $1
              AND ($2::TEXT IS NULL OR project_id = $2)
@@ -553,6 +563,7 @@ pub async fn claim_one(
                      SELECT 1 FROM worker_pod wp
                      WHERE wp.pod_name = $3
                        AND wp.status IN ('spawning', 'alive')
+                       AND wp.role = 'worker'
                        AND (task.target_pod_name = $3
                             OR (NOT wp.draining
                                 AND (task.binary_hash IS NULL
@@ -593,7 +604,12 @@ pub async fn claim_one(
 
     tx.commit().await?;
 
-    Ok(Some(row_to_task(row)?))
+    let mut task = row_to_task(row)?;
+    // The SELECT ran before the claim UPDATE bumped the counter, so
+    // reflect THIS claim in the returned value: `attempts` counts the
+    // claim the caller is now holding.
+    task.attempts += 1;
+    Ok(Some(task))
 }
 
 /// Renew the claim's lease. Returns false if the row no longer
@@ -613,6 +629,73 @@ pub async fn heartbeat(pool: &PgPool, task_id: Uuid, pod_id: &str) -> Result<boo
     .execute(pool)
     .await?;
     Ok(rows.rows_affected() > 0)
+}
+
+/// Surrender a claim: put the row back to `pending` with no claimant
+/// so any matching pod can claim it. Used by the picker when it can
+/// no longer renew its lease (DB unreachable past the lease window)
+/// but the work itself did not fail: terminalizing there would turn a
+/// transient outage into a permanent failure. Guarded on
+/// `claimed_by = $pod`, so a thief that already re-claimed the row is
+/// never clobbered; returns false in that case (the thief owns the
+/// task) and true when the requeue landed. Keeps `target_pod_name`
+/// (a pinned task stays addressed; surrender is not pod death).
+pub async fn requeue(pool: &PgPool, task_id: Uuid, pod_id: &str) -> Result<bool> {
+    let rows = sqlx::query(
+        r#"UPDATE task
+           SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL
+           WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
+    )
+    .bind(task_id)
+    .bind(pod_id)
+    .execute(pool)
+    .await?;
+    Ok(rows.rows_affected() > 0)
+}
+
+/// Record a partial result on a still-claimed row WITHOUT completing
+/// it. For executors whose work has a non-re-runnable side effect: the
+/// harvested outcome is persisted here first, so a later claim of the
+/// same task returns it instead of redoing the side effect. Guarded on
+/// `claimed_by = $pod`; a zero-row UPDATE (lease lost, row moved on)
+/// fails loudly so the caller never believes an unrecorded result is
+/// durable.
+pub async fn store_result_partial(
+    pool: &PgPool,
+    task_id: Uuid,
+    pod_id: &str,
+    result: &Value,
+) -> Result<()> {
+    let updated = sqlx::query(
+        r#"UPDATE task
+           SET result = $1
+           WHERE id = $2 AND claimed_by = $3 AND status = 'claimed'"#,
+    )
+    .bind(result)
+    .bind(task_id)
+    .bind(pod_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        anyhow::bail!(
+            "store_result_partial: task {task_id} no longer claimed by {pod_id}; \
+             the result was NOT recorded"
+        );
+    }
+    Ok(())
+}
+
+/// The row's recorded result, or `None` when the row is gone or holds
+/// none. Reads whatever `store_result_partial` or `complete` wrote;
+/// the row outlives claims (only the terminal-retention sweep deletes
+/// it), so a re-claim reads a prior claim's recorded outcome here.
+pub async fn stored_result(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>> {
+    let row: Option<(Option<Value>,)> =
+        sqlx::query_as("SELECT result FROM task WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(r,)| r))
 }
 
 /// Mark a claim complete with a result payload. Bails if the row
@@ -725,11 +808,52 @@ pub async fn wait_for_terminal(
     }
 }
 
+/// [`peek`] scoped to a project: answers only when the task row
+/// belongs to `project_id`, so an API route can hand back a task
+/// outcome without leaking another project's tasks (ownership
+/// enforced in the query, not by the caller remembering to check).
+pub async fn peek_for_project(
+    pool: &PgPool,
+    task_id: Uuid,
+    project_id: &str,
+) -> Result<Option<TaskOutcome>> {
+    // `result` is answered only once the task is terminal: a partial
+    // result stored mid-claim (see `store_result_partial`) is an
+    // internal re-claim handle, never a public outcome, so a poller
+    // can treat "result present" as "done" without checking status.
+    let row = sqlx::query(
+        "SELECT status,
+                CASE WHEN status IN ('complete', 'failed') THEN result END AS result,
+                error
+         FROM task WHERE id = $1 AND project_id = $2",
+    )
+    .bind(task_id)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let status_str: String = row.try_get("status")?;
+    let status =
+        TaskStatus::parse(&status_str).ok_or_else(|| anyhow::anyhow!("bad status {status_str}"))?;
+    Ok(Some(TaskOutcome {
+        status,
+        result: row.try_get("result")?,
+        error: row.try_get("error")?,
+    }))
+}
+
 async fn peek(pool: &PgPool, task_id: Uuid) -> Result<Option<TaskOutcome>> {
-    let row = sqlx::query("SELECT status, result, error FROM task WHERE id = $1")
-        .bind(task_id)
-        .fetch_optional(pool)
-        .await?;
+    // Same terminal-only `result` rule as `peek_for_project`: a
+    // mid-claim partial result never leaves the store as an outcome.
+    let row = sqlx::query(
+        "SELECT status,
+                CASE WHEN status IN ('complete', 'failed') THEN result END AS result,
+                error
+         FROM task WHERE id = $1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
     let Some(row) = row else { return Ok(None) };
     let status_str: String = row.try_get("status")?;
     let status =
@@ -961,6 +1085,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
     let project_id: Option<String> = row.try_get("project_id")?;
     let color: Option<String> = row.try_get("color")?;
     let tenant_id: Option<String> = row.try_get("tenant_id")?;
+    let attempts: i32 = row.try_get("attempts")?;
     let payload: Value = row.try_get("payload")?;
     Ok(Task {
         id,
@@ -969,6 +1094,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         project_id,
         color,
         tenant_id,
+        attempts,
         payload,
     })
 }
@@ -1048,6 +1174,7 @@ mod wire_tests {
             project_id: None,
             color: None,
             tenant_id: None,
+            attempts: 2,
             payload: serde_json::json!(null),
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -1058,7 +1185,26 @@ mod wire_tests {
         assert_eq!(back.project_id, original.project_id);
         assert_eq!(back.color, original.color);
         assert_eq!(back.tenant_id, original.tenant_id);
+        assert_eq!(back.attempts, original.attempts);
         assert_eq!(back.payload, original.payload);
         assert!(json.contains("\"status\":\"pending\""));
+    }
+
+    #[test]
+    fn task_tolerates_an_omitted_attempts() {
+        // `#[serde(default)]` on `attempts`: a producer that omits the
+        // field entirely still deserializes, to 0 (meaning "unknown /
+        // not a claim's view of the row").
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000000",
+            "kind": "execute",
+            "status": "pending",
+            "project_id": null,
+            "color": null,
+            "tenant_id": null,
+            "payload": {}
+        }"#;
+        let back: Task = serde_json::from_str(json).unwrap();
+        assert_eq!(back.attempts, 0);
     }
 }

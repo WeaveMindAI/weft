@@ -1,0 +1,86 @@
+{
+  "type": "GmailSend",
+  "label": "Gmail: Send",
+  "description": "Send mail as the connected Google account: to/cc/bcc, plain text and/or HTML, file attachments, and reply-in-thread (pass the original message's id and clients thread it correctly).",
+  "tags": [
+    "google",
+    "gmail",
+    "email"
+  ],
+  "icon": "Send",
+  "color": "#EA4335",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/gmail.send"
+      ],
+      "description": "A Google account with the send-mail permission."
+    },
+    {
+      "name": "to",
+      "type": "String | List[String]",
+      "required": false,
+      "label": "To"
+    },
+    {
+      "name": "cc",
+      "type": "String | List[String]",
+      "required": false,
+      "label": "Cc"
+    },
+    {
+      "name": "bcc",
+      "type": "String | List[String]",
+      "required": false,
+      "label": "Bcc"
+    },
+    {
+      "name": "subject",
+      "type": "String",
+      "required": false,
+      "label": "Subject"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": false,
+      "label": "Text body"
+    },
+    {
+      "name": "html",
+      "type": "String",
+      "required": false,
+      "label": "HTML body",
+      "description": "Text and/or HTML; both together send a proper alternative pair."
+    },
+    {
+      "name": "replyTo",
+      "type": "String",
+      "required": false,
+      "label": "Reply to message id",
+      "description": "Send as a reply in this message's thread (the id a Gmail trigger or Get emits)."
+    },
+    {
+      "name": "attachments",
+      "type": "File | List[File]",
+      "required": false,
+      "description": "Stored files to attach."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "id",
+      "type": "String",
+      "required": false,
+      "description": "The sent message's id."
+    },
+    {
+      "name": "threadId",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

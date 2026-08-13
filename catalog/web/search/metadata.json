@@ -1,0 +1,62 @@
+{
+  "type": "WebSearch",
+  "label": "Web Search",
+  "description": "Search the web (semantic + keyword, auto-picked per query) and get results with their page text, ready for an LLM step. Powered by Exa.",
+  "tags": [
+    "web",
+    "search"
+  ],
+  "icon": "Globe",
+  "color": "#1B64F2",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Exa access (wire an ExaAccess node)."
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": true,
+      "label": "Query"
+    },
+    {
+      "name": "numResults",
+      "type": "Number",
+      "exposure": "config",
+      "default": 10,
+      "label": "Results",
+      "description": "How many results (1-100)."
+    },
+    {
+      "name": "includeText",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": true,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Include page text"
+    },
+    {
+      "name": "includeDomains",
+      "type": "List[String]",
+      "required": false,
+      "description": "Only results from these domains. Empty = the whole web."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "results",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each result: title, url, publishedDate, text."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

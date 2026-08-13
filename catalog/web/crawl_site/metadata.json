@@ -1,0 +1,47 @@
+{
+  "type": "CrawlSite",
+  "label": "Crawl Site",
+  "description": "Crawl a site from a starting URL and emit every reached page as clean markdown. Runs as long as the crawl takes; the page limit bounds cost.",
+  "tags": [
+    "web",
+    "scrape",
+    "crawl"
+  ],
+  "icon": "Network",
+  "color": "#FF713C",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Firecrawl access (wire a FirecrawlAccess node)."
+    },
+    {
+      "name": "url",
+      "type": "String",
+      "required": true,
+      "label": "Start URL"
+    },
+    {
+      "name": "limit",
+      "type": "Number",
+      "exposure": "config",
+      "default": 25,
+      "label": "Max pages",
+      "description": "Upper bound on crawled pages (1-1000); the crawl bills per page."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "pages",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each page: url, title, markdown."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

@@ -72,7 +72,19 @@
       "required": true,
       "exposure": "config",
       "widget": {
-        "kind": "text"
+        "kind": "remote_select",
+        "access": "connection",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://openrouter.ai/api/v1/models",
+            "items": "data",
+            "label": "id",
+            "value": "id",
+            "public": true
+          }
+        ]
       },
       "label": "Model",
       "placeholder": "deepseek/deepseek-v4-flash-0731"

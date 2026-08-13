@@ -1,0 +1,51 @@
+{
+  "type": "SlackGetThread",
+  "label": "Slack: Get Thread",
+  "description": "Read a whole thread: the parent message and every reply, in order, paging until exhausted (capped at 10000 messages; a larger thread fails loudly). Address it by channel + the parent message's ts.",
+  "tags": [
+    "slack",
+    "message",
+    "thread"
+  ],
+  "icon": "MessagesSquare",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "channels:history"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Reading needs the channels:history scope (groups:history for private channels) and channel membership."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "label": "Channel",
+      "placeholder": "The channel id the thread lives in"
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": true,
+      "label": "Parent ts",
+      "placeholder": "The thread's parent message ts"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "messages",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Every message in the thread (parent first), as Slack returns them: text, user, ts, reactions, ..."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false,
+      "description": "How many messages the thread holds (parent included)."
+    }
+  ]
+}

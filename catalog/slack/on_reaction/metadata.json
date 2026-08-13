@@ -1,0 +1,117 @@
+{
+  "type": "SlackOnReaction",
+  "label": "Slack: On Reaction",
+  "description": "Fires when an emoji reaction is added to (or removed from) a message, optionally filtered to one channel and one emoji. The event carries the message's address (channel + ts), not its text; wire a read downstream when the content is needed.",
+  "tags": [
+    "slack",
+    "trigger",
+    "reaction"
+  ],
+  "icon": "SmilePlus",
+  "color": "#4A154B",
+  "features": {
+    "isTrigger": true
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "reactions:read"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the reactions:read scope."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          }
+        ]
+      },
+      "label": "Channel",
+      "description": "Only fire on reactions in this channel. Leave empty for the whole workspace."
+    },
+    {
+      "name": "emoji",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Emoji",
+      "placeholder": "eyes (with or without colons)",
+      "description": "Only fire on this emoji. Leave empty for any."
+    },
+    {
+      "name": "direction",
+      "type": "String",
+      "exposure": "config",
+      "default": "added",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "added",
+          "removed",
+          "both"
+        ]
+      },
+      "label": "Fire on",
+      "description": "Reactions being added, removed, or both."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "emoji",
+      "type": "String",
+      "required": false,
+      "description": "The reaction's emoji name (no colons)."
+    },
+    {
+      "name": "user",
+      "type": "String",
+      "required": false,
+      "description": "Who reacted."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": false,
+      "description": "The channel the reacted message lives in."
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": false,
+      "description": "The reacted message's timestamp id."
+    },
+    {
+      "name": "messageUser",
+      "type": "String",
+      "required": false,
+      "description": "Who wrote the reacted message."
+    },
+    {
+      "name": "type",
+      "type": "String",
+      "required": false,
+      "description": "reaction_added or reaction_removed."
+    }
+  ]
+}

@@ -513,13 +513,15 @@ fn decoded_body(
     webhook: &weft_core::access::events::WebhookRecipe,
     bytes: &[u8],
 ) -> Result<Value, String> {
-    let raw = parse_body(bytes);
-    let Some(decode) = &webhook.decode else { return Ok(raw) };
-    let encoded = lookup_path(&raw, &decode.path)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("the push carries nothing at '{}' to decode", decode.path))?;
+    let Some(decode) = &webhook.decode else { return Ok(parse_body(bytes)) };
     match decode.encoding {
         weft_core::access::events::Encoding::Base64Json => {
+            let raw = parse_body(bytes);
+            let encoded = lookup_path(&raw, &decode.path)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("the push carries nothing at '{}' to decode", decode.path)
+                })?;
             // The queue relays use URL-safe base64; accept standard
             // too, since both alphabets appear in the wild.
             let bytes = base64::engine::general_purpose::URL_SAFE
@@ -529,6 +531,18 @@ fn decoded_body(
                 .map_err(|e| format!("the push's '{}' is not base64: {e}", decode.path))?;
             serde_json::from_slice(&bytes)
                 .map_err(|e| format!("the decoded '{}' is not JSON: {e}", decode.path))
+        }
+        weft_core::access::events::Encoding::FormJson => {
+            // The raw body is form data; `path` names the field whose
+            // value is the JSON event (Slack interactivity: `payload=`).
+            let text = url::form_urlencoded::parse(bytes)
+                .find(|(k, _)| k == decode.path.as_str())
+                .map(|(_, v)| v.into_owned())
+                .ok_or_else(|| {
+                    format!("the form-encoded push carries no '{}' field", decode.path)
+                })?;
+            serde_json::from_str(&text)
+                .map_err(|e| format!("the form field '{}' is not JSON: {e}", decode.path))
         }
     }
 }
@@ -644,4 +658,32 @@ mod tests {
         assert!(err.contains("message.data"), "{err}");
     }
 
+    /// The form decode: a urlencoded `payload=` field unwraps to its
+    /// JSON (Slack interactivity); a missing field and non-JSON both
+    /// fail naming the field.
+    #[test]
+    fn the_form_decode_unwraps_the_payload_field() {
+        let recipe: weft_core::access::events::WebhookRecipe = serde_json::from_value(
+            serde_json::json!({
+                "verify": { "kind": "hmac",
+                            "signature_header": "X-Slack-Signature",
+                            "timestamp_header": "X-Slack-Request-Timestamp",
+                            "concat": "v0:{timestamp}:{body}",
+                            "prefix": "v0=" },
+                "decode": { "path": "payload", "encoding": "form_json" }
+            }),
+        )
+        .unwrap();
+        let inner = serde_json::json!({ "type": "block_actions", "team": { "id": "T1" } });
+        let body: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("payload", &serde_json::to_string(&inner).unwrap())
+            .finish();
+        let out = decoded_body(&recipe, body.as_bytes()).expect("decodes");
+        assert_eq!(out, inner);
+
+        let err = decoded_body(&recipe, b"other=1").unwrap_err();
+        assert!(err.contains("payload"), "{err}");
+        let err = decoded_body(&recipe, b"payload=not-json").unwrap_err();
+        assert!(err.contains("payload"), "{err}");
+    }
 }

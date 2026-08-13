@@ -51,8 +51,16 @@ use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftErr
 #[derive(NodeManifest)]
 pub struct ExecPythonNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for ExecPythonNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let code: String = ctx.inputs.get("code")?;
 

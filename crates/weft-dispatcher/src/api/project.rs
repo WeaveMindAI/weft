@@ -746,7 +746,8 @@ async fn start_queued_execution(
         project_id: project_id.to_string(),
         entry_node: entry_node.to_string(),
         phase,
-        definition_hash: definition_hash.to_string(),
+        definition_hash: Some(definition_hash.to_string()),
+        node_test: false,
         at_unix: now,
     };
     let kick_events: Vec<weft_journal::ExecEvent> = kicks

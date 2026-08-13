@@ -16,6 +16,12 @@
 [dependencies]
 pyo3 = { version = "0.22", features = ["auto-initialize"] }
 
+[build-dependencies]
+# The package's build.rs stamps an rpath to the probed interpreter's
+# lib dir, so a host-built test binary finds the same libpython the
+# link chose (conda/pyenv interpreters live outside the loader path).
+pyo3-build-config = "0.22"
+
 [system.build.apt]
 # python3 at build time: PyO3's build script runs it to probe
 # the interpreter's sysconfig (version, lib dir, lib name). Kept

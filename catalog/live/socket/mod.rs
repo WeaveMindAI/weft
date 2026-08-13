@@ -19,8 +19,16 @@ use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct LiveSocketNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for LiveSocketNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?);
         ctx.register_signal(LiveSocket { common }).await

@@ -33,8 +33,16 @@ use super::call;
 #[derive(NodeManifest)]
 pub struct LlmInferenceNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for LlmInferenceNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // `parseJson` declares a metadata default, so the bag always
         // holds a value.

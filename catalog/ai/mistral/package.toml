@@ -1,0 +1,8 @@
+[package]
+name = "mistral"
+
+# The Mistral nodes: document AI (OCR / parse-to-markdown). They speak
+# to Mistral specifically (its files + OCR endpoints, its API key).
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"

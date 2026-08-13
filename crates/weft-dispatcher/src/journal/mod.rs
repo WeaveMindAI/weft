@@ -230,6 +230,21 @@ pub trait Journal: Send + Sync {
     /// Look up a single signal by its token.
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
 
+    /// Persist a kind's evolving durable state (a delta-poll cursor)
+    /// onto its signal row. Two fences: the write is rejected when the
+    /// row's placement generation is above `placement_generation` (a
+    /// drained pod writing after the signal moved) or when the row's
+    /// `kind_state_seq` is at or above `seq` (an older update
+    /// arriving late must never regress a newer cursor). Returns
+    /// whether a row was written.
+    async fn signal_update_kind_state(
+        &self,
+        token: &str,
+        kind_state: &Value,
+        seq: i64,
+        placement_generation: i64,
+    ) -> anyhow::Result<bool>;
+
     /// Remove signals by token in one SQL statement. Returns the
     /// deleted rows so the caller can drive listener-unregister
     /// against them. Atomic: either every matching row is gone or
@@ -329,6 +344,11 @@ pub struct SignalRegistration {
     /// the clock. The dispatcher treats this field as opaque
     /// JSON; only the kind's handler interprets it.
     pub kind_state: Value,
+    /// The kind_state write-fence version this state was read/written
+    /// at (see the `signal.kind_state_seq` column). A register that
+    /// carries prior state forward passes the seq it read; a fresh
+    /// token starts at 0.
+    pub kind_state_seq: i64,
 }
 
 /// The placement an insert stamps on a new `signal` row: which pod holds

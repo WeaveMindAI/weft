@@ -1,0 +1,90 @@
+{
+  "type": "SlackUploadFile",
+  "label": "Slack: Upload File",
+  "description": "Share a stored file into a channel (optionally inside a thread), with an optional title and comment. Uses Slack's external-upload flow, the only upload path Slack still supports.",
+  "tags": [
+    "slack",
+    "file"
+  ],
+  "icon": "Upload",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "files:write"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the files:write scope."
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "required": true,
+      "description": "The stored file to share (from FetchToStorage, a trigger's attachment, any node emitting a file)."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          }
+        ]
+      },
+      "label": "Channel",
+      "placeholder": "Pick a channel or paste its id"
+    },
+    {
+      "name": "threadTs",
+      "type": "String",
+      "required": false,
+      "label": "Share in thread",
+      "placeholder": "The parent message's ts"
+    },
+    {
+      "name": "title",
+      "type": "String",
+      "required": false,
+      "label": "Title",
+      "description": "Display name in Slack. Defaults to the stored file's name."
+    },
+    {
+      "name": "comment",
+      "type": "String",
+      "required": false,
+      "label": "Comment",
+      "description": "A message posted alongside the file."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": false,
+      "description": "The shared file's Slack id (F...)."
+    },
+    {
+      "name": "permalink",
+      "type": "String",
+      "required": false,
+      "description": "A link to the shared file."
+    }
+  ]
+}

@@ -32,14 +32,29 @@ pub async fn ensure_worker_builder_base() -> Result<String> {
     // build context reads, via `compute_builder_base_hash`), so a
     // present tag IS the right content: no stamp file needed.
     if !image_present(&tag).await? {
-        // Stage the base build context: the worker-linked workspace slice
-        // + toolchain pin + generated warm-up crate + the RENDERED
-        // Dockerfile (target-cache key substituted), and nothing else, so
-        // the baked image (and the docker tarball) carry exactly what the
-        // base hash covers. See `build::stage_builder_base_context`.
-        let ctx = weft_compiler::build::stage_builder_base_context(&root)
-            .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
-        build_image(&tag, &ctx.join("Dockerfile"), &ctx, None).await?;
+        // The staging dir is one FIXED path (wiped and rewritten), and
+        // parallel `weft test-node` processes all funnel here, so the
+        // stage-and-build holds an exclusive file lock: the loser
+        // blocks, then finds the tag present and skips. The lock file
+        // lives BESIDE the staging dir (staging wipes the dir itself).
+        let ctx_dir = root.join(weft_compiler::worker_image::BASE_CONTEXT_DIR);
+        if let Some(parent) = ctx_dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock = std::fs::File::create(ctx_dir.with_extension("lock"))?;
+        tokio::task::block_in_place(|| lock.lock())
+            .map_err(|e| anyhow::anyhow!("lock the builder-base staging dir: {e}"))?;
+        if !image_present(&tag).await? {
+            // Stage the base build context: the worker-linked workspace
+            // slice + toolchain pin + generated warm-up crate + the
+            // RENDERED Dockerfile (target-cache key substituted), and
+            // nothing else, so the baked image (and the docker tarball)
+            // carry exactly what the base hash covers. See
+            // `build::stage_builder_base_context`.
+            let ctx = weft_compiler::build::stage_builder_base_context(&root)
+                .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
+            build_image(&tag, &ctx.join("Dockerfile"), &ctx, None).await?;
+        }
     }
     // Builder-base images are large (~1GB+: debian + rustup +
     // staged workspace). Earlier shape GC'd every prior tag after a
@@ -305,6 +320,57 @@ pub async fn kind_node_repo_tags(cluster: &str) -> Result<Vec<String>> {
         .filter_map(|t| t.as_str())
         .map(str::to_string)
         .collect())
+}
+
+/// The hashes of every image the dispatcher still counts on: running
+/// projects' binary hashes UNION non-terminal worker pods' hashes and
+/// pending/claimed task hashes (a pod draining in-flight work may run
+/// an image its project no longer points at; deleting it would strand
+/// a restart). The ONE fetch every image reclaim subtracts before
+/// deleting anything; a failure is the caller's cue to skip the
+/// reclaim, never to guess "nothing is referenced".
+/// SYNC: response shape (JSON array of bare hash strings) <->
+///       crates/weft-dispatcher/src/api/project.rs referenced_images
+pub async fn referenced_image_hashes(
+    client: &crate::client::DispatcherClient,
+) -> Result<std::collections::BTreeSet<String>> {
+    let json = client
+        .get_json("/images/referenced")
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch referenced images (is the daemon up?): {e}"))?;
+    Ok(json
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The node refs in `node_refs` whose repo (ignoring any registry
+/// prefix) is `repo` and whose tag satisfies `condemn`, ready for
+/// `crictl rmi`. Pure so it is unit-testable; only `repo`'s refs ever
+/// leave, which is the guarantee that keeps system images (listener &
+/// co) safe from every node cleanup. Handles bare (`repo:<tag>`),
+/// docker-canonical (`docker.io/library/...`), and registry-qualified
+/// (`host:port/path/repo:<tag>`) spellings.
+pub fn node_refs_matching(
+    repo: &str,
+    node_refs: &[String],
+    condemn: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let prefix = format!("{repo}:");
+    node_refs
+        .iter()
+        .filter(|full| {
+            let repo_tag = full.rsplit_once('/').map_or(full.as_str(), |(_, t)| t);
+            match repo_tag.strip_prefix(&prefix) {
+                Some(tag) => condemn(tag),
+                None => false,
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 /// Whether the kind node already has an image tagged `tag`. Tag

@@ -86,6 +86,51 @@
         "id": "channels:history",
         "label": "Read channel messages",
         "description": "Read the message history of public channels the bot is in."
+      },
+      {
+        "id": "groups:read",
+        "label": "List private channels",
+        "description": "See the private channels the bot has been invited into."
+      },
+      {
+        "id": "groups:history",
+        "label": "Read private channel messages",
+        "description": "Read the message history of private channels the bot is in."
+      },
+      {
+        "id": "im:write",
+        "label": "Start direct messages",
+        "description": "Open direct-message conversations to send to a user."
+      },
+      {
+        "id": "reactions:read",
+        "label": "See reactions",
+        "description": "See emoji reactions (needed by the reaction trigger)."
+      },
+      {
+        "id": "reactions:write",
+        "label": "Add reactions",
+        "description": "Add and remove emoji reactions on messages."
+      },
+      {
+        "id": "files:read",
+        "label": "Read shared files",
+        "description": "See and download files shared in channels the bot is in."
+      },
+      {
+        "id": "files:write",
+        "label": "Upload files",
+        "description": "Upload and share files into channels."
+      },
+      {
+        "id": "users:read",
+        "label": "Look up users",
+        "description": "See workspace members' names and profiles."
+      },
+      {
+        "id": "users:read.email",
+        "label": "Look up users by email",
+        "description": "Resolve a workspace member from their email address."
       }
     ],
     "all_permissions_url": "https://docs.slack.dev/reference/scopes",
@@ -132,6 +177,171 @@
           "thread": "thread_ts",
           "ts": "ts",
           "workspace": "team"
+        },
+        "account": {
+          "value": "team_id",
+          "path": "team_id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {app_token}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url"
+              }
+            ]
+          },
+          "replies": [
+            {
+              "when_field": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "event_path": "payload.event",
+          "multi_account": true
+        },
+        "webhook": {
+          "handshake": {
+            "kind": "echo_body_field",
+            "path": "challenge"
+          },
+          "verify": {
+            "kind": "hmac",
+            "signature_header": "X-Slack-Signature",
+            "timestamp_header": "X-Slack-Request-Timestamp",
+            "concat": "v0:{timestamp}:{body}",
+            "prefix": "v0="
+          },
+          "event_path": "event"
+        }
+      },
+      "reactions": {
+        "fields": {
+          "type": "type",
+          "emoji": "reaction",
+          "user": "user",
+          "channel": "item.channel",
+          "ts": "item.ts",
+          "messageUser": "item_user"
+        },
+        "account": {
+          "value": "team_id",
+          "path": "team_id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {app_token}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url"
+              }
+            ]
+          },
+          "replies": [
+            {
+              "when_field": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "event_path": "payload.event",
+          "multi_account": true
+        },
+        "webhook": {
+          "handshake": {
+            "kind": "echo_body_field",
+            "path": "challenge"
+          },
+          "verify": {
+            "kind": "hmac",
+            "signature_header": "X-Slack-Signature",
+            "timestamp_header": "X-Slack-Request-Timestamp",
+            "concat": "v0:{timestamp}:{body}",
+            "prefix": "v0="
+          },
+          "event_path": "event"
+        }
+      },
+      "interactions": {
+        "fields": {
+          "type": "type",
+          "callbackId": "message.metadata.event_payload.callback",
+          "action": "actions.0.action_id",
+          "value": "actions.0.value",
+          "user": "user.id",
+          "userName": "user.username",
+          "channel": "channel.id",
+          "ts": "message.ts",
+          "responseUrl": "response_url"
+        },
+        "account": {
+          "value": "team_id",
+          "path": "team.id"
+        },
+        "socket": {
+          "connect": {
+            "url": "https://slack.com/api/apps.connections.open",
+            "method": "POST",
+            "auth": [
+              {
+                "kind": "header",
+                "name": "Authorization",
+                "value": "Bearer {app_token}"
+              }
+            ],
+            "captures": [
+              {
+                "name": "url",
+                "path": "url"
+              }
+            ]
+          },
+          "replies": [
+            {
+              "when_field": "envelope_id",
+              "frame": "{\"envelope_id\":\"{value}\"}"
+            }
+          ],
+          "event_path": "payload"
+        },
+        "webhook": {
+          "verify": {
+            "kind": "hmac",
+            "signature_header": "X-Slack-Signature",
+            "timestamp_header": "X-Slack-Request-Timestamp",
+            "concat": "v0:{timestamp}:{body}",
+            "prefix": "v0="
+          },
+          "decode": {
+            "path": "payload",
+            "encoding": "form_json"
+          },
+          "event_path": ""
+        }
+      },
+      "files": {
+        "fields": {
+          "type": "type",
+          "fileId": "file_id",
+          "channel": "channel_id",
+          "user": "user_id"
         },
         "account": {
           "value": "team_id",

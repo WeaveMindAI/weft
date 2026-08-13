@@ -282,13 +282,17 @@ impl Platform {
     // gone) AND the spawn-pod task's `attempts > 1` (a fresh process was
     // spawned) AND the execution still completed. We assert those, not names.
 
-    /// The `worker_pod` rows for a project, newest first. Lets a test see pod
-    /// status / heartbeat directly (e.g. to confirm a killed pod went `dead`).
+    /// The WORKER `worker_pod` rows for a project, newest first (role
+    /// 'worker' only: a node-test pod holds a row in the same table
+    /// and must never count as worker capacity in an assertion). Lets
+    /// a test see pod status / heartbeat directly (e.g. to confirm a
+    /// killed pod went `dead`).
     pub async fn worker_pods_for_project(&self, project_id: &Uuid) -> Result<Vec<WorkerPodRow>> {
         let rows: Vec<WorkerPodRow> = sqlx::query_as(
             "SELECT pod_name, project_id, namespace, status, last_heartbeat_unix, \
-                    terminal_at_unix, draining, binary_hash \
-             FROM worker_pod WHERE project_id = $1 ORDER BY created_at_unix DESC",
+                    terminal_at_unix, draining, binary_hash, role \
+             FROM worker_pod WHERE project_id = $1 AND role = 'worker' \
+             ORDER BY created_at_unix DESC",
         )
         .bind(project_id.to_string())
         .fetch_all(&self.pool)
@@ -329,7 +333,9 @@ impl Platform {
             &src.project_id,
             &src.namespace,
             &owner,
-            &src.binary_hash,
+            Some(&src.binary_hash),
+            "worker",
+            None,
         )
         .await
         .context("insert clone's spawning row")?;
@@ -527,7 +533,8 @@ impl Platform {
     pub async fn kill_workers(&self, project_id: &Uuid) -> Result<Vec<String>> {
         let live: Vec<(String, String)> = sqlx::query_as(
             "SELECT pod_name, namespace FROM worker_pod \
-             WHERE project_id = $1 AND status IN ('spawning', 'alive')",
+             WHERE project_id = $1 AND status IN ('spawning', 'alive') \
+               AND role = 'worker'",
         )
         .bind(project_id.to_string())
         .fetch_all(&self.pool)
@@ -1361,6 +1368,8 @@ pub struct WorkerPodRow {
     pub draining: bool,
     /// The image the pod was baked from (what the claim gate matches).
     pub binary_hash: String,
+    /// 'worker' or 'node-test' (the projection filters to 'worker').
+    pub role: String,
 }
 
 /// Backdate slack: push a timestamp this much PAST a reaper's threshold so the

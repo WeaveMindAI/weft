@@ -102,6 +102,7 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         )
         .route("/v1/task/claim_one", post(handlers::task_claim_one))
         .route("/v1/task/heartbeat", post(handlers::task_heartbeat))
+        .route("/v1/task/requeue", post(handlers::task_requeue))
         .route("/v1/task/complete", post(handlers::task_complete))
         .route("/v1/task/fail", post(handlers::task_fail))
         // worker_pod

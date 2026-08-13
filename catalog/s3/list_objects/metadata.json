@@ -1,0 +1,51 @@
+{
+  "type": "S3ListObjects",
+  "label": "S3: List Objects",
+  "description": "List a bucket's objects under a prefix (paging until exhausted): keys, sizes, and last-modified times.",
+  "tags": [
+    "s3",
+    "storage",
+    "object"
+  ],
+  "icon": "List",
+  "color": "#E25444",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The object store access (wire an S3Access node)."
+    },
+    {
+      "name": "bucket",
+      "type": "String",
+      "required": true,
+      "label": "Bucket"
+    },
+    {
+      "name": "prefix",
+      "type": "String",
+      "required": false,
+      "label": "Prefix",
+      "description": "Only keys starting with this. Empty = the whole bucket."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "objects",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each object: key, sizeBytes, lastModified."
+    },
+    {
+      "name": "keys",
+      "type": "List[String]",
+      "required": false
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

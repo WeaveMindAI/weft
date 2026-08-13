@@ -1,0 +1,47 @@
+{
+  "type": "GoogleDocsCreate",
+  "label": "Google Docs: Create",
+  "description": "Create a Google Doc with a title and optional initial text. The report sink: an LLM writes, the doc lands in Drive.",
+  "tags": [
+    "google",
+    "docs",
+    "document"
+  ],
+  "icon": "FileText",
+  "color": "#4285F4",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/documents"
+      ],
+      "description": "A Google account with the documents permission."
+    },
+    {
+      "name": "title",
+      "type": "String",
+      "required": true,
+      "label": "Title"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": false,
+      "label": "Initial text"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "documentId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "link",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

@@ -134,7 +134,9 @@ impl BrokerState {
         // fake clock at the store layer).
         let runtime_store = match object_store.clone() {
             Some(bucket) => {
-                crate::runtime_store::migrate(&pool).await.context("runtime_file migrate")?;
+                weft_task_store::apply_groups(&pool, &[&crate::runtime_store::GROUP])
+                    .await
+                    .context("apply runtime_file schema group")?;
                 Some(Arc::new(RuntimeStore::new(
                     pool.clone(),
                     bucket,

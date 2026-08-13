@@ -38,6 +38,16 @@ pub trait WorkerBackend: Send + Sync {
     ) -> anyhow::Result<WorkerHandle>;
 
     async fn kill_pod(&self, pod_name: String, namespace: String) -> anyhow::Result<()>;
+
+    /// Name of the k8s `imagePullSecret` pods spawned alongside this
+    /// backend's workers must reference to pull their image, or `None`
+    /// when pulls need no explicit credential (images loaded onto the
+    /// node directly, or a cluster that authenticates pulls
+    /// implicitly). The backend owns the registry configuration, so it
+    /// is the one source of this answer for every pod spawner.
+    fn pull_secret(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Spec for spawning a worker Pod. The Pod runs the content-addressed

@@ -74,11 +74,18 @@ where
 /// Worker-pod reaper. Once every 30s, mark failed pods `dead` (which
 /// makes the fencing trigger reject any further journal writes) +
 /// `kubectl delete` the Pod:
-///   - `alive` rows whose heartbeat went stale (the worker died), and
+///   - `alive` rows whose heartbeat went stale (the worker died),
 ///   - `spawning` rows that never registered `alive` within the generous
 ///     boot deadline. Without sweeping the latter, a ghost `spawning` row
 ///     is counted as available capacity by the scale-up check forever, so
-///     the project's pending work hangs with no live worker and no error.
+///     the project's pending work hangs with no live worker and no error,
+///     and
+///   - non-terminal `role='node-test'` rows whose owning task is gone or
+///     has been terminal past a full claim duration (the executor's
+///     cleanup failed partway; nothing else re-runs it). The grace keeps
+///     the sweep clear of an executor's own in-flight cleanup: a task
+///     terminal for less than one claim duration may still have its
+///     finishing claim working against the pod.
 ///
 /// The spawning deadline (`SPAWN_BOOT_DEADLINE_SECS`) is deliberately
 /// GENEROUS, far above any realistic boot (image pull + binary init), so
@@ -105,9 +112,21 @@ async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
         now - weft_task_store::worker_pod::SPAWN_BOOT_DEADLINE_SECS,
     )
     .await?;
-    // Stale-heartbeat alive pods (worker died) and over-deadline spawning
-    // pods (never registered) both reap through the same path; a dead row
-    // is not re-listed by either query, so each is reaped once.
+    // Node-test pods are excluded from both queries above (their
+    // liveness is owned by the driving task executor), so they get
+    // their own orphan predicate: a non-terminal node-test row whose
+    // owning task is gone, or terminal past a full claim duration,
+    // means the executor's cleanup failed partway and nothing will
+    // re-run it. A live task, or one terminal for less than a claim
+    // duration (its finishing claim may still be cleaning up), keeps
+    // the row protected.
+    let orphaned_node_tests = weft_task_store::worker_pod::list_orphaned_node_test(
+        &state.pg_pool,
+        now - weft_task_store::CLAIM_DURATION_SECS,
+    )
+    .await?;
+    // All three sets reap through the same path; a dead row is not
+    // re-listed by any query, so each is reaped once.
     for (reason, row) in stale
         .into_iter()
         .map(|r| ("stale heartbeat", r))
@@ -115,6 +134,11 @@ async fn sweep_worker_pods(state: DispatcherState) -> anyhow::Result<()> {
             stuck_spawning
                 .into_iter()
                 .map(|r| ("spawning past boot deadline, never registered alive", r)),
+        )
+        .chain(
+            orphaned_node_tests
+                .into_iter()
+                .map(|r| ("node-test row outlived its owning task", r)),
         )
     {
         reap_worker_pod(&state, &row, reason).await?;
@@ -139,7 +163,7 @@ async fn reap_worker_pod(
         pod = %row.pod_name,
         last_heartbeat = row.last_heartbeat_unix,
         reason,
-        "marking failed worker pod dead"
+        "marking failed pod dead"
     );
     weft_task_store::worker_pod::mark_dead(&state.pg_pool, &row.pod_name).await?;
     // kubectl delete: log loudly on error. A failed kill leaves the pod

@@ -1,0 +1,44 @@
+{
+  "type": "LlmEmbed",
+  "label": "Embed",
+  "description": "Texts to embedding vectors through the wired OpenRouter connection: pick the embedding model on the provider node (voyageai/voyage-4, openai/text-embedding-3-small, ...).",
+  "tags": [
+    "ai",
+    "embedding",
+    "llm"
+  ],
+  "icon": "Braces",
+  "color": "#7C3AED",
+  "inputs": [
+    {
+      "name": "provider",
+      "type": "LlmProvider",
+      "required": true,
+      "description": "Wire an OpenRouterProvider whose model names the model to use."
+    },
+    {
+      "name": "texts",
+      "type": "String | List[String]",
+      "required": true,
+      "description": "One text or a list; one vector comes back per text."
+    },
+    {
+      "name": "dimensions",
+      "type": "Number",
+      "required": false,
+      "description": "Shrink vectors to this many dimensions (models supporting matryoshka sizing only)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "embeddings",
+      "type": "List[List[Number]]",
+      "required": false
+    },
+    {
+      "name": "dimensions",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

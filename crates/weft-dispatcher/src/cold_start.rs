@@ -78,6 +78,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
                  SELECT 1 FROM worker_pod wp
                  WHERE wp.project_id = t.project_id
                    AND wp.status IN ('spawning', 'alive')
+                   AND wp.role = 'worker'
                    AND NOT wp.draining
                    AND wp.mem_pressure < $1
                    AND (t.binary_hash IS NULL OR wp.binary_hash = t.binary_hash)
@@ -159,6 +160,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
                  SELECT 1 FROM worker_pod wp
                  WHERE wp.project_id = t.project_id
                    AND wp.status IN ('spawning', 'alive')
+                   AND wp.role = 'worker'
                    AND wp.binary_hash = t.binary_hash
              )
            LIMIT 100"#,

@@ -67,7 +67,12 @@ impl KindHandler for SocketListenHandler {
         });
         let on_event = Box::new(move |payload: Value| {
             let fire = fire.clone();
-            async move { fire.fire(payload, "socket_listen").await }.boxed()
+            async move {
+                // A socket event has no replay cursor; the delivery
+                // outcome is already logged by the fire path.
+                let _ = fire.fire(payload, "socket_listen").await;
+            }
+            .boxed()
         });
         Ok(Some(socket_engine::spawn(prepare, on_event, "socket_listen")))
     }

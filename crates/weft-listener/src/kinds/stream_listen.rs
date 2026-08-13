@@ -66,7 +66,12 @@ impl KindHandler for StreamListenHandler {
         });
         let on_event = Box::new(move |payload: Value| {
             let fire = fire.clone();
-            async move { fire.fire(payload, "stream_listen").await }.boxed()
+            async move {
+                // A stream event has no replay cursor; the delivery
+                // outcome is already logged by the fire path.
+                let _ = fire.fire(payload, "stream_listen").await;
+            }
+            .boxed()
         });
         Ok(Some(stream_engine::spawn(prepare, on_event, "stream_listen")))
     }

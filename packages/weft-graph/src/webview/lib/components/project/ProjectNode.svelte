@@ -664,13 +664,34 @@
 			: (data.config as Record<string, unknown>)?.[field.key];
 	}
 
-	/** Resolve a remote_select's authenticating access STRUCTURALLY:
-	 *  follow this node's `accessInput` wire back to the feeding access
-	 *  node and read the grant id it persisted when the user clicked
-	 *  Connect (plus its service, off its template's recipe). There is
-	 *  no data flow between nodes at edit time; this graph walk is what
+	/** Resolve a remote_select's authenticating access STRUCTURALLY.
+	 *  Two homes, checked in order: the named input may be an access
+	 *  widget on THIS node (the grant handle sits in this node's own
+	 *  config, no edge exists), or an Access-typed port wired back to a
+	 *  feeding access node whose config holds the handle. Either way we
+	 *  read the grant id persisted when the user clicked Connect, plus
+	 *  the service off the owning template's recipe. There is no data
+	 *  flow between nodes at edit time; this structural read is what
 	 *  makes the dropdown live with nothing running. */
+	/** Whether the named access input is an access WIDGET on this node
+	 *  (the connection is picked in this node's own config) rather than
+	 *  an Access-typed port fed by a wire. Drives both the trace below
+	 *  and the dropdown's connect-first wording (pick here vs wire in). */
+	function accessInputIsOwnWidget(accessInput: string | undefined): boolean {
+		if (!accessInput) return false;
+		const ownInputs = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		return ownInputs.some((i) => i.name === accessInput && i.widget?.kind === 'access');
+	}
+
 	function traceAccessRef(accessInput: string): { accessId: string; service: string } | null {
+		if (accessInputIsOwnWidget(accessInput)) {
+			const service = typeConfig.service?.service;
+			if (!service) return null;
+			const handle = (data.config as Record<string, unknown>)?.[accessInput];
+			const grantId =
+				handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
+			return typeof grantId === 'string' ? { accessId: grantId, service } : null;
+		}
 		const edge = edgesState.current.find(
 			(e: Edge) => e.target === id && e.targetHandle === accessInput,
 		);
@@ -1658,6 +1679,7 @@
 								{field}
 								value={fieldHomeValue(field) as string | undefined}
 								accessRef={field.access ? traceAccessRef(field.access) : null}
+								accessIsOwnField={accessInputIsOwnWidget(field.access)}
 								grantedScopes={field.access ? (tracedGrants[field.access]?.scopes ?? null) : null}
 								parents={remoteSelectParents(field)}
 								onUpdate={(v) => updateFieldValue(field.key, v, field.portDriven)}

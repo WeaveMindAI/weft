@@ -136,7 +136,7 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
 
     // Tools: each wired value is one LlmTool node's `{ name,
     // description, parameters }` object, handed to the lib verbatim.
-    let tools = chat::one_or_many(ctx.inputs.opt("tools")?);
+    let tools: Vec<Value> = ctx.inputs.list("tools")?;
     let has_tools = !tools.is_empty();
     for tool in tools {
         let def: ToolDefinition =
@@ -183,7 +183,7 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
         stored.insert(0, chat::stored_message("system", &system_prompt, &[], None)?);
     }
     let prompt: Option<String> = ctx.inputs.opt("prompt")?;
-    let media = chat::one_or_many(ctx.inputs.opt("media")?);
+    let media: Vec<Value> = ctx.inputs.list("media")?;
     if prompt.is_some() || !media.is_empty() {
         stored.push(chat::stored_message("user", prompt.as_deref().unwrap_or(""), &media, None)?);
     }

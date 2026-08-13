@@ -1,0 +1,39 @@
+{
+  "type": "S3DeleteObject",
+  "label": "S3: Delete Object",
+  "description": "Delete one object.",
+  "tags": [
+    "s3",
+    "storage",
+    "object"
+  ],
+  "icon": "Trash2",
+  "color": "#E25444",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The object store access (wire an S3Access node)."
+    },
+    {
+      "name": "bucket",
+      "type": "String",
+      "required": true,
+      "label": "Bucket"
+    },
+    {
+      "name": "key",
+      "type": "String",
+      "required": true,
+      "label": "Key"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "type": "GoogleDocsAppend",
+  "label": "Google Docs: Append",
+  "description": "Append text at the end of a Google Doc.",
+  "tags": [
+    "google",
+    "docs",
+    "document"
+  ],
+  "icon": "FilePlus",
+  "color": "#4285F4",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/documents"
+      ],
+      "description": "A Google account with the documents permission."
+    },
+    {
+      "name": "documentId",
+      "type": "String",
+      "required": true,
+      "label": "Document id"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "label": "Text"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
+  ]
+}

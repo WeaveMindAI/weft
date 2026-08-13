@@ -285,33 +285,7 @@ mod fs_hashes {
         let project_root = project.root.as_path();
         let mut hasher = Sha256::new();
         hasher.update(b"weft-binary-v1\n");
-
-        // weft.toml carries build choices (base image, custom template)
-        // AND the crate name (which becomes the binary name). Both
-        // affect the docker image bytes. Project configs live in
-        // main.weft, not weft.toml, so this stays binary-scoped.
-        hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
-
-        // A custom Dockerfile template's CONTENT shapes the image too;
-        // weft.toml only carries its path, so an edit to the template
-        // file itself would otherwise never trigger a rebuild. The caller
-        // already loaded the project, so read the manifest off it (no
-        // redundant re-read of weft.toml from disk). A set-but-MISSING
-        // template path is a config error: fail loudly here rather than
-        // hashing the absence (which would let the build proceed to a
-        // docker failure later with a less obvious cause).
-        if let Some(rel) = &project.manifest.build.worker.dockerfile_template {
-            let template_path = project_root.join(rel);
-            if !template_path.exists() {
-                anyhow::bail!(
-                    "weft.toml sets [build.worker] dockerfile_template = {:?} but that file does \
-                     not exist (resolved to {}); fix the path or remove the setting",
-                    rel,
-                    template_path.display()
-                );
-            }
-            hash_path(&mut hasher, "dockerfile_template", &template_path)?;
-        }
+        hash_image_recipe(&mut hasher, project)?;
 
         // SET of referenced node TYPES: the dispatch table in registry.rs
         // is generated from this. The ORDER doesn't matter (we sort), and
@@ -334,11 +308,71 @@ mod fs_hashes {
             &[project_root, weft_root],
         )?;
 
+        // The baked type registry: `write_main_rs` bakes EVERY
+        // package's nominal type declarations into the binary (not
+        // just the referenced packages'), so a type edit anywhere in
+        // the catalog changes the compiled bytes and must flip this
+        // digest, or a cached image would silently serve the previous
+        // registry.
+        hash_type_registry(&mut hasher, catalog);
+
         // Worker build environment: workspace source the binary links
         // against + the builder-base image it compiles inside.
         hash_worker_build_env(&mut hasher, weft_root)?;
 
         Ok(hex(&hasher.finalize()))
+    }
+
+    /// Fold the catalog's full nominal type registry into the digest
+    /// (sorted, so map order can never flip it). Shared by the binary
+    /// hash and the node-test hash: both bake this registry into their
+    /// generated `main.rs`.
+    fn hash_type_registry(hasher: &mut Sha256, catalog: &FsCatalog) {
+        let mut entries = catalog.type_registry().nominal_entries();
+        entries.sort();
+        hasher.update(b"type_registry:\n");
+        for (name, body) in entries {
+            hasher.update(b"  ");
+            hasher.update(name.as_bytes());
+            hasher.update(b"=");
+            hasher.update(body.as_bytes());
+            hasher.update(b"\n");
+        }
+    }
+
+    /// Hash the image RECIPE a staged build renders through
+    /// `worker_image::emit`: `weft.toml`'s build choices (base image,
+    /// custom template path, crate name) and, when a custom template
+    /// is set, the template file's own content. Shared by the binary
+    /// hash and the node-test hash so every image-naming digest covers
+    /// the same recipe inputs; a base-image or template edit flips
+    /// both instead of silently serving a stale cached image.
+    fn hash_image_recipe(hasher: &mut Sha256, project: &Project) -> Result<()> {
+        let project_root = project.root.as_path();
+        // Project configs live in main.weft, not weft.toml, so this
+        // stays image-scoped.
+        hash_path(hasher, "weft.toml", &project_root.join("weft.toml"))?;
+
+        // A custom Dockerfile template's CONTENT shapes the image too;
+        // weft.toml only carries its path, so an edit to the template
+        // file itself would otherwise never trigger a rebuild. A
+        // set-but-MISSING template path is a config error: fail loudly
+        // here rather than hashing the absence (which would let the
+        // build proceed to a docker failure later with a less obvious
+        // cause).
+        if let Some(rel) = &project.manifest.build.worker.dockerfile_template {
+            let template_path = project_root.join(rel);
+            if !template_path.exists() {
+                anyhow::bail!(
+                    "weft.toml sets [build.worker] dockerfile_template = {:?} but that file does \
+                     not exist (resolved to {}); fix the path or remove the setting",
+                    rel,
+                    template_path.display()
+                );
+            }
+            hash_path(hasher, "dockerfile_template", &template_path)?;
+        }
+        Ok(())
     }
 
     /// Hash a sorted, deduped set of package roots, each prefixed by its
@@ -384,6 +418,39 @@ mod fs_hashes {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-node-package-v1\n");
         hash_package_roots(&mut hasher, std::slice::from_ref(&root.to_path_buf()), bases)?;
+        Ok(hex(&hasher.finalize()))
+    }
+
+    /// Content hash of ONE package's node-test artifact: the image
+    /// recipe (weft.toml build choices + custom template content, the
+    /// same inputs the binary hash covers), the package's own sources
+    /// (which include every member's `tests.rs`; the package walk
+    /// hashes all files), and the worker build environment the test
+    /// binary compiles against (engine closure, manifests, toolchain,
+    /// builder-base Dockerfile). This is the staleness rule for a
+    /// per-package test binary/image: change the base image, a node, a
+    /// test, or the engine and the hash flips; change nothing and a
+    /// cached artifact is current.
+    pub fn compute_node_test_hash(
+        package_root: &Path,
+        project: &Project,
+        weft_root: &Path,
+        catalog: &FsCatalog,
+    ) -> Result<SourceHash> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"weft-node-test-v1\n");
+        hash_image_recipe(&mut hasher, project)?;
+        hash_package_roots(
+            &mut hasher,
+            std::slice::from_ref(&package_root.to_path_buf()),
+            &[project.root.as_path(), weft_root],
+        )?;
+        // The test crate's main.rs bakes the FULL catalog type
+        // registry (see the binary hash's identical step): a type
+        // edit in a SIBLING package changes this package's test
+        // binary, so it must flip this digest too.
+        hash_type_registry(&mut hasher, catalog);
+        hash_worker_build_env(&mut hasher, weft_root)?;
         Ok(hex(&hasher.finalize()))
     }
 

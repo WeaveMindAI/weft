@@ -30,8 +30,10 @@ use sqlx::postgres::PgPool;
 // the dispatcher keeps the short module-relative path.
 pub use weft_broker_client::protocol::{InfraLifecycleVerb, RunningPolicy};
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let stmts = [
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "infra_lifecycle_command",
+    tables: &["infra_lifecycle_command"],
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_lifecycle_command (
             id                BIGSERIAL PRIMARY KEY,
             tenant_id         TEXT NOT NULL,
@@ -110,12 +112,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_cmd_pending_apply
               ON infra_lifecycle_command(project_id, node_id)
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
-    ];
-    for sql in stmts {
-        sqlx::query(sql).execute(pool).await?;
-    }
-    Ok(())
-}
+    ],
+};
 
 /// Enqueue a Stop or Terminate command. Returns its id; the
 /// supervisor polling for the tenant claims it on its next tick.

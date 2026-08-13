@@ -255,6 +255,19 @@ pub fn connection_client(
              to route them by; connect your own credential on the node"
         )));
     }
+    // A runtime-supplied credential is only ever sent on routes its
+    // meter explicitly knows (the meter IS the allowlist: billable
+    // routes carry the measurement, free routes are declared free).
+    // Without a meter there is no allowlist, so the shared door does
+    // not open, on either lane.
+    if sink.origin == weft_core::CredentialOwner::Ours && meter.is_none() {
+        return Err(WeftError::NodeExecution(format!(
+            "service '{service}' offers a runtime credential but registers no meter; a \
+             runtime credential only travels on meter-declared routes, so this door \
+             cannot open. Connect your own credential on the node, or register a meter \
+             for the service"
+        )));
+    }
     let follow_up = reqwest_middleware::ClientBuilder::new(follow_up_client().clone())
         .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
         .build();
@@ -315,35 +328,44 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         });
 
         if let Some(relay) = &self.relay_url {
-            // Relayed lane: rebuild the URL against the relay and send. The
-            // relay does the measuring; this side does none.
-            let Some(route) = route else {
-                return Err(middleware_err(format!(
-                    "this call ({}) is not under service '{}''s API ({}), so the runtime \
-                     cannot relay it; calls on a runtime-supplied credential must address \
-                     the service's own API",
-                    req.url(),
-                    self.sink.service,
-                    self.meter.map(|m| m.base_url()).unwrap_or("<unknown>"),
-                )));
-            };
-            let query = req.url().query().map(|q| format!("?{q}")).unwrap_or_default();
-            let relayed = format!("{}/{}{}", relay.trim_end_matches('/'), route, query);
+            // Relayed lane: rebuild the URL against the relay and send.
+            // The relay does the measuring; this side does none. The
+            // rebuild is the shared one every relayed lane uses.
+            let meter = self.meter.expect("connection_client refuses a relay without a meter");
+            let relayed =
+                weft_providers::relay_join(meter.base_url(), relay, req.url().as_str())
+                    .map_err(middleware_err)?;
             *req.url_mut() = reqwest::Url::parse(&relayed).map_err(|e| {
                 middleware_err(format!("relay URL {relayed:?} does not parse: {e}"))
             })?;
             return next.run(req, extensions).await;
         }
 
-        // Direct lane: measure billable routes; everything else passes
-        // through untouched (a free route, an unknown route on a key the
-        // user holds, a provider with no meter).
+        // Direct lane. A RUNTIME credential (origin Ours) travels only
+        // on routes its meter explicitly declares; the shared gate
+        // refuses everything else loud BEFORE the credential is
+        // attached. A key the USER holds is theirs to aim: unknown
+        // routes pass through unmeasured as always.
+        if self.sink.origin == weft_core::CredentialOwner::Ours {
+            let meter = self.meter.expect("connection_client refuses Ours without a meter");
+            weft_providers::ours_route_on(
+                meter,
+                &self.sink.service,
+                req.method().as_str(),
+                req.url().as_str(),
+            )
+            .map_err(middleware_err)?;
+        }
+
+        // Measure billable routes; everything else passes through
+        // untouched (a free route, an unknown route on a key the user
+        // holds, a provider with no meter).
         let (Some(meter), Some(route)) = (self.meter, route.as_deref()) else {
             return next.run(req, extensions).await;
         };
-        if !matches!(meter.classify(req.method().as_str(), route), RouteClass::Billable(_)) {
+        let RouteClass::Billable(_) = meter.classify(req.method().as_str(), route) else {
             return next.run(req, extensions).await;
-        }
+        };
 
         // Prepare the request so its cost becomes reportable. A body the
         // middleware cannot see (a streaming body) cannot be prepared, and
@@ -381,7 +403,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         // the observer reads what it needs in passing. When the stream
         // ends (or is cut, including by drop), the finalizer resolves the
         // cost and records it, detached from the caller's future.
-        let mut observer = meter.observe();
+        let mut observer = meter.observe(route);
         observer.on_status(response.status().as_u16());
         let status = response.status();
         let version = response.version();
@@ -391,6 +413,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
             finalizer: Some(Finalizer {
                 observer,
                 meter,
+                route: route.to_string(),
                 follow_up: self.follow_up.clone(),
                 sink: self.sink.clone(),
             }),
@@ -414,6 +437,8 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
 struct Finalizer {
     observer: Box<dyn CallObservation>,
     meter: &'static dyn ProviderMeter,
+    /// The call's route, carried to `resolve` as a fact.
+    route: String,
     /// The signed-in follow-up client (bounded pool + the connection's
     /// auth); the meter never sees a credential.
     follow_up: reqwest_middleware::ClientWithMiddleware,
@@ -421,18 +446,24 @@ struct Finalizer {
 }
 
 impl Finalizer {
-    /// End the observation and book the resolve + record through
-    /// [`CostSink::book`] (detached, tracked, loud on loss).
+    /// End the observation and book the figure through [`CostSink::book`]
+    /// (detached, tracked, loud on loss). EVERY billable call resolves
+    /// through its meter, fixed-priced routes included: whether a call
+    /// was actually charged is provider-specific knowledge (a provider
+    /// may answer 200 with a failure body it never bills, or bill a
+    /// call it then refuses), so the declared price is the meter's
+    /// input, never the middleware's verdict.
     fn finish(self, interrupted: bool) {
         let observed = self.observer.end(interrupted);
         let meter = self.meter;
+        let route = self.route;
         let follow_up_http = self.follow_up;
         self.sink.book(async move {
             let follow_up = FollowUp {
                 http: &follow_up_http,
                 base_url: meter.base_url(),
             };
-            meter.resolve(observed, follow_up).await
+            meter.resolve(&route, observed, follow_up).await
         });
     }
 }
@@ -520,6 +551,9 @@ mod tests {
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
+        async fn requeue(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
         async fn heartbeat(&self, _task_id: uuid::Uuid, _pod_id: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
@@ -544,17 +578,25 @@ mod tests {
     /// A meter for a provider living at the test server: chat/completions
     /// billable, cost read from the LAST SSE `usage.cost` seen; an
     /// interrupted call with no usage resolves to an honest unknown.
+    /// With `fixed_usd` set, the same route classifies Fixed instead and
+    /// `resolve` answers the declared price from the observed status
+    /// (the meter, not the middleware, decides whether a fixed-priced
+    /// call was actually charged).
     struct TestMeter {
         base: &'static str,
+        fixed_usd: Option<f64>,
     }
 
     struct TestObservation {
         scanner: weft_providers::sse::DataLineScanner,
+        status: u16,
         cost: Option<f64>,
     }
 
     impl CallObservation for TestObservation {
-        fn on_status(&mut self, _status: u16) {}
+        fn on_status(&mut self, status: u16) {
+            self.status = status;
+        }
         fn on_chunk(&mut self, bytes: &[u8]) {
             let cost = &mut self.cost;
             self.scanner.feed(bytes, |payload| {
@@ -568,6 +610,7 @@ mod tests {
         fn end(self: Box<Self>, interrupted: bool) -> ObservedCall {
             ObservedCall {
                 interrupted,
+                status: self.status,
                 data: serde_json::json!({ "cost": self.cost }),
             }
         }
@@ -583,9 +626,11 @@ mod tests {
         }
         fn classify(&self, method: &str, path: &str) -> RouteClass {
             match (method, path) {
-                ("POST", "chat/completions") => {
-                    RouteClass::Billable(weft_providers::Pricing::Metered)
-                }
+                ("POST", "chat/completions") => RouteClass::Billable(match self.fixed_usd {
+                    Some(usd) => weft_providers::Pricing::Fixed { usd },
+                    None => weft_providers::Pricing::Metered,
+                }),
+                ("GET", "models") => RouteClass::Free,
                 _ => RouteClass::Unknown,
             }
         }
@@ -602,13 +647,34 @@ mod tests {
         ) -> anyhow::Result<f64> {
             Ok(1.0)
         }
-        fn observe(&self) -> Box<dyn CallObservation> {
+        fn observe(&self, _path: &str) -> Box<dyn CallObservation> {
             Box::new(TestObservation {
                 scanner: weft_providers::sse::DataLineScanner::new(),
+                status: 0,
                 cost: None,
             })
         }
-        async fn resolve(&self, observed: ObservedCall, _follow_up: FollowUp<'_>) -> MeasuredCost {
+        async fn resolve(
+            &self,
+            _path: &str,
+            observed: ObservedCall,
+            _follow_up: FollowUp<'_>,
+        ) -> MeasuredCost {
+            if let Some(usd) = self.fixed_usd {
+                let refused = !(200..300).contains(&observed.status);
+                return MeasuredCost {
+                    amount_usd: Some(if refused { 0.0 } else { usd }),
+                    model: None,
+                    metadata: serde_json::json!({
+                        "resolution": if refused {
+                            "provider refused the call; nothing billed"
+                        } else {
+                            "fixed route price"
+                        },
+                        "status": observed.status,
+                    }),
+                };
+            }
             MeasuredCost {
                 amount_usd: observed.data["cost"].as_f64(),
                 model: None,
@@ -664,6 +730,16 @@ mod tests {
         relay_url: Option<String>,
     ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordingTaskStore>, Arc<PendingCostRecords>)
     {
+        rig_owned(base, relay_url, weft_core::CredentialOwner::TheirOwn, None)
+    }
+
+    fn rig_owned(
+        base: &'static str,
+        relay_url: Option<String>,
+        origin: weft_core::CredentialOwner,
+        fixed_usd: Option<f64>,
+    ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordingTaskStore>, Arc<PendingCostRecords>)
+    {
         let tasks = Arc::new(RecordingTaskStore::default());
         let pending = PendingCostRecords::new();
         let sink = CostSink {
@@ -675,14 +751,14 @@ mod tests {
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
             service: "testprov".into(),
-            origin: weft_core::CredentialOwner::TheirOwn,
+            origin,
         };
         // The follow-up client of the rig: same signed-in shape the
         // production composition builds (auth-free here; the test meter
         // makes no follow-up call).
         let follow_up = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let middleware = MeteringMiddleware {
-            meter: Some(Box::leak(Box::new(TestMeter { base }))),
+            meter: Some(Box::leak(Box::new(TestMeter { base, fixed_usd }))),
             relay_url,
             follow_up,
             sink: Arc::new(sink),
@@ -761,7 +837,7 @@ mod tests {
         let base: &'static str = Box::leak(base.into_boxed_str());
         // Register the test meter under a unique service name via the
         // production composition (not the hand-built rig).
-        let meter: &'static TestMeter = Box::leak(Box::new(TestMeter { base }));
+        let meter: &'static TestMeter = Box::leak(Box::new(TestMeter { base, fixed_usd: None }));
         // `connection_client` looks meters up in the global registry;
         // inject through the same code path by registering.
         struct Registered;
@@ -835,6 +911,33 @@ mod tests {
         // the server (it answered), and the recorded body proves the
         // prepared rewrite went out on the SAME request.
         assert_eq!(received.lock().unwrap()[0]["usage"]["include"], true);
+    }
+
+    /// A FIXED-price route still resolves THROUGH its meter (whether a
+    /// fixed-priced call was charged is provider knowledge): the record
+    /// carries the declared price and names the fixed resolution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fixed_route_books_its_declared_price_through_resolve() {
+        let (base, chunk_tx, _received) = spawn_sse_server().await;
+        let base: &'static str = Box::leak(base.into_boxed_str());
+        let (client, tasks, pending) =
+            rig_owned(base, None, weft_core::CredentialOwner::TheirOwn, Some(0.001));
+
+        chunk_tx.send(Bytes::from("data: [DONE]\n\n")).unwrap();
+        drop(chunk_tx);
+        let response = client
+            .post(format!("{base}/chat/completions"))
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .expect("send");
+        response.bytes().await.expect("body");
+
+        wait_recorded(&tasks, &pending).await;
+        let payloads = recorded_payloads(&tasks);
+        assert_eq!(payloads.len(), 1, "the fixed call was booked");
+        assert_eq!(payloads[0].amount_usd, Some(0.001));
+        assert_eq!(payloads[0].metadata["resolution"], "fixed route price");
     }
 
     /// A service with NO registered meter records nothing: the client
@@ -987,6 +1090,50 @@ mod tests {
         assert_eq!(payloads[0].metadata["interrupted"], true);
     }
 
+    /// The runtime-credential allowlist: on origin Ours, an UNKNOWN
+    /// route (or a URL off the provider's API) is refused loudly and
+    /// nothing is sent, an explicitly FREE route passes; the same
+    /// unknown route on the user's own key passes through unmeasured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runtime_credential_only_travels_on_declared_routes() {
+        let (base, _chunk_tx, received) = spawn_sse_server().await;
+        let leaked: &'static str = Box::leak(base.clone().into_boxed_str());
+        let (ours, tasks, _pending) =
+            rig_owned(leaked, None, weft_core::CredentialOwner::Ours, None);
+
+        // Unknown route: refused, the server never sees it.
+        let err = ours
+            .post(format!("{base}/mystery"))
+            .body("x")
+            .send()
+            .await
+            .expect_err("an unknown route must refuse on a runtime credential");
+        assert!(err.to_string().contains("not a route"), "{err}");
+        // Off the provider's API entirely: refused too.
+        let err = ours
+            .post("https://elsewhere.invalid/steal")
+            .send()
+            .await
+            .expect_err("an off-API URL must refuse on a runtime credential");
+        assert!(err.to_string().contains("only travels"), "{err}");
+        assert!(received.lock().unwrap().is_empty(), "nothing reached the server");
+        assert!(tasks.enqueued.lock().unwrap().is_empty());
+
+        // An explicitly FREE route passes: the middleware lets it out
+        // (a refusal would surface as the send() erroring, exactly as
+        // above; the test server's answer for the path is irrelevant).
+        ours.get(format!("{base}/models")).send().await.expect("free route passes");
+
+        // The SAME unknown route on the user's own key passes through.
+        let (theirs, _tasks, _pending) = rig(leaked, None);
+        theirs
+            .post(format!("{base}/mystery"))
+            .body("x")
+            .send()
+            .await
+            .expect("an unknown route on the user's own key passes through");
+    }
+
     /// L3, the relay lane: a call on a relayed access is REWRITTEN to the
     /// relay (path + query preserved) and NOT measured here (the relay is
     /// where the runtime measures). A call outside the provider's API
@@ -1023,7 +1170,7 @@ mod tests {
             .send()
             .await
             .expect_err("a non-provider URL cannot be relayed");
-        assert!(err.to_string().contains("cannot relay"), "{err}");
+        assert!(err.to_string().contains("cannot be relayed"), "{err}");
     }
 
     /// L3, the redirect policy: STANDARD library handling, nothing

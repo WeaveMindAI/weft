@@ -1,0 +1,91 @@
+{
+  "type": "ExaAccess",
+  "label": "Exa Access",
+  "description": "Sign in to Exa, the web-search API the Web Search node speaks. Pick an existing connection or paste an API key.",
+  "tags": [
+    "web",
+    "search",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#1B64F2",
+  "service": {
+    "service": "exa",
+    "label": "Exa",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "exa_..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "x-api-key",
+        "value": "{key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.exa.ai/search",
+      "method": "POST",
+      "expect_status": 400
+    },
+    "identity": "exa",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://dashboard.exa.ai/api-keys",
+        "steps": [
+          "Open dashboard.exa.ai and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The Exa access: wire it into Web Search."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "ExaAccess '{id}' has no connected account; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

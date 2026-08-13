@@ -84,6 +84,16 @@ mod node_trait {
         /// setup time too); for a trigger it runs only on a real firing,
         /// with the fire's payload fields on the `ctx.wake` bag.
         async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>;
+
+        /// The node's self-tests (see `crate::node_test`), declared in
+        /// the node folder's `tests.rs` and bridged here:
+        /// `fn tests(&self) -> Vec<NodeTest> { tests::tests() }`.
+        /// Default: none. Discovery walks the registry and asks each
+        /// node, so a test binary or UI lists tests without any
+        /// metadata mirror.
+        fn tests(&self) -> Vec<crate::node_test::NodeTest> {
+            Vec::new()
+        }
     }
 }
 
@@ -389,7 +399,7 @@ impl NodeMetadata {
                         input.name
                     ));
                 }
-                Widget::RemoteSelect { access, sources, depends_on } => {
+                Widget::RemoteSelect { access, sources, depends_on, free_text: _ } => {
                     let names_access_input = self.inputs.iter().any(|i| {
                         i.name == *access && i.input_type == WeftType::Access
                     });
@@ -429,6 +439,21 @@ impl NodeMetadata {
                                         "input '{}': a picker needs its glue `code` (the \
                                          statements that open the chooser and call \
                                          weft.done)",
+                                        input.name
+                                    ));
+                                }
+                            }
+                            ResourceSource::List { requires, lookup } => {
+                                // "public" says the call carries no credential
+                                // at all; "requires" says it needs these
+                                // permissions on the connection. Declaring
+                                // both is self-contradictory and would leave
+                                // the editor's source-selection ambiguous.
+                                if lookup.public && !requires.is_empty() {
+                                    return Err(format!(
+                                        "input '{}': a `public` list source cannot also \
+                                         declare `requires` (a credential-free call has \
+                                         no permissions to hold)",
                                         input.name
                                     ));
                                 }
@@ -1087,6 +1112,13 @@ pub enum Widget {
         /// field when a parent changes.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         depends_on: Vec<String>,
+        /// Whether the user may TYPE a value the sources never listed
+        /// (a model id shipped yesterday, a custom endpoint's name).
+        /// The fetched list is then suggestions, not a closed set.
+        /// Default false: a picked resource is normally an id that
+        /// must exist.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        free_text: bool,
     },
     FormBuilder,
     /// Editor file picker: the user picks a project file (drop/browse) or
@@ -1172,12 +1204,13 @@ fn file_drop_default_type() -> crate::weft_type::WeftType {
 ///   Requires the connection to have recorded them; contributes
 ///   nothing on services whose consent never names resources.
 /// - `list`: call the service and enumerate. Requires the listed
-///   permissions on the connection.
+///   permissions on the connection, unless the lookup is `public`
+///   (a credential-free endpoint), which requires nothing.
 /// - `picker`: open the provider's own chooser, where choosing GRANTS
 ///   the picked resource. Requires a connection, nothing more.
 /// - `from_url`: the user pastes a link; a pattern extracts the id.
-///   Requires nothing at all, so it is the one source left standing
-///   with NO connection (the works-without-signing-in path).
+///   Requires nothing at all. It and a `public` list are the sources
+///   standing with NO connection (the works-without-signing-in path).
 // SYNC: ResourceSource <-> packages/weft-graph/src/protocol.ts ResourceSource
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1263,6 +1296,11 @@ pub struct Lookup {
     /// Cursor pagination, for services whose list is windowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page: Option<PageSpec>,
+    /// The endpoint is public: the call is made with no credential at
+    /// all, so the source works with no connection picked (and never
+    /// signs even when one is).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub public: bool,
 }
 
 /// Cursor pagination on a [`Lookup`]: the request param the cursor is
@@ -1296,6 +1334,19 @@ impl NodeOutput {
     pub fn set(mut self, port: impl Into<String>, value: impl Into<Value>) -> Self {
         self.outputs.insert(port.into(), value.into());
         self
+    }
+
+    /// The standard stored-file output quartet: `file` (the stored-file
+    /// value), `filename`, `mimeType`, `sizeBytes`. Every node whose
+    /// job is "put bytes in storage and hand the file downstream" emits
+    /// this exact port set, so the shape is a constructor rather than
+    /// four `set` calls each download node restates.
+    pub fn stored_file(stored: crate::storage::StoredFile) -> Self {
+        Self::new()
+            .set("file", stored.to_value())
+            .set("filename", stored.filename)
+            .set("mimeType", stored.mime_type)
+            .set("sizeBytes", stored.size_bytes)
     }
 
     /// Fan every top-level key of a JSON object onto a same-named
@@ -1777,6 +1828,7 @@ mod input_semantics_tests {
                 access: "account".into(),
                 sources: vec![ResourceSource::FromUrl { pattern: "(x)".into() }],
                 depends_on: vec![],
+                free_text: false,
             },
             Widget::FormBuilder,
             Widget::FileDrop {
@@ -1871,6 +1923,7 @@ mod input_semantics_tests {
             access: "account".into(),
             sources: vec![],
             depends_on: vec![],
+            free_text: false,
         });
         let e = metadata_with(vec![account.clone(), field.clone()])
             .validate_semantics()
@@ -1881,6 +1934,7 @@ mod input_semantics_tests {
             access: "account".into(),
             sources: vec![ResourceSource::FromUrl { pattern: "([unclosed".into() }],
             depends_on: vec![],
+            free_text: false,
         });
         let e = metadata_with(vec![account.clone(), field.clone()])
             .validate_semantics()
@@ -1893,6 +1947,7 @@ mod input_semantics_tests {
                 pattern: "/spreadsheets/d/([a-zA-Z0-9_-]+)".into(),
             }],
             depends_on: vec![],
+            free_text: false,
         });
         assert!(metadata_with(vec![account, field]).validate_semantics().is_ok());
     }

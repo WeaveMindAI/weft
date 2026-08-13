@@ -119,6 +119,7 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         auth_kind: "none".to_string(),
         auth_config: None,
         kind_state: json!({}),
+        kind_state_seq: 0,
         access_id: None,
         port_snapshot: None,
     }
@@ -369,7 +370,8 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         project_id: missing_project.to_string(),
         entry_node: "entry".into(),
         phase: weft_core::context::Phase::Fire,
-        definition_hash: "def-1".into(),
+        definition_hash: Some("def-1".into()),
+        node_test: false,
         at_unix: now,
     };
     let kick = weft_journal::ExecEvent::NodeKicked {
@@ -426,7 +428,8 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         project_id: registered.to_string(),
         entry_node: "entry".into(),
         phase: weft_core::context::Phase::Fire,
-        definition_hash: "def-1".into(),
+        definition_hash: Some("def-1".into()),
+        node_test: false,
         at_unix: now,
     };
     let task2 = weft_task_store::tasks::NewTask {

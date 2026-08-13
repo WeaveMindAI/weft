@@ -180,6 +180,10 @@ impl WorkerBackend for K8sWorkerBackend {
             .delete_named(&namespace, "pod", &pod_name, DeleteOpts::no_wait())
             .await
     }
+
+    fn pull_secret(&self) -> Option<String> {
+        self.registry.as_ref().and_then(|r| r.pull_secret.clone())
+    }
 }
 
 pub(crate) fn short_project_id(project_id: &str) -> String {

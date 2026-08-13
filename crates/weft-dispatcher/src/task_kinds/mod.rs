@@ -12,7 +12,9 @@ pub mod record_cost;
 pub mod record_log;
 pub mod register_signal;
 pub mod route_entry;
+pub mod run_node_test;
 pub mod spawn_pod;
+pub mod update_kind_state;
 
 // Only the executor unit structs are re-exported because main.rs
 // instantiates them when wiring the registry. Concrete payload /
@@ -23,4 +25,6 @@ pub use record_cost::RecordCostExecutor;
 pub use record_log::RecordLogExecutor;
 pub use register_signal::RegisterSignalExecutor;
 pub use route_entry::RouteEntryExecutor;
+pub use run_node_test::RunNodeTestExecutor;
 pub use spawn_pod::SpawnPodExecutor;
+pub use update_kind_state::UpdateSignalKindStateExecutor;

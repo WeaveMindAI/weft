@@ -162,7 +162,8 @@
                     project_id: project.id.to_string(),
                     entry_node: "producer".into(),
                     phase: weft_core::context::Phase::Fire,
-                    definition_hash: "test-hash".into(),
+                    definition_hash: Some("test-hash".into()),
+                    node_test: false,
                     at_unix: 0,
                 },
                 None,
@@ -323,7 +324,8 @@
         let journal = Arc::new(MemJournal::default());
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: "waiter".into(),
-            phase: weft_core::context::Phase::Fire, definition_hash: "test-hash".into(), at_unix: 0,
+            phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
+            node_test: false, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: "waiter".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -587,7 +589,8 @@
         let journal = Arc::new(MemJournal::default());
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: creator.into(),
-            phase: weft_core::context::Phase::Fire, definition_hash: "test-hash".into(), at_unix: 0,
+            phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
+            node_test: false, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: creator.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1086,7 +1089,8 @@
             let journal = Arc::new(MemJournal::default());
             journal.record_event(&ExecEvent::ExecutionStarted {
                 color, project_id: pid.clone(), entry_node: "payer".into(),
-                phase: weft_core::context::Phase::Fire, definition_hash: "test-hash".into(), at_unix: 0,
+                phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
+            node_test: false, at_unix: 0,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
                 color, node_id: "payer".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1310,6 +1314,9 @@
         async fn heartbeat(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
+        async fn requeue(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
         async fn complete(&self, _t: uuid::Uuid, _p: &str, _r: Value) -> anyhow::Result<()> {
             Ok(())
         }
@@ -1341,7 +1348,8 @@
                     project_id: pid,
                     entry_node: entry,
                     phase: weft_core::context::Phase::Fire,
-                    definition_hash: "test-hash".into(),
+                    definition_hash: Some("test-hash".into()),
+                    node_test: false,
                     at_unix: 0,
                 },
                 None,
@@ -2109,7 +2117,8 @@
                     project_id: project.id.to_string(),
                     entry_node: entry.into(),
                     phase: weft_core::context::Phase::Fire,
-                    definition_hash: "test-hash".into(),
+                    definition_hash: Some("test-hash".into()),
+                    node_test: false,
                     at_unix: 0,
                 },
                 None,
@@ -2456,7 +2465,8 @@
         // Kick both reader nodes.
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: "ra".into(),
-            phase: weft_core::context::Phase::Fire, definition_hash: "h".into(), at_unix: 0,
+            phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
+            node_test: false, at_unix: 0,
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {

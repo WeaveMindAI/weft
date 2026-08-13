@@ -1954,3 +1954,11 @@ again, once per replay. An un-wrapped paid API call or payment inside that
 loop is charged again on every human response. Wrap every side-effecting
 or non-deterministic call in `ctx.run` (the same name each iteration is
 fine, the runtime keys on call order, not name).
+
+## Testing your node
+
+Every node can declare its own tests in a `tests.rs` next to its
+`mod.rs`: pure `basic` tests, `fake` tests running the full body
+against canned provider responses (no credentials, no cost), and
+`live` tests through the real access path. Run them with
+`weft test-node`. Full guide: [node-tests.md](node-tests.md).

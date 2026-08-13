@@ -11,8 +11,16 @@ use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult}
 #[derive(NodeManifest)]
 pub struct GitHubCreateIssueNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for GitHubCreateIssueNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let repo: String = ctx.inputs.get("repo")?;
@@ -20,25 +28,16 @@ impl Node for GitHubCreateIssueNode {
         let body: String = ctx.inputs.get_or("body", String::new())?;
 
         let gh = ctx.client(&access).await?;
-        let resp = gh
-            .post(format!("https://api.github.com/repos/{repo}/issues"))
-            .header("Accept", "application/vnd.github+json")
-            .json(&serde_json::json!({ "title": title, "body": body }))
-            .send()
-            .await
-            .node_err("github: create issue")?;
-        let status = resp.status();
-        let answer: Value = resp.json().await.node_err("github: read create-issue response")?;
-        if !status.is_success() {
-            weft::node_bail!(
-                "github answered {status} creating the issue: {}",
-                answer.get("message").and_then(Value::as_str).unwrap_or("no detail")
-            );
-        }
-        let url = answer
-            .get("html_url")
-            .and_then(Value::as_str)
-            .node_err("github: created issue carries no html_url")?
+        // GitHub's error envelope is a top-level `message`, which
+        // `json_call` quotes; the Accept header pins the API version.
+        let answer = weft::access::client::json_call(
+            gh.post(format!("https://api.github.com/repos/{repo}/issues"))
+                .header("Accept", "application/vnd.github+json")
+                .json(&serde_json::json!({ "title": title, "body": body })),
+            "github: create the issue",
+        )
+        .await?;
+        let url = weft::access::client::required_str(&answer, "create the issue", "html_url")?
             .to_string();
         let number = answer
             .get("number")

@@ -1,0 +1,69 @@
+{
+  "type": "SlackFindUser",
+  "label": "Slack: Find User",
+  "description": "Resolve a person to their Slack identity: by email (bridge a CRM/ticket contact to a Slack user for DMs) or by user id (turn an event's bare U... into a name and profile). Exactly one of the two keys.",
+  "tags": [
+    "slack",
+    "user",
+    "lookup"
+  ],
+  "icon": "UserSearch",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "users:read"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs users:read; email lookup also needs users:read.email."
+    },
+    {
+      "name": "email",
+      "type": "String",
+      "required": false,
+      "label": "Email",
+      "placeholder": "person@company.com"
+    },
+    {
+      "name": "id",
+      "type": "String",
+      "required": false,
+      "label": "User id",
+      "placeholder": "U0123456789"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "id",
+      "type": "String",
+      "required": false,
+      "description": "The user's Slack id (U...)."
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": false,
+      "description": "Display name (falls back to real name)."
+    },
+    {
+      "name": "email",
+      "type": "String",
+      "required": false,
+      "description": "The profile email (empty without users:read.email)."
+    },
+    {
+      "name": "timezone",
+      "type": "String",
+      "required": false,
+      "description": "The user's timezone, e.g. Europe/Paris."
+    },
+    {
+      "name": "user",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The full user object as Slack returns it."
+    }
+  ]
+}

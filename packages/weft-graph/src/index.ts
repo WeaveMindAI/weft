@@ -29,6 +29,11 @@ export { nodeTags, TAGS_CONFIG_KEY } from './webview/lib/node-tags';
 // EditOps (source tokens via `formatConfigValue`), instead of a parallel
 // hand-rolled renderer + token formatter that would drift.
 export { default as FieldStrip } from './webview/lib/components/project/FieldStrip.svelte';
+// The `remote_select` control (pick a resource on a connected service), for a
+// host-drawn panel that renders input-spec-shaped fields outside the canvas:
+// FieldStrip hands `remote_select` to its `renderCustom` snippet, and this is
+// the component that snippet draws (the same one the canvas uses).
+export { default as RemoteSelectField } from './webview/lib/components/project/RemoteSelectField.svelte';
 export { diffConfigOps, diffPortLiteralOps } from './webview/lib/projection/config-diff';
 
 // The one snake_case -> camelCase remap for the dispatcher status payload lives

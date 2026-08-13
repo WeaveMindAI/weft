@@ -11,14 +11,22 @@
 
 use async_trait::async_trait;
 
-use weft::signal::{Predicate, PredicateOp, ProviderEvents};
+use weft::signal::{Predicate, ProviderEvents};
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct SlackReceiveMessageNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for SlackReceiveMessageNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let channel: String = ctx.inputs.get("channel")?;
@@ -28,53 +36,25 @@ impl Node for SlackReceiveMessageNode {
         let include_bots: bool = ctx.inputs.get("includeBots")?;
         let replies: String = ctx.inputs.get("replies")?;
 
-        let eq = |field: &str, value: String| Predicate {
-            field: field.into(),
-            op: PredicateOp::Eq,
-            value: Some(value),
-        };
-        let mut filters = vec![
-            eq("type", "message".into()),
-            eq("channel", channel),
-        ];
+        let mut filters = vec![Predicate::eq("type", "message"), Predicate::eq("channel", channel)];
         if let Some(k) = keyword.filter(|k| !k.trim().is_empty()) {
-            filters.push(Predicate {
-                field: "text".into(),
-                op: PredicateOp::Contains,
-                value: Some(k),
-            });
+            filters.push(Predicate::contains("text", k));
         }
         if let Some(p) = pattern.filter(|p| !p.trim().is_empty()) {
-            filters.push(Predicate {
-                field: "text".into(),
-                op: PredicateOp::Regex,
-                value: Some(p),
-            });
+            filters.push(Predicate::regex("text", p));
         }
         if let Some(u) = from_user.filter(|u| !u.trim().is_empty()) {
-            filters.push(eq("user", u));
+            filters.push(Predicate::eq("user", u));
         }
         if !include_bots {
             // A bot message carries the `bot` field; a human's does not.
-            filters.push(Predicate {
-                field: "bot".into(),
-                op: PredicateOp::NotExists,
-                value: None,
-            });
+            filters.push(Predicate::not_exists("bot"));
         }
         match replies.as_str() {
             // A thread reply carries the `thread` field; a top-level
             // message does not.
-            "top_level" => filters.push(Predicate {
-                field: "thread".into(),
-                op: PredicateOp::NotExists,
-                value: None,
-            }),
-            "thread_replies" => filters.push(Predicate {
-                field: "thread".into(),
-                op: PredicateOp::Exists,
-                value: None,
-            }),
+            "top_level" => filters.push(Predicate::not_exists("thread")),
+            "thread_replies" => filters.push(Predicate::exists("thread")),
             _ => {}
         }
 
@@ -85,7 +65,6 @@ impl Node for SlackReceiveMessageNode {
         // The wake payload is the service's named event; fan the
         // declared output ports. Missing fields stay un-mentioned and
         // close at termination.
-        let data = serde_json::Value::Object(ctx.wake.object()?.clone());
-        ctx.pulse_downstream(ctx.fan_declared(&data)).await
+        ctx.pulse_downstream(ctx.fan_declared(&ctx.wake.record()?)).await
     }
 }

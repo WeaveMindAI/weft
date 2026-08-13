@@ -6,3 +6,5 @@ async-trait = "0.1"
 serde_json = "1"
 csv = "1"
 urlencoding = "2"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }

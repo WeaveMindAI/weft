@@ -32,8 +32,10 @@ pub struct InfraEventRow {
     pub at_unix: i64,
 }
 
-pub async fn migrate(pool: &PgPool) -> Result<()> {
-    let stmts = [
+pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    name: "infra_event",
+    tables: &["infra_event"],
+    ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_event (
             id          BIGSERIAL PRIMARY KEY,
             tenant_id   TEXT NOT NULL,
@@ -45,12 +47,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_chrono ON infra_event(id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_project ON infra_event(project_id)"#,
-    ];
-    for sql in stmts {
-        sqlx::query(sql).execute(pool).await?;
-    }
-    Ok(())
-}
+    ],
+};
 
 pub async fn insert(
     pool: &PgPool,

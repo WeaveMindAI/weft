@@ -1,0 +1,55 @@
+{
+  "type": "GoogleDriveCopy",
+  "label": "Google Drive: Copy",
+  "description": "Copy a file, optionally into a folder and under a new name. The template pattern: keep a template, copy it per run, fill the copy.",
+  "tags": [
+    "google",
+    "drive",
+    "file"
+  ],
+  "icon": "Copy",
+  "color": "#1FA463",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/drive.file"
+      ],
+      "description": "A Google account that can read the file."
+    },
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": true,
+      "label": "File id"
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": false,
+      "label": "Name"
+    },
+    {
+      "name": "folder",
+      "type": "String",
+      "required": false,
+      "label": "Folder id",
+      "description": "The destination Drive folder's id (from its URL). Empty = My Drive root."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "fileId",
+      "type": "String",
+      "required": false,
+      "description": "The copy's id."
+    },
+    {
+      "name": "link",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

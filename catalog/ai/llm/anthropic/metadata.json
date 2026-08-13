@@ -70,7 +70,18 @@
       "required": true,
       "exposure": "config",
       "widget": {
-        "kind": "text"
+        "kind": "remote_select",
+        "access": "connection",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.anthropic.com/v1/models?limit=100",
+            "items": "data",
+            "label": "id",
+            "value": "id"
+          }
+        ]
       },
       "label": "Model",
       "placeholder": "claude-sonnet-5"

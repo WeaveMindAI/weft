@@ -1,0 +1,62 @@
+{
+  "type": "SlackReact",
+  "label": "Slack: React",
+  "description": "Add (or remove) an emoji reaction on a message, addressed by channel + ts. The usual acknowledgement pattern: react to the message a workflow just handled.",
+  "tags": [
+    "slack",
+    "reaction"
+  ],
+  "icon": "SmilePlus",
+  "color": "#4A154B",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "reactions:write"
+      ],
+      "description": "The Slack access (wire a SlackAccess node). Needs the reactions:write scope."
+    },
+    {
+      "name": "channel",
+      "type": "String",
+      "required": true,
+      "label": "Channel",
+      "placeholder": "The channel id the message lives in"
+    },
+    {
+      "name": "ts",
+      "type": "String",
+      "required": true,
+      "label": "Message ts",
+      "placeholder": "The message's timestamp id"
+    },
+    {
+      "name": "emoji",
+      "type": "String",
+      "required": true,
+      "label": "Emoji",
+      "placeholder": "thumbsup (with or without colons)"
+    },
+    {
+      "name": "remove",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Remove instead of add",
+      "description": "Take the reaction off instead of adding it."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false,
+      "description": "True once the reaction change landed."
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+# The two ai/llm RUNTIME mechanisms no node test can reach, in one
+# graph against the real service: a streamed call (deltas ride the
+# `stream` bus and are journaled) and a full tool round trip closed
+# entirely in the graph (forced tool call -> ExecPython extracts the
+# call id -> Chat Message feeds the result back as a role-tool message
+# -> a prompt-less re-entry answers from it). Per-provider wire
+# correctness lives in the ai/llm node tests, not here.
+#
+# The TEST stamps the provider node's connection (own-key door, from
+# OPENROUTER_API_KEY). Each question demands one exact word so the
+# answers are assertable; the cheapest model keeps the run nearly free.
+
+prov = OpenRouterProvider {
+  model: "openai/gpt-4.1-nano"
+}
+
+params = LlmParams {
+  systemPrompt: "You answer with exactly one word, lowercase, no punctuation.",
+  temperature: 0.0,
+  maxTokens: 64
+}
+
+# The streamed call: the deltas ride the `stream` bus (the test reasserts
+# them from the journal and checks their concatenation IS the response).
+live = LlmStream {
+  prompt: "Count from 1 to 5 as plain digits separated by single spaces."
+}
+live.provider = prov.provider
+live.params = params.params
+out_stream = Debug
+out_stream.data = live.response
+
+# The tool round trip. The first call is FORCED to call the tool; the
+# model's call comes out on toolCalls, ExecPython plays the tool (it
+# answers "Biscuit" and hands back the call id), Chat Message appends
+# the role-tool result to the history, and the second call re-enters
+# with the history alone (no prompt) to answer from the result.
+dog = LlmTool {
+  name: "dog_name",
+  description: "Returns the name of the user's dog."
+}
+
+t1 = LlmInference -> (response: String) {
+  prompt: "What is my dog's name? Use the dog_name tool to find out.",
+  toolChoice: "required"
+}
+t1.provider = prov.provider
+t1.params = params.params
+t1.tools = dog.tool
+
+ext = ExecPython(calls: List[ToolCall]) -> (call_id: String) {
+  code: "return {'call_id': calls[0]['id']}"
+}
+ext.calls = t1.toolCalls
+
+answer = ChatHistoryAppend {
+  role: "tool"
+}
+answer.history = t1.history
+answer.toolCallId = ext.call_id
+answer.text = "Biscuit"
+
+t2 = LlmInference -> (response: String) {
+  toolChoice: "none"
+}
+t2.history = answer.history
+t2.provider = prov.provider
+t2.params = params.params
+t2.tools = dog.tool
+out_tool = Debug
+out_tool.data = t2.response

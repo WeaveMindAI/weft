@@ -610,6 +610,7 @@ export interface FieldDefinition {
 	access?: string; // For remote_select fields: the Access input authenticating sources needing one
 	sources?: import('../../../protocol').ResourceSource[]; // For remote_select fields: the fill sources, in preference order
 	dependsOn?: string[]; // For remote_select fields: parent inputs for drill-down
+	freeText?: boolean; // For remote_select fields: a typed value outside the fetched list is legal
 }
 
 // =============================================================================

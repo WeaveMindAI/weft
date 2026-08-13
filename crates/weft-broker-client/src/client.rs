@@ -297,6 +297,15 @@ impl TaskStoreClient for BrokerTaskStoreClient {
         Ok(resp.renewed)
     }
 
+    async fn requeue(&self, task_id: Uuid, pod_id: &str) -> Result<bool> {
+        let req = TaskRequeueRequest {
+            task_id,
+            pod_id: pod_id.to_string(),
+        };
+        let resp: TaskRequeueResponse = self.http.post("/v1/task/requeue", &req).await?;
+        Ok(resp.requeued)
+    }
+
     async fn complete(&self, task_id: Uuid, pod_id: &str, result: Value) -> Result<()> {
         let req = TaskCompleteRequest {
             task_id,

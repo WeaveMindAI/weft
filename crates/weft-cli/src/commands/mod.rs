@@ -25,6 +25,7 @@ pub mod describe_nodes;
 pub mod parse;
 pub mod executions;
 pub mod status;
+pub mod test_node;
 pub mod token;
 pub mod listener;
 pub mod files;

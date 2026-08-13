@@ -266,16 +266,16 @@ fn spawn_dispatcher_task<Ctx>(
         };
         let task_id = task.id;
         let kind = task.kind.clone();
-        let lease_lost = CancellationToken::new();
+        let lease = LeaseSignal::new();
         let heartbeat = spawn_claim_heartbeat(
             store.clone(),
             task_id,
             pod_id.clone(),
-            lease_lost.clone(),
+            lease.clone(),
         );
         let outcome = run_with_lease_guard(
             executor.execute(&ctx, &task),
-            lease_lost.clone(),
+            lease,
             task_id,
             &kind,
         )
@@ -285,52 +285,149 @@ fn spawn_dispatcher_task<Ctx>(
     });
 }
 
-/// Run an executor future. If the heartbeat task signals lease loss
-/// before the executor finishes, abandon the executor and synthesize
-/// a fail outcome. The sibling pod that re-claims will redo the work
-/// idempotently (every dispatcher task kind is idempotent on retry,
-/// e.g. RegisterSignal / RouteEntry / FireSignal).
+/// Why the heartbeat task told the executor to stop. Typed so the
+/// finalizer acts on the CAUSE, not on a synthesized error string:
+/// the two cases need opposite reactions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseLoss {
+    /// The heartbeat came back "row no longer claimed by us": a
+    /// sibling pod already re-claimed it (our lease lapsed and was
+    /// taken). The thief owns the task now; we touch nothing.
+    Stolen,
+    /// The heartbeat could not REACH the store past the lease window.
+    /// The work did not fail, WE lost the ability to prove liveness,
+    /// so the task is surrendered: requeued to `pending` for any pod
+    /// (including us) to claim again.
+    Unrenewable,
+}
+
+/// Cancellation token + the reason it fired. The heartbeat task sets
+/// the reason before cancelling, so the guard always reads a cause.
+#[derive(Clone)]
+struct LeaseSignal {
+    reason: Arc<std::sync::OnceLock<LeaseLoss>>,
+    token: CancellationToken,
+}
+
+impl LeaseSignal {
+    fn new() -> Self {
+        Self {
+            reason: Arc::new(std::sync::OnceLock::new()),
+            token: CancellationToken::new(),
+        }
+    }
+
+    fn lost(&self, why: LeaseLoss) {
+        let _ = self.reason.set(why);
+        self.token.cancel();
+    }
+
+    async fn cancelled(&self) {
+        self.token.cancelled().await
+    }
+
+    fn reason(&self) -> LeaseLoss {
+        *self
+            .reason
+            .get()
+            .expect("lease token cancelled without a recorded reason")
+    }
+}
+
+/// The guard's verdict on one executor run.
+enum ExecOutcome {
+    /// The executor future ran to completion: a value, an error, or a
+    /// panic caught by `catch_unwind`.
+    Finished(std::thread::Result<Result<Value>>),
+    /// The heartbeat signalled lease loss first; the executor future
+    /// was dropped mid-flight.
+    LeaseLost(LeaseLoss),
+}
+
+/// Run an executor future under the lease guard. If the heartbeat
+/// task signals lease loss before the executor finishes, the future
+/// is dropped and the typed cause is handed to `finalize_task`, which
+/// requeues (surrender) or stands down (stolen). A later claim of the
+/// row redoes the work; every task kind is re-runnable by contract
+/// (see the idempotency note in `tasks`).
 async fn run_with_lease_guard<F>(
     fut: F,
-    lease_lost: CancellationToken,
+    lease: LeaseSignal,
     task_id: uuid::Uuid,
     kind: &str,
-) -> std::thread::Result<Result<Value>>
+) -> ExecOutcome
 where
     F: std::future::Future<Output = Result<Value>>,
 {
     tokio::select! {
-        out = AssertUnwindSafe(fut).catch_unwind() => out,
-        _ = lease_lost.cancelled() => {
+        out = AssertUnwindSafe(fut).catch_unwind() => ExecOutcome::Finished(out),
+        _ = lease.cancelled() => {
+            let why = lease.reason();
             tracing::warn!(
                 target: "weft_task_store::executor",
-                id = %task_id, kind = %kind,
-                "lease lost mid-execution; surrendering task"
+                id = %task_id, kind = %kind, cause = ?why,
+                "lease lost mid-execution; abandoning the executor future"
             );
-            Ok(Err(anyhow::anyhow!("lease lost; sibling pod will retry")))
+            ExecOutcome::LeaseLost(why)
         }
     }
 }
 
-/// Persist a `(complete | fail)` decision for one task. Used by both
-/// pickers. The `outcome` packs three layers:
+/// Persist the verdict for one task. Used by both pickers.
 ///
-///   - `Ok(Ok(value))`: executor returned a value. → `tasks::complete`.
-///   - `Ok(Err(e))`: executor returned an error. → `tasks::fail` with
-///     the error message.
-///   - `Err(panic)`: catch_unwind tripped. → `tasks::fail` with a
-///     "panic: ..." prefix so the dashboard can flag it visibly.
-///
-/// Without this layering, a panicking executor would ride the
-/// JoinSet's JoinError up and get discarded by `try_join_next`, and
-/// the row would sit `claimed` until the lease expired.
+///   - `Finished(Ok(Ok(value)))`: → `tasks::complete`.
+///   - `Finished(Ok(Err(e)))`: → `tasks::fail` with the error message.
+///   - `Finished(Err(panic))`: → `tasks::fail` with a "panic: ..."
+///     prefix so the dashboard can flag it visibly. Without this
+///     layering, a panicking executor would ride the JoinSet's
+///     JoinError up and get discarded by `try_join_next`, and the row
+///     would sit `claimed` until the lease expired.
+///   - `LeaseLost(Unrenewable)`: → `tasks::requeue` (guarded on our
+///     claim), putting the row back to `pending` for the next claim.
+///     A transient store outage must never terminalize work that did
+///     not fail.
+///   - `LeaseLost(Stolen)`: → nothing. The re-claimer owns the row;
+///     any write from us would race its run.
 async fn finalize_task(
     store: &dyn TaskStoreClient,
     task_id: uuid::Uuid,
     pod_id: &str,
     kind: &str,
-    outcome: std::thread::Result<Result<Value>>,
+    outcome: ExecOutcome,
 ) {
+    let outcome = match outcome {
+        ExecOutcome::Finished(finished) => finished,
+        ExecOutcome::LeaseLost(LeaseLoss::Stolen) => {
+            tracing::warn!(
+                target: "weft_task_store::executor",
+                id = %task_id, kind = %kind,
+                "lease stolen by a sibling pod; it owns the task, standing down"
+            );
+            return;
+        }
+        ExecOutcome::LeaseLost(LeaseLoss::Unrenewable) => {
+            match store.requeue(task_id, pod_id).await {
+                Ok(true) => tracing::warn!(
+                    target: "weft_task_store::executor",
+                    id = %task_id, kind = %kind,
+                    "surrendered task requeued; the next claim re-runs it"
+                ),
+                Ok(false) => tracing::warn!(
+                    target: "weft_task_store::executor",
+                    id = %task_id, kind = %kind,
+                    "surrender found the row no longer ours (already re-claimed); \
+                     the claimer owns it"
+                ),
+                Err(e) => tracing::error!(
+                    target: "weft_task_store::executor",
+                    id = %task_id, kind = %kind, error = %e,
+                    "surrender requeue failed; the row sits claimed until its lease \
+                     expires, then claim_one rescues it"
+                ),
+            }
+            return;
+        }
+    };
     match outcome {
         Ok(Ok(result)) => {
             if let Err(e) = store.complete(task_id, pod_id, result).await {
@@ -505,12 +602,6 @@ where
     let task_id = task.id;
     let kind = task.kind.clone();
 
-    // The worker's WorkerTaskKind returns Result<()>; adapt to the
-    // Result<Value> shape that finalize_task expects so both pickers
-    // share the same complete/fail/panic logic.
-    let kind_for_value = kind.clone();
-    let to_value = move |r: Result<()>| r.map(|()| serde_json::json!({"kind": kind_for_value}));
-
     if handler.spawn_in_background() {
         let store_inner = store.clone();
         let pod_inner = pod_name.to_string();
@@ -518,89 +609,70 @@ where
         let handler_inner = handler.clone();
         let kind_inner = kind.clone();
         tokio::spawn(async move {
-            let lease_lost = CancellationToken::new();
+            let lease = LeaseSignal::new();
             let heartbeat = spawn_claim_heartbeat(
                 store_inner.clone(),
                 task_id,
                 pod_inner.clone(),
-                lease_lost.clone(),
+                lease.clone(),
             );
-            let outcome = run_worker_with_lease_guard(
-                handler_inner.handle(&ctx_inner, &task),
-                lease_lost.clone(),
-                task_id,
-                &kind_inner,
-                to_value.clone(),
-            )
-            .await;
+            // The worker's WorkerTaskKind returns Result<()>; map to
+            // the Result<Value> shape the shared guard + finalizer
+            // expect so both pickers share one lease/complete/fail/
+            // requeue path.
+            let kind_value = kind_inner.clone();
+            let fut = async {
+                handler_inner
+                    .handle(&ctx_inner, &task)
+                    .await
+                    .map(|()| serde_json::json!({"kind": kind_value}))
+            };
+            let outcome = run_with_lease_guard(fut, lease, task_id, &kind_inner).await;
             heartbeat.abort();
             finalize_task(store_inner.as_ref(), task_id, &pod_inner, &kind_inner, outcome).await;
         });
         return Ok(true);
     }
 
-    let lease_lost = CancellationToken::new();
+    let lease = LeaseSignal::new();
     let heartbeat = spawn_claim_heartbeat(
         store.clone(),
         task_id,
         pod_name.to_string(),
-        lease_lost.clone(),
+        lease.clone(),
     );
-    let outcome = run_worker_with_lease_guard(
-        handler.handle(ctx, &task),
-        lease_lost.clone(),
-        task_id,
-        &kind,
-        to_value.clone(),
-    )
-    .await;
+    let kind_value = kind.clone();
+    let fut = async {
+        handler
+            .handle(ctx, &task)
+            .await
+            .map(|()| serde_json::json!({"kind": kind_value}))
+    };
+    let outcome = run_with_lease_guard(fut, lease, task_id, &kind).await;
     heartbeat.abort();
     finalize_task(store.as_ref(), task_id, pod_name, &kind, outcome).await;
     Ok(true)
 }
 
-async fn run_worker_with_lease_guard<F, M>(
-    fut: F,
-    lease_lost: CancellationToken,
-    task_id: uuid::Uuid,
-    kind: &str,
-    to_value: M,
-) -> std::thread::Result<Result<Value>>
-where
-    F: std::future::Future<Output = Result<()>>,
-    M: Fn(Result<()>) -> Result<Value>,
-{
-    tokio::select! {
-        out = AssertUnwindSafe(fut).catch_unwind() => out.map(&to_value),
-        _ = lease_lost.cancelled() => {
-            tracing::warn!(
-                target: "weft_task_store::executor",
-                id = %task_id, kind = %kind,
-                "lease lost mid-execution; surrendering task"
-            );
-            Ok(to_value(Err(anyhow::anyhow!("lease lost; sibling pod will retry"))))
-        }
-    }
-}
-
 /// Renew the claim every `CLAIM_HEARTBEAT_INTERVAL_SECS` until the
 /// owning future finishes (which aborts this handle).
 ///
-/// Three exit conditions trip `lease_lost`:
+/// Two exit conditions fire the lease signal, each with its cause:
 ///   - heartbeat returns `Ok(false)`: the row is no longer claimed by
-///     us (sibling pod beat the lease): surrender now.
+///     us (sibling pod took the lease): `LeaseLoss::Stolen`, the
+///     finalizer stands down.
 ///   - heartbeat errors past `CLAIM_DURATION_SECS / interval` ticks:
 ///     the lease has lapsed at this point regardless of what the DB
 ///     says; a sibling pod can re-claim, so we must stop or risk
-///     parallel execution of the same row.
-///   - the future never trips its own end (executor stalled): the
-///     heartbeat keeps renewing, the executor keeps running, no
-///     leak.
+///     parallel execution of the same row. `LeaseLoss::Unrenewable`,
+///     the finalizer requeues the row.
+/// A stalled executor is NOT an exit: the heartbeat keeps renewing,
+/// the executor keeps running, no leak.
 fn spawn_claim_heartbeat(
     store: Arc<dyn TaskStoreClient>,
     task_id: uuid::Uuid,
     pod_id: String,
-    lease_lost: CancellationToken,
+    lease: LeaseSignal,
 ) -> tokio::task::JoinHandle<()> {
     let max_consecutive_errors =
         (CLAIM_DURATION_SECS as u64 / CLAIM_HEARTBEAT_INTERVAL_SECS) as u32 + 1;
@@ -618,7 +690,7 @@ fn spawn_claim_heartbeat(
                         id = %task_id,
                         "heartbeat: lease no longer ours; signalling executor"
                     );
-                    lease_lost.cancel();
+                    lease.lost(LeaseLoss::Stolen);
                     break;
                 }
                 Err(e) => {
@@ -629,7 +701,7 @@ fn spawn_claim_heartbeat(
                             id = %task_id, error = %e, consecutive_errors,
                             "heartbeat unreachable past lease window; signalling executor"
                         );
-                        lease_lost.cancel();
+                        lease.lost(LeaseLoss::Unrenewable);
                         break;
                     }
                     tracing::warn!(
@@ -672,6 +744,9 @@ mod idle_exit_tests {
         }
         async fn heartbeat(&self, _id: Uuid, _pod: &str) -> Result<bool> {
             Ok(true)
+        }
+        async fn requeue(&self, _id: Uuid, _pod: &str) -> Result<bool> {
+            unreachable!("idle picker never surrenders (heartbeat always renews)")
         }
         async fn complete(&self, _id: Uuid, _pod: &str, _r: Value) -> Result<()> {
             Ok(())

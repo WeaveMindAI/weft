@@ -4,22 +4,26 @@
 
 use async_trait::async_trait;
 
-use weft::signal::{Form, FormSchema};
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::form_helpers::{build_form_fields, map_response_to_ports, parse_form_fields};
+use super::form_helpers::{build_form, map_response_to_ports, parse_form_fields};
 
 #[derive(NodeManifest)]
 pub struct HumanQueryNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for HumanQueryNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let raw_fields = parse_form_fields(ctx.inputs.object()?);
         let specs = &self.manifest().form_field_specs;
-
-        let title: String = ctx.inputs.get_or("title", String::new())?;
-        let description: Option<String> = ctx.inputs.opt("description")?;
 
         // Project the node's DATA inputs into a flat {key: value} map so
         // display / prefilled / source=input fields can lift them out by
@@ -30,25 +34,10 @@ impl Node for HumanQueryNode {
         for (k, v) in ctx.inputs.custom() {
             input_obj.insert(k.clone(), v.clone());
         }
-        let input_value = serde_json::Value::Object(input_obj);
+        let prefill = serde_json::Value::Object(input_obj);
 
-        let fields = build_form_fields(&raw_fields, specs, &input_value);
-
-        let schema = FormSchema {
-            title: title.clone(),
-            description: description.clone(),
-            fields,
-        };
-
-        let submission = ctx
-            .await_signal(Form {
-                form_type: "human-query".to_string(),
-                schema,
-                title: if title.is_empty() { None } else { Some(title) },
-                description,
-                consumer_kind: Some("human_in_the_loop".into()),
-            })
-            .await?;
+        let form = build_form(&ctx.inputs, specs, "human-query", &prefill)?;
+        let submission = ctx.await_signal(form).await?;
         ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)).await
     }
 }

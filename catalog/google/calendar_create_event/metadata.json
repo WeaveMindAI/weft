@@ -1,0 +1,77 @@
+{
+  "type": "GoogleCalendarCreateEvent",
+  "label": "Google Calendar: Create Event",
+  "description": "Put an event on a calendar: timed (RFC 3339 datetimes like 2026-08-06T15:00:00+02:00) or all-day (plain YYYY-MM-DD dates), with optional description, location, and attendees.",
+  "tags": [
+    "google",
+    "calendar"
+  ],
+  "icon": "CalendarPlus",
+  "color": "#4285F4",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "https://www.googleapis.com/auth/calendar.events"
+      ],
+      "description": "A Google account with the calendar permission."
+    },
+    {
+      "name": "calendar",
+      "type": "String",
+      "default": "primary",
+      "label": "Calendar",
+      "description": "The calendar id. 'primary' is the account's main calendar."
+    },
+    {
+      "name": "summary",
+      "type": "String",
+      "required": true,
+      "label": "Title"
+    },
+    {
+      "name": "start",
+      "type": "String",
+      "required": true,
+      "label": "Start"
+    },
+    {
+      "name": "end",
+      "type": "String",
+      "required": true,
+      "label": "End"
+    },
+    {
+      "name": "description",
+      "type": "String",
+      "required": false,
+      "label": "Description"
+    },
+    {
+      "name": "location",
+      "type": "String",
+      "required": false,
+      "label": "Location"
+    },
+    {
+      "name": "attendees",
+      "type": "List[String]",
+      "required": false,
+      "description": "Attendee email addresses; they receive invitations."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "eventId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "link",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

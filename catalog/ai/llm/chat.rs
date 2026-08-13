@@ -41,17 +41,6 @@ pub fn media_part(media: &Value) -> WeftResult<Value> {
     })
 }
 
-/// An input's one-or-many forms, normalized: absent/null is none, a
-/// list is itself, a single value is a one-item list (the `media` and
-/// `tools` inputs both take either).
-pub fn one_or_many(value: Option<Value>) -> Vec<Value> {
-    match value {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(items)) => items,
-        Some(single) => vec![single],
-    }
-}
-
 /// The stored-form message for one turn: plain text content, or parts
 /// (text first, then each stored media). A tool-result message (`role:
 /// tool`) carries the id of the call it answers.

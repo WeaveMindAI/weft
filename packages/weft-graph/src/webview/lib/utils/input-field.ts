@@ -45,6 +45,7 @@ export function fieldForInput(input: PortDefinition): FieldDefinition {
 			field.access = w.access;
 			field.sources = w.sources;
 			if (w.depends_on) field.dependsOn = w.depends_on;
+			if (w.free_text) field.freeText = true;
 			break;
 		case 'file_drop':
 			if (w.accept) field.accept = w.accept;

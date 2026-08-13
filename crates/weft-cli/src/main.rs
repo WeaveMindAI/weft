@@ -9,6 +9,7 @@ mod commands;
 pub mod images;
 pub mod progress;
 pub mod prompt;
+pub mod user_config;
 
 #[derive(Debug, Parser)]
 #[command(name = "weft", version, about = "Weft CLI")]
@@ -43,6 +44,53 @@ enum Cmd {
     BuildBase {
         #[arg(long)]
         quiet: bool,
+    },
+    /// Run node self-tests. Without a target: every package. Without
+    /// --tier: the basic + fake tiers (compiled + run locally, no
+    /// cluster needed). With a package name or node type: just that
+    /// scope. `--tier live` adds the live tier: real credentials
+    /// through the production access path, as a test pod in the
+    /// cluster; it can spend money, so it confirms first (persist
+    /// "don't ask again" when prompted, or pass --yes).
+    #[command(name = "test-node")]
+    TestNode {
+        /// A package name or a node type; absent = every package.
+        target: Option<String>,
+        /// Run only the test with this name.
+        #[arg(long)]
+        test: Option<String>,
+        /// Tiers to run (repeatable). Default: basic and fake.
+        #[arg(long = "tier", value_enum)]
+        tiers: Vec<commands::test_node::TierArg>,
+        /// Live: paste a throwaway key for this service (repeatable);
+        /// each field is read from `WEFT_NODE_TEST_<SERVICE>_<FIELD>`
+        /// when set, else prompted on stdin, never an argument. The
+        /// grant is deleted afterwards.
+        #[arg(long, value_name = "service")]
+        key: Vec<String>,
+        /// Live: use this exact connection (grant) id, as
+        /// `<service>=<grant id>` (repeatable; a bare id works when
+        /// the selected tests need exactly one service).
+        #[arg(long, value_name = "service=grant-id")]
+        connection: Vec<String>,
+        /// Skip the live-run confirmation for this invocation.
+        #[arg(long)]
+        yes: bool,
+        /// Run tests concurrently: bare `--parallel` runs everything at
+        /// once, `--parallel N` caps in-flight tests at N. Applies to
+        /// the local tiers and to live pod runs alike.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "N")]
+        parallel: Option<usize>,
+    },
+    /// Print the content hash naming a package's node-test build (the
+    /// hash its live test image is tagged with). A scripted runner
+    /// records it after a fully green live run to skip unchanged
+    /// packages. With no target, prints `<package> <hash>` for every
+    /// test-declaring package.
+    #[command(name = "node-test-hash")]
+    NodeTestHash {
+        /// A package name or a node type; absent = every package.
+        target: Option<String>,
     },
     /// Run the current project via the dispatcher. Streams logs until
     /// completion or suspension unless `--detach` is set.
@@ -615,6 +663,22 @@ async fn main() -> anyhow::Result<()> {
         Cmd::New { name } => commands::new::run(ctx, name).await,
         Cmd::Build => commands::build::run(ctx).await,
         Cmd::BuildBase { quiet } => commands::build::run_build_base(quiet).await,
+        Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
+            commands::test_node::run(
+                ctx,
+                commands::test_node::TestNodeArgs {
+                    target,
+                    test,
+                    tiers,
+                    key,
+                    connection,
+                    yes,
+                    parallel,
+                },
+            )
+            .await
+        }
+        Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
         Cmd::Run { detach } => commands::run::run(ctx, detach).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,

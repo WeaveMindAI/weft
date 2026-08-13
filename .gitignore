@@ -51,3 +51,4 @@ dashboard-v1/static/projects
 .claude/MEMORY.md
 CODE_QUALITY_TRIAGE.md
 packages/weft-graph/node_modules
+.weft-base-context.lock

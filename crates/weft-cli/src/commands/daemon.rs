@@ -218,7 +218,10 @@ fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 ///   address (the public tunnel mints it), never a replacement: the
 ///   base URL keeps every local surface stable, and only the surfaces
 ///   the open internet must reach prefer this one.
-async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str, String)>> {
+async fn manifest_template_vars(
+    cfg: &ClusterConfig,
+    internet_url: Option<&str>,
+) -> Result<Vec<(&'static str, String)>> {
     check_cidr(&cfg.service_cidr, true)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
     check_cidr(&cfg.pod_cidr, false)
@@ -226,13 +229,73 @@ async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str
     let apiserver_ip = apiserver_clusterip(&cfg.service_cidr)
         .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_SERVICE_CIDR='{}': {e}", cfg.service_cidr))?;
 
+    // Object-store slot: the broker's runtime-file plane (`ctx.storage`) writes
+    // bytes to this bucket, and workers read/write it DIRECTLY via presigned URLs.
+    // The store is ALWAYS external to the cluster, reached over S3 (endpoint from
+    // env), so both endpoints below reach OUT of the cluster. An operator can
+    // override any of these via env for their own S3.
+    //
+    // INTERNAL endpoint (the broker's I/O + the host pods reach): the object store
+    // container runs on the HOST, and in-cluster pods reach the host via the kind
+    // network's gateway IP. This is the host string presigned Internal URLs are
+    // signed for, and the host pods then connect to (the two must match for SigV4).
+    let object_store_endpoint = match std::env::var("WEFT_OBJECT_STORE_ENDPOINT") {
+        Ok(v) => v,
+        Err(_) => format!("http://{}:{}", kind_network_gateway_ipv4().await?, cfg.seaweed_port),
+    };
+
     // The broker's egress denies every private range so an access
     // outbound call reaches external services only. An object store
-    // that sits on a private range opens exactly that range here; the
-    // default is a benign public /32 that re-permits nothing (a store
-    // reached over a public S3 endpoint stays at the default).
-    let store_allow_cidr =
-        std::env::var("WEFT_STORE_ALLOW_CIDR").unwrap_or_else(|_| "192.0.2.0/32".into());
+    // that sits on a private address needs exactly that address
+    // re-permitted, and the endpoint above already names it: derive
+    // the /32 from it, so the opening can never drift from the store
+    // the broker actually dials. A store reached over a public
+    // endpoint (or a hostname) derives a benign public /32 that
+    // re-permits nothing (a hostname that resolves privately gets an
+    // informational pointer at the override). An IPv6 host cannot be
+    // expressed as a derived IPv4 /32 at all, so it fails loud naming
+    // WEFT_STORE_ALLOW_CIDR, which overrides every derivation.
+    let store_allow_cidr = match std::env::var("WEFT_STORE_ALLOW_CIDR") {
+        Ok(v) => v,
+        Err(_) => match endpoint_host(&object_store_endpoint) {
+            EndpointHost::PrivateIpv4(ip) => format!("{ip}/32"),
+            EndpointHost::PublicIpv4 => "192.0.2.0/32".into(),
+            EndpointHost::Hostname(host) => {
+                // The lookup only feeds an advisory note; a stalled
+                // resolver must never stall daemon start, so it gets
+                // a short deadline and a miss just skips the note.
+                if let Ok(Ok(addrs)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    tokio::net::lookup_host((host.as_str(), 0)),
+                )
+                .await
+                {
+                    let private: Vec<String> = addrs
+                        .filter_map(|a| match a.ip() {
+                            std::net::IpAddr::V4(ip) if is_private_ipv4(ip) => {
+                                Some(ip.to_string())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !private.is_empty() {
+                        println!(
+                            "note: the object store host '{host}' resolves to private \
+                             address(es) {}; the broker's egress will NOT reach them \
+                             unless you set WEFT_STORE_ALLOW_CIDR to the store's range",
+                            private.join(", ")
+                        );
+                    }
+                }
+                "192.0.2.0/32".into()
+            }
+            EndpointHost::Ipv6(host) => anyhow::bail!(
+                "the object store endpoint host '{host}' is an IPv6 address, which the \
+                 derived egress opening cannot express; set WEFT_STORE_ALLOW_CIDR to \
+                 the store's IPv6 range instead"
+            ),
+        },
+    };
     check_cidr(&store_allow_cidr, false)
         .map_err(|e| anyhow::anyhow!("WEFT_STORE_ALLOW_CIDR='{store_allow_cidr}': {e}"))?;
 
@@ -308,20 +371,6 @@ async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str
         }
     };
 
-    // Object-store slot: the broker's runtime-file plane (`ctx.storage`) writes
-    // bytes to this bucket, and workers read/write it DIRECTLY via presigned URLs.
-    // The store is ALWAYS external to the cluster, reached over S3 (endpoint from
-    // env), so both endpoints below reach OUT of the cluster. An operator can
-    // override any of these via env for their own S3.
-    //
-    // INTERNAL endpoint (the broker's I/O + the host pods reach): the object store
-    // container runs on the HOST, and in-cluster pods reach the host via the kind
-    // network's gateway IP. This is the host string presigned Internal URLs are
-    // signed for, and the host pods then connect to (the two must match for SigV4).
-    let object_store_endpoint = match std::env::var("WEFT_OBJECT_STORE_ENDPOINT") {
-        Ok(v) => v,
-        Err(_) => format!("http://{}:{}", kind_network_gateway_ipv4().await?, cfg.seaweed_port),
-    };
     let object_store_bucket =
         std::env::var("WEFT_OBJECT_STORE_BUCKET").unwrap_or_else(|_| "weft".to_string());
     let object_store_region =
@@ -343,12 +392,18 @@ async fn manifest_template_vars(cfg: &ClusterConfig) -> Result<Vec<(&'static str
         ("WEFT_LISTENER_ALLOW_CIDR", listener_allow_cidr),
         ("WEFT_APISERVER_CLUSTERIP", apiserver_ip),
         ("WEFT_DISPATCHER_PUBLIC_BASE_URL", public_base_url),
-        // The ADDITIONAL internet-reachable address (the public
-        // tunnel's minted URL), empty when none: the base URL above
-        // stays the stable local address either way.
+        // The ADDITIONAL internet-reachable address, empty when none:
+        // the base URL above stays the stable local address either
+        // way. The reconciled tunnel's address arrives as the
+        // `internet_url` PARAMETER (a computed value, passed, never
+        // smuggled through the process env); the env var remains the
+        // operator's seat for a deployment with no tunnel at all.
         (
             "WEFT_DISPATCHER_INTERNET_URL",
-            std::env::var("WEFT_DISPATCHER_INTERNET_URL").unwrap_or_default(),
+            internet_url
+                .map(str::to_string)
+                .or_else(|| std::env::var("WEFT_DISPATCHER_INTERNET_URL").ok())
+                .unwrap_or_default(),
         ),
         ("WEFT_LOCAL_DEV", local_dev),
         ("GATEWAY_HOST", gateway_host),
@@ -674,6 +729,20 @@ async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltIma
     Ok(built)
 }
 
+/// Reconcile the public tunnel, then compute the template vars that
+/// carry its address into the dispatcher manifest. THE one sequence
+/// both boot paths run: the tunnel must be resolved BEFORE the vars,
+/// or the dispatcher gets applied with an empty internet address,
+/// silently un-wiring a tunnel that is still running (https consents
+/// block, event pushes point at nothing).
+async fn tunnel_then_template_vars(
+    cfg: &ClusterConfig,
+    manifests: &Path,
+) -> Result<Vec<(&'static str, String)>> {
+    let tunnel_url = reconcile_public_tunnel(manifests).await?;
+    manifest_template_vars(cfg, tunnel_url.as_deref()).await
+}
+
 /// Apply every static manifest in `deploy/k8s`. Returns true iff
 /// `kubectl apply` reported a change (non-`unchanged` line) on any
 /// manifest, signalling that a pod rollout is warranted.
@@ -681,7 +750,7 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     let repo_root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let manifests = repo_root.join("deploy/k8s");
-    let template_vars = manifest_template_vars(cfg).await?;
+    let template_vars = manifest_template_vars(cfg, None).await?;
     let mut any_changed = false;
     // Namespaces first: everything below (the tunnel included) lands
     // inside them, and on a fresh cluster they do not exist yet.
@@ -695,12 +764,7 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     // the stable loopback address, and only the surfaces the open
     // internet must reach (event pushes, activation URLs) prefer the
     // tunnel.
-    let tunnel_url = reconcile_public_tunnel(&manifests).await?;
-    if let Some(url) = &tunnel_url {
-        // The template var reader consults the env; the tunnel's
-        // address takes the same seat an operator override would.
-        std::env::set_var("WEFT_DISPATCHER_INTERNET_URL", url);
-    }
+    //
     // broker + dispatcher carry ${...} placeholders (CIDRs, and for
     // the dispatcher the public base URL + local-dev flag), all
     // substituted from `template_vars`; the others have no
@@ -711,11 +775,7 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     // dispatcher creates at first infra apply. Cluster-scoped; in the
     // rolling-apply list so RBAC drift (e.g. the supervisor's surface
     // growing) stays in sync.
-    //
-    // Recomputed here (not reused from the namespace pass) because the
-    // tunnel's address just landed in the env above and the dispatcher
-    // manifest interpolates it.
-    let template_vars = manifest_template_vars(cfg).await?;
+    let template_vars = tunnel_then_template_vars(cfg, &manifests).await?;
     for name in [
         "system-namespace.yaml",
         "db-namespace.yaml",
@@ -799,28 +859,169 @@ fn public_url_enabled() -> bool {
     public_url_marker().exists()
 }
 
+/// The operator's named-tunnel choice, from the environment (the shell
+/// or the `.env` the CLI loaded): the Cloudflare tunnel token plus the
+/// stable https hostname its dashboard config routes to the proxy.
+/// Both or neither; one without the other is a half-configured tunnel
+/// and fails loudly naming the missing half.
+fn named_tunnel_config() -> Result<Option<(String, String)>> {
+    let token = std::env::var("WEFT_PUBLIC_TUNNEL_TOKEN").ok().filter(|v| !v.is_empty());
+    let hostname =
+        std::env::var("WEFT_PUBLIC_TUNNEL_HOSTNAME").ok().filter(|v| !v.is_empty());
+    match (token, hostname) {
+        (Some(token), Some(hostname)) => {
+            Ok(Some((token, canonical_tunnel_hostname(&hostname)?)))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) => anyhow::bail!(
+            "WEFT_PUBLIC_TUNNEL_TOKEN is set but WEFT_PUBLIC_TUNNEL_HOSTNAME is not; \
+             set both (the hostname the tunnel's Cloudflare config routes to weft)"
+        ),
+        (None, Some(_)) => anyhow::bail!(
+            "WEFT_PUBLIC_TUNNEL_HOSTNAME is set but WEFT_PUBLIC_TUNNEL_TOKEN is not; \
+             set both (the token from the tunnel's Cloudflare dashboard page)"
+        ),
+    }
+}
+
+/// Validate + normalize the named tunnel's hostname to
+/// `https://<host>`. The value becomes the base every public URL is
+/// joined onto, so a stray path, query, port, or scheme would produce
+/// registered-then-404ing addresses with no diagnostic; each is
+/// refused naming the offending part.
+fn canonical_tunnel_hostname(raw: &str) -> Result<String> {
+    let parsed = url::Url::parse(raw).map_err(|e| {
+        anyhow::anyhow!("WEFT_PUBLIC_TUNNEL_HOSTNAME '{raw}' is not a URL: {e}")
+    })?;
+    anyhow::ensure!(
+        parsed.scheme() == "https",
+        "WEFT_PUBLIC_TUNNEL_HOSTNAME must be https (got '{raw}')"
+    );
+    let host = parsed
+        .host_str()
+        .filter(|h| h.contains('.'))
+        .ok_or_else(|| {
+            anyhow::anyhow!("WEFT_PUBLIC_TUNNEL_HOSTNAME '{raw}' has no hostname")
+        })?;
+    anyhow::ensure!(
+        parsed.port().is_none(),
+        "WEFT_PUBLIC_TUNNEL_HOSTNAME must not carry a port (a named tunnel serves \
+         on 443); got '{raw}'"
+    );
+    anyhow::ensure!(
+        parsed.path() == "/" && parsed.query().is_none() && parsed.fragment().is_none(),
+        "WEFT_PUBLIC_TUNNEL_HOSTNAME must be the bare hostname with no path or query \
+         (e.g. https://weft.example.com); got '{raw}'"
+    );
+    Ok(format!("https://{host}"))
+}
+
 /// Bring the tunnel + filtering proxy up (or tear them down) to match
 /// the persisted choice, and answer the public https address when one
-/// is up. The address is read from the tunnel's own logs: a quick
-/// tunnel mints a RANDOM address per start, so the logs are the only
-/// authority.
+/// is up. Quick mode reads the minted random address from the tunnel's
+/// own logs (the only authority for a per-connection address); named
+/// mode's address is the configured hostname.
 async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<String>> {
     let manifest = manifests.join("public-tunnel.yaml");
+    // The manifest carries `${TUNNEL_ARGS}` (the mode's argv); any
+    // kubectl that PARSES it needs the substitution, deletes included.
+    let quick_args = r#"["tunnel", "--no-autoupdate", "--url", "http://weft-public-proxy.weft-system.svc.cluster.local:8080"]"#;
     if !public_url_enabled() {
-        // Idempotent teardown; nothing to report when it was never up.
-        let _ = kubectl(&["delete", "-f", manifest.to_str().unwrap(), "--ignore-not-found"])
-            .output()
-            .await;
+        // Local state first, cluster second: a transient apiserver
+        // failure below must never leave the stamps or the recorded
+        // address AHEAD of the cluster (a later re-open would trust a
+        // stamp for resources that were only partially deleted and
+        // skip the rollout gates). Without the stamps a re-open is
+        // unambiguously "changed".
         let _ = std::fs::remove_file(public_url_file());
+        let _ = std::fs::remove_file(manifest_stamp_file(&manifest));
+        let _ = std::fs::remove_file(manifest_stamp_file(Path::new("weft-tunnel-token")));
+        let _ = std::fs::remove_file(manifest_stamp_file(Path::new("weft-public-page")));
+        // Teardown closes a PUBLIC surface, so every kubectl step is
+        // checked: reporting success while the tunnel still serves
+        // would leave the operator believing a door is shut that is
+        // not. The args value is irrelevant to a delete (kubectl
+        // matches on kind/name), any valid one renders the manifest
+        // parseable.
+        kubectl_delete_rendered(&manifest, &[("TUNNEL_ARGS", quick_args.to_string())]).await?;
+        delete_tunnel_token_secret().await?;
+        let out = kubectl(&[
+            "-n",
+            "weft-system",
+            "delete",
+            "configmap",
+            "weft-public-page",
+            "--ignore-not-found",
+        ])
+        .output()
+        .await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "deleting the weft-public-page configmap failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         return Ok(None);
     }
+    // Named mode (a stable operator-owned hostname) or the free quick
+    // tunnel (a random address per connection). The mode decides the
+    // container's argv; a mode switch changes the Deployment spec and
+    // rolls the tunnel pod on its own.
+    let named = named_tunnel_config()?;
+    let tunnel_args = match &named {
+        Some(_) => r#"["tunnel", "--no-autoupdate", "run"]"#,
+        None => quick_args,
+    };
+    // The token Secret before the manifest in named mode, so a rolling
+    // pod always finds it. Its content feeds the same change signal as
+    // the manifest: a ROTATED token with an unchanged manifest must
+    // still reach the pod, and env from a secretKeyRef is injected
+    // only at pod start.
+    let mut secret_changed = false;
+    if let Some((token, _)) = &named {
+        let secret = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "weft-tunnel-token", "namespace": "weft-system" },
+            "type": "Opaque",
+            "stringData": { "TUNNEL_TOKEN": token },
+        })
+        .to_string();
+        kubectl_apply_stdin(&secret, "weft-tunnel-token secret").await?;
+        secret_changed = manifest_apply_changed_by_stamp(Path::new("weft-tunnel-token"), &secret);
+    }
     // Content-hash apply: when the manifest actually changed (e.g. the
-    // proxy's nginx allowlist gained a location), the running proxy
-    // must be ROLLED, because nginx never re-reads a mounted ConfigMap
-    // on its own; a plain apply would leave the old filter serving
-    // until the pod happens to restart. The tunnel pod is untouched
-    // (its minted address survives a proxy roll).
-    if kubectl_apply_changed(&manifest, &[]).await? {
+    // proxy's nginx allowlist gained a location, or the mode's argv
+    // switched), the running proxy must be ROLLED, because nginx never
+    // re-reads a mounted ConfigMap on its own. A tunnel-Deployment
+    // spec change rolls the tunnel pod by itself; a proxy-only change
+    // leaves it alone (a quick tunnel's minted address survives a
+    // proxy roll). A secret-only change rolls the tunnel explicitly,
+    // since nothing else would re-inject the new token; a page-only
+    // change rolls the proxy the same way (its files mount at start).
+    // The root page's files before the manifest, so the proxy pod the
+    // manifest (or a roll below) creates always finds its mount.
+    let page_dir = manifests
+        .parent()
+        .expect("deploy/k8s has a parent")
+        .join("public-page");
+    let page_changed = apply_public_page_configmap(&page_dir).await?;
+    let manifest_changed =
+        kubectl_apply_changed(&manifest, &[("TUNNEL_ARGS", tunnel_args.to_string())]).await?;
+    if secret_changed {
+        let status = kubectl(&[
+            "-n",
+            "weft-system",
+            "rollout",
+            "restart",
+            "deployment/weft-tunnel",
+        ])
+        .status()
+        .await?;
+        if !status.success() {
+            anyhow::bail!("restarting the tunnel after a token change failed");
+        }
+    }
+    if manifest_changed || page_changed {
         let status = kubectl(&[
             "-n",
             "weft-system",
@@ -847,43 +1048,126 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
             anyhow::bail!("the public proxy never became ready after its restart");
         }
     }
-    let url = wait_for_tunnel_url().await?;
+    // Unconditional readiness gate, changed or not: the address
+    // answered below is only meaningful while exactly one tunnel pod
+    // is running and ready. Without this, the steady-state re-run
+    // would print a confident address over a crash-looping pod (a
+    // revoked token, an evicted node), and the quick-mode log read
+    // below could hit a terminating pod's stale banner.
+    let status = kubectl(&[
+        "-n",
+        "weft-system",
+        "rollout",
+        "status",
+        "deployment/weft-tunnel",
+        "--timeout=120s",
+    ])
+    .status()
+    .await?;
+    if !status.success() {
+        anyhow::bail!(
+            "the tunnel never became ready.\n\
+             Inspect it: kubectl -n weft-system describe deployment/weft-tunnel\n\
+             and:        kubectl -n weft-system logs deployment/weft-tunnel"
+        );
+    }
+    // Quick mode leaves no stale token behind: a later named run must
+    // prove its own token, and an orphaned credential in the cluster
+    // is junk nobody acts on. Deleted only AFTER the apply and the
+    // readiness gate succeeded, so a failed apply never strands a
+    // still-named Deployment with its token already gone.
+    if named.is_none() {
+        delete_tunnel_token_secret().await?;
+    }
+    let url = match &named {
+        // The named tunnel's address is the operator's own hostname;
+        // the pod's logs never carry it (routing lives in the tunnel's
+        // Cloudflare config), so the env is the authority.
+        Some((_, hostname)) => hostname.clone(),
+        None => wait_for_quick_tunnel_url().await?,
+    };
     std::fs::create_dir_all(data_dir())?;
     std::fs::write(public_url_file(), &url)?;
     println!("public trigger surface reachable at {url}");
     println!("  exposed through the filtering proxy: /events/... (provider event pushes), /signal/... (per-signal fire tokens), and /public/files/... (minted expiring media links); everything else answers 404.");
     println!("  Rerun with --no-public-url to close it.");
-    println!("  NOTE: this address changes whenever the tunnel restarts; re-run the daemon start to re-wire active triggers after one.");
+    if named.is_none() {
+        println!(
+            "  NOTE: this free-tunnel address changes whenever the tunnel reconnects, \
+             and everything registered against it (a provider's event push URL, an \
+             OAuth redirect) rots until re-registered. For a stable address, set \
+             WEFT_PUBLIC_TUNNEL_TOKEN + WEFT_PUBLIC_TUNNEL_HOSTNAME (docs/stable-public-address.md)."
+        );
+    }
     Ok(Some(url))
 }
 
-/// The tunnel address, from the cloudflared pod's logs. The quick
-/// tunnel prints its minted `https://<random>.trycloudflare.com` a
-/// few seconds after start; poll the logs until it shows.
-async fn wait_for_tunnel_url() -> Result<String> {
+/// The QUICK tunnel's minted address, scraped from its own pod's log
+/// banner (`https://<random>.trycloudflare.com`, printed a few seconds
+/// after start); polled until it shows. Named tunnels never come here:
+/// their address is configuration, not a log line. The log read
+/// targets the single Running pod BY NAME: `logs deployment/...`
+/// picks one matching pod, and during a rollout that can be the
+/// terminating one whose banner carries the previous address.
+async fn wait_for_quick_tunnel_url() -> Result<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
+        let pod = kubectl(&[
+            "-n",
+            "weft-system",
+            "get",
+            "pod",
+            "-l",
+            "app=weft-tunnel",
+            "--field-selector=status.phase=Running",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+        ])
+        .output()
+        .await?;
+        let pod = String::from_utf8_lossy(&pod.stdout).trim().to_string();
+        if pod.is_empty() {
+            // The readiness gate upstream makes this transient (a pod
+            // is running); re-poll inside the same deadline.
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "no running tunnel pod to read the minted address from.\n\
+                     Inspect it: kubectl -n weft-system describe deployment/weft-tunnel"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            continue;
+        }
         let out = kubectl(&[
             "-n",
             "weft-system",
             "logs",
-            "deployment/weft-tunnel",
+            &format!("pod/{pod}"),
             "--tail",
             "200",
         ])
         .output()
         .await?;
         let text = String::from_utf8_lossy(&out.stdout);
+        // The LAST address in the window: a quick tunnel re-registers
+        // under a fresh random address when its edge connection drops,
+        // and the startup banner's old address can still sit earlier
+        // in the log. Only the newest one answers.
         if let Some(url) = text
             .split_whitespace()
-            .find(|w| w.starts_with("https://") && w.contains(".trycloudflare.com"))
+            .filter(|w| w.starts_with("https://") && w.contains(".trycloudflare.com"))
+            .last()
         {
             return Ok(url.trim_end_matches('/').to_string());
         }
         if std::time::Instant::now() > deadline {
             anyhow::bail!(
-                "the tunnel never reported its public address.\n\
-                 Check its logs: `kubectl -n weft-system logs deployment/weft-tunnel`"
+                "the tunnel pod reported no public address (its minting banner may \
+                 have rotated out of the log).\n\
+                 Mint a fresh one with: kubectl -n weft-system rollout restart \
+                 deployment/weft-tunnel\n\
+                 then re-run `weft daemon start` (and re-register the new address \
+                 wherever the old one was registered)."
             );
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1030,9 +1314,16 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // system-namespace carries cluster-specific placeholders (the
     // dispatcher's and pooled listener's egress-NetworkPolicy CIDRs +
     // apiserver ClusterIP), so it goes through the templated applier.
-    let template_vars = manifest_template_vars(cfg).await?;
-    kubectl_apply_templated(&manifests.join("system-namespace.yaml"), &template_vars).await?;
+    kubectl_apply_templated(
+        &manifests.join("system-namespace.yaml"),
+        &manifest_template_vars(cfg, None).await?,
+    )
+    .await?;
     kubectl_apply_file(&manifests.join("db-namespace.yaml")).await?;
+    // The public tunnel (when opted in) before the dispatcher: the
+    // shared sequence resolves its address into the vars the
+    // dispatcher manifest interpolates.
+    let template_vars = tunnel_then_template_vars(cfg, &manifests).await?;
     // No per-tenant namespace exists anymore: storage is a shared pooled
     // pod in the control-plane namespace (placed lazily on first write),
     // and a project gets its own namespace only at first infra apply.
@@ -1284,6 +1575,55 @@ async fn kind_network_gateway_ipv4() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no IPv4 gateway on the kind docker network"))
 }
 
+/// An endpoint URL's host, classified for the store egress opening.
+#[derive(Debug, PartialEq, Eq)]
+enum EndpointHost {
+    /// A private IPv4 address (RFC-1918, CGNAT, or link-local): the
+    /// one shape that derives a /32 opening.
+    PrivateIpv4(std::net::Ipv4Addr),
+    /// A public IPv4 address: re-permits nothing.
+    PublicIpv4,
+    /// An IPv6 literal (bracketed or bare): the derived-/32 shape
+    /// cannot express it; the caller decides how to fail.
+    Ipv6(String),
+    /// A DNS name: re-permits nothing (it may still resolve
+    /// privately; the caller may check and point at the override).
+    Hostname(String),
+}
+
+/// Parse and classify the endpoint URL's host. Userinfo before an
+/// `@` is dropped; a bracketed literal (`http://[fd00::1]:9096`) is
+/// unwrapped; an authority with several `:` is a bare IPv6 literal,
+/// otherwise the single `:` splits off the port.
+fn endpoint_host(endpoint: &str) -> EndpointHost {
+    let rest = endpoint.split("://").nth(1).unwrap_or(endpoint);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or(stripped).to_string()
+    } else if authority.matches(':').count() > 1 {
+        authority.to_string()
+    } else {
+        authority.split(':').next().unwrap_or(authority).to_string()
+    };
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        if is_private_ipv4(ip) {
+            return EndpointHost::PrivateIpv4(ip);
+        }
+        return EndpointHost::PublicIpv4;
+    }
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return EndpointHost::Ipv6(host);
+    }
+    EndpointHost::Hostname(host)
+}
+
+/// RFC-1918, CGNAT, or link-local.
+fn is_private_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let cgnat = ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]);
+    ip.is_private() || ip.is_link_local() || cgnat
+}
+
 /// Bring up the object store as a HOST docker container (SeaweedFS's S3 gateway).
 /// The cluster reaches OUT to it over S3: the store is never inside
 /// the cluster. Idempotent: a running container is left alone, a stopped one is
@@ -1291,6 +1631,33 @@ async fn kind_network_gateway_ipv4() -> Result<String> {
 /// gateway validates each presigned request against its own incoming Host header
 /// (v3.80 behavior), letting the SAME instance accept URLs signed for the host
 /// gateway IP (pods) AND for 127.0.0.1 (the browser).
+/// Remove the Docker-created root-owned `s3.config.json` directory and
+/// chown the config dir back to the invoking user, with docker's own
+/// (root) privileges. Only called after a plain remove failed.
+async fn heal_root_owned_config_dir(cfg_dir: &std::path::Path) -> Result<()> {
+    let id_of = |flag: &'static str| async move {
+        let out = Command::new("id").arg(flag).output().await?;
+        anyhow::ensure!(out.status.success(), "id {flag} failed");
+        Ok::<String, anyhow::Error>(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let (uid, gid) = (id_of("-u").await?, id_of("-g").await?);
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &format!("{}:/heal", cfg_dir.display()),
+            "alpine:3",
+            "sh",
+            "-c",
+            &format!("rm -rf /heal/s3.config.json && chown {uid}:{gid} /heal"),
+        ])
+        .status()
+        .await?;
+    anyhow::ensure!(status.success(), "the docker-run cleanup exited with {status}");
+    Ok(())
+}
+
 async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
     let running = Command::new("docker")
         .args(["ps", "-q", "-f", &format!("name=^{OBJECT_STORE_CONTAINER}$")])
@@ -1310,13 +1677,23 @@ async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
     let cfg_dir = data_dir().join("object-store");
     let cfg_path = cfg_dir.join("s3.config.json");
     if cfg_path.is_dir() {
-        std::fs::remove_dir_all(&cfg_path).with_context(|| {
-            format!(
-                "the object-store config path {} is a directory (Docker auto-created it from a \
-                 missing bind-mount source); remove it to write the real config file",
-                cfg_path.display()
-            )
-        })?;
+        if let Err(remove_err) = std::fs::remove_dir_all(&cfg_path) {
+            // Docker auto-creates a missing bind-mount source as a
+            // ROOT-owned directory, so the plain remove fails with
+            // permission denied for the invoking user. Docker made
+            // the mess as root; it can clean it as root: a one-shot
+            // container removes the stray directory and hands the
+            // config dir back to the user.
+            heal_root_owned_config_dir(&cfg_dir).await.with_context(|| {
+                format!(
+                    "the object-store config path {} is a directory (Docker auto-created it \
+                     from a missing bind-mount source) and removing it failed \
+                     ({remove_err}); remove it by hand: sudo rm -rf {}",
+                    cfg_path.display(),
+                    cfg_dir.display()
+                )
+            })?;
+        }
     }
     std::fs::create_dir_all(&cfg_dir)?;
     std::fs::write(
@@ -1780,15 +2157,11 @@ async fn kubectl_apply_templated(path: &Path, vars: &[(&str, String)]) -> Result
     kubectl_apply_changed(path, vars).await.map(|_| ())
 }
 
-/// The one `kubectl apply` path. Reads the manifest, substitutes
-/// `${VAR}` placeholders from `vars` (empty for manifests with no
-/// placeholders), pipes the result to `kubectl apply -f -`, and
-/// reports whether any resource changed (`created`/`configured`, vs
-/// the `unchanged` no-op `restart` uses to decide whether to roll the
-/// dispatcher pod). Always fails loud on a leftover `${...}` so a
-/// typo'd or unpassed placeholder can never apply literally to the
-/// cluster, regardless of which manifest it's in.
-async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<bool> {
+/// Read a manifest and substitute its `${VAR}` placeholders; a
+/// placeholder left over after substitution is a loud error, never a
+/// literal handed to kubectl. THE one renderer for every path that
+/// parses a templated manifest (apply and delete alike).
+async fn render_manifest(path: &Path, vars: &[(&str, String)]) -> Result<String> {
     let mut manifest = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))?;
@@ -1802,6 +2175,117 @@ async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<b
             path.display()
         );
     }
+    Ok(manifest)
+}
+
+/// Delete every resource a templated manifest declares, checked: a
+/// deletion that silently fails would leave resources running that the
+/// operator was just told are gone.
+async fn kubectl_delete_rendered(path: &Path, vars: &[(&str, String)]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let manifest = render_manifest(path, vars).await?;
+    let mut child = kubectl(&["delete", "-f", "-", "--ignore-not-found"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn kubectl delete: {e}"))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(manifest.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write manifest to kubectl stdin: {e}"))?;
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "kubectl delete ({}) failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Ship `deploy/public-page/` (the static page the proxy serves on
+/// the tunnel's bare root) into the cluster as the `weft-public-page`
+/// ConfigMap: text files as plain data, everything else as binary.
+/// Returns whether the content changed since the last apply (the
+/// proxy pod mounts the files at start, so a change needs its roll).
+async fn apply_public_page_configmap(page_dir: &Path) -> Result<bool> {
+    use base64::Engine as _;
+    let mut data = serde_json::Map::new();
+    let mut binary = serde_json::Map::new();
+    let entries = std::fs::read_dir(page_dir)
+        .map_err(|e| anyhow::anyhow!("read the public page dir {}: {e}", page_dir.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let bytes = std::fs::read(entry.path())?;
+        match String::from_utf8(bytes) {
+            Ok(text) => {
+                data.insert(name, serde_json::Value::String(text));
+            }
+            Err(raw) => {
+                binary.insert(
+                    name,
+                    serde_json::Value::String(
+                        base64::engine::general_purpose::STANDARD.encode(raw.into_bytes()),
+                    ),
+                );
+            }
+        }
+    }
+    anyhow::ensure!(
+        data.contains_key("index.html"),
+        "{} has no index.html; the proxy's root page needs one",
+        page_dir.display()
+    );
+    let configmap = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": { "name": "weft-public-page", "namespace": "weft-system" },
+        "data": data,
+        "binaryData": binary,
+    })
+    .to_string();
+    kubectl_apply_stdin(&configmap, "weft-public-page configmap").await?;
+    Ok(manifest_apply_changed_by_stamp(Path::new("weft-public-page"), &configmap))
+}
+
+/// Delete the named tunnel's token Secret, checked (missing is fine;
+/// a failed delete of a credential is not).
+async fn delete_tunnel_token_secret() -> Result<()> {
+    let out = kubectl(&[
+        "-n",
+        "weft-system",
+        "delete",
+        "secret",
+        "weft-tunnel-token",
+        "--ignore-not-found",
+    ])
+    .output()
+    .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "deleting the weft-tunnel-token secret failed: {}\n\
+             Remove it by hand: kubectl -n weft-system delete secret weft-tunnel-token",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// The one `kubectl apply` path: renders the manifest, pipes it to
+/// `kubectl apply -f -`, and reports whether the CONTENT changed since
+/// the last apply (the stamp below), which is what decides pod
+/// rollouts.
+async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<bool> {
+    let manifest = render_manifest(path, vars).await?;
     kubectl_apply_stdin(&manifest, &path.display().to_string()).await?;
     // "changed" is decided by the CONTENT we applied, not kubectl's verb. Some
     // server-defaulted resources (the Envoy-Gateway HTTPRoute) report
@@ -1923,14 +2407,23 @@ const ACCESS_APPS_SECRET_KEY: &str = "access-apps.json";
 /// last applied content for `path` (or there is no prior stamp). Mirrors the
 /// image-build stamp pattern. A stamp-write failure conservatively returns
 /// true (treat as changed) so we never SKIP a real rollout on an I/O hiccup.
+/// Where a manifest's last-applied content hash is stamped. THE one
+/// place the naming convention lives, so the teardown that removes a
+/// stamp and the stamper that writes it cannot drift apart.
+fn manifest_stamp_file(path: &Path) -> PathBuf {
+    let stem = path
+        .file_name()
+        .map(|s| s.to_string_lossy().replace(['/', ':'], "_"))
+        .unwrap_or_else(|| "manifest".into());
+    data_dir().join("manifest-stamps").join(format!("{stem}.hash"))
+}
+
 fn manifest_apply_changed_by_stamp(path: &Path, manifest: &str) -> bool {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(manifest.as_bytes());
     let want = format!("{:x}", hasher.finalize());
-    let stem = path.file_name().map(|s| s.to_string_lossy().replace(['/', ':'], "_"))
-        .unwrap_or_else(|| "manifest".into());
-    let stamp = data_dir().join("manifest-stamps").join(format!("{stem}.hash"));
+    let stamp = manifest_stamp_file(path);
     let have = std::fs::read_to_string(&stamp).ok().map(|s| s.trim().to_string());
     if have.as_deref() == Some(want.as_str()) {
         return false;
@@ -1984,7 +2477,32 @@ fn signal_term(pid: i32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apiserver_clusterip, check_cidr};
+    use super::{
+        apiserver_clusterip, canonical_tunnel_hostname, check_cidr, endpoint_host, EndpointHost,
+    };
+
+    #[test]
+    fn tunnel_hostname_accepts_only_a_bare_https_host() {
+        assert_eq!(
+            canonical_tunnel_hostname("https://weft.example.com").expect("bare host"),
+            "https://weft.example.com"
+        );
+        // A trailing slash is the same address, normalized away.
+        assert_eq!(
+            canonical_tunnel_hostname("https://weft.example.com/").expect("trailing slash"),
+            "https://weft.example.com"
+        );
+        for bad in [
+            "http://weft.example.com",     // not https
+            "https://weft.example.com/x",  // a path would double-join
+            "https://weft.example.com?x=1", // query
+            "https://weft.example.com:8443", // named tunnels serve on 443
+            "https://localhost",           // no dot: not a public hostname
+            "not a url",
+        ] {
+            assert!(canonical_tunnel_hostname(bad).is_err(), "'{bad}' must refuse");
+        }
+    }
 
     #[test]
     fn rejects_unparseable_cidr() {
@@ -2025,5 +2543,53 @@ mod tests {
         // IPv6: same network+1 derivation (the egress /32 is security-critical).
         assert_eq!(apiserver_clusterip("fd00::/108").unwrap(), "fd00::1");
         assert!(apiserver_clusterip("garbage").is_err());
+    }
+
+    #[test]
+    fn endpoint_host_classifies_every_shape() {
+        let ip = |s: &str| s.parse::<std::net::Ipv4Addr>().unwrap();
+        // The kind-gateway shape the local daemon derives.
+        assert_eq!(
+            endpoint_host("http://172.19.0.1:9096"),
+            EndpointHost::PrivateIpv4(ip("172.19.0.1"))
+        );
+        assert_eq!(
+            endpoint_host("http://10.1.2.3:9000/path"),
+            EndpointHost::PrivateIpv4(ip("10.1.2.3"))
+        );
+        assert_eq!(
+            endpoint_host("http://192.168.0.9"),
+            EndpointHost::PrivateIpv4(ip("192.168.0.9"))
+        );
+        assert_eq!(
+            endpoint_host("http://100.64.0.1:9000"),
+            EndpointHost::PrivateIpv4(ip("100.64.0.1"))
+        );
+        // Public addresses re-permit nothing.
+        assert_eq!(endpoint_host("https://8.8.8.8:443"), EndpointHost::PublicIpv4);
+        assert_eq!(endpoint_host("http://100.128.0.1:9000"), EndpointHost::PublicIpv4);
+        // A hostname keeps its name (the caller may resolve it).
+        assert_eq!(
+            endpoint_host("https://s3.amazonaws.com"),
+            EndpointHost::Hostname("s3.amazonaws.com".into())
+        );
+        // IPv6: bracketed and bare literals both classify as IPv6
+        // (a bracketed one must not mis-split on ':').
+        assert_eq!(
+            endpoint_host("http://[fd00::1]:9096"),
+            EndpointHost::Ipv6("fd00::1".into())
+        );
+        assert_eq!(endpoint_host("http://fd00::1"), EndpointHost::Ipv6("fd00::1".into()));
+        // Userinfo is dropped before classification: with a password
+        // the authority holds two ':' and must not be misread as a
+        // bare IPv6 literal.
+        assert_eq!(
+            endpoint_host("http://user@10.0.0.5:9000"),
+            EndpointHost::PrivateIpv4("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(
+            endpoint_host("http://user:pw@10.0.0.5:9000"),
+            EndpointHost::PrivateIpv4("10.0.0.5".parse().unwrap())
+        );
     }
 }

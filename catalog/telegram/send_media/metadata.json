@@ -1,0 +1,62 @@
+{
+  "type": "TelegramSendMedia",
+  "label": "Telegram: Send Media",
+  "description": "Send a stored file to a chat as a photo, document, voice note, video, or audio, with an optional caption.",
+  "tags": [
+    "telegram",
+    "message",
+    "chat"
+  ],
+  "icon": "Image",
+  "color": "#229ED9",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Telegram bot access (wire a TelegramAccess node)."
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": true,
+      "label": "Chat id",
+      "description": "The chat to address (a user's or group's id; the receive trigger emits it)."
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "required": true
+    },
+    {
+      "name": "kind",
+      "type": "String",
+      "exposure": "config",
+      "default": "document",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "photo",
+          "document",
+          "voice",
+          "video",
+          "audio"
+        ]
+      },
+      "label": "Send as"
+    },
+    {
+      "name": "caption",
+      "type": "String",
+      "required": false,
+      "label": "Caption"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "messageId",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

@@ -219,11 +219,16 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
     // the project row's `running_binary_hash` stays current regardless of whether we
     // rebuilt or hit the cache.
     let worker = crate::commands::build::worker_planned_image(&plan)?;
+    // What must survive the post-ensure GC beyond the fresh tag (idle
+    // projects' current images, draining pods). Unreachable daemon =
+    // no answer = the GC is skipped, never guessed.
+    let referenced = crate::images::referenced_image_hashes(&client).await.ok();
     crate::commands::build::ensure_worker_image_with_progress(
         progress,
         &project.id().to_string(),
         &worker.image_ref,
         &worker.context_dir,
+        referenced.as_ref(),
     )
     .await
     .context("worker image")?;

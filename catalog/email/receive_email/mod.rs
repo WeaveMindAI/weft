@@ -22,8 +22,16 @@ use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct ReceiveEmailNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for ReceiveEmailNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         // The IMAP watch dialogue: sign in, open the inbox, hold an
@@ -55,8 +63,8 @@ impl Node for ReceiveEmailNode {
         let subject_contains: Option<String> = ctx.inputs.opt("subjectContains")?;
         let conn = ctx.open(&account).await?;
 
-        let address = format!("{}:{}", conn.value("imap_host")?, conn.value("imap_port")?);
-        let raw_messages = fetch_unseen(&address, conn.value("user")?, conn.value("password")?)
+        let imap = super::mailbox::imap(&conn)?;
+        let raw_messages = fetch_unseen(&imap.address, &imap.user, &imap.password)
             .await
             .map_err(|e| weft::WeftError::NodeExecution(format!("reading the inbox over IMAP: {e}")))?;
 

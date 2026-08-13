@@ -58,6 +58,21 @@ pub fn is_node_tree_excluded(name: &str) -> bool {
     NODE_TREE_EXCLUDE.contains(&name)
 }
 
+/// True if `s` is a plain Rust identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+/// Every name codegen interpolates into generated Rust source (a
+/// node's `node_type`, a shared file's module stem) must pass this,
+/// so a bad name fails at discovery/emit with the offending file
+/// named instead of surfacing as a confusing rustc error deep inside
+/// generated code.
+pub fn is_rust_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 // ----- Filesystem-backed catalog -------------------------------------
 
 #[derive(Debug, Clone)]
@@ -234,6 +249,16 @@ impl FsCatalog {
         self.entries.get(node_type)
     }
 
+    /// Whether the named package declares any node self-tests (a
+    /// member node carries a `tests.rs`). THE one definition of "this
+    /// package has tests", so every consumer that filters packages for
+    /// test builds answers the question identically.
+    pub fn package_declares_tests(&self, package: &Package) -> bool {
+        package.node_types.iter().any(|nt| {
+            self.entry(nt).is_some_and(|e| e.source_dir.join("tests.rs").is_file())
+        })
+    }
+
     /// Read the node's optional `deps.toml`. Returns `None` if the
     /// node has no `deps.toml` (many nodes have zero extra deps).
     pub fn deps(&self, node_type: &str) -> Result<Option<NodeDeps>, CatalogError> {
@@ -303,6 +328,11 @@ impl FsCatalog {
 pub struct NodeDeps {
     #[serde(default)]
     pub dependencies: toml::Table,
+    /// Cargo `[build-dependencies]` for the package's own `build.rs`
+    /// (a `build.rs` at the package root ships as the emitted package
+    /// crate's build script).
+    #[serde(default, rename = "build-dependencies")]
+    pub build_dependencies: toml::Table,
     #[serde(default)]
     pub system: SystemPackages,
     #[serde(default)]
@@ -521,6 +551,26 @@ impl DiscoverCtx<'_> {
         self.cat.entries.insert(entry.node_type.clone(), entry);
         Ok(true)
     }
+
+    /// Claim a package NAME for a unit about to register, refusing a
+    /// duplicate the same way a duplicate node type is refused: every
+    /// by-name package lookup (the test-crate emit picks its package
+    /// by name) must resolve to exactly one root, so a second root
+    /// with the same name is ambiguous. `Strict` errors, `Lenient`
+    /// warns and keeps the first (the whole second unit is skipped,
+    /// entries included, so no entry ever points at an unregistered
+    /// package). Returns whether the unit may register.
+    fn claim_package_name(&mut self, name: &str, root: &Path) -> Result<bool, CatalogError> {
+        if let Some(existing) = self.cat.packages.values().find(|p| p.name == name) {
+            self.soft_fail(CatalogError::PackageNameCollision {
+                name: name.to_string(),
+                first: existing.root.clone(),
+                second: root.to_path_buf(),
+            })?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
 }
 
 /// Harvest every `types` declaration under `root` and build the
@@ -710,6 +760,9 @@ fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), Catal
             })
         }
     };
+    if !ctx.claim_package_name(&package_name, dir)? {
+        return Ok(());
+    }
     let node_type = entry.node_type.clone();
     // Only register the package if the node's type actually landed in
     // `entries` (Lenient may drop a collision with a warning); otherwise
@@ -752,6 +805,9 @@ fn register_package(
             })
         }
     };
+    if !ctx.claim_package_name(&parsed.package.name, dir)? {
+        return Ok(());
+    }
 
     // Package-level metadata defaults: an OPTIONAL, PARTIAL `metadata.json`
     // at the package root. Every member inherits its top-level keys unless
@@ -934,6 +990,20 @@ fn load_node_entry(
         path: meta_path.clone(),
         error,
     })?;
+    // Codegen interpolates the node type into generated Rust source
+    // (registry match arms, `{type}Node` struct paths), so a name that
+    // is not a plain identifier must fail HERE, naming this file,
+    // instead of as a rustc error inside a generated crate.
+    if !is_rust_identifier(&metadata.node_type) {
+        return Err(CatalogError::Parse {
+            path: meta_path.clone(),
+            error: format!(
+                "node type '{}' is not a valid Rust identifier \
+                 ([A-Za-z_][A-Za-z0-9_]*)",
+                metadata.node_type
+            ),
+        });
+    }
 
     Ok(CatalogEntry {
         node_type: metadata.node_type.clone(),
@@ -961,11 +1031,73 @@ pub enum CatalogError {
         first: PathBuf,
         second: PathBuf,
     },
+    #[error("package name '{name}' declared twice: {first} and {second}")]
+    PackageNameCollision {
+        name: String,
+        first: PathBuf,
+        second: PathBuf,
+    },
 }
 
 #[cfg(test)]
 mod package_tests {
     use super::*;
+
+    #[test]
+    fn rust_identifier_check() {
+        for ok in ["Text", "SlackSendMessage", "_hidden", "a1", "A_b_2"] {
+            assert!(is_rust_identifier(ok), "{ok} should pass");
+        }
+        for bad in ["", "1abc", "my-node", "my.node", "with space", "émoji", "a\"b"] {
+            assert!(!is_rust_identifier(bad), "{bad} should fail");
+        }
+    }
+
+    fn copy_dir(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).expect("mkdir");
+        for entry in fs::read_dir(src).expect("read dir") {
+            let entry = entry.expect("dir entry");
+            let to = dst.join(entry.file_name());
+            if entry.file_type().expect("file type").is_dir() {
+                copy_dir(&entry.path(), &to);
+            } else {
+                fs::copy(entry.path(), &to).expect("copy file");
+            }
+        }
+    }
+
+    /// Two roots declaring the same package NAME are ambiguous the
+    /// same way two roots declaring the same node type are: Strict
+    /// errors naming both roots, Lenient warns and keeps the first.
+    #[test]
+    fn duplicate_package_name_is_refused() {
+        let root = tempfile::tempdir().expect("temp root");
+        // Same package.toml name under two different directory roots.
+        // (The node-type collision inside would also fire, but the
+        // name is claimed BEFORE any entry inserts, so the error must
+        // be the package-name collision.)
+        copy_dir(&stdlib_root().join("slack"), &root.path().join("a"));
+        copy_dir(&stdlib_root().join("slack"), &root.path().join("b"));
+
+        let err = FsCatalog::discover(root.path()).expect_err("duplicate name refused");
+        assert!(
+            matches!(&err, CatalogError::PackageNameCollision { name, .. } if name == "slack"),
+            "expected a package-name collision, got: {err}"
+        );
+
+        let cat = FsCatalog::discover_with_policy(root.path(), DiscoverPolicy::Lenient)
+            .expect("lenient never errors on a collision");
+        assert_eq!(
+            cat.packages().count(),
+            1,
+            "lenient keeps exactly the first root"
+        );
+        assert!(
+            cat.warnings().iter().any(|w| w.contains("declared twice")),
+            "the drop is warned, not silent: {:?}",
+            cat.warnings()
+        );
+    }
 
     /// Every shipped stdlib `metadata.json` parses under the strict schema
     /// (`deny_unknown_fields` on every nested struct). A typo or stale key in

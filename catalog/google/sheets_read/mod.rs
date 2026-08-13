@@ -11,18 +11,23 @@
 //! branches feed one pure cells-to-rows step.
 
 use async_trait::async_trait;
-use serde_json::{Map, Value};
 
 use weft::node::NodeOutput;
-use weft::access::client::get_json;
 use weft::reqwest_middleware::ClientWithMiddleware;
 use weft::{node_bail, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+
+use super::sheets::{read_cells, rows_from_cells, tab_title};
 
 #[derive(NodeManifest)]
 pub struct GoogleSheetsReadNode;
 
 #[async_trait]
 impl Node for GoogleSheetsReadNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Option<Access> = ctx.inputs.opt("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
@@ -42,54 +47,14 @@ impl Node for GoogleSheetsReadNode {
     }
 }
 
-/// Signed in: the Sheets API. Two calls: the sheet list (to turn the
-/// gid into the tab's title, the only addressing `values.get` accepts),
-/// then the values themselves.
+/// Signed in: the Sheets API. Two calls: gid to title, then the
+/// values (both shared package plumbing).
 async fn read_via_sheets_api(http: &ClientWithMiddleware,
     id: &str,
     gid: &str,
 ) -> WeftResult<Vec<Vec<String>>> {
-    let meta: Value = get_json(
-        http,
-        &format!("https://sheets.googleapis.com/v4/spreadsheets/{id}?fields=sheets.properties"),
-        "list the sheet's tabs",
-    )
-    .await?;
-    let title = meta["sheets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|s| &s["properties"])
-        .find(|p| p["sheetId"].as_i64().map(|g| g.to_string()).as_deref() == Some(gid))
-        .and_then(|p| p["title"].as_str().map(str::to_string));
-    let Some(title) = title else {
-        node_bail!("the spreadsheet has no tab with gid {gid}; pick the tab again");
-    };
-    let values: Value = get_json(
-        http,
-        &format!(
-            "https://sheets.googleapis.com/v4/spreadsheets/{id}/values/{}",
-            urlencoding::encode(&format!("'{title}'"))
-        ),
-        "read the tab's values",
-    )
-    .await?;
-    let cells = values["values"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|row| {
-            row.as_array()
-                .into_iter()
-                .flatten()
-                .map(|cell| match cell {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                })
-                .collect()
-        })
-        .collect();
-    Ok(cells)
+    let title = tab_title(http, id, gid).await?;
+    read_cells(http, id, &title).await
 }
 
 /// Not signed in: the public CSV export, which serves a sheet shared
@@ -130,56 +95,5 @@ fn parse_csv_cells(csv_text: &str) -> WeftResult<Vec<Vec<String>>> {
     Ok(cells)
 }
 
-/// Cell grid -> rows of objects. With a header, keys are the first
-/// row's cells; without one, positional `c0, c1, ...`. Shared by both
-/// read paths so they answer identically.
-fn rows_from_cells(cells: Vec<Vec<String>>, has_header: bool) -> Value {
-    let mut iter = cells.into_iter();
-    let headers: Option<Vec<String>> = if has_header { iter.next() } else { None };
-    let rows = iter
-        .map(|record| {
-            let mut row = Map::new();
-            for (i, cell) in record.into_iter().enumerate() {
-                let key = match &headers {
-                    Some(h) => h.get(i).cloned().unwrap_or_else(|| format!("c{i}")),
-                    None => format!("c{i}"),
-                };
-                row.insert(key, Value::String(cell));
-            }
-            Value::Object(row)
-        })
-        .collect();
-    Value::Array(rows)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn rows(csv: &str, has_header: bool) -> Value {
-        rows_from_cells(parse_csv_cells(csv).unwrap(), has_header)
-    }
-
-    #[test]
-    fn rows_parse_with_and_without_a_header() {
-        let csv = "name,age\nada,36\ngrace,45\n";
-        let with = rows(csv, true);
-        assert_eq!(with[0]["name"], "ada");
-        assert_eq!(with[1]["age"], "45");
-
-        let without = rows(csv, false);
-        assert_eq!(without[0]["c0"], "name", "no header: the first row is data");
-        assert_eq!(without[2]["c1"], "45");
-    }
-
-    /// A ragged row (fewer/more cells than the header) still parses;
-    /// extra cells get positional keys rather than being dropped.
-    #[test]
-    fn ragged_rows_keep_their_cells() {
-        let csv = "a,b\n1\n2,3,4\n";
-        let r = rows(csv, true);
-        assert_eq!(r[0]["a"], "1");
-        assert!(r[0].get("b").is_none());
-        assert_eq!(r[1]["c2"], "4", "an extra cell keeps a positional key");
-    }
-}
+#[cfg(feature = "node-tests")]
+mod tests;

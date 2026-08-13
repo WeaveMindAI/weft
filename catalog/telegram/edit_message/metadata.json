@@ -1,0 +1,46 @@
+{
+  "type": "TelegramEditMessage",
+  "label": "Telegram: Edit Message",
+  "description": "Rewrite a message the bot sent earlier, addressed by chat + message id (both from Send Message).",
+  "tags": [
+    "telegram",
+    "message",
+    "chat"
+  ],
+  "icon": "Pencil",
+  "color": "#229ED9",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Telegram bot access (wire a TelegramAccess node)."
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": true,
+      "label": "Chat id",
+      "description": "The chat to address (a user's or group's id; the receive trigger emits it)."
+    },
+    {
+      "name": "messageId",
+      "type": "Number",
+      "required": true,
+      "label": "Message id"
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "label": "New text"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
+  ]
+}

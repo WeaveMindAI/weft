@@ -15,8 +15,16 @@ use super::provider;
 #[derive(NodeManifest)]
 pub struct AnthropicProviderNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for AnthropicProviderNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         provider::emit(&ctx, "anthropic", true).await
     }

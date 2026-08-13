@@ -55,6 +55,55 @@ pub struct RegisterRequest {
     /// is below the signal row's current one, so a stale old-pod fire
     /// during a scale-down move overlap is fenced out (no double-fire).
     pub placement_generation: i64,
+    /// Where routing and kind_state come from (see [`RegisterSource`]).
+    /// Defaults to a fresh registration with no prior state, so an
+    /// older dispatcher's request still deserializes.
+    #[serde(default)]
+    pub source: RegisterSource,
+}
+
+/// Where a registration's routing and kind_state come from.
+///
+/// `Fresh` is the register/reactivate path: the kind computes routing
+/// (which may mint a secret) and its initial state; `prior_kind_state`
+/// carries the token's previously-persisted state when the row already
+/// exists (entry tokens are reused across reactivates), so a kind
+/// whose state is a feed cursor can carry it forward instead of
+/// re-priming and silently discarding everything that arrived while
+/// the project was inactive.
+///
+/// `Restore` is the pod-move path (scale-down drain, fire
+/// re-placement): both values come from the durable row VERBATIM.
+/// Recomputing routing would mint a fresh API key and silently
+/// invalidate the user's existing one; recomputing state would reset
+/// a timer's clock mid-schedule. A move is not a user action, so
+/// nothing may change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RegisterSource {
+    Fresh {
+        #[serde(default)]
+        prior_kind_state: Option<serde_json::Value>,
+        /// The kind_state write-fence version the prior state was
+        /// read at (0 for a brand-new token). The spawned task's
+        /// durable cursor writes continue at `seq + 1` so a
+        /// reactivate can never regress the fence.
+        #[serde(default)]
+        prior_seq: i64,
+    },
+    Restore {
+        routing: SignalRouting,
+        kind_state: serde_json::Value,
+        /// The row's `kind_state_seq` at restore time.
+        #[serde(default)]
+        seq: i64,
+    },
+}
+
+impl Default for RegisterSource {
+    fn default() -> Self {
+        Self::Fresh { prior_kind_state: None, prior_seq: 0 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,14 +289,64 @@ mod tests {
             is_resume: false,
             color: Some("c-1".into()),
             placement_generation: 7,
+            source: RegisterSource::Fresh {
+                prior_kind_state: Some(serde_json::json!({"cursor": 42})),
+                prior_seq: 9,
+            },
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["tenant_id"], "acme");
         assert_eq!(json["placement_generation"], 7);
+        assert_eq!(json["source"]["prior_kind_state"]["cursor"], 42);
         let back: RegisterRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back.tenant_id, "acme");
         assert_eq!(back.placement_generation, 7);
         assert_eq!(back.token, "tok-1");
+        match back.source {
+            RegisterSource::Fresh { prior_kind_state, prior_seq } => {
+                assert_eq!(prior_kind_state.unwrap()["cursor"], 42);
+                assert_eq!(prior_seq, 9);
+            }
+            RegisterSource::Restore { .. } => panic!("round trip flipped the source"),
+        }
+    }
+
+    /// A request without a `source` (an older writer) deserializes as a
+    /// fresh registration with no prior state; a Restore round-trips
+    /// its routing and state verbatim.
+    #[test]
+    fn register_source_defaults_fresh_and_restore_round_trips() {
+        let json = serde_json::json!({
+            "token": "tok-1",
+            "tenant_id": "acme",
+            "spec": { "kind": "timer", "config": {} },
+            "node_id": "node-1",
+            "placement_generation": 7
+        });
+        let back: RegisterRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back.source,
+            RegisterSource::Fresh { prior_kind_state: None, prior_seq: 0 }
+        ));
+
+        let restore = RegisterSource::Restore {
+            routing: SignalRouting {
+                surface: weft_core::primitive::SignalSurface::Internal,
+                auth: weft_core::primitive::SignalAuth::None,
+                auth_config: serde_json::Value::Null,
+            },
+            kind_state: serde_json::json!({"cursor": 7}),
+            seq: 12,
+        };
+        let json = serde_json::to_value(&restore).unwrap();
+        let back: RegisterSource = serde_json::from_value(json).unwrap();
+        match back {
+            RegisterSource::Restore { kind_state, seq, .. } => {
+                assert_eq!(kind_state["cursor"], 7);
+                assert_eq!(seq, 12);
+            }
+            RegisterSource::Fresh { .. } => panic!("round trip flipped the source"),
+        }
     }
 
     /// A required new field must be a hard deserialize failure when

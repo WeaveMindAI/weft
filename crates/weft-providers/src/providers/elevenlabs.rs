@@ -163,7 +163,7 @@ impl ProviderMeter for ElevenLabsMeter {
         Ok(None)
     }
 
-    fn observe(&self) -> Box<dyn CallObservation> {
+    fn observe(&self, _path: &str) -> Box<dyn CallObservation> {
         // No route classifies Billable, so no per-call observer is ever
         // minted; a call here is a meter bug.
         unreachable!("the elevenlabs meter has no Billable (one-shot) routes")
@@ -208,6 +208,7 @@ impl ProviderMeter for ElevenLabsMeter {
 
     async fn resolve(
         &self,
+        _path: &str,
         _observed: crate::ObservedCall,
         _follow_up: FollowUp<'_>,
     ) -> MeasuredCost {

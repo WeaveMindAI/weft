@@ -38,8 +38,18 @@ pub enum ExecEvent {
         /// against the SAME shape it was suspended on. Without
         /// this, a resume folds the OLD journal state but executes
         /// against the NEW topology / config, which is undefined
-        /// behavior.
-        definition_hash: String,
+        /// behavior. `None` for a run that executes no project
+        /// definition (a node self-test): a resume against such a
+        /// color fails loudly as NotFound instead of resuming
+        /// against a sentinel hash.
+        definition_hash: Option<String>,
+        /// True for a node self-test's execution identity: the color
+        /// is real (cost attribution, broker scoping, a terminal
+        /// event) but its lifecycle is owned by the test task, so
+        /// project-lifecycle sweeps (cancel, wipe, drain counting)
+        /// must not touch it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        node_test: bool,
         at_unix: u64,
     },
 
@@ -1263,7 +1273,8 @@ mod fold_pulse_tests {
                 project_id: "p".into(),
                 entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::Fire,
-                definition_hash: "test-hash".into(),
+                definition_hash: Some("test-hash".into()),
+                node_test: false,
                 at_unix: 0,
             },
             ExecEvent::NodeKicked {
@@ -2332,6 +2343,39 @@ mod caller_event_wire_tests {
             serde_json::to_value(&back).unwrap(),
             "round-trip changed the shape: {json}"
         );
+    }
+
+    /// `ExecutionStarted` in both shapes: a project run (hash present,
+    /// `node_test` omitted from the wire since it is false) and a node
+    /// self-test (no hash, `node_test: true` on the wire).
+    #[test]
+    fn execution_started_round_trips_both_kinds() {
+        let started = ExecEvent::ExecutionStarted {
+            color: color(),
+            project_id: "p".into(),
+            entry_node: "trigger".into(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: Some("h".into()),
+            node_test: false,
+            at_unix: 7,
+        };
+        let json = serde_json::to_value(&started).unwrap();
+        assert!(json.get("node_test").is_none(), "false is omitted from the wire: {json}");
+        round_trip(started);
+
+        let test_started = ExecEvent::ExecutionStarted {
+            color: color(),
+            project_id: "p".into(),
+            entry_node: "node-test:MyNode::my_test".into(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: None,
+            node_test: true,
+            at_unix: 7,
+        };
+        let json = serde_json::to_value(&test_started).unwrap();
+        assert_eq!(json["node_test"], true, "{json}");
+        assert_eq!(json["definition_hash"], serde_json::Value::Null, "{json}");
+        round_trip(test_started);
     }
 
     #[test]

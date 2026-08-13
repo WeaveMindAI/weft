@@ -1,0 +1,11 @@
+# A mid-run wait answered by a provider push: the custom node parks on
+# the connection's `interactions` topic with a fixed correlation id;
+# the rig delivers a SIGNED synthetic form-encoded interactivity
+# payload and watches the run resume with the clicked action.
+
+ws = SlackAccess
+wait = AwaitInteraction
+wait.account = ws.access
+
+out = Debug
+out.data = wait.action

@@ -132,8 +132,20 @@ pub async fn post_json(
     json_call(client.post(url).json(body), what).await
 }
 
+/// Send a prepared request expecting a JSON answer: refuse a
+/// non-success status quoting the provider's own words, then parse.
+/// The one status-and-bail shape behind [`get_json`] / [`post_json`];
+/// public for callers whose request needs its own preparation (a
+/// custom content type, a raw multipart body) but the same contract.
+///
+/// The error text quotes the provider's own message when the failure
+/// body carries one of the common JSON error envelopes:
+/// `{"error": {"message": ...}}` / `{"error": "..."}` (Google, and most
+/// JSON APIs), top-level `{"message": ...}` (GitHub), or top-level
+/// `{"detail": ...}` (FastAPI services). Otherwise it quotes the raw
+/// body (truncated), so an HTML 502 from a proxy is still legible.
 #[cfg(feature = "runtime")]
-async fn json_call(
+pub async fn json_call(
     req: reqwest_middleware::RequestBuilder,
     what: &str,
 ) -> crate::WeftResult<serde_json::Value> {
@@ -145,12 +157,157 @@ async fn json_call(
     let status = resp.status();
     let body = resp.text().await.node_err(what)?;
     if !status.is_success() {
+        let nested = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or_else(|| v["error"].as_str())
+                .or_else(|| v["message"].as_str())
+                .or_else(|| v["detail"].as_str())
+                .map(str::to_string)
+        });
+        let detail = nested.unwrap_or_else(|| body.chars().take(500).collect::<String>());
         return Err(node_error(format!(
-            "the service answered {status} trying to {what}: {}",
-            body.chars().take(500).collect::<String>()
+            "the service answered {status} trying to {what}: {detail}"
         )));
     }
     serde_json::from_str(&body).node_err(what)
+}
+
+/// A REQUIRED string field of a JSON answer: absent or non-string fails
+/// the node loudly naming the call and the field, so a blank id never
+/// travels downstream to surface later as a confusing failure on an
+/// empty value. `what` names what answered (the method, the call).
+#[cfg(feature = "runtime")]
+pub fn required_str<'a>(
+    answer: &'a serde_json::Value,
+    what: &str,
+    name: &str,
+) -> crate::WeftResult<&'a str> {
+    use crate::error::NodeErrExt;
+    answer
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .node_err(format!("the {what} answer carries no {name}"))
+}
+
+/// A hand-framed multipart body: `multipart/form-data` for the
+/// name-addressed field shape (an upload endpoint's named fields plus
+/// a file part), `multipart/related` for the typed-part shape (a JSON
+/// metadata part plus the bytes, Drive-style). Collect the parts, then
+/// [`Multipart::build`] frames the body.
+///
+/// The boundary is minted at random PER BUILD and verified absent from
+/// every part's headers and payload (multipart framing truncates at
+/// the first match, and part content is arbitrary workflow data);
+/// the astronomically rare collision re-mints. The scan looks for the
+/// BARE `--<boundary>` (no leading CRLF): the part header's own
+/// CRLF-CRLF terminator donates a newline right before the payload's
+/// first byte, so a payload STARTING with the delimiter would frame a
+/// boundary a CRLF-prefixed scan would miss.
+pub struct Multipart {
+    subtype: &'static str,
+    parts: Vec<MultipartPart>,
+}
+
+/// One framed part: its header lines (everything between the boundary
+/// line and the blank line) and its payload bytes.
+struct MultipartPart {
+    headers: String,
+    payload: Vec<u8>,
+}
+
+/// A value placed inside a quoted-string parameter (a filename in a
+/// Content-Disposition): quotes and backslashes escape, and the CR/LF
+/// bytes that would break the header line become '_'.
+fn quoted_param(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\r', '\n'], "_")
+}
+
+/// Whether `--<boundary>` occurs in any part's headers or payload.
+fn boundary_collides(parts: &[MultipartPart], boundary: &str) -> bool {
+    let marker = format!("--{boundary}");
+    parts.iter().any(|p| {
+        p.headers.contains(&marker)
+            || p.payload.windows(marker.len()).any(|w| w == marker.as_bytes())
+    })
+}
+
+impl Multipart {
+    /// A `multipart/form-data` body ([`Self::text`] / [`Self::file`] parts).
+    pub fn form_data() -> Self {
+        Self { subtype: "form-data", parts: Vec::new() }
+    }
+
+    /// A `multipart/related` body ([`Self::part`] parts).
+    pub fn related() -> Self {
+        Self { subtype: "related", parts: Vec::new() }
+    }
+
+    /// A named text field (form-data).
+    pub fn text(mut self, name: &str, value: &str) -> Self {
+        assert_eq!(self.subtype, "form-data", "named fields belong to a form-data body");
+        self.parts.push(MultipartPart {
+            headers: format!(
+                "Content-Disposition: form-data; name=\"{}\"",
+                quoted_param(name)
+            ),
+            payload: value.as_bytes().to_vec(),
+        });
+        self
+    }
+
+    /// A named file field with filename and content type (form-data).
+    pub fn file(
+        mut self,
+        name: &str,
+        filename: &str,
+        content_type: &str,
+        bytes: impl Into<Vec<u8>>,
+    ) -> Self {
+        assert_eq!(self.subtype, "form-data", "named fields belong to a form-data body");
+        self.parts.push(MultipartPart {
+            headers: format!(
+                "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n\
+                 Content-Type: {content_type}",
+                quoted_param(name),
+                quoted_param(filename),
+            ),
+            payload: bytes.into(),
+        });
+        self
+    }
+
+    /// A typed part, addressed by position (related).
+    pub fn part(mut self, content_type: &str, bytes: impl Into<Vec<u8>>) -> Self {
+        assert_eq!(self.subtype, "related", "typed parts belong to a related body");
+        self.parts.push(MultipartPart {
+            headers: format!("Content-Type: {content_type}"),
+            payload: bytes.into(),
+        });
+        self
+    }
+
+    /// Frame the body: mints the verified boundary and returns the
+    /// Content-Type header value plus the body bytes.
+    pub fn build(self) -> (String, Vec<u8>) {
+        let boundary = loop {
+            let candidate = format!("weft-{}", uuid::Uuid::new_v4().simple());
+            if !boundary_collides(&self.parts, &candidate) {
+                break candidate;
+            }
+        };
+        let mut body: Vec<u8> = Vec::new();
+        for part in &self.parts {
+            body.extend_from_slice(format!("--{boundary}\r\n{}\r\n\r\n", part.headers).as_bytes());
+            body.extend_from_slice(&part.payload);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        (format!("multipart/{}; boundary={boundary}", self.subtype), body)
+    }
 }
 
 /// One auth step with its templates RESOLVED against the grant's
@@ -421,16 +578,16 @@ pub mod sigv4 {
     use super::*;
 
     /// The AWS "uri-encode" charset: unreserved chars stay, everything
-    /// else percent-encodes (uppercase hex). `encode_slash` = false for
-    /// the path (segment separators stay).
-    fn uri_encode(s: &str, encode_slash: bool) -> String {
+    /// else percent-encodes (uppercase hex), '/' included. The only
+    /// caller is the canonical query, where a slash inside a value is
+    /// data, never a segment separator.
+    fn uri_encode(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         for b in s.bytes() {
             match b {
                 b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
                     out.push(b as char)
                 }
-                b'/' if !encode_slash => out.push('/'),
                 _ => out.push_str(&format!("%{b:02X}")),
             }
         }
@@ -442,7 +599,7 @@ pub mod sigv4 {
     fn canonical_query(url: &url::Url) -> String {
         let mut pairs: Vec<(String, String)> = url
             .query_pairs()
-            .map(|(k, v)| (uri_encode(&k, true), uri_encode(&v, true)))
+            .map(|(k, v)| (uri_encode(&k), uri_encode(&v)))
             .collect();
         pairs.sort();
         pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
@@ -469,9 +626,16 @@ pub mod sigv4 {
             headers.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
         let signed_headers =
             headers.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+        // S3's single-encode convention: the canonical URI is the path
+        // EXACTLY as it goes on the wire (`url.path()` is already
+        // percent-encoded once; reqwest sends those bytes verbatim).
+        // Re-encoding here would double-encode every escaped byte
+        // (`%20` -> `%2520`) and sign a different path than the one
+        // sent, so any key with a space, `+`, `&`, or non-ASCII would
+        // answer 403 SignatureDoesNotMatch.
         let canonical_request = format!(
             "{method}\n{}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
-            uri_encode(url.path(), false),
+            url.path(),
             canonical_query(url),
         );
         let scope = format!("{date}/{region}/{service}/aws4_request");
@@ -811,6 +975,83 @@ mod tests {
         );
     }
 
+    /// The built body frames each payload verbatim, and the minted
+    /// boundary occurs ONLY as framing: parts + 1 bare `--<boundary>`
+    /// markers, none contributed by content.
+    #[test]
+    fn multipart_boundary_is_absent_from_every_payload() {
+        let payload = b"binary \xff\x00 --weft-looks-like-a-marker".to_vec();
+        let (content_type, body) = Multipart::form_data()
+            .text("purpose", "ocr")
+            .file("file", "doc.pdf", "application/pdf", payload.clone())
+            .build();
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .expect("the content type carries the boundary");
+        let marker = format!("--{boundary}");
+        let hits = body
+            .windows(marker.len())
+            .filter(|w| *w == marker.as_bytes())
+            .count();
+        assert_eq!(hits, 3, "two part openers + the terminator, nothing from content");
+        assert!(
+            body.windows(payload.len()).any(|w| w == payload.as_slice()),
+            "the file bytes ride verbatim"
+        );
+        // The collision scan itself, pinned deterministically: a
+        // boundary occurring in a payload (or a header) is refused.
+        let parts = [MultipartPart {
+            headers: "Content-Type: text/plain".into(),
+            payload: b"data --clash data".to_vec(),
+        }];
+        assert!(boundary_collides(&parts, "clash"));
+        assert!(!boundary_collides(&parts, "no-clash"));
+    }
+
+    /// A filename with quotes, backslashes, and CR/LF lands escaped in
+    /// the Content-Disposition instead of breaking the header framing.
+    #[test]
+    fn multipart_filenames_escape_quotes_and_backslashes() {
+        let (_, body) = Multipart::form_data()
+            .file("file", "a\"b\\c\r\nd.pdf", "application/pdf", b"x".to_vec())
+            .build();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(r#"filename="a\"b\\c__d.pdf""#), "{text}");
+    }
+
+    /// form-data parts are name-addressed; related parts are typed and
+    /// positional (no Content-Disposition at all).
+    #[test]
+    fn multipart_related_and_form_data_frame_their_shapes() {
+        let (content_type, body) = Multipart::related()
+            .part("application/json; charset=UTF-8", b"{\"name\":\"x\"}".to_vec())
+            .part("application/pdf", b"bytes".to_vec())
+            .build();
+        assert!(content_type.starts_with("multipart/related; boundary="));
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("Content-Disposition"), "{text}");
+        assert!(text.contains("Content-Type: application/json; charset=UTF-8\r\n\r\n{\"name\":\"x\"}\r\n"), "{text}");
+        assert!(text.ends_with("--\r\n"), "{text}");
+
+        let (content_type, body) =
+            Multipart::form_data().text("chat_id", "42").build();
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n42\r\n"), "{text}");
+    }
+
+    /// `required_str` hands back a present string field and fails loud
+    /// (naming the call and the field) on absence or a non-string.
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn required_str_reads_or_names_the_missing_field() {
+        let answer = serde_json::json!({ "id": "f1", "n": 7 });
+        assert_eq!(required_str(&answer, "copy", "id").unwrap(), "f1");
+        let err = required_str(&answer, "copy", "webViewLink").unwrap_err().to_string();
+        assert!(err.contains("copy") && err.contains("webViewLink"), "{err}");
+        assert!(required_str(&answer, "copy", "n").is_err());
+    }
+
     #[test]
     fn resolve_steps_fails_loud_on_unknown_value() {
         let e = resolve_steps(
@@ -849,6 +1090,33 @@ mod tests {
         assert_eq!(scope, "20150830/us-east-1/iam/aws4_request");
         assert_eq!(signed, "content-type;host;x-amz-date");
         assert_eq!(sig, "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7");
+    }
+
+    /// A key with a space and a `+` signs over the path EXACTLY as it
+    /// goes on the wire (`/bkt/a%20b%2Bc.txt`, encoded once). The hex
+    /// is a pinned regression vector: re-encoding the already-encoded
+    /// path in the canonical request (`%20` -> `%2520`) flips it, and
+    /// that double-encode is precisely the bug that made every
+    /// non-trivial S3 key answer 403 SignatureDoesNotMatch.
+    #[test]
+    fn sigv4_signs_the_wire_path_once_for_encoded_keys() {
+        let url: url::Url = "https://bkt.s3.amazonaws.com/bkt/a%20b%2Bc.txt".parse().unwrap();
+        assert_eq!(url.path(), "/bkt/a%20b%2Bc.txt", "the wire path keeps the single encode");
+        let headers = vec![
+            ("host".to_string(), "bkt.s3.amazonaws.com".to_string()),
+            ("x-amz-date".to_string(), "20150830T123600Z".to_string()),
+        ];
+        let (sig, ..) = sigv4::signature(
+            "GET",
+            &url,
+            &headers,
+            &sha256_hex(b""),
+            "s3",
+            "us-east-1",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            t0(),
+        );
+        assert_eq!(sig, "f77ded97ed653b5aa527347295b0c735877e7e040996f070cbe677f8816efd22");
     }
 
     #[test]

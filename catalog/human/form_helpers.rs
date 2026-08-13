@@ -19,7 +19,40 @@ use serde_json::{Map, Value};
 use weft::node::FormFieldSpec;
 use weft::node::FormFieldPort;
 use weft::node::NodeOutput;
-use weft::signal::FormField;
+use weft::signal::{Form, FormField, FormSchema};
+use weft::{ValueBag, WeftResult};
+
+/// Assemble the whole [`Form`] signal from a form node's inputs: the
+/// fields array, `title`/`description`, and `prefill` (the values
+/// display / prefilled / source=input fields lift out by key: the
+/// query node projects its wired inputs, the trigger has no upstream
+/// and passes an empty object). ONE builder for both nodes, so "what
+/// a human form signal looks like" is defined once; only the
+/// `form_type` and the prefill source genuinely differ.
+pub fn build_form(
+    inputs: &ValueBag,
+    specs: &[FormFieldSpec],
+    form_type: &str,
+    prefill: &Value,
+) -> WeftResult<Form> {
+    let raw_fields = parse_form_fields(inputs.object()?);
+    let title: String = inputs.get_or("title", String::new())?;
+    let description: Option<String> = inputs.opt("description")?;
+    let schema = FormSchema {
+        title: title.clone(),
+        description: description.clone(),
+        fields: build_form_fields(&raw_fields, specs, prefill),
+    };
+    Ok(Form {
+        form_type: form_type.to_string(),
+        schema,
+        title: if title.is_empty() { None } else { Some(title) },
+        description,
+        // Browser extension / human-in-the-loop processors enumerate
+        // this consumer kind.
+        consumer_kind: Some("human_in_the_loop".into()),
+    })
+}
 
 /// Pull the `fields` array off a node's config. The canonical shape is a
 /// JSON array (what the compiler produces); anything else means no fields.

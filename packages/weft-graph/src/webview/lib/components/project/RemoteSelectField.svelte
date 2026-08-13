@@ -35,6 +35,7 @@
 		field,
 		value,
 		accessRef,
+		accessIsOwnField = false,
 		grantedScopes = null,
 		parents = {},
 		onUpdate,
@@ -46,6 +47,9 @@
 		/// The feeding access node's connection, traced structurally
 		/// through the graph's edges by the parent; null = none picked.
 		accessRef: { accessId: string; service: string } | null;
+		/// Whether the access input is a connection picker on THIS node
+		/// (vs a wired Access port): decides the connect-first wording.
+		accessIsOwnField?: boolean;
 		/// The traced connection's granted permission set, when the
 		/// parent fetched it (for dropping `list` sources whose
 		/// `requires` are not held); null = unknown, sources stay.
@@ -67,6 +71,9 @@
 				case 'picker':
 					return accessRef != null;
 				case 'list':
+					// A public endpoint is called bare, so the source
+					// stands with no connection at all.
+					if (s.public) return true;
 					if (!accessRef) return false;
 					if (grantedScopes == null) return true;
 					return (s.requires ?? []).every((r) => grantedScopes.includes(r));
@@ -85,24 +92,67 @@
 		return labelCache.get(value) ?? value;
 	});
 
+	/// What the search box can actually do right now, spelled out per
+	/// case so the placeholder never promises a search that cannot
+	/// happen (a free-text field with no usable source only takes a
+	/// typed id).
+	const searchPlaceholder = $derived.by(() => {
+		if (usable.length === 0) return 'Type the id...';
+		if (fromUrlSource) {
+			return accessRef ? 'Search, or paste a URL or id...' : 'Paste a link or id...';
+		}
+		return 'Search, or paste an id...';
+	});
+
+	/// Whether the list call filters server-side: a `{query}` in the
+	/// URL means each keystroke re-asks the service. Without one the
+	/// service answers the same full list every time, so the typed text
+	/// narrows it HERE instead (label or id substring).
+	const serverFiltered = $derived(
+		listSource?.kind === 'list' && listSource.get.includes('{query}'),
+	);
+	const shownItems = $derived.by(() => {
+		const q = query.trim().toLowerCase();
+		if (serverFiltered || !q) return items;
+		return items.filter(
+			(i) => i.label.toLowerCase().includes(q) || i.id.toLowerCase().includes(q),
+		);
+	});
+
 	let open = $state(false);
 	let query = $state('');
 	let items = $state<LookupItem[]>([]);
 	let nextCursor = $state<string | null>(null);
+	/// Whether a load has COMPLETED for the current connection state.
+	/// Its own piece of state on purpose: `items.length` conflates
+	/// "never tried", "tried and failed", and "tried and got nothing",
+	/// which turned keystrokes into a retry loop against a failing or
+	/// empty endpoint.
+	let loaded = $state(false);
 	let busy = $state(false);
 	let error = $state<string | null>(null);
 	let searchSeq = 0;
+
+	// The loaded list belongs to ONE connection state; a connect or a
+	// rewire invalidates it (the old list may have been fetched with
+	// different credentials, or none).
+	$effect(() => {
+		void accessRef?.accessId;
+		items = [];
+		nextCursor = null;
+		loaded = false;
+	});
 
 	/// Fill the option list from the richest enumerating source:
 	/// `granted` (free, off the row) first; when it holds nothing (or
 	/// is not declared), the `list` call.
 	async function loadOptions(cursor?: string) {
-		if (!accessRef) return;
+		if (!accessRef && !(listSource?.kind === 'list' && listSource.public)) return;
 		const seq = ++searchSeq;
 		busy = true;
 		error = null;
 		try {
-			if (!cursor && grantedSource?.kind === 'granted' && !query.trim()) {
+			if (!cursor && accessRef && grantedSource?.kind === 'granted' && !query.trim()) {
 				const recorded = await accessCall<LookupItem[]>('POST', 'granted', {
 					access_id: accessRef.accessId,
 					service: accessRef.service,
@@ -114,6 +164,7 @@
 				if (recorded.length > 0) {
 					items = recorded;
 					nextCursor = null;
+					loaded = true;
 					return;
 				}
 				// Recorded nothing (a service whose consent never names
@@ -125,10 +176,13 @@
 				'POST',
 				'lookup',
 				{
-					access_id: accessRef.accessId,
-					service: accessRef.service,
+					access_id: accessRef?.accessId ?? null,
+					service: accessRef?.service ?? '',
 					lookup,
-					query,
+					// Honest wire: the typed text is a server-side filter
+					// only when the URL declares `{query}`; otherwise the
+					// narrowing happens here and the call carries none.
+					query: serverFiltered ? query : '',
 					parents,
 					cursor: cursor ?? null,
 				},
@@ -136,6 +190,7 @@
 			if (seq !== searchSeq) return;
 			items = cursor ? [...items, ...page.items] : page.items;
 			nextCursor = page.next_cursor;
+			loaded = true;
 		} catch (e) {
 			if (seq !== searchSeq) return;
 			error = e instanceof Error ? e.message : String(e);
@@ -147,7 +202,6 @@
 	let debounce: ReturnType<typeof setTimeout> | undefined;
 	function onQueryInput(v: string) {
 		query = v;
-		error = null;
 		// A pasted URL resolves locally through the declared extractor:
 		// no network, instant pick.
 		if (fromUrlSource?.kind === 'from_url') {
@@ -164,7 +218,14 @@
 			}
 		}
 		clearTimeout(debounce);
-		debounce = setTimeout(() => void loadOptions(), 300);
+		// A locally-narrowed list (no `{query}` in the URL) re-asks the
+		// service only when no load has completed yet: the service would
+		// answer the same full list on every keystroke. `loaded`, not
+		// `items.length`: a failed or legitimately empty load must not
+		// turn keystrokes into a retry loop.
+		if (serverFiltered || !loaded) {
+			debounce = setTimeout(() => void loadOptions(), 300);
+		}
 	}
 
 	/// Whether a picker session is live (its page open in the user's
@@ -249,6 +310,7 @@
 		open = false;
 		query = '';
 		items = [];
+		loaded = false;
 		if (item.label) labelCache.set(item.id, item.label);
 		onUpdate(item.id);
 	}
@@ -261,7 +323,9 @@
 	function toggle(e: MouseEvent) {
 		e.stopPropagation();
 		open = !open;
-		if (open && accessRef && (grantedSource || listSource)) void loadOptions();
+		// `usable` already dropped every source whose requirement is
+		// unmet, so any enumerating source left is loadable.
+		if (open && (grantedSource || listSource)) void loadOptions();
 	}
 </script>
 
@@ -274,21 +338,26 @@
 
 	{#if open}
 		<div class="border border-border rounded p-1.5 space-y-1 bg-background">
-			{#if usable.length === 0}
+			{#if usable.length === 0 && !field.freeText}
 				<div class="text-[10px] text-muted-foreground">
-					Connect an account first (wire this node's `{field.access}` input to a connected access node).
+					{#if accessIsOwnField}
+						Connect an account first (pick a connection on this node's `{field.access}` field).
+					{:else}
+						Connect an account first (wire this node's `{field.access}` input to a connected access node).
+					{/if}
 				</div>
 			{:else}
 				<input
 					type="text"
 					class="w-full text-xs bg-muted px-2 py-1 rounded border-none outline-none"
-					placeholder={fromUrlSource
-						? accessRef
-							? 'Search, or paste a URL or id...'
-							: 'Paste a link or id...'
-						: 'Search, or paste an id...'}
+					placeholder={searchPlaceholder}
 					value={query}
 					oninput={(e) => onQueryInput(e.currentTarget.value)}
+					onkeydown={(e) => {
+						// Free-text fields take the typed value as-is on
+						// Enter: the list is suggestions, not a closed set.
+						if (e.key === 'Enter' && field.freeText) useRawId();
+					}}
 				/>
 				{#if pickerSource && !pickerOpen}
 					<button
@@ -317,7 +386,7 @@
 					<div class="text-[10px] text-muted-foreground px-1">Loading...</div>
 				{/if}
 				<div class="max-h-40 overflow-y-auto space-y-0.5">
-					{#each items as item (item.id)}
+					{#each shownItems as item (item.id)}
 						<button
 							type="button"
 							class="w-full text-left text-[11px] px-1.5 py-1 rounded hover:bg-muted truncate"
@@ -327,7 +396,9 @@
 					{/each}
 				</div>
 				{#if nextCursor}
-					<button type="button" class="text-[10px] text-blue-500 hover:underline px-1" disabled={busy} onclick={() => void loadOptions(nextCursor ?? undefined)}>More...</button>
+					<!-- Under a local narrow, a fetched page may add nothing
+				     VISIBLE; the loaded count shows the fetch worked. -->
+				<button type="button" class="text-[10px] text-blue-500 hover:underline px-1" disabled={busy} onclick={() => void loadOptions(nextCursor ?? undefined)}>More... ({items.length} loaded)</button>
 				{/if}
 				{#if query.trim() && !busy}
 					<button type="button" class="text-[10px] text-muted-foreground hover:text-foreground px-1" onclick={useRawId}>Use "{query.trim()}" as the id</button>

@@ -203,21 +203,20 @@ impl std::fmt::Debug for OpenedConnection {
 ///
 /// ```ignore
 /// weft::access_node!(SlackAccessNode);
-/// weft::access_node!(ElevenLabsAccessNode, "connection"); // non-default input name
 /// ```
+///
+/// The input is always named `account`, the one name every access
+/// node's metadata declares.
 #[macro_export]
 macro_rules! access_node {
     ($name:ident) => {
-        $crate::access_node!($name, "account");
-    };
-    ($name:ident, $input:literal) => {
         #[derive($crate::NodeManifest)]
         pub struct $name;
 
         #[$crate::async_trait::async_trait]
         impl $crate::Node for $name {
             async fn run(&self, ctx: $crate::ExecutionContext) -> $crate::WeftResult<()> {
-                let access: $crate::Access = ctx.inputs.get($input)?;
+                let access: $crate::Access = ctx.inputs.get("account")?;
                 ctx.pulse_downstream($crate::node::NodeOutput::new().set("access", access))
                     .await
             }

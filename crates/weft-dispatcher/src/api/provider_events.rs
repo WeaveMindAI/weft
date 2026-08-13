@@ -134,11 +134,19 @@ async fn match_signals(
     targets: &[weft_broker_client::protocol::EventTargetWire],
     signal_token: Option<String>,
 ) -> anyhow::Result<Vec<MatchedSignal>> {
+    // Entry AND resume signals both feed from pushes: a trigger fires
+    // a fresh execution, an awaited signal (a node parked on
+    // `await_signal(ProviderEvents...)`, e.g. a Slack button wait)
+    // resumes its execution. The lifecycle gate downstream already
+    // routes each by its row's own is_resume; a resume signal always
+    // carries a predicate pinning it to its minted correlation id
+    // (registration refuses a predicate-less provider_events resume),
+    // so a broad push never resumes the wrong wait.
     let rows = match signal_token {
         Some(token) => {
             sqlx::query(
                 "SELECT token, tenant_id, spec_json FROM signal
-                 WHERE token = $1 AND is_resume = FALSE",
+                 WHERE token = $1",
             )
             .bind(token)
             .fetch_all(&state.pg_pool)
@@ -152,8 +160,7 @@ async fn match_signals(
             // instead of a spec-parsing table scan.
             sqlx::query(
                 "SELECT token, tenant_id, spec_json FROM signal
-                 WHERE is_resume = FALSE
-                   AND access_id = ANY($1)
+                 WHERE access_id = ANY($1)
                    AND (spec_json::jsonb ->> 'kind') = 'provider_events'",
             )
             .bind(&access_ids)

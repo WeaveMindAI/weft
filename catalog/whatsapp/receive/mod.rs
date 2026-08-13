@@ -18,16 +18,21 @@ use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 #[derive(NodeManifest)]
 pub struct WhatsAppReceiveNode;
 
+#[cfg(feature = "node-tests")]
+mod tests;
+
 #[async_trait]
 impl Node for WhatsAppReceiveNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> {
+        tests::tests()
+    }
+
     // Registers the SSE signal; setup emits nothing downstream.
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let bridge: String = ctx.inputs.get("endpointUrl")?;
-        // `endpointUrl` is the bridge's bare endpoint URL (the bridge node
-        // exports `ctx.endpoint("api").url()`, no path). Append our route.
-        let events_url = format!("{}/events", bridge.trim_end_matches('/'));
         ctx.register_signal(SseSubscribe {
-            url: events_url,
+            url: super::bridge_api::route(&bridge, "/events"),
             event_name: "message.received".into(),
         })
         .await
@@ -69,7 +74,7 @@ impl Node for WhatsAppReceiveNode {
             // into execution storage via the language capability (it GETs,
             // derives the mime, streams in bounded-memory). The node only
             // builds the URL + a stable filename; no HTTP plumbing here.
-            let url = format!("{}/media/{}", bridge.trim_end_matches('/'), message_id);
+            let url = super::bridge_api::route(&bridge, &format!("/media/{message_id}"));
             let filename = format!("whatsapp-{message_id}");
             let file = ctx
                 .storage(weft::storage::StorageScope::Execution)

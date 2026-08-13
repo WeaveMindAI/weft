@@ -44,3 +44,37 @@ pub async fn emit(ctx: &ExecutionContext, kind: &str, connection_required: bool)
     }
     ctx.pulse_downstream(NodeOutput::new().set("provider", Value::Object(provider))).await
 }
+
+/// The wired `LlmProvider` object decoded for a single-service
+/// endpoint node (moderation, rerank, embeddings): refuses a provider
+/// of any other kind, and hands back the model and the picked
+/// connection. The one reader beside `call::assemble`, so the object
+/// has exactly two decoding paths (the multi-provider inference one
+/// and this single-service one), never a per-node copy. `what` names
+/// the capability ("moderation", "reranking", ...).
+pub fn read_for(
+    ctx: &ExecutionContext,
+    expected_kind: &str,
+    what: &str,
+) -> WeftResult<(String, Access)> {
+    let provider = ctx.inputs.nested("provider")?;
+    let kind: String = provider.get("kind")?;
+    if kind != expected_kind {
+        // Name the NODE the user has to wire, not the wire-level kind.
+        let (api, node) = match expected_kind {
+            "openai" => ("OpenAI", "OpenAIProvider"),
+            "openrouter" => ("OpenRouter", "OpenRouterProvider"),
+            "anthropic" => ("Anthropic", "AnthropicProvider"),
+            other => (other, other),
+        };
+        weft::node_bail!("{what} speaks the {api} API; wire an {node} (got '{kind}')");
+    }
+    let model: String = provider.get("model")?;
+    let account: Access = match provider.opt("account")? {
+        Some(a) => a,
+        None => weft::node_bail!(
+            "the wired LlmProvider object carries no connection; pick one on the provider node"
+        ),
+    };
+    Ok((model, account))
+}

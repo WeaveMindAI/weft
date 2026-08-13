@@ -204,6 +204,7 @@ pub async fn rehydrate(
             crate::kinds::RoutingSource::Restore {
                 routing,
                 kind_state: row.kind_state,
+                seq: row.kind_state_seq,
             },
             registry.clone(),
             sink.clone(),
