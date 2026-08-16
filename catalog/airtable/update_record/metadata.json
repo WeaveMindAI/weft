@@ -116,5 +116,8 @@
       "required": false,
       "description": "The updated record."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

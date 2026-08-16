@@ -65,5 +65,8 @@
       "required": false,
       "description": "The new page's link."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

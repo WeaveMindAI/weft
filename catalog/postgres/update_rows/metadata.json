@@ -59,5 +59,8 @@
       "type": "Number",
       "required": false
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

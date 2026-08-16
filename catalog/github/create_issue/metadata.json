@@ -71,5 +71,8 @@
       "required": false,
       "description": "The created issue's number."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

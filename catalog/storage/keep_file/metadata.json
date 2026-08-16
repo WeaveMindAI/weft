@@ -38,5 +38,8 @@
       "description": "The same reference, now flagged to survive the run."
     }
   ],
-  "requires_infra": false
+  "requires_infra": false,
+  "features": {
+    "isOutputDefault": true
+  }
 }

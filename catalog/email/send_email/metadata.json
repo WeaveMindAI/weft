@@ -63,5 +63,8 @@
       "required": false,
       "description": "The sent message's Message-ID header."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

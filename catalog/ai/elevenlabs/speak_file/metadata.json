@@ -140,5 +140,8 @@
   "display": {
     "kind": "media",
     "output": "file"
+  },
+  "features": {
+    "isOutputDefault": true
   }
 }

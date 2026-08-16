@@ -75,5 +75,8 @@
       "required": false,
       "description": "The minted agent's id: what Agent: Place Call takes."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

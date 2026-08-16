@@ -134,5 +134,8 @@
       "required": false,
       "description": "The scheduled message's id when postAt was set."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

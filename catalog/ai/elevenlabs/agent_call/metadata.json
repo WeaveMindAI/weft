@@ -96,5 +96,8 @@
       "required": false,
       "description": "The telephony call id (Twilio numbers)."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

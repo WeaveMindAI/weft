@@ -54,5 +54,8 @@
       "required": false,
       "description": "The updated message's timestamp id."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

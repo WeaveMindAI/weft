@@ -34,5 +34,7 @@
     }
   ],
   "requires_infra": false,
-  "features": {}
+  "features": {
+    "isOutputDefault": true
+  }
 }

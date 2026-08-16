@@ -44,5 +44,8 @@
       "required": false,
       "description": "The stored object's ETag."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

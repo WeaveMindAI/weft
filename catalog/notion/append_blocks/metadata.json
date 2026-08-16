@@ -54,5 +54,8 @@
       "required": false,
       "description": "How many blocks were appended."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

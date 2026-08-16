@@ -58,5 +58,8 @@
       "required": false,
       "description": "The generated previews: audio + the preview id Create Voice takes."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

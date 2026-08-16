@@ -57,5 +57,8 @@
       "required": false,
       "description": "The minted voice's id: what the speak nodes take."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

@@ -28,8 +28,27 @@
       "exposure": "config",
       "default": "fal-ai/flux/dev",
       "label": "Model",
-      "placeholder": "fal-ai/flux/dev",
-      "description": "The fal model route (fal.ai/models)."
+      "placeholder": "Pick a model, or paste a fal route",
+      "description": "The fal model route (fal.ai/models).",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.fal.ai/v1/models?status=active&category=text-to-image&q={query}",
+            "items": "models",
+            "label": "endpoint_id",
+            "value": "endpoint_id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "next_cursor"
+            },
+            "public": true
+          }
+        ]
+      }
     },
     {
       "name": "imageSize",
@@ -92,5 +111,8 @@
   "display": {
     "kind": "media",
     "output": "image"
+  },
+  "features": {
+    "isOutputDefault": true
   }
 }

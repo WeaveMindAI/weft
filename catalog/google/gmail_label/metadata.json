@@ -45,5 +45,8 @@
       "required": false,
       "description": "The message's label ids after the change."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

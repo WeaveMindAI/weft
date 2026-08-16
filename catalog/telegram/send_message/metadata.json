@@ -67,5 +67,8 @@
       "required": false,
       "description": "The sent message's id."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

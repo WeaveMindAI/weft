@@ -43,5 +43,8 @@
       "type": "String",
       "required": false
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

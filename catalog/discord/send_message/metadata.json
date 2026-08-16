@@ -47,5 +47,8 @@
       "required": false,
       "description": "The created message as Discord answered it."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

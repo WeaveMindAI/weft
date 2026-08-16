@@ -110,5 +110,8 @@
       "required": false,
       "description": "The created record (id, createdTime, fields)."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

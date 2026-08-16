@@ -120,5 +120,8 @@
       "type": "Boolean",
       "required": false
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

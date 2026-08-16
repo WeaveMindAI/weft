@@ -40,5 +40,8 @@
       "required": false,
       "description": "The inserted row as the database stored it."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

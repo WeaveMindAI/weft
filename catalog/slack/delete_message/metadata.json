@@ -41,5 +41,8 @@
       "required": false,
       "description": "True once the message is gone."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }

@@ -58,5 +58,8 @@
       "required": false,
       "description": "True once the reaction change landed."
     }
-  ]
+  ],
+  "features": {
+    "isOutputDefault": true
+  }
 }
