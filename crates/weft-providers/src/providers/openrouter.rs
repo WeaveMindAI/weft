@@ -225,7 +225,7 @@ impl ProviderMeter for OpenRouterMeter {
         Ok(estimate_cost_usd(&messages, &params, &rates))
     }
 
-    fn observe(&self, _path: &str) -> Box<dyn CallObservation> {
+    fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
         // Every billable route answers the same envelope (an id + a
         // `usage` block with the inline charge), streaming or not, so
         // one observation shape serves chat, embeddings, and rerank.
@@ -719,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_recorded_json_response_resolves_to_its_inline_cost() {
-        let mut obs = meter().observe("chat/completions");
+        let mut obs = meter().observe("chat/completions", "", b"");
         obs.on_status(200);
         // Feed in awkward pieces to prove reassembly.
         let bytes = RECORDED_JSON_RESPONSE.as_bytes();
@@ -746,7 +746,7 @@ mod tests {
             "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
             "usage": {"prompt_tokens": 12, "total_tokens": 12, "cost": 0.0000006}
         }"#;
-        let mut obs = meter().observe("embeddings");
+        let mut obs = meter().observe("embeddings", "", b"");
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
         let observed = obs.end(false);
@@ -768,7 +768,7 @@ mod tests {
             "results": [{"index": 2, "relevance_score": 0.98}],
             "usage": {"total_tokens": 340, "cost": 0.0025, "search_units": 1}
         }"#;
-        let mut obs = meter().observe("rerank");
+        let mut obs = meter().observe("rerank", "", b"");
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
         let observed = obs.end(false);
@@ -790,7 +790,7 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6,
                       "cost": 0.0, "cost_details": {"upstream_inference_cost": 0.00042}}
         }"#;
-        let mut obs = meter().observe("chat/completions");
+        let mut obs = meter().observe("chat/completions", "", b"");
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
@@ -810,7 +810,7 @@ mod tests {
             "data: {\"id\":\"gen-3\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11,\"cost\":0.000031,\"cost_details\":{\"upstream_inference_cost\":null}}}\n\n",
             "data: [DONE]\n\n",
         );
-        let mut obs = meter().observe("chat/completions");
+        let mut obs = meter().observe("chat/completions", "", b"");
         obs.on_status(200);
         // Split mid-line to prove the scanner reassembles across chunks.
         let bytes = stream.as_bytes();
@@ -830,7 +830,7 @@ mod tests {
     /// A refused call (non-2xx, no generation minted) is a KNOWN zero.
     #[tokio::test]
     async fn a_refused_call_is_a_known_zero() {
-        let mut obs = meter().observe("chat/completions");
+        let mut obs = meter().observe("chat/completions", "", b"");
         obs.on_status(401);
         obs.on_chunk(br#"{"error":{"message":"invalid key","code":401}}"#);
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
@@ -844,7 +844,7 @@ mod tests {
     /// never a fake $0.
     #[tokio::test]
     async fn an_unanchored_interrupt_is_unknown_not_zero() {
-        let obs = meter().observe("chat/completions");
+        let obs = meter().observe("chat/completions", "", b"");
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
         let cost = meter()
             .resolve("chat/completions", obs.end(true), FollowUp { http: &http, base_url: "http://u.test" })

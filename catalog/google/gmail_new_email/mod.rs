@@ -45,7 +45,7 @@ impl Node for GmailNewEmailNode {
                 cursor_param: None,
             }),
             access: Some(weft::primitive::AccessRef::from(&account)),
-            filters: Vec::new(),
+            ..Default::default()
         })
         .await
     }

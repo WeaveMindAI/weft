@@ -1,0 +1,69 @@
+{
+  "type": "NotionCreatePage",
+  "label": "Notion: Create Page",
+  "description": "Create a page under a parent page, with plain text (one paragraph per line) or raw Notion blocks as its body. Emits the new page's id and link.",
+  "tags": [
+    "notion",
+    "page"
+  ],
+  "icon": "FilePlus",
+  "color": "#37352f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Notion access (wire a NotionAccess node)."
+    },
+    {
+      "name": "parentPage",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "from_url",
+            "pattern": "([0-9a-fA-F]{32})"
+          }
+        ]
+      },
+      "label": "Parent page",
+      "placeholder": "Paste the parent page's link or id",
+      "description": "The page the new page is created under (the connection must have access to it)."
+    },
+    {
+      "name": "title",
+      "type": "String",
+      "required": true,
+      "description": "The new page's title."
+    },
+    {
+      "name": "content",
+      "type": "String",
+      "required": false,
+      "description": "Plain-text body: one paragraph per line."
+    },
+    {
+      "name": "blocks",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Raw Notion block objects; overrides content when set."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "pageId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "url",
+      "type": "String",
+      "required": false,
+      "description": "The new page's link."
+    }
+  ]
+}

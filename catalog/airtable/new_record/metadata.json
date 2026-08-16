@@ -1,0 +1,122 @@
+{
+  "type": "AirtableNewRecord",
+  "label": "Airtable: On New Record",
+  "description": "Fires once per record added to a table. The table needs a Created time column to sort on (add one if it has none); activation starts from now and the position survives restarts.",
+  "tags": [
+    "airtable",
+    "record",
+    "trigger"
+  ],
+  "icon": "BellPlus",
+  "color": "#f82b60",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "data.records:read"
+      ],
+      "description": "The Airtable access (wire an AirtableAccess node)."
+    },
+    {
+      "name": "base",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "schema.bases:read"
+            ],
+            "get": "https://api.airtable.com/v0/meta/bases",
+            "items": "bases",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "offset",
+              "cursor_path": "offset"
+            }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "(app[A-Za-z0-9]+)"
+          }
+        ]
+      },
+      "label": "Base",
+      "placeholder": "Pick a base, or paste its link"
+    },
+    {
+      "name": "table",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "base"
+        ],
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "schema.bases:read"
+            ],
+            "get": "https://api.airtable.com/v0/meta/bases/{base}/tables",
+            "items": "tables",
+            "label": "name",
+            "value": "id"
+          },
+          {
+            "kind": "from_url",
+            "pattern": "(tbl[A-Za-z0-9]+)"
+          }
+        ]
+      },
+      "label": "Table",
+      "placeholder": "Pick a table, or paste its link"
+    },
+    {
+      "name": "createdField",
+      "type": "String",
+      "exposure": "config",
+      "default": "Created",
+      "label": "Created time column",
+      "description": "The table's Created time column, sorted on to spot new records."
+    },
+    {
+      "name": "intervalSecs",
+      "type": "Number",
+      "exposure": "config",
+      "default": 30,
+      "label": "Check every (seconds)",
+      "description": "How often the table is checked for new records."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "record",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The new record (id, createdTime, fields)."
+    },
+    {
+      "name": "recordId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "fields",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The new record's fields keyed by column name."
+    }
+  ],
+  "features": {
+    "isTrigger": true
+  }
+}

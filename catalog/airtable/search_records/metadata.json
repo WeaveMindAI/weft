@@ -1,0 +1,122 @@
+{
+  "type": "AirtableSearchRecords",
+  "label": "Airtable: Search Records",
+  "description": "Read records out of a table, optionally narrowed by an Airtable formula (e.g. {Stage} = 'Lead') and a view.",
+  "tags": [
+    "airtable",
+    "record",
+    "search"
+  ],
+  "icon": "TableCellsSplit",
+  "color": "#f82b60",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "data.records:read"
+      ],
+      "description": "The Airtable access (wire an AirtableAccess node)."
+    },
+    {
+      "name": "base",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "schema.bases:read"
+            ],
+            "get": "https://api.airtable.com/v0/meta/bases",
+            "items": "bases",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "offset",
+              "cursor_path": "offset"
+            }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "(app[A-Za-z0-9]+)"
+          }
+        ]
+      },
+      "label": "Base",
+      "placeholder": "Pick a base, or paste its link"
+    },
+    {
+      "name": "table",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "base"
+        ],
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "schema.bases:read"
+            ],
+            "get": "https://api.airtable.com/v0/meta/bases/{base}/tables",
+            "items": "tables",
+            "label": "name",
+            "value": "id"
+          },
+          {
+            "kind": "from_url",
+            "pattern": "(tbl[A-Za-z0-9]+)"
+          }
+        ]
+      },
+      "label": "Table",
+      "placeholder": "Pick a table, or paste its link"
+    },
+    {
+      "name": "filterByFormula",
+      "type": "String",
+      "required": false,
+      "description": "Airtable formula the records must match, e.g. {Stage} = 'Lead'."
+    },
+    {
+      "name": "view",
+      "type": "String",
+      "required": false,
+      "description": "A view's name or id: only its records, in its order."
+    },
+    {
+      "name": "maxRecords",
+      "type": "Number",
+      "exposure": "config",
+      "default": 100,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 1000,
+        "step": 1
+      },
+      "label": "Max records"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "records",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "The matching records (id, createdTime, fields)."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "type": "FalGenerateImage",
+  "label": "Generate Image",
+  "description": "Generate images from a text prompt through fal.ai. The knobs target the default model; any fal image model works by setting its id and passing model-specific extras in params.",
+  "tags": [
+    "ai",
+    "image",
+    "generation"
+  ],
+  "icon": "ImagePlus",
+  "color": "#7c3aed",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The fal access (wire a FalAccess node)."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "What the image should show."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "fal-ai/flux/dev",
+      "label": "Model",
+      "placeholder": "fal-ai/flux/dev",
+      "description": "The fal model route (fal.ai/models)."
+    },
+    {
+      "name": "imageSize",
+      "type": "String",
+      "exposure": "config",
+      "default": "landscape_4_3",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "square_hd",
+          "square",
+          "portrait_4_3",
+          "portrait_16_9",
+          "landscape_4_3",
+          "landscape_16_9"
+        ]
+      },
+      "label": "Image size"
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "exposure": "config",
+      "default": 1,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 8,
+        "step": 1
+      },
+      "label": "Images"
+    },
+    {
+      "name": "seed",
+      "type": "Number",
+      "required": false,
+      "description": "Fixed seed for reproducible output."
+    },
+    {
+      "name": "params",
+      "type": "JsonDict",
+      "required": false,
+      "description": "Model-specific extras merged into the request (guidance_scale, num_inference_steps, ...). Declared knobs win."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "images",
+      "type": "List[Image]",
+      "required": false,
+      "description": "Every generated image."
+    },
+    {
+      "name": "image",
+      "type": "Image",
+      "required": false,
+      "description": "The first generated image."
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "image"
+  }
+}

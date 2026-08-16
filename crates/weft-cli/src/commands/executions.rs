@@ -134,7 +134,8 @@ pub async fn clean(
 ///
 /// Then (with `--all`, kind backend only) the kind node's own cached worker
 /// images get the same treatment, computed from the node's own list (see
-/// `stale_worker_node_refs`); system images are never touched there, and a
+/// `images::kind_node_image_tag_groups` + `images::node_images_condemned`);
+/// system images are never touched there, and a
 /// scoped (non-`--all`) run skips the node because crictl cannot see the
 /// per-project build labels. Without `--all`, the host side is scoped to
 /// the cwd project's images (label filter).
@@ -287,9 +288,9 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     if cfg.backend != ClusterBackend::Kind {
         return Ok(());
     }
-    let node_stale = crate::images::node_refs_matching(
+    let node_stale = crate::images::node_images_condemned(
         weft_compiler::build::WORKER_IMAGE_REPO,
-        &crate::images::kind_node_repo_tags(&cfg.cluster_name).await?,
+        &crate::images::kind_node_image_tag_groups(&cfg.cluster_name).await?,
         |hash| !referenced.contains(hash),
     );
     if !node_stale.is_empty() {
@@ -372,33 +373,62 @@ async fn clean_build_cache() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Only the named repo's tags leave the shared matcher, and only the
-    /// condemned ones: the system images (listener & co) must NEVER be
-    /// node-pruned (a blanket prune once stranded on-demand listener pods
-    /// in ImagePullBackOff), and a referenced worker must survive. All
-    /// three ref spellings are handled: bare, docker-canonical, and
+    /// Only the named repo's images leave the shared matcher, and only
+    /// fully condemned ones: the system images (listener & co) must NEVER
+    /// be node-pruned (a blanket prune once stranded on-demand listener
+    /// pods in ImagePullBackOff), and a referenced worker must survive.
+    /// All three ref spellings are handled: bare, docker-canonical, and
     /// registry-qualified with a host:port.
     #[test]
-    fn node_cleanup_targets_only_unreferenced_worker_tags() {
-        let refs: Vec<String> = [
-            "docker.io/library/weft-listener:local",
-            "docker.io/library/weft-worker:aaa111",
-            "docker.io/library/weft-worker:bbb222",
-            "registry.example.com:5000/weft-images/weft-worker:ccc333",
-            "weft-worker:ddd444",
-            "docker.io/library/debian:bookworm-slim",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    fn node_cleanup_targets_only_unreferenced_worker_images() {
+        let one = |s: &str| vec![s.to_string()];
+        let groups: Vec<Vec<String>> = vec![
+            one("docker.io/library/weft-listener:local"),
+            one("docker.io/library/weft-worker:aaa111"),
+            one("docker.io/library/weft-worker:bbb222"),
+            one("registry.example.com:5000/weft-images/weft-worker:ccc333"),
+            one("weft-worker:ddd444"),
+            one("docker.io/library/debian:bookworm-slim"),
+        ];
         let referenced: std::collections::BTreeSet<String> =
             ["aaa111".to_string(), "ccc333".to_string()].into_iter().collect();
         assert_eq!(
-            crate::images::node_refs_matching("weft-worker", &refs, |h| !referenced.contains(h)),
+            crate::images::node_images_condemned("weft-worker", &groups, |h| !referenced
+                .contains(h)),
             vec![
                 "docker.io/library/weft-worker:bbb222".to_string(),
                 "weft-worker:ddd444".to_string(),
             ]
+        );
+    }
+
+    /// `crictl rmi` removes the whole image behind a ref, so an image
+    /// carrying a live tag alongside a condemned one (identical content
+    /// loaded under two tags) must survive untouched; per-tag removal
+    /// once deleted a freshly loaded test image this way.
+    #[test]
+    fn node_cleanup_spares_images_sharing_a_live_tag() {
+        let groups: Vec<Vec<String>> = vec![
+            vec![
+                "docker.io/library/weft-worker:stale1".to_string(),
+                "docker.io/library/weft-worker:live1".to_string(),
+            ],
+            vec![
+                "docker.io/library/weft-worker:stale2".to_string(),
+                "docker.io/library/weft-listener:local".to_string(),
+            ],
+            vec![
+                "docker.io/library/weft-worker:stale3".to_string(),
+                "weft-worker:stale4".to_string(),
+            ],
+        ];
+        let live: std::collections::BTreeSet<String> = ["live1".to_string()].into_iter().collect();
+        assert_eq!(
+            crate::images::node_images_condemned("weft-worker", &groups, |h| !live.contains(h)),
+            // Only the all-condemned image goes (one ref suffices: the
+            // rmi takes the whole image with it); the live-tag and the
+            // other-repo-tag images both survive.
+            vec!["docker.io/library/weft-worker:stale3".to_string()]
         );
     }
 }

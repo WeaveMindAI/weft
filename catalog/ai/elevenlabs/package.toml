@@ -1,7 +1,9 @@
 [package]
 name = "elevenlabs"
 
-# The ElevenLabs nodes: audio AI (realtime transcription today). They
+# The ElevenLabs nodes: speech synthesis (batch and streaming),
+# transcription, dubbing, alignment, voice management, and the
+# conversational agents. They
 # speak to ElevenLabs specifically (its realtime protocol, its API key),
 # which is why they are named for it rather than for "speech" in
 # general: another provider is another protocol and another key.

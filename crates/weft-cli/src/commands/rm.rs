@@ -1,5 +1,5 @@
-//! `weft rm [project] [--infra] [--journal] [--image] [--local]
-//! [--all]`: multi-level project cleanup.
+//! `weft rm [project] [--infra] [--journal] [--local] [--all]`:
+//! multi-level project cleanup.
 //!
 //! Levels, cheapest to most-destructive:
 //!
@@ -8,26 +8,24 @@
 //! | (none)      | deactivate + unregister on dispatcher                  |
 //! | `--infra`   | also terminate infra pods (deletes PVCs, auth gone)      |
 //! | `--journal` | also drop this project's execution + log rows          |
-//! | `--image`   | also remove every `weft-worker-<id>:*` tag from docker+kind |
 //! | `--local`   | also wipe `.weft/target/` under the cwd project        |
-//! | `--all`     | implies the four levels above                          |
+//! | `--all`     | implies the three levels above                         |
 //!
 //! Flags are additive. `--all` is pure sugar. The default
-//! (no-arg, no-flag) is safe: the user's k8s infra and cached
-//! images survive unless they explicitly ask for those levels.
+//! (no-arg, no-flag) is safe: the user's k8s infra survives unless
+//! they explicitly ask for those levels. Worker images are content
+//! addressed and shared across projects, so no per-project level can
+//! reclaim them; `weft clean --images` is the reclaimer.
 
 use anyhow::{Context, Result};
-use tokio::process::Command;
 
 use super::{resolve_project_id, Ctx};
-use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::progress::{ActionVerb, Progress};
 
 pub struct RmArgs {
     pub project: Option<String>,
     pub infra: bool,
     pub journal: bool,
-    pub image: bool,
     pub local: bool,
     pub all: bool,
     /// `weft rm --force`: skip the supervisor terminate-wait window.
@@ -39,7 +37,6 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         project,
         mut infra,
         mut journal,
-        mut image,
         mut local,
         all,
         force,
@@ -47,7 +44,6 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     if all {
         infra = true;
         journal = true;
-        image = true;
         local = true;
     }
 
@@ -110,9 +106,6 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         if journal {
             drop_journal_rows(&progress, &client, &project_id).await?;
         }
-        if image {
-            remove_worker_image(&progress, &project_id).await?;
-        }
         if local {
             wipe_local_artifacts(&ctx, &progress)?;
         }
@@ -158,65 +151,6 @@ async fn drop_journal_rows(
     progress.dispatcher_call_done(serde_json::json!({
         "step": "journal_drop",
         "dropped": dropped,
-    }));
-    Ok(())
-}
-
-async fn remove_worker_image(progress: &Progress, project_id: &str) -> Result<()> {
-    // Worker tags are `weft-worker-<id>:<short-hash>`; the hash
-    // changes every rebuild. List every tag for the project and rmi
-    // each one.
-    let repo = format!("weft-worker-{project_id}");
-    let listing = Command::new("docker")
-        .args(["images", "--format", "{{.Repository}}:{{.Tag}}", &repo])
-        .output()
-        .await
-        .context("docker images")?;
-    if !listing.status.success() {
-        anyhow::bail!(
-            "docker images failed: {}",
-            String::from_utf8_lossy(&listing.stderr)
-        );
-    }
-    let tags: Vec<String> = String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.starts_with(&format!("{repo}:")))
-        .collect();
-    if tags.is_empty() {
-        progress.dispatcher_call_done(serde_json::json!({
-            "step": "image_remove",
-            "removed": 0,
-        }));
-        return Ok(());
-    }
-    for tag in &tags {
-        let st = Command::new("docker")
-            .args(["image", "rm", "-f", tag])
-            .status()
-            .await
-            .with_context(|| format!("docker image rm {tag}"))?;
-        if !st.success() {
-            anyhow::bail!("docker image rm {tag} exited {st}");
-        }
-    }
-    let cfg = cluster_config();
-    if cfg.backend == ClusterBackend::Kind {
-        let node = format!("{}-control-plane", cfg.cluster_name);
-        for tag in &tags {
-            // crictl rmi is best-effort: if the kind cluster isn't
-            // running OR doesn't have this image cached, that's
-            // fine. The tag is gone from the docker host already,
-            // which is what matters for the next rebuild.
-            let _ = Command::new("docker")
-                .args(["exec", &node, "crictl", "rmi", tag])
-                .status()
-                .await;
-        }
-    }
-    progress.dispatcher_call_done(serde_json::json!({
-        "step": "image_remove",
-        "removed": tags.len(),
     }));
     Ok(())
 }

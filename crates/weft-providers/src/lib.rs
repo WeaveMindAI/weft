@@ -212,8 +212,14 @@ pub trait ProviderMeter: Send + Sync {
     }
 
     /// A fresh observer for one Billable call's response, on `path`
-    /// (relative, as [`Self::classify`] receives it).
-    fn observe(&self, path: &str) -> Box<dyn CallObservation>;
+    /// (relative, as [`Self::classify`] receives it). `query` is the
+    /// request URL's raw query string (no leading '?') and
+    /// `request_body` the bytes actually sent (after [`Self::prepare`]),
+    /// because some routes' cost is a function of the REQUEST (a TTS
+    /// call prices its text's characters; an output format in the
+    /// query decides bytes-per-second); routes priced purely off the
+    /// response ignore both.
+    fn observe(&self, path: &str, query: &str, request_body: &[u8]) -> Box<dyn CallObservation>;
 
     /// A fresh observer for one session on a `BillableSession` route.
     /// `query` is the raw query string of the session URL (no leading

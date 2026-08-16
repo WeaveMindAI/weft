@@ -33,8 +33,19 @@ export function guideSteps(spec: AccessSpecWire, ticked: string[]): string[] {
 	return steps.map((s) => s.replaceAll('{permissions}', labels));
 }
 
-// The catalogue entries that start ticked.
+// The catalogue entries that start ticked. Own-account-only entries
+// are capability declarations, never consent asks, so they are never
+// ticked.
 // SYNC: defaultPermissions <-> crates/weft-core/src/access/spec.rs AccessSpec::default_permissions
 export function defaultPermissions(spec: AccessSpecWire): string[] {
-	return (spec.permissions ?? []).filter((p) => p.default).map((p) => p.id);
+	return (spec.permissions ?? [])
+		.filter((p) => p.default && !p.own_only)
+		.map((p) => p.id);
+}
+
+// The catalogue entries the consent/tick surfaces show: everything
+// except own-account-only capabilities (those surface as their own
+// tutorial sections instead).
+export function tickablePermissions(spec: AccessSpecWire) {
+	return (spec.permissions ?? []).filter((p) => !p.own_only);
 }

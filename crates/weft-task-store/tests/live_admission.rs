@@ -1097,6 +1097,100 @@ async fn orphan_sweep_requeues_non_live_task(pool: PgPool) {
     assert_eq!(status, "pending");
 }
 
+/// A DISPATCHER-target task in flight is untouched by the sweep: its
+/// claimant is a dispatcher pod, which never has a `worker_pod` row, so
+/// the "claimed by a non-routable pod" predicate must not apply (it
+/// would yank every running dispatcher task back to pending mid-run and
+/// a second claim would race the first). A dead dispatcher's tasks are
+/// recovered by lease expiry instead.
+#[sqlx::test]
+async fn orphan_sweep_leaves_dispatcher_claimed_tasks_alone(pool: PgPool) {
+    setup(&pool).await;
+    tasks::enqueue(
+        &pool,
+        tasks::NewTask {
+            kind: TaskKind::FireSignal.into(),
+            target: TaskTarget::Dispatcher,
+            project_id: Some(PROJECT.to_string()),
+            dedup_key: None,
+            color: None,
+            tenant_id: TENANT.map(str::to_string),
+            target_pod_name: None,
+            binary_hash: None,
+            payload: json!({}),
+        },
+    )
+    .await
+    .expect("enqueue");
+    let task = claim_one(&pool, "weft-dispatcher-0", ClaimFilter::Dispatcher)
+        .await
+        .expect("claim")
+        .expect("claimed");
+
+    let orphans = reclaim_orphaned_tasks(&pool).await.expect("reclaim");
+    assert!(orphans.is_empty());
+    let (status, claimed_by): (String, Option<String>) =
+        sqlx::query_as("SELECT status, claimed_by FROM task WHERE id = $1")
+            .bind(task.id)
+            .fetch_one(&pool)
+            .await
+            .expect("row");
+    assert_eq!(status, "claimed", "the running dispatcher task keeps its claim");
+    assert_eq!(claimed_by.as_deref(), Some("weft-dispatcher-0"));
+}
+
+/// The recovery path the orphan sweep defers to: a dispatcher pod that
+/// died mid-task leaves its row claimed, and the claim's lapsed lease
+/// (not the sweep) hands the row to a sibling pod via `claim_one`.
+/// While the lease is live, no sibling can steal the row.
+#[sqlx::test]
+async fn expired_dispatcher_claim_is_rescued_by_the_next_claim(pool: PgPool) {
+    setup(&pool).await;
+    tasks::enqueue(
+        &pool,
+        tasks::NewTask {
+            kind: TaskKind::FireSignal.into(),
+            target: TaskTarget::Dispatcher,
+            project_id: Some(PROJECT.to_string()),
+            dedup_key: None,
+            color: None,
+            tenant_id: TENANT.map(str::to_string),
+            target_pod_name: None,
+            binary_hash: None,
+            payload: json!({}),
+        },
+    )
+    .await
+    .expect("enqueue");
+    let task = claim_one(&pool, "weft-dispatcher-0", ClaimFilter::Dispatcher)
+        .await
+        .expect("claim")
+        .expect("claimed");
+
+    let stolen = claim_one(&pool, "weft-dispatcher-1", ClaimFilter::Dispatcher)
+        .await
+        .expect("claim");
+    assert!(stolen.is_none(), "a live claim is not stealable");
+
+    // The pod died: no heartbeat renews the lease, so it lapses.
+    sqlx::query("UPDATE task SET claimed_until_unix = $1 WHERE id = $2")
+        .bind(now_unix() - 1)
+        .bind(task.id)
+        .execute(&pool)
+        .await
+        .expect("expire");
+
+    let orphans = reclaim_orphaned_tasks(&pool).await.expect("reclaim");
+    assert!(orphans.is_empty(), "the sweep still leaves dispatcher rows alone");
+
+    let rescued = claim_one(&pool, "weft-dispatcher-1", ClaimFilter::Dispatcher)
+        .await
+        .expect("claim")
+        .expect("a lapsed claim is re-claimable");
+    assert_eq!(rescued.id, task.id);
+    assert_eq!(rescued.attempts, 2, "the rescue counts as a second claim");
+}
+
 // ----- current-image gating (stale-image pods take no NEW work) ------------
 
 /// An UNPINNED worker task stamped with a `binary_hash` is invisible to a

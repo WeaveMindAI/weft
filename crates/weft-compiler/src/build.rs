@@ -309,15 +309,46 @@ pub fn node_test_content_hash(
     package_name: &str,
 ) -> CompileResult<crate::hash::SourceHash> {
     let weft_root = resolve_weft_root()?;
-    let package_root = catalog
+    let package_root = package_root(catalog, package_name)?;
+    crate::hash::compute_node_test_hash(&package_root, project, &weft_root, catalog)
+        .map_err(|e| CompileError::Build(format!("compute node-test hash: {e}")))
+}
+
+/// Content hash of everything that can change a package's node-test
+/// OUTCOME: the package's own sources (every member's mod.rs /
+/// metadata.json / tests.rs plus the package's shared files) and the
+/// catalog's type registry (a sibling's type edit changes how this
+/// package's ports resolve). The staleness rule for the live-pass
+/// cache and the test-listing cache, via `weft node-test-hash`.
+/// Deliberately narrower than [`node_test_content_hash`] (the image
+/// tag): live tests spend real provider money, so an engine or
+/// image-recipe edit (which rightly rebuilds the test image) does not
+/// by itself invalidate a recorded live pass.
+pub fn node_test_cache_hash(
+    project: &Project,
+    catalog: &FsCatalog,
+    package_name: &str,
+) -> CompileResult<crate::hash::SourceHash> {
+    let weft_root = resolve_weft_root()?;
+    let package_root = package_root(catalog, package_name)?;
+    crate::hash::compute_node_test_outcome_hash(
+        &package_root,
+        &[project.root.as_path(), weft_root.as_path()],
+        catalog,
+    )
+    .map_err(|e| CompileError::Build(format!("compute node-test cache hash: {e}")))
+}
+
+/// The filesystem root of `package_name`, or a loud error naming the
+/// project's nodes/ as the place it was looked for.
+fn package_root(catalog: &FsCatalog, package_name: &str) -> CompileResult<PathBuf> {
+    catalog
         .packages()
         .find(|p| p.name == package_name)
         .map(|p| p.root.clone())
         .ok_or_else(|| {
             CompileError::Build(format!("no package named '{package_name}' in this project's nodes/"))
-        })?;
-    crate::hash::compute_node_test_hash(&package_root, project, &weft_root, catalog)
-        .map_err(|e| CompileError::Build(format!("compute node-test hash: {e}")))
+        })
 }
 
 /// Top-level entries of a closure crate that enter the worker slice:

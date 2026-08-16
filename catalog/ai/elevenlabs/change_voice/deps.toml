@@ -1,0 +1,3 @@
+# The output format rides the speech-to-speech URL's query string.
+[dependencies]
+urlencoding = "2"

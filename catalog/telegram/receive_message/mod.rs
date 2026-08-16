@@ -66,6 +66,7 @@ impl Node for TelegramReceiveMessageNode {
             }),
             access: Some(weft::primitive::AccessRef::from(&account)),
             filters,
+            ..Default::default()
         })
         .await
     }

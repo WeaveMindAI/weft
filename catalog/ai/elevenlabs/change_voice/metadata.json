@@ -1,0 +1,116 @@
+{
+  "type": "ElevenLabsChangeVoice",
+  "label": "Change Voice",
+  "description": "Re-voice a recording: the words, timing, and emotion stay, the voice becomes the one you pick. Audio file in, audio file out.",
+  "tags": [
+    "ai",
+    "audio",
+    "voice"
+  ],
+  "icon": "Replace",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
+    },
+    {
+      "name": "audio",
+      "type": "Audio",
+      "required": true,
+      "description": "The recording to re-voice."
+    },
+    {
+      "name": "voice",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/voices",
+            "items": "voices",
+            "label": "name",
+            "value": "voice_id"
+          }
+        ]
+      },
+      "label": "Voice",
+      "placeholder": "Pick a voice, or paste a voice id"
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "eleven_multilingual_sts_v2",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "eleven_multilingual_sts_v2",
+          "eleven_english_sts_v2"
+        ]
+      },
+      "label": "Model"
+    },
+    {
+      "name": "outputFormat",
+      "type": "String",
+      "exposure": "config",
+      "default": "mp3_44100_128",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "mp3_44100_128",
+          "mp3_44100_192",
+          "pcm_16000",
+          "pcm_44100",
+          "ulaw_8000"
+        ]
+      },
+      "label": "Output format"
+    },
+    {
+      "name": "removeBackgroundNoise",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Remove background noise",
+      "description": "Clean the recording before re-voicing."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "Audio",
+      "required": false,
+      "description": "The re-voiced audio."
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "file"
+  }
+}

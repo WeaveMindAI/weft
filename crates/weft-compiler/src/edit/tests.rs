@@ -355,7 +355,7 @@ fn set_config_writes_a_multiline_object_value_everywhere() {
     let marker = "{\n  \"__weft_image__\": {\n    \"key\": \"local/project/p/abc\",\n    \"mimeType\": \"image/png\",\n    \"sizeBytes\": 52,\n    \"filename\": \"x.png\"\n  }\n}";
 
     // Bodyless node (insert synthesizes the body).
-    let src = "pick = ImagePick\nshow = ImageDisplay\n\nshow.image = pick.image\n";
+    let src = "pick = ImagePick\nshow = MediaDisplay\n\nshow.media = pick.image\n";
     let out = apply(src, vec![EditOp::SetConfig { node: "pick".into(), key: "file".into(), value: marker.into(), form: None }]);
     parse_ok(&out);
     assert!(out.contains("__weft_image__"), "{out}");

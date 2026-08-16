@@ -1,0 +1,91 @@
+{
+  "type": "ElevenLabsMusic",
+  "label": "Compose Music",
+  "description": "Generate a music track from a text prompt, in any style, with or without vocals. Emits the audio file.",
+  "tags": [
+    "ai",
+    "audio",
+    "music"
+  ],
+  "icon": "Music",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "What the track should sound like: style, mood, instruments, lyrics.",
+      "placeholder": "A slow lo-fi hip hop beat with warm piano chords"
+    },
+    {
+      "name": "lengthSecs",
+      "type": "Number",
+      "required": false,
+      "widget": {
+        "kind": "number",
+        "min": 3,
+        "max": 600,
+        "step": 1
+      },
+      "description": "Track length in seconds (3 to 600). Absent = the model picks."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "music_v1",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "music_v1",
+          "music_v2"
+        ]
+      },
+      "label": "Model"
+    },
+    {
+      "name": "forceInstrumental",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Instrumental only",
+      "description": "Never generate vocals."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "Audio",
+      "required": false,
+      "description": "The composed track."
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "file"
+  }
+}

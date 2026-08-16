@@ -1,0 +1,9 @@
+[package]
+name = "notion"
+
+# The Notion nodes: pages, databases (data sources), and the new-item
+# trigger, over Notion's public API (version 2025-09-03, the
+# data-source model).
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"

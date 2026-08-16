@@ -1,0 +1,121 @@
+{
+  "type": "NotionAccess",
+  "label": "Notion Access",
+  "description": "Connect a Notion workspace: sign in through Notion's consent page (picking which pages the connection can see), or paste an internal integration token. Wire the access output into every Notion node.",
+  "tags": [
+    "notion",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#37352f",
+  "service": {
+    "service": "notion",
+    "label": "Notion",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "callback_https": true,
+    "acquisition": {
+      "kind": "oauth2",
+      "grant": {
+        "kind": "authorization_code",
+        "auth_url": "https://api.notion.com/v1/oauth/authorize",
+        "pkce": false
+      },
+      "token_url": "https://api.notion.com/v1/oauth/token",
+      "token_auth": "basic",
+      "auth_params": {
+        "owner": "user"
+      },
+      "captures": [
+        {
+          "name": "workspace",
+          "path": "workspace_name",
+          "optional": true
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {token}"
+      },
+      {
+        "kind": "header",
+        "name": "Notion-Version",
+        "value": "2025-09-03"
+      }
+    ],
+    "test": {
+      "url": "https://api.notion.com/v1/users/me",
+      "captures": [
+        {
+          "name": "workspace",
+          "path": "bot.workspace_name",
+          "optional": true
+        }
+      ]
+    },
+    "identity": "{workspace}",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "paste": {
+        "fields": [
+          {
+            "name": "token",
+            "label": "Internal integration token",
+            "placeholder": "ntn_..."
+          }
+        ]
+      },
+      "guide": {
+        "link": "https://www.notion.so/my-integrations",
+        "steps": [
+          "Open notion.so/my-integrations and create an internal integration in your workspace.",
+          "Copy its Internal Integration Secret and paste it below.",
+          "In Notion, open each page or database the project should reach and share it with the integration (... menu > Connections)."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Workspace"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The Notion access: wire it into the Notion nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "NotionAccess '{id}' has no connected workspace; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

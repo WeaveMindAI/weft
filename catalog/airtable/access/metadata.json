@@ -1,0 +1,127 @@
+{
+  "type": "AirtableAccess",
+  "label": "Airtable Access",
+  "description": "Connect an Airtable account: sign in through Airtable's consent page (picking which bases the connection can reach), or paste a personal access token. Wire the access output into every Airtable node.",
+  "tags": [
+    "airtable",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#f82b60",
+  "service": {
+    "service": "airtable",
+    "label": "Airtable",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "callback_https": true,
+    "acquisition": {
+      "kind": "oauth2",
+      "grant": {
+        "kind": "authorization_code",
+        "auth_url": "https://airtable.com/oauth2/v1/authorize",
+        "pkce": true
+      },
+      "token_url": "https://airtable.com/oauth2/v1/token",
+      "token_auth": "basic"
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Bearer {token}"
+      }
+    ],
+    "test": {
+      "url": "https://api.airtable.com/v0/meta/whoami",
+      "captures": [
+        {
+          "name": "email",
+          "path": "email",
+          "optional": true
+        }
+      ]
+    },
+    "identity": "{email}",
+    "permissions": [
+      {
+        "id": "data.records:read",
+        "label": "Read records",
+        "description": "Read records out of the shared bases.",
+        "default": true
+      },
+      {
+        "id": "data.records:write",
+        "label": "Write records",
+        "description": "Create and change records in the shared bases.",
+        "default": true
+      },
+      {
+        "id": "schema.bases:read",
+        "label": "List bases and tables",
+        "description": "See the shared bases' names and table layouts (what the pickers browse).",
+        "default": true
+      }
+    ],
+    "all_permissions_url": "https://airtable.com/developers/web/api/scopes",
+    "verification": {
+      "rung": "reports_permissions",
+      "cost": "free"
+    },
+    "own_page": {
+      "paste": {
+        "fields": [
+          {
+            "name": "token",
+            "label": "Personal access token",
+            "placeholder": "pat..."
+          }
+        ]
+      },
+      "guide": {
+        "link": "https://airtable.com/create/tokens",
+        "steps": [
+          "Open airtable.com/create/tokens and create a personal access token.",
+          "Give it the data.records:read, data.records:write, and schema.bases:read scopes, and add the bases it should reach.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The Airtable access: wire it into the Airtable nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "AirtableAccess '{id}' has no connected account; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

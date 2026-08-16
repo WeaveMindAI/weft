@@ -407,17 +407,23 @@ mod fs_hashes {
         Ok(())
     }
 
-    /// Content hash of ONE node package root: the unit that compiles
-    /// together (mod.rs, metadata.json, deps.toml, shared package files).
-    /// Same folding + same relative-path labeling as the binary hash's
-    /// package section, so the digest is machine-independent and stable
-    /// for an unmodified catalog node across projects. This is the
-    /// content address OF a node's code; consumers use it wherever "this
-    /// exact node source" must be named (caching, review, provenance).
-    pub fn compute_node_package_hash(root: &Path, bases: &[&Path]) -> Result<SourceHash> {
+    /// Content hash of everything that can change a package's node-test
+    /// OUTCOME: the package's own sources plus the catalog's nominal
+    /// type registry (the test binary bakes EVERY package's type
+    /// declarations and resolves this package's port types through
+    /// them, so a sibling's type edit changes this package's results).
+    /// Excludes the image recipe and the worker build environment on
+    /// purpose: those rebuild the test image without changing what a
+    /// test does, and live tests spend real provider money.
+    pub fn compute_node_test_outcome_hash(
+        package_root: &Path,
+        bases: &[&Path],
+        catalog: &FsCatalog,
+    ) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-node-package-v1\n");
-        hash_package_roots(&mut hasher, std::slice::from_ref(&root.to_path_buf()), bases)?;
+        hasher.update(b"weft-node-test-outcome-v1\n");
+        hash_package_roots(&mut hasher, std::slice::from_ref(&package_root.to_path_buf()), bases)?;
+        hash_type_registry(&mut hasher, catalog);
         Ok(hex(&hasher.finalize()))
     }
 

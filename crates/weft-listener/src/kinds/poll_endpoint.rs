@@ -137,7 +137,20 @@ fn spawn_loop(
                     continue;
                 }
             };
-            let resp = match client.get(&tick_url).send().await {
+            // The verb and body are part of the registered recipe: a
+            // POST feed (a query endpoint) sends its declared body
+            // every tick, a GET feed sends the bare URL.
+            let request = match poll.method {
+                weft_core::signal::PollMethod::Get => client.get(&tick_url),
+                weft_core::signal::PollMethod::Post => {
+                    let req = client.post(&tick_url);
+                    match &poll.body {
+                        Some(b) => req.json(b),
+                        None => req,
+                    }
+                }
+            };
+            let resp = match request.send().await {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
                     fail(&mut consecutive_failures, &url, "non-success poll", r.status().to_string());
@@ -166,13 +179,23 @@ fn spawn_loop(
             };
 
             // Delta mode: fire once per NEW item, then persist the
-            // advanced cursor.
-            let parsed: Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    fail(&mut consecutive_failures, &url, "delta poll needs a JSON response", e.to_string());
-                    continue;
-                }
+            // advanced cursor. The declared format decides how the
+            // body becomes the item-bearing JSON.
+            let parsed: Value = match poll.format {
+                weft_core::signal::PollFormat::Json => match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        fail(&mut consecutive_failures, &url, "delta poll needs a JSON response", e.to_string());
+                        continue;
+                    }
+                },
+                weft_core::signal::PollFormat::Feed => match feed_items(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        fail(&mut consecutive_failures, &url, "delta poll needs an RSS/Atom feed", e);
+                        continue;
+                    }
+                },
             };
             let (fires, idle_state) = match delta_advance(delta, &parsed, state.as_ref()) {
                 Ok(x) => x,
@@ -225,6 +248,33 @@ fn spawn_loop(
 /// Consecutive failed polls before the per-tick warning escalates to
 /// an error naming the streak.
 const POLL_FAILURE_ESCALATION: u32 = 3;
+
+/// An RSS/Atom body as the delta pipeline's item JSON:
+/// `{ "items": [{ id, title, link, summary, published, author }] }`.
+/// The id is the feed's own GUID; for a feed that mints none, the
+/// parser synthesizes a stable content hash, so dedup always has
+/// something durable.
+fn feed_items(body: &str) -> Result<Value, String> {
+    let feed = feed_rs::parser::parse(body.as_bytes())
+        .map_err(|e| format!("feed does not parse: {e}"))?;
+    let items: Vec<Value> = feed
+        .entries
+        .iter()
+        .map(|e| {
+            let link = e.links.first().map(|l| l.href.clone());
+            let title = e.title.as_ref().map(|t| t.content.clone());
+            serde_json::json!({
+                "id": e.id,
+                "title": title,
+                "link": link,
+                "summary": e.summary.as_ref().map(|s| s.content.clone()),
+                "published": e.published.or(e.updated).map(|t| t.to_rfc3339()),
+                "author": e.authors.first().map(|a| a.name.clone()),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "items": items }))
+}
 
 /// The URL one poll tick actually requests: the configured URL, plus
 /// the acknowledged-cursor parameter when the spec declares one and a
@@ -738,5 +788,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("values"), "{err}");
+    }
+
+    /// An RSS body parses into the delta pipeline's item JSON, ids
+    /// falling back to the link when the feed mints no GUID; garbage
+    /// is a loud parse error.
+    #[test]
+    fn feed_bodies_become_item_json() {
+        let rss = r#"<?xml version="1.0"?>
+            <rss version="2.0"><channel><title>Blog</title>
+              <item><title>Post one</title><link>https://b.example/1</link>
+                <guid>tag:1</guid><description>first</description></item>
+              <item><title>Post two</title><link>https://b.example/2</link></item>
+            </channel></rss>"#;
+        let parsed = feed_items(rss).unwrap();
+        let items = parsed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], json!("tag:1"));
+        assert_eq!(items[0]["title"], json!("Post one"));
+        assert_eq!(items[0]["summary"], json!("first"));
+        let synthesized = items[1]["id"].as_str().unwrap();
+        assert!(
+            !synthesized.is_empty() && synthesized != "tag:1",
+            "a guid-less entry gets a synthesized stable id: {synthesized}"
+        );
+        assert_eq!(
+            feed_items(rss).unwrap()["items"][1]["id"].as_str().unwrap(),
+            synthesized,
+            "the synthesized id is stable across polls"
+        );
+        assert!(feed_items("not a feed").is_err());
     }
 }

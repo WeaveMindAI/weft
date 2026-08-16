@@ -57,7 +57,7 @@ pub use form::{Form, FormSchema, FormField};
 #[cfg(feature = "runtime")]
 pub use sse_subscribe::SseSubscribe;
 #[cfg(feature = "runtime")]
-pub use poll_endpoint::{CursorParam, DeltaMode, PollDelta, PollEndpoint};
+pub use poll_endpoint::{CursorParam, DeltaMode, PollDelta, PollEndpoint, PollFormat, PollMethod};
 #[cfg(feature = "runtime")]
 pub use socket_listen::{SocketFrame, SocketListen};
 #[cfg(feature = "runtime")]

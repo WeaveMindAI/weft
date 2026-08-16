@@ -20,8 +20,11 @@
   ],
   "outputs": [],
   "requires_infra": false,
+  "display": {
+    "kind": "link",
+    "input": "file"
+  },
   "features": {
-    "showDownloadLink": true,
     "isOutputDefault": true
   }
 }

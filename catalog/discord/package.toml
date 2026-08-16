@@ -1,0 +1,9 @@
+[package]
+name = "discord"
+
+# The Discord nodes: webhook messaging (a channel webhook is the
+# zero-registration door into Discord; the webhook URL is the
+# credential, sealed in the access store).
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"

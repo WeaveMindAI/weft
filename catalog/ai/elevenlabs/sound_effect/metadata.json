@@ -1,0 +1,89 @@
+{
+  "type": "ElevenLabsSoundEffect",
+  "label": "Sound Effect",
+  "description": "Generate a sound effect from a text prompt (a whoosh, rain on glass, an engine start). Emits the audio file.",
+  "tags": [
+    "ai",
+    "audio",
+    "sound"
+  ],
+  "icon": "Drum",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "description": "What the sound should be.",
+      "placeholder": "Heavy rain on a tin roof"
+    },
+    {
+      "name": "durationSecs",
+      "type": "Number",
+      "required": false,
+      "widget": {
+        "kind": "number",
+        "min": 0.5,
+        "max": 30,
+        "step": 0.5
+      },
+      "description": "Length in seconds (0.5 to 30). Absent = the model picks."
+    },
+    {
+      "name": "loop",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Seamless loop",
+      "description": "Generate audio that loops cleanly."
+    },
+    {
+      "name": "promptInfluence",
+      "type": "Number",
+      "required": false,
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 1,
+        "step": 0.05
+      },
+      "description": "How literally the prompt is followed (0 creative, 1 literal)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "Audio",
+      "required": false,
+      "description": "The generated sound effect."
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "file"
+  }
+}

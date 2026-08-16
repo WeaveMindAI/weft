@@ -1,0 +1,68 @@
+{
+  "type": "FalGenerateVideo",
+  "label": "Generate Video",
+  "description": "Generate a video from a text prompt through fal.ai. The knobs target the default model; any fal text-to-video model works by setting its id and passing model-specific extras (duration, resolution, audio) in params.",
+  "tags": [
+    "ai",
+    "video",
+    "generation"
+  ],
+  "icon": "Clapperboard",
+  "color": "#7c3aed",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The fal access (wire a FalAccess node)."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "What the video should show."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "fal-ai/veo3/fast",
+      "label": "Model",
+      "placeholder": "fal-ai/veo3/fast",
+      "description": "The fal model route (fal.ai/models)."
+    },
+    {
+      "name": "aspectRatio",
+      "type": "String",
+      "exposure": "config",
+      "default": "16:9",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "16:9",
+          "9:16",
+          "1:1"
+        ]
+      },
+      "label": "Aspect ratio"
+    },
+    {
+      "name": "params",
+      "type": "JsonDict",
+      "required": false,
+      "description": "Model-specific extras merged into the request (duration, resolution, generate_audio, ...). Declared knobs win."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "video",
+      "type": "Video",
+      "required": false,
+      "description": "The generated video."
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "video"
+  }
+}

@@ -8,6 +8,7 @@
 
 pub mod elevenlabs;
 pub mod exa;
+pub mod fal;
 pub mod firecrawl;
 pub mod mistral;
 pub mod openrouter;

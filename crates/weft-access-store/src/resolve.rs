@@ -12,9 +12,10 @@ use sha2::Digest;
 
 use weft_core::access::client::{authed_client, base_client, resolve_steps, run_connect_call};
 use weft_core::access::events::EventsSpec;
-use weft_core::access::spec::{lookup_path, Acquisition, AppRegistration, Door, OAuthGrant};
+use weft_core::access::spec::{
+    lookup_path, AccessSpec, Acquisition, AppRegistration, Door, OAuthGrant,
+};
 use weft_core::node::Lookup;
-use weft_core::AccessSpec;
 
 use crate::flows::{apply_captures, expires_at_of, token_request};
 use crate::{scopes_of, spec_of, values_of, AccessError};
@@ -60,6 +61,35 @@ pub fn permission_shortfall<'r>(
         return None;
     }
     required.iter().find(|s| !granted.contains(s)).map(String::as_str)
+}
+
+/// The own-account gate, pure: an own-account-only capability (it
+/// creates or reads things INSIDE the credential's account: minted
+/// voices, configured agents) can never be served by a runtime-supplied
+/// credential; the result would land in the runtime's account. Checked
+/// against the spec's catalogue, independent of verification: this is
+/// a policy of the capability, not a provider-reported scope.
+/// `Some(reason)` = refuse.
+pub fn own_only_refusal(
+    owner: weft_core::CredentialOwner,
+    spec: &AccessSpec,
+    required: &[String],
+) -> Option<String> {
+    if owner != weft_core::CredentialOwner::Ours {
+        return None;
+    }
+    let p = spec.permissions.iter().find(|p| p.own_only && required.contains(&p.id))?;
+    let link = p
+        .guide
+        .as_ref()
+        .and_then(|g| g.link.as_deref())
+        .map(|l| format!(" (set-up guide: {l})"))
+        .unwrap_or_default();
+    Some(format!(
+        "'{}' only works on your own {} account (the shared credential's account would \
+         hold the result); connect your own on the access node{link}",
+        p.label, spec.service,
+    ))
 }
 
 /// The consumer-declared VALUE check, pure: the first required value
@@ -197,6 +227,9 @@ async fn read_walled_grant(
     }
 
     let spec = spec_of(&spec_json)?;
+    if let Some(reason) = own_only_refusal(owner, &spec, required_permissions) {
+        return Err(AccessError::NeedsReconnect { service: service.to_string(), reason }.into());
+    }
     let registration = registration_sealed
         .as_deref()
         .map(crate::open_json)
@@ -577,7 +610,7 @@ async fn refresh(
         Acquisition::Runtime {} => {
             Err(anyhow::anyhow!("a runtime acquisition never reaches refresh"))
         }
-        Acquisition::OAuth2 { grant, token_url, refresh: refresh_call, .. } => {
+        Acquisition::OAuth2 { grant, token_url, refresh: refresh_call, token_auth, .. } => {
             let Some(registration) = registration else {
                 return Err(reconnect(
                     "the grant has no app to refresh with; reconnect".into(),
@@ -617,12 +650,9 @@ async fn refresh(
                         ("grant_type".into(), "refresh_token".into()),
                         ("refresh_token".into(), refresh_token),
                     ];
-                    for name in ["client_id", "client_secret"] {
-                        if let Some(v) = reg.get(name) {
-                            params.push((name.into(), v.clone()));
-                        }
-                    }
-                    let resp = token_request(token_url, &params).await.map_err(|e| {
+                    let basic =
+                        crate::flows::place_client_auth(*token_auth, &reg, &mut params);
+                    let resp = token_request(token_url, &params, basic).await.map_err(|e| {
                         anyhow::Error::from(reconnect(format!("the refresh was refused ({e})")))
                     })?;
                     let token = resp
@@ -664,22 +694,19 @@ async fn client_credentials_token_with(
     reg: &BTreeMap<String, String>,
     values: &mut BTreeMap<String, String>,
 ) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
-    let Acquisition::OAuth2 { extra_params, captures, .. } = &spec.acquisition else {
+    let Acquisition::OAuth2 { extra_params, captures, token_auth, .. } = &spec.acquisition
+    else {
         return Err(anyhow::anyhow!("client_credentials_token on a non-oauth2 spec"));
     };
     let mut params: Vec<(String, String)> =
         vec![("grant_type".into(), "client_credentials".into())];
-    for name in ["client_id", "client_secret"] {
-        if let Some(v) = reg.get(name) {
-            params.push((name.into(), v.clone()));
-        }
-    }
+    let basic = crate::flows::place_client_auth(*token_auth, reg, &mut params);
     for (name, template) in extra_params {
         // Extra params interpolate registration values (Zoom's
         // account_id is pasted at registration time).
         params.push((name.clone(), template.resolve(reg).map_err(AccessError::Invalid)?));
     }
-    let resp = token_request(token_url, &params).await?;
+    let resp = token_request(token_url, &params, basic).await?;
     let token = resp
         .get("access_token")
         .and_then(Value::as_str)
@@ -1101,5 +1128,35 @@ mod tests {
             "an unknown granted set never blocks"
         );
         assert_eq!(permission_shortfall(true, &granted, &[]), None);
+    }
+
+    /// The own-account gate: an `Ours` credential is refused for an
+    /// own-only capability (with the guide link in the reason), passes
+    /// for plain capabilities, and a user-owned credential always
+    /// passes whatever is required.
+    #[test]
+    fn own_only_gate_refuses_the_runtime_credential_only() {
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "elevenlabs",
+            "acquisition": { "kind": "static", "fields": [{ "name": "key" }] },
+            "auth": [{ "kind": "header", "name": "xi-api-key", "value": "{key}" }],
+            "permissions": [
+                { "id": "generate", "label": "Generate audio", "description": "x" },
+                { "id": "voice_lab", "label": "Voice creation", "description": "x",
+                  "own_only": true,
+                  "guide": { "link": "https://example/voices", "steps": ["s"] } },
+            ],
+        }))
+        .expect("spec parses");
+        use weft_core::CredentialOwner::{Ours, TheirOwn};
+        let need = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let reason =
+            own_only_refusal(Ours, &spec, &need(&["voice_lab"])).expect("Ours is refused");
+        assert!(reason.contains("Voice creation"), "{reason}");
+        assert!(reason.contains("https://example/voices"), "{reason}");
+        assert_eq!(own_only_refusal(Ours, &spec, &need(&["generate"])), None);
+        assert_eq!(own_only_refusal(TheirOwn, &spec, &need(&["voice_lab"])), None);
+        assert_eq!(own_only_refusal(Ours, &spec, &[]), None);
     }
 }

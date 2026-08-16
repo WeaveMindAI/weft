@@ -1,0 +1,63 @@
+{
+  "type": "PostgresUpdateRows",
+  "label": "Postgres: Update Rows",
+  "description": "Update matching rows: SET columns from a JSON object, WHERE from a SQL condition (its $1-style placeholders read from whereParams). Emits the changed rows.",
+  "tags": [
+    "postgres",
+    "database",
+    "update"
+  ],
+  "icon": "FilePenLine",
+  "color": "#336791",
+  "inputs": [
+    {
+      "name": "connectionString",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "password"
+      },
+      "label": "Connection string",
+      "placeholder": "postgres://user:password@host:5432/db"
+    },
+    {
+      "name": "table",
+      "type": "String",
+      "required": true,
+      "description": "The table to update."
+    },
+    {
+      "name": "set",
+      "type": "JsonDict",
+      "required": true,
+      "description": "The columns to change, e.g. { \"stage\": \"won\" }."
+    },
+    {
+      "name": "where",
+      "type": "String",
+      "required": true,
+      "label": "Where",
+      "placeholder": "email = $1",
+      "description": "SQL condition the rows must match; write `true` to update every row."
+    },
+    {
+      "name": "whereParams",
+      "type": "List[String | Number | Boolean | Null | JsonDict]",
+      "required": false,
+      "description": "Values for the condition's $1, $2, ..."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "rows",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "The changed rows as the database stored them."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

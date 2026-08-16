@@ -1,0 +1,8 @@
+[package]
+name = "airtable"
+
+# The Airtable nodes: records in bases, over Airtable's Web API.
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"
+urlencoding = "2"

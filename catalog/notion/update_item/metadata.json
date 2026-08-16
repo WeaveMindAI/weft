@@ -1,0 +1,62 @@
+{
+  "type": "NotionUpdateItem",
+  "label": "Notion: Update Database Item",
+  "description": "Change a database row's properties (Notion property-value JSON), or archive/restore it.",
+  "tags": [
+    "notion",
+    "database",
+    "update"
+  ],
+  "icon": "FilePenLine",
+  "color": "#37352f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Notion access (wire a NotionAccess node)."
+    },
+    {
+      "name": "pageId",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "from_url",
+            "pattern": "([0-9a-fA-F]{32})"
+          }
+        ]
+      },
+      "label": "Row",
+      "placeholder": "The row's page id (from a query or trigger)"
+    },
+    {
+      "name": "properties",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The columns to change, as Notion property values."
+    },
+    {
+      "name": "archived",
+      "type": "Boolean",
+      "required": false,
+      "description": "true archives the row, false restores it."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "pageId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "url",
+      "type": "String",
+      "required": false
+    }
+  ]
+}

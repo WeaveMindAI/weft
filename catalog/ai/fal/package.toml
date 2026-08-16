@@ -1,0 +1,11 @@
+[package]
+name = "fal"
+
+# The fal.ai nodes: image + video generation. fal is a day-0 aggregator
+# for the current image/video models behind one key and one queue API,
+# which is why the media nodes speak it rather than any single model
+# vendor: the model is a field, the transport never changes.
+[dependencies]
+async-trait = "0.1"
+serde_json = "1"
+tokio = "1"

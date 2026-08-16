@@ -1,0 +1,94 @@
+{
+  "type": "DiscordWebhookAccess",
+  "label": "Discord Webhook",
+  "description": "Connect a Discord channel through its webhook URL (Channel settings > Integrations > Webhooks). The URL is the credential: it stays sealed in the connection, never in node config.",
+  "tags": [
+    "discord",
+    "access",
+    "webhook"
+  ],
+  "icon": "KeyRound",
+  "color": "#5865f2",
+  "service": {
+    "service": "discord_webhook",
+    "label": "Discord webhook",
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "webhook_url",
+          "label": "Webhook URL",
+          "placeholder": "https://discord.com/api/webhooks/..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "base_url",
+        "value": "{webhook_url}"
+      }
+    ],
+    "test": {
+      "url": "{webhook_url}",
+      "captures": [
+        {
+          "name": "webhook_name",
+          "path": "name",
+          "optional": true
+        }
+      ]
+    },
+    "identity": "{webhook_name}",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://support.discord.com/hc/en-us/articles/228383668",
+        "steps": [
+          "In Discord, open the channel's settings > Integrations > Webhooks and create one.",
+          "Copy its webhook URL, paste it below, and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Channel webhook"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The webhook access: wire it into Discord Send Message."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "DiscordWebhookAccess '{id}' has no connected webhook; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

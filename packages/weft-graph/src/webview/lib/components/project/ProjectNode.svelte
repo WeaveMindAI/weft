@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { untrack } from "svelte";
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
-	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
+	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
 	import { inputExposure } from "../../types";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "../../constants/colors";
@@ -236,20 +236,21 @@
 		return JSON.stringify(cleaned, null, 2);
 	});
 
-	// File preview (ImageDisplay / DownloadLink): these sink nodes
-	// take a File value on an INPUT port and emit nothing, so the
-	// preview reads the latest execution's input, not its output.
-	// Returns the first file value found (a concrete `__weft_<kind>__`
-	// marker carrying a `key` or `url` handle; data-backed values have
-	// no resolvable handle and are skipped).
-	const inputFileValue = $derived.by<FileValueWire | null>(() => {
-		const input = latestExecution?.input;
-		if (typeof input !== 'object' || input === null) return null;
-		for (const value of Object.values(input as Record<string, unknown>)) {
-			const file = parseFileValue(value);
-			if (file) return file;
-		}
-		return null;
+	// The node's declared inline file display (`features.display`):
+	// the named port's value from the latest firing, read off the side
+	// the declaration names (a sink shows what was wired IN, a
+	// generator shows what it EMITTED). Only a concrete
+	// `__weft_<kind>__` marker carrying a `key` or `url` handle
+	// renders; data-backed values have no resolvable handle.
+	const displayedFileValue = $derived.by<FileValueWire | null>(() => {
+		const spec = typeConfig.display;
+		if (!spec) return null;
+		// The declaration names the port WITH its side, so a node with
+		// a same-named input and output stays unambiguous.
+		const side = spec.output !== undefined ? latestExecution?.output : latestExecution?.input;
+		const port = spec.output ?? spec.input;
+		if (typeof side !== 'object' || side === null || port === undefined) return null;
+		return parseFileValue((side as Record<string, unknown>)[port]);
 	});
 
 	// Check if node has expandable content (fields, run location option, debug preview, etc.)
@@ -258,8 +259,8 @@
 		if (displayedFields.length > 0) return true;
 		// Has debug preview (Debug node)
 		if (typeConfig.features?.showDebugPreview) return true;
-		// Has a stored-file preview (ImageDisplay / DownloadLink)
-		if (typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink) return true;
+		// Has a declared file display (MediaDisplay / DownloadLink / a generator)
+		if (typeConfig.display) return true;
 		return false;
 	});
 
@@ -271,7 +272,7 @@
 	// in `liveDisplay`, and `hasLiveDisplay` picks it up for free.
 	const showBodyFeed = $derived(!!data.bodyFeed && (data.bodyFeed.state === 'error' || data.bodyFeed.items.length > 0));
 	const showDebugDisplay = $derived(!!(typeConfig.features?.showDebugPreview && debugDataJson));
-	const showFileDisplay = $derived(!!((typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink) && inputFileValue));
+	const showFileDisplay = $derived(!!(typeConfig.display && displayedFileValue));
 	// Simplified view: a node with any live-display part (an infra/trigger feed, a
 	// debug preview, an image/file preview) is drawn as a card showing that display
 	// instead of a bare square.
@@ -720,7 +721,16 @@
 	/// and the resource sources read. Refetched when the traced ids
 	/// change (a rewire, a reconnect).
 	let tracedGrants = $state<
-		Record<string, { scopes: string[]; verified: boolean; valueNames: string[] }>
+		Record<
+			string,
+			{
+				scopes: string[];
+				verified: boolean;
+				valueNames: string[];
+				owner: string;
+				service: string;
+			}
+		>
 	>({});
 
 	/// Which access inputs to watch: every Access-typed input declaring
@@ -768,7 +778,13 @@
 		(async () => {
 			const next: Record<
 				string,
-				{ scopes: string[]; verified: boolean; valueNames: string[] }
+				{
+					scopes: string[];
+					verified: boolean;
+					valueNames: string[];
+					owner: string;
+					service: string;
+				}
 			> = {};
 			let failure: string | null = null;
 			for (const { name, ref } of refs) {
@@ -780,6 +796,8 @@
 							scopes: grant.scopes,
 							verified: grant.permissions_verified,
 							valueNames: grant.value_names ?? [],
+							owner: grant.owner,
+							service: ref.service,
 						};
 				} catch (e) {
 					failure = e instanceof Error ? e.message : String(e);
@@ -810,6 +828,33 @@
 			for (const r of required) {
 				if (!grant.scopes.includes(r)) {
 					out.push(`'${i.name}' needs permission ${r}; the picked connection does not hold it. Reconnect or upgrade it on the access node.`);
+				}
+			}
+		}
+		return out;
+	});
+
+	/// The live OWN-ACCOUNT check: a node requiring an own-account-only
+	/// capability (it creates things inside the credential's account)
+	/// with the SHARED (runtime-owned) connection picked. Marks
+	/// immediately, whatever verification says: this is a policy of
+	/// the capability, not a provider-reported scope. The resolve-time
+	/// refusal is the backstop.
+	const ownAccountShortfalls = $derived.by(() => {
+		const out: { text: string; link?: string }[] = [];
+		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		for (const i of inputList) {
+			const required = i.requiresScopes ?? [];
+			if (required.length === 0) continue;
+			const grant = tracedGrants[i.name];
+			if (!grant || grant.owner !== 'ours') continue;
+			const catalogue = specForService(grant.service)?.permissions ?? [];
+			for (const p of catalogue) {
+				if (p.own_only && required.includes(p.id)) {
+					out.push({
+						text: `'${p.label}' only works on your own ${grant.service} account (the shared credential's account would hold the result); connect your own on the access node.`,
+						link: p.guide?.link,
+					});
 				}
 			}
 		}
@@ -1164,8 +1209,8 @@
 			<pre class="debug-data-container nodrag nopan nowheel select-text cursor-text">{debugDataJson}</pre>
 		</div>
 	{/if}
-	{#if showFileDisplay && inputFileValue}
-		<FilePreview file={inputFileValue} mode={typeConfig.features?.showImagePreview ? 'image' : 'link'} />
+	{#if showFileDisplay && displayedFileValue}
+		<FilePreview file={displayedFileValue} mode={typeConfig.display?.kind === 'media' ? 'media' : 'link'} />
 	{/if}
 {/snippet}
 
@@ -1520,6 +1565,23 @@
 			<div class="mt-1.5 text-[10px] text-red-500 bg-red-50 rounded px-2 py-1">{shortfall}</div>
 		{/each}
 
+		<!-- Live own-account check: this node's capability creates
+		     things inside the credential's account, so the shared
+		     connection can never serve it. -->
+		{#each ownAccountShortfalls as shortfall}
+			<div class="mt-1.5 text-[10px] text-red-500 bg-red-50 rounded px-2 py-1">
+				{shortfall.text}
+				{#if shortfall.link}
+					<a
+						href={shortfall.link}
+						target="_blank"
+						rel="noreferrer"
+						class="underline">Set-up guide</a
+					>
+				{/if}
+			</div>
+		{/each}
+
 		<!-- Live value check: a picked connection missing a value this
 		     node needs (a mailbox with no receiving server wired into a
 		     mail trigger). Always marks; a stored value is knowable. -->
@@ -1814,16 +1876,17 @@
 				{/if}
 			{/if}
 
-			<!-- File preview: inline image (ImageDisplay) or a
-			     download-link card (DownloadLink). Reads the latest
-			     execution's INPUT (these nodes emit nothing). Key-backed
-			     files fetch through the authenticated download handshake;
-			     url-backed ones render/link their URL directly. -->
-			{#if typeConfig.features?.showImagePreview || typeConfig.features?.showDownloadLink}
-				{#if inputFileValue}
+			<!-- The declared file display (`features.display`): inline
+			     media (MediaDisplay, the generators) or a download-link
+			     card (DownloadLink), showing the declared port of the
+			     latest firing. Key-backed files fetch through the
+			     authenticated download handshake; url-backed ones
+			     render/link their URL directly. -->
+			{#if typeConfig.display}
+				{#if displayedFileValue}
 					<FilePreview
-						file={inputFileValue}
-						mode={typeConfig.features?.showImagePreview ? 'image' : 'link'}
+						file={displayedFileValue}
+						mode={typeConfig.display?.kind === 'media' ? 'media' : 'link'}
 					/>
 				{:else if displayedStatus === 'completed'}
 					<div class="debug-placeholder completed">

@@ -248,7 +248,35 @@ vs statement; locked to statement for `"assignment"` inputs).
 every field): `type`, `label`, `description`, `tags`, `icon`,
 `color`, `inputs` (`{ name, type, required, exposure, widget, default,
 label, placeholder, description }`), `outputs` (`{ name, type, required,
-description }`), `requires_infra`, `images`, `features`, `validate`.
+description }`), `requires_infra`, `images`, `features`, `display`,
+`validate`. (`features` is for boolean-ish flags; anything with
+structure, like `display`, is its own top-level key.)
+
+### Showing a result on the node: `display`
+
+A node whose firing produces (or receives) a FILE worth seeing
+declares which port the editor renders inline on the node body,
+per firing:
+
+```json
+"display": { "kind": "media", "output": "image" }
+```
+
+- `kind`: `media` renders the file by its OWN mime type: an image
+  inline, audio and video with a real player, anything unplayable as
+  the file card; a save button rides below. `link` renders the
+  metadata + download card only. There is never a flag per media
+  type; a new playable format is a renderer detail.
+- The port is named WITH its side: exactly one of `output` (a
+  generator shows what it emitted: the generated image, the spoken
+  audio) or `input` (a display sink shows what was wired in). Naming
+  the side is what keeps a node with a same-named input and output
+  unambiguous; declaring both, neither, or a port that does not exist
+  is refused when the catalog loads.
+
+The generation nodes (`catalog/ai/fal`, the ElevenLabs audio nodes)
+and the display sinks (`MediaDisplay`, `DownloadLink`) are the worked
+examples.
 
 `icon` names any [Lucide](https://lucide.dev/icons) icon in its
 PascalCase form (`"BrainCircuit"`, `"KeyRound"`); the editor resolves
@@ -818,6 +846,16 @@ no compile-time check, because source holds only a connection id):
   A VERIFIED shortfall is a hard error; a claimed/unknown one is let
   through, because nobody actually knows (a pasted key on a service
   that reports nothing must not be refused).
+- A required permission may be an OWN-ACCOUNT-ONLY capability (the
+  service's catalogue marks it `own_only`, e.g. ElevenLabs'
+  `voice_lab` / `agents`): the node's work creates or reads durable
+  things INSIDE the connected account (minted voices, configured
+  agents), so a runtime-supplied shared credential can never serve
+  it. Declare it through the same `requiresScopes`; resolution
+  refuses the shared credential with the capability's set-up guide,
+  and the editor marks the node the moment the shared connection is
+  picked. Marking entries and writing their guides is the access
+  reference's job: see [access-system.md](access-system.md).
 - `requiresValues`: for services whose optional fields decide what a
   connection can DO (a mailbox holding the incoming half, the
   outgoing half, or both; the service declares the groups as
@@ -1049,7 +1087,7 @@ fires a fresh execution per event):
 | Kind | What it does | Use for |
 | --- | --- | --- |
 | `SseSubscribe { url, event_name }` | Holds a one-way Server-Sent-Events stream; fires per matching event. Receive-only. | A service that pushes an SSE feed (the WhatsApp bridge). |
-| `PollEndpoint { url, interval_secs }` | Hits a URL on a timer; fires with the response body. No held connection. | A "give me what's new" endpoint (a bot getUpdates loop). |
+| `PollEndpoint { url, interval_secs, method?, body?, format?, delta? }` | Hits a URL on a timer; fires with the response body, or (with `delta`) once per NEW item. `method: Post` + `body` polls a query endpoint (Notion's data-source query); `format: Feed` parses RSS/Atom into `{ "items": [...] }`. No held connection. | A "give me what's new" endpoint (a bot getUpdates loop, a database query, a feed). |
 | `SocketListen { url, handshake?, heartbeat?, heartbeat_secs }` | Holds a bidirectional WebSocket alive, sends an optional handshake on open and an optional heartbeat frame on a schedule; fires per inbound frame. | A gateway that needs login + keepalive or it drops you (Discord, Slack socket mode). The service-specific protocol (op-codes) is YOUR concern, expressed as the literal `handshake` / `heartbeat` frames. |
 | `StreamListen { address, framing, script, replies?, heartbeat?, fire }` | Holds a raw TCP/TLS pipe for services that speak neither HTTP nor WebSocket (IMAP, MQTT, Redis, XMPP). Runs a declared connect dialogue (send frame, wait for a matching line), cuts the byte stream by the declared framing (delimiter, length prefix, or varint prefix), and fires every unit matching the `fire` pattern. Text frames interpolate `{placeholders}` from the attached connection, so credentials ride the dialogue without sitting in the spec. | Any wire protocol. The watch is the trigger; the fired body then talks the protocol properly itself (fetch the mail, decode the packet) with its own library, where code is unrestricted. See `catalog/email/receive_email` for the worked example (IMAP IDLE). |
 

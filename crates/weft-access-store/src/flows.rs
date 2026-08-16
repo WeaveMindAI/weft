@@ -1074,7 +1074,7 @@ async fn finish_connect(
     }
     let spec = crate::spec_of(&spec_json)?;
     let ticked = scopes_of(&ticked_json);
-    let Acquisition::OAuth2 { token_url, captures, .. } = &spec.acquisition else {
+    let Acquisition::OAuth2 { token_url, captures, token_auth, .. } = &spec.acquisition else {
         return Err(anyhow::anyhow!("pending connect row is not an oauth2 spec"));
     };
 
@@ -1084,15 +1084,11 @@ async fn finish_connect(
         ("code".into(), code.to_string()),
         ("redirect_uri".into(), redirect_uri),
     ];
-    for name in ["client_id", "client_secret"] {
-        if let Some(v) = reg.get(name) {
-            params.push((name.into(), v.clone()));
-        }
-    }
+    let basic = place_client_auth(*token_auth, &reg, &mut params);
     if let Some(verifier) = verifier {
         params.push(("code_verifier".into(), verifier));
     }
-    let resp = token_request(token_url, &params).await?;
+    let resp = token_request(token_url, &params, basic).await?;
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let token = resp
@@ -1280,14 +1276,45 @@ async fn finish_connect(
 /// POST a token-endpoint form and parse the JSON answer. Loud on a
 /// non-success status AND on the Slack-style `{"ok": false}` body
 /// (Slack answers 200 for errors).
+/// Place the app's client_id + client_secret where the spec's
+/// `token_auth` says the token endpoint reads them: `Body` pushes them
+/// into the form params (the return is `None`), `Basic` hands them
+/// back for the request's HTTP Basic header. One helper so exchange,
+/// refresh, and client-credentials can never disagree.
+pub(crate) fn place_client_auth(
+    token_auth: weft_core::access::spec::TokenAuth,
+    reg: &BTreeMap<String, String>,
+    params: &mut Vec<(String, String)>,
+) -> Option<(String, String)> {
+    match token_auth {
+        weft_core::access::spec::TokenAuth::Body => {
+            for name in ["client_id", "client_secret"] {
+                if let Some(v) = reg.get(name) {
+                    params.push((name.into(), v.clone()));
+                }
+            }
+            None
+        }
+        weft_core::access::spec::TokenAuth::Basic => Some((
+            reg.get("client_id").cloned().unwrap_or_default(),
+            reg.get("client_secret").cloned().unwrap_or_default(),
+        )),
+    }
+}
+
 pub(crate) async fn token_request(
     token_url: &str,
     params: &[(String, String)],
+    basic: Option<(String, String)>,
 ) -> anyhow::Result<Value> {
-    let resp = base_client()
+    let mut req = base_client()
         .post(token_url)
         .header(reqwest::header::ACCEPT, "application/json")
-        .form(params)
+        .form(params);
+    if let Some((user, pass)) = basic {
+        req = req.basic_auth(user, Some(pass));
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("token endpoint unreachable: {e}"))?;

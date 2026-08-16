@@ -376,6 +376,19 @@ pub fn check_covers(spec: &AccessSpec, apps: &[RegisteredApp]) -> anyhow::Result
                     spec.service
                 );
             }
+            // An own-account-only capability can never be covered by a
+            // shared app: whatever it creates would land in the shared
+            // account. A covers entry claiming one is a config error.
+            if spec.permissions.iter().any(|p| p.id == *covered && p.own_only) {
+                anyhow::bail!(
+                    "the access apps file's '{}' app for '{}' covers '{covered}', but that \
+                     capability is own-account-only (it creates things inside the \
+                     connected account) and can never be served by a shared app; remove \
+                     it from covers",
+                    app.app.label,
+                    spec.service
+                );
+            }
         }
     }
     Ok(())

@@ -1,0 +1,67 @@
+{
+  "type": "FalEditImage",
+  "label": "Edit Image",
+  "description": "Change an existing image with a text instruction: edit, restyle, or inpaint (with an optional mask) through fal.ai. Any fal edit model works by setting its id.",
+  "tags": [
+    "ai",
+    "image",
+    "edit",
+    "inpaint"
+  ],
+  "icon": "ImageUpscale",
+  "color": "#7c3aed",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The fal access (wire a FalAccess node)."
+    },
+    {
+      "name": "image",
+      "type": "Image",
+      "required": true,
+      "description": "The image to change."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "What to change.",
+      "placeholder": "Make the sky a sunset"
+    },
+    {
+      "name": "mask",
+      "type": "Image",
+      "required": false,
+      "description": "Inpaint mask: white areas change, black areas stay (models that take mask_url)."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "fal-ai/flux-pro/kontext",
+      "label": "Model",
+      "placeholder": "fal-ai/flux-pro/kontext",
+      "description": "The fal model route (fal.ai/models)."
+    },
+    {
+      "name": "params",
+      "type": "JsonDict",
+      "required": false,
+      "description": "Model-specific extras merged into the request. Declared knobs win."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "image",
+      "type": "Image",
+      "required": false,
+      "description": "The edited image."
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "image"
+  }
+}

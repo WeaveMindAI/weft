@@ -107,6 +107,17 @@ export function typeReferencesFile(type: string): boolean {
 /// clobber the file).
 export type FileContent = { content: string } | { error: string } | { loading: true };
 
+/** The inline per-firing display a node declares: which renderer
+ *  (`media` plays the file by mime, `link` shows the file card), and
+ *  which PORT it shows, named with its side (exactly one of
+ *  `input`/`output`). */
+// SYNC: DisplaySpecWire <-> crates/weft-core/src/node.rs DisplaySpec
+export interface DisplaySpecWire {
+  kind: 'media' | 'link';
+  input?: string;
+  output?: string;
+}
+
 // SYNC: NodeFeaturesWire <-> crates/weft-core/src/node.rs NodeFeatures
 // This mirrors ONLY the features the editor reads. Backend-only
 // features (cast ports, output defaults, hidden filtering, ...) stay
@@ -119,10 +130,6 @@ export interface NodeFeaturesWire {
   hasFormSchema?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
-  // SYNC: showImagePreview <-> crates/weft-core/src/node.rs NodeFeatures.show_image_preview
-  showImagePreview?: boolean;
-  // SYNC: showDownloadLink <-> crates/weft-core/src/node.rs NodeFeatures.show_download_link
-  showDownloadLink?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
   /// so the panel doesn't show a broken eye.
@@ -365,6 +372,10 @@ export interface CatalogEntry {
   outputs: OutputSpec[];
   requires_infra?: boolean;
   features?: NodeFeaturesWire;
+  /** The node's declared inline per-firing display (a media player, a
+   *  file card) and which port it shows. */
+  // SYNC: display <-> crates/weft-core/src/node.rs NodeMetadata.display
+  display?: DisplaySpecWire;
   /** Form-field vocabulary for nodes whose `features.hasFormSchema`
    *  is true. Empty/undefined for everything else. A metadata key,
    *  declared once in the package root's partial `metadata.json` and
@@ -424,6 +435,14 @@ export interface Permission {
   label: string;
   description: string;
   default?: boolean;
+  /** This capability creates or reads things INSIDE the credential's
+   *  own account, so a runtime-supplied (shared) credential can never
+   *  serve it; the editor greys the shared option and resolution
+   *  refuses it. */
+  own_only?: boolean;
+  /** The set-up tutorial for this capability, shown as its own
+   *  foldable section on the "Your own" page. */
+  guide?: { link?: string; steps: string[] };
 }
 
 // SYNC: VerificationRung <-> crates/weft-core/src/access/spec.rs VerificationRung
@@ -1413,7 +1432,7 @@ export type WebviewMessage =
   /// browser<->box directly, never through the dispatcher. A 404
   /// surfaces as "expired or deleted" (the metadata in the value
   /// stays readable; the bytes are gone).
-  | { kind: 'downloadStoredFile'; key: string }
+  | { kind: 'downloadStoredFile'; key: string; filename?: string }
   /// Drive one storage-plane verb through the host: the host POSTs `body`
   /// as JSON to the dispatcher's `/storage/<path>` route and replies with a
   /// correlated `storageResult`. This is the ONE channel for storage control

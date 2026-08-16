@@ -118,7 +118,7 @@ impl ProviderMeter for MistralMeter {
         Ok(MAX_PAGES_PER_DOC * MAX_USD_PER_PAGE)
     }
 
-    fn observe(&self, _path: &str) -> Box<dyn CallObservation> {
+    fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
         Box::new(super::JsonBodyObservation::default())
     }
 

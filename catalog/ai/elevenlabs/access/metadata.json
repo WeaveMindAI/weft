@@ -43,6 +43,37 @@
       ]
     },
     "identity": "{account_name}",
+    "permissions": [
+      {
+        "id": "voice_lab",
+        "label": "Voice creation",
+        "description": "Clone or design voices. A minted voice lives in the connected account and counts against its voice slots.",
+        "own_only": true,
+        "guide": {
+          "link": "https://elevenlabs.io/app/voice-lab",
+          "steps": [
+            "Voices you clone or design land in the connected ElevenLabs account, so these nodes need your own account (any paid tier adds voice slots).",
+            "Nothing to pre-create: connect your own API key and the Clone Voice / Design Voice nodes mint voices straight into your Voice Lab.",
+            "Manage or delete minted voices at elevenlabs.io/app/voice-lab."
+          ]
+        }
+      },
+      {
+        "id": "agents",
+        "label": "Voice agents",
+        "description": "Phone/voice agents: the agents, their phone numbers, and their call history live in the connected account.",
+        "own_only": true,
+        "guide": {
+          "link": "https://elevenlabs.io/app/agents",
+          "steps": [
+            "Agents, phone numbers, and conversations live in the connected ElevenLabs account, so the agent nodes need your own account.",
+            "Create an agent at elevenlabs.io/app/agents (or with the Create Agent node) and give it a voice, a prompt, and a first message.",
+            "For phone calls, import a number under Agents > Phone Numbers (Twilio or a SIP trunk) and assign it to the agent.",
+            "Optional: design or clone a custom voice first (Voice creation above) and pick it as the agent's voice."
+          ]
+        }
+      }
+    ],
     "verification": {
       "rung": "reports_validity",
       "cost": "free"

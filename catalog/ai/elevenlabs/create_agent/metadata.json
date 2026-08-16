@@ -1,0 +1,79 @@
+{
+  "type": "ElevenLabsCreateAgent",
+  "label": "Agent: Create",
+  "description": "Mint a voice agent on the account: name, system prompt, first message, voice, language. The agent id works in Agent: Place Call; manage it at elevenlabs.io/app/agents.",
+  "tags": [
+    "ai",
+    "audio",
+    "agent"
+  ],
+  "icon": "BotMessageSquare",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "agents"
+      ],
+      "description": "Your own ElevenLabs account (the minted agent lives in it; the shared credential cannot serve this)."
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": true,
+      "description": "The agent's name on the account."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "The agent's system prompt: who it is, what it does, how it talks. {{variables}} are filled per call.",
+      "placeholder": "You are a friendly booking assistant for..."
+    },
+    {
+      "name": "firstMessage",
+      "type": "String",
+      "required": false,
+      "description": "What the agent says first. Absent = it waits for the caller."
+    },
+    {
+      "name": "voice",
+      "type": "String",
+      "required": false,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/voices",
+            "items": "voices",
+            "label": "name",
+            "value": "voice_id"
+          }
+        ]
+      },
+      "label": "Voice",
+      "placeholder": "Pick a voice, or paste a voice id"
+    },
+    {
+      "name": "language",
+      "type": "String",
+      "exposure": "config",
+      "default": "en",
+      "label": "Language",
+      "description": "The agent's ISO language code."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "agentId",
+      "type": "String",
+      "required": false,
+      "description": "The minted agent's id: what Agent: Place Call takes."
+    }
+  ]
+}

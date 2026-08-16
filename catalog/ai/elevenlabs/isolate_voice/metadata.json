@@ -1,0 +1,53 @@
+{
+  "type": "ElevenLabsIsolateVoice",
+  "label": "Isolate Voice",
+  "description": "Remove background noise from a recording, keeping only the voice. Audio file in, cleaned audio file out.",
+  "tags": [
+    "ai",
+    "audio",
+    "cleanup"
+  ],
+  "icon": "MicVocal",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
+    },
+    {
+      "name": "audio",
+      "type": "Audio",
+      "required": true,
+      "description": "The recording to clean."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "Audio",
+      "required": false,
+      "description": "The voice with the background removed."
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "file"
+  }
+}

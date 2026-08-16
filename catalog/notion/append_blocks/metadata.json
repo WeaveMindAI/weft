@@ -1,0 +1,58 @@
+{
+  "type": "NotionAppendBlocks",
+  "label": "Notion: Append to Page",
+  "description": "Append plain text (one paragraph per line) or raw Notion blocks to the end of a page.",
+  "tags": [
+    "notion",
+    "page",
+    "append"
+  ],
+  "icon": "ListPlus",
+  "color": "#37352f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Notion access (wire a NotionAccess node)."
+    },
+    {
+      "name": "page",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "from_url",
+            "pattern": "([0-9a-fA-F]{32})"
+          }
+        ]
+      },
+      "label": "Page",
+      "placeholder": "Paste the page's link or id"
+    },
+    {
+      "name": "content",
+      "type": "String",
+      "required": false,
+      "description": "Plain text to append: one paragraph per line."
+    },
+    {
+      "name": "blocks",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Raw Notion block objects; overrides content when set."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "appended",
+      "type": "Number",
+      "required": false,
+      "description": "How many blocks were appended."
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "type": "ElevenLabsDub",
+  "label": "Dub Audio",
+  "description": "Dub a recording into another language: translated and re-voiced to match the original speakers. Runs as long as the dub takes and emits the dubbed audio file.",
+  "tags": [
+    "ai",
+    "audio",
+    "dubbing",
+    "translation"
+  ],
+  "icon": "Languages",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "required": true,
+      "description": "The audio or video to dub."
+    },
+    {
+      "name": "targetLang",
+      "type": "String",
+      "required": true,
+      "label": "Target language",
+      "placeholder": "fr",
+      "description": "ISO language code to dub into (fr, es, de, ...)."
+    },
+    {
+      "name": "sourceLang",
+      "type": "String",
+      "required": false,
+      "label": "Source language",
+      "description": "ISO code of the spoken language. Absent = auto-detect."
+    },
+    {
+      "name": "numSpeakers",
+      "type": "Number",
+      "required": false,
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 20,
+        "step": 1
+      },
+      "description": "How many speakers the recording has. Absent or 0 = auto-detect."
+    },
+    {
+      "name": "dropBackgroundAudio",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Drop background audio",
+      "description": "Keep only the dubbed voices, discarding music and effects."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "file",
+      "type": "Audio",
+      "required": false,
+      "description": "The dubbed audio."
+    },
+    {
+      "name": "dubbingId",
+      "type": "String",
+      "required": false,
+      "description": "The dub project's id on the account (re-download other languages, or delete it)."
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "file"
+  }
+}

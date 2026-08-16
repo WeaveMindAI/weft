@@ -1535,6 +1535,8 @@ nodes:
 /// Docker container name for the daemon's object store. A distinct,
 /// weft-prefixed name (and a non-default host port) so it runs side by side
 /// with any other object store on the host without clashing.
+// SYNC: OBJECT_STORE_CONTAINER <-> setup.sh (purge step removing the
+//       container, its "<container>-data" volume, and the seaweedfs image)
 const OBJECT_STORE_CONTAINER: &str = "weft-object-store";
 
 /// The S3 identities config the object store validates signatures against: one

@@ -1,0 +1,62 @@
+{
+  "type": "RssFeed",
+  "label": "RSS: On New Entry",
+  "description": "Fires once per new entry in an RSS or Atom feed. No account needed; activation starts from now (history never replays) and the position survives restarts.",
+  "tags": [
+    "rss",
+    "atom",
+    "feed",
+    "trigger"
+  ],
+  "icon": "Rss",
+  "color": "#f26522",
+  "inputs": [
+    {
+      "name": "feedUrl",
+      "type": "String",
+      "required": true,
+      "label": "Feed URL",
+      "placeholder": "https://example.com/feed.xml"
+    },
+    {
+      "name": "intervalSecs",
+      "type": "Number",
+      "exposure": "config",
+      "default": 300,
+      "label": "Check every (seconds)",
+      "description": "How often the feed is checked."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "title",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "link",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "summary",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "published",
+      "type": "String",
+      "required": false,
+      "description": "The entry's publish time (RFC 3339)."
+    },
+    {
+      "name": "entry",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The whole parsed entry (id, title, link, summary, published, author)."
+    }
+  ],
+  "features": {
+    "isTrigger": true
+  }
+}

@@ -30,6 +30,21 @@ fn default_poll_interval_secs() -> u64 {
 pub struct PollEndpoint {
     /// The endpoint to poll.
     pub url: String,
+    /// How the poll asks. `Get` (default) sends the bare URL; `Post`
+    /// sends `body` as JSON: the shape for feeds that only answer a
+    /// query POST (Notion's data-source query).
+    #[serde(default)]
+    pub method: PollMethod,
+    /// The JSON body a `Post` poll sends every tick. Refused on `Get`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<serde_json::Value>,
+    /// How the response parses. `Json` (default) reads it as JSON;
+    /// `Feed` reads it as a syndication feed (RSS or Atom, either
+    /// works) and answers `{ "items": [...] }` where each item is
+    /// `{ id, title, link, summary, published, author }`, so the
+    /// delta machinery (and `delta.items = "items"`) works unchanged.
+    #[serde(default)]
+    pub format: PollFormat,
     /// Seconds between polls. Floored at [`MIN_POLL_INTERVAL_SECS`].
     #[serde(default = "default_poll_interval_secs")]
     pub interval_secs: u64,
@@ -108,6 +123,42 @@ pub struct CursorParam {
     pub prime: Option<i64>,
 }
 
+/// The empty GET poll at the default cadence: registration sites fill
+/// `url` (+ whatever else they need) and `..Default::default()` the
+/// rest. An unset `url` is refused by `validate`, never sent.
+impl Default for PollEndpoint {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            method: PollMethod::Get,
+            body: None,
+            format: PollFormat::Json,
+            interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+            delta: None,
+            access: None,
+            filters: Vec::new(),
+        }
+    }
+}
+
+/// How a poll response's body parses; see [`PollEndpoint::format`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollFormat {
+    #[default]
+    Json,
+    Feed,
+}
+
+/// The HTTP verb a poll tick uses; see [`PollEndpoint::method`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollMethod {
+    #[default]
+    Get,
+    Post,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaMode {
@@ -135,6 +186,13 @@ impl Signal for PollEndpoint {
                  poll generates runaway load and risks external rate-limit bans; got {}",
                 self.interval_secs
             ));
+        }
+        if self.body.is_some() && self.method != PollMethod::Post {
+            return Err(
+                "poll_endpoint.body only rides a `post` poll; set method: Post or drop the \
+                 body"
+                    .into(),
+            );
         }
         if let Some(delta) = &self.delta {
             if let Some(f) = &delta.cursor_field {
@@ -185,14 +243,14 @@ mod tests {
     #[test]
     fn too_tight_interval_rejected() {
         let p =
-            PollEndpoint { url: "https://x".into(), interval_secs: 1, delta: None, access: None, filters: Vec::new() };
+            PollEndpoint { url: "https://x".into(), interval_secs: 1, ..Default::default() };
         assert!(p.validate().unwrap_err().contains("interval_secs"));
     }
 
     #[test]
     fn valid_round_trips() {
         let p =
-            PollEndpoint { url: "https://x/u".into(), interval_secs: 10, delta: None, access: None, filters: Vec::new() };
+            PollEndpoint { url: "https://x/u".into(), interval_secs: 10, ..Default::default() };
         let spec = crate::signal::to_spec(p);
         assert_eq!(spec.kind, "poll_endpoint");
     }
@@ -208,7 +266,7 @@ mod tests {
         assert_eq!(p.delta.as_ref().unwrap().items, "values");
         // A plain (non-delta) spec keeps its old wire shape: no field.
         let plain =
-            PollEndpoint { url: "https://x".into(), interval_secs: 30, delta: None, access: None, filters: Vec::new() };
+            PollEndpoint { url: "https://x".into(), interval_secs: 30, ..Default::default() };
         let wire = serde_json::to_value(&plain).unwrap();
         assert!(wire.get("delta").is_none());
 
@@ -221,8 +279,7 @@ mod tests {
                 mode: Default::default(),
                 cursor_param: None,
             }),
-            access: None,
-            filters: Vec::new(),
+            ..Default::default()
         };
         assert!(bad.validate().unwrap_err().contains("cursor_field"));
     }

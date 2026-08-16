@@ -522,7 +522,7 @@ mod tests {
         fn prepare(&self, _path: &str, _body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
             Ok(None)
         }
-        fn observe(&self, _path: &str) -> Box<dyn weft_providers::CallObservation> {
+        fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn weft_providers::CallObservation> {
             unreachable!("no one-shot routes")
         }
         fn observe_session(

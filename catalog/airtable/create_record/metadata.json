@@ -1,0 +1,114 @@
+{
+  "type": "AirtableCreateRecord",
+  "label": "Airtable: Create Record",
+  "description": "Add a record to a table. Fields are keyed by column name; turn on typecast to let Airtable coerce strings into selects, dates, and links.",
+  "tags": [
+    "airtable",
+    "record",
+    "create"
+  ],
+  "icon": "Grid2x2Plus",
+  "color": "#f82b60",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "data.records:write"
+      ],
+      "description": "The Airtable access (wire an AirtableAccess node)."
+    },
+    {
+      "name": "base",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "schema.bases:read"
+            ],
+            "get": "https://api.airtable.com/v0/meta/bases",
+            "items": "bases",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "offset",
+              "cursor_path": "offset"
+            }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "(app[A-Za-z0-9]+)"
+          }
+        ]
+      },
+      "label": "Base",
+      "placeholder": "Pick a base, or paste its link"
+    },
+    {
+      "name": "table",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "base"
+        ],
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "schema.bases:read"
+            ],
+            "get": "https://api.airtable.com/v0/meta/bases/{base}/tables",
+            "items": "tables",
+            "label": "name",
+            "value": "id"
+          },
+          {
+            "kind": "from_url",
+            "pattern": "(tbl[A-Za-z0-9]+)"
+          }
+        ]
+      },
+      "label": "Table",
+      "placeholder": "Pick a table, or paste its link"
+    },
+    {
+      "name": "fields",
+      "type": "JsonDict",
+      "required": true,
+      "description": "The record's fields keyed by column name, e.g. { \"Name\": \"Acme\", \"Stage\": \"Lead\" }."
+    },
+    {
+      "name": "typecast",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": true,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Typecast values",
+      "description": "Let Airtable coerce strings into selects, dates, collaborators, and links."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "recordId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "record",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The created record (id, createdTime, fields)."
+    }
+  ]
+}

@@ -256,6 +256,21 @@ pub struct Permission {
     /// Starts ticked on the picker.
     #[serde(default)]
     pub default: bool,
+    /// This capability creates or reads things INSIDE the credential's
+    /// own account (minted voices, configured agents, phone numbers),
+    /// so a runtime-supplied credential can never serve it: the result
+    /// would land in the runtime's account, shared across everyone.
+    /// Resolution refuses an `Ours`-owned connection for a node
+    /// requiring it, and the editor greys the shared option with the
+    /// guide below.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_only: bool,
+    /// The set-up tutorial for THIS capability, shown on the "Your
+    /// own" page as its own foldable section (and linked from the
+    /// refusal): what to create on the provider's site before a node
+    /// needing this capability can run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<Guide>,
 }
 
 /// What connect-time verification can learn, and what it costs.
@@ -478,6 +493,14 @@ pub enum Acquisition {
         /// `instance_url`, Slack team/bot ids, the granted-scopes echo).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         captures: Vec<Capture>,
+        /// How the token endpoint authenticates the CLIENT, on every
+        /// token call (exchange, refresh, client credentials). `Body`
+        /// (the RFC's form-field option, the wider-supported default)
+        /// sends client_id + client_secret as form fields; `Basic`
+        /// sends them as HTTP Basic, for providers that ignore body
+        /// credentials (Notion, Airtable).
+        #[serde(default)]
+        token_auth: TokenAuth,
         /// How a stale grant is RENEWED, for providers whose renewal
         /// is not the standard refresh-token POST (Meta's long-lived
         /// token exchange: a GET interpolating the current token).
@@ -522,6 +545,18 @@ pub enum Acquisition {
 
 fn default_jwt_ttl() -> u64 {
     600
+}
+
+/// How an OAuth2 token call authenticates the client; see the
+/// `token_auth` field on [`Acquisition::OAuth2`]. (The editor's
+/// acquisition wire passes unknown keys through, so this needs no
+/// frontend mirror.)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenAuth {
+    #[default]
+    Body,
+    Basic,
 }
 
 /// The OAuth2 grant flow.
@@ -950,6 +985,11 @@ impl Template {
 /// segments index arrays. The one path-lookup used by every capture
 /// site (store acquisition, test calls, lookup pagination).
 pub fn lookup_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
+    // The empty path names the root: what a lookup whose response IS
+    // the item array declares (`"items": ""`).
+    if path.is_empty() {
+        return Some(value);
+    }
     let mut cur = value;
     for seg in path.split('.') {
         cur = match cur {
@@ -1430,8 +1470,15 @@ impl AccessSpec {
 
     /// The catalogue entries that start ticked.
     // SYNC: AccessSpec::default_permissions <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts defaultPermissions
+    // Own-account-only entries are capability declarations, never
+    // consent asks, so they are never ticked (and never ride a
+    // consent URL).
     pub fn default_permissions(&self) -> Vec<String> {
-        self.permissions.iter().filter(|p| p.default).map(|p| p.id.clone()).collect()
+        self.permissions
+            .iter()
+            .filter(|p| p.default && !p.own_only)
+            .map(|p| p.id.clone())
+            .collect()
     }
 
     /// Is `id` in the permission catalogue?
@@ -1983,6 +2030,8 @@ mod tests {
             label: "Again".into(),
             description: "Duplicate.".into(),
             default: false,
+            own_only: false,
+            guide: None,
         });
         assert!(dup.validate().unwrap_err().contains("duplicate permission"));
 

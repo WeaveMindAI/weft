@@ -193,5 +193,43 @@
       "label": "Runtime key",
       "key": "REPLACE_WITH_MISTRAL_KEY"
     }
+  ],
+  "fal": [
+    {
+      "_setup": "fal.ai -> Dashboard -> Keys. Serves the media nodes' (image/video generation) shared door.",
+      "kind": "api_key",
+      "label": "Runtime key",
+      "key": "REPLACE_WITH_FAL_KEY_ID:REPLACE_WITH_FAL_KEY_SECRET"
+    }
+  ],
+  "notion": [
+    {
+      "_setup": "notion.so/my-integrations -> New integration -> pick Public. Add the callback URL as the Redirect URI, set 'User capabilities' to what the nodes need (read + insert + update content), and copy the OAuth client ID and secret here. Notion has no scope ids: the user picks which pages the connection can see on the consent screen, so `covers` stays empty.",
+      "label": "Notion",
+      "covers": [],
+      "auth_url": "https://api.notion.com/v1/oauth/authorize",
+      "token_url": "https://api.notion.com/v1/oauth/token",
+      "client_id": "REPLACE_WITH_NOTION_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_NOTION_CLIENT_SECRET",
+      "events": {},
+      "kind": "oauth_app"
+    }
+  ],
+  "airtable": [
+    {
+      "_setup": "airtable.com/create/oauth -> register an OAuth integration. Add the callback URL as the redirect URI, tick the data.records:read, data.records:write, and schema.bases:read scopes, and copy the client ID and secret here.",
+      "label": "Airtable",
+      "covers": [
+        "data.records:read",
+        "data.records:write",
+        "schema.bases:read"
+      ],
+      "auth_url": "https://airtable.com/oauth2/v1/authorize",
+      "token_url": "https://airtable.com/oauth2/v1/token",
+      "client_id": "REPLACE_WITH_AIRTABLE_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_AIRTABLE_CLIENT_SECRET",
+      "events": {},
+      "kind": "oauth_app"
+    }
   ]
 }

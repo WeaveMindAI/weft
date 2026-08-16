@@ -181,10 +181,13 @@ pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
 }
 
 /// `weft node-test-hash`: print the content hash naming a package's
-/// node-test build (the same hash the live test image is tagged with).
-/// A scripted runner records it per package after a fully green live
-/// run and skips packages whose hash has not moved since. With no
-/// target, prints `<package> <hash>` for every test-declaring package.
+/// test OUTCOME inputs (`node_test_cache_hash`: the package's own
+/// sources plus the catalog's type registry; narrower than the image
+/// tag, so an engine or image-recipe edit rebuilds the image but does
+/// not move this hash). A scripted runner records it per package
+/// after a fully green live run and skips packages whose hash has not
+/// moved since; live tests cost money. With no target, prints
+/// `<package> <hash>` for every test-declaring package.
 pub fn hash(ctx: Ctx, target: Option<String>) -> Result<()> {
     let project = ctx.project()?;
     let catalog = weft_compiler::build::build_project_catalog(&project.root)
@@ -195,14 +198,14 @@ pub fn hash(ctx: Ctx, target: Option<String>) -> Result<()> {
             // argument surface matches `weft test-node`.
             let targets = resolve_targets(&catalog, Some(&t))?;
             let package = &targets.first().expect("resolve_targets errors instead of empty").name;
-            let hash = weft_compiler::build::node_test_content_hash(project, &catalog, package)
+            let hash = weft_compiler::build::node_test_cache_hash(project, &catalog, package)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{hash}");
         }
         None => {
             for target in resolve_targets(&catalog, None)? {
                 let hash =
-                    weft_compiler::build::node_test_content_hash(project, &catalog, &target.name)
+                    weft_compiler::build::node_test_cache_hash(project, &catalog, &target.name)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                 println!("{} {hash}", target.name);
             }
@@ -314,9 +317,11 @@ fn list_tests(binary: &PathBuf) -> Result<Vec<NodeTestsListing>> {
 /// A package's test listing without an unconditional build: a
 /// live-only sweep must not pay a cargo build per package just to
 /// learn "no live tests here". The listing is a pure function of the
-/// package's code, so it is cached under the build root keyed by the
-/// SAME content hash the test image rides; a hash hit reads the
-/// stored answer, a miss builds the binary, asks it, and stores.
+/// package's code, so it is cached under the build root keyed by
+/// `node_test_cache_hash` (the package's sources plus the type
+/// registry; an engine edit changes the binary but never the
+/// listing); a hash hit reads the stored answer,
+/// a miss builds the binary, asks it, and stores.
 fn cached_listing(
     project: &weft_compiler::project::Project,
     catalog: &FsCatalog,
@@ -328,7 +333,7 @@ fn cached_listing(
         hash: String,
         nodes: Vec<NodeTestsListing>,
     }
-    let hash = weft_compiler::build::node_test_content_hash(project, catalog, package)
+    let hash = weft_compiler::build::node_test_cache_hash(project, catalog, package)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let path = test_build_root
         .join("listings")

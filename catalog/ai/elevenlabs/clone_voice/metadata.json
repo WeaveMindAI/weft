@@ -1,0 +1,61 @@
+{
+  "type": "ElevenLabsCloneVoice",
+  "label": "Clone Voice",
+  "description": "Create a voice on the account from sample recordings (instant voice clone). The minted voice id is a durable account asset: use it in any speak node from then on.",
+  "tags": [
+    "ai",
+    "audio",
+    "voice",
+    "clone"
+  ],
+  "icon": "CopyPlus",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "voice_lab"
+      ],
+      "description": "Your own ElevenLabs account (the minted voice lives in it; the shared credential cannot serve this)."
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": true,
+      "description": "The new voice's name on the account."
+    },
+    {
+      "name": "samples",
+      "type": "List[Audio]",
+      "required": true,
+      "description": "Sample recordings of the voice (a minute of clean speech works well)."
+    },
+    {
+      "name": "description",
+      "type": "String",
+      "required": false,
+      "description": "A note stored with the voice."
+    },
+    {
+      "name": "removeBackgroundNoise",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Remove background noise",
+      "description": "Clean the samples before cloning."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "voiceId",
+      "type": "String",
+      "required": false,
+      "description": "The minted voice's id: what the speak nodes take."
+    }
+  ]
+}

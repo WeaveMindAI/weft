@@ -289,13 +289,17 @@ async fn kind_load_inner(cluster: &str, tag: &str, allow_tag_skip: bool) -> Resu
     Ok(())
 }
 
-/// Every image ref (`repoTags` entry) present on the kind node, via
-/// `crictl images -o json` on the control-plane container. THE one
-/// node-image-list reader: tag-presence checks (`kind_node_has_tag`) and
-/// image reclamation (`weft clean --images`) both parse through here, so
-/// the two cannot drift on how a node ref is spelled. Digest-only images
-/// (null `repoTags`) are skipped.
-pub async fn kind_node_repo_tags(cluster: &str) -> Result<Vec<String>> {
+/// The node's images as one `repoTags` group PER IMAGE, via `crictl
+/// images -o json` on the control-plane container. THE one
+/// node-image-list reader: tag-presence checks (`kind_node_has_tag`)
+/// and image reclamation (`weft clean --images`) both parse through
+/// here, so the two cannot drift on how a node ref is spelled. The
+/// grouping preserves which refs share content: `crictl rmi` removes
+/// the whole image behind a ref (every tag on it, not just the named
+/// one), so any node-side removal must decide per IMAGE, never per
+/// tag. Digest-only images list an empty `repoTags` array and come
+/// back as empty groups.
+pub async fn kind_node_image_tag_groups(cluster: &str) -> Result<Vec<Vec<String>>> {
     let node = format!("{cluster}-control-plane");
     let out = Command::new("docker")
         .args(["exec", &node, "crictl", "images", "-o", "json"])
@@ -310,15 +314,16 @@ pub async fn kind_node_repo_tags(cluster: &str) -> Result<Vec<String>> {
     }
     let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
         .map_err(|e| anyhow::anyhow!("parse crictl images output from {node}: {e}"))?;
-    Ok(parsed
-        .get("images")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
+    // A listing without an `images` array is an unreadable listing,
+    // not an empty node; treating it as empty would make a reclaim
+    // silently reclaim nothing and report success.
+    let images = parsed.get("images").and_then(|v| v.as_array()).ok_or_else(|| {
+        anyhow::anyhow!("crictl images on {node} returned no `images` array: {parsed}")
+    })?;
+    Ok(images
+        .iter()
         .filter_map(|img| img.get("repoTags").and_then(|v| v.as_array()))
-        .flatten()
-        .filter_map(|t| t.as_str())
-        .map(str::to_string)
+        .map(|tags| tags.iter().filter_map(|t| t.as_str()).map(str::to_string).collect())
         .collect())
 }
 
@@ -347,29 +352,34 @@ pub async fn referenced_image_hashes(
         .collect())
 }
 
-/// The node refs in `node_refs` whose repo (ignoring any registry
-/// prefix) is `repo` and whose tag satisfies `condemn`, ready for
-/// `crictl rmi`. Pure so it is unit-testable; only `repo`'s refs ever
-/// leave, which is the guarantee that keeps system images (listener &
-/// co) safe from every node cleanup. Handles bare (`repo:<tag>`),
-/// docker-canonical (`docker.io/library/...`), and registry-qualified
-/// (`host:port/path/repo:<tag>`) spellings.
-pub fn node_refs_matching(
+/// One ref per NODE IMAGE that is safe to `crictl rmi`: every one of
+/// the image's tags is a `repo` tag (ignoring any registry prefix)
+/// satisfying `condemn`. `crictl rmi` removes the whole image behind
+/// a ref, every tag included, so an image carrying even one live tag
+/// (a fresh tag whose content matches a stale one, or another repo's
+/// tag) must survive untouched; condemning per tag once deleted a
+/// freshly loaded test image whose bits matched the stale tag being
+/// dropped. Pure so it is unit-testable; only images made purely of
+/// `repo`'s refs ever leave, which is the guarantee that keeps system
+/// images (listener & co) safe from every node cleanup. Handles bare
+/// (`repo:<tag>`), docker-canonical (`docker.io/library/...`), and
+/// registry-qualified (`host:port/path/repo:<tag>`) spellings.
+pub fn node_images_condemned(
     repo: &str,
-    node_refs: &[String],
+    image_tag_groups: &[Vec<String>],
     condemn: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let prefix = format!("{repo}:");
-    node_refs
+    image_tag_groups
         .iter()
-        .filter(|full| {
-            let repo_tag = full.rsplit_once('/').map_or(full.as_str(), |(_, t)| t);
-            match repo_tag.strip_prefix(&prefix) {
-                Some(tag) => condemn(tag),
-                None => false,
-            }
+        .filter(|group| {
+            !group.is_empty()
+                && group.iter().all(|full| {
+                    let repo_tag = full.rsplit_once('/').map_or(full.as_str(), |(_, t)| t);
+                    repo_tag.strip_prefix(&prefix).is_some_and(&condemn)
+                })
         })
-        .cloned()
+        .filter_map(|group| group.first().cloned())
         .collect()
 }
 
@@ -381,11 +391,12 @@ pub fn node_refs_matching(
 /// failure reads as "absent" so the caller just re-loads.
 async fn kind_node_has_tag(cluster: &str, tag: &str) -> bool {
     let (repo, version) = tag.split_once(':').unwrap_or((tag, "latest"));
-    let Ok(tags) = kind_node_repo_tags(cluster).await else {
+    let Ok(groups) = kind_node_image_tag_groups(cluster).await else {
         return false;
     };
-    tags.iter()
-        .any(|t| t == &format!("{repo}:{version}") || t == &format!("docker.io/library/{repo}:{version}"))
+    groups.iter().flatten().any(|t| {
+        t == &format!("{repo}:{version}") || t == &format!("docker.io/library/{repo}:{version}")
+    })
 }
 
 #[cfg(test)]

@@ -449,7 +449,7 @@ async fn build_infra_images(
             continue;
         }
 
-        let exists = images::image_present(&tag).await.unwrap_or(false);
+        let exists = images::image_present(&tag).await?;
         if exists {
             progress.build_skip(&tag, "hash_match");
         } else {

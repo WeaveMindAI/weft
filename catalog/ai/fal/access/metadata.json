@@ -1,0 +1,90 @@
+{
+  "type": "FalAccess",
+  "label": "fal Access",
+  "description": "Sign in to fal.ai, the image and video generation API the media nodes speak. Pick an existing connection or paste an API key.",
+  "tags": [
+    "ai",
+    "media",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#7c3aed",
+  "service": {
+    "service": "fal",
+    "label": "fal.ai",
+    "doors": [
+      "shared",
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "key_id:key_secret"
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "Authorization",
+        "value": "Key {key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.fal.ai/v1/models?limit=1",
+      "expect_status": 200
+    },
+    "identity": "fal",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "own_page": {
+      "guide": {
+        "link": "https://fal.ai/dashboard/keys",
+        "steps": [
+          "Open fal.ai, Dashboard > Keys, and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The fal access: wire it into the media nodes."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "FalAccess '{id}' has no connected account; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
+}

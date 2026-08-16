@@ -1,0 +1,3 @@
+# The self-tests build the provider's base64 preview payload.
+[dependencies]
+base64 = "0.22"

@@ -52,6 +52,28 @@ The place a meter lives decides one thing: who can pay for the provider.
   key IS submitting its meter to weft to be reviewed and shipped, and a meter
   you already wrote in your project is most of that work.
 
+  The review checks more than the arithmetic. To be promoted, a meter must
+  hold every one of these:
+
+  1. **Every billable route is priced from published rates or a reported
+     figure**, never guessed. A route whose real cost cannot be known stays
+     `Unknown` (own-key only), with a comment saying why.
+  2. **Cost-lookup and status routes are `Free`**, so nothing double-charges
+     (the double-charge trap below).
+  3. **No account-asset route is reachable by the platform key.** A route
+     that CREATES or MODIFIES durable things inside the credential's account
+     (minting a voice, registering an agent, adding a webhook, uploading a
+     file that persists) must classify `Unknown`, never `Free` and never
+     `Billable`: on the platform key those assets would land in the
+     platform's own account, shared across every tenant. Listing/read
+     routes that only serve pickers (a voice list, a model list) may be
+     `Free`. Pair the refusal with an `own_only` capability on the
+     service's permission catalogue so the editor guides the user to their
+     own account instead of failing at run time.
+  4. **The ceiling is the tightest bound the request allows** (the ceilings
+     section below), and the tests in "Tests a meter must ship" are all
+     present, including recorded-real-response resolves.
+
 Meters are the trusted artifact of the whole paid-call system. A node never
 states a cost and has no way to: the runtime runs the provider's meter
 around every call made on an opened connection's client, and every cost

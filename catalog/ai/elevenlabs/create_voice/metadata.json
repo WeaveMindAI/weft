@@ -1,0 +1,49 @@
+{
+  "type": "ElevenLabsCreateVoice",
+  "label": "Create Voice",
+  "description": "Mint a designed preview (from Design Voice) into a durable voice on the account. The minted voice id works in every speak node from then on.",
+  "tags": [
+    "ai",
+    "audio",
+    "voice"
+  ],
+  "icon": "BadgePlus",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "voice_lab"
+      ],
+      "description": "Your own ElevenLabs account (the minted voice lives in it; the shared credential cannot serve this)."
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": true,
+      "description": "The new voice's name on the account."
+    },
+    {
+      "name": "description",
+      "type": "String",
+      "required": true,
+      "description": "The voice description (kept with the voice)."
+    },
+    {
+      "name": "previewId",
+      "type": "String",
+      "required": true,
+      "description": "The chosen preview's voiceId from Design Voice."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "voiceId",
+      "type": "String",
+      "required": false,
+      "description": "The minted voice's id: what the speak nodes take."
+    }
+  ]
+}

@@ -397,13 +397,20 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         // itself, but a caller-set header would; force identity.
         req.headers_mut().remove(http::header::ACCEPT_ENCODING);
 
+        // Captured for the observer below: some routes price off the
+        // REQUEST (its query's format, its body's text), and the
+        // request is consumed by the send.
+        let request_query = req.url().query().unwrap_or("").to_string();
+        let request_bytes: Vec<u8> =
+            req.body().and_then(|b| b.as_bytes()).map(|b| b.to_vec()).unwrap_or_default();
+
         let response = next.run(req, extensions).await?;
 
         // Tap the response: the caller sees every chunk in real time while
         // the observer reads what it needs in passing. When the stream
         // ends (or is cut, including by drop), the finalizer resolves the
         // cost and records it, detached from the caller's future.
-        let mut observer = meter.observe(route);
+        let mut observer = meter.observe(route, &request_query, &request_bytes);
         observer.on_status(response.status().as_u16());
         let status = response.status();
         let version = response.version();
@@ -647,7 +654,7 @@ mod tests {
         ) -> anyhow::Result<f64> {
             Ok(1.0)
         }
-        fn observe(&self, _path: &str) -> Box<dyn CallObservation> {
+        fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
             Box::new(TestObservation {
                 scanner: weft_providers::sse::DataLineScanner::new(),
                 status: 0,

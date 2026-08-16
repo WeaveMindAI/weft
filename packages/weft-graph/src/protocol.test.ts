@@ -76,9 +76,9 @@ describe('catalog wire fixture', () => {
 			],
 			outputs: [{ name: 'out', type: 'String' }],
 			features: { oneOfRequired: [['code', 'img']], isTrigger: true,
-			            showImagePreview: true, showDownloadLink: true,
 			            hasFormSchema: true, canAddInputPorts: true,
 			            showDebugPreview: true, liveEndpoint: 'web' },
+			display: { kind: 'media', output: 'out' },
 			formFieldSpecs: [
 				{ fieldType: 'text', label: 'Text',
 				  render: { component: 'text_input', source: 'input', multiple: true },

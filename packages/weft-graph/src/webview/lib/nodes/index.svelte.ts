@@ -61,6 +61,7 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		defaultInputs: (entry.inputs ?? []).map(toInputPort),
 		defaultOutputs: (entry.outputs ?? []).map(toOutputPort),
 		features: entry.features,
+		display: entry.display,
 		// `weft describe-nodes` ships the field-type vocabulary inline
 		// for nodes whose features.hasFormSchema is true; the
 		// form_builder editor reads it via `typeConfig.formFieldSpecs`.
@@ -93,6 +94,19 @@ export function getAllNodes(): NodeTemplate[] {
 
 export function getAllNodeTypes(): string[] {
 	return Object.keys(registry);
+}
+
+/** The service recipe for `service`, from whichever access node
+ *  declares it (each service's recipe lives on exactly one access
+ *  node). What the consumer-node live checks read to classify a
+ *  required permission (own-account-only, its guide). */
+export function specForService(
+	service: string,
+): import('../../../protocol').AccessSpecWire | undefined {
+	for (const t of Object.values(registry)) {
+		if (t.service && t.service.service === service) return t.service;
+	}
+	return undefined;
 }
 
 /** Back-compat aliases. v1 consumers import these directly and

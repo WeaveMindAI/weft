@@ -151,7 +151,7 @@ out.data = n.response
     // braces form is refused with the assignment remediation...
     let project = parse_enrich(
         r#"
-n = ImageDisplay { image: "not-a-file" }
+n = MediaDisplay { media: "not-a-file" }
 "#,
     );
     let d = validate(&project, &catalog());
@@ -162,8 +162,8 @@ n = ImageDisplay { image: "not-a-file" }
     // `port_literals`, exactly like a wire would deliver it.
     let project = parse_enrich(
         r#"
-n = ImageDisplay
-n.image = "a-literal"
+n = MediaDisplay
+n.media = "a-literal"
 "#,
     );
     let d = validate(&project, &catalog());
@@ -173,7 +173,7 @@ n.image = "a-literal"
     );
     let node = project.nodes.iter().find(|n| n.id == "n").unwrap();
     assert!(
-        node.port_literals.contains_key("image"),
+        node.port_literals.contains_key("media"),
         "the literal must normalize into port_literals: {:?}",
         node.port_literals
     );
@@ -892,11 +892,11 @@ my_loop = Loop(other: List[String]) -> (out: List[String | Null]) {
 #[test]
 fn storage_plane_example_chain_validates_clean() {
     // FetchToStorage emits a File (any stored file). DownloadLink and
-    // KeepFile take File, so those edges are File -> File. ImageDisplay
-    // demands Image, which File does NOT satisfy. The author NARROWS the
+    // KeepFile take File, so those edges are File -> File. MediaDisplay
+    // demands displayable media, which File does NOT satisfy. The author NARROWS the
     // fetch's output port to Image in the node header (`-> (file: Image)`):
     // legal because Image is a sub-case of the declared File, and the
-    // narrowed Image then satisfies ImageDisplay. The runtime enforces the
+    // narrowed Image then satisfies MediaDisplay. The runtime enforces the
     // narrow (a non-image fetched here closes the port and warns).
     let project = parse_enrich(
         r#"
@@ -905,8 +905,8 @@ file_url = Text { value: "https://example.com/x.png" }
 fetch = FetchToStorage -> (file: Image) { keep: false }
 fetch.url = file_url.value
 
-show = ImageDisplay
-show.image = fetch.file
+show = MediaDisplay
+show.media = fetch.file
 
 link = DownloadLink
 link.file = fetch.file

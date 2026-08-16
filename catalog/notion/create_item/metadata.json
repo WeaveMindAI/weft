@@ -1,0 +1,80 @@
+{
+  "type": "NotionCreateItem",
+  "label": "Notion: Create Database Item",
+  "description": "Add a row to a Notion database. Properties are Notion property-value JSON keyed by column name.",
+  "tags": [
+    "notion",
+    "database",
+    "create"
+  ],
+  "icon": "DatabaseBackup",
+  "color": "#37352f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Notion access (wire a NotionAccess node)."
+    },
+    {
+      "name": "database",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "from_url",
+            "pattern": "([0-9a-fA-F]{32})"
+          }
+        ]
+      },
+      "label": "Database",
+      "placeholder": "Paste the database's link or id"
+    },
+    {
+      "name": "source",
+      "type": "String",
+      "required": false,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "database"
+        ],
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.notion.com/v1/databases/{database}",
+            "items": "data_sources",
+            "label": "name",
+            "value": "id"
+          }
+        ]
+      },
+      "label": "Source",
+      "placeholder": "Only needed when the database has several sources"
+    },
+    {
+      "name": "properties",
+      "type": "JsonDict",
+      "required": true,
+      "description": "The row's columns as Notion property values, e.g. { \"Name\": { \"title\": [{ \"text\": { \"content\": \"Task\" } }] } }."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "pageId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "url",
+      "type": "String",
+      "required": false,
+      "description": "The new row's link."
+    }
+  ]
+}

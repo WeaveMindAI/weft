@@ -1,0 +1,114 @@
+{
+  "type": "ElevenLabsSpeak",
+  "label": "Speak (streaming)",
+  "description": "Streaming text-to-speech: a live text bus in (an LLM stream, a transcript), a live audio bus out, spoken as the text arrives. The full audio also lands as a file at the end. For whole-text-in, file-out, use Speak to File.",
+  "tags": [
+    "ai",
+    "audio",
+    "tts",
+    "voice",
+    "streaming"
+  ],
+  "icon": "Speech",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
+    },
+    {
+      "name": "text",
+      "type": "Bus",
+      "required": true,
+      "description": "The live text: plain-string messages (an LLM stream) or { text } objects (a transcript bus)."
+    },
+    {
+      "name": "voice",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/voices",
+            "items": "voices",
+            "label": "name",
+            "value": "voice_id"
+          }
+        ]
+      },
+      "label": "Voice",
+      "placeholder": "Pick a voice, or paste a voice id"
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "eleven_flash_v2_5",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "eleven_flash_v2_5",
+          "eleven_turbo_v2_5",
+          "eleven_multilingual_v2"
+        ]
+      },
+      "label": "Model"
+    },
+    {
+      "name": "outputFormat",
+      "type": "String",
+      "exposure": "config",
+      "default": "pcm_16000",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "pcm_16000",
+          "pcm_44100",
+          "ulaw_8000",
+          "mp3_44100_128"
+        ]
+      },
+      "label": "Output format",
+      "description": "pcm_16000 is the audio-bus standard the other realtime nodes speak."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "audio",
+      "type": "Bus",
+      "required": false,
+      "description": "The live audio: raw byte frames in the declared format (bus metadata carries sample_rate and encoding)."
+    },
+    {
+      "name": "file",
+      "type": "Audio",
+      "required": false,
+      "description": "The whole spoken audio, stored when the stream ends."
+    },
+    {
+      "name": "filename",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "mimeType",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "file"
+  }
+}

@@ -180,7 +180,14 @@ impl Node for ElevenLabsTranscribeNode {
         // The audio ended: commit whatever the VAD still holds, then
         // drain the session alone. The drain relays EVERY committed
         // segment (the flush may commit several) and ends only on the
-        // benign nothing-left answer, the session closing, or a refusal.
+        // benign nothing-left answer, the session closing, or a
+        // refusal. The session CLOSING is a clean end, not a
+        // truncation: after the final commit the server delivers its
+        // remaining committed segments and hangs up (the nothing-left
+        // answer only comes when the flush found no speech), and
+        // frames arrive in order, so every segment sent before the
+        // close has already been read by this loop. Requiring a
+        // goodbye frame here fails real sessions (verified live).
         session
             .send(SocketMessage::Text(
                 json!({

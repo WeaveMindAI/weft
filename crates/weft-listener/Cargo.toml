@@ -18,6 +18,9 @@ axum = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 cron = "0.12"
+# Feed-format polls (`PollFormat::Feed`): RSS/Atom parsed into the
+# delta pipeline's item JSON.
+feed-rs = "2"
 dashmap = "6"
 inventory = { workspace = true }
 futures-util = "0.3"

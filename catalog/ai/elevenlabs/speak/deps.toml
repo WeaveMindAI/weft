@@ -1,0 +1,5 @@
+# The provider protocol carries audio as base64 inside JSON frames;
+# the model + output format ride the session URL's query string.
+[dependencies]
+base64 = "0.22"
+urlencoding = "2"

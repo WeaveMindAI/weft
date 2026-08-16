@@ -28,6 +28,7 @@
     "@uiw/codemirror-theme-github": "^4.25.9",
     "bits-ui": "^2.18.0",
     "clsx": "^2.1.1",
+    "plyr": "^3.8.4",
     "codemirror": "^6.0.2",
     "marked": "^18.0.2",
     "svelte-sonner": "^1.1.0",

@@ -82,10 +82,14 @@ enum Cmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "N")]
         parallel: Option<usize>,
     },
-    /// Print the content hash naming a package's node-test build (the
-    /// hash its live test image is tagged with). A scripted runner
-    /// records it after a fully green live run to skip unchanged
-    /// packages. With no target, prints `<package> <hash>` for every
+    /// Print the content hash naming a package's node-test OUTCOME
+    /// inputs: the package's own sources plus the catalog's type
+    /// registry. Deliberately narrower than the test image's tag: an
+    /// engine or image-recipe edit rebuilds the image but does not
+    /// move this hash, so a recorded live pass (live tests spend real
+    /// provider money) survives a rebuild. A scripted runner records
+    /// it after a fully green live run to skip unchanged packages.
+    /// With no target, prints `<package> <hash>` for every
     /// test-declaring package.
     #[command(name = "node-test-hash")]
     NodeTestHash {
@@ -175,7 +179,6 @@ enum Cmd {
     /// cwd project is deactivated + unregistered on the
     /// dispatcher. Add flags to escalate: `--infra` terminates
     /// infra pods, `--journal` drops execution history,
-    /// `--image` removes the worker image from docker + kind,
     /// `--local` wipes `.weft/target/` on the host, `--all`
     /// implies every flag. An explicit project id overrides the
     /// cwd discovery.
@@ -186,8 +189,6 @@ enum Cmd {
         infra: bool,
         #[arg(long)]
         journal: bool,
-        #[arg(long)]
-        image: bool,
         #[arg(long)]
         local: bool,
         #[arg(long)]
@@ -718,10 +719,10 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Ps => commands::ps::run(ctx).await,
-        Cmd::Rm { project, infra, journal, image, local, all, force } => {
+        Cmd::Rm { project, infra, journal, local, all, force } => {
             commands::rm::run(
                 ctx,
-                commands::rm::RmArgs { project, infra, journal, image, local, all, force },
+                commands::rm::RmArgs { project, infra, journal, local, all, force },
             )
             .await
         }

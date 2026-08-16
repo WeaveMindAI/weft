@@ -262,6 +262,12 @@ data, shared by every service.
 `captures` pull values off token/test responses by dotted JSON path
 and become stored values templates can interpolate.
 
+An `oauth2` acquisition may declare `token_auth` for how every token
+call (exchange, refresh, client credentials) authenticates the CLIENT:
+`body` (default) sends client_id + client_secret as form fields;
+`basic` sends them as HTTP Basic, for providers that ignore body
+credentials (Notion, Airtable).
+
 An `oauth2` acquisition may also declare `refresh`, its own renewal
 call, for providers whose renewal is not the standard refresh-token
 POST (Meta's long-lived-token exchange is a GET interpolating the
@@ -317,6 +323,19 @@ by name (`conn.value("imap_host")`) instead.
   sentence each. Deliberately not exhaustive on huge-scope providers:
   list what shipped nodes use, declare `all_permissions_url` so the
   picker can say where the rest live.
+- A catalogue entry may declare `own_only: true` plus its own `guide`
+  (same shape as `own_page.guide`): an OWN-ACCOUNT-ONLY capability.
+  Use it when the capability creates or reads durable things INSIDE
+  the connected account (minted voices, configured agents, phone
+  numbers): a runtime-supplied credential can never serve it (the
+  result would land in the runtime's account), so resolution refuses
+  the shared credential for any node requiring it, the editor marks
+  the consumer node live, and the "Your own" page shows the entry's
+  guide as its own foldable set-up section. `own_only` entries are
+  capability declarations, not consent asks: they never appear in the
+  tick list and never ride a consent URL, so they work equally on a
+  static (pasted-key) service, where nodes name them via
+  `requiresScopes` like any permission.
 - `verification`: the ladder rung + cost, above.
 - `test`: the declarative connect-time check (URL, method, expected
   status, captures). Also where identity captures usually hang;

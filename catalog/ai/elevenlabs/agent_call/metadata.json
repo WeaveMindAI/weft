@@ -1,0 +1,100 @@
+{
+  "type": "ElevenLabsAgentCall",
+  "label": "Agent: Place Call",
+  "description": "Place an outbound phone call with a configured ElevenLabs voice agent. The agent holds the conversation on its own; wire the conversation id into Agent: Get Conversation for the transcript.",
+  "tags": [
+    "ai",
+    "audio",
+    "agent",
+    "phone",
+    "call"
+  ],
+  "icon": "PhoneOutgoing",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "agents"
+      ],
+      "description": "Your own ElevenLabs account (agents and phone numbers live in it; the shared credential cannot serve this)."
+    },
+    {
+      "name": "agent",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/convai/agents",
+            "items": "agents",
+            "label": "name",
+            "value": "agent_id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "next_cursor"
+            }
+          }
+        ]
+      },
+      "label": "Agent",
+      "placeholder": "Pick an agent, or paste its id"
+    },
+    {
+      "name": "phoneNumber",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.elevenlabs.io/v1/convai/phone-numbers",
+            "items": "",
+            "label": "phone_number",
+            "value": "phone_number_id"
+          }
+        ]
+      },
+      "label": "From number",
+      "placeholder": "Pick an imported number, or paste its id",
+      "description": "The agent's imported phone number (Agents > Phone Numbers)."
+    },
+    {
+      "name": "toNumber",
+      "type": "String",
+      "required": true,
+      "label": "To number",
+      "placeholder": "+15551234567",
+      "description": "The number to call, E.164 format."
+    },
+    {
+      "name": "dynamicVariables",
+      "type": "JsonDict",
+      "required": false,
+      "description": "Values for the agent prompt's {{variables}}, e.g. { \"customer_name\": \"Ada\" }."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "conversationId",
+      "type": "String",
+      "required": false,
+      "description": "The conversation's id: what Get Conversation takes."
+    },
+    {
+      "name": "callSid",
+      "type": "String",
+      "required": false,
+      "description": "The telephony call id (Twilio numbers)."
+    }
+  ]
+}

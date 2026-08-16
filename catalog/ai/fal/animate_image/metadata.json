@@ -1,0 +1,66 @@
+{
+  "type": "FalAnimateImage",
+  "label": "Animate Image",
+  "description": "Turn a still image into a video through fal.ai: the image is the first frame, the prompt says what happens, an optional tail image pins the last frame (on models that take one).",
+  "tags": [
+    "ai",
+    "video",
+    "image",
+    "animation"
+  ],
+  "icon": "Film",
+  "color": "#7c3aed",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The fal access (wire a FalAccess node)."
+    },
+    {
+      "name": "image",
+      "type": "Image",
+      "required": true,
+      "description": "The first frame."
+    },
+    {
+      "name": "prompt",
+      "type": "String",
+      "required": true,
+      "description": "What happens in the video."
+    },
+    {
+      "name": "tailImage",
+      "type": "Image",
+      "required": false,
+      "description": "The last frame, for models that pin one (tail_image_url)."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "fal-ai/kling-video/v2.1/standard/image-to-video",
+      "label": "Model",
+      "placeholder": "fal-ai/kling-video/v2.1/standard/image-to-video",
+      "description": "The fal model route (fal.ai/models)."
+    },
+    {
+      "name": "params",
+      "type": "JsonDict",
+      "required": false,
+      "description": "Model-specific extras merged into the request (duration, cfg_scale, ...). Declared knobs win."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "video",
+      "type": "Video",
+      "required": false,
+      "description": "The generated video."
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "video"
+  }
+}

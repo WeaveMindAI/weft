@@ -206,9 +206,16 @@ pub struct NodeMetadata {
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
-    /// Node-level semantic constraints. Small, extensible.
+    /// Node-level semantic constraints. Small, extensible, boolean-ish
+    /// flags; anything with structure gets its own top-level key (like
+    /// `display` below).
     #[serde(default)]
     pub features: NodeFeatures,
+    /// The inline per-firing display this node declares (a media
+    /// player, a file card) and which PORT it shows, named with its
+    /// side. See [`DisplaySpec`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplaySpec>,
     /// Declarative validation rules. Evaluated against the project's
     /// graph state by the compiler's validate pass. Closed grammar
     /// (see `ValidationRule` / `Condition`); no user Rust runs.
@@ -362,6 +369,36 @@ impl NodeMetadata {
     /// must sit inside its declared min/max, so a default the runtime
     /// would later reject fails the metadata load instead.
     pub fn validate_semantics(&self) -> Result<(), String> {
+        if let Some(display) = &self.display {
+            let port = match (&display.input, &display.output) {
+                (Some(name), None) => {
+                    if !self.inputs.iter().any(|i| i.name == *name) {
+                        return Err(format!(
+                            "display names input '{name}', which this node does \
+                             not declare"
+                        ));
+                    }
+                    name
+                }
+                (None, Some(name)) => {
+                    if !self.outputs.iter().any(|o| o.name == *name) {
+                        return Err(format!(
+                            "display names output '{name}', which this node does \
+                             not declare"
+                        ));
+                    }
+                    name
+                }
+                _ => {
+                    return Err(
+                        "display must name exactly one port: either `input` or \
+                         `output`"
+                            .into(),
+                    )
+                }
+            };
+            let _ = port;
+        }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for input in &self.inputs {
             if !seen.insert(input.name.as_str()) {
@@ -731,6 +768,38 @@ pub struct CastPorts {
     pub output: String,
 }
 
+/// The inline per-firing display a node declares
+/// (the top-level `display` metadata key): which renderer, and which PORT it shows,
+/// named with its side (`"input": "media"` or `"output": "image"`,
+/// exactly one). New kinds extend the enum; there is never a flag per
+/// renderer.
+// SYNC: DisplaySpec <-> packages/weft-graph/src/protocol.ts DisplaySpecWire
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DisplaySpec {
+    pub kind: DisplayKind,
+    /// Show this INPUT port's value (a display sink).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// Show this OUTPUT port's value (a generator's result).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+/// How a displayed port renders.
+// SYNC: DisplayKind <-> packages/weft-graph/src/protocol.ts DisplaySpecWire.kind
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayKind {
+    /// Render the file by its own mime: an image inline, audio/video
+    /// with a real player; anything unplayable falls back to the file
+    /// card. A save button rides below either way.
+    Media,
+    /// The file card with metadata and a download button, never a
+    /// player.
+    Link,
+}
+
 // SYNC: NodeFeatures <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -760,20 +829,6 @@ pub struct NodeFeatures {
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview", skip_serializing_if = "std::ops::Not::not")]
     pub show_debug_preview: bool,
-    /// Webview hint: when the node's input is a stored image
-    /// reference, render the picture inline on the node body, fetched
-    /// through the authenticated download handshake. Used by
-    /// ImageDisplay.
-    // SYNC: showImagePreview <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire.showImagePreview
-    #[serde(default, rename = "showImagePreview", skip_serializing_if = "std::ops::Not::not")]
-    pub show_image_preview: bool,
-    /// Webview hint: when the node's input is a stored-file
-    /// reference, render a download button inline on the node body
-    /// (the click runs the same handshake a CLI download uses). Used
-    /// by DownloadLink.
-    // SYNC: showDownloadLink <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire.showDownloadLink
-    #[serde(default, rename = "showDownloadLink", skip_serializing_if = "std::ops::Not::not")]
-    pub show_download_link: bool,
     /// Default value of the node's `is_output` config flag. Nodes that
     /// are semantically "produce this thing" (Debug, Output) default
     /// to true. Any project can override by setting `is_output` in the
@@ -1628,9 +1683,9 @@ mod catalog_wire_tests {
             ],
             "outputs": [{ "name": "out", "type": "String" }],
             "features": { "oneOfRequired": [["code", "img"]], "isTrigger": true,
-                          "showImagePreview": true, "showDownloadLink": true,
                           "hasFormSchema": true, "canAddInputPorts": true,
                           "showDebugPreview": true, "liveEndpoint": "web" },
+            "display": { "kind": "media", "output": "out" },
             "formFieldSpecs": [
                 { "fieldType": "text", "label": "Text",
                   "render": { "component": "text_input", "source": "input", "multiple": true } }
@@ -1650,8 +1705,8 @@ mod catalog_wire_tests {
         };
         assert_eq!(
             keys(&v),
-            ["color", "description", "features", "formFieldSpecs", "icon", "inputs",
-             "label", "outputs", "requires_infra", "tags", "type"],
+            ["color", "description", "display", "features", "formFieldSpecs", "icon",
+             "inputs", "label", "outputs", "requires_infra", "tags", "type"],
             "top-level catalog keys are the editor contract"
         );
         // Every resolved input ships the full editor surface, with the
@@ -1670,8 +1725,13 @@ mod catalog_wire_tests {
         assert_eq!(
             keys(&v["features"]),
             ["canAddInputPorts", "hasFormSchema", "isTrigger", "liveEndpoint",
-             "oneOfRequired", "showDebugPreview", "showDownloadLink", "showImagePreview"],
+             "oneOfRequired", "showDebugPreview"],
             "feature keys are the camelCase forms the editor reads"
+        );
+        assert_eq!(
+            keys(&v["display"]),
+            ["kind", "output"],
+            "the display declaration carries only its kind and the named side"
         );
         assert_eq!(keys(&v["formFieldSpecs"][0]),
             ["addsInputs", "addsOutputs", "fieldType", "label", "optionalConfig",
@@ -1873,6 +1933,42 @@ mod input_semantics_tests {
         let mut t = input("value", WeftType::TypeVar("T".into()));
         t.widget = Some(Widget::Number { min: None, max: None, step: None });
         assert!(metadata_with(vec![t]).validate_semantics().is_ok());
+    }
+
+    /// The display declaration names exactly one existing port with
+    /// its side; anything else is refused at load, never a silent
+    /// no-preview.
+    #[test]
+    fn validate_semantics_checks_the_display_declaration() {
+        let display = |input: Option<&str>, output: Option<&str>| DisplaySpec {
+            kind: DisplayKind::Media,
+            input: input.map(str::to_string),
+            output: output.map(str::to_string),
+        };
+        let with = |d: DisplaySpec| {
+            let mut m = metadata_with(vec![input(
+                "media",
+                WeftType::primitive(WeftPrimitive::Image),
+            )]);
+            m.outputs.push(OutputSpec {
+                name: "file".into(),
+                port_type: WeftType::primitive(WeftPrimitive::Image),
+                required: false,
+                description: None,
+            });
+            m.display = Some(d);
+            m
+        };
+        assert!(with(display(Some("media"), None)).validate_semantics().is_ok());
+        assert!(with(display(None, Some("file"))).validate_semantics().is_ok());
+        let e = with(display(Some("nope"), None)).validate_semantics().unwrap_err();
+        assert!(e.contains("input 'nope'"), "{e}");
+        let e = with(display(None, Some("nope"))).validate_semantics().unwrap_err();
+        assert!(e.contains("output 'nope'"), "{e}");
+        let e = with(display(None, None)).validate_semantics().unwrap_err();
+        assert!(e.contains("exactly one port"), "{e}");
+        let e = with(display(Some("media"), Some("file"))).validate_semantics().unwrap_err();
+        assert!(e.contains("exactly one port"), "{e}");
     }
 
     /// The access widget's rules bind on the access node's OWN input:

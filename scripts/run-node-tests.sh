@@ -21,9 +21,12 @@
 # Live runs remember what already passed: after a package's whole live
 # tier runs green, its `weft node-test-hash` is recorded in the scratch
 # project's `.live-pass-cache`, and later live runs skip the package
-# until any code the hash covers moves (its own files, a shared
-# function, a sibling package's types, the image recipe). `--retest`
-# forces the recorded packages to run anyway.
+# until its test OUTCOME inputs move: the package's own code (nodes,
+# tests, shared package files) or the catalog's type registry (a
+# sibling's type edit changes how this package's ports resolve).
+# Engine / image-recipe edits rebuild the test image but do not
+# invalidate a recorded pass (live tests cost real money).
+# `--retest` forces the recorded packages to run anyway.
 #
 # The suite runs inside a scratch project (target/node-tests, created on
 # first use) whose base catalog is re-synced from THIS checkout on every
@@ -216,11 +219,12 @@ fi
 # ---------- The live-pass cache ----------
 # Live tests cost real provider money, so a package whose code has not
 # moved since its last fully green live run is skipped. Identity is
-# `weft node-test-hash`: the package's own files + the image recipe +
-# the full type registry + the build env, so a shared-function or
-# sibling-type edit re-tests every package it reaches. Recorded ONLY
-# after a run that covered the package's whole live tier (never under
-# --test); `--retest` ignores recorded passes for this run.
+# `weft node-test-hash`: the package's own files (nodes, tests, shared
+# package files) plus the catalog's type registry; engine / recipe
+# edits rebuild the image but never re-spend a recorded pass.
+# Recorded ONLY after a run
+# that covered the package's whole live tier (never under --test);
+# `--retest` ignores recorded passes for this run.
 CACHE_FILE="$PROJECT_DIR/.live-pass-cache"
 declare -A PKG_HASH
 CACHE_ACTIVE=0

@@ -1,0 +1,33 @@
+{
+  "type": "MediaDisplay",
+  "label": "Media Display",
+  "description": "Show a stored image, audio clip, or video inline in the graph: images render in place, audio and video get a real player, and a save button sits below. A display sink; it emits nothing.",
+  "tags": [
+    "storage",
+    "media",
+    "image",
+    "audio",
+    "video",
+    "display",
+    "preview"
+  ],
+  "icon": "MonitorPlay",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "media",
+      "type": "Image | Audio | Video",
+      "required": true,
+      "description": "The stored media to show inline."
+    }
+  ],
+  "outputs": [],
+  "requires_infra": false,
+  "display": {
+    "kind": "media",
+    "input": "media"
+  },
+  "features": {
+    "isOutputDefault": true
+  }
+}

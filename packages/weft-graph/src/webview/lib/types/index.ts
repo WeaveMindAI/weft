@@ -762,6 +762,9 @@ export interface NodeTemplate {
 	defaultInputs: PortDefinition[];
 	defaultOutputs: PortDefinition[];
 	features?: NodeFeatures;
+	/** The node's declared inline per-firing display (a media player,
+	 *  a file card) and which port it shows. */
+	display?: import('../../../protocol').DisplaySpecWire;
 	formFieldSpecs?: import('../utils/form-field-specs').FormFieldSpec[];
 	/** The service recipe, present ONLY on a personal access node;
 	 *  drives the connect flow's forms and scope menu. */

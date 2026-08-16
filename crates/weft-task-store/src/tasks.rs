@@ -928,6 +928,14 @@ pub struct OrphanedLiveExecution {
 /// ('spawning','alive')` for that pod name. A task with `target_pod_name`
 /// NULL and no `claimed_by` is normal pending work, untouched.
 ///
+/// WORKER-target tasks only: worker pods are the only claimants with
+/// `worker_pod` rows. A dispatcher-target task is claimed by a
+/// dispatcher pod, which never has one, so this predicate would yank
+/// every in-flight dispatcher task back to pending mid-run (a second
+/// claim then races the first); a dead dispatcher pod's tasks are
+/// recovered by lease expiry instead (`claim_one` rescues a lapsed
+/// claim).
+///
 /// Idempotent across sibling reaper Pods: (1) is a read (a second pass
 /// re-finds the same not-yet-deleted orphans; the cancel dedups), and (2) is
 /// a conditional UPDATE.
@@ -973,6 +981,7 @@ pub async fn reclaim_orphaned_tasks(pool: &PgPool) -> Result<Vec<OrphanedLiveExe
            SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL,
                target_pod_name = NULL
            WHERE t.status IN ('pending', 'claimed')
+             AND t.target = 'worker'
              AND (
                  (t.target_pod_name IS NOT NULL AND NOT EXISTS (
                      SELECT 1 FROM worker_pod wp

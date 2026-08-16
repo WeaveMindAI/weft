@@ -1,0 +1,99 @@
+{
+  "type": "NotionQueryDatabase",
+  "label": "Notion: Query Database",
+  "description": "Read rows out of a Notion database, with Notion's own filter and sort JSON. Emits the raw page objects.",
+  "tags": [
+    "notion",
+    "database",
+    "query"
+  ],
+  "icon": "DatabaseZap",
+  "color": "#37352f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Notion access (wire a NotionAccess node)."
+    },
+    {
+      "name": "database",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "from_url",
+            "pattern": "([0-9a-fA-F]{32})"
+          }
+        ]
+      },
+      "label": "Database",
+      "placeholder": "Paste the database's link or id"
+    },
+    {
+      "name": "source",
+      "type": "String",
+      "required": false,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "database"
+        ],
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.notion.com/v1/databases/{database}",
+            "items": "data_sources",
+            "label": "name",
+            "value": "id"
+          }
+        ]
+      },
+      "label": "Source",
+      "placeholder": "Only needed when the database has several sources"
+    },
+    {
+      "name": "filter",
+      "type": "JsonDict",
+      "required": false,
+      "description": "Notion filter JSON (developers.notion.com, 'Filter database entries')."
+    },
+    {
+      "name": "sorts",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Notion sorts JSON."
+    },
+    {
+      "name": "limit",
+      "type": "Number",
+      "exposure": "config",
+      "default": 100,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 1000,
+        "step": 1
+      },
+      "label": "Max rows"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "items",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "The matching pages, raw Notion page objects."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

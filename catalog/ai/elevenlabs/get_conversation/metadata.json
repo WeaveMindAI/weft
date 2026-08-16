@@ -1,0 +1,101 @@
+{
+  "type": "ElevenLabsGetConversation",
+  "label": "Agent: Get Conversation",
+  "description": "Read an agent conversation: waits for the call to finish (default), then emits the transcript, the summary, whether the call succeeded, and optionally the recording.",
+  "tags": [
+    "ai",
+    "audio",
+    "agent",
+    "conversation",
+    "transcript"
+  ],
+  "icon": "PhoneCall",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "requiresScopes": [
+        "agents"
+      ],
+      "description": "Your own ElevenLabs account (conversations live in it; the shared credential cannot serve this)."
+    },
+    {
+      "name": "conversationId",
+      "type": "String",
+      "required": true,
+      "description": "The conversation to read (from Agent: Place Call)."
+    },
+    {
+      "name": "waitUntilDone",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": true,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Wait for the call to finish",
+      "description": "Off = answer the current state immediately."
+    },
+    {
+      "name": "includeAudio",
+      "type": "Boolean",
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Download the recording",
+      "description": "Also fetch the call audio and emit it on the audio port."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "status",
+      "type": "String",
+      "required": false,
+      "description": "done, failed, or the in-flight state when not waiting."
+    },
+    {
+      "name": "transcript",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each turn: role (agent/user) and message."
+    },
+    {
+      "name": "text",
+      "type": "String",
+      "required": false,
+      "description": "The whole transcript as role-prefixed lines."
+    },
+    {
+      "name": "summary",
+      "type": "String",
+      "required": false,
+      "description": "The analysis's transcript summary."
+    },
+    {
+      "name": "successful",
+      "type": "String",
+      "required": false,
+      "description": "The analysis's call outcome (success / failure / unknown)."
+    },
+    {
+      "name": "conversation",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The whole conversation object."
+    },
+    {
+      "name": "audio",
+      "type": "Audio",
+      "required": false,
+      "description": "The call recording (when Download the recording is on)."
+    }
+  ],
+  "display": {
+    "kind": "media",
+    "output": "audio"
+  }
+}

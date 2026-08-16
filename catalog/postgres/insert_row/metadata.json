@@ -1,0 +1,44 @@
+{
+  "type": "PostgresInsertRow",
+  "label": "Postgres: Insert Row",
+  "description": "Insert one row into a table, columns from a JSON object, and get the inserted row back (defaults and generated ids filled in).",
+  "tags": [
+    "postgres",
+    "database",
+    "insert"
+  ],
+  "icon": "DatabaseBackup",
+  "color": "#336791",
+  "inputs": [
+    {
+      "name": "connectionString",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "password"
+      },
+      "label": "Connection string",
+      "placeholder": "postgres://user:password@host:5432/db"
+    },
+    {
+      "name": "table",
+      "type": "String",
+      "required": true,
+      "description": "The table to insert into."
+    },
+    {
+      "name": "values",
+      "type": "JsonDict",
+      "required": true,
+      "description": "The row as column: value pairs, e.g. { \"email\": \"a@b.c\", \"age\": 30 }."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "row",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The inserted row as the database stored it."
+    }
+  ]
+}

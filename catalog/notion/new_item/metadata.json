@@ -1,0 +1,96 @@
+{
+  "type": "NotionNewItem",
+  "label": "Notion: On New Database Item",
+  "description": "Fires once per row added to a Notion database. Activation starts from now (history never replays) and the position survives restarts.",
+  "tags": [
+    "notion",
+    "database",
+    "trigger"
+  ],
+  "icon": "BellPlus",
+  "color": "#37352f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The Notion access (wire a NotionAccess node)."
+    },
+    {
+      "name": "database",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "free_text": true,
+        "sources": [
+          {
+            "kind": "from_url",
+            "pattern": "([0-9a-fA-F]{32})"
+          }
+        ]
+      },
+      "label": "Database",
+      "placeholder": "Paste the database's link or id"
+    },
+    {
+      "name": "source",
+      "type": "String",
+      "required": false,
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "depends_on": [
+          "database"
+        ],
+        "sources": [
+          {
+            "kind": "list",
+            "get": "https://api.notion.com/v1/databases/{database}",
+            "items": "data_sources",
+            "label": "name",
+            "value": "id"
+          }
+        ]
+      },
+      "label": "Source",
+      "placeholder": "Only needed when the database has several sources"
+    },
+    {
+      "name": "intervalSecs",
+      "type": "Number",
+      "exposure": "config",
+      "default": 30,
+      "label": "Check every (seconds)",
+      "description": "How often the database is checked for new rows."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "page",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The new row, the raw Notion page object."
+    },
+    {
+      "name": "pageId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "url",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "properties",
+      "type": "JsonDict",
+      "required": false,
+      "description": "The row's property values."
+    }
+  ],
+  "features": {
+    "isTrigger": true
+  }
+}

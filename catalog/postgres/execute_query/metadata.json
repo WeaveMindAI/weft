@@ -1,0 +1,54 @@
+{
+  "type": "PostgresExecuteQuery",
+  "label": "Postgres: Query",
+  "description": "Run SQL against a Postgres database and get the rows back. Use $1-style placeholders with the params list; cast placeholders for non-text types ($1::int).",
+  "tags": [
+    "postgres",
+    "database",
+    "sql"
+  ],
+  "icon": "Database",
+  "color": "#336791",
+  "inputs": [
+    {
+      "name": "connectionString",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "password"
+      },
+      "label": "Connection string",
+      "placeholder": "postgres://user:password@host:5432/db"
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "code",
+        "language": "sql"
+      },
+      "label": "SQL",
+      "placeholder": "SELECT * FROM users WHERE email = $1"
+    },
+    {
+      "name": "params",
+      "type": "List[String | Number | Boolean | Null | JsonDict]",
+      "required": false,
+      "description": "Values for $1, $2, ... A string binds as text, a number as float8, an object as jsonb; cast in the SQL for other types."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "rows",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "The answered rows keyed by column name."
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ]
+}

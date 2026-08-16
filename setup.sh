@@ -49,19 +49,22 @@
 #                 the daemon (graceful: leases released on the Pod's
 #                 SIGTERM), uninstalls the VS Code extension, drops
 #                 the CLI symlink. PRESERVES: kind cluster,
-#                 postgres data, docker images, BuildKit cache,
+#                 postgres data, the object-store container + its
+#                 data volume, docker images, BuildKit cache,
 #                 cargo target/, image-hash stamps, browser
 #                 extensions. Reinstall via ./setup.sh and your
 #                 projects + history come back instantly.
-#   --purge       TRUE clean slate. Deletes the kind cluster, every
-#                 weft-built docker image (dispatcher, listener,
-#                 every weft-worker-*), every weft infra
-#                 image, the BuildKit cache, the workspace target/
-#                 cargo cache, ~/.local/share/weft (image-hash
-#                 stamps, port-forward state, etc), and every
-#                 extension build artifact. The next install pays
-#                 a full cold-rebuild cost. Can combine with
-#                 --uninstall.
+#   --purge       TRUE clean slate. Deletes the kind cluster (and
+#                 the `kind` docker network once no clusters
+#                 remain), every weft-built docker image
+#                 (dispatcher, listener, every weft-worker-*),
+#                 every weft infra image, the object-store
+#                 container + data volume + seaweedfs image, the
+#                 BuildKit cache, the workspace target/ cargo
+#                 cache, ~/.local/share/weft (image-hash stamps,
+#                 port-forward state, etc), and every extension
+#                 build artifact. The next install pays a full
+#                 cold-rebuild cost. Can combine with --uninstall.
 #
 #                 SHARED base images (commonly reused by other
 #                 docker projects on the host) are kept by default.
@@ -522,6 +525,8 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       printf '\n%s%sWhat is preserved:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
       printf "  %skind cluster%s %s'%s' (postgres, history, projects)%s\n" \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${WEFT_CLUSTER_NAME:-weft-local}" "${C_RESET}"
+      printf '  %sobject store%s %s(weft-object-store container + data volume)%s\n' \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sdocker images%s %s(dispatcher, listener, weft-worker-*)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sworkspace target/%s %s(cargo cache)%s\n' \
@@ -539,7 +544,10 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     section "Purge"
     hint "${C_DIM}true clean slate; next install pays a full rebuild cost${C_RESET}"
 
-    # 1. Delete the kind cluster.
+    # 1. Delete the kind cluster. `kind delete` leaves the shared
+    #    `kind` docker network behind; once no clusters remain it is
+    #    pure leftover, so remove it too (best-effort: another tool's
+    #    running container on it just keeps it alive).
     if command -v kind >/dev/null 2>&1; then
       cluster="${WEFT_CLUSTER_NAME:-weft-local}"
       if kind get clusters 2>/dev/null | grep -qx "${cluster}"; then
@@ -547,6 +555,11 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         ok "kind cluster ${C_DIM}'${cluster}'${C_RESET} deleted"
       else
         hint "kind cluster ${C_DIM}'${cluster}'${C_RESET}: not present"
+      fi
+      if [[ -z "$(kind get clusters 2>/dev/null)" ]] \
+        && docker network inspect kind >/dev/null 2>&1; then
+        docker network rm kind >/dev/null 2>&1 || true
+        ok "removed the ${C_DIM}kind${C_RESET} docker network"
       fi
     fi
 
@@ -598,6 +611,18 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         ok "removed debian:bookworm-slim ${C_DIM}(--debian)${C_RESET}"
       fi
 
+      # The daemon's host-side object store: a docker container, its
+      # named data volume, and the pulled seaweedfs image. All three
+      # are weft-created (the image is niche enough that nothing else
+      # on the host wants it), so a purge removes them unconditionally.
+      # SYNC: weft-object-store <-> crates/weft-cli/src/commands/daemon.rs
+      #       (OBJECT_STORE_CONTAINER; the volume is "<container>-data",
+      #       the image is the `docker run` line below the constant)
+      docker rm -f weft-object-store >/dev/null 2>&1 || true
+      docker volume rm weft-object-store-data >/dev/null 2>&1 || true
+      docker image rm -f chrislusf/seaweedfs:3.80 >/dev/null 2>&1 || true
+      ok "removed the object-store container + data volume + seaweedfs image"
+
       docker buildx prune --force >/dev/null 2>&1 || true
       ok "pruned BuildKit cache"
     fi
@@ -608,9 +633,12 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       rm -rf "${here}/target"
       ok "removed ${C_DIM}target/${C_RESET}"
     fi
-    if [[ -d "${here}/.weft-base-context" ]]; then
-      rm -rf "${here}/.weft-base-context"
-      ok "removed ${C_DIM}.weft-base-context/${C_RESET}"
+    # The staging lock lives BESIDE the dir (see
+    # weft-cli images.rs ensure_worker_builder_base), so it needs its
+    # own removal or it survives the purge.
+    if [[ -d "${here}/.weft-base-context" || -f "${here}/.weft-base-context.lock" ]]; then
+      rm -rf "${here}/.weft-base-context" "${here}/.weft-base-context.lock"
+      ok "removed ${C_DIM}.weft-base-context/${C_RESET} (and its staging lock)"
     fi
 
     # 4. Daemon-local state. Docker may have auto-created root-owned

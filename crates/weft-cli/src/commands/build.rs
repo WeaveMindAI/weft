@@ -317,15 +317,21 @@ pub async fn gc_stale_images(
     // tag (with no labels); condemn exactly the host-stale hash set
     // there, through the one matcher every node cleanup uses (bare,
     // docker-canonical, and registry-qualified spellings). A tag a
-    // live pod still runs refuses the rmi and survives.
+    // live pod still runs refuses the rmi and survives. A node image
+    // whose tags mix stale and live (two builds produced identical
+    // bytes) is intentionally spared here, forever: once the live tag
+    // goes stale too it is no longer in the HOST's stale list, so
+    // this sweep never condemns the group. `weft clean --images`
+    // reclaims it, since it condemns against the dispatcher's
+    // referenced set instead of the host-stale set.
     let stale_hashes: std::collections::BTreeSet<&str> =
         stale.iter().filter_map(|s| s.rsplit_once(':').map(|(_, h)| h)).collect();
     let cfg = cluster_config();
     if cfg.backend == ClusterBackend::Kind && kind_available(&cfg.cluster_name).await {
-        if let Ok(node_tags) = images::kind_node_repo_tags(&cfg.cluster_name).await {
+        if let Ok(groups) = images::kind_node_image_tag_groups(&cfg.cluster_name).await {
             let node = format!("{}-control-plane", cfg.cluster_name);
             let node_stale =
-                images::node_refs_matching(repo, &node_tags, |h| stale_hashes.contains(h));
+                images::node_images_condemned(repo, &groups, |h| stale_hashes.contains(h));
             if !node_stale.is_empty() {
                 let _ = Command::new("docker")
                     .args(["exec", &node, "crictl", "rmi"])

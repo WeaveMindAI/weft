@@ -1,0 +1,47 @@
+{
+  "type": "ElevenLabsAlign",
+  "label": "Align Transcript",
+  "description": "Line up a known transcript with its audio: each word gets its start and end time in seconds (for subtitles, karaoke, or editing by word).",
+  "tags": [
+    "ai",
+    "audio",
+    "alignment",
+    "subtitles"
+  ],
+  "icon": "AlignHorizontalDistributeCenter",
+  "color": "#6b6b99",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
+    },
+    {
+      "name": "audio",
+      "type": "Audio",
+      "required": true,
+      "description": "The recording."
+    },
+    {
+      "name": "transcript",
+      "type": "String",
+      "required": true,
+      "description": "The text actually spoken in the recording."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "words",
+      "type": "List[JsonDict]",
+      "required": false,
+      "description": "Each word: text, start, end (seconds)."
+    },
+    {
+      "name": "loss",
+      "type": "Number",
+      "required": false,
+      "description": "How well the transcript matched the audio (lower is better)."
+    }
+  ]
+}

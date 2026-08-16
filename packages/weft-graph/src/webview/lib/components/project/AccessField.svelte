@@ -14,7 +14,7 @@
 	// switch and no second tab.
 	import { accessCall, openExternalUrl } from '../../../vscode';
 	import type { AccessSpecWire, AppRegistration, Door, GrantSummary } from '../../../../protocol';
-	import { defaultPermissions, guideSteps, ownFields } from './own-fields';
+	import { defaultPermissions, guideSteps, ownFields, tickablePermissions } from './own-fields';
 	import { grantsForService, invalidateGrants } from './grants-cache.svelte';
 	import PermissionPicker from './PermissionPicker.svelte';
 
@@ -44,7 +44,7 @@
 		spec.acquisition.kind === 'oauth2' &&
 			spec.acquisition.grant?.kind === 'authorization_code',
 	);
-	const hasPermissions = $derived((spec.permissions ?? []).length > 0);
+	const hasPermissions = $derived(tickablePermissions(spec).length > 0);
 	const declaredDoors = $derived<Door[]>(spec.doors ?? ['own']);
 
 	let open = $state(false);
@@ -89,6 +89,15 @@
 	/// first field on the "Your own" page.
 	let ownName = $state('');
 	let guideOpen = $state(true);
+	/// The own-account-only capabilities with their own tutorial
+	/// section on the "Your own" page; folded state per capability.
+	const ownOnlyGuides = $derived(
+		(spec.permissions ?? []).filter((p) => p.own_only && p.guide),
+	);
+	const ownOnlyLabels = $derived(
+		(spec.permissions ?? []).filter((p) => p.own_only).map((p) => p.label),
+	);
+	let capGuideOpen = $state<Record<string, boolean>>({});
 	/// The shared door's one-time displacement warning: shown before
 	/// the FIRST connection is created through it (rarely, since
 	/// connections are created rarely), acknowledged per attempt.
@@ -460,7 +469,17 @@
 								type="button"
 								class="w-full text-left text-[10px] px-2 py-1 rounded bg-muted hover:bg-muted/70"
 								onclick={(e) => { e.stopPropagation(); chosenApp = null; surface = 'shared'; sharedWarningAcked = false; }}
-							>Use ours (uses your credits)</button>
+							>
+								<span>Use ours (uses your credits)</span>
+								{#if ownOnlyLabels.length > 0}
+									<!-- Own-account-only capabilities create things
+									     inside the credential's account, so the
+									     shared credential never serves them. -->
+									<span class="block text-muted-foreground truncate"
+										>No {ownOnlyLabels.join(' / ')}: own account only</span
+									>
+								{/if}
+							</button>
 						{/if}
 					{/if}
 					{#if declaredDoors.includes('own')}
@@ -522,7 +541,7 @@
 				<!-- ONE page, three optional parts + the fields. No tabs. -->
 				{#if hasPermissions}
 					<PermissionPicker
-						permissions={spec.permissions ?? []}
+						permissions={tickablePermissions(spec)}
 						allPermissionsUrl={spec.all_permissions_url ?? null}
 						{nodeType}
 						bind:ticked
@@ -560,6 +579,32 @@
 						</div>
 					{/if}
 				{/if}
+				<!-- Per-capability tutorials: an own-account-only
+				     capability (voice creation, phone agents) carries its
+				     own set-up guide. Each renders as its own foldable
+				     section, folded by default: they only matter to
+				     someone setting up for that capability. -->
+				{#each ownOnlyGuides as cap (cap.id)}
+					<button
+						type="button"
+						class="w-full flex items-center gap-1.5 text-[10px] text-blue-500 hover:text-blue-600 font-medium"
+						onclick={(e) => { e.stopPropagation(); capGuideOpen[cap.id] = !capGuideOpen[cap.id]; }}
+					>
+						<span class="text-xs">{capGuideOpen[cap.id] ? '▾' : '▸'}</span>
+						<span>Set up: {cap.label}</span>
+					</button>
+					{#if capGuideOpen[cap.id]}
+						<div class="text-[10px] text-muted-foreground bg-blue-50 rounded px-2 py-1.5 space-y-1">
+							<p>{cap.description}</p>
+							{#if cap.guide?.link}
+								<button type="button" class="text-blue-500 hover:underline" onclick={(e) => { e.stopPropagation(); openExternalUrl(cap.guide!.link!); }}>Open the provider's page</button>
+							{/if}
+							{#each cap.guide?.steps ?? [] as step, i}
+								<p>{i + 1}. {step}</p>
+							{/each}
+						</div>
+					{/if}
+				{/each}
 				<!-- The fields. A name field is always prepended, whatever
 				     the service declares: it is the connection list's
 				     middle column. -->

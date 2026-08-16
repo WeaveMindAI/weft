@@ -1,5 +1,5 @@
 //! DownloadLink: a terminal sink that surfaces a download button for a
-//! file in the graph. Like Debug/ImageDisplay it emits nothing; the
+//! file in the graph. Like Debug/MediaDisplay it emits nothing; the
 //! graph view reads the input off the SSE stream and, seeing a file
 //! value (`features.showDownloadLink`), renders the filename, size, and
 //! an action button. A key-backed file downloads through the SAME
