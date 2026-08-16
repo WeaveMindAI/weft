@@ -186,6 +186,18 @@ editor's clamp and the compiler's `literal-out-of-range`),
 `password`, `form_builder`, `file_drop`, and the connection surface
 (`access`, `remote_select`; see "Connections" below).
 
+A field whose value names something enumerable is NEVER a bare text
+field. If the vocabulary is small and fixed, declare `select` with the
+options. If the provider can list the choices (model ids, voices,
+channels, databases, repos), declare `remote_select` so the user gets
+search-as-you-type instead of copying an id from the provider's docs;
+add `free_text: true` when any pasted id is also valid (a model route
+the list hasn't caught up with). The default text control is only for
+genuinely free-form values (a prompt, a URL, a message body). See
+`catalog/ai/llm/openrouter` (public model list) and
+`catalog/ai/elevenlabs/speak` (signed voice list) for the two common
+shapes.
+
 `default` is the value the runtime supplies when nothing else drives
 the input. It is consulted at run time and rendered by the editor as
 the effective value, never written into source; `required` plus
@@ -251,6 +263,17 @@ label, placeholder, description }`), `outputs` (`{ name, type, required,
 description }`), `requires_infra`, `images`, `features`, `display`,
 `validate`. (`features` is for boolean-ish flags; anything with
 structure, like `display`, is its own top-level key.)
+
+One `features` flag every author must decide, not default: if your
+node's firing IS the deliverable (it generates an artifact: an image,
+a video, speech; or it performs the outward effect: sends the message,
+creates the record, uploads the file), set
+`features.isOutputDefault: true`. A run executes the union of the
+upstream closures of the project's output nodes, so this flag is what
+lets a user drop your node at the end of a chain and hit run with no
+Debug node attached. Reads, transforms, lookups, and triggers leave it
+unset; any project can override per instance with `is_output` in the
+node's config.
 
 ### Showing a result on the node: `display`
 
