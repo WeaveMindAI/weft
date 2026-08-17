@@ -278,7 +278,10 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
                 registry,
             ) {
                 Ok(r) => r,
-                Err(e) => return ServerResponse { id, payload: None, error: Some(format!("edit: {e}")) },
+                // The message travels verbatim: the host knows which request
+                // kind it sent, so no kind prefix is smuggled into the text
+                // (it would end up in a user-facing toast).
+                Err(e) => return ServerResponse { id, payload: None, error: Some(e.to_string()) },
             };
             edit_envelope(id, new_source, inverse, &project, &base, &req, catalogs)
         }
@@ -291,7 +294,8 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
             };
             let new_source = match weft_compiler::edit::apply_text_edit(&req.source, text_edit) {
                 Ok(s) => s,
-                Err(e) => return ServerResponse { id, payload: None, error: Some(format!("applyEdit: {e}")) },
+                // Verbatim, same as the edit arm: no kind prefix in the text.
+                Err(e) => return ServerResponse { id, payload: None, error: Some(e.to_string()) },
             };
             let inverse = weft_compiler::edit::invert_text_edit(&req.source, &new_source);
             edit_envelope(id, new_source, inverse, &project, &base, &req, catalogs)

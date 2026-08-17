@@ -919,6 +919,22 @@ impl FakeRig {
         stored.to_value()
     }
 
+    /// The metadata the run stored under `key` (from an emitted
+    /// stored-file value's `key` field), for asserting storage-side
+    /// facts the wire value does not carry (the keep flag). Loud when
+    /// nothing was stored under that key.
+    pub fn stored_meta(&self, key: &str) -> WeftResult<crate::storage::StoredFileMeta> {
+        self.state
+            .storage
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|e| e.meta.clone())
+            .ok_or_else(|| {
+                WeftError::NodeExecution(format!("no stored file under key {key}"))
+            })
+    }
+
     /// The live bus behind an emitted marker (`outcome.outputs["stream"]`),
     /// for reading what the run sent. Loud when the run opened no bus
     /// behind that marker.

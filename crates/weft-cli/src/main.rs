@@ -176,17 +176,15 @@ enum Cmd {
     /// List every project registered with the dispatcher.
     Ps,
     /// Remove a project at the level you ask for. No flags → the
-    /// cwd project is deactivated + unregistered on the
-    /// dispatcher. Add flags to escalate: `--infra` terminates
-    /// infra pods, `--journal` drops execution history,
+    /// cwd project is unregistered: the dispatcher deactivates it,
+    /// terminates its infra pods, and reclaims its stored data.
+    /// Add flags to escalate: `--journal` drops execution history,
     /// `--local` wipes `.weft/target/` on the host, `--all`
     /// implies every flag. An explicit project id overrides the
     /// cwd discovery.
     Rm {
         #[arg(value_name = "project")]
         project: Option<String>,
-        #[arg(long)]
-        infra: bool,
         #[arg(long)]
         journal: bool,
         #[arg(long)]
@@ -719,10 +717,10 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Ps => commands::ps::run(ctx).await,
-        Cmd::Rm { project, infra, journal, local, all, force } => {
+        Cmd::Rm { project, journal, local, all, force } => {
             commands::rm::run(
                 ctx,
-                commands::rm::RmArgs { project, infra, journal, local, all, force },
+                commands::rm::RmArgs { project, journal, local, all, force },
             )
             .await
         }

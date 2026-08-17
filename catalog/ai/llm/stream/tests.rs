@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use weft::bus::BusEntryKind;
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use super::LlmStreamNode;
 
@@ -12,7 +12,32 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("deltas_ride_the_bus_then_the_reply_pulses", streams),
         NodeTest::fake("a_dropped_stream_fails_loud_after_partial_deltas", truncated),
+        NodeTest::live("one_real_streamed_completion", "openrouter", live_stream),
     ]
+}
+
+/// One real streamed completion on the cheapest routed model: the
+/// deltas ride a real SSE wire (what the fake tier cannot prove) and
+/// the whole reply still pulses. A one-word answer keeps the cost at
+/// a fraction of a cent.
+async fn live_stream(rig: LiveRig) -> WeftResult<()> {
+    let outcome = rig
+        .run(
+            &LlmStreamNode,
+            json!({
+                "provider": {
+                    "kind": "openrouter",
+                    "model": "openai/gpt-4o-mini",
+                    "account": rig.access("openrouter"),
+                },
+                "prompt": "Answer with the single word: pong",
+            }),
+        )
+        .await
+        .ok()?;
+    let text = outcome.output("response")?.as_str().expect("text reply").to_lowercase();
+    assert!(text.contains("pong"), "unexpected reply: {text}");
+    Ok(())
 }
 
 /// A body that stops mid-stream (no finish reason, no `[DONE]`): the

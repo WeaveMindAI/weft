@@ -82,14 +82,18 @@ pub async fn usage(
 #[derive(Debug, Deserialize)]
 pub struct DownloadRequest {
     pub key: String,
-    /// Presigned-URL lifetime; None = broker default (~15 min).
+    /// Download-link lifetime; None = broker default (~15 min).
     pub ttl_secs: Option<u64>,
 }
 
 /// POST /storage/files/download: resolve the acting tenant, prefix the key, and
-/// ask the broker to presign a single-file download URL (with the file's name +
-/// size for the client). Returns `PresignResult` directly (the presign result IS
-/// the download-handshake response; no separate same-fields struct).
+/// mint a relay download link (with the file's name + size for the client).
+/// The answer is a `/public/files/{token}` URL on this dispatcher's public
+/// base, NOT a presigned bucket URL: the download handshake serves browsers
+/// and CLIs on the user's side of any port forward, tunnel, or proxy, and a
+/// presigned URL's signature covers the exact host the client must send, so
+/// one rewritten hop turns it into a bucket signature error. The token URL
+/// rides the same base every other editor call already reaches.
 pub async fn download(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -97,7 +101,7 @@ pub async fn download(
 ) -> Result<Json<weft_core::storage::PresignResult>, ApiError> {
     let tenant = caller.0;
     let key = ensure_tenant_key(&tenant, &req.key)?;
-    let p = crate::storage::presign(&state, &key, req.ttl_secs).await.map_err(storage_err)?;
+    let p = crate::storage::download_link(&state, &key, req.ttl_secs).await.map_err(storage_err)?;
     Ok(Json(p))
 }
 

@@ -435,7 +435,7 @@ impl ProviderMeter for ElevenLabsMeter {
         &self,
         path: &str,
         body: &[u8],
-        _http: &reqwest::Client,
+        _follow_up: FollowUp<'_>,
     ) -> anyhow::Result<f64> {
         // Every billable batch route prices off its REQUEST; the same
         // math the observer runs is the ceiling (plus the output-priced

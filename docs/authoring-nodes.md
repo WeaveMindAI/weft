@@ -1551,6 +1551,22 @@ The lifetime distinction is the thing to get right:
   `Shared` file is the owner's, addressed by a name they choose, and a
   project's deletion never touches it.
 
+**An Execution-scoped file your node EMITS must be kept.** Every
+Execution write (`put`, `put_stream`, `put_response`, `put_from_url`,
+`internalize`) takes a `keep: Option<KeepTtl>`. `None` means the file is
+swept shortly after the run ends: right for scratch, wrong for anything
+the node pulses downstream, because an emitted reference lands in the
+journal and renders in the editor long after the run, and a swept file
+shows up there as "media expired". So a node that produces a user-facing
+artifact (a generated image, synthesized speech, downloaded or received
+media) passes `Some(KeepTtl::Default)`: kept 30 days, and every access
+bumps the clock, so artifacts still in use never expire while abandoned
+ones age out. A node whose file is cheaply re-fetchable (a plain
+download) may instead expose a `keep` boolean config input (default off)
+and pass `keep.then_some(KeepTtl::Default)`, letting the user decide.
+The `KeepFile` node extends or pins any stored file's lifetime after the
+fact.
+
 So "do I want this file to survive deleting the project?" is answered
 entirely by the scope on the write call: `Project` = no, `Shared` = yes.
 There is no separate setting; changing the scope argument is the whole

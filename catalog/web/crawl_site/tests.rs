@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
 use super::CrawlSiteNode;
 
@@ -12,7 +12,33 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("crawls_and_accumulates_pages_across_links", crawl_accumulates),
         NodeTest::fake("a_failed_crawl_fails_loud", failed_crawl),
         NodeTest::fake("an_unknown_status_fails_loud", unknown_status),
+        NodeTest::live("one_real_single_page_crawl", "firecrawl", live_crawl),
     ]
+}
+
+/// One real crawl capped at a single page (the cheapest crawl
+/// firecrawl sells, one credit), against a small stable site. Nothing
+/// lands on the account.
+async fn live_crawl(rig: LiveRig) -> WeftResult<()> {
+    let outcome = rig
+        .run(
+            &CrawlSiteNode,
+            json!({
+                "account": rig.access("firecrawl"),
+                "url": "https://example.com",
+                "limit": 1,
+            }),
+        )
+        .await
+        .ok()?;
+    assert_eq!(outcome.output("count")?.as_f64(), Some(1.0));
+    let pages = outcome.output("pages")?;
+    assert!(
+        pages[0]["markdown"].as_str().unwrap_or_default().contains("Example Domain"),
+        "the crawled page carries the real content: {}",
+        pages[0]
+    );
+    Ok(())
 }
 
 async fn crawl_accumulates(rig: FakeRig) -> WeftResult<()> {

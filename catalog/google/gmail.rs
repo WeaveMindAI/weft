@@ -294,7 +294,14 @@ pub async fn read_message(
                 }
                 (None, None) => continue,
             };
-            files.push(storage.put(bytes, mime, filename, None).await?);
+            // Attachments are content the workflow acts on and the
+            // editor previews after the run: keep them past the run
+            // (default 30-day access-bumped TTL).
+            files.push(
+                storage
+                    .put(bytes, mime, filename, Some(weft::storage::KeepTtl::Default))
+                    .await?,
+            );
         }
     }
     Ok(ReadMessage { msg, body, body_is_html, files })

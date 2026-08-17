@@ -2,12 +2,38 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult, WeftType};
+use weft::{FakeRig, LiveRig, NodeTest, WeftResult, WeftType};
 
 use super::FalEditImageNode;
 
 pub fn tests() -> Vec<NodeTest> {
-    vec![NodeTest::fake("edits_and_stores_the_image", edits)]
+    vec![
+        NodeTest::fake("edits_and_stores_the_image", edits),
+        NodeTest::live("one_real_edit", "fal", live_edit),
+    ]
+}
+
+/// One real edit of a freshly minted sample image, on the blessed
+/// per-image-priced edit model. fal stores nothing on the account, so
+/// there is nothing to clean.
+async fn live_edit(rig: LiveRig) -> WeftResult<()> {
+    let conn = rig.connect().await?;
+    let (mime, bytes) = crate::testing::sample_image(&conn).await?;
+    let image = rig.store_file("seed.png", &mime, bytes).await?;
+    let outcome = rig
+        .run(
+            &FalEditImageNode,
+            json!({
+                "account": rig.access("fal"),
+                "image": image,
+                "prompt": "make the square red",
+                "model": "fal-ai/flux-pro/kontext",
+            }),
+        )
+        .await
+        .ok()?;
+    assert!(outcome.output("image")?.is_object(), "the edit lands as a stored file");
+    Ok(())
 }
 
 async fn edits(rig: FakeRig) -> WeftResult<()> {

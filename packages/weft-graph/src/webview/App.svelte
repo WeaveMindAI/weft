@@ -5,12 +5,12 @@
   import ProjectEditor from './lib/components/project/ProjectEditor.svelte';
   import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
   import DeactivationPicker from './lib/components/project/DeactivationPicker.svelte';
-  import { send, onMessage, teardownTransport } from './vscode';
+  import { send, onMessage, teardownTransport, hostRequest, cancelPendingHostRequests, HostRequestCancelled } from './vscode';
   import { registerCatalog, setCatalog } from './lib/nodes';
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
-  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, ProjectDefinition as ProtocolProject } from '../protocol';
+  import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import type { Snippet } from 'svelte';
   import type { EditorContext } from './editor-context';
@@ -51,32 +51,135 @@
   // its own so a successful parse can't erase a live catalog problem.
   let catalogError: string | null = $state(null);
   let catalogWarnings: string[] = $state([]);
+  // The in-canvas problems pill: parse + catalog problems folded into
+  // one surface, each entry a short collapsed label plus the full text
+  // for the expanded view.
+  const problems = $derived([
+    ...(error ? [{ label: 'source error', text: error, severity: 'error' as const }] : []),
+    ...(catalogError
+      ? [{ label: 'node catalog error', text: catalogError, severity: 'error' as const }]
+      : []),
+    ...catalogWarnings.map((w) => ({
+      label: 'node catalog warning',
+      text: w,
+      severity: 'warning' as const,
+    })),
+  ]);
+  let problemsExpanded = $state(false);
+  // Most catalog/metadata failures are a stale per-project node copy;
+  // the fix is the same every time, so the hint travels with every
+  // problem surface.
+  const CATALOG_HINT =
+    'Stale node copies cause most catalog/metadata errors: run `weft catalog update` in the project, then save again.';
   let layoutCode = $state('');
   // RPC for source edits: applyEdits/applyTextEdit await the host's
-  // `editApplied` reply (correlated by id). Success carries the inverse text
-  // edit (the editor's undo) PLUS the post-edit truth, translated here at the
-  // wire boundary so the editor stays in its own project shape. A refusal
-  // REJECTS with the host's reason: resolve-vs-reject is the success/failure
-  // channel, so a refused edit always rolls the editor's optimistic op back.
-  let nextRequestId = 0;
-  const pendingEdits = new Map<number, { resolve: (r: EditRpcResult) => void; reject: (err: Error) => void }>();
-  function requestEdit(make: (requestId: number) => void): Promise<EditRpcResult> {
-    const requestId = nextRequestId++;
-    return new Promise((resolve, reject) => {
-      pendingEdits.set(requestId, { resolve, reject });
-      make(requestId);
-    });
+  // `editApplied` reply through the ONE shared request registry
+  // (`hostRequest`, the same correlator the storage/access/asset calls
+  // ride). Success carries the inverse text edit (the editor's undo) PLUS
+  // the post-edit truth, translated here at the wire boundary so the editor
+  // stays in its own project shape. A refusal REJECTS with the host's
+  // reason: resolve-vs-reject is the success/failure channel, so a refused
+  // edit always rolls the editor's optimistic op back. A CANCELLED request
+  // (the view switched away mid-round-trip; `cancelPendingHostRequests`
+  // swept it) resolves with the dedicated `cancelled` outcome: the engine
+  // stands down quietly, without confirming, persisting, or rolling back
+  // (this dying view's layout must never reach the newly watched file).
+  async function requestEdit(make: (requestId: number) => WebviewMessage): Promise<EditRpcResult> {
+    let reply: Extract<HostMessage, { kind: 'editApplied' }>;
+    try {
+      reply = await hostRequest('editApplied', make);
+    } catch (e) {
+      if (e instanceof HostRequestCancelled) return { inverse: null, project: null, weftCode: '', cancelled: true };
+      throw e;
+    }
+    if (!reply.ok) throw new Error(reply.reason);
+    // No truth payload: the host applied the edit but the user switched
+    // `.weft` tabs mid-round-trip. Resolve the inverse for undo bookkeeping
+    // WITHOUT advancing truth (the new doc's parseResult is its truth).
+    if (reply.response === undefined || reply.source === undefined) {
+      return { inverse: reply.inverse ?? null, project: null, weftCode: '' };
+    }
+    try {
+      // Translate FIRST: only advance catalog + bar flags once the new truth
+      // actually renders, so a failure can't leave them ahead of the
+      // displayed project.
+      const translated = translateProject(reply.response.project, reply.source, layoutCode);
+      registerCatalog(reply.response.catalog);
+      recomputeSourceFlags(reply.response.project);
+      // Advance the active source so a code-view slot bound to
+      // `ctx.activeSource` reflects the edit LIVE.
+      activeSource = reply.source;
+      error = null;
+      releaseTranslationLock();
+      return { inverse: reply.inverse ?? null, project: translated, weftCode: reply.source };
+    } catch (e) {
+      // The edit IS on disk; this is not a refused edit, it's a truth the
+      // webview cannot render (wire-shape drift). Do NOT roll back (that
+      // would diverge the editor from disk). Lock source-mutating gestures
+      // (every further edit would be computed against a stale picture and
+      // bounce off the host in a rejection loop) until a later parse
+      // translates cleanly, and resolve the undo inverse with no truth.
+      engageTranslationLock(e);
+      return { inverse: reply.inverse ?? null, project: null, weftCode: '' };
+    }
   }
   // RPC for post-rejection resyncs: resolves the host's current truth, or
   // null when the source doesn't parse right now (the editor keeps its
-  // previous truth until the parse path delivers a fresh one).
-  const pendingResyncs = new Map<number, { resolve: (r: { project: V1Project; weftCode: string } | null) => void }>();
-  function requestResync(): Promise<{ project: V1Project; weftCode: string } | null> {
-    const requestId = nextRequestId++;
-    return new Promise((resolve) => {
-      pendingResyncs.set(requestId, { resolve });
-      send({ kind: 'resyncSource', requestId });
-    });
+  // previous truth until the parse path delivers a fresh one) or the view
+  // switched away mid-flight (the request was swept; the dying editor keeps
+  // its truth and settles).
+  async function requestResync(): Promise<{ project: V1Project; weftCode: string } | null> {
+    let reply: Extract<HostMessage, { kind: 'sourceResynced' }>;
+    try {
+      reply = await hostRequest('sourceResynced', (requestId) => ({ kind: 'resyncSource', requestId }));
+    } catch (e) {
+      if (e instanceof HostRequestCancelled) return null;
+      throw e;
+    }
+    if (!reply.ok) {
+      // The current source doesn't parse (user mid-edit in the text tab).
+      // The editor keeps its previous truth; surface why.
+      toast.warning('Source has errors', { description: reply.error, duration: 4000 });
+      return null;
+    }
+    try {
+      const translated = translateProject(reply.response.project, reply.source, layoutCode);
+      registerCatalog(reply.response.catalog);
+      recomputeSourceFlags(reply.response.project);
+      activeSource = reply.source;
+      releaseTranslationLock();
+      return { project: translated, weftCode: reply.source };
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      console.error('translateProject failed on sourceResynced:', errMsg);
+      toast.warning('Resync failed', { description: errMsg, duration: 4000 });
+      engageTranslationLock(e);
+      return null;
+    }
+  }
+
+  // Translation-failure lock: when a reply carries truth the webview cannot
+  // render, the graph on screen is known-stale, so source-mutating gestures
+  // are locked through the engine's existing graph-logic lock (preflight
+  // then refuses them with this reason) instead of letting the user edit on
+  // top of a picture the host disagrees with. Released by the next reply or
+  // parse that translates cleanly. Tracked locally so releasing never
+  // clobbers a lock someone ELSE set (the AI-streaming lock).
+  let translationLocked = false;
+  function engageTranslationLock(e: unknown): void {
+    const errMsg = e instanceof Error ? e.message : String(e);
+    console.error('translateProject failed:', errMsg);
+    error = `Project translation failed: ${errMsg}`;
+    translationLocked = true;
+    // No editorRef = no editor exists yet (a first-mount failure): the
+    // blocked-first-render state shows instead of an editor, so there
+    // is no gesture surface to lock; the flag alone carries the state.
+    editorRef?.setGraphLogicLock?.(true, `the last edit could not be rendered (${errMsg}); fix the source in the code tab`);
+  }
+  function releaseTranslationLock(): void {
+    if (!translationLocked) return;
+    translationLocked = false;
+    editorRef?.setGraphLogicLock?.(false);
   }
   // Include-navigation back-stack state, driven by the host's `navState`.
   let navDepth = $state(0);
@@ -219,77 +322,9 @@
     };
     window.addEventListener('weft-signal-action', onSignalAction as EventListener);
     const unsub = onMessage((msg) => {
-      if (msg.kind === 'editApplied') {
-        // Reply to applyEdits/applyTextEdit. Success resolves with the inverse
-        // PLUS the post-edit truth (translated here); a refusal REJECTS with
-        // the host's reason so the editor rolls its optimistic op back. A
-        // translation failure on the reply (wire-shape drift) is surfaced as a
-        // rejection too: the editor rolls back instead of diverging silently.
-        const pending = pendingEdits.get(msg.requestId);
-        if (!pending) return;
-        pendingEdits.delete(msg.requestId);
-        if (!msg.ok) {
-          pending.reject(new Error(msg.reason));
-          return;
-        }
-        // No truth payload: the host applied the edit but the user switched
-        // `.weft` tabs mid-round-trip. Resolve the inverse for undo bookkeeping
-        // WITHOUT advancing truth (the new doc's parseResult is its truth).
-        if (msg.response === undefined || msg.source === undefined) {
-          pending.resolve({ inverse: msg.inverse ?? null, project: null, weftCode: '' });
-          return;
-        }
-        try {
-          // Translate FIRST: only advance catalog + bar flags once the new
-          // truth actually renders, so a failure can't leave them ahead of the
-          // displayed project.
-          const translated = translateProject(msg.response.project, msg.source, layoutCode);
-          registerCatalog(msg.response.catalog);
-          recomputeSourceFlags(msg.response.project);
-          // Advance the active source so a code-view slot bound to `ctx.activeSource`
-          // reflects the edit LIVE (it otherwise only updated on a fresh parse, so
-          // an in-place graph edit left the code view stale until a save+reopen).
-          activeSource = msg.source;
-          error = null;
-          pending.resolve({ inverse: msg.inverse ?? null, project: translated, weftCode: msg.source });
-        } catch (e) {
-          // The edit IS on disk; this is not a refused edit, it's a truth the
-          // webview cannot render (wire-shape drift). Do NOT roll back (that
-          // would diverge the editor from disk). Surface the inline error
-          // banner (same as a parseResult translation failure) and resolve the
-          // undo inverse with no truth advance.
-          const errMsg = e instanceof Error ? e.message : String(e);
-          console.error('translateProject failed on editApplied:', errMsg);
-          error = `Project translation failed: ${errMsg}`;
-          pending.resolve({ inverse: msg.inverse ?? null, project: null, weftCode: '' });
-        }
-        return;
-      }
-      if (msg.kind === 'sourceResynced') {
-        const pending = pendingResyncs.get(msg.requestId);
-        if (!pending) return;
-        pendingResyncs.delete(msg.requestId);
-        if (!msg.ok) {
-          // The current source doesn't parse (user mid-edit in the text tab).
-          // The editor keeps its previous truth; surface why.
-          toast.warning('Source has errors', { description: msg.error, duration: 4000 });
-          pending.resolve(null);
-          return;
-        }
-        try {
-          const translated = translateProject(msg.response.project, msg.source, layoutCode);
-          registerCatalog(msg.response.catalog);
-          recomputeSourceFlags(msg.response.project);
-          activeSource = msg.source;
-          pending.resolve({ project: translated, weftCode: msg.source });
-        } catch (e) {
-          const errMsg = e instanceof Error ? e.message : String(e);
-          console.error('translateProject failed on sourceResynced:', errMsg);
-          toast.warning('Resync failed', { description: errMsg, duration: 4000 });
-          pending.resolve(null);
-        }
-        return;
-      }
+      // editApplied and sourceResynced replies are consumed by the shared
+      // hostRequest correlator (see requestEdit/requestResync above), not
+      // handled here.
       if (msg.kind === 'codeEditTouched') {
         // An external change landed on the watched doc: slide the editor's
         // auto-lock forward (source-mutating graph gestures pause for 1s).
@@ -341,12 +376,15 @@
         try {
           translated = translateProject(msg.response.project, msg.source, msg.layoutCode);
         } catch (e) {
-          const errMsg = e instanceof Error ? e.message : String(e);
-          console.error('translateProject failed:', errMsg);
-          error = `Project translation failed: ${errMsg}`;
+          engageTranslationLock(e);
           return;
         }
         if (freshMount) {
+          // The view is being rebuilt from scratch: any request still in
+          // flight belongs to the editor instance about to be destroyed.
+          // Sweep them so its engine chain settles (a promise left pending
+          // forever wedges it) and no late reply lands in the new view.
+          cancelPendingHostRequests('the view changed');
           // No saved layout (fresh file, or layout absent): auto-organize on
           // mount so the graph isn't a pile at the origin.
           autoOrganizeOnMount = msg.layoutCode.trim() === '';
@@ -357,6 +395,7 @@
         }
         recomputeSourceFlags(msg.response.project);
         error = null;
+        releaseTranslationLock();
         // Surface the structured diagnostics (line + column) so the code panel
         // paints inline squiggles. A clean parse resets them to [].
         diagnostics = msg.response.diagnostics ?? [];
@@ -738,6 +777,9 @@
     return () => {
       unsub();
       window.removeEventListener('weft-signal-action', onSignalAction as EventListener);
+      // The whole editor is going away: settle every in-flight host request
+      // so nothing awaits a reply that will never be consumed.
+      cancelPendingHostRequests('the editor closed');
       // Last consumer of this editor mount is gone: detach the module-global
       // fan-out from the transport so a host that tears down on "no receivers"
       // (the browser host closes its SSE + pull timer) actually does. The VS
@@ -747,14 +789,7 @@
     };
   });
 
-  function onSave(data: {
-    layoutCode?: string;
-    fileRef?: { path: string; content: string };
-  }) {
-    if (data.layoutCode !== undefined && data.layoutCode !== layoutCode) {
-      layoutCode = data.layoutCode;
-      send({ kind: 'saveLayout', layoutCode: data.layoutCode });
-    }
+  function onSave(data: { fileRef?: { path: string; content: string } }) {
     if (data.fileRef !== undefined) {
       // File-backed config field edit: the content goes to the
       // referenced file, not the `@file(...)` token in the source.
@@ -762,17 +797,34 @@
     }
   }
 
+  /// Persist the layout durably. Resolves once the host ACKED the disk
+  /// write: the editor refuses to adopt any layout echoed back by a parse
+  /// while a save is un-acked (that echo predates the write and adopting it
+  /// would erase the just-saved positions). Cancellation (the view switched
+  /// away; the request was swept) resolves too: the dying editor just needs
+  /// its awaiter settled.
+  async function onPersistLayout(code: string): Promise<void> {
+    if (code === layoutCode) return;
+    layoutCode = code;
+    try {
+      await hostRequest('layoutSaved', (requestId) => ({ kind: 'saveLayout', layoutCode: code, requestId }));
+    } catch (e) {
+      if (e instanceof HostRequestCancelled) return;
+      throw e;
+    }
+  }
+
   /// A graph (GUI) edit: send the intents to the host (Rust edit-server
   /// applies + writes the source). Resolves with the inverse text edit (this
   /// action's undo) plus the post-edit truth; rejects with the host's reason.
   function onApplyEdits(ops: EditOp[]): Promise<EditRpcResult> {
-    return requestEdit((requestId) => send({ kind: 'applyEdits', ops, requestId }));
+    return requestEdit((requestId) => ({ kind: 'applyEdits', ops, requestId }));
   }
 
   /// Replay a raw source text edit (undo/redo of a source action). Same reply
   /// shape (the inverse undoes THIS replay, so undo<->redo round-trips).
   function onApplyTextEdit(edit: TextEdit): Promise<EditRpcResult> {
-    return requestEdit((requestId) => send({ kind: 'applyTextEdit', edit, requestId }));
+    return requestEdit((requestId) => ({ kind: 'applyTextEdit', edit, requestId }));
   }
 
   /// Fetch the host's current truth after a rejected edit.
@@ -925,24 +977,42 @@
 </script>
 
 <div class="absolute inset-0">
-  <!-- Catalog feedback: a non-blocking banner. When the graph renders,
-       it floats over the top edge (z-10) so it doesn't push layout.
-       When a parse error has taken over the view, it stacks ABOVE the
-       parse-error text (normal flow) so the two error surfaces don't
-       overlap. Independent of the parse `error` state either way. -->
-  {#if catalogError || catalogWarnings.length > 0}
-    <div class="{error ? 'relative' : 'absolute top-0 inset-x-0 z-10'} p-2 text-xs">
-      {#if catalogError}
-        <div class="text-destructive">node catalog: {catalogError}</div>
-      {/if}
-      {#each catalogWarnings as w}
-        <div class="text-yellow-600">node catalog: {w}</div>
-      {/each}
+  <!-- Problems pill: ONE compact, expandable surface floating over the
+       canvas for parse + catalog problems. A failure never takes the
+       rendered graph down: the last good graph stays on screen (source
+       gestures are locked separately while it is stale), and this pill
+       is the in-context signal. The action bar's sticky error chip
+       carries the same failure with the full details modal. -->
+  {#if project && problems.length > 0}
+    <div class="absolute top-2 inset-x-0 z-20 flex justify-center px-4">
+      <div class="max-w-[80%] rounded-md border border-destructive/40 bg-background/95 text-xs shadow-md">
+        <button
+          class="flex w-full items-center gap-2 px-3 py-1.5 text-left"
+          onclick={() => (problemsExpanded = !problemsExpanded)}
+        >
+          <span class="shrink-0 font-medium text-destructive">
+            {problems.length === 1 ? problems[0].label : `${problems.length} problems`}
+          </span>
+          {#if !problemsExpanded && problems.length === 1}
+            <span class="truncate text-muted-foreground">{problems[0].text}</span>
+          {/if}
+          {#if error}
+            <span class="shrink-0 text-muted-foreground">· showing the last rendered graph</span>
+          {/if}
+          <span class="ml-auto shrink-0 text-muted-foreground">{problemsExpanded ? '▴' : '▾'}</span>
+        </button>
+        {#if problemsExpanded}
+          <div class="space-y-2 border-t border-destructive/20 px-3 py-2">
+            {#each problems as p}
+              <div class="whitespace-pre-wrap break-words {p.severity === 'warning' ? 'text-yellow-600' : 'text-destructive'}">{p.text}</div>
+            {/each}
+            <div class="text-muted-foreground">{CATALOG_HINT}</div>
+          </div>
+        {/if}
+      </div>
     </div>
   {/if}
-  {#if error}
-    <div class="p-4 text-destructive">parse error: {error}</div>
-  {:else if project}
+  {#if project}
     <!-- Editor frame: toolbar on top, then a row of [left slot | canvas | right
          slot]. A host fills the slots (e.g. a web host injects a code view +
          replay bar); when a snippet is absent (the VS Code extension) its region
@@ -981,6 +1051,7 @@
       bind:this={editorRef}
       {project}
       {onSave}
+      {onPersistLayout}
       {onApplyEdits}
       {onApplyTextEdit}
       {onResyncSource}
@@ -1031,6 +1102,17 @@
     {/key}
         </div>
         {#if rightPanel}{@render rightPanel(editorContext)}{/if}
+      </div>
+    </div>
+  {:else if error || catalogError}
+    <!-- Nothing has rendered this session AND the first parse (or
+         catalog load) failed: there is no last graph to keep showing,
+         so explain compactly instead of dumping a wall of red text. -->
+    <div class="flex h-full w-full items-center justify-center p-8">
+      <div class="max-w-xl space-y-2 text-sm">
+        <div class="font-medium text-destructive">The graph can't render yet</div>
+        <div class="whitespace-pre-wrap break-words text-muted-foreground">{error ?? catalogError}</div>
+        <div class="text-xs text-muted-foreground">{CATALOG_HINT}</div>
       </div>
     </div>
   {:else}

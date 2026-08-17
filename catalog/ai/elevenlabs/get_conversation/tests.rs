@@ -7,6 +7,14 @@ use weft::{FakeRig, NodeTest, WeftResult};
 use super::ElevenLabsGetConversationNode;
 
 pub fn tests() -> Vec<NodeTest> {
+    // Live coverage rides the agent_call round trip: its live test
+    // reads the conversation it just dialed back THROUGH THIS NODE
+    // (mint agent -> call -> Get Conversation -> delete agent). A
+    // standalone live read cannot exist on a self-cleaning account:
+    // every past conversation's agent is deleted by the tests that
+    // minted it, and ElevenLabs answers 404 for a conversation whose
+    // agent is gone, so there is never an old readable conversation
+    // to pick up.
     vec![NodeTest::fake("reads_and_shapes_a_done_conversation", reads)]
 }
 

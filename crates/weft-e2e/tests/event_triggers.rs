@@ -285,13 +285,25 @@ async fn a_signed_interactivity_push_resumes_the_parked_run() -> Result<()> {
     )?;
 
     // Start the run and wait until the node has PARKED: its awaited
-    // resume signal appearing in the project's signal set is exactly
-    // that moment (posting the push before it would race the park).
+    // resume signal row appearing in the journal is exactly that
+    // moment (posting the push before it would race the park). The
+    // signal-token enumeration can NOT detect this park: provider-push
+    // signals render no consumer payload (nothing for a human to see
+    // or fire; the provider answers them), so they never enumerate.
+    // The row itself is the park marker, read through the same pool
+    // the grant was seeded with.
     let color = run::start(&mut project).await?;
-    let scope = weft_e2e::signal::SignalScope::open(&disp, &pid).await?;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        if scope.signal_for_node("wait").await?.is_some() {
+        let parked: Option<(String,)> = sqlx::query_as(
+            "SELECT token FROM signal \
+             WHERE project_id = $1 AND node_id = 'wait' AND is_resume",
+        )
+        .bind(pid.to_string())
+        .fetch_optional(&pool)
+        .await
+        .context("poll for the parked resume signal")?;
+        if parked.is_some() {
             break;
         }
         anyhow::ensure!(

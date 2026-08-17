@@ -48,6 +48,18 @@ interface Pending {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** The server ANSWERED with an error (an invalid edit, a parse/catalog
+ *  failure): the message is the server's own words, fit to show the user
+ *  verbatim. Distinct from `WeftCliError`, which wraps TRANSPORT failures
+ *  (spawn/exit/timeout/wire), where the `weft parse-server: ` framing is the
+ *  right thing to say. */
+export class ParseServerError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ParseServerError';
+  }
+}
+
 /** A request that gets no response within this window is treated as a wedged
  *  server: reject loudly and tear the child down so the next request respawns.
  *  A dead child already self-heals via the exit handler; this covers the
@@ -176,7 +188,7 @@ export class ParseServer {
     clearTimeout(p.timer);
     this.pending.delete(env.id);
     if (env.error !== undefined) {
-      p.reject(new WeftCliError(['parse-server'], null, env.error));
+      p.reject(new ParseServerError(env.error));
     } else {
       p.resolve(env.payload);
     }

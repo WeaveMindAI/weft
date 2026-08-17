@@ -2,12 +2,48 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{fixture_spec, FakeRig, LiveRig, NodeTest, WeftResult};
+
+use crate::testing::{
+    delete_record, seed_record, unique_name, BASE_FIXTURE, BASE_LABEL, TABLE_FIXTURE, TABLE_LABEL,
+};
 
 use super::AirtableSearchRecordsNode;
 
 pub fn tests() -> Vec<NodeTest> {
-    vec![NodeTest::fake("filters_and_pages_the_records", searches)]
+    vec![
+        NodeTest::fake("filters_and_pages_the_records", searches),
+        NodeTest::live("one_real_filtered_search", "airtable", live_search)
+            .with_fixture(fixture_spec(BASE_FIXTURE, BASE_LABEL.0, BASE_LABEL.1))
+            .with_fixture(fixture_spec(TABLE_FIXTURE, TABLE_LABEL.0, TABLE_LABEL.1)),
+    ]
+}
+
+/// One real filtered search: a record seeded under a run-unique name
+/// is the only match for its own formula, then it is deleted so the
+/// table stays empty. Airtable bills nothing for this.
+async fn live_search(rig: LiveRig) -> WeftResult<()> {
+    let base = rig.fixture(BASE_FIXTURE)?;
+    let table = rig.fixture(TABLE_FIXTURE)?;
+    let conn = rig.connect().await?;
+    let name = unique_name("weft search test");
+    let record_id = seed_record(&conn, &base, &table, &name).await?;
+    let outcome = rig
+        .run(
+            &AirtableSearchRecordsNode,
+            json!({
+                "account": rig.access("airtable"),
+                "base": base,
+                "table": table,
+                "filterByFormula": format!("{{Name}} = '{name}'"),
+                "maxRecords": 10,
+            }),
+        )
+        .await
+        .ok()?;
+    assert_eq!(outcome.output("count")?.as_f64(), Some(1.0), "exactly the seeded row matches");
+    assert_eq!(outcome.output("records")?[0]["id"].as_str(), Some(record_id.as_str()));
+    delete_record(&conn, &base, &table, &record_id).await
 }
 
 async fn searches(rig: FakeRig) -> WeftResult<()> {

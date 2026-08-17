@@ -1,0 +1,68 @@
+{
+  "type": "BaileyManageGroup",
+  "label": "WhatsApp Manage Group (Baileys)",
+  "description": "Manage a WhatsApp group via the project's bridge: create one, add/kick/promote/demote participants, or set its name/description. `create` needs `name` + `participants` and emits the new `groupId`; every other action needs `groupId` (participant actions also need `participants`, `rename` needs `name`, `describe` needs `description`).",
+  "tags": [
+    "whatsapp",
+    "baileys",
+    "group"
+  ],
+  "icon": "Users",
+  "color": "#25D366",
+  "inputs": [
+    {
+      "name": "endpointUrl",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "action",
+      "type": "String",
+      "exposure": "config",
+      "default": "create",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "create",
+          "add",
+          "kick",
+          "promote",
+          "demote",
+          "rename",
+          "describe"
+        ]
+      }
+    },
+    {
+      "name": "groupId",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "description",
+      "type": "String",
+      "required": false
+    },
+    {
+      "name": "participants",
+      "type": "List[String]",
+      "required": false
+    }
+  ],
+  "outputs": [
+    {
+      "name": "groupId",
+      "type": "String",
+      "required": false
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "isOutputDefault": true
+  }
+}

@@ -39,8 +39,29 @@ export function openStreamingEdit(doc: vscode.TextDocument): StreamingEditHandle
   return {
     pushChunk: (chunk) => handleChunk(state, chunk),
     end: async () => {
-      // Buffer contains no complete block; discard. We never emit a
-      // partial patch.
+      // A leftover buffer CONTAINING A BLOCK START at end-of-stream is a
+      // TRUNCATED edit: the stream died mid-block, so part of the patch
+      // never applied. Say so (same loudness as a failed block match);
+      // silently discarding would leave the document half-patched with no
+      // signal. Leftover text WITHOUT a block start is the model's closing
+      // prose ("Done, I updated the function"), not a lost edit: staying
+      // quiet there keeps the warning meaningful. A stream can also die
+      // INSIDE the marker itself ("<<<<<<< SEA"), so a partial marker at
+      // the very end of the buffer counts too, but only a DISTINCTIVE one
+      // (three or more chars): an ordinary sentence can end in '<' or '<<'
+      // ("I replaced the generic with Foo<"), and crying wolf there would
+      // train the user to ignore the one real truncation.
+      const endsInPartialMarker = (buf: string): boolean => {
+        for (let k = Math.min(buf.length, SEARCH_MARKER.length - 1); k >= 3; k--) {
+          if (buf.endsWith(SEARCH_MARKER.slice(0, k))) return true;
+        }
+        return false;
+      };
+      if ((state.buffer.includes(SEARCH_MARKER) || endsInPartialMarker(state.buffer)) && !state.disabled) {
+        void vscode.window.showErrorMessage(
+          `Weft: streaming edit ended mid-block; ${state.buffer.length} characters were not applied to ${state.doc.fileName}.`,
+        );
+      }
       state.buffer = '';
     },
   };

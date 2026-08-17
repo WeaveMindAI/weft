@@ -17,7 +17,7 @@
 	import type { EditOp, TextEdit } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
-	import { updateLayoutEntry, removeLayoutEntry, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
+	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_SQUARE_PX, SIMPLIFIED_CARD_MAX_W_PX } from "../../constants/simplified-view";
 	import { Boxes } from "@lucide/svelte";
 	import { formatConfigValue } from "../../value-format";
@@ -34,6 +34,7 @@
 	let {
 		project,
 		onSave,
+		onPersistLayout,
 		onApplyEdits,
 		onApplyTextEdit,
 		onResyncSource,
@@ -69,7 +70,10 @@
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
-		onSave: (data: { layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
+		onSave: (data: { fileRef?: { path: string; content: string } }) => void;
+		/** Persist the layout durably; resolves once the host acked the disk
+		 *  write (the engine gates stale-echo adoption on this). */
+		onPersistLayout: (layoutCode: string) => Promise<void>;
 		// Graph (GUI) edits: emit structured intents; Rust rewrites the source and
 		// the reply carries the inverse text edit (the action's undo) PLUS the
 		// post-edit truth. Rejects with the server's reason; the editor rolls the
@@ -160,7 +164,7 @@
 			applyEdits: (ops) => onApplyEdits(ops),
 			applyTextEdit: (edit) => onApplyTextEdit(edit),
 			resyncSource: () => onResyncSource(),
-			persistLayout: (committedLayout) => saveLayout(committedLayout),
+			persistLayout: (committedLayout) => onPersistLayout(committedLayout),
 			notify: (title, description) => toast.warning(title, { description, duration: 5000 }),
 			snapBack: () => rebuildFromProjection(),
 			flashSave: () => flashSaveStatus(),
@@ -303,8 +307,11 @@
 				// coords under their re-keyed ids.
 				next = renameLayoutSubtree(next, oldKey, newKey);
 			}
-			const entry = parseLayoutCode(next)[newKey];
-			return updateLayoutEntry(next, newKey, newPos.x, newPos.y, entry?.w, entry?.h, entry?.expanded ?? null);
+			// The position write targets the ACTIVE view's block (the drop
+			// coordinates are that view's geometry); the re-key above already
+			// covered both views.
+			const entry = parseLayoutCode(next, layoutVerb)[newKey];
+			return updateLayoutEntry(next, newKey, newPos.x, newPos.y, entry?.w, entry?.h, entry?.expanded ?? null, undefined, layoutVerb);
 		});
 	}
 
@@ -991,6 +998,14 @@
 			const e = layoutMap?.[n.id];
 			if (e) nextFreeY = Math.max(nextFreeY, e.y + (e.h ?? 120) + 40);
 		}
+		// Fallback placements chosen this pass, persisted below as REAL layout
+		// entries (no undo slot: not user-authored). Anchoring the guess makes
+		// it a one-time commitment: without it, "below everything else" is
+		// recomputed on every rebuild, so a node typed into the code tab
+		// drifted downward every time an unrelated node was dragged further
+		// down. Persisting re-derives the layout once more; the second pass
+		// finds the entries and places nothing, so this reaches a fixpoint.
+		const placedAnchors: Array<[string, { x: number; y: number }]> = [];
 
 		// Containment floors: an expanded container's drawn box grows to enclose
 		// its children, recursively, so a container child (a Loop inside a
@@ -1039,7 +1054,7 @@
 			{ right: 40, bottom: 40 },
 		);
 
-		return sortedNodes.map((n) => {
+		const built = sortedNodes.map((n) => {
 			const isGroup = isContainerNodeType(n.nodeType);
 			const isAnnotation = n.nodeType === 'Annotation';
 			const rawParentId = (n.config as Record<string, string>)?.parentId;
@@ -1108,6 +1123,7 @@
 			} else if (!rawParentId) {
 				position = { x: 0, y: nextFreeY };
 				nextFreeY += 140;
+				placedAnchors.push([n.id, position]);
 			} else {
 				position = n.position;
 			}
@@ -1154,6 +1170,19 @@
 				parentId,
 			};
 		});
+		if (placedAnchors.length > 0) {
+			// Deferred: buildNodes runs inside reactive derivations, and a
+			// synchronous layout write would mutate engine state mid-derive.
+			const verb = layoutVerb;
+			queueMicrotask(() => {
+				if (destroyed) return;
+				persistLayoutEdit((layout) => placedAnchors.reduce(
+					(l, [id, p]) => updateLayoutEntry(l, id, p.x, p.y, undefined, undefined, undefined, undefined, verb),
+					layout,
+				));
+			});
+		}
+		return built;
 	}
 
 	// The INITIAL graph snapshot, seeded ONCE from the props. The live
@@ -1713,14 +1742,17 @@
 	let selectedNodeId = $state<string | null>(null);
 
 	let contextMenu = $state<{ x: number; y: number; flowX: number; flowY: number; nodeId: string | null } | null>(null);
-	// An OPEN node menu in simplified view shows only infra lifecycle actions; if
-	// the node's infra actions disappear while the menu is open (an execution tick
-	// terminates the node), the menu would render empty. Close it instead, using the
-	// SAME predicate that gates opening (nodeInfraActions), so open-time and
-	// stay-open agree. The empty-area menu (no nodeId) always has Undo/Redo, never
-	// empties.
+	// An OPEN node menu closes itself when its target can no longer fill it:
+	// the node vanished from the graph (deleted from the text tab in another
+	// column while the menu was open), or, in simplified view, its only menu
+	// content (infra lifecycle actions) disappeared mid-execution. Same
+	// predicates that gate rendering the items, so open-time and stay-open
+	// agree and an empty popover shell can never linger. The empty-area menu
+	// (no nodeId) always has Undo/Redo, never empties.
 	$effect(() => {
-		if (contextMenu?.nodeId && simplified && !nodeInfraActions(contextMenu.nodeId).has) {
+		if (!contextMenu?.nodeId) return;
+		const target = nodes.find(n => n.id === contextMenu!.nodeId);
+		if (!target || (simplified && !nodeInfraActions(contextMenu.nodeId).has)) {
 			contextMenu = null;
 		}
 	});
@@ -1758,7 +1790,12 @@
 	let contextMenuFlowPos = $state<{ x: number; y: number } | null>(null);
 
 	// Track pending connection for "drop on empty" feature
-	let pendingConnection = $state<{ sourceNodeId: string; sourceHandle: string | null } | null>(null);
+	// A connection drag dropped on empty canvas: the half-gesture the Add Node
+	// menu completes. `side` is which end the drag STARTED from ('source' =
+	// dragged from an output, so the new node becomes the target; 'target' =
+	// dragged backwards from an input, so the new node becomes the source).
+	// Consumed by addNode, which wires the picked node in the same batch.
+	let pendingConnection = $state<{ nodeId: string; handle: string | null; side: 'source' | 'target' } | null>(null);
 
 
 	// Compute a node's type/style/zIndex/dimensions from its `data` (which holds
@@ -2111,7 +2148,6 @@
 
 	// Fit view to graph on initial load
 	let hasFitView = $state(false);
-	let hasAutoOrganized = $state(false);
 	// Hide canvas until initial ELK layout completes to avoid flash of ugly unorganized positions
 	let canvasReady = $state(false);
 	// The set of view verbs (@layout / @slayout) whose positions have already been
@@ -2138,7 +2174,6 @@
 			if (!activeViewHasPositions || autoOrganizeOnMount) {
 				// No saved layout or explicitly requested: run ELK to compute positions.
 				// runAutoOrganize waits for measured sizes internally (see its body).
-				hasAutoOrganized = true;
 				void (async () => {
 					// Un-claim ONLY on 'view-changed' (the user switched away mid-run): a
 					// toggle BACK then re-fires the view-switch effect, which re-claims and
@@ -2152,6 +2187,16 @@
 				setTimeout(() => { doFitView(); canvasReady = true; }, 100);
 			}
 		} else if (!hasFitView && nodes.length === 0) {
+			// An EMPTY project's mount is complete: claim it fully, exactly like
+			// the populated branch. Leaving `hasFitView` unset would keep this
+			// effect armed, and with the host's organize-on-mount flag set (an
+			// empty project has no saved layout) it would fire the moment the
+			// user creates their first node, yanking it away from where they
+			// placed it. An automatic re-layout is only ever allowed on mount
+			// of an unpositioned view, a user resize, expand/collapse, or the
+			// explicit organize action; "first node created" is none of those.
+			hasFitView = true;
+			organizedVerbs.add(layoutVerb);
 			canvasReady = true;
 		}
 	});
@@ -2215,19 +2260,32 @@
 				break;
 			}
 			case 'delete': {
-				// Selected edges take priority over nodes (matches canvas Delete).
+				// One gesture, one batch: a mixed selection (edges AND nodes)
+				// deletes everything at once. Edge ops go first, while both
+				// endpoints still exist in the batch's fold; node removals
+				// cascade their remaining edges. Splitting this into "edges
+				// first, press again for nodes" silently kept half the
+				// selection alive.
 				const selectedEdges = edges.filter(e => e.selected);
-				if (selectedEdges.length > 0) {
-					// The projection paints the removal; no live edge mutation.
-					recordEdit(selectedEdges.map(e => {
+				const selectedNodes = nodes.filter(n => n.selected);
+				const nodeIds = selectedNodes.length > 0
+					? selectedNodes.map(n => n.id)
+					: selectedNodeId ? [selectedNodeId] : [];
+				const doomed = new Set(nodeIds);
+				// Edges touching a deleted node are covered by its cascade;
+				// listing them explicitly would double-remove in one batch.
+				const edgeOps = selectedEdges
+					.filter(e => !doomed.has(e.source) && !doomed.has(e.target))
+					.map(e => {
 						const ref = toWeftEdgeRef(e.source, e.sourceHandle || 'value', e.target, e.targetHandle || 'value');
 						return { op: 'removeEdge' as const, source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
-					}));
-					break;
-				}
-				const selectedNodes = nodes.filter(n => n.selected);
-				if (selectedNodes.length > 0) deleteNodes(selectedNodes.map(n => n.id));
-				else if (selectedNodeId) deleteNodes([selectedNodeId]);
+					});
+				contextMenu = null;
+				transaction(() => {
+					// The projection paints the removal; no live edge mutation.
+					if (edgeOps.length > 0) recordEdit(edgeOps);
+					deleteNodes(nodeIds);
+				});
 				break;
 			}
 			case 'escape':
@@ -2388,8 +2446,9 @@
 			// Store the source info from connectionState
 			if (connectionState.fromNode) {
 				pendingConnection = {
-					sourceNodeId: connectionState.fromNode.id,
-					sourceHandle: connectionState.fromHandle?.id || null,
+					nodeId: connectionState.fromNode.id,
+					handle: connectionState.fromHandle?.id || null,
+					side: connectionState.fromHandle?.type === 'target' ? 'target' : 'source',
 				};
 			}
 			
@@ -2483,7 +2542,48 @@
 			: isGroup
 				? { op: 'addGroup', label: containerLabel!, parentGroup: null }
 				: { op: 'addNode', id, nodeType: type, parentGroup: null };
-		recordEdit([op], (layout) => {
+		// A connection drag dropped on empty canvas opened this menu: finish
+		// the gesture by wiring the picked node to the drag's origin in the
+		// SAME batch (one gesture, one undo unit). The wire lands on the first
+		// compatible port; the same leniency as isValidConnection applies
+		// (unresolvable types pass, the compiler is the authority). Containers
+		// are skipped (they start portless), and a scoped origin is skipped
+		// too (the new node is top-level, and a cross-scope wire is invalid).
+		const wire = pendingConnection;
+		pendingConnection = null;
+		let edgeOp: EditOp | null = null;
+		if (wire && !isContainer) {
+			const origin = nodes.find(n => n.id === wire.nodeId);
+			const originTopLevel =
+				origin !== undefined
+				&& !(origin.data.config as Record<string, string>)?.parentId
+				&& !(wire.handle ?? '').endsWith('__inner');
+			if (originTopLevel) {
+				const compatible = (from: string | null, to: string | null): boolean =>
+					from === null || to === null
+					|| parseWeftType(from) === null || parseWeftType(to) === null
+					|| isWeftTypeCompatible(from, to);
+				const template = NODE_TYPE_CONFIG[type];
+				const originType = handlePortType(wire.nodeId, wire.handle, wire.side);
+				if (wire.side === 'source') {
+					const input = (template?.defaultInputs ?? []).find(
+						p => inputExposure(p) !== 'config' && compatible(originType, p.portType),
+					);
+					if (input) {
+						const ref = toWeftEdgeRef(wire.nodeId, wire.handle || 'value', id, input.name);
+						edgeOp = { op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+					}
+				} else if (!vetoLiteralDrivenTarget(wire.nodeId, wire.handle)) {
+					// Dragged backwards from an input: the new node drives it.
+					const output = (template?.defaultOutputs ?? []).find(p => compatible(p.portType, originType));
+					if (output) {
+						const ref = toWeftEdgeRef(id, output.name, wire.nodeId, wire.handle || 'value');
+						edgeOp = { op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null };
+					}
+				}
+			}
+		}
+		recordEdit(edgeOp ? [op, edgeOp] : [op], (layout) => {
 			if (isContainer) {
 				// Default container size: groups get 500x350, loops a taller box to
 				// fit the config strip plus a few body nodes. GroupNode's min-height
@@ -2557,7 +2657,9 @@
 		const childMoves = computeUngroupLayoutMoves(containers, fold.project.nodes, parseLayoutCode(engine.layoutCode));
 		recordEdit(ops, (layout) => {
 			let next = layout;
-			for (const key of layoutKeysToDrop) next = removeLayoutEntry(next, key);
+			// A deleted node is gone in BOTH views: sweep every verb's block,
+			// or the inactive view keeps an orphan line for a dead node forever.
+			for (const key of layoutKeysToDrop) next = removeLayoutEntryEveryView(next, key);
 			// Rename deepest keys first so a parent's rename can't swallow a
 			// child's not-yet-processed entry (renameLayoutSubtree re-keys a
 			// whole subtree; deepest-first keeps each move exact).
@@ -3133,7 +3235,7 @@
 		// GUI edits, so layoutBase now holds the authoritative layout; using the
 		// derived layoutCode (base + any still-optimistic ops) could persist a layout
 		// the engine hasn't committed.
-		saveLayout(engine.layoutBase);
+		void onPersistLayout(engine.layoutBase);
 		flashSaveStatus();
 	}
 
@@ -3146,10 +3248,6 @@
 	/// `layoutBase`, NOT the derived `layoutCode` (base + in-flight optimistic
 	/// ops): persisting the optimistic view would write a layout the engine has
 	/// not yet committed, so a rejected/rebased layout op would leak to disk.
-	function saveLayout(layoutToPersist: string) {
-		onSave({ layoutCode: layoutToPersist });
-	}
-
 	type PortLike = { name: string; required?: boolean; portType?: string };
 	function toPortSigs(ports: PortLike[]): import('../../../../protocol').EditPortSig[] {
 		return (ports ?? []).map(p => ({ name: p.name, required: p.required !== false, portType: p.portType }));

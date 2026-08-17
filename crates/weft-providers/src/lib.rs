@@ -86,14 +86,17 @@ pub struct ObservedCall {
     pub data: Value,
 }
 
-/// Everything a meter needs to make its own follow-up query when the
-/// provider only reports cost out-of-band (e.g. OpenRouter's
-/// `/generation?id=...`): an ALREADY-SIGNED-IN HTTP client (the caller
-/// applies the same auth the original call rode) and the provider base
-/// to ask. A meter never touches a credential, which is exactly what
-/// makes the same meter work on a pasted key and on a sign-in. The
-/// follow-up is the METER's call, on a route the meter itself
-/// classifies as free.
+/// The meter's own signed side-query lane: an ALREADY-SIGNED-IN HTTP
+/// client (the caller applies the same auth the original call rode) and
+/// the provider base to ask. A meter never touches a credential, which
+/// is exactly what makes the same meter work on a pasted key and on a
+/// sign-in. Two consumers: a resolve follow-up when the provider only
+/// reports cost out-of-band (e.g. OpenRouter's `/generation?id=...`),
+/// and a ceiling's rate-catalog lookup when the provider publishes its
+/// prices behind its own authenticated API (e.g. fal's pricing catalog).
+/// Either way the query is the METER's call, on a provider route that
+/// bills nothing; it may address any of the provider's own origins, but
+/// never anything a caller could influence.
 pub struct FollowUp<'a> {
     pub http: &'a reqwest_middleware::ClientWithMiddleware,
     pub base_url: &'a str,
@@ -200,7 +203,7 @@ pub trait ProviderMeter: Send + Sync {
         &self,
         _path: &str,
         _body: &[u8],
-        _http: &reqwest::Client,
+        _follow_up: FollowUp<'_>,
     ) -> anyhow::Result<f64> {
         anyhow::bail!(
             "service '{}' does not price calls ahead of time, so it cannot run on the \

@@ -657,6 +657,10 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
         warn "could not remove ${C_DIM}~/.local/share/weft/${C_RESET}; remove it manually: sudo rm -rf ~/.local/share/weft"
       else
         ok "removed ${C_DIM}~/.local/share/weft/${C_RESET}"
+        # The run journal lived in the directory we just purged.
+        # Recreating it to append the exit line would undo the clean
+        # slate, so the journal ends here for this run.
+        run_log=/dev/null
       fi
     fi
 

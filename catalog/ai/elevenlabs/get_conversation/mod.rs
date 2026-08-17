@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use weft::access::client::get_json;
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
-use weft::storage::StorageScope;
+use weft::storage::{KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::API;
@@ -109,7 +109,9 @@ impl Node for ElevenLabsGetConversationNode {
                     "elevenlabs: download the call audio",
                     None,
                     &format!("call_{conversation}.mp3"),
-                    None,
+                    // The recording is the run's product: keep it past
+                    // the run (default 30-day access-bumped TTL).
+                    Some(KeepTtl::Default),
                 )
                 .await?;
             out = out.set("audio", stored.to_value());

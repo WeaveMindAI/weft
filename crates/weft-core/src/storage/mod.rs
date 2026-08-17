@@ -605,6 +605,21 @@ pub struct PresignResult {
     pub size_bytes: u64,
 }
 
+/// `POST /v1/storage/admin/download-link` response: a minted relay
+/// token (resolved at the dispatcher's `/public/files/{token}` route)
+/// plus the file's friendly name and size. The relay link is what a
+/// BROWSER download rides: unlike a presigned bucket URL, whose SigV4
+/// signature covers the exact host the browser must send, a token URL
+/// survives any port forward, tunnel, or proxy rewrite between the
+/// user and the dispatcher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadLinkResult {
+    pub token: String,
+    pub filename: String,
+    #[serde(rename = "sizeBytes")]
+    pub size_bytes: u64,
+}
+
 /// `POST /v1/storage/admin/wipe-prefix`: wipe a whole scope/tenant prefix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WipePrefixRequest {

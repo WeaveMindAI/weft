@@ -1148,6 +1148,8 @@ export type HostMessage =
   /// the current source doesn't parse (the webview keeps its previous truth).
   | { kind: 'sourceResynced'; requestId: number; ok: true; response: ParseResponse; source: string }
   | { kind: 'sourceResynced'; requestId: number; ok: false; error: string }
+  // Ack for `saveLayout` (see its comment): the layout write reached disk.
+  | { kind: 'layoutSaved'; requestId: number }
   /// An EXTERNAL change landed on the watched `.weft` doc (user typing in the
   /// text tab, AI streaming edits): the webview engages its 1s auto-lock on
   /// source-mutating graph gestures. Re-posted on every keystroke; the lock
@@ -1319,7 +1321,15 @@ export type WebviewMessage =
   /// panel IS the text surface. `requestId` is unused (no reply correlation; the
   /// host's parseResult is the truth), kept absent.
   | { kind: 'editActiveSource'; source: string }
-  | { kind: 'saveLayout'; layoutCode: string }
+  // `requestId` is acked by `layoutSaved` once the layout is durably on the
+  // host's disk. The editor holds off adopting any layout echoed back by a
+  // parse while a save is still un-acked: that echo was read from a disk
+  // state the save had not reached yet, and adopting it would erase the
+  // just-saved positions (a freshly created node snapping to the fallback
+  // spot). EVERY host must reply, success only (a failed save is surfaced
+  // host-side and deliberately left un-acked: the editor's copy is ahead of
+  // disk, so continuing to refuse stale echoes is exactly right).
+  | { kind: 'saveLayout'; layoutCode: string; requestId: number }
   /// Write-back for a file-backed config field (`@file("path", Type)`).
   /// The edit goes to the referenced file, not the `@file(...)` token in
   /// the source. `path` is project-root-relative.

@@ -14,6 +14,7 @@ function subscribeSse(
     onData: (data: string) => void,
     onError?: (err: unknown) => void,
     onClosed?: () => void,
+    onOpen?: () => void,
 ): SseSubscription {
     const controller = new AbortController();
     let closed = false;
@@ -26,6 +27,7 @@ function subscribeSse(
             if (!res.ok || !res.body) {
                 throw new Error(`SSE ${url}: ${res.status}`);
             }
+            if (!closed) onOpen?.();
             const reader = res.body.getReader();
             const decoder = new TextDecoder();
             let buf = '';
@@ -127,18 +129,23 @@ export class DispatcherClient {
     if (!res.ok && res.status !== 204) throw await httpError('DELETE', path, res);
   }
 
-  /** Subscribe to an SSE stream. `onError` fires when the stream
-   *  fails (connection refused, non-2xx, mid-stream read error);
-   *  `onClosed` fires when the server cleanly ends the stream. Both
-   *  are optional; a caller that passes neither falls back to a
-   *  console.warn on error so a dropped stream is never fully silent.
-   *  A caller that DOES pass them owns surfacing the dead stream to
-   *  the user (the follower turns it into a "live follow lost" state
-   *  instead of leaving the execution stuck "running" forever). */
+  /** Subscribe to an SSE stream. `onOpen` fires once the server
+   *  accepted the stream (2xx with a body); `onError` fires when the
+   *  stream fails (connection refused, non-2xx, mid-stream read
+   *  error); `onClosed` fires when the server cleanly ends the
+   *  stream. All are optional; a caller that passes no error handler
+   *  falls back to a console.warn so a dropped stream is never fully
+   *  silent. A caller that DOES pass one owns surfacing the dead
+   *  stream (reconnect loop, "live follow lost" state) instead of
+   *  leaving the UI stuck forever. */
   subscribe(
     path: string,
     onEvent: (ev: { data: string }) => void,
-    handlers?: { onError?: (err: unknown) => void; onClosed?: () => void },
+    handlers?: {
+      onError?: (err: unknown) => void;
+      onClosed?: () => void;
+      onOpen?: () => void;
+    },
   ): SseSubscription {
     return subscribeSse(
       `${this.baseUrl}${path}`,
@@ -148,6 +155,7 @@ export class DispatcherClient {
         else console.warn('[weft/dispatcher] SSE subscription failed:', err);
       },
       handlers?.onClosed,
+      handlers?.onOpen,
     );
   }
 }

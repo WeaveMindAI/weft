@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
-use weft::storage::StorageScope;
+use weft::storage::{KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::API;
@@ -74,7 +74,9 @@ impl Node for ElevenLabsDesignVoiceNode {
             .node_err("the previews port declares no type")?;
         let stored = ctx
             .storage(StorageScope::Execution)
-            .internalize(&json!(previews), &ty, None)
+            // The preview clips are the run's product: keep them past
+            // the run (default 30-day access-bumped TTL).
+            .internalize(&json!(previews), &ty, Some(KeepTtl::Default))
             .await?;
         ctx.pulse_downstream(NodeOutput::new().set("previews", stored)).await
     }

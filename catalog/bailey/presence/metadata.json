@@ -1,0 +1,52 @@
+{
+  "type": "BaileyPresence",
+  "label": "WhatsApp Presence (Baileys)",
+  "description": "Show a presence state in a chat (typing, recording, online, offline) via the project's bridge. Send `composing` before a long-running reply so the other side sees typing dots.",
+  "tags": [
+    "whatsapp",
+    "baileys",
+    "presence",
+    "typing"
+  ],
+  "icon": "PenLine",
+  "color": "#25D366",
+  "inputs": [
+    {
+      "name": "endpointUrl",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "presence",
+      "type": "String",
+      "exposure": "config",
+      "default": "composing",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "composing",
+          "recording",
+          "paused",
+          "available",
+          "unavailable"
+        ]
+      }
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "isOutputDefault": true
+  }
+}

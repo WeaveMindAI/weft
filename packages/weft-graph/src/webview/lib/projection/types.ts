@@ -51,10 +51,22 @@ export interface PendingOp {
  *    through the edit-server and the layout ops locally.
  *  - `reapply`: a previously-undone pending op; redo re-records its forward
  *    ops + layout as a fresh gesture. */
-export type HistoryEntry =
+/** `seq` is the entry's STABLE IDENTITY, minted once when the entry is first
+ *  created and inherited by every transformation of it (the
+ *  pending->confirmed swap, a rollback's layout scrub). An undo press
+ *  captures its target by seq, so the press still finds the entry after any
+ *  such rewrite; matching on object identity broke the moment a rewrite
+ *  cloned the entry. */
+export type HistoryEntry = { seq: number; pressStamp?: number } & (
   | { kind: 'pending'; opId: string }
   | { kind: 'confirmed'; source?: TextEdit; layout?: LayoutOp[] }
-  | { kind: 'reapply'; ops: EditOp[]; layout?: LayoutOp[] };
+  | { kind: 'reapply'; ops: EditOp[]; layout?: LayoutOp[] }
+);
+// `pressStamp` (redo-stack entries only): the global press number of the UNDO
+// press that produced the entry. A queued redo press only consumes entries
+// whose stamp precedes its own, so a redo pressed EARLIER can never redo the
+// product of an undo pressed LATER (queued tasks would otherwise let the
+// stack repopulate under an old press).
 
 /** What a successful edit RPC resolves with: the inverse text edit (this
  *  action's undo) and, normally, the post-edit truth (already translated to
@@ -67,6 +79,12 @@ export interface EditRpcResult {
   inverse: TextEdit | null;
   project: ProjectDefinition | null;
   weftCode: string;
+  /** The reply will never come: the view switched away mid-round-trip and
+   *  the request was swept. NOT a confirmation and NOT a refusal: the engine
+   *  stands down quietly (drops the op and its layout layers without
+   *  confirming, persisting, or toasting). Nothing a dying view holds may
+   *  reach disk; its layout would land on the file the host now watches. */
+  cancelled?: true;
 }
 
 /** Result of folding pendingOps over a truth project: the projected visible

@@ -14,12 +14,12 @@
 //      catchUpToLatest, which goes back to 'latest' + follows the
 //      newest currently-running or most-recent completed exec.
 //
-// The controller owns the project-level SSE subscription. It has
-// no UI of its own; it tells the webview what to show via
-// `kind: followStatus` messages and defers the actual
-// execution-event stream to ExecutionFollower.
+// The controller consumes the shared project event stream
+// (ProjectEventStream: the extension feeds `handleEvent` /
+// `handleReconnect`). It has no UI of its own; it tells the webview
+// what to show via `kind: followStatus` messages and defers the
+// actual execution-event stream to ExecutionFollower.
 
-import type { DispatcherClient, SseSubscription } from './dispatcher';
 import type { ExecutionFollower, DispatcherEvent } from './execFollower';
 import type { HostMessage } from '../../packages/weft-graph/src/protocol';
 
@@ -50,11 +50,7 @@ export class AutoFollowController {
   // can pop the most-recent when the user catches up.
   private pendingQueue: string[] = [];
 
-  private projectId: string | undefined;
-  private subscription: SseSubscription | undefined;
-
   constructor(
-    private readonly client: DispatcherClient,
     private readonly follower: ExecutionFollower,
     private readonly post: PostFn,
     /// Notified on events that shift available_actions (start /
@@ -64,29 +60,37 @@ export class AutoFollowController {
     private readonly onActionable: ActionableEventHandler = () => {},
   ) {}
 
-  /** Called when the extension pins a different project. Resets
-   *  everything and re-subscribes to the new project's SSE. */
-  setProject(projectId: string | undefined): void {
-    this.subscription?.close();
-    this.subscription = undefined;
-    this.projectId = projectId;
+  /** Called when the extension pins a different project (the shared
+   *  project event stream re-points in the same breath). Resets the
+   *  follow state to a clean 'latest'. */
+  setProject(): void {
     this.mode = 'latest';
     this.color = undefined;
     this.pendingCount = 0;
     this.pendingQueue = [];
     this.follower.stop();
-    if (projectId) {
-      this.subscription = this.client.subscribe(
-        `/events/project/${projectId}`,
-        (ev) => {
-          try {
-            this.onEvent(JSON.parse(ev.data) as DispatcherEvent);
-          } catch (err) {
-            console.warn('[weft/autoFollow] bad SSE payload', err);
-          }
-        },
-      );
-    }
+    this.emitStatus();
+  }
+
+  /** The execution the graph is currently streaming, if any. The ONE
+   *  place that answers "which color is on screen": consumers (e.g.
+   *  the sidebar's delete action) read it here instead of shadowing
+   *  it, since every follow path updates it. */
+  currentColor(): string | undefined {
+    return this.color;
+  }
+
+  /** The followed execution ceased to exist (deleted from the
+   *  sidebar): stop streaming it and clear the follow. Mode reverts
+   *  to 'latest': a pin on a deleted execution points at nothing, and
+   *  'latest' auto-jumps to the next run, which is what the user is
+   *  left wanting. */
+  clearFollow(): void {
+    this.mode = 'latest';
+    this.color = undefined;
+    this.pendingCount = 0;
+    this.pendingQueue = [];
+    this.follower.stop();
     this.emitStatus();
   }
 
@@ -96,6 +100,7 @@ export class AutoFollowController {
    *  the latter case the caller passes `undefined` and we pick up
    *  the next ExecutionStarted. */
   pinAndFollow(color: string | undefined): void {
+    console.log(`[weft/autoFollow] pinAndFollow(${color}): mode=${this.mode} color=${this.color}`);
     this.mode = 'latest';
     this.pendingCount = 0;
     this.pendingQueue = [];
@@ -164,11 +169,27 @@ export class AutoFollowController {
     this.emitStatus();
   }
 
-  dispose(): void {
-    this.subscription?.close();
+  /** The project stream (re)connected: events emitted while it was
+   *  down are gone, so the extension hands us the freshly fetched
+   *  newest RUNNING execution (if any) to catch up on. In 'latest'
+   *  mode we jump to it exactly as if its ExecutionStarted had
+   *  arrived live; while pinned it queues like any background run. */
+  handleReconnect(runningColor: string | undefined): void {
+    console.log(`[weft/autoFollow] reconnect resync: running=${runningColor} mode=${this.mode} color=${this.color}`);
+    if (!runningColor || this.color === runningColor) return;
+    if (this.mode === 'latest') {
+      this.color = runningColor;
+      void this.follower.replay(runningColor);
+      this.emitStatus();
+    } else if (!this.pendingQueue.includes(runningColor)) {
+      this.pendingQueue.push(runningColor);
+      this.pendingCount += 1;
+      this.emitStatus();
+    }
   }
 
-  private onEvent(ev: DispatcherEvent): void {
+  /** Every parsed event from the shared project stream. */
+  handleEvent(ev: DispatcherEvent): void {
     // Anything that shifts the dispatcher's `available_actions` list
     // routes to the actionable-event handler so the action bar
     // refetches `weft status --json` and re-renders. Includes:
@@ -200,6 +221,7 @@ export class AutoFollowController {
     }
 
     if (ev.kind !== 'execution_started') return;
+    console.log(`[weft/autoFollow] execution_started ${ev.color}: mode=${this.mode} color=${this.color}`);
     if (this.mode === 'latest') {
       // If we're already following this color (the run command
       // called `pinAndFollow(color)` synchronously and the
@@ -223,7 +245,10 @@ export class AutoFollowController {
     }
   }
 
-  private emitStatus(): void {
+  /** Post the current follow status to the webview. Public because a
+   *  webview remount loses its copy of the status while the follow
+   *  itself lives on extension-side: the ready handler re-seeds it. */
+  emitStatus(): void {
     const status: FollowStatus = {
       mode: this.mode,
       color: this.color,

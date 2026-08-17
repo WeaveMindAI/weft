@@ -78,7 +78,7 @@ impl ProviderMeter for MistralMeter {
         &self,
         _path: &str,
         body: &[u8],
-        http: &reqwest::Client,
+        follow_up: FollowUp<'_>,
     ) -> anyhow::Result<f64> {
         // Estimate, never a blanket cap: (1) an explicit `pages`
         // selection bounds the call exactly; (2) else the document's
@@ -106,7 +106,7 @@ impl ProviderMeter for MistralMeter {
             .and_then(Value::as_str)
             .filter(|u| own_host(u))
         {
-            if let Ok(resp) = http.head(url).send().await {
+            if let Ok(resp) = follow_up.http.head(url).send().await {
                 if let Some(bytes) = resp.content_length().filter(|b| *b > 0) {
                     const WORST_BYTES_PER_PAGE: f64 = 15.0 * 1024.0;
                     let pages =

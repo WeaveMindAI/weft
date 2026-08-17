@@ -29,6 +29,7 @@ import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/proje
 import { ExecutionsProvider, ExecutionNode, type ExecutionSummary } from './sidebar/executions';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
+import { ProjectEventStream } from './projectEvents';
 import type { ActionVerb, ActionErrorDetails, CliEvent } from '../../packages/weft-graph/src/protocol';
 import { emptyActionAvailability, parseStatusPayload } from '../../packages/weft-graph/src/status';
 
@@ -49,11 +50,12 @@ export function activate(context: vscode.ExtensionContext) {
   const projectsProvider = new ProjectsProvider();
   const executionsProvider = new ExecutionsProvider(dispatcher);
 
-  // Single source of truth for which project + execution the UI is
-  // "looking at". Sidebar and graph view both read/write through
-  // this so the three stay in sync.
+  // Single source of truth for which project the UI is "looking at".
+  // Sidebar and graph view both read/write through this so they stay
+  // in sync. Which EXECUTION is on screen lives in AutoFollowController
+  // (autoFollow.currentColor()): every follow path updates it there,
+  // so nothing shadows it here.
   let pinnedProject: WeftProject | undefined;
-  let pinnedExecution: string | undefined;
 
   const graphView = new GraphViewController(context, dispatcher, parseServer);
 
@@ -82,6 +84,10 @@ export function activate(context: vscode.ExtensionContext) {
     if (lastStatusSnapshot) {
       graphView.post({ kind: 'statusSnapshot', snapshot: lastStatusSnapshot });
     }
+    // The follow itself lives extension-side and survives the
+    // remount; the webview's copy of its status does not. Re-seed it
+    // so the pin pill / catch-up banner render the real state.
+    autoFollow.emitStatus();
   });
 
   const follower = new ExecutionFollower(
@@ -90,7 +96,6 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   const autoFollow = new AutoFollowController(
-    dispatcher,
     follower,
     (msg) => {
       // Mirror autoFollow's followStatus into the action-bar
@@ -120,6 +125,38 @@ export function activate(context: vscode.ExtensionContext) {
       scheduleStatusRefresh('sse');
     },
   );
+
+  // The ONE persistent project SSE stream. It reconnects with backoff
+  // forever (the dispatcher may not be up yet when the graph opens:
+  // the first Run boots it; and it can restart mid-session), so a
+  // failed first connection never permanently silences auto-follow,
+  // the executions tree, or the action bar. Events missed while the
+  // stream was down are unrecoverable, so every (re)connect resyncs
+  // from authoritative state: refetch status, refetch the executions
+  // list, and hand auto-follow the newest still-running execution.
+  const projectStream = new ProjectEventStream(dispatcher);
+  projectStream.onEvent((ev) => {
+    autoFollow.handleEvent(ev);
+    executionsProvider.noteEvent();
+  });
+  projectStream.onConnect(() => {
+    void (async () => {
+      // Neither call rejects: the status fetch degrades to an empty
+      // snapshot and refresh() surfaces failures as a tree row while
+      // keeping its last successful list (so newestRunningFor still
+      // answers from the best-known state).
+      void refreshActionBarFromStatus();
+      // `settled` is the pin the refresh actually rebuilt under
+      // (undefined if a pin change mid-flight obsoleted it). Catch up
+      // only when it matches the CURRENT pin: on a mismatch the pin
+      // change re-pointed the stream, and the new project's own
+      // connect will run this resync correctly.
+      const settled = await executionsProvider.refresh();
+      if (settled && settled === pinnedProject?.id) {
+        autoFollow.handleReconnect(executionsProvider.newestRunningFor(settled));
+      }
+    })();
+  });
 
   /// Debounce window for SSE-triggered status refetches. Bursts of
   /// node-start / node-complete events during a run shouldn't
@@ -178,7 +215,8 @@ export function activate(context: vscode.ExtensionContext) {
     lastStatusSnapshot = undefined;
     pinnedProject = project;
     executionsProvider.setPinnedProject(project);
-    autoFollow.setProject(project.id);
+    projectStream.setProject(project.id);
+    autoFollow.setProject();
     // Tell the action-bar store which slot drives webview
     // emissions now. The store keeps every project's slot alive
     // (so an in-flight verb's events keep accumulating in the
@@ -216,7 +254,14 @@ export function activate(context: vscode.ExtensionContext) {
       void vscode.window.showInformationMessage('Pin a Weft project first.');
       return;
     }
-    await graphView.waitForPendingSave();
+    try {
+      await graphView.waitForPendingSave();
+    } catch (err) {
+      // The user's last edit never reached disk: refuse the verb loudly
+      // instead of silently building the pre-edit source.
+      void vscode.window.showErrorMessage(`Weft: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
     // Reactivate-prompt for activate when project is hibernate/park.
     // The CLI's --json mode skips its own terminal prompt, so the
     // extension is responsible for showing the modal when there's
@@ -243,6 +288,22 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       await runWeftCliJson(projectId, [verb, ...args], projectRoot, (ev) => {
         actionBar.cliEvent(projectId, ev);
+        // A run's dispatcher reply carries the fresh execution's
+        // color: follow it from HERE, the run's own reply channel,
+        // never from the project SSE alone. On a brand-new project
+        // registration lands milliseconds before the execution
+        // starts (the image builds first), so a subscriber that can
+        // only attach after registration structurally misses the
+        // first run's execution_started event.
+        if (
+          verb === 'run' &&
+          ev.phase === 'dispatcher_call_done' &&
+          typeof ev.detail?.color === 'string' &&
+          ev.detail?.project_id === projectId &&
+          pinnedProject?.id === projectId
+        ) {
+          autoFollow.pinAndFollow(ev.detail.color);
+        }
       });
     } catch (err) {
       const tracking = cliTracking.get(projectId);
@@ -796,31 +857,44 @@ export function activate(context: vscode.ExtensionContext) {
     if (match && pinnedProject?.id !== match.id) {
       await pinProject(match);
     }
-    pinnedExecution = summary.color;
     autoFollow.pinToExecution(summary.color);
   }
 
-  async function deleteExecution(summary: ExecutionSummary): Promise<void> {
+  /** Returns true when the row is gone. False = the delete was
+   *  blocked or failed and an error was already shown (clearAll uses
+   *  this to stop instead of stacking one dialog per row). */
+  async function deleteExecution(summary: ExecutionSummary): Promise<boolean> {
     if (summary.status.toLowerCase() === 'running') {
       // Cancel first so the runtime stops emitting new events and
-      // drops pulses, then delete the journal. Prevents stray events
-      // after the row disappears.
+      // drops pulses, then delete the journal. The cancel is the
+      // delete's precondition: if it fails, deleting anyway would
+      // leave the worker streaming into an erased journal, so abort
+      // loudly instead. (Cancelling an already-finished execution is
+      // an idempotent success, so a stale 'running' label is fine.)
       try {
         await dispatcher.post(`/executions/${summary.color}/cancel`, {});
-      } catch {
-        /* keep going */
+      } catch (err) {
+        void vscode.window.showErrorMessage(
+          `Could not cancel ${summary.color}, so it was not deleted (it is still running): ${err}`,
+        );
+        return false;
       }
     }
-    if (pinnedExecution === summary.color) {
-      follower.stop();
-      pinnedExecution = undefined;
+    // If the graph is streaming exactly this execution, drop the
+    // follow through the controller (which owns the followed color)
+    // so its state and the webview's pill stay consistent.
+    if (autoFollow.currentColor() === summary.color) {
+      autoFollow.clearFollow();
     }
+    let deleted = true;
     try {
       await dispatcher.del(`/executions/${summary.color}`);
     } catch (err) {
       void vscode.window.showErrorMessage(`Delete failed: ${err}`);
+      deleted = false;
     }
     await executionsProvider.refresh();
+    return deleted;
   }
 
   async function clearAllExecutions(): Promise<void> {
@@ -831,7 +905,11 @@ export function activate(context: vscode.ExtensionContext) {
     );
     if (confirm !== 'Delete all') return;
     const all = executionsProvider.summaries();
-    for (const s of all) await deleteExecution(s);
+    for (const s of all) {
+      // Stop on the first failure: its dialog is already up, and
+      // marching on would stack one more per remaining row.
+      if (!(await deleteExecution(s))) return;
+    }
   }
 
   // Register sidebar views + commands.
@@ -842,7 +920,7 @@ export function activate(context: vscode.ExtensionContext) {
     // shutdown so reloading VS Code doesn't pile up stale streams
     // against the dispatcher.
     { dispose: () => executionsProvider.dispose() },
-    { dispose: () => autoFollow.dispose() },
+    { dispose: () => projectStream.dispose() },
 
     vscode.commands.registerCommand('weft.refreshProjects', () => projectsProvider.refresh()),
     vscode.commands.registerCommand('weft.refreshExecutions', () => executionsProvider.refresh()),
@@ -945,26 +1023,10 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.onDidChangeActiveTextEditor(async (ed) => {
       if (!ed || ed.document.languageId !== 'weft') return;
 
-      // Pin the project when this `.weft` is a known project entry (drives the
-      // action bar / executions). Nested non-entry `.weft` files still get the
-      // graph treatment below; they just don't change the pin.
-      const found = projectsProvider
-        .projects()
-        .find((p) => p.entryPath === ed.document.uri.fsPath);
-      if (found) {
-        pinnedProject = found;
-        executionsProvider.setPinnedProject(found);
-        autoFollow.setProject(found.id);
-      }
-
       // A `.weft` should be viewed as a GRAPH, not code: clicking any `.weft`
       // (entry or nested) drives the graph view. The one exception is the
-      // deliberate "Source" view (the Source button), tracked by URI. So:
-      //   - this text editor IS the Source view -> leave it (intentional code).
-      //   - graph open -> the click popped a stray text tab over the graph; the
-      //     graph's own handler already switched to this file, so reveal the
-      //     graph and close the stray tab.
-      //   - graph not open -> cold open: show the graph, close the text tab.
+      // deliberate "Source" view (the Source button), tracked by URI: that
+      // editor is intentional code viewing, leave it entirely alone.
       if (ed.document.uri.fsPath === sourceViewPath) return;
 
       const docUri = ed.document.uri;
@@ -973,15 +1035,33 @@ export function activate(context: vscode.ExtensionContext) {
         if (tabs.length > 0) await vscode.window.tabGroups.close(tabs);
       };
 
+      const found = projectsProvider
+        .projects()
+        .find((p) => p.entryPath === ed.document.uri.fsPath);
+
+      // Known project entry whose pin actually CHANGES: pinProject is the
+      // ONE pinning routine (event stream repoint, follow reset, action-bar
+      // slot, graph open). Re-focusing the already-pinned entry must not
+      // re-pin: that would tear down the live follow and drop the working
+      // event stream just because the user clicked the tab.
+      if (found && pinnedProject?.id !== found.id) {
+        await pinProject(found);
+        await closeStrayTextTab();
+        return;
+      }
+
       if (graphView.isOpen()) {
+        // The click popped a stray text tab over the graph; the graph's own
+        // handler already switched to this file, so reveal it and clean up.
         graphView.reveal();
         await closeStrayTextTab();
         return;
       }
 
-      // Cold open: show the graph for this file and close the text tab.
-      if (found) await pinProject(found);
-      else await graphView.open(ed.document);
+      // Cold open with the pin unchanged: a nested non-entry `.weft`, or the
+      // pinned entry whose graph panel was closed. Show the graph without
+      // re-pinning (the follow and stream keep running untouched).
+      await graphView.open(ed.document, found?.id);
       await closeStrayTextTab();
     }),
   );

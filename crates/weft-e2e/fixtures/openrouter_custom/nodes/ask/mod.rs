@@ -91,8 +91,8 @@ impl ProviderMeter for OpenRouterCustomMeter {
     fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
         OPENROUTER.prepare(path, body)
     }
-    async fn ceiling_usd(&self, path: &str, body: &[u8], http: &reqwest::Client) -> anyhow::Result<f64> {
-        OPENROUTER.ceiling_usd(path, body, http).await
+    async fn ceiling_usd(&self, path: &str, body: &[u8], follow_up: FollowUp<'_>) -> anyhow::Result<f64> {
+        OPENROUTER.ceiling_usd(path, body, follow_up).await
     }
     fn observe(&self, path: &str, query: &str, request_body: &[u8]) -> Box<dyn CallObservation> {
         OPENROUTER.observe(path, query, request_body)

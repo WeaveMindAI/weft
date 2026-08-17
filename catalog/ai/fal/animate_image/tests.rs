@@ -2,12 +2,39 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult, WeftType};
+use weft::{FakeRig, LiveRig, NodeTest, WeftResult, WeftType};
 
 use super::FalAnimateImageNode;
 
 pub fn tests() -> Vec<NodeTest> {
-    vec![NodeTest::fake("animates_and_stores_the_video", animates)]
+    vec![
+        NodeTest::fake("animates_and_stores_the_video", animates),
+        NodeTest::live("one_real_short_animation", "fal", live_animate),
+    ]
+}
+
+/// One real image-to-video run on the cheapest priced model fal
+/// carries (ltx, a flat two cents per video), fed a freshly minted
+/// sample image. fal stores nothing on the account, so there is
+/// nothing to clean.
+async fn live_animate(rig: LiveRig) -> WeftResult<()> {
+    let conn = rig.connect().await?;
+    let (mime, bytes) = crate::testing::sample_image(&conn).await?;
+    let image = rig.store_file("seed.png", &mime, bytes).await?;
+    let outcome = rig
+        .run(
+            &FalAnimateImageNode,
+            json!({
+                "account": rig.access("fal"),
+                "image": image,
+                "prompt": "the square slowly rotates",
+                "model": "fal-ai/ltx-video/image-to-video",
+            }),
+        )
+        .await
+        .ok()?;
+    assert!(outcome.output("video")?.is_object(), "the video lands as a stored file");
+    Ok(())
 }
 
 async fn animates(rig: FakeRig) -> WeftResult<()> {

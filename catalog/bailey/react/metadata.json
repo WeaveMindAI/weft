@@ -1,0 +1,45 @@
+{
+  "type": "BaileyReact",
+  "label": "WhatsApp React (Baileys)",
+  "description": "React to a WhatsApp message with an emoji via the project's bridge. An empty emoji removes the reaction. Wire `endpointUrl` from a BaileyBridge; `chatId` and `messageId` usually come from a WhatsApp Receive fire.",
+  "tags": [
+    "whatsapp",
+    "baileys",
+    "reaction"
+  ],
+  "icon": "SmilePlus",
+  "color": "#25D366",
+  "inputs": [
+    {
+      "name": "endpointUrl",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "messageId",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "emoji",
+      "type": "String",
+      "required": true
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "isOutputDefault": true
+  }
+}

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use weft::access::client::{get_json, json_call, Multipart};
 use weft::context::LogLevel;
 use weft::node::NodeOutput;
-use weft::storage::{FileHandle, StorageScope};
+use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::API;
@@ -106,7 +106,9 @@ impl Node for ElevenLabsDubNode {
                 "elevenlabs: download the dubbed audio",
                 None,
                 &format!("dubbed_{target_lang}_{}", meta.filename),
-                None,
+                // The dubbed audio is the run's product: keep it past
+                // the run (default 30-day access-bumped TTL).
+                Some(KeepTtl::Default),
             )
             .await?;
         // The dub PROJECT stays on the account (re-downloadable,

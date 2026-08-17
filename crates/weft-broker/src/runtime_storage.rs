@@ -101,6 +101,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/tenant-usage", post(admin_tenant_usage))
         .route("/v1/storage/admin/files/{*key}", delete(admin_delete_file))
         .route("/v1/storage/admin/presign", post(admin_presign))
+        .route("/v1/storage/admin/download-link", post(admin_download_link))
         .route("/v1/storage/admin/relay/{token}", axum::routing::get(admin_relay))
         .route("/v1/storage/admin/wipe-prefix", post(admin_wipe_prefix))
         .route("/v1/storage/admin/sweep-exec", post(admin_sweep_exec))
@@ -765,6 +766,29 @@ async fn admin_presign(
     let meta = store.meta(&parsed).await.map_err(map_err)?;
     let url = store.presign(&parsed, req.ttl_secs).await.map_err(map_err)?;
     Ok(Json(PresignResult { url, filename: meta.filename, size_bytes: meta.size_bytes }))
+}
+
+/// Mint a relay download token for one file (the dispatcher builds the
+/// `/public/files/{token}` URL on its own public base). The browser
+/// lane of the download handshake: host-rewrite-proof where a presigned
+/// bucket URL is not (its signature covers the exact host).
+async fn admin_download_link(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<weft_core::storage::PresignRequest>,
+) -> Result<Json<weft_core::storage::DownloadLinkResult>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let store = store(&state)?;
+    let parsed = key::parse_key(&req.key).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // Meta first (name + size) so a missing file is a clean 404 before
+    // minting, mirroring admin_presign.
+    let meta = store.meta(&parsed).await.map_err(map_err)?;
+    let token = store.mint_public_link(&parsed, req.ttl_secs).await.map_err(map_err)?;
+    Ok(Json(weft_core::storage::DownloadLinkResult {
+        token,
+        filename: meta.filename,
+        size_bytes: meta.size_bytes,
+    }))
 }
 
 async fn admin_wipe_prefix(

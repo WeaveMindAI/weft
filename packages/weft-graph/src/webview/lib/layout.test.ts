@@ -10,6 +10,7 @@ import {
 	parseViewMode,
 	setViewMode,
 	removeLayoutEntry,
+	removeLayoutEntryEveryView,
 	SIMPLIFIED_LAYOUT_VERB,
 	type ContainmentItem,
 } from './layout';
@@ -223,5 +224,55 @@ describe('computeContainmentFloors', () => {
 		const floors = computeContainmentFloors(items, defaults, margin);
 		expect(floors.get('A')!.w).toBeGreaterThanOrEqual(400);
 		expect(floors.get('B')!.w).toBeGreaterThanOrEqual(400);
+	});
+});
+
+describe('the one layout writer (parse-modify-serialize)', () => {
+	it('diff + apply round-trips a CLEARED size (undo of a resize restores no-explicit-size)', () => {
+		const before = 'L @layout 5 5 600x500';
+		const after = 'L @layout 5 5';
+		const applied = applyLayoutOps(before, diffLayoutOps(before, after));
+		expect(parseLayoutCode(applied).L).toEqual({ x: 5, y: 5 });
+	});
+
+	it('diff + apply round-trips cleared expanded and configCollapsed flags', () => {
+		const before = 'L @layout 5 5 600x500 expanded configCollapsed';
+		const after = 'L @layout 5 5';
+		const applied = applyLayoutOps(before, diffLayoutOps(before, after));
+		expect(parseLayoutCode(applied).L).toEqual({ x: 5, y: 5 });
+	});
+
+	it('a write to a duplicated key collapses it to ONE line that the reader agrees with', () => {
+		// parseLayoutCode is last-wins; the writer must land its update on the
+		// line the reader honors, not silently update a shadowed line.
+		const code = 'a @layout 1 1\na @layout 5 5';
+		const updated = updateLayoutEntry(code, 'a', 9, 9);
+		expect(parseLayoutCode(updated).a).toEqual({ x: 9, y: 9 });
+		expect(updated.split('\n').filter((l) => l.startsWith('a ')).length).toBe(1);
+	});
+
+	it('updates preserve unrecognized lines and the other view block', () => {
+		const code = '@view simplified\n# note\na @layout 1 1\na @slayout 2 2';
+		const updated = updateLayoutEntry(code, 'a', 9, 9);
+		expect(updated).toContain('@view simplified');
+		expect(updated).toContain('# note');
+		expect(parseLayoutCode(updated, SIMPLIFIED_LAYOUT_VERB).a).toEqual({ x: 2, y: 2 });
+		expect(parseLayoutCode(updated).a).toEqual({ x: 9, y: 9 });
+	});
+
+	it('renameLayoutSubtree carries unrecognized lines through', () => {
+		const renamed = renameLayoutSubtree('# my note\na @layout 1 1', 'a', 'b');
+		expect(renamed).toContain('# my note');
+		expect(parseLayoutCode(renamed).b).toEqual({ x: 1, y: 1 });
+		expect(parseLayoutCode(renamed).a).toBeUndefined();
+	});
+
+	it('removeLayoutEntryEveryView strips a dead node from BOTH view blocks', () => {
+		const code = 'a @layout 1 1\nb @layout 2 2\na @slayout 3 3\nb @slayout 4 4';
+		const removed = removeLayoutEntryEveryView(code, 'a');
+		expect(parseLayoutCode(removed).a).toBeUndefined();
+		expect(parseLayoutCode(removed, SIMPLIFIED_LAYOUT_VERB).a).toBeUndefined();
+		expect(parseLayoutCode(removed).b).toEqual({ x: 2, y: 2 });
+		expect(parseLayoutCode(removed, SIMPLIFIED_LAYOUT_VERB).b).toEqual({ x: 4, y: 4 });
 	});
 });

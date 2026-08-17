@@ -3,7 +3,7 @@
 //! storage, emitted as the stored-file quartet).
 
 use weft::node::NodeOutput;
-use weft::storage::StorageScope;
+use weft::storage::{KeepTtl, StorageScope};
 use weft::{ExecutionContext, NodeErrExt, WeftResult};
 
 pub const API: &str = "https://api.elevenlabs.io/v1";
@@ -34,7 +34,9 @@ pub async fn emit_audio(
     let resp = req.send().await.node_err(what)?;
     let stored = ctx
         .storage(StorageScope::Execution)
-        .put_response(resp, what, None, filename, None)
+        // The generated audio is the run's product: keep it past the
+        // run (default 30-day access-bumped TTL).
+        .put_response(resp, what, None, filename, Some(KeepTtl::Default))
         .await?;
     ctx.pulse_downstream(NodeOutput::stored_file(stored)).await
 }

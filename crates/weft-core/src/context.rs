@@ -1021,6 +1021,10 @@ impl StorageHandle {
     /// execution-scoped file to survive the terminate sweep (with the
     /// given access-bumped TTL); it is meaningless for project/shared
     /// scopes (those persist without a flag) and rejected there.
+    /// `None` leaves the file run-scoped (swept shortly after the run
+    /// ends): right for scratch bytes, wrong for a node's user-facing
+    /// media output, which should pass a keep TTL so the artifact
+    /// outlives the run.
     pub async fn put(
         &self,
         bytes: impl Into<bytes::Bytes>,
@@ -1065,7 +1069,8 @@ impl StorageHandle {
     /// (a file-info call, an export's chosen format); None takes the
     /// response Content-Type (octet-stream when it serves none).
     /// Returns the parsed [`crate::storage::StoredFile`] so the caller
-    /// emits [`crate::node::NodeOutput::stored_file`].
+    /// emits [`crate::node::NodeOutput::stored_file`]. See [`Self::put`]
+    /// for what `keep` means and when a node must pass one.
     pub async fn put_response(
         &self,
         resp: reqwest::Response,
@@ -1102,7 +1107,8 @@ impl StorageHandle {
     /// stream through (never fully buffered), the mime is taken from
     /// the response Content-Type, and `filename` None derives one from
     /// the URL. The one-call "I want this URL in storage" capability;
-    /// nodes never hand-roll an HTTP client for this.
+    /// nodes never hand-roll an HTTP client for this. See [`Self::put`]
+    /// for what `keep` means and when a node must pass one.
     pub async fn put_from_url(
         &self,
         url: &str,

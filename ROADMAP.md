@@ -39,6 +39,11 @@ What's coming next. Not prioritized, not promised, just directions we're explori
   - Infrastructure targets: local k8s (kind) or a remote cluster.
 - **Distributed compiled subprograms**: Compile different parts of a program independently. Infrastructure subgraph runs on a remote server, execution subgraph runs locally, they discover each other at runtime.
 
+## Catalog
+
+- **GitHub package, done properly**: the old package (access + create-issue only) was removed rather than left half-built. A real one covers the surface people actually automate: issues (create, comment, read, search), pull requests (open, review-comment, merge state), and repo triggers (new issue, new PR, push) through the existing webhook/trigger machinery. The PAT door and the GitHub-App door (JWT -> installation-token minting) already exist in the access system; re-point the access e2es at the new package when it lands.
+- **Postgres package, done properly**: the current nodes take a raw connection string input instead of an access connection. Rebuild on a PostgresAccess service (host/db/user/password as connection values) so credentials live in the access store like every other service, add a new-row trigger, and give the package the live-test tier the access seam unlocks.
+
 ## Stabilization
 
 - **Big refactor and code cleanup pass**: Weft was built fast, solo, over a few months. Several core files are too big (the compiler, the executor, the REST API), the error handling in `weft-api` is inconsistent, Restate is tangled into `weft-core` in ways that block standalone use, and parts of the codebase are under-documented. None of this is urgent, the project works, but it will start to hurt as soon as external contributions pick up. The plan is to dedicate a few uninterrupted weeks to a real stabilization pass (splitting the oversized files, extracting Restate out of `weft-core`, standardizing error handling, tightening the registry lifecycle, adding the comments a contributor coming in cold actually needs) as soon as the project is financially stable enough that I can spend that time on cleanup instead of shipping features. Until then, contributors should expect some rough edges and are welcome to open PRs that chip away at the list.

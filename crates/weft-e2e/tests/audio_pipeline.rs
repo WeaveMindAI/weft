@@ -35,7 +35,7 @@ async fn assert_transcribed(
     origin: &str,
 ) -> Result<()> {
     let mut project = Project::prepare("audio_transcribe", disp).await?;
-    set_account(&project, "ears", "connection", conn.handle())?;
+    set_account(&project, "ears", "account", conn.handle())?;
     project.set_node_config("src", "audio", "@asset(\"assets/speech.wav\", Audio)")?;
 
     let mut settled = run::run_and_settle(&mut project).await?;

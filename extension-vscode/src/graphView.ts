@@ -281,18 +281,18 @@ export class GraphViewController {
         if (this.watchedDoc && e.document === this.watchedDoc) {
           // Skip when the doc already matches what we rendered: our own edit write,
           // the save pipeline's trim/newline follow-ups, and an undo back to the
-          // rendered text all leave the text == lastRenderedSource and need no
+          // rendered text all leave the doc equal to `lastRendered` and need no
           // reparse (the graph isn't stale). A genuine edit differs and reparses.
-          if (e.document.getText() === this.lastRenderedSource) return;
+          if (this.isRenderCurrent()) return;
           // A genuine EXTERNAL change (text-tab typing, AI streaming): tell the
           // webview so it engages its auto-lock on source-mutating graph
           // gestures. Re-posted per keystroke; the lock window slides forward.
           // Skip our OWN edit writes: their change events land here (the doc
-          // differs from lastRenderedSource until applyParseResult runs), but
+          // differs from `lastRendered` until applyParseResult runs), but
           // auto-locking the user right after their own GUI edit is wrong. The
           // selfWriteDepth bracket scopes exactly our applyEdit + save events.
           if (this.selfWriteDepth === 0) this.post({ kind: 'codeEditTouched' });
-          this.scheduleParse();
+          this.scheduleParse('watched-text');
           return;
         }
         const key = e.document.uri.fsPath;
@@ -335,7 +335,17 @@ export class GraphViewController {
             // Retitle to the new project's root folder.
             if (this.panel) this.panel.title = this.panelTitle(ed.document);
           }
-          void this.triggerParse();
+          // Refocusing the SAME tab with a (settled) current render has
+          // nothing to parse: skip, same invariant as the debounce
+          // ("reparse iff the render is stale"). This is not just waste:
+          // the parseResult echo can race an edit still in flight, and its
+          // truth then ALREADY contains that edit's effect while the op is
+          // still pending, so the refold rolls the op back as a duplicate
+          // of its own work ("id already exists in scope" on a gesture
+          // that succeeded). triggerParse awaits the write chain before
+          // deciding, so the skip judges settled text, not a mid-write
+          // snapshot. A genuinely stale render still parses.
+          void this.triggerParse(false, !isDifferentDoc);
         }
       }),
       // Push source-open state to the webview so the "Source"
@@ -431,7 +441,10 @@ export class GraphViewController {
     }
     for (const rel of includeRel) {
       const w = vscode.workspace.createFileSystemWatcher(nodePath.resolve(baseDir, rel));
-      const onChange = () => this.scheduleParse();
+      // A dependency change: the watched doc's TEXT is untouched, so the
+      // debounce's render-current skip must not apply (the render is stale
+      // through the include, not the text).
+      const onChange = () => this.scheduleParse('dependency');
       disposables.push(w, w.onDidChange(onChange), w.onDidCreate(onChange), w.onDidDelete(onChange));
     }
     this.refWatcher = vscode.Disposable.from(...disposables);
@@ -480,18 +493,70 @@ export class GraphViewController {
     this.post({ kind: 'sourceState', open });
   }
 
-  private scheduleParse(): void {
+  /// The strongest reason among the schedules coalesced into the pending
+  /// debounce. 'dependency' is sticky: once an @include target changed, the
+  /// parse MUST run even if a later watched-text schedule (whose skip check
+  /// would pass) resets the timer.
+  private pendingParseReason: 'watched-text' | 'dependency' | null = null;
+
+  /// Debounced reparse. `reason` decides whether the parse is skippable at
+  /// fire time:
+  /// - 'watched-text': the watched doc's text changed. Skipped when the doc
+  ///   matches the last render BY THEN: the change event fires
+  ///   mid-transaction for our own edit writes (the doc differs from the
+  ///   pre-edit render at event time), but by fire time the transaction has
+  ///   rendered the post-edit truth. Re-parsing then is a pure echo of what
+  ///   the edit reply already delivered, and its parseResult races the
+  ///   webview's async layout persist (adopting a pre-persist layout snaps
+  ///   just-placed nodes away). "Reparse iff the render is stale", applied
+  ///   where the parse actually starts.
+  /// - 'dependency': something the parse READS changed (an @include target)
+  ///   without touching the watched doc's text, so the render is stale even
+  ///   though the text matches it. Never skipped.
+  private scheduleParse(reason: 'watched-text' | 'dependency'): void {
     const debounce = vscode.workspace
       .getConfiguration('weft.parse')
       .get<number>('debounceMs', 100);
+    this.pendingParseReason = reason === 'dependency' ? 'dependency' : (this.pendingParseReason ?? 'watched-text');
     if (this.parseTimer) clearTimeout(this.parseTimer);
-    this.parseTimer = setTimeout(() => void this.triggerParse(), debounce);
+    this.parseTimer = setTimeout(() => {
+      this.parseTimer = undefined;
+      const pending = this.pendingParseReason ?? 'watched-text';
+      this.pendingParseReason = null;
+      void this.triggerParse(false, pending === 'watched-text');
+    }, debounce);
   }
 
-  private async triggerParse(reloadCatalog = false): Promise<void> {
+  /// `skipIfCurrent`: the caller's trigger was "the watched text changed",
+  /// so a doc that (once settled) still matches the last render has nothing
+  /// to reparse. Callers whose trigger makes the render stale regardless of
+  /// text (a dependency changed, a doc switch, a catalog reload) leave it
+  /// false.
+  private async triggerParse(reloadCatalog = false, skipIfCurrent = false): Promise<void> {
     if (!this.panel || !this.watchedDoc) return;
-    const source = this.watchedDoc.getText();
-    const layoutCode = await this.readLayoutCode(this.watchedDoc);
+    // Resolve to a live doc: with the source tab closed, watchedDoc may be
+    // a detached instance whose text froze at close time (see liveDoc).
+    const doc = await this.liveDoc(this.watchedDoc);
+    // Parse only SETTLED text. An edit transaction writes the doc mid-flight;
+    // a parse fired from that write's own change event would read the
+    // post-write text and race the transaction's render: its parseResult can
+    // land in the webview BEFORE the edit reply, adopting truth that already
+    // contains the pending op's effect, which rolls the op back with a false
+    // "not found" toast on a gesture that succeeded. Await the per-path write
+    // chain (loop: a settled entry may not have unregistered yet, and a new
+    // write may have chained on), then decide staleness on the settled doc.
+    let awaited: Promise<unknown> | undefined;
+    for (
+      let chain = this.pendingWrites.get(doc.uri.fsPath);
+      chain && chain !== awaited;
+      chain = this.pendingWrites.get(doc.uri.fsPath)
+    ) {
+      awaited = chain;
+      await chain.catch(() => {});
+    }
+    if (skipIfCurrent && this.isRenderCurrent()) return;
+    const source = doc.getText();
+    const layoutCode = await this.readLayoutCode(doc);
     // Parses run concurrently (many triggers); stamp each and drop a result if
     // a newer parse started while this one was in flight, otherwise a slow
     // older parse could land last and render stale graph or consume freshMount
@@ -501,11 +566,11 @@ export class GraphViewController {
       const response = await this.parseServer.request<ParseResponse>({
         kind: 'parse',
         source,
-        file: this.watchedDoc.uri.fsPath,
+        file: doc.uri.fsPath,
         reloadCatalog,
       });
       if (seq !== this.parseSeq) return; // superseded by a newer parse
-      this.applyParseResult(response, source, layoutCode);
+      this.applyParseResult(response, source, { code: layoutCode });
     } catch (err) {
       // Same seq guard as the success path. A stale parse that errors
       // after a fresher parse already succeeded must not overwrite the
@@ -533,8 +598,13 @@ export class GraphViewController {
   /** Render a parse into the webview + sync host-side state from it. The single
    *  post-parse path: a `parse` request feeds it (via triggerParse, behind the
    *  seq guard), and an `edit` feeds the parse the edit-server already returned
-   *  (so a GUI edit re-renders from that ONE round-trip, no second parse). */
-  private applyParseResult(response: ParseResponse, source: string, layoutCode: string, postToWebview = true): void {
+   *  (so a GUI edit re-renders from that ONE round-trip, no second parse).
+   *  `layoutCode` is consumed ONLY by the posted `parseResult`, so it exists
+   *  only on the posting variant of the call: the edit path passes none (its
+   *  truth rides the `editApplied` reply, and reading the layout there would
+   *  observe the pre-gesture file, the webview's persist for the very gesture
+   *  being applied not having arrived yet). */
+  private applyParseResult(response: ParseResponse, source: string, layout?: { code: string }): void {
     // The parse succeeded: clear any sticky parse-error banner a prior
     // (half-typed) keystroke raised. The user fixes their code and the
     // graph renders, so the banner the failure put up must come down on
@@ -563,12 +633,14 @@ export class GraphViewController {
     // doc's post-trim change event, so a GUI edit on a file that trim-on-save
     // mutates doesn't fire one spurious reparse. (The graph is identical for
     // whitespace-only differences, so skipping is correct.)
-    this.lastRenderedSource = this.watchedDoc?.getText() ?? source;
+    this.lastRendered = this.watchedDoc
+      ? { path: this.watchedDoc.uri.fsPath, text: this.watchedDoc.getText() }
+      : null;
     // An edit-fed render hands the webview its truth inside the `editApplied`
     // reply instead (one message, no double render); only parse-fed renders
-    // post `parseResult`.
-    if (postToWebview) {
-      this.post({ kind: 'parseResult', response, source, layoutCode, freshMount: this.freshMount });
+    // (which carry the layout) post `parseResult`.
+    if (layout) {
+      this.post({ kind: 'parseResult', response, source, layoutCode: layout.code, freshMount: this.freshMount });
     }
     this.freshMount = false;
     this.syncInfraLivePollers(response);
@@ -906,7 +978,16 @@ export class GraphViewController {
         void this.resyncSource(msg.requestId);
         break;
       case 'saveLayout':
-        void this.saveLayoutCode(msg.layoutCode);
+        // Ack ONLY on success: an un-acked save tells the editor its copy is
+        // ahead of disk, so it keeps refusing stale layout echoes (correct
+        // for a failed write too). The failure itself is surfaced here.
+        void this.saveLayoutCode(msg.layoutCode)
+          .then(() => this.post({ kind: 'layoutSaved', requestId: msg.requestId }))
+          .catch((err: unknown) => {
+            void vscode.window.showErrorMessage(
+              `Weft: saving the layout file failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
         break;
       case 'saveFileRef':
         void this.saveFileRef(msg.path, msg.content);
@@ -1300,9 +1381,39 @@ export class GraphViewController {
   /// clicked Run before an in-flight edit's write+reparse finished. Awaits the
   /// watched doc's per-path write chain (the one `applyEditTransaction` uses).
   async waitForPendingSave(): Promise<void> {
-    const key = this.watchedDoc?.uri.fsPath;
-    const pending = key ? this.pendingWrites.get(key) : undefined;
+    if (!this.watchedDoc) return;
+    // Live resolve: a detached doc's isDirty is frozen, and save() on it
+    // cannot land; a fresh open from disk is never dirty (see liveDoc).
+    const doc = await this.liveDoc(this.watchedDoc);
+    const pending = this.pendingWrites.get(doc.uri.fsPath);
+    // A rejected chain already rolled back and surfaced; what matters below
+    // is the doc's ACTUAL state once the chain settles, not the chain's
+    // memory of how it settled (a finished failed write deletes its chain
+    // entry, so remembering failures here would be a check that only fires
+    // in a razor-thin window).
     if (pending) await pending.catch(() => {});
+    // The condition the build actually depends on: does DISK hold what the
+    // user sees? A dirty buffer (an edit whose save failed, or plain
+    // unsaved text-tab typing) means no; save it now, and refuse the verb
+    // loudly if the save cannot land (building would silently use the
+    // stale on-disk source).
+    if (doc.isDirty) {
+      // Bracketed as a SELF write: the save pipeline's trim/newline
+      // follow-ups fire change events, and unbracketed they would read as
+      // the user typing and engage the webview's 1s edit lock right after
+      // they clicked Run.
+      this.selfWriteDepth++;
+      try {
+        if (!(await doc.save())) {
+          throw new Error(
+            `${nodePath.basename(doc.uri.fsPath)} has unsaved changes that could not be saved; ` +
+              'running now would build the stale on-disk source. Save the file first.',
+          );
+        }
+      } finally {
+        this.selfWriteDepth--;
+      }
+    }
   }
 
   /// In-flight full-text write per file (keyed by resolved fsPath). Each write
@@ -1314,23 +1425,54 @@ export class GraphViewController {
   /// `Promise<unknown>`: a transaction can resolve to any type (a write is
   /// void, but an edit transaction is free to return its own value).
   private pendingWrites = new Map<string, Promise<unknown>>();
-  /// The source text the host last PARSED and rendered for the watched doc. The
-  /// onDidChangeTextDocument handler skips the self-reparse when the changed doc's
-  /// text already equals this: the rendered graph is not stale, so there is nothing
-  /// to reparse. This is the timing-independent invariant ("reparse iff the render
-  /// is stale"), which subsumes every self-write case without enumerating the save
-  /// pipeline's intermediate texts: our own edit write, the save pipeline's
-  /// trim-trailing-whitespace / insert-final-newline follow-ups, a format-on-save
-  /// participant, and an undo back to the rendered text all leave the text equal to
-  /// what we rendered and are correctly skipped; a genuine edit differs and reparses.
-  /// (The old time-window flag missed late save-pipeline change events and flickered.)
-  private lastRenderedSource: string | null = null;
+  /// The doc (path + settled text) the host last PARSED and rendered. The
+  /// onDidChangeTextDocument handler and the parse debounce skip a reparse
+  /// when the watched doc still matches this: the rendered graph is not
+  /// stale, so there is nothing to reparse. This is the timing-independent
+  /// invariant ("reparse iff the render is stale"), which subsumes every
+  /// self-write case without enumerating the save pipeline's intermediate
+  /// texts: our own edit write, the save pipeline's trim-trailing-whitespace
+  /// / insert-final-newline follow-ups, a format-on-save participant, and an
+  /// undo back to the rendered text all leave the text equal to what we
+  /// rendered and are correctly skipped; a genuine edit differs and
+  /// reparses. Staleness is a PER-DOCUMENT fact, so the path rides along:
+  /// switching to a different doc whose text happens to equal the previous
+  /// render must still read as stale (nothing was rendered for THAT doc).
+  /// (The old time-window flag missed late save-pipeline change events and
+  /// flickered.)
+  private lastRendered: { path: string; text: string } | null = null;
+
+  /// True when the watched doc's CURRENT text is exactly what was last
+  /// rendered for that same doc. The one staleness predicate both skip
+  /// sites use. A closed doc is never "current": its getText() is frozen
+  /// at close time, so the comparison would answer about stale text.
+  private isRenderCurrent(): boolean {
+    return this.watchedDoc !== undefined && !this.watchedDoc.isClosed
+      && this.lastRendered !== null
+      && this.lastRendered.path === this.watchedDoc.uri.fsPath
+      && this.lastRendered.text === this.watchedDoc.getText();
+  }
+
+  /// Resolve `doc` to a LIVE TextDocument for the same file. Closing the
+  /// source tab eventually closes its TextDocument (VS Code detaches it at
+  /// a moment nothing here controls); a closed doc's getText()/isDirty/
+  /// version are frozen at close time, so reading it computes edits and
+  /// parses against stale source while writes keep landing on disk. This
+  /// re-opens the file (current disk content, and the SAME instance the
+  /// user's editor shows if one is open) and re-latches it as the watched
+  /// doc when the closed instance was still the watched one.
+  private async liveDoc(doc: vscode.TextDocument): Promise<vscode.TextDocument> {
+    if (!doc.isClosed) return doc;
+    const fresh = await vscode.workspace.openTextDocument(doc.uri);
+    if (this.watchedDoc === doc) this.watchedDoc = fresh;
+    return fresh;
+  }
 
   /// >0 while THIS controller is writing the watched doc (a graph edit's
   /// writeTextRaw). The `onDidChangeTextDocument` change events for our own
   /// applyEdit + save (and any save participant) are delivered before those
   /// awaits resolve, so they land inside this bracket. Used to suppress the
-  /// `codeEditTouched` auto-lock for our own writes: lastRenderedSource still
+  /// `codeEditTouched` auto-lock for our own writes: `lastRendered` still
   /// holds the PRE-edit text at that moment (it updates later in
   /// applyParseResult), so a text comparison can't tell our write apart from
   /// external typing, but the depth gate can.
@@ -1418,7 +1560,10 @@ export class GraphViewController {
     const key = doc.uri.fsPath;
     try {
       const result = await this.serializeOnPath(key, async () => {
-        const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === key) ?? doc;
+        // Live resolve: with the source tab closed, `doc` may be detached
+        // (frozen text/version); a same-path doc the user reopened is a
+        // different instance. liveDoc covers both (see its comment).
+        const openDoc = await this.liveDoc(doc);
         // Doc-version backstop: if the user (or AI) typed into the doc while
         // the edit-server was computing, writing the result would overwrite
         // that keystroke. Capture the version AFTER the predecessor settled,
@@ -1445,8 +1590,9 @@ export class GraphViewController {
         if (sameDoc) {
           this.parseSeq++; // authoritative result; drop a concurrent stale parse
           // The webview receives this truth inside the editApplied reply
-          // (postToWebview=false): one message advances source + parse + undo.
-          this.applyParseResult(r.parse, r.source, await this.readLayoutCode(doc), false);
+          // (no layout, no parseResult post): one message advances source +
+          // parse + undo, and the layout stays whatever the webview holds.
+          this.applyParseResult(r.parse, r.source);
         }
         // `current` carries truth ONLY when this is still the watched doc. On a
         // mid-edit doc switch the render was suppressed above; carrying the old
@@ -1465,18 +1611,17 @@ export class GraphViewController {
     } catch (err) {
       // An edit being REJECTED (e.g. a duplicate id, a cross-scope wire) is not
       // a parse failure: the source on disk is unchanged (the write above never
-      // ran). The reply carries the edit-server's message as the rollback
-      // toast's reason (minus the wire's `edit: ` envelope prefix); the webview
-      // owns its optimistic state, so it owns the rollback (resync + drop the
-      // pending op). This is NOT a `parseError` (which would blank a perfectly
-      // renderable project).
+      // ran). The webview owns its optimistic state, so it owns the rollback
+      // (resync + drop the pending op). This is NOT a `parseError` (which
+      // would blank a perfectly renderable project).
       const message = err instanceof Error ? err.message : String(err);
       this.post({
         kind: 'editApplied', requestId, ok: false,
-        // Both wire envelopes (`edit: ` for ops, `applyEdit: ` for the
-        // undo/redo replay) are transport prefixes, not part of the
-        // user-facing reason.
-        reason: message.replace(/^(edit|applyEdit): /, ''),
+        // A ParseServerError's message is the server's own words, fit for
+        // the user verbatim (no envelope to strip: the wire carries the
+        // message bare). A transport failure (WeftCliError) keeps its
+        // framing: naming the parse server IS the explanation there.
+        reason: message,
       });
     }
   }
@@ -1495,7 +1640,8 @@ export class GraphViewController {
     const key = doc.uri.fsPath;
     try {
       const { response, source } = await this.serializeOnPath(key, async () => {
-        const openDoc = vscode.workspace.textDocuments.find((d) => d.uri.fsPath === key) ?? doc;
+        // Live resolve, same reason as applyEditTransaction (see liveDoc).
+        const openDoc = await this.liveDoc(doc);
         const source = openDoc.getText();
         const response = await this.parseServer.request<ParseResponse>({
           kind: 'parse',
@@ -1703,6 +1849,9 @@ export class GraphViewController {
 
   private onDispose(): void {
     if (this.parseTimer) clearTimeout(this.parseTimer);
+    // The controller object is reused across panel sessions: a parse owed to
+    // the torn-down session must not carry into the next one.
+    this.pendingParseReason = null;
     if (this.catalogRefreshTimer) clearTimeout(this.catalogRefreshTimer);
     this.nodesWatcher?.dispose();
     this.nodesWatcher = undefined;

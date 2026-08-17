@@ -2,7 +2,7 @@
 //! text (or raw Notion blocks) as its body.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use weft::access::client::post_json;
 use weft::node::NodeOutput;

@@ -15,8 +15,8 @@
 
 import type { ProjectDefinition } from '../types';
 import type { EditOp, TextEdit } from '../../../protocol';
-import { applyLayoutOps, diffLayoutOps, type LayoutOp } from '../layout';
-import { foldOps, type ProjectionCatalog } from './apply';
+import { applyLayoutOps, diffLayoutOps, LAYOUT_VERB, type LayoutOp } from '../layout';
+import { applyOpsToProject, foldOps, type ProjectionCatalog } from './apply';
 import { runPreflight } from './preflight';
 import type { EditRpcResult, HistoryEntry, LockState, PendingOp, Truth } from './types';
 
@@ -31,8 +31,13 @@ export interface EngineHost {
 	/** Fetch the host's current truth after a rejection. Null = source
 	 *  doesn't parse right now (keep the previous truth). */
 	resyncSource(): Promise<{ project: ProjectDefinition; weftCode: string } | null>;
-	/** Persist the layout file (fire-and-forget outward save). */
-	persistLayout(layoutCode: string): void;
+	/** Persist the layout file. Resolves once the layout is durably on the
+	 *  host's disk (the host acks the write): while any persist is
+	 *  outstanding, the engine refuses to adopt a layout echoed back by a
+	 *  parse, because that echo was read from a disk state the write had
+	 *  not reached yet and adopting it would erase the just-saved
+	 *  positions. */
+	persistLayout(layoutCode: string): Promise<void>;
 	/** Surface a user-facing notice (rejection/rollback/undo failures). */
 	notify(title: string, description: string): void;
 	/** A preflight rejection may leave stale gesture visuals (xyflow already
@@ -56,10 +61,16 @@ export type LayoutMutator = (layout: string) => string;
 /** One layer in the layout log: a chronological set of forward layout ops and
  *  who owns them. `owner` is a pending source op's id (dropped if that op is
  *  rejected) or the sentinel `COMMITTED` for a layout-only gesture (durable,
- *  never dropped, lives in the log only until the next rebase). */
+ *  never dropped, lives in the log only until the next rebase). `routed`
+ *  distinguishes WHY an op-owned layer exists: the op's OWN forward layout
+ *  (part of the gesture; rolls back wholesale with a rejection) versus ops
+ *  ROUTED to it from an independent gesture (a reflow that touched the op's
+ *  optimistic node; on rejection those are re-judged, not blindly dropped:
+ *  a position of a node that still exists is rescued). */
 interface LayoutLayer {
 	owner: string;
 	ops: LayoutOp[];
+	routed?: boolean;
 }
 const COMMITTED = '__committed__';
 
@@ -95,10 +106,13 @@ export class ProjectionEngine {
 	// Bumped per forward action; an in-flight undo's redo-push checks it so a
 	// dead redo branch can't resurrect.
 	private redoEpoch = 0;
-	// Confirmed inverses for ops whose `pending` history entry an undo popped
-	// before the confirmation landed (the undo task queues behind the send).
-	private confirmedByOpId = new Map<string, HistoryEntry & { kind: 'confirmed' }>();
 	private nextOpId = 0;
+	// Mints each history entry's stable identity (see HistoryEntry.seq).
+	private nextHistorySeq = 0;
+	// Persists sent to the host whose disk write has not yet been acked.
+	// While any is outstanding, a parse's layout echo predates our write and
+	// must not be adopted (see applyExternalSource).
+	private outstandingPersists = 0;
 	private typingFlushTimer: ReturnType<typeof setTimeout> | null = null;
 	// Gesture transaction buffer: recordEdit calls inside `transaction(fn)`
 	// coalesce into ONE pending op + ONE history entry.
@@ -109,6 +123,16 @@ export class ProjectionEngine {
 		this.catalog = catalog;
 		this.truth = initial;
 		this.layoutBase = layoutCode;
+	}
+
+	/** Write the durable base to the host, tracking the ack. The count (not
+	 *  a boolean) survives overlapping persists; a rejection (the request
+	 *  swept on view teardown) still settles the counter. */
+	private persistBase(): void {
+		this.outstandingPersists++;
+		void this.host.persistLayout(this.layoutBase).finally(() => {
+			this.outstandingPersists--;
+		});
 	}
 
 	/** The projected visible project: truth + pending ops. Recomputed on
@@ -137,9 +161,9 @@ export class ProjectionEngine {
 	 *  until that op resolves; a teardown in that one-round-trip window loses it.
 	 *  That's accepted over the alternative (persist the optimistic fold), which
 	 *  re-introduces the on-disk orphan when the in-flight op is rejected. */
-	private pushLayoutLayer(owner: string, ops: LayoutOp[]): void {
+	private pushLayoutLayer(owner: string, ops: LayoutOp[], routed = false): void {
 		if (ops.length === 0) return;
-		this.layoutLog = [...this.layoutLog, { owner, ops }];
+		this.layoutLog = [...this.layoutLog, routed ? { owner, ops, routed } : { owner, ops }];
 	}
 
 	/** Drop every layer owned by `owner` (a rejected source op). The visible
@@ -162,12 +186,73 @@ export class ProjectionEngine {
 		if (after === before) return undefined;
 		if (this.pendingOps.length === 0) {
 			this.layoutBase = after;
-			this.host.persistLayout(this.layoutBase);
+			this.persistBase();
 		} else {
-			this.pushLayoutLayer(COMMITTED, diffLayoutOps(before, after));
+			// A durable (COMMITTED) layer must never absorb a key whose NODE
+			// exists only through a still-unconfirmed op: the diff below is
+			// taken against the VISIBLE layout, which includes optimistic
+			// entries (a just-added node's position, a scope-move's re-keyed
+			// id), and committing one of those would survive the op's
+			// rejection as a permanent orphan line in the saved file. Split
+			// the gesture by ownership: keys of nodes TRUTH knows commit as
+			// usual (a drag of a real node survives an unrelated rejection,
+			// the fold's core guarantee); keys of optimistic-only nodes ride
+			// a layer OWNED by the op that introduced them, so they drop
+			// with it on rejection and turn durable with it at the rebase.
+			const committed: LayoutOp[] = [];
+			const byOwner = new Map<string, LayoutOp[]>();
+			for (const op of diffLayoutOps(before, after)) {
+				const owner = op.op === 'setView' ? null : this.pendingOwnerOfKey(op.id);
+				if (owner === null) committed.push(op);
+				else {
+					const list = byOwner.get(owner);
+					if (list) list.push(op);
+					else byOwner.set(owner, [op]);
+				}
+			}
+			this.pushLayoutLayer(COMMITTED, committed);
+			for (const [owner, ownedOps] of byOwner) this.pushLayoutLayer(owner, ownedOps, true);
 		}
 		const inv = diffLayoutOps(after, before);
 		return inv.length > 0 ? inv : undefined;
+	}
+
+	/** The pending op id whose fold FLIPS the existence of the node behind
+	 *  layout key `id` relative to truth, or null when no pending op changes
+	 *  it (the fact is durable; commit as usual). Ownership is decided by
+	 *  the projection itself, folding the pending ops over truth one op at a
+	 *  time, and it is SYMMETRIC: a key APPEARING optimistically (an added
+	 *  node, a scope-move's new scoped id) is owned by the op that makes the
+	 *  node exist, and a key DISAPPEARING optimistically (the scope-move's
+	 *  OLD id, a pending delete) is owned by the op that makes it stop.
+	 *  Both halves of a rename therefore ride ONE owner and drop or turn
+	 *  durable together; judging only the appearing half made a rejected
+	 *  scope-move keep the old key's REMOVAL durably, erasing the node's
+	 *  saved position. Total by construction: an op with no layout half of
+	 *  its own still owns its node's keys. */
+	private pendingOwnerOfKey(id: string): string | null {
+		let present = this.truth.project.nodes.some(n => n.id === id);
+		let working = this.truth.project;
+		let owner: string | null = null;
+		for (const p of this.pendingOps) {
+			try {
+				working = applyOpsToProject(working, p.ops, this.catalog);
+			} catch {
+				// This op no longer applies (it will be dropped at the next
+				// refold); it cannot flip anything.
+				continue;
+			}
+			const now = working.nodes.some(n => n.id === id);
+			if (now !== present) {
+				// The LAST flip owns: it is the op that decides whether the
+				// node finally exists. First-flip ownership orphaned a
+				// delete-then-readd chain (the delete confirming while the
+				// readd was rejected kept a position line for a dead node).
+				owner = p.id;
+				present = now;
+			}
+		}
+		return owner;
 	}
 
 	/** Fold the whole log into the base and clear it, but ONLY when no source
@@ -181,7 +266,7 @@ export class ProjectionEngine {
 		if (this.pendingOps.length > 0) return;
 		this.layoutBase = applyLayoutOps(this.layoutBase, this.layoutLog.flatMap(l => l.ops));
 		this.layoutLog = [];
-		this.host.persistLayout(this.layoutBase);
+		this.persistBase();
 	}
 
 	/** Settle of every queued task, including tasks a running task appends
@@ -267,7 +352,7 @@ export class ProjectionEngine {
 			// quiescent, else a COMMITTED layer) so this gesture and history
 			// replay can't drift. The returned inverse is the undo entry.
 			const inverse = this.applyLayoutChange(diffLayoutOps(before, mutateLayout(before)));
-			if (inverse) this.pushHistory({ kind: 'confirmed', layout: inverse });
+			if (inverse) this.pushHistory({ seq: this.nextHistorySeq++, kind: 'confirmed', layout: inverse });
 			return;
 		}
 
@@ -308,10 +393,19 @@ export class ProjectionEngine {
 		const savedRedo = this.redoStack;
 		this.pendingOps = [...this.pendingOps, p];
 		this.pushLayoutLayer(p.id, forward);
-		this.pushHistory({ kind: 'pending', opId: p.id });
+		this.pushHistory({ seq: this.nextHistorySeq++, kind: 'pending', opId: p.id });
 		p.redoRestore = { saved: savedRedo, epoch: this.redoEpoch };
 		if (typingKey) this.armTypingFlush();
-		else this.sendPendingOp(p);
+		else {
+			// Sends must leave in QUEUE order. A typing op still waiting on its
+			// debounce was recorded BEFORE this structural op; letting the
+			// structural op jump the queue makes the host apply them reversed
+			// (e.g. a config edit arriving AFTER the delete of its node, which
+			// the edit-server rejects with "node not found" and rolls back a
+			// gesture the user already saw succeed). Flush first.
+			this.flushTypingOps();
+			this.sendPendingOp(p);
+		}
 	}
 
 	private pushHistory(entry: HistoryEntry): void {
@@ -334,12 +428,136 @@ export class ProjectionEngine {
 	 *  no persist is needed. */
 	failPendingOp(p: PendingOp, reason: string): void {
 		if (!this.pendingOps.some(x => x.id === p.id)) return;
-		this.pendingOps = this.pendingOps.filter(x => x.id !== p.id);
-		this.dropLayoutLayers(p.id);   // its forward layout leaves the fold
+		this.discardPendingOp(p);
 		this.maybeRebaseLayout();      // folds surviving layers if nothing pends
-		this.undoStack = this.undoStack.filter(e => !(e.kind === 'pending' && e.opId === p.id));
-		this.redoStack = this.redoStack.filter(e => !(e.kind === 'pending' && e.opId === p.id));
 		this.host.notify('Edit failed', `${reason}. Rolled back to last good state.`);
+	}
+
+	/** Remove an op, its layout layers, and its history entries, with no
+	 *  side effects beyond that. `failPendingOp` adds the rebase + toast for
+	 *  a rejection; the cancellation path in `sendPendingOp` uses this bare
+	 *  (a dying view must not persist or toast). */
+	/** Undo an UNCONFIRMED op locally (the revoke and the unsent-typing
+	 *  peel): capture its full forward layout (all its layers flattened in
+	 *  log order, so the redo restores the LAST position the user saw, not
+	 *  the first one recorded), then remove it through the SAME re-judging
+	 *  cleanup a rejection uses. Undo and rejection remove the same op, so
+	 *  they must clean up identically: the blunt drop this replaced also
+	 *  erased a reflow's move of a NEIGHBOR node that had been routed to
+	 *  the op. Returns the reapply entry's layout half. */
+	private peelOp(p: PendingOp): LayoutOp[] | undefined {
+		const flattened = this.layoutLog.filter(l => l.owner === p.id).flatMap(l => l.ops);
+		const dead = this.discardPendingOp(p);
+		this.maybeRebaseLayout();
+		// The redo restores exactly what this undo made disappear: the LAST
+		// value of each key that died with the op (a routed reflow may have
+		// moved the node after the gesture's own layout wrote it). Keys the
+		// discard rescued still live in the layout; re-carrying them would
+		// wrongly tie a surviving node's position to the redone op's fate.
+		// Only setEntry ops qualify: a removeEntry is not a position (a
+		// reflow that DROPPED the dead node's line would otherwise ride the
+		// redo as "delete this key" and erase a saved position on replay),
+		// and the key died with the op anyway, so the redo carries nothing
+		// for it: the same treatment the history scrub gives dead keys.
+		const lastByKey = new Map<string, LayoutOp>();
+		for (const o of flattened) {
+			if (o.op !== 'setEntry') continue;
+			const key = `${o.verb ?? LAYOUT_VERB}:${o.id}`;
+			if (dead.has(key)) lastByKey.set(key, o);
+		}
+		const ops = [...lastByKey.values()];
+		return ops.length > 0 ? ops : undefined;
+	}
+
+	/** Insert a redo entry at its PRESS-ORDERED slot. A queued undo press
+	 *  completes after a later sync revoke already pushed its entry, and
+	 *  redo consumes products in reverse press order (LIFO by press), so
+	 *  the stack orders by press stamp, never by which path finished
+	 *  first. Invariant: EVERY redo-stack entry is stamped (both push
+	 *  sites stamp, and every re-push restores an already-stamped entry). */
+	private pushRedoEntry(entry: HistoryEntry & { pressStamp: number }): void {
+		const at = this.redoStack.findIndex(e => e.pressStamp! > entry.pressStamp);
+		this.redoStack = at < 0
+			? [...this.redoStack, entry]
+			: [...this.redoStack.slice(0, at), entry, ...this.redoStack.slice(at)];
+	}
+
+	/** Returns the set of layout keys (`verb:id`) that DIED with the op, so
+	 *  a peel can hand redo exactly what the removal took away. */
+	private discardPendingOp(p: PendingOp): Set<string> {
+		this.pendingOps = this.pendingOps.filter(x => x.id !== p.id);
+		// The op's owned layer ops are re-judged now that the op is gone,
+		// each by the fate of ITS key's node:
+		// - node dead (not in truth, no remaining pending op flips it): the
+		//   key exists only through the discarded op. Its ops drop, and any
+		//   HISTORY entry still holding layout ops for it (a drag of the
+		//   optimistic node produced a confirmed entry whose inverse would
+		//   put the dead key back) loses them too, or a single undo would
+		//   write the dead node's line durably into the saved file.
+		// - node still flipped by a REMAINING pending op: re-own the ops to
+		//   that op (they drop or turn durable with it).
+		// - node alive in truth: a setEntry is a REAL position the user saw
+		//   (a reflow placed a node whose delete-then-readd chain collapsed):
+		//   rescue it as COMMITTED, don't erase it with the dead op. A
+		//   removeEntry, though, was CONTINGENT on the op (a rejected delete
+		//   must not keep the removal of the live node's position): void it.
+		// The transformation is IN PLACE: a rescued op keeps its layer's
+		// position in the chronological log (pushing it at the end would
+		// make the dead op's old write win over a LATER drag of the same
+		// key, clobbering the fold's latest-write-wins guarantee).
+		const deadKeys = new Set<string>();
+		this.layoutLog = this.layoutLog.flatMap((layer): LayoutLayer[] => {
+			if (layer.owner !== p.id) return [layer];
+			if (!layer.routed) {
+				// The op's OWN forward layout: part of the rejected gesture,
+				// rolls back wholesale (an unconfirmed op's optimistic layout
+				// must never outlive it). Its dead-node keys still feed the
+				// history scrub.
+				for (const o of layer.ops) {
+					if (o.op === 'setView') continue;
+					if (!this.truth.project.nodes.some(n => n.id === o.id) && this.pendingOwnerOfKey(o.id) === null) {
+						deadKeys.add(`${o.verb ?? LAYOUT_VERB}:${o.id}`);
+					}
+				}
+				return [];
+			}
+			const parts: LayoutLayer[] = [];
+			const emit = (owner: string, o: LayoutOp): void => {
+				const last = parts[parts.length - 1];
+				if (last && last.owner === owner) last.ops.push(o);
+				else parts.push({ owner, ops: [o], routed: true });
+			};
+			for (const o of layer.ops) {
+				if (o.op === 'setView') {
+					emit(COMMITTED, o);
+					continue;
+				}
+				const inTruth = this.truth.project.nodes.some(n => n.id === o.id);
+				const owner = this.pendingOwnerOfKey(o.id);
+				if (!inTruth && owner === null) {
+					deadKeys.add(`${o.verb ?? LAYOUT_VERB}:${o.id}`);
+					continue;
+				}
+				if (o.op === 'removeEntry') continue; // contingent on p: void
+				emit(owner ?? COMMITTED, o);
+			}
+			return parts;
+		});
+		const scrub = (entries: HistoryEntry[]): HistoryEntry[] =>
+			entries.flatMap((e): HistoryEntry[] => {
+				if (e.kind === 'pending') return e.opId === p.id ? [] : [e];
+				if (!e.layout || deadKeys.size === 0) return [e];
+				const kept = e.layout.filter(
+					o => o.op === 'setView' || !deadKeys.has(`${o.verb ?? LAYOUT_VERB}:${o.id}`),
+				);
+				if (kept.length === e.layout.length) return [e];
+				const layout = kept.length > 0 ? kept : undefined;
+				if (e.kind === 'confirmed' && !e.source && !layout) return [];
+				return [{ ...e, layout }];
+			});
+		this.undoStack = scrub(this.undoStack);
+		this.redoStack = scrub(this.redoStack);
+		return deadKeys;
 	}
 
 	/** Advance truth and re-validate the queue against it: pending ops that
@@ -370,7 +588,13 @@ export class ProjectionEngine {
 			if (this.layoutLog.length > 0) {
 				this.host.notify('Layout engine warning', 'recovered a stray layout layer (please report)');
 				this.maybeRebaseLayout();
-			} else if (newLayoutCode !== this.layoutBase) {
+			} else if (this.outstandingPersists === 0 && newLayoutCode !== this.layoutBase) {
+				// Adopt the host's layout only when nothing we wrote is still
+				// in transit: an echo read from disk BEFORE our un-acked save
+				// landed predates our base, and adopting it would erase the
+				// just-saved positions (a freshly created node then falls back
+				// to the x=0 stack placement, which the anchor pass would
+				// persist as if deliberate).
 				this.layoutBase = newLayoutCode;
 			}
 		}
@@ -389,16 +613,44 @@ export class ProjectionEngine {
 		p.state = 'sending';
 		this.enqueue(async () => {
 			// The op may have left the queue while this task waited (an undo
-			// peeled it, or a truth advance invalidated it).
-			if (!this.pendingOps.some(x => x.id === p.id)) return;
+			// peeled it, or a truth advance invalidated it). A revoke that
+			// beat this task marked the op for post-reply cleanup, but with
+			// the request never dispatched there is nothing to invert:
+			// consume the mark here or it leaks forever.
+			if (!this.pendingOps.some(x => x.id === p.id)) {
+				this.revokedOps.delete(p.id);
+				return;
+			}
 			try {
 				const r = await this.host.applyEdits(p.ops);
+				// Revoked while in flight (undo pressed before the reply): the
+				// projection already dropped the op at press time. Apply the
+				// inverse NOW, still inside this chain slot, so every send
+				// queued after the press lands after the revert, exactly as
+				// the projection showed it. A refusal needs nothing (the op
+				// never landed and the projection already agrees); a
+				// cancellation is the dying-view case, nothing either.
+				if (this.revokedOps.delete(p.id)) {
+					if (!r.cancelled && r.inverse) {
+						const reverted = await this.host.applyTextEdit(r.inverse);
+						if (!reverted.cancelled && reverted.project) this.adoptTruth(reverted.project, reverted.weftCode);
+					}
+					return;
+				}
 				// A synchronous truth-advance (external parseResult) may have
 				// dropped this op while the RPC was in flight. If so, its slot
 				// is gone and the newer truth already won: do NOT regress truth
 				// to this older reply, and do NOT stash a confirmed inverse no
 				// undo will ever consume.
 				if (!this.pendingOps.some(x => x.id === p.id)) return;
+				// Cancelled: the view switched away and the reply will never
+				// come. Stand down QUIETLY: no confirmation, no rebase (a
+				// rebase would PERSIST this dying view's layout, which the
+				// host would write onto the file it now watches), no toast.
+				if (r.cancelled) {
+					this.discardPendingOp(p);
+					return;
+				}
 				// The op confirmed: its forward layout layer STAYS in the log and
 				// becomes durable at the rebase below. Op ids are monotonic and
 				// never reused, and dropLayoutLayers only ever targets an op still
@@ -416,6 +668,10 @@ export class ProjectionEngine {
 				// banner; the new truth is un-renderable here anyway).
 				if (r.project) this.adoptTruth(r.project, r.weftCode);
 			} catch (err) {
+				// A revoked op that the server then REFUSED: the projection
+				// already agrees (the op is gone on both sides), so there is
+				// nothing to revert, roll back, or toast. Consume the mark.
+				if (this.revokedOps.delete(p.id)) return;
 				// Same race on the failure side: a truth-advance already dropped
 				// and rolled this op back. failPendingOp is idempotent, but bail
 				// before the redo-restore + resync so a stale rejection can't
@@ -456,20 +712,24 @@ export class ProjectionEngine {
 			.catch(err => this.host.notify('Edit engine error', err instanceof Error ? err.message : String(err)));
 	}
 
-	/** Swap an op's `pending` history entry to its confirmed inverse. When an
-	 *  undo already popped the entry (its task queues behind this confirmation
-	 *  on the chain), stash the inverse for that task to consume. */
-	private confirmHistoryEntry(opId: string, entry: HistoryEntry & { kind: 'confirmed' }): void {
-		const keep = entry.source || entry.layout ? entry : null;
+	/** Swap an op's `pending` history entry to its confirmed inverse. The
+	 *  entry is always still on a stack here: undo pops inside the chain, so
+	 *  it cannot outrun this confirmation (the send's own task), and a
+	 *  rolled-back op never confirms (failPendingOp removed both op and
+	 *  entry, and the send guard skips it). */
+	private confirmHistoryEntry(opId: string, entry: Omit<HistoryEntry & { kind: 'confirmed' }, 'seq'>): void {
 		const idx = this.undoStack.findIndex(e => e.kind === 'pending' && e.opId === opId);
-		if (idx < 0) {
-			if (keep) this.confirmedByOpId.set(opId, keep);
+		if (idx >= 0) {
+			const next = [...this.undoStack];
+			// The swap INHERITS the pending entry's seq (an entry's identity
+			// survives its transformations), so a queued undo press that
+			// captured the pending entry still finds its target.
+			if (entry.source || entry.layout) next[idx] = { ...entry, seq: next[idx].seq };
+			else next.splice(idx, 1); // nothing reversible came back: drop the entry
+			this.undoStack = next;
 			return;
 		}
-		const next = [...this.undoStack];
-		if (keep) next[idx] = keep;
-		else next.splice(idx, 1); // nothing reversible came back: drop the entry
-		this.undoStack = next;
+		// idx < 0: the entry aged out of MAX_HISTORY; nothing to swap.
 	}
 
 	// ── Config typing ────────────────────────────────────────────────────
@@ -501,29 +761,149 @@ export class ProjectionEngine {
 
 	// ── Undo / redo ──────────────────────────────────────────────────────
 
+	// Undo and redo RESOLVE INSIDE their chain task, not at press time. The
+	// stacks only reach their settled state once the tasks ahead on the chain
+	// have run (a confirmation swaps the op's `pending` entry to its inverse;
+	// an undo pushes its redo entry), so acting on the press-time stack reads
+	// state that hasn't caught up: undo pressed during a round-trip missed the
+	// inverse, and redo pressed right after undo found an empty redo stack and
+	// silently dropped the press.
+	//
+	// An undo press captures its TARGET (the entry the user meant, which is
+	// the top entry not already claimed by an earlier queued press) and undoes
+	// that entry at run time wherever it then sits. Gestures recorded between
+	// press and run do NOT cancel the press: a layout-only gesture above the
+	// target commutes (no source text involved) and the undo proceeds; a
+	// SOURCE gesture above it does not (the target's inverse TextEdit was
+	// minted against a source that gesture has since changed, and replaying it
+	// out of order would edit at stale offsets), so that undo refuses LOUDLY
+	// instead of silently vanishing.
+	// No typing flush is needed in either: the top history entry IS the newest
+	// gesture, so an unsent typing op can only be undone as itself (the local
+	// peel in applyHistoryEntry), never bypassed by an older entry's replay.
+
+	/** Presses queued but not yet run, so a rapid second press targets the
+	 *  entry BELOW the first press's target instead of double-claiming it. */
+	private queuedUndoPresses = 0;
+
+	/** Redo presses queued but not yet run (see redo's press-stamp guard). */
+	private queuedRedoPresses = 0;
+
+	/** Global press order across undo AND redo: stamps each redo-stack entry
+	 *  with the undo press that produced it, so a queued redo press can tell
+	 *  earlier-born entries (its to consume) from later-born ones (not). */
+	private pressSeq = 0;
+
+	/** Ops REVOKED while their send was in flight (undo pressed before the
+	 *  reply): the projection already dropped them at press time, and their
+	 *  send task, when the reply lands, applies the inverse immediately
+	 *  (still inside its own chain slot, so anything recorded after the
+	 *  press lands AFTER the inverse, exactly as the projection showed it). */
+	private revokedOps = new Set<string>();
+
+	/** Outstanding revoke marks. Every mark is consumed by the op's send task,
+	 *  so this is 0 at rest; a non-zero count at quiescence means a mark
+	 *  outlived its op. Read by the contract tests as the leak assertion. */
+	get revokedOpCount(): number {
+		return this.revokedOps.size;
+	}
+
 	undo(): void {
-		const entry = this.undoStack[this.undoStack.length - 1];
-		if (!entry) return;
-		this.undoStack = this.undoStack.slice(0, -1);
+		const press = ++this.pressSeq;
+		const target = this.undoStack[this.undoStack.length - 1 - this.queuedUndoPresses];
+		if (!target) return;
+		// An UNCONFIRMED op undoes AT PRESS TIME, not after its round-trip:
+		// the projection drops it instantly, so a long optimistic chain
+		// (edit, undo, edit, undo, redo...) reads coherently even while the
+		// server is still at step 0, and every LATER gesture is recorded
+		// against the world the user actually sees. An unsent op is simply
+		// never sent; an in-flight one is marked revoked and its send task
+		// applies the inverse the moment the confirmation lands, before any
+		// later-queued send.
+		if (target.kind === 'pending') {
+			const p = this.pendingOps.find(x => x.id === target.opId);
+			if (p) {
+				if (p.state === 'sending') this.revokedOps.add(p.id);
+				this.pushRedoEntry({ seq: this.nextHistorySeq++, pressStamp: press, kind: 'reapply', ops: p.ops, layout: this.peelOp(p) });
+				return;
+			}
+			// The op left the queue in the same tick (confirmed: the entry
+			// was swapped; rolled back: the entry is gone). Either way this
+			// captured entry object is stale; fall through to the task path,
+			// whose locator resolves by opId against the CURRENT stack.
+		}
+		this.queuedUndoPresses++;
 		const epoch = this.redoEpoch;
 		this.enqueue(async () => {
+			this.queuedUndoPresses--;
+			// Find the target now BY SEQ: rewrites (the pending->confirmed
+			// swap, a rollback's layout scrub) clone the entry but inherit
+			// its seq, so the press survives them all.
+			const idx = this.undoStack.findIndex(e => e.seq === target.seq);
+			// Gone entirely: the gesture itself was rolled back (its rejection
+			// already toasted) or aged past the history cap. Nothing to undo.
+			if (idx < 0) return;
+			// Entries recorded above the target: pure-layout ones commute;
+			// anything touching source makes the target's inverse stale.
+			for (const above of this.undoStack.slice(idx + 1)) {
+				if (!(above.kind === 'confirmed' && !above.source)) {
+					this.host.notify('Undo failed', 'a newer edit landed before the undo could run');
+					return;
+				}
+			}
+			const entry = this.undoStack[idx];
+			this.undoStack = [...this.undoStack.slice(0, idx), ...this.undoStack.slice(idx + 1)];
 			try {
 				const redoEntry = await this.applyHistoryEntry(entry);
 				// Only repopulate redo if no new forward edit branched history
 				// meanwhile (which cleared redo and bumped the epoch).
-				if (redoEntry && this.redoEpoch === epoch) this.redoStack = [...this.redoStack, redoEntry];
+				if (redoEntry && this.redoEpoch === epoch) {
+					this.pushRedoEntry({ ...redoEntry, pressStamp: press });
+				}
 			} catch (e) {
-				this.undoStack = [...this.undoStack, entry]; // replay failed: restore
+				// Replay failed: restore the entry where it sat.
+				this.undoStack = [...this.undoStack.slice(0, idx), entry, ...this.undoStack.slice(idx)];
 				this.host.notify('Undo failed', e instanceof Error ? e.message : String(e));
 			}
 		});
 	}
 
 	redo(): void {
-		const entry = this.redoStack[this.redoStack.length - 1];
-		if (!entry) return;
-		this.redoStack = this.redoStack.slice(0, -1);
+		const press = ++this.pressSeq;
+		// OPTIMISTIC redo, symmetric with undo's revoke: a `reapply` entry on
+		// top re-records RIGHT NOW (the projection shows it instantly, and
+		// anything the user does next is recorded on top of it, in press
+		// order). Only possible when no earlier redo press is still queued
+		// (LIFO order must not skip around a queued claim) AND no undo press
+		// is still queued: a queued undo's product is this press's rightful
+		// target, and acting early would both grab an older entry and plant
+		// a fresh pending entry above the queued undo's target, defeating it.
+		if (this.queuedRedoPresses === 0 && this.queuedUndoPresses === 0) {
+			const top = this.redoStack[this.redoStack.length - 1];
+			if (top && top.kind === 'reapply') {
+				this.redoStack = this.redoStack.slice(0, -1);
+				try {
+					const undoEntry = this.reapplyEntry(top);
+					this.undoStack = [...this.undoStack, undoEntry].slice(-MAX_HISTORY);
+				} catch (e) {
+					this.redoStack = [...this.redoStack, top]; // refused: keep replayable
+					this.host.notify('Redo failed', e instanceof Error ? e.message : String(e));
+				}
+				return;
+			}
+		}
+		// Queued redo: pop at RUN time (the entry a just-completed undo
+		// pushed is here by then; a forward gesture recorded since the press
+		// cleared the stack, so an empty stack is a natural no-op). The
+		// press-stamp guard keeps press ORDER: an entry born of an undo
+		// pressed AFTER this redo press is not this press's to consume.
+		this.queuedRedoPresses++;
 		this.enqueue(async () => {
+			this.queuedRedoPresses--;
+			const entry = this.redoStack[this.redoStack.length - 1];
+			if (!entry) return;
+			if (entry.pressStamp! > press) return;
+			this.redoStack = this.redoStack.slice(0, -1);
 			try {
 				const undoEntry = await this.applyHistoryEntry(entry);
 				if (undoEntry) this.undoStack = [...this.undoStack, undoEntry].slice(-MAX_HISTORY);
@@ -541,47 +921,53 @@ export class ProjectionEngine {
 		if (entry.kind === 'pending') {
 			const p = this.pendingOps.find(x => x.id === entry.opId);
 			if (p) {
-				// Still unconfirmed. Structural sends queued ahead of this task
-				// have settled (the chain serializes), so this is an unsent
-				// typing op or a queued-but-not-yet-sent op: peel it locally.
-				// Its forward layout layer leaves the fold; the reapply entry
-				// carries that forward so redo restores both source and layout.
-				const layer = this.layoutLog.find(l => l.owner === p.id);
-				const forwardLayout = layer?.ops;
-				this.pendingOps = this.pendingOps.filter(x => x.id !== p.id);
-				this.dropLayoutLayers(p.id);
-				this.maybeRebaseLayout();
-				return { kind: 'reapply', ops: p.ops, layout: forwardLayout && forwardLayout.length > 0 ? forwardLayout : undefined };
+				// Still unconfirmed. Sends queued ahead of this task have
+				// settled (the chain serializes), so this is an unsent typing
+				// op: peel it locally. The reapply entry carries the gesture's
+				// forward layout so redo restores both source and layout.
+				return { seq: this.nextHistorySeq++, kind: 'reapply', ops: p.ops, layout: this.peelOp(p) };
 			}
-			// The op confirmed while this undo was queued: consume the stashed
-			// inverse. A rejected op stashed nothing (its rollback already
-			// happened), so the undo is a no-op.
-			const confirmed = this.confirmedByOpId.get(entry.opId);
-			this.confirmedByOpId.delete(entry.opId);
-			return confirmed ? this.applyHistoryEntry(confirmed) : null;
+			// Unreachable by construction: a confirmed op's entry was swapped
+			// to 'confirmed' before this task ran (undo resolves inside the
+			// chain), and a rolled-back op's entry left the stack with it. If
+			// this ever fires the invariant broke; say so instead of quietly
+			// doing nothing.
+			this.host.notify('Undo engine error', `a history entry points at a missing op (${entry.opId}); please report`);
+			return null;
 		}
 		if (entry.kind === 'confirmed') {
 			let source: TextEdit | undefined;
 			if (entry.source) {
 				const r = await this.host.applyTextEdit(entry.source);
+				// Cancelled mid-replay (the view switched away): the replay
+				// never ran. Throw so the caller restores the popped entry;
+				// applying the LAYOUT half anyway would persist a dying
+				// view's layout onto the newly watched file.
+				if (r.cancelled) throw new Error('the view changed before the replay could run');
 				if (r.project) this.adoptTruth(r.project, r.weftCode);
 				source = r.inverse ?? undefined;
 			}
 			const layout = entry.layout ? this.applyLayoutChange(entry.layout) : undefined;
-			return source || layout ? { kind: 'confirmed', source, layout } : null;
+			return source || layout ? { seq: this.nextHistorySeq++, kind: 'confirmed', source, layout } : null;
 		}
 		// 'reapply' (redo of an undone pending op): re-record as a fresh
-		// gesture. The caller pushes the returned `pending` entry, so no
-		// pushHistory here (and the redo branch must NOT be cleared: we're
-		// walking it).
+		// gesture, synchronously (see reapplyEntry).
+		return this.reapplyEntry(entry);
+	}
+
+	/** Re-record an undone gesture (`reapply` entry) as a fresh pending op:
+	 *  preflight, rebuild the op with its forward layout, send. Returns the
+	 *  new `pending` history entry; the caller pushes it (no pushHistory:
+	 *  the redo branch must NOT be cleared, we're walking it). Fully
+	 *  synchronous, so redo can apply a reapply OPTIMISTICALLY at press
+	 *  time. Throws on a preflight refusal (don't return null): the
+	 *  caller's catch restores the popped entry to its stack and notifies,
+	 *  so a transient rejection (e.g. the 1s code-edit lock) leaves the
+	 *  redo replayable once it clears, instead of silently destroying the
+	 *  branch. */
+	private reapplyEntry(entry: HistoryEntry & { kind: 'reapply' }): HistoryEntry {
 		const pf = runPreflight(entry.ops, this.visibleProject(), this.lock(), this.catalog, this.host.now());
-		if (!pf.ok) {
-			// THROW (don't return null): the caller's catch restores the popped
-			// entry to its stack and notifies, so a transient rejection (e.g.
-			// the 1s code-edit lock) leaves the redo replayable once it clears,
-			// instead of silently destroying the branch.
-			throw new Error(pf.reason);
-		}
+		if (!pf.ok) throw new Error(pf.reason);
 		const p: PendingOp = { id: `op-${++this.nextOpId}`, ops: entry.ops, state: 'pending' };
 		// If the SERVER refuses this reapply (a transient race, not just the
 		// preflight lock above), the redo entry must come BACK onto the redo
@@ -601,6 +987,6 @@ export class ProjectionEngine {
 		}
 		this.pendingOps = [...this.pendingOps, p];
 		this.sendPendingOp(p);
-		return { kind: 'pending', opId: p.id };
+		return { seq: this.nextHistorySeq++, kind: 'pending', opId: p.id };
 	}
 }

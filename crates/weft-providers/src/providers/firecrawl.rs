@@ -69,7 +69,7 @@ impl ProviderMeter for FirecrawlMeter {
         &self,
         path: &str,
         body: &[u8],
-        _http: &reqwest::Client,
+        _follow_up: FollowUp<'_>,
     ) -> anyhow::Result<f64> {
         if path == "v2/scrape" {
             return Ok(USD_PER_CREDIT);

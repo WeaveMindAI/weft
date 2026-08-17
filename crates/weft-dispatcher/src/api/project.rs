@@ -272,11 +272,15 @@ pub async fn remove(
     caller: CallerTenant,
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<RemoveQuery>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, StatusError> {
     let id = id
         .parse::<uuid::Uuid>()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    authorize_project(&state, &caller.0, id).await?;
+    // Marked gate, not `authorize_project`: rm is a delete, so the CLI
+    // retries it idempotently and needs the `x-weft-not-found` marker
+    // to treat "already gone" as the desired end state instead of an
+    // error (a headerless 404 must still bubble as version skew).
+    authorize_project_marked(&state, &caller.0, id).await?;
     // Deactivate first: cancels any in-flight executions, unregisters
     // every wake signal (entry + resume) from the tenant's listener,
     // drops entry tokens. If deactivate fails on a DB / listener
@@ -311,7 +315,9 @@ pub async fn remove(
         .tenant_for(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tenant_for: {e:#}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+        // The row vanished mid-remove (a concurrent rm won): that IS
+        // rm's desired end state, so it gets the marker too.
+        .ok_or(StatusError::NotMyProject)?;
     state
         .project_reclaimer
         .reclaim(&state, tenant.as_str(), id)
@@ -333,7 +339,9 @@ pub async fn remove(
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "project not found".into()))
+        // A concurrent rm dropped the row after our gate: still rm's
+        // desired end state, so it gets the marker.
+        Err(StatusError::NotMyProject)
     }
 }
 
@@ -1286,13 +1294,16 @@ pub struct StatusQuery {
 /// executions, drift signals (when desired hashes are passed in
 /// query params), and the list of currently-valid action verbs.
 /// One response, no stitching required by the CLI.
-/// Error envelope for the `status` handler. Most arms are a plain
+/// Error envelope for project-scoped handlers whose 404 must be
+/// machine-readable (`status`, `remove`). Most arms are a plain
 /// `(StatusCode, String)` (via `From`, so existing `.map_err`
 /// closures are unchanged); the one special case is `NotMyProject`,
 /// which renders a 404 carrying the `x-weft-not-found: project`
 /// marker header, so a client can tell "no project I may see under
 /// this id" apart from a bare routing 404 (e.g. a version-skewed
 /// dispatcher missing the route), which must bubble as an error.
+/// `remove` needs it so the CLI's `delete_idempotent` can treat
+/// "already gone" as rm's desired end state on a retry.
 ///
 /// `NotMyProject` covers BOTH "no such project" AND "exists but owned by
 /// another tenant", with the SAME response. Collapsing them is the
@@ -1328,6 +1339,25 @@ impl IntoResponse for StatusError {
     }
 }
 
+/// Ownership gate for marked handlers: `authorize_project` (the ONE
+/// ownership lookup, existence-leak collapse included) with its 404
+/// upgraded to `NotMyProject` so the response carries the
+/// `x-weft-not-found: project` marker instead of a headerless 404 the
+/// client cannot tell apart from a version-skew routing 404.
+async fn authorize_project_marked(
+    state: &DispatcherState,
+    caller: &crate::tenant::TenantId,
+    id: uuid::Uuid,
+) -> Result<(), StatusError> {
+    authorize_project(state, caller, id).await.map_err(|(status, msg)| {
+        if status == StatusCode::NOT_FOUND {
+            StatusError::NotMyProject
+        } else {
+            (status, msg).into()
+        }
+    })
+}
+
 pub async fn status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -1342,22 +1372,8 @@ pub async fn status(
     // routing 404 it must bubble. We must NOT call
     // `authorize_project` first: it returns a headerless 404, which would
     // make the marker unreachable and a brand-new `weft run` could never
-    // pass the gate. So resolve ownership explicitly. Both "no row" and
-    // "row owned by another tenant" map to `NotMyProject` (marker + 404),
-    // the SAME response, so a caller probing another tenant's id cannot
-    // tell "exists but not yours" from "does not exist" (no existence
-    // leak), and the CLI's action is correct in both (the id is not a
-    // runnable project of theirs). Only the caller's OWN row proceeds.
-    match state
-        .projects
-        .tenant_for(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tenant_for: {e}")))?
-    {
-        Some(owner) if owner == caller.0.as_str() => {}
-        // No row OR another tenant's row: indistinguishable on the wire.
-        None | Some(_) => return Err(StatusError::NotMyProject),
-    }
+    // pass the gate. So resolve ownership through the marked gate.
+    authorize_project_marked(&state, &caller.0, id).await?;
     let summary = state
         .projects
         .get(id)
@@ -2914,11 +2930,14 @@ pub async fn deactivate(
     caller: CallerTenant,
     Path(id_str): Path<String>,
     Json(spec): Json<weft_broker_client::protocol::DeactivateSpec>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, StatusError> {
     let id = id_str
         .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
-    authorize_project(&state, &caller.0, id).await?;
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".to_string()))?;
+    // Marked gate: deactivate is part of teardown flows (`weft rm
+    // --journal` quiesces through it), so its "no such project" must
+    // be tellable apart from a routing 404, same as `remove`/`status`.
+    authorize_project_marked(&state, &caller.0, id).await?;
     spec.validate()
         .map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
     let existed = deactivate_project_with_mode(
@@ -2933,7 +2952,9 @@ pub async fn deactivate(
     )
     .await?;
     if !existed {
-        return Err((StatusCode::NOT_FOUND, "project not found".into()));
+        // Vanished between the gate and the deactivate (a concurrent
+        // rm): same "no project I may see" answer, marker included.
+        return Err(StatusError::NotMyProject);
     }
     Ok(StatusCode::NO_CONTENT)
 }

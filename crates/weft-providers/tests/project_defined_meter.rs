@@ -41,7 +41,7 @@ impl ProviderMeter for ProjectMeter {
         &self,
         _path: &str,
         _body: &[u8],
-        _http: &reqwest::Client,
+        _follow_up: FollowUp<'_>,
     ) -> anyhow::Result<f64> {
         Ok(0.01)
     }

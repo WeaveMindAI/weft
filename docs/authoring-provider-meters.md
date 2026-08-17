@@ -97,7 +97,7 @@ impl ProviderMeter for MyProviderMeter {
     fn base_url(&self) -> &'static str;   // where the provider REALLY lives
     fn classify(&self, method: &str, path: &str) -> RouteClass;
     fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
-    async fn ceiling_usd(&self, path: &str, body: &[u8], http: &reqwest::Client)
+    async fn ceiling_usd(&self, path: &str, body: &[u8], follow_up: FollowUp<'_>)
         -> anyhow::Result<f64>;
     fn observe(&self, path: &str) -> Box<dyn CallObservation>;
     async fn resolve(&self, path: &str, observed: ObservedCall, follow_up: FollowUp<'_>)
@@ -132,7 +132,9 @@ impl ProviderMeter for MyProviderMeter {
   for "here is my conversation, for estimation purposes" would let a caller
   understate what it is about to spend). Lean high; the measured actual is
   the figure that counts. A call that cannot be priced (unknown model, no
-  output bound) is a loud error, never a guess.
+  output bound) is a loud error, never a guess. `follow_up` is the
+  meter's signed side-query lane, for a rate catalog the provider
+  serves behind its own authenticated API (fal's pricing catalog).
 - **`observe`** mints a fresh per-call tap for the call's route. The tap sees
   every byte AS IT FLOWS THROUGH to the real consumer: it must never
   buffer, delay, or reorder chunks, and it must stay O(small) in memory no
@@ -279,6 +281,37 @@ whole lifecycle (`classify`, `prepare`, `ceiling_usd`, `observe`,
 `resolve`): a multi-route meter opens each method with a match on the
 route and delegates to per-route functions, never inferring the route
 from a response's shape.
+
+## Cover the provider's whole surface, dynamically
+
+A meter must cover everything the provider's NODES let the user ask
+for. If a node exposes a model picker (a `remote_select` over the
+provider's model list, a free-text model field), the meter covers
+EVERY model that picker can produce, not a hand-picked subset: a
+hard-coded "priced models" table turns a valid user choice into a
+refusal, and the table is stale the day the provider ships a model.
+
+The way to get there is dynamic pricing: fetch the provider's own
+rate catalog at call time (cached with a TTL) instead of copying
+numbers into constants. Two shipped patterns to copy:
+
+- **OpenRouter**: the billable route accepts any model; rates come
+  from the provider's public price catalog, fetched and cached by the
+  estimator (`providers/openrouter.rs`).
+- **fal**: any well-formed model submit is billable; the unit price
+  and billing unit come from fal's authenticated pricing catalog via
+  the meter's signed side-query lane (`FollowUp`), and the billed
+  quantity is read from the request per unit KIND (images, megapixels,
+  seconds), so no per-model knowledge exists anywhere
+  (`providers/fal.rs`).
+
+Hard-coded rates are acceptable only when the provider publishes no
+machine-readable catalog AND the rate is a property of the ROUTE, not
+of a user-selectable model (a per-page OCR price, a per-hour
+transcription price). Even then, price by family/prefix where the
+provider versions its models, and refuse (never guess) on a name the
+mapping does not recognize. If you catch yourself writing
+`const PRICED_MODELS`, stop: find the provider's pricing endpoint.
 
 ## Ceilings are estimates, not blanket caps
 

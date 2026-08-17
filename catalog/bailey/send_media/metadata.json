@@ -1,0 +1,46 @@
+{
+  "type": "BaileySendMedia",
+  "label": "WhatsApp Send Media (Baileys)",
+  "description": "Send a stored file (image, video, audio, or document) via the project's WhatsApp bridge, with an optional caption. Wire `endpointUrl` from a BaileyBridge and `file` from any node that outputs a file.",
+  "tags": [
+    "whatsapp",
+    "baileys",
+    "send",
+    "media"
+  ],
+  "icon": "Image",
+  "color": "#25D366",
+  "inputs": [
+    {
+      "name": "endpointUrl",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "to",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "required": true
+    },
+    {
+      "name": "caption",
+      "type": "String",
+      "required": false
+    }
+  ],
+  "outputs": [
+    {
+      "name": "messageId",
+      "type": "String",
+      "required": false
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "isOutputDefault": true
+  }
+}

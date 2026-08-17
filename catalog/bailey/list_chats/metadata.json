@@ -1,0 +1,35 @@
+{
+  "type": "BaileyListChats",
+  "label": "WhatsApp List Chats (Baileys)",
+  "description": "List the group chats the connected account participates in, via the project's bridge. Each entry carries `id`, `name`, and `participantCount`.",
+  "tags": [
+    "whatsapp",
+    "baileys",
+    "chats"
+  ],
+  "icon": "MessagesSquare",
+  "color": "#25D366",
+  "inputs": [
+    {
+      "name": "endpointUrl",
+      "type": "String",
+      "required": true
+    }
+  ],
+  "outputs": [
+    {
+      "name": "chats",
+      "type": "List[JsonDict]",
+      "required": false
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "isOutputDefault": true
+  }
+}

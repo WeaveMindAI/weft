@@ -160,6 +160,24 @@ color of their own, reported with the result.
   on a Bus-typed input, register a name on the writer, `send` /
   `send_bytes` frames, then `close` so the node sees the stream end.
 
+Live tests spend real money, so drive the cost of each one as low as
+the provider allows: pick the CHEAPEST model/tier that still exercises
+the node's real path (query the provider's price catalog rather than
+assuming; the fal tests run their videos on a two-cent model, not the
+default), the smallest inputs (one image, the shortest clip, a
+one-line prompt, the fastest quality settings), and mint any needed
+input material on the cheapest route too. A live test that costs
+dollars per run stops being run; a test nobody runs protects nothing.
+
+At the same time, the live tier must COVER the node: every node whose
+run body talks to a provider gets at least one live test, and the set
+of live tests across a package should touch the node's main use cases
+(the primary action, plus any second path with its own provider
+behavior, e.g. a masked edit vs a plain edit) rather than only the
+happy path of one configuration. Cheap and covering beats expensive
+and singular: two one-cent tests on two paths are worth more than one
+dollar test on one.
+
 Live tests prefer self-provisioned targets: act on a resource named
 `weft-node-tests` in the connected account, creating (and cleaning up)
 what the API allows. A live test cleans up after itself wherever the

@@ -294,8 +294,8 @@ pub fn connection_client(
 /// shared pool on purpose: a follow-up must be bounded (the
 /// pending-record tracker relies on every resolve finishing), so it
 /// carries a total request timeout. Redirects are disabled because a
-/// follow-up addresses a route on the meter's own base_url and must
-/// never leave that origin.
+/// follow-up addresses the provider's own fixed origins (its base_url,
+/// its rate catalog) and must never be bounced anywhere else.
 fn follow_up_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -650,7 +650,7 @@ mod tests {
             &self,
             _path: &str,
             _body: &[u8],
-            _http: &reqwest::Client,
+            _follow_up: FollowUp<'_>,
         ) -> anyhow::Result<f64> {
             Ok(1.0)
         }

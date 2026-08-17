@@ -3,7 +3,9 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{fixture_spec, FakeRig, LiveRig, NodeTest, WeftResult};
+
+use crate::testing::{archive_page, unique_title, DATABASE_FIXTURE, DATABASE_LABEL};
 
 use super::NotionQueryDatabaseNode;
 
@@ -11,7 +13,46 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("resolves_the_source_and_pages_the_query", queries),
         NodeTest::fake("several_sources_without_a_pick_refuses", ambiguous),
+        NodeTest::live("one_real_filtered_query", "notion", live_query).with_fixture(
+            fixture_spec(DATABASE_FIXTURE, DATABASE_LABEL.0, DATABASE_LABEL.1),
+        ),
     ]
+}
+
+/// One real filtered query: a row minted under a run-unique title is
+/// the only match for its own filter, then it is archived so the
+/// database stays clean. Notion bills nothing for this.
+async fn live_query(rig: LiveRig) -> WeftResult<()> {
+    let database = rig.fixture(DATABASE_FIXTURE)?;
+    let title = unique_title("weft query row");
+    let minted = rig
+        .run(
+            &crate::notion_create_item::NotionCreateItemNode,
+            json!({
+                "account": rig.access("notion"),
+                "database": database,
+                "properties": { "Name": { "title": [{ "text": { "content": title } }] } },
+            }),
+        )
+        .await
+        .ok()?;
+    let page_id = minted.output("pageId")?.as_str().unwrap_or_default().to_string();
+    let outcome = rig
+        .run(
+            &NotionQueryDatabaseNode,
+            json!({
+                "account": rig.access("notion"),
+                "database": database,
+                "filter": { "property": "Name", "title": { "equals": title } },
+                "limit": 10,
+            }),
+        )
+        .await
+        .ok()?;
+    assert_eq!(outcome.output("count")?.as_f64(), Some(1.0), "exactly the minted row matches");
+    assert_eq!(outcome.output("items")?[0]["id"].as_str(), Some(page_id.as_str()));
+    let conn = rig.connect().await?;
+    archive_page(&conn, &page_id).await
 }
 
 async fn queries(rig: FakeRig) -> WeftResult<()> {

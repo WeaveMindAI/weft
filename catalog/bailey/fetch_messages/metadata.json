@@ -1,0 +1,48 @@
+{
+  "type": "BaileyFetchMessages",
+  "label": "WhatsApp Fetch History (Baileys)",
+  "description": "Fetch the most recent messages of a chat via the project's bridge (the bridge syncs history on demand). Each entry carries `from`, `pushName`, `content`, `messageType`, `messageId`, `timestamp`, and `fromMe`.",
+  "tags": [
+    "whatsapp",
+    "baileys",
+    "history",
+    "messages"
+  ],
+  "icon": "History",
+  "color": "#25D366",
+  "inputs": [
+    {
+      "name": "endpointUrl",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "chatId",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "exposure": "config",
+      "default": 20,
+      "description": "How many recent messages to fetch."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "messages",
+      "type": "List[JsonDict]",
+      "required": false
+    },
+    {
+      "name": "count",
+      "type": "Number",
+      "required": false
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "isOutputDefault": true
+  }
+}

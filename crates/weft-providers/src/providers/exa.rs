@@ -73,7 +73,7 @@ impl ProviderMeter for ExaMeter {
         &self,
         path: &str,
         body: &[u8],
-        _http: &reqwest::Client,
+        _follow_up: FollowUp<'_>,
     ) -> anyhow::Result<f64> {
         // Estimate from what the request actually asks for: the
         // request's own search tier, the requested result count (only

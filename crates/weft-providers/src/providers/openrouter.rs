@@ -176,7 +176,7 @@ impl ProviderMeter for OpenRouterMeter {
         &self,
         path: &str,
         body: &[u8],
-        _http: &reqwest::Client,
+        _follow_up: FollowUp<'_>,
     ) -> anyhow::Result<f64> {
         // Embeddings and rerank estimate from the request's own text at
         // the REQUEST MODEL's published input rate (the same catalog the

@@ -273,8 +273,15 @@ async fn apply_lifecycle_gate(
 ) -> Result<StatusCode, (StatusCode, String)> {
     use crate::project_store::ProjectStatus;
 
-    // Active project: live fire. Ship straight to the listener.
-    if routing.status == ProjectStatus::Active {
+    // Active project: live fire. Registered counts as live too: a
+    // project a plain `weft run` started can hold suspended executions
+    // whose resume signals are its ONLY signals (entry triggers appear
+    // at activation), and it has no activate/drain moment ever, so a
+    // fire parked here would strand the suspended run forever.
+    if matches!(
+        routing.status,
+        ProjectStatus::Active | ProjectStatus::Registered
+    ) {
         return dispatch_listener_outcome(
             state,
             token,

@@ -39,6 +39,7 @@
 	let {
 		project,
 		onSave,
+		onPersistLayout,
 		onApplyEdits,
 		onApplyTextEdit,
 		onResyncSource,
@@ -74,7 +75,8 @@
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
-		onSave: (data: { layoutCode?: string; fileRef?: { path: string; content: string } }) => void;
+		onSave: (data: { fileRef?: { path: string; content: string } }) => void;
+		onPersistLayout: (layoutCode: string) => Promise<void>;
 		onApplyEdits: (ops: import('../../../../protocol').EditOp[]) => Promise<import('../../projection/types').EditRpcResult>;
 		onApplyTextEdit: (edit: import('../../../../protocol').TextEdit) => Promise<import('../../projection/types').EditRpcResult>;
 		onResyncSource: () => Promise<{ project: ProjectDefinition; weftCode: string } | null>;
@@ -123,6 +125,7 @@
 		bind:this={inner}
 		{project}
 		{onSave}
+		{onPersistLayout}
 		{onApplyEdits}
 		{onApplyTextEdit}
 		{onResyncSource}

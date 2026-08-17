@@ -196,6 +196,34 @@ pub async fn presign(state: &DispatcherState, key: &str, ttl_secs: Option<u64>) 
     .await
 }
 
+/// Mint a relay download link for one file: the broker's token joined
+/// onto THIS dispatcher's public base, resolved by the public
+/// `/public/files/{token}` route. What a browser download rides (a
+/// presigned bucket URL breaks the moment a forward/proxy rewrites the
+/// host, because its signature covers it; a token URL does not care).
+pub async fn download_link(
+    state: &DispatcherState,
+    key: &str,
+    ttl_secs: Option<u64>,
+) -> Result<PresignResult> {
+    let minted: weft_core::storage::DownloadLinkResult = post_admin(
+        state,
+        "/v1/storage/admin/download-link",
+        "download-link",
+        &PresignRequest { key: key.to_string(), ttl_secs },
+    )
+    .await?;
+    Ok(PresignResult {
+        url: format!(
+            "{}/public/files/{}",
+            state.public_base_url.trim_end_matches('/'),
+            minted.token
+        ),
+        filename: minted.filename,
+        size_bytes: minted.size_bytes,
+    })
+}
+
 /// Wipe a whole scope/tenant prefix (`weft files rm <prefix>` / project-delete).
 pub async fn wipe_prefix(state: &DispatcherState, prefix: &str) -> Result<u64> {
     let out: WipePrefixResponse = post_admin(

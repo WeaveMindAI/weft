@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::storage::StorageScope;
+use weft::storage::{KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued};
@@ -59,7 +59,10 @@ impl Node for FalGenerateImageNode {
         let ty = ctx.output_type("images").node_err("the images port declares no type")?;
         let stored = ctx
             .storage(StorageScope::Execution)
-            .internalize(&json!(urls), &ty, None)
+            // A generated image is the run's product: keep it past the
+            // run (default 30-day access-bumped TTL) so the reference
+            // stays readable after the execution ends.
+            .internalize(&json!(urls), &ty, Some(KeepTtl::Default))
             .await?;
         let first = stored.as_array().and_then(|a| a.first()).cloned().expect("checked non-empty");
         ctx.pulse_downstream(

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::storage::{FileHandle, StorageScope};
+use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::fal::{media_url, merge_params, run_queued};
@@ -49,7 +49,9 @@ impl Node for FalUpscaleImageNode {
         let ty = ctx.output_type("image").node_err("the image port declares no type")?;
         let stored = ctx
             .storage(StorageScope::Execution)
-            .internalize(&Value::String(url.to_string()), &ty, None)
+            // The upscaled image is the run's product: keep it past the
+            // run (default 30-day access-bumped TTL).
+            .internalize(&Value::String(url.to_string()), &ty, Some(KeepTtl::Default))
             .await?;
         ctx.pulse_downstream(NodeOutput::new().set("image", stored)).await
     }

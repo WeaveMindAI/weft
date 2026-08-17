@@ -9,9 +9,7 @@
 //! MISSING var SKIPS that service's e2e with a loud message naming it
 //! (absent creds never fake a pass and never fail the suite):
 //!
-//!   github      WEFT_E2E_GITHUB_TOKEN, WEFT_E2E_GITHUB_REPO (owner/name)
-//!   github app  WEFT_E2E_GITHUB_APP_ID, WEFT_E2E_GITHUB_APP_INSTALLATION_ID,
-//!               WEFT_E2E_GITHUB_APP_PRIVATE_KEY (PEM), WEFT_E2E_GITHUB_REPO
+//!   exa         WEFT_NODE_TEST_EXA_KEY (shared with the node-test tier)
 //!   telegram    WEFT_E2E_TELEGRAM_TOKEN, WEFT_E2E_TELEGRAM_CHAT_ID
 //!   slack       WEFT_E2E_SLACK_BOT_TOKEN (xoxb-, a hand-made bot),
 //!               WEFT_E2E_SLACK_CHANNEL_ID (the bot must be in it)
@@ -61,31 +59,28 @@ async fn a_stale_connection_fails_loud_at_resolution() -> Result<()> {
 
 // ---------- live proofs, one per auth shape ----------
 
-/// Static key in a header (GitHub PAT): connect validates through the
-/// declared test call, the run opens a real issue.
+/// Static key in a header (Exa): connect validates through the
+/// declared test call, the run performs a real search.
 #[tokio::test]
-async fn github_pat_opens_a_real_issue() -> Result<()> {
-    let Some(env) =
-        env_group_or_skip("github pat", &["WEFT_E2E_GITHUB_TOKEN", "WEFT_E2E_GITHUB_REPO"])
-    else {
+async fn exa_key_runs_a_real_search() -> Result<()> {
+    let Some(env) = env_group_or_skip("exa key", &["WEFT_NODE_TEST_EXA_KEY"]) else {
         return Ok(());
     };
-    let [token, repo] = <[String; 2]>::try_from(env).expect("two vars requested");
+    let [key] = <[String; 1]>::try_from(env).expect("one var requested");
     let disp = ensure::up().await?;
     let conn =
-        connect_direct(&disp, catalog_spec("github", "access")?, "own", json!({ "token": token }))
+        connect_direct(&disp, catalog_spec("web", "exa_access")?, "own", json!({ "key": key }))
             .await?;
 
-    let mut project = Project::prepare("access_github", disp).await?;
-    set_account(&project, "gh", "account", conn.handle())?;
-    project.set_node_config("issue", "repo", &format!("{repo:?}"))?;
+    let mut project = Project::prepare("access_exa", disp).await?;
+    set_account(&project, "exa", "account", conn.handle())?;
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
-    let url = settled
+    let count = settled
         .input_of("out")
-        .and_then(|i| i.get("data").and_then(Value::as_str).map(str::to_string))
+        .and_then(|i| i.get("data").and_then(Value::as_f64))
         .unwrap_or_default();
-    anyhow::ensure!(url.contains("github.com") && url.contains("/issues/"), "issue url: {url}");
+    anyhow::ensure!(count >= 1.0, "the search answered no results");
     project.finish().await?;
     conn.finish().await
 }
@@ -323,40 +318,8 @@ async fn s3_sigv4_uploads_a_real_object() -> Result<()> {
     conn.finish().await
 }
 
-/// MintJwt (GitHub App): the connect itself mints + exchanges a real
-/// installation token (a bad key/id fails right there), and the run
-/// opens a real issue as the app.
-#[tokio::test]
-async fn github_app_mints_a_token_and_opens_a_real_issue() -> Result<()> {
-    let Some(env) = env_group_or_skip(
-        "github app",
-        &[
-            "WEFT_E2E_GITHUB_APP_ID",
-            "WEFT_E2E_GITHUB_APP_INSTALLATION_ID",
-            "WEFT_E2E_GITHUB_APP_PRIVATE_KEY",
-            "WEFT_E2E_GITHUB_REPO",
-        ],
-    ) else {
-        return Ok(());
-    };
-    let [app_id, installation_id, private_key, repo] =
-        <[String; 4]>::try_from(env).expect("four vars requested");
-    let disp = ensure::up().await?;
-    let conn = connect_direct(
-        &disp,
-        catalog_spec("github", "app_access")?,
-        "own",
-        json!({
-            "app_id": app_id, "installation_id": installation_id, "private_key": private_key,
-        }),
-    )
-    .await?;
-
-    let mut project = Project::prepare("access_github_app", disp).await?;
-    set_account(&project, "app", "account", conn.handle())?;
-    project.set_node_config("issue", "repo", &format!("{repo:?}"))?;
-    let settled = run::run_and_settle(&mut project).await?;
-    settled.completed()?;
-    project.finish().await?;
-    conn.finish().await
-}
+// The MintJwt auth shape (a signed app JWT exchanged for a short-lived
+// installation token) currently has no catalog vehicle: its only user
+// was the GitHub package, removed to be rebuilt properly (see
+// ROADMAP.md, "GitHub package, done properly"). Restore its live proof
+// here the day a MintJwt service returns.

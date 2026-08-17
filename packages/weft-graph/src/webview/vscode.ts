@@ -131,13 +131,25 @@ export function teardownTransport(): void {
 // ---- host request/reply calls ----
 //
 // Several webview features ask the host something and await a correlated
-// reply (the storage handshake, the asset picker, the project-file listing).
-// ONE registry correlates them all: a reply is matched by (kind, requestId),
-// riding the same fan-out as every other host message so it rebinds on a
-// transport swap like everything else.
+// reply (graph edits, post-rejection resyncs, the storage handshake, the
+// asset picker, the project-file listing). ONE registry correlates them all:
+// a reply is matched by (kind, requestId), riding the same fan-out as every
+// other host message so it rebinds on a transport swap like everything else.
 
-let nextRequestId = 1;
-const pendingReplies = new Map<string, (msg: HostMessage) => void>();
+// Correlation ids are OPAQUE to the host (echoed back verbatim), so they are
+// minted from a per-module-load random base: a torn-down webview instance (a
+// VS Code column move destroys and rebuilds the iframe, resetting this
+// module) restarts its counter, and without the random base a LATE reply to
+// the old instance's request could collide with a fresh request that reused
+// the same small number, resolving it with another gesture's result.
+let nextRequestId = Math.floor(Math.random() * 0x4000_0000);
+
+/// The rejection every swept host request settles with (see
+/// `cancelPendingHostRequests`). Callers that treat cancellation as a benign
+/// outcome (a view switch mid-round-trip) match on this class.
+export class HostRequestCancelled extends Error {}
+
+const pendingReplies = new Map<string, { resolve: (msg: HostMessage) => void; reject: (err: Error) => void }>();
 let repliesSubscribed = false;
 
 function ensureRepliesSubscribed(): void {
@@ -150,25 +162,40 @@ function ensureRepliesSubscribed(): void {
     const pending = pendingReplies.get(key);
     if (pending) {
       pendingReplies.delete(key);
-      pending(msg);
+      pending.resolve(msg);
     }
   });
 }
 
 /// Send one request-shaped message and await its correlated reply of
-/// `replyKind`. The single primitive every host request/reply pair builds on.
-function hostRequest<K extends HostMessage['kind']>(
+/// `replyKind`. The single primitive every host request/reply pair builds
+/// on; rejects with `HostRequestCancelled` if the request is swept before
+/// its reply arrives.
+export function hostRequest<K extends HostMessage['kind']>(
   replyKind: K,
   build: (requestId: number) => WebviewMessage,
 ): Promise<Extract<HostMessage, { kind: K }>> {
   ensureRepliesSubscribed();
   const requestId = nextRequestId++;
-  return new Promise((resolve) => {
-    pendingReplies.set(`${replyKind}:${requestId}`, (msg) => {
-      resolve(msg as Extract<HostMessage, { kind: K }>);
+  return new Promise((resolve, reject) => {
+    pendingReplies.set(`${replyKind}:${requestId}`, {
+      resolve: (msg) => resolve(msg as Extract<HostMessage, { kind: K }>),
+      reject,
     });
     send(build(requestId));
   });
+}
+
+/// Settle every in-flight host request with `HostRequestCancelled`. Called
+/// when the view the requests belong to goes away (an include navigation or
+/// doc switch remounts the editor; the editor unmounts entirely): a promise
+/// left pending forever would wedge its awaiter (the edit engine's serialized
+/// chain sits on these), and its reply, arriving after the remount, would
+/// belong to a view that no longer exists.
+export function cancelPendingHostRequests(reason: string): void {
+  const pending = [...pendingReplies.values()];
+  pendingReplies.clear();
+  for (const p of pending) p.reject(new HostRequestCancelled(reason));
 }
 
 /// Drive one dispatcher storage verb through the host. `path` is the route

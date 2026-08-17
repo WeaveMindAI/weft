@@ -1,0 +1,11 @@
+# Run a real web search through a pasted key. The test connects the
+# grant through the dispatcher's access store and stamps the connect
+# handle before running. Exa signs with a static key in a HEADER, so
+# this is the header-key auth-shape proof.
+
+exa = ExaAccess
+search = WebSearch { query: "weft graph language", numResults: 1 }
+search.account = exa.access
+
+out = Debug
+out.data = search.count

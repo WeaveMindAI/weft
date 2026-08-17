@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use weft::access::socket::SocketMessage;
 use weft::bus::{BusEntryKind, BusOptions, BusPayloadKind, WirePayload};
 use weft::node::NodeOutput;
-use weft::storage::StorageScope;
+use weft::storage::{KeepTtl, StorageScope};
 use weft::{node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::audio_file_type;
@@ -253,7 +253,9 @@ impl Node for ElevenLabsSpeakNode {
 
         let stored = ctx
             .storage(StorageScope::Execution)
-            .put(full, mime, &format!("speech.{ext}"), None)
+            // The generated speech is the run's product: keep it past
+            // the run (default 30-day access-bumped TTL).
+            .put(full, mime, &format!("speech.{ext}"), Some(KeepTtl::Default))
             .await?;
         let stored = weft::storage::StoredFile::from_value(&stored)?;
         ctx.pulse_downstream(NodeOutput::stored_file(stored)).await

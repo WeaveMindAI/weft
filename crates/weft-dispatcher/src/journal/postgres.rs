@@ -760,8 +760,17 @@ impl Journal for PostgresJournal {
              AND ($3::bigint IS NULL OR ec.started_at_unix >= $3) \
              AND ($4::bigint IS NULL OR ec.started_at_unix < $4)";
 
+        // The count carries the SAME started-event predicate as the row
+        // query's inner lateral join: a seeded `execution_color` row
+        // with no `execution_started` event can never be listed, so it
+        // must not be counted either, else `total` promises rows the
+        // pages cannot produce.
         let total: (i64,) = sqlx::query_as(&format!(
-            "SELECT COUNT(*) FROM execution_color ec WHERE {where_clause}"
+            "SELECT COUNT(*) FROM execution_color ec WHERE {where_clause} \
+             AND EXISTS ( \
+                 SELECT 1 FROM exec_event \
+                 WHERE color = ec.color AND kind = 'execution_started' \
+             )"
         ))
         .bind(tenant)
         .bind(project)

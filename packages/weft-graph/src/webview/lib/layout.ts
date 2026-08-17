@@ -63,76 +63,143 @@ export const LAYOUT_VERB = '@layout';
 export const SIMPLIFIED_LAYOUT_VERB = '@slayout';
 export type LayoutVerb = typeof LAYOUT_VERB | typeof SIMPLIFIED_LAYOUT_VERB;
 
+/** The one entry-line pattern for a verb: parsing and rewriting share it, so
+ *  a line is "a layout entry" by exactly one definition. */
+function entryRe(verb: LayoutVerb): RegExp {
+  return new RegExp(`^(.+?)\\s+${verb}\\s+(-?\\d+(?:\\.\\d+)?)\\s+(-?\\d+(?:\\.\\d+)?)(?:\\s+(\\d+(?:\\.\\d+)?)x(\\d+(?:\\.\\d+)?))?(?:\\s+(collapsed|expanded))?(?:\\s+(configCollapsed))?\\s*$`);
+}
+
+function matchToEntry(match: RegExpMatchArray): [string, LayoutEntry] {
+  const [, scopedId, xStr, yStr, wStr, hStr, state, configState] = match;
+  const entry: LayoutEntry = { x: parseFloat(xStr), y: parseFloat(yStr) };
+  if (wStr && hStr) {
+    entry.w = parseFloat(wStr);
+    entry.h = parseFloat(hStr);
+  }
+  if (state === 'expanded') entry.expanded = true;
+  if (state === 'collapsed') entry.expanded = false;
+  if (configState === 'configCollapsed') entry.configCollapsed = true;
+  return [scopedId, entry];
+}
+
 export function parseLayoutCode(layoutCode: string, verb: LayoutVerb = LAYOUT_VERB): Record<string, LayoutEntry> {
   const map: Record<string, LayoutEntry> = {};
   if (!layoutCode) return map;
-  const re = new RegExp(`^(.+?)\\s+${verb}\\s+(-?\\d+(?:\\.\\d+)?)\\s+(-?\\d+(?:\\.\\d+)?)(?:\\s+(\\d+(?:\\.\\d+)?)x(\\d+(?:\\.\\d+)?))?(?:\\s+(collapsed|expanded))?(?:\\s+(configCollapsed))?\\s*$`);
+  const re = entryRe(verb);
   for (const line of layoutCode.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     const match = trimmed.match(re);
     if (!match) continue;
-    const [, scopedId, xStr, yStr, wStr, hStr, state, configState] = match;
-    const entry: LayoutEntry = { x: parseFloat(xStr), y: parseFloat(yStr) };
-    if (wStr && hStr) {
-      entry.w = parseFloat(wStr);
-      entry.h = parseFloat(hStr);
-    }
-    if (state === 'expanded') entry.expanded = true;
-    if (state === 'collapsed') entry.expanded = false;
-    if (configState === 'configCollapsed') entry.configCollapsed = true;
+    const [scopedId, entry] = matchToEntry(match);
     map[scopedId] = entry;
   }
   return map;
 }
 
+/** Rewrite ONE verb's entry block through a map mutation: parse every entry
+ *  line of `verb` into a map (last-wins, the same rule `parseLayoutCode`
+ *  reads by), run `mutate`, and serialize the map back where the block
+ *  lived. Every non-matching line (the other verb's entries, the `@view`
+ *  header, anything unrecognized) passes through untouched and in order.
+ *  This is THE layout writer: it collapses duplicate keys to one line by
+ *  construction, so a writer and the reader can never disagree about which
+ *  line a key means. */
+function rewriteVerbEntries(
+  layoutCode: string,
+  verb: LayoutVerb,
+  mutate: (map: Record<string, LayoutEntry>) => void,
+): string {
+  const re = entryRe(verb);
+  const map: Record<string, LayoutEntry> = {};
+  const passthrough: Array<{ idx: number; line: string }> = [];
+  let firstIdx = -1;
+  (layoutCode || '').split('\n').forEach((line, idx) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const match = trimmed.match(re);
+    if (match) {
+      if (firstIdx < 0) firstIdx = idx;
+      const [scopedId, entry] = matchToEntry(match);
+      map[scopedId] = entry;
+    } else {
+      passthrough.push({ idx, line: trimmed });
+    }
+  });
+  mutate(map);
+  const block = serializeLayoutMap(map, verb).split('\n').filter((l) => l !== '');
+  const out: string[] = [];
+  let inserted = false;
+  for (const p of passthrough) {
+    if (!inserted && firstIdx >= 0 && p.idx > firstIdx) {
+      out.push(...block);
+      inserted = true;
+    }
+    out.push(p.line);
+  }
+  if (!inserted) out.push(...block);
+  return out.join('\n');
+}
+
 /** Update or insert a layout entry. Returns the new layoutCode.
  *
- *  `undefined` for `w`/`h`/`expanded` means "leave whatever is already
- *  persisted", NOT "clear it". This matters because position-only updates (a
- *  drag, an ELK reflow moving a NEIGHBOUR node) call this without knowing the
- *  node's size/collapse state; a destructive rewrite would strip the persisted
- *  `expanded` flag and the node would snap to its type default on the next
- *  rebuild (spurious collapse/expand on untouched nodes). To actually clear a
- *  flag, pass `null`. */
+ *  `undefined` for `w`/`h`/`expanded`/`configCollapsed` means "leave whatever
+ *  is already persisted", NOT "clear it". This matters because position-only
+ *  updates (a drag, an ELK reflow moving a NEIGHBOUR node) call this without
+ *  knowing the node's size/collapse state; a destructive rewrite would strip
+ *  the persisted `expanded` flag and the node would snap to its type default
+ *  on the next rebuild (spurious collapse/expand on untouched nodes). To
+ *  actually clear a field, pass `null`: all four optional fields share the
+ *  same three-state rule, so a diffed op that DROPS a size can round-trip
+ *  (undo of a resize must be able to restore "no explicit size"). */
 export function updateLayoutEntry(
   layoutCode: string,
   scopedId: string,
   x: number,
   y: number,
-  w?: number,
-  h?: number,
+  w?: number | null,
+  h?: number | null,
   expanded?: boolean | null,
   configCollapsed?: boolean | null,
   verb: LayoutVerb = LAYOUT_VERB,
 ): string {
-  const lines = (layoutCode || '').split('\n');
-  const idx = lines.findIndex((l) => {
-    const t = l.trim();
-    return t.startsWith(scopedId + ' ' + verb) || t.startsWith(scopedId + '\t' + verb);
+  return rewriteVerbEntries(layoutCode, verb, (map) => {
+    const prior = map[scopedId];
+    const entry: LayoutEntry = { x, y };
+    const mergedW = w === undefined ? prior?.w : w ?? undefined;
+    const mergedH = h === undefined ? prior?.h : h ?? undefined;
+    // A size is one fact, not two: the format has no way to write width
+    // without height, so a half-set size would be dropped SILENTLY at
+    // serialization. Refuse it here instead.
+    if ((mergedW === undefined) !== (mergedH === undefined)) {
+      throw new Error(
+        `layout entry '${scopedId}': width and height must be set or cleared together (got w=${mergedW}, h=${mergedH})`,
+      );
+    }
+    const mergedExpanded = expanded === undefined ? prior?.expanded : expanded ?? undefined;
+    const mergedConfigCollapsed = configCollapsed === undefined ? prior?.configCollapsed : configCollapsed ?? undefined;
+    if (mergedW !== undefined) entry.w = mergedW;
+    if (mergedH !== undefined) entry.h = mergedH;
+    if (mergedExpanded !== undefined) entry.expanded = mergedExpanded;
+    if (mergedConfigCollapsed !== undefined) entry.configCollapsed = mergedConfigCollapsed;
+    map[scopedId] = entry;
   });
-  // Merge against the existing entry so undefined args preserve prior values.
-  const prior = idx >= 0 ? parseLayoutCode(lines[idx], verb)[scopedId] : undefined;
-  const mergedW = w !== undefined ? w : prior?.w;
-  const mergedH = h !== undefined ? h : prior?.h;
-  const mergedExpanded = expanded !== undefined ? expanded : prior?.expanded;
-  const mergedConfigCollapsed = configCollapsed !== undefined ? configCollapsed : prior?.configCollapsed;
-  const newLine = `${scopedId} ${formatLayoutStr(x, y, mergedW, mergedH, mergedExpanded, mergedConfigCollapsed, verb)}`;
-  if (idx >= 0) lines[idx] = newLine;
-  else lines.push(newLine);
-  return lines.filter((l) => l.trim() !== '').join('\n');
 }
 
 /** Remove a layout entry (one view's verb). Returns the new layoutCode. */
 export function removeLayoutEntry(layoutCode: string, scopedId: string, verb: LayoutVerb = LAYOUT_VERB): string {
   if (!layoutCode) return '';
-  return layoutCode
-    .split('\n')
-    .filter((l) => {
-      const t = l.trim();
-      return !(t.startsWith(scopedId + ' ' + verb) || t.startsWith(scopedId + '\t' + verb));
-    })
-    .join('\n');
+  return rewriteVerbEntries(layoutCode, verb, (map) => {
+    delete map[scopedId];
+  });
+}
+
+/** Remove a node's layout entry from EVERY view's block. A node that left the
+ *  project (delete, ungroup consuming its key) is gone in both views; a
+ *  caller deleting from only the view it happens to render would strand the
+ *  other view's line forever. */
+export function removeLayoutEntryEveryView(layoutCode: string, scopedId: string): string {
+  return removeLayoutEntry(removeLayoutEntry(layoutCode, scopedId, LAYOUT_VERB), scopedId, SIMPLIFIED_LAYOUT_VERB);
 }
 
 function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?: boolean | null, configCollapsed?: boolean | null, verb: LayoutVerb = LAYOUT_VERB): string {
@@ -175,29 +242,24 @@ export function serializeLayoutMap(map: Record<string, LayoutEntry>, verb: Layou
  *  always the moved entry regardless of original line order. */
 export function renameLayoutSubtree(layoutCode: string, oldKey: string, newKey: string): string {
   if (!layoutCode || oldKey === newKey) return layoutCode;
-  // A move/rename re-keys the node in BOTH views' position blocks. Re-key each
-  // verb independently and recombine, so neither the builder nor the simplified
-  // positions are dropped.
-  const reKeyVerb = (verb: LayoutVerb): string => {
-    const map = parseLayoutCode(layoutCode, verb);
-    const rebuilt: Record<string, LayoutEntry> = {};
+  // A move/rename re-keys the node in BOTH views' position blocks. Each verb's
+  // block is rewritten through the one layout writer, so the `@view` header
+  // and any line the parser does not recognize pass through untouched (a
+  // rename must never be the operation that silently deletes them).
+  const reKey = (map: Record<string, LayoutEntry>): void => {
     const reKeyed: Array<[string, LayoutEntry]> = [];
     for (const [key, entry] of Object.entries(map)) {
       if (key === oldKey) reKeyed.push([newKey, entry]);
       else if (key.startsWith(oldKey + '.')) reKeyed.push([newKey + key.slice(oldKey.length), entry]);
-      else rebuilt[key] = entry; // outside the subtree: keep as-is
+      else continue;
+      delete map[key];
     }
-    // Re-keyed entries last so the moved subtree wins any collision with an
-    // entry outside it (the displaced entry's view-state is obsolete).
-    for (const [k, entry] of reKeyed) rebuilt[k] = entry;
-    return serializeLayoutMap(rebuilt, verb);
+    // Re-keyed entries written last so the moved subtree wins any collision
+    // with an entry outside it (the displaced entry's view-state is obsolete).
+    for (const [k, entry] of reKeyed) map[k] = entry;
   };
-  const builder = reKeyVerb(LAYOUT_VERB);
-  const simplified = reKeyVerb(SIMPLIFIED_LAYOUT_VERB);
-  // serializeLayoutMap emits only node lines, so re-apply the view-mode header
-  // (a move/reparent must not silently drop simplified view).
-  const body = [builder, simplified].filter((s) => s !== '').join('\n');
-  return setViewMode(body, parseViewMode(layoutCode));
+  const builder = rewriteVerbEntries(layoutCode, LAYOUT_VERB, reKey);
+  return rewriteVerbEntries(builder, SIMPLIFIED_LAYOUT_VERB, reKey);
 }
 
 // ── Container containment floors ─────────────────────────────────────────
@@ -294,8 +356,12 @@ export function applyLayoutOps(layoutCode: string, ops: LayoutOp[]): string {
   let code = layoutCode;
   for (const op of ops) {
     if (op.op === 'setEntry') {
+      // An op's entry is the COMPLETE description of the key: every absent
+      // field is a clear (`?? null`), never a preserve, so a diff that
+      // dropped a size round-trips (undo of a resize restores "no explicit
+      // size" instead of resurrecting the resized one).
       const e = op.entry;
-      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w, e.h, e.expanded ?? null, e.configCollapsed ?? null, op.verb ?? LAYOUT_VERB);
+      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w ?? null, e.h ?? null, e.expanded ?? null, e.configCollapsed ?? null, op.verb ?? LAYOUT_VERB);
     } else if (op.op === 'removeEntry') {
       code = removeLayoutEntry(code, op.id, op.verb ?? LAYOUT_VERB);
     } else {
