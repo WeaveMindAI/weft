@@ -1,12 +1,10 @@
-# Weft: Local Getting Started
+# Getting started
 
-How to boot a dispatcher, scaffold a project, run it, wire a
-webhook, and see live events. Everything here runs against the
-subprocess worker backend and sqlite journal, no cloud, no docker.
+By the end of this page you will have a Weft program running on your machine,
+reachable over HTTP, with a graph view showing you every value as it flows
+through. Everything runs locally, and nothing asks you to sign up.
 
 ## Install
-
-One script, release build, symlinks into `~/.local/bin`:
 
 ```bash
 git clone <this repo>
@@ -14,58 +12,38 @@ cd weft
 ./setup.sh
 ```
 
-That produces:
+The script builds three binaries and symlinks them into `~/.local/bin`:
+`weft` (the CLI you'll use for everything), `weft-dispatcher` (the local
+daemon that runs your programs), and `weft-runner` (the worker the dispatcher
+spawns). If `~/.local/bin` isn't on your `PATH`, the script prints the exact
+line to add to your shell rc.
 
-- `~/.local/bin/weft` (CLI)
-- `~/.local/bin/weft-dispatcher` (daemon)
-- `~/.local/bin/weft-runner` (worker, invoked by the dispatcher)
+Re-run `./setup.sh` anytime to rebuild. Useful flags: `--debug` for faster
+incremental builds, `--vscode` / `--browser` / `--cli` / `--daemon` to build
+a subset, `--uninstall` to remove everything (`--purge` also deletes local
+state).
 
-The script verifies `~/.local/bin` is on your `PATH`; if not, it
-prints the exact line to add to your shell rc. The dispatcher
-auto-discovers `weft-runner` as a sibling of its own binary, so
-`WEFT_RUNNER_PATH` isn't needed.
+## The runtime
 
-Re-run `./setup.sh` anytime to rebuild and re-link. Component
-flags pick a subset (`--cli`, `--daemon`, `--vscode`, `--browser`)
-and combine. `./setup.sh --debug` uses the debug profile for
-faster incremental builds. `./setup.sh --uninstall` removes the
-installed pieces; add `--purge` to also delete the kind cluster
-and journal.
+Weft programs are run by a small daemon on your machine, and `./setup.sh`
+already started it: by the time the script finishes, the runtime is up and
+waiting on port 9999 (override with `WEFT_HTTP_PORT=…` if that's taken).
 
-## Start the dispatcher
+If you ever need to manage it by hand: `weft daemon status` says whether it's
+up, `weft daemon logs -f` tails it, `weft daemon stop` and `weft daemon start`
+do what they say.
 
-```bash
-weft daemon start    # fork in the background   (alias: weft d start)
-weft daemon status   # is it up?                 (alias: weft d status)
-weft daemon logs -f  # tail the log              (alias: weft d logs -f)
-weft daemon stop     # when done                 (alias: weft d stop)
-weft daemon restart  # stop + start              (alias: weft d restart)
-```
-
-Port 9999 by default. Override with `WEFT_HTTP_PORT=…` when
-calling `weft daemon start` if that port is taken.
-
-The dispatcher's ops dashboard lives at `http://localhost:9999/`.
-
-## Your first project
+## Your first program
 
 ```bash
 weft new hello
 cd hello
+weft run
 ```
 
-You get:
-
-```
-hello/
-├── weft.toml          # project id + manifest
-├── main.weft          # starter graph: Text -> Debug
-├── nodes/             # place your own rust nodes here (phase B)
-├── .weft/             # local state
-└── .gitignore
-```
-
-`main.weft` starts as:
+That's a complete cycle: `weft new` scaffolds a project, `weft run` compiles
+it, registers it with the daemon, fires an execution, and streams the events
+live until it finishes. The program it just ran is `main.weft`:
 
 ```weft
 greeting = Text { value: "hello world" }
@@ -74,30 +52,57 @@ out = Debug
 out.data = greeting.value
 ```
 
-Run it:
+Read it as a graph: a `Text` node holds a string, a `Debug` node prints
+whatever reaches it, and the one connection hands the string over. Before
+anything ran, the compiler checked that connection: the types match, the
+ports exist, nothing required is left unwired. Everything you build in Weft
+works this way, whatever the size.
 
-```bash
-weft run
+## See it as a graph
+
+Open the project folder in VS Code (with the Weft extension installed, which
+`./setup.sh` does by default). Open `main.weft` and the graph appears next to
+the code: the same program drawn as boxes and wires, refreshed every time
+you save.
+
+<!-- CAPTURE: VS Code split view, main.weft source on the left, the two-node
+     graph rendered on the right. -->
+
+Now hit run from the editor (or `weft run` again in the terminal) and watch
+the graph light up: each node flashes as it executes, and clicking a node
+shows the exact values that went in and came out. You will spend most of your
+Weft life in this view. Iterating on a program means running it, clicking the
+step that looks wrong, seeing the actual value, and fixing that step.
+
+<!-- CAPTURE: the same graph mid-run, one node highlighted, the inspector
+     panel open showing the value on the edge. -->
+
+## Put it on a URL
+
+So far the program only runs when you ask it to. The `ApiEndpoint` node
+makes it run when the outside world calls: every HTTP request that hits its
+path fires a fresh execution.
+
+Replace `main.weft` with:
+
+```weft
+api = ApiEndpoint { path: "hello" }
+reply = Reply
+
+reply.started = api.started
 ```
 
-`weft run` compiles, registers the project with the dispatcher,
-kicks off a fresh execution, then streams SSE events until the
-execution completes. Use `--detach` if you don't want to watch.
-
-Look at the ops dashboard in a browser: `http://localhost:9999/`.
-You should see the `hello` project listed.
-
-## Live HTTP entry
-
-Make a project an outside caller can hit over HTTP. `ApiEndpoint` is the
-trigger (each request fires a fresh execution); a downstream node reads the
-request and replies through the caller handle. The responder is a
-project-local node you write yourself (a directory under `nodes/`; see
-`docs/authoring-nodes.md` for the full authoring guide):
+`Reply` doesn't exist yet; you're about to write it, and writing your own
+nodes is routine in Weft. A node is a folder under `nodes/` with two files:
+a small JSON manifest describing its ports, and the Rust that does the work.
 
 ```bash
 mkdir -p nodes/reply
-cat > nodes/reply/metadata.json <<'EOF'
+```
+
+`nodes/reply/metadata.json`:
+
+```json
 {
   "type": "Reply",
   "label": "Reply",
@@ -115,8 +120,11 @@ cat > nodes/reply/metadata.json <<'EOF'
   ],
   "requires_infra": false
 }
-EOF
-cat > nodes/reply/mod.rs <<'EOF'
+```
+
+`nodes/reply/mod.rs`:
+
+```rust
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -142,115 +150,86 @@ impl Node for ReplyNode {
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }
-EOF
-cat > main.weft <<'EOF'
-api = ApiEndpoint { path: "hello" }
-reply = Reply { _label: "responder" }
-
-reply.started = api.started
-EOF
-
-weft activate      # compiles, registers, activates; prints the live URL
 ```
 
-Fire it from anywhere:
+The node contains no server code and no routing. The `ctx` hands it a live
+caller handle and it answers. Everything a node needs from the outside world
+(callers, storage, messaging between nodes, secrets) comes through the `ctx`
+the same way, already built and already hardened, so the code you write is
+only your own logic.
+
+Activate it:
 
 ```bash
-curl -X POST "<live URL from activate>" \
+weft activate    # compiles, registers, prints the live URL
+```
+
+And fire it from anywhere:
+
+```bash
+curl -X POST "<the URL activate printed>" \
      -H "content-type: application/json" \
      -d '{"message":"hi"}'
 ```
 
-Look at the logs:
+Each request is a full execution you can inspect: `weft follow <project-id>`
+streams them live, and in the editor you'll see them appear in the executions
+list as they happen.
+
+## Add a human
+
+Some steps of a real workflow belong to a person, an approval or a judgment
+call. In Weft a human is a node like any other. A `HumanQuery` node
+suspends the execution, the pending task shows up in the Weft browser
+extension, and when the person answers, the execution resumes exactly where
+it stopped, whether that took a minute or a week.
+
+The extension takes a few minutes to set up (build it, load it in your
+browser, connect it with a token); the walkthrough is in
+[docs/browser-extension.md](./browser-extension.md). Once it's connected, add
+a `HumanQuery` node to any program: the task appears in the extension, and
+answering it wakes the program up.
+
+<!-- CAPTURE: the browser extension popup showing one pending task, next to
+     the graph with the HumanQuery node in its waiting state. -->
+
+## Give it infrastructure
+
+Some capabilities need a process that's always there: a WhatsApp bridge
+holding a phone session, a local LLM server, a database, a headless browser.
+In Weft these are infra nodes, and they sit on the graph like everything
+else. You drop the node in, run `weft infra start`, and Weft provisions a
+real container for it (locally in a `kind` cluster, which the daemon sets up
+lazily; install [kind](https://kind.sigs.k8s.io/docs/user/quick-start/) and
+[kubectl](https://kubernetes.io/docs/tasks/tools/) once per machine). You
+write no YAML and manage no containers; the rest of your graph just gets a
+URL to talk to.
+
+The lifecycle is four verbs:
 
 ```bash
-weft logs <color>
-# or live:
-weft follow <project-id>
+weft infra start        # bring everything up, wait for ready
+weft infra stop         # scale to zero, keep disks and addresses
+weft infra upgrade      # roll a new image or spec
+weft infra terminate    # delete it all, disks included
 ```
 
-## Human-in-the-loop (`@weft` pending tasks)
+`weft infra status` shows per-node health and endpoints, and the graph shows
+each infra node's status right on the node.
 
-1. Mint an extension token:
+## Where to go next
 
-   ```bash
-   weft token mint --name "my laptop"
-   # prints the wm_ext_xxxxx token + the URL to paste in the extension
-   ```
-
-2. Build + load the browser extension (WXT-based):
-
-   ```bash
-   cd extension-browser
-   pnpm install
-   pnpm dev
-   ```
-
-   This launches a browser with the extension auto-installed. Paste
-   the URL from step 1 into the extension's popup.
-
-3. Write a weft program with a HumanQuery node. The node calls
-   `ctx.await_form(...)`; the dispatcher mints a form URL; the
-   extension sees the task in its pending list.
-
-4. Complete the task from the extension. The dispatcher resumes
-   the suspended execution with the form submission.
-
-## Infra: long-running services your workflow can use
-
-Most Weft nodes are short-lived: they run, produce a value, and exit.
-But some capabilities need a process that's *always there*: a WhatsApp
-bridge holding a phone session, a local LLM server, a database, a
-headless browser. Weft calls these **infra nodes**, and the whole point
-is that you declare them like any other node and Weft runs them for you.
-
-**Why it's nice.** You don't write Kubernetes YAML, manage Docker
-Compose, or babysit a daemon. You drop a "WhatsApp Bridge" node onto
-the graph, hit Start, and Weft provisions a real pod, wires up its
-network, persists its state on a disk, and hands the rest of your
-workflow a URL to talk to it. Locally that runs in a `kind` cluster on
-your machine, and the same code runs against real Kubernetes when deployed:
-**one model, no separate "local vs prod" setup.** Weft itself is the
-infrastructure layer.
-
-**How it works, in one breath.** An infra node describes what it wants
-(a container, a port, a disk) as a typed spec. When you Start, Weft
-compiles that to Kubernetes objects, applies them, waits for the pod to
-be ready, and records a stable in-cluster URL. Downstream nodes get
-that URL and make HTTP calls. Weft watches the pod's health and shows
-its status right on the node in the graph.
-
-**The lifecycle you'll actually use:**
-
-- **Start**: bring the infra up (or bring back any piece that was down).
-- **Stop**: scale it to zero. Its disk and address are kept, so a later
-  Start is fast. A node can mark a piece *NoOp* meaning "leave me
-  running on stop" for things that are expensive to recreate.
-- **Upgrade**: stop then start, to roll a new version of your node's
-  image or spec. (A NoOp piece stays frozen until you explicitly take
-  it down with `weft infra <node> stop --force`, the graph shows a hint
-  when that's the case.)
-- **Terminate**: delete everything, including the disk.
-
-**Prerequisites (local).** Infra runs in a `kind` cluster the
-dispatcher provisions lazily. Install once per machine:
-
-```bash
-#   https://kind.sigs.k8s.io/docs/user/quick-start/
-#   https://kubernetes.io/docs/tasks/tools/
-```
-
-```bash
-weft infra start         # provision the project's infra, wait for ready
-weft infra status        # per-node status + endpoint URLs
-weft infra stop          # scale to zero (keeps disks)
-weft infra upgrade       # roll a new image/spec (stop + start)
-weft infra terminate     # delete it all
-```
-
-To author your own infra node, see `docs/authoring-nodes.md` (the
-"Infra nodes" section): the typed `InfraSpec`, how to expose endpoints,
-and the `/live` / `/outputs` HTTP contracts.
+- [The Weft language](./weft-lang-guide.md): the full syntax, the type
+  system, groups, loops, triggers.
+- [Authoring nodes](./authoring-nodes.md): everything the `ctx` gives you
+  (buses, storage, secrets, callers, suspensions) and the test rig that
+  proves your node works.
+- [The browser extension](./browser-extension.md): build it, load it, and
+  connect it, so programs can hand tasks to people.
+- [The access system](./access-system.md): how programs connect to external
+  accounts (Slack, Google, email) without secrets ever touching your code.
+- [Event triggers](./event-triggers.md): programs that wake on Slack
+  messages, emails, and schedules instead of HTTP.
 
 ## CLI cheat sheet
 
@@ -284,13 +263,13 @@ weft infra node-terminate <id>        Terminate one infra node (delete its resou
 weft add <git-url>         Install an external node package (phase B).
 ```
 
-## Troubleshooting
+## When something goes wrong
 
 - `dispatcher unreachable`: run `weft daemon start`.
-- `weft-runner not found`: re-run `./setup.sh`; the dispatcher
-  expects `weft-runner` to sit next to its own binary.
-- Port 9999 in use: `WEFT_HTTP_PORT=19999 weft daemon start`, and
-  pass `--dispatcher http://localhost:19999` to every `weft`
-  command (or `export WEFT_DISPATCHER_URL=http://localhost:19999`).
-- `kind` not found: install it. The dispatcher logs an actionable
-  error when the first infra node is provisioned.
+- `weft-runner not found`: re-run `./setup.sh`; the daemon expects
+  `weft-runner` next to its own binary.
+- Port 9999 in use: `WEFT_HTTP_PORT=19999 weft daemon start`, then
+  `export WEFT_DISPATCHER_URL=http://localhost:19999` so every `weft`
+  command finds it.
+- `kind` not found: install it; the daemon prints an actionable error the
+  first time an infra node needs provisioning.

@@ -8,7 +8,6 @@
 //!   claims, and a polling bridge that fans supervisor-emitted
 //!   `infra_event` rows out over SSE.
 //! - Journal (Postgres-backed; `weft-journal` crate).
-//! - Ops dashboard (HTTP + SSE).
 //! - Cost aggregation.
 //!
 //! Does NOT execute user node code. Workers run the user's compiled

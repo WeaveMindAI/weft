@@ -1,14 +1,18 @@
 # Weft
 
-**Agents improvise. Weft orchestrates.**
+**A programming language where an LLM call, a human approval, a database, and a WhatsApp line are the same kind of thing: typed nodes a compiler can check. An AI writes it, you read it as a graph, and it runs as a native Rust binary.**
 
-The bet behind this language: production-ready AI won't be one giant agent left to figure everything out. It'll be a fast, reliable *orchestration* of intelligent pieces, and Weft is the language for writing it.
+```bash
+git clone https://github.com/WeaveMindAI/weft.git && cd weft && ./setup.sh
+```
 
-Right now you have three bad options for building AI software. Agents are flexible but you can't trust them on long work. Custom code can do anything, but no language can actually reason about a system stitched together from LLMs, humans, and APIs, so it turns fragile fast. Zapier-style tools are predictable until step five, then they're spaghetti, you're managing infrastructure by hand, and you're running on a graph some engine walks at runtime, so it crawls and falls over at scale. Every option makes you trade away something you needed.
+Why can't any compiler see the parts of your system that matter most, the LLM calls, the human review steps, the API glue?
 
-Weft is the fourth option. It's a language where LLMs, humans, APIs, databases, and infrastructure are not libraries you import, they're *primitives you wire together*. The compiler reads the whole system, checks every connection and type, then transpiles the whole thing to Rust: your program is a native binary, not a graph being interpreted. No glue code. No plumbing. If it compiles, the architecture holds, and it runs at Rust speed.
+Why does "wait for a person to approve this" take a webhook, a queue, and a state machine instead of one line?
 
-**You own the units of computation. Weft owns the coordination between them, types, time, failure, live messaging, and infrastructure.** That's the whole idea.
+Why did your AI assistant just write ten thousand lines of Python that neither of you can hold in your head?
+
+Every language you can use today was designed before programs had intelligence inside them. Weft is designed after. LLMs, humans, APIs, databases, and infrastructure are its primitives, the way numbers and operators are primitives elsewhere. The compiler reads the whole system, checks every connection and every type, and transpiles it to Rust: a native binary, not a graph crawling through an interpreter.
 
 Here's a real one. A support ticket comes in by email, an LLM triages it, and anything it flags as critical waits for a human before it gets escalated:
 
@@ -44,27 +48,34 @@ alert.data = escalate.value
 
 Read it top to bottom: ticket in, LLM classifies, a human approves the escalation, the gate only lets approved tickets through to the alert. Every edge and every type was checked before a single node ran. The human pause is one node (`HumanQuery`): the program can wait minutes or days for that approval and resume exactly where it left off. Open the same file in the editor and it's a graph you click through and watch execute live.
 
+<!-- CAPTURE: hero image or short GIF right here: the support-ticket example
+     above, shown side by side as code and as its rendered graph in VS Code,
+     ideally mid-execution with one node lit. This is the front door's one
+     visual; it carries the "code for the AI, graph for you" claim. -->
+
 > **Building in public, early days.** The language, the type system, and the durable executor are the stable core. The node catalog is small and opinionated on purpose. Breaking changes will happen while the shape settles, and they'll come with migration notes. Treat this as a foundation to build on, not a finished product.
 
 ## Two layers, one cheap seam
 
-Here's the thing that makes Weft different from everything else, and it's worth slowing down for.
-
-Most tools pick a side. Zapier lets you *compose* pre-built blocks but you can't make new ones. A library lets you *make* primitives but composing them is just... more raw code, with all the plumbing back. Weft is built so the seam between those two worlds is cheap to cross.
+Most tools pick a side. Zapier lets you *compose* pre-built blocks but you can't make new ones. A library lets you *make* primitives but composing them is just more raw code, with all the plumbing back. Weft is built so the seam between those two worlds is cheap to cross, and that seam is what makes it different from everything else.
 
 **The lower layer is vocabulary.** Someone wraps a capability (an LLM call, a Postgres store, a WhatsApp bridge, a NeRF, a niche model, a custom agent) into a *node*: a typed, self-contained building block with clean input and output ports. Hard tech that was painful to use becomes a drop-in. The node carries its own dependencies and infrastructure, so when someone else imports it, it just works.
 
-**The upper layer is composition.** You snap that vocabulary into programs. If the node you need already exists, you use it or import someone else's. If it doesn't, you write one in a few minutes, and now it's vocabulary forever. The catalog compounds: every node added pulls in more builders, who add more nodes.
-
-That's the whole model. Build the words once, write sentences forever.
+**The upper layer is composition.** You snap that vocabulary into programs. If the node you need already exists, you use it or import someone else's. If it doesn't, you write one in a few minutes, and now it's vocabulary forever. The catalog compounds: every node added pulls in more builders, who add more nodes. Build a word once and every sentence after that gets to use it.
 
 ## Built to be written by AI, not learned by humans
 
 People hear "new language" and flinch: nobody wants to learn another syntax. But you don't learn Weft. **It's designed from the ground up to be written by AI and read by you as a graph.**
 
-And the syntax isn't AI-friendly by accident, it's AI-friendly because it's *strict*. Strong typing, top-down construction, and connection-completeness aren't ergonomics, they're a cage. The compiler won't let the AI wire a String into a Number, leave a required input dangling, or send unfiltered user input straight into a model. The AI builds *inside* a structure that's guaranteed sound, instead of improvising the whole thing and hoping. That's the difference between an agent and orchestration: you don't trust the model, you trust the architecture.
+What makes the syntax AI-friendly is that it is *strict*. Strong typing, top-down construction, and connection-completeness form a cage around the model: the compiler won't let it wire a String into a Number, leave a required input dangling, or send unfiltered user input straight into an LLM. The AI builds *inside* a structure that's guaranteed sound, instead of improvising the whole thing and hoping. That's the difference between an agent and orchestration: your trust goes to the architecture, which the compiler checked, rather than to the model's good behavior.
 
 The payoff shows up in build time. In our testing, an AI builds the equivalent system in Weft about **20x faster** than writing it in Python with a coding agent (a customer-feedback triage pipeline went from ~1 hour to ~3 minutes), and the result is a graph you can read, edit, and watch execute live.
+
+## How you actually build with it
+
+You grow the system against a real example instead of writing it from a spec. Take one input that matters to you, build the first step, run it, click the node, and look at the value that actually came out. When that step produces what you want, grow the next one. When the whole chain works end to end, feed it a second example and fix whichever steps break, while the earlier examples keep passing. A few examples in, new inputs just work, and at no point were you guessing: every decision was made looking at a real value on a real run.
+
+We call this way of working **Sequential Diffusion Programming**: the program sharpens pass after pass, the way an image sharpens out of noise, and each pass is anchored to a concrete case. It only became viable now, because an AI pass over a Weft program is fast and cheap enough that refining beats up-front design. The graph view exists for exactly this loop, and when something breaks in production later, the same motion works in reverse: the journal keeps every execution, so you open the failed run, descend the folded groups to the step whose value went wrong, and iterate on that step with the failing case as your new example.
 
 ## What the compiler buys you
 
@@ -73,9 +84,9 @@ Because the whole orchestration is legible (not buried in glue code), the machin
 - **Guarantees before it runs.** The compiler reads the entire architecture. It can flag user input reaching a model with no filter, an output hitting a destructive action with no human review, and it's the place to enforce things like compliance or jailbreak protection, before a single node fires.
 - **Reliable systems from unpredictable parts.** LLMs are unpredictable by nature. You choose how tightly each one is contained, from "acts freely, fast to prototype" to "output bounded and checked." Prototype loose, then lock down the parts that need to be reliable, without losing the intelligence where it matters.
 - **Everything is mockable.** Any node or group can be swapped for "pretend it returns this." Test one step, benchmark it, compare two prompts in isolation. The mock is type-checked against the real ports, so it can't silently drift.
-- **First-class humans.** Pause mid-program, send a form to a person, wait three days, resume exactly where you left off. One node. No webhooks, no polling, no hand-rolled state machine.
+- **First-class humans.** Pause mid-program, send a form to a person, wait three days, resume exactly where you left off. All of that is one node, with no webhooks or polling loops to hand-roll around it.
 - **Durable by default.** Programs survive crashes and restarts. "Wait three days for an approval" is the same code as "wait three seconds for an API response."
-- **The full power of Kubernetes, none of operating it.** Kubernetes already won at coordinating real infrastructure (pods, networking, storage, health, lifecycle). The only thing wrong with it is that wielding it means YAML, operators, and an ops priesthood. Weft puts a tiny typed DSL in front of all that power: a database, a WhatsApp bridge, a headless browser is just a node you drop on the graph and wire up. Hit start and the platform provisions the real pod, waits for it to be healthy, and hands the rest of your program a URL. The same code runs on a local cluster on your laptop and on real Kubernetes in any cloud: one model, no "local vs prod" split. And the defaults are sane, not a ceiling: an expert can drop down to the actual cluster config and tighten it for their use case, because every node's full vocabulary is always there to tweak, no expertise required to start, none lost when you have it.
+- **The full power of Kubernetes without operating it.** Kubernetes already won at coordinating real infrastructure (pods, networking, storage, health, lifecycle). The only thing wrong with it is that wielding it means YAML, operators, and an ops priesthood. Weft puts a tiny typed DSL in front of all that power: a database, a WhatsApp bridge, a headless browser is just a node you drop on the graph and wire up. Hit start and the platform provisions the real pod, waits for it to be healthy, and hands the rest of your program a URL. The same code runs on a local cluster on your laptop and on real Kubernetes in any cloud, with no separate "prod" setup to maintain. The defaults are sane without being a ceiling: an expert can always drop down to the actual cluster config and tighten it, because every node's full vocabulary stays reachable.
 - **Recursively foldable.** Any group of nodes collapses into a single node with a typed interface. A 100-node system still reads as 5 blocks at the top level.
 - **Compiles to native code.** Weft transpiles to Rust, so you get memory safety and real performance, not a slow interpreted graph (the Zapier-clone failure mode) that buckles at scale. The graph is how you read and edit it; the thing that runs is a compiled binary.
 
@@ -89,7 +100,7 @@ cd weft
 ./setup.sh
 ```
 
-One script. It builds and links three binaries into `~/.local/bin`:
+That one script builds and links three binaries into `~/.local/bin`:
 
 - `weft` (the CLI)
 - `weft-dispatcher` (the local runtime daemon)
@@ -97,10 +108,10 @@ One script. It builds and links three binaries into `~/.local/bin`:
 
 It also builds and installs the VS Code extension, which is where the graph editor and live execution view live. If `~/.local/bin` isn't on your `PATH`, the script prints the exact line to add.
 
-Then build your first project:
+The script also leaves the local runtime daemon up and running, so you can go
+straight to your first project:
 
 ```bash
-weft daemon start      # launch the local runtime in the background
 weft new hello         # scaffold a project
 cd hello
 weft run               # compile, register, fire an execution, stream live events

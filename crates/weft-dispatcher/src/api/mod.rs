@@ -7,7 +7,6 @@
 //! - `/executions/*`: execution state queries and control.
 //! - `/events/*`: SSE streams for project and execution state.
 //! - `/signal-token*`: signal-token minting + token-scoped signal access.
-//! - `/dashboard/*`: the ops dashboard UI (static assets + SSE).
 //!
 //! The dispatcher does NO node-aware work: parse, validate, and
 //! catalog introspection are client-side (the CLI reads the project's
@@ -32,7 +31,6 @@ mod events;
 mod provider_events;
 mod signal_token;
 mod signal_token_names;
-mod dashboard;
 mod infra;
 pub(crate) mod signal;
 pub mod access;
@@ -110,9 +108,6 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
             get(signal_token::list_tokens).post(signal_token::mint_token),
         )
         .route("/signal-tokens/{id}", axum::routing::delete(signal_token::revoke_token))
-        .route("/", get(dashboard::serve_root))
-        .route("/dashboard", get(dashboard::serve_root))
-        .route("/dashboard/{*path}", get(dashboard::serve))
         .route("/listener/inspect", get(signal::listener_inspect))
         .route("/images/referenced", get(project::referenced_images))
         // Storage plane: the `weft files` CLI surface (list, usage, download

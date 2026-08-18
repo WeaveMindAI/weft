@@ -914,8 +914,8 @@ pub struct FormFieldSpec {
     #[serde(default)]
     pub label: String,
     /// Default render metadata applied to the field if not
-    /// overridden in the weft source. The dashboard / browser
-    /// extension reads `render.component` (and its sibling flags)
+    /// overridden in the weft source. The browser extension reads
+    /// `render.component` (and its sibling flags)
     /// to pick a UI primitive without knowing field-type strings.
     pub render: FormFieldRender,
     /// Config keys the form_builder editor must collect when the

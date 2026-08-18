@@ -506,3 +506,21 @@ and free-typing already unblocks every model today.
 [Update Notice Warning] If we touch the remote_select widget, the
 Lookup shape, or split the LLM provider nodes per capability, revisit
 this entry.
+
+## Suspendable live channels (bus + generator)
+
+**What.** A live channel (a `Bus`, and once implemented a
+`Generator[T]` stream, see `docs/generator-design.md`) is pinned to
+one worker: both endpoints must stay co-alive, and `await_signal` is
+forbidden while the channel is open. Make these channels survive
+suspension and worker death: journal enough of the channel state that
+a fresh worker can resume both endpoints mid-stream.
+
+**Why deferred.** Durable mid-stream resume needs a replay story for
+partially-consumed streams (which yields were delivered, which pulls
+were answered) and interacts with the deterministic-replay rule.
+Design it after Generator[T] lands in its non-durable form; the
+no-suspension-while-open rule keeps the gap honest until then.
+
+[Update Notice Warning] If we touch the BusCoordinator, implement
+Generator[T], or rework await_signal journaling, revisit this entry.
