@@ -166,6 +166,18 @@ Port types the compiler understands:
   nodes. A `Bus` output connects only to a `Bus` input; message payloads are
   not type-checked by the language. Wired-only: the value is a live runtime
   handle, never a config literal.
+- **`Generator[T]`**: a typed, one-directional, terminating stream. The port
+  accepts being emitted into repeatedly: the producer's `pulse_downstream` on
+  a `Generator[T]` output is a yield, each emission one item checked against
+  `T`, with the producer's own state living in plain Rust locals across all
+  of them. The consumer fires ONCE on the first item and pulls the rest in
+  its own code (or a `Loop` names the port in `over` and pulls one item per
+  iteration); the stream ends when the producer's body returns. Exactly one
+  producer feeds exactly one consumer (a stream has one taker; to broadcast,
+  use a `Bus`), the stream cannot cross a group boundary, sit inside a
+  container, or be carried between loop iterations, and it takes no literal.
+  Use `Generator[T]` when items should flow as they are produced; a
+  `List[T]` is the right port when the whole collection exists up front.
 - **`Access`**: the authorized ability to call a third-party service, the
   value emitted by a node that holds a connection to that service. One
   general type for every service (wiring the wrong service's access fails
@@ -338,6 +350,27 @@ The five base shapes:
 
 For a count-based loop ("run N times"), feed a `Range` catalog node into a map
 loop's `over` input.
+
+`over` dispatches on the port's type. On a `List[T]` port it is the iteration
+above: the count is known up front. On a `Generator[T]` port the loop PULLS
+the stream: a sequential loop takes the next item once the previous iteration
+finished, a parallel loop launches a lane per arriving item, and "over
+exhausted" means "the stream ended". A stream in `over` must be the only over
+port (a loop iterates one stream at a time), and a `Generator` input on a
+loop is only legal AS the over port (a stream cannot broadcast into the
+body). A loop over a stream whose producer failed fails loudly instead of
+gathering a list that looks complete but is truncated. A producer that runs
+ahead of its consumer may buffer up to a cap of un-taken items it declares in
+its own code (4096 by default) before its next emission fails.
+
+One edge to know when pairing a stream with a loop that can stop early (a
+`self.done` vote or a `max_iters` cap): a producer that yields in lock step
+(`yield_downstream`) is parked on each item until it is taken, so the item it
+is holding when the loop terminates can never be taken, and that producer
+fails loudly, failing the execution. When the CONSUMER decides how much of
+the stream to use, the producer must either emit fire-and-forget
+(`pulse_downstream`, whose leftover items are simply dropped when the loop
+ends) or be the side that decides when to stop.
 
 ### A loop is a wrapper, not a lifecycle owner
 

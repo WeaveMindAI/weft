@@ -329,6 +329,14 @@ pub fn merge_package_defaults(
 }
 
 impl NodeMetadata {
+    /// Whether this node consumes a stream: any input whose declared
+    /// type is a `Generator` (aliases peel). THE one spelling of the
+    /// question for manifest-driven callers (both node-test rigs), so
+    /// the definition cannot drift between them.
+    pub fn has_generator_input(&self) -> bool {
+        self.inputs.iter().any(|p| p.input_type.as_generator().is_some())
+    }
+
     /// Parse a compile-time-embedded `metadata.json`, merging the package
     /// root's partial defaults (`defaults_json`, the sibling package
     /// `metadata.json` when the node is a package member; `None` for a bare

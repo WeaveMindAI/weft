@@ -144,7 +144,9 @@
 		// here is a TS compile error, not a silent blank line.
 		switch (ev.kind) {
 			case 'instantiated':
-				return `instantiated (${ev.parallel ? 'parallel' : 'sequential'}, ${ev.iterCount} iterations planned)`;
+				return `instantiated (${ev.parallel ? 'parallel' : 'sequential'}, ${
+					ev.iterCap === null ? 'uncapped' : `cap ${ev.iterCap}`
+				})`;
 			case 'iteration_launched':
 				return `iter ${ev.index} launched`;
 			case 'out_fired': {

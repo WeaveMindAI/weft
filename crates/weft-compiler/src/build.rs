@@ -65,16 +65,10 @@ pub struct StagedImageBuild {
 /// runtime, no custom template), the build context omits `weft/`
 /// because the engine workspace already lives inside the base
 /// image at `/weft/`.
-///
-/// `_release` is currently unused because cargo invocation moved
-/// into the builder image, which always builds release. Kept on
-/// the signature so future debug/release mode selection doesn't
-/// require another plumbing pass.
 pub fn build_project(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
-    _release: bool,
     builder_base_tag: &str,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();

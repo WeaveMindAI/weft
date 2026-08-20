@@ -546,12 +546,12 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
             color, source_node, target_node, value, closed, ..
         } => sniff_bus_participants(*color, &project_id, source_node, target_node, value, *closed),
         ExecEvent::LoopInstantiated {
-            color, group_id, parent_frames, iter_count, parallel, ..
+            color, group_id, parent_frames, iter_cap, parallel, ..
         } => vec![DispatcherEvent::LoopInstantiated {
             color: *color, project_id,
             group_id: group_id.clone(),
             parent_frames: parent_frames.clone(),
-            iter_count: *iter_count,
+            iter_cap: *iter_cap,
             parallel: *parallel,
         }],
         ExecEvent::LoopIterationLaunched {

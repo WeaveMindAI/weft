@@ -812,8 +812,14 @@ impl FakeRig {
     /// manifest (declared inputs/outputs) + `inputs` (a JSON object of
     /// input name -> value), capture everything it emits.
     pub async fn run(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
-        let (handle, ctx) = match self.build_ctx(node, inputs) {
-            Ok(pair) => pair,
+        // `_feeds_alive` is LOAD-BEARING despite never being read: it
+        // OWNS the run's generator feeds (the registry keeps only a
+        // `Weak`, so these `Arc`s are what keep the markers
+        // resolvable) and unregisters them when the body returns.
+        // Binding it bare `_` would drop it immediately and every
+        // `ctx.inputs.get::<Generator<T>>` read would fail "not live".
+        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, inputs) {
+            Ok(triple) => triple,
             Err(e) => {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
@@ -832,13 +838,14 @@ impl FakeRig {
             closed_ports: Vec::new(),
             infra_spec: None,
         };
-        let bag = match manifest_input_bag(node.manifest(), inputs) {
-            Ok(bag) => bag,
+        // Keeps the run's generator feeds registered (see `run`).
+        let (bag, _feeds_alive) = match manifest_input_bag(node.manifest(), inputs) {
+            Ok(pair) => pair,
             Err(e) => return RunOutcome { result: Err(e), ..empty() },
         };
         let ictx = crate::infra::InfraProvisionContext::new(
             "node-test-project".to_string(),
-            "node-under-test".to_string(),
+            NODE_UNDER_TEST_ID.to_string(),
             "wft-project-node-test".to_string(),
             "node-test".to_string(),
         );
@@ -851,8 +858,9 @@ impl FakeRig {
     /// Run the node's `setup_trigger` body (a trigger registering its
     /// wake signal). Assert on [`Self::registered_signals`] after.
     pub async fn run_setup_trigger(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
-        let (handle, ctx) = match self.build_ctx(node, inputs) {
-            Ok(pair) => pair,
+        // Keeps the run's generator feeds registered (see `run`).
+        let (handle, ctx, _feeds_alive) = match self.build_ctx(node, inputs) {
+            Ok(triple) => triple,
             Err(e) => {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
@@ -865,9 +873,9 @@ impl FakeRig {
         &self,
         node: &dyn Node,
         inputs: Value,
-    ) -> WeftResult<(CaptureBox, ExecutionContext)> {
+    ) -> WeftResult<(CaptureBox, ExecutionContext, RegisteredFeeds)> {
         let manifest = node.manifest();
-        let bag = manifest_input_bag(manifest, inputs)?;
+        let (bag, feeds) = manifest_input_bag(manifest, inputs)?;
         let wake = self.state.wake.lock().unwrap().take();
         // Declared overrides play the compiler's role for MustOverride
         // ports; concrete metadata types stand as-is.
@@ -879,10 +887,11 @@ impl FakeRig {
             state: self.state.clone(),
             capture: Capture::new(outputs),
             wake,
+            has_generator_input: manifest.has_generator_input(),
             run_step_index: AtomicU32::new(0),
         });
         let ctx = test_context(manifest, bag, handle.clone());
-        Ok((CaptureBox::Fake(handle), ctx))
+        Ok((CaptureBox::Fake(handle), ctx, feeds))
     }
 
     /// Seed a stored file and get its stored-file value, to place on a
@@ -1000,17 +1009,50 @@ impl Default for FakeRig {
 /// inputs, and the manifest's input names become the spec-name set so
 /// `ctx.inputs.custom()` behaves. Tests hand values in engine shape
 /// (an access input carries a marker built by `rig.access(..)`).
-fn manifest_input_bag(manifest: &NodeMetadata, inputs: Value) -> WeftResult<ValueBag> {
+fn manifest_input_bag(
+    manifest: &NodeMetadata,
+    inputs: Value,
+) -> WeftResult<(ValueBag, RegisteredFeeds)> {
     let Value::Object(mut delivered) = inputs else {
         return Err(WeftError::Input(format!(
             "test inputs must be a JSON object of input name -> value, got: {inputs}"
         )));
     };
+    let mut feeds = RegisteredFeeds(Vec::new());
     for input in &manifest.inputs {
         if let Some(default) = &input.default {
             delivered
                 .entry(input.name.clone())
                 .or_insert_with(|| default.clone());
+        }
+        // A `Generator[T]` input takes its test value as a plain ARRAY
+        // of items: the rig plays the engine's role, pre-loading a live
+        // feed with the items (stream already finished) and placing the
+        // handle marker in the bag, so the node's
+        // `ctx.inputs.get::<Generator<T>>` pull loop runs unmodified.
+        if input.input_type.as_generator().is_some() {
+            if let Some(v) = delivered.get(&input.name) {
+                let Some(items) = v.as_array().cloned() else {
+                    return Err(WeftError::Input(format!(
+                        "test input '{}' feeds a Generator port: pass the items as a JSON \
+                         array (got: {v})",
+                        input.name
+                    )));
+                };
+                let feed = crate::generator::GeneratorFeed::new(
+                    input.name.clone(),
+                    crate::liveness::no_liveness(),
+                    None,
+                    Box::new(|_| {}),
+                );
+                for item in items {
+                    feed.push(uuid::Uuid::new_v4(), item)?;
+                }
+                feed.close(crate::generator::StreamEnd::Finished);
+                let id = crate::generator::register_feed(&feed);
+                feeds.0.push((id, feed));
+                delivered.insert(input.name.clone(), crate::generator::generator_marker(id));
+            }
         }
         // The same requiresScopes/requiresValues stamping the
         // production bag build applies, so the fake's open sees what
@@ -1023,7 +1065,22 @@ fn manifest_input_bag(manifest: &NodeMetadata, inputs: Value) -> WeftResult<Valu
         );
     }
     let spec_names = manifest.inputs.iter().map(|i| i.name.clone()).collect();
-    Ok(ValueBag::inputs(delivered, spec_names))
+    Ok((ValueBag::inputs(delivered, spec_names), feeds))
+}
+
+/// The generator-feed registrations one rig run installed. OWNS the
+/// feeds (the registry keeps only a `Weak`, so these `Arc`s are what
+/// keep the markers resolvable while the body runs) and unregisters
+/// them on drop (every exit path, panics included), so the
+/// process-wide feed registry never accumulates dead test feeds.
+struct RegisteredFeeds(Vec<(uuid::Uuid, Arc<crate::generator::GeneratorFeed>)>);
+
+impl Drop for RegisteredFeeds {
+    fn drop(&mut self) {
+        for (id, _) in self.0.drain(..) {
+            crate::generator::unregister_feed(id);
+        }
+    }
 }
 
 fn declared_output_map(manifest: &NodeMetadata) -> HashMap<String, WeftType> {
@@ -1044,7 +1101,7 @@ fn test_context(
     ExecutionContext::new(
         format!("node-test-{}", uuid::Uuid::new_v4().simple()),
         "node-test".to_string(),
-        "node-under-test".to_string(),
+        NODE_UNDER_TEST_ID.to_string(),
         manifest.node_type.clone(),
         None,
         crate::Color::new_v4(),
@@ -1061,21 +1118,36 @@ fn test_context(
 struct Capture {
     declared: HashMap<String, WeftType>,
     outputs: Mutex<serde_json::Map<String, Value>>,
+    /// Items emitted on `Generator[T]` ports, in order. Folded into
+    /// `outputs` as one JSON array per port at outcome time, so a test
+    /// asserts the whole yielded sequence with the plain
+    /// `outcome.output(port)` read.
+    stream_outputs: Mutex<HashMap<String, Vec<Value>>>,
     closed_ports: Mutex<Vec<String>>,
 }
 
 impl Capture {
     fn new(declared: HashMap<String, WeftType>) -> Self {
-        Self { declared, outputs: Mutex::new(Default::default()), closed_ports: Mutex::new(Vec::new()) }
+        Self {
+            declared,
+            outputs: Mutex::new(Default::default()),
+            stream_outputs: Mutex::new(HashMap::new()),
+            closed_ports: Mutex::new(Vec::new()),
+        }
     }
 
+    // `pulse_downstream` and `yield_downstream` capture identically:
+    // the harness consumes every yield instantly, so a delivered yield
+    // resolves at once and a plain one has nothing left un-taken.
     fn pulse(&self, output: NodeOutput) -> WeftResult<()> {
         let mut recorded = self.outputs.lock().unwrap();
+        let mut streams = self.stream_outputs.lock().unwrap();
         let closed = self.closed_ports.lock().unwrap();
         // Gate order mirrors production's `pulse_downstream`: all
-        // ports declared, then the one-emission-per-port claim, then
-        // the runtime output-type check, so a multi-fault emission
-        // errors on the same gate here and there.
+        // ports declared, then the one-emission-per-port claim
+        // (generator ports accept repeats, but never past a close),
+        // then the runtime output-type check, so a multi-fault
+        // emission errors on the same gate here and there.
         for (port, _) in &output.outputs {
             if !self.declared.contains_key(port) {
                 return Err(WeftError::NodeExecution(format!(
@@ -1085,7 +1157,18 @@ impl Capture {
             }
         }
         for (port, _) in &output.outputs {
-            if recorded.contains_key(port) || closed.iter().any(|p| p == port) {
+            let is_generator = self.declared[port].as_generator().is_some();
+            if closed.iter().any(|p| p == port) {
+                return Err(WeftError::NodeExecution(if is_generator {
+                    format!("the node yielded on stream port '{port}' after closing it")
+                } else {
+                    format!(
+                        "the node touched output port '{port}' twice in one firing; each \
+                         port can be emitted or closed at most once"
+                    )
+                }));
+            }
+            if !is_generator && recorded.contains_key(port) {
                 return Err(WeftError::NodeExecution(format!(
                     "the node touched output port '{port}' twice in one firing; each port \
                      can be emitted or closed at most once"
@@ -1097,8 +1180,10 @@ impl Capture {
         // delivers the rest of the emission; the rig fails the run
         // instead, because a test exists precisely to surface that
         // silent degradation. Do not "fix" this back to a mirror.
+        // Generator ports check each ITEM against the element type,
+        // the same per-item gate production applies.
         for (port, value) in &output.outputs {
-            let declared = &self.declared[port];
+            let declared = self.declared[port].port_value_type();
             if !declared.accepts_runtime_value(value) {
                 return Err(WeftError::NodeExecution(format!(
                     "the node emitted a value on port '{port}' that its declared type \
@@ -1107,8 +1192,21 @@ impl Capture {
                 )));
             }
         }
+        // No buffer-overrun check here, on purpose: production's cap
+        // (`check_generator_buffer_cap`) counts UN-TAKEN items, and in
+        // a node test the harness is the consumer and takes every
+        // yield instantly, so that count is honestly always zero. A
+        // lifetime counter would falsely fail any high-volume
+        // fire-and-forget producer that runs fine behind a keeping-up
+        // consumer. The overrun contract is pinned at the engine layer
+        // instead (execution_driver_tests/stream.rs, deterministic
+        // gated-consumer constructions).
         for (port, value) in output.outputs {
-            recorded.insert(port, value);
+            if self.declared[&port].as_generator().is_some() {
+                streams.entry(port).or_default().push(value);
+            } else {
+                recorded.insert(port, value);
+            }
         }
         Ok(())
     }
@@ -1121,20 +1219,68 @@ impl Capture {
         }
         let recorded = self.outputs.lock().unwrap();
         let mut closed = self.closed_ports.lock().unwrap();
-        if recorded.contains_key(port) || closed.iter().any(|p| p == port) {
+        // A generator port closes AFTER its yields (that IS the early
+        // end-of-stream verb); only a second close is a bug. Every
+        // other port keeps the one-touch rule.
+        let is_generator = self.declared[port].as_generator().is_some();
+        if closed.iter().any(|p| p == port)
+            || (!is_generator && recorded.contains_key(port))
+        {
             return Err(WeftError::NodeExecution(format!(
                 "the node touched output port '{port}' twice in one firing; each port can \
-                 be emitted or closed at most once"
+                 be emitted or closed at most once (a stream port may yield then close once)"
             )));
         }
         closed.push(port.to_string());
         Ok(())
     }
 
+    /// Whether the body has touched (emitted or closed) any output
+    /// port yet, mirroring production's port-claims "mentioned" set
+    /// for the `await_signal` guard (a touch-then-durable-suspend
+    /// would touch again on replay).
+    fn has_mentioned_a_port(&self) -> bool {
+        !self.outputs.lock().unwrap().is_empty()
+            || !self.stream_outputs.lock().unwrap().is_empty()
+            || !self.closed_ports.lock().unwrap().is_empty()
+    }
+
+    /// Same ARGUMENT validation production applies (a declared
+    /// generator output, a cap above zero). The cap itself is not
+    /// enforced in a node test: the harness consumes every yield
+    /// instantly, so nothing is ever un-taken (see `pulse`).
+    fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
+        if !self.declared.get(port).is_some_and(|t| t.as_generator().is_some()) {
+            return Err(WeftError::NodeExecution(format!(
+                "set_max_buffered_items on '{port}', which is not a Generator output of \
+                 this node"
+            )));
+        }
+        if items == 0 {
+            return Err(WeftError::NodeExecution(
+                "set_max_buffered_items(0): a cap of 0 could never accept even the first \
+                 item"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn into_outcome(self, result: WeftResult<()>) -> RunOutcome {
+        let mut outputs = self.outputs.into_inner().unwrap();
+        let mut streams = self.stream_outputs.into_inner().unwrap();
+        // EVERY declared generator output lands in the outcome as one
+        // array, a stream that yielded nothing included: a test asserts
+        // the whole yielded sequence, and "no entry" would make an
+        // empty stream indistinguishable from a port that isn't one.
+        for (port, ty) in &self.declared {
+            if ty.as_generator().is_some() {
+                outputs.insert(port.clone(), Value::Array(streams.remove(port).unwrap_or_default()));
+            }
+        }
         RunOutcome {
             result,
-            outputs: self.outputs.into_inner().unwrap(),
+            outputs,
             closed_ports: self.closed_ports.into_inner().unwrap(),
             infra_spec: None,
         }
@@ -1183,6 +1329,9 @@ struct TestHandle {
     state: Arc<FakeState>,
     capture: Capture,
     wake: Option<Value>,
+    /// Whether the node under test declares a Generator input, so the
+    /// rig refuses `await_signal` exactly where an execution would.
+    has_generator_input: bool,
     /// `ctx.run` memo-step counter. There is no journal here, so every
     /// step is fresh; the counter only keeps the call/record indices
     /// aligned with the trait contract.
@@ -1199,6 +1348,19 @@ impl ContextHandle for TestHandle {
     }
 
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
+        // Same refusals as the production handle, in production's
+        // order: a green node test on a body an execution would refuse
+        // is the costly divergence.
+        if self.capture.has_mentioned_a_port() {
+            return Err(WeftError::NodeExecution(
+                crate::context::emitted_then_await_signal_error(NODE_UNDER_TEST_ID),
+            ));
+        }
+        if self.has_generator_input {
+            return Err(WeftError::NodeExecution(
+                crate::context::stream_consumer_await_signal_error(NODE_UNDER_TEST_ID),
+            ));
+        }
         self.state.signals.lock().unwrap().pop_front().ok_or_else(|| {
             WeftError::Config(format!(
                 "the node awaited a '{}' signal but the test declared no payload for it; \
@@ -1304,8 +1466,16 @@ impl ContextHandle for TestHandle {
         &self.capture.declared
     }
 
-    async fn pulse_downstream(&self, output: NodeOutput) -> WeftResult<()> {
+    async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
+        // No downstream graph in a rig run: the harness is the
+        // consumer and takes every yield instantly, so a delivery-
+        // waiting emission resolves immediately and a plain one leaves
+        // nothing un-taken.
         self.capture.pulse(output)
+    }
+
+    fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
+        self.capture.set_max_buffered_items(port, items)
     }
 
     async fn close_port(&self, port: &str) -> WeftResult<()> {
@@ -1617,14 +1787,42 @@ impl reqwest_middleware::Middleware for CannedAnswerMiddleware {
 
 // ----- The live rig ---------------------------------------------------
 
-/// Builds the production `ContextHandle` for one node under test,
-/// from the node's type name and its declared output map. The runtime
-/// composes it (broker clients, throwaway execution identity, no-op
-/// journal) and hands it to the runner; weft-core only names the seam
-/// so [`NodeTest`] can be declared without depending on the runtime
+/// Which actor a live-rig handle serves. STATED by the caller, never
+/// inferred from the node-type string: the role decides the handle's
+/// firing identity (the node under test vs the harness), which the
+/// runtime's parked-body watchdog and error attribution key on, and a
+/// node type that merely LOOKS like a harness sentinel must not be
+/// misfiled.
+pub enum HandleRole<'a> {
+    /// The node body under test.
+    NodeUnderTest { node_type: &'a str },
+    /// A harness-side helper (a bus/storage/connect seed the TEST CODE
+    /// drives, not the body).
+    Harness { node_type: &'static str },
+}
+
+/// The firing id every [`HandleRole::NodeUnderTest`] handle runs as.
+/// One definition: the runtime's parked-body watchdog keys its
+/// in-flight set on exactly this id, and the rigs' error messages name
+/// it, so a drifted copy would silently blind the watchdog.
+pub const NODE_UNDER_TEST_ID: &str = "node-under-test";
+
+/// The firing id every [`HandleRole::Harness`] handle runs as, keeping
+/// the test code's own waits out of the watchdog's picture.
+pub const NODE_TEST_HARNESS_ID: &str = "node-test-harness";
+
+/// Builds the production `ContextHandle` for one live-rig actor, from
+/// its role, its declared output map, and whether it declares a
+/// Generator input (so the production `await_signal` guard applies in
+/// a live test exactly as in an execution). The runtime composes it
+/// (broker clients, throwaway execution identity, no-op journal) and
+/// hands it to the runner; weft-core only names the seam so
+/// [`NodeTest`] can be declared without depending on the runtime
 /// crate.
 pub type LiveHandleFactory = Arc<
-    dyn Fn(&str, HashMap<String, WeftType>) -> WeftResult<Arc<dyn ContextHandle>> + Send + Sync,
+    dyn Fn(HandleRole<'_>, HashMap<String, WeftType>, bool) -> WeftResult<Arc<dyn ContextHandle>>
+        + Send
+        + Sync,
 >;
 
 /// The live-tier harness handle: same surface shape as [`FakeRig`],
@@ -1687,7 +1885,11 @@ impl LiveRig {
         bytes: impl Into<Vec<u8>>,
     ) -> WeftResult<Value> {
         // A storage seed emits nothing, so it declares no outputs.
-        let handle = (self.factory)("NodeTestStorageSeed", HashMap::new())?;
+        let handle = (self.factory)(
+            HandleRole::Harness { node_type: "NodeTestStorageSeed" },
+            HashMap::new(),
+            false,
+        )?;
         handle
             .storage_put(
                 &crate::storage::StorageScope::Execution,
@@ -1712,7 +1914,11 @@ impl LiveRig {
     pub async fn connect(&self) -> WeftResult<OpenedConnection> {
         // A setup/teardown connection emits nothing, so its handle
         // declares no outputs.
-        let handle = (self.factory)("NodeTestConnect", HashMap::new())?;
+        let handle = (self.factory)(
+            HandleRole::Harness { node_type: "NodeTestConnect" },
+            HashMap::new(),
+            false,
+        )?;
         handle
             .open_connection(&self.access, crate::context::DEFAULT_PROVIDER_WINDOW)
             .await
@@ -1730,7 +1936,11 @@ impl LiveRig {
         opts: crate::bus::BusOptions,
     ) -> WeftResult<(crate::bus::BusHandle, Value)> {
         // A bus seed emits nothing, so its handle declares no outputs.
-        let handle = (self.factory)("NodeTestBusSeed", HashMap::new())?;
+        let handle = (self.factory)(
+            HandleRole::Harness { node_type: "NodeTestBusSeed" },
+            HashMap::new(),
+            false,
+        )?;
         handle.create_bus(opts)
     }
 
@@ -1739,13 +1949,20 @@ impl LiveRig {
     /// in a node test, so pulses are recorded, not routed).
     pub async fn run(&self, node: &dyn Node, inputs: Value) -> RunOutcome {
         let manifest = node.manifest();
-        let bag = match manifest_input_bag(manifest, inputs) {
-            Ok(bag) => bag,
+        // Keeps the run's generator feeds registered (see the fake
+        // rig's `run` for why this binding must outlive the body).
+        let (bag, _feeds_alive) = match manifest_input_bag(manifest, inputs) {
+            Ok(pair) => pair,
             Err(e) => {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
             }
         };
-        let inner = match (self.factory)(&manifest.node_type, declared_output_map(manifest)) {
+        let has_generator_input = manifest.has_generator_input();
+        let inner = match (self.factory)(
+            HandleRole::NodeUnderTest { node_type: &manifest.node_type },
+            declared_output_map(manifest),
+            has_generator_input,
+        ) {
             Ok(handle) => handle,
             Err(e) => {
                 return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
@@ -1774,6 +1991,14 @@ struct CapturingHandle {
 #[async_trait::async_trait]
 impl ContextHandle for CapturingHandle {
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
+        // Emissions are captured HERE, so the inner production
+        // handle's own emitted-then-suspend guard never sees them;
+        // apply it at the capture layer where the truth lives.
+        if self.capture.has_mentioned_a_port() {
+            return Err(WeftError::NodeExecution(
+                crate::context::emitted_then_await_signal_error(NODE_UNDER_TEST_ID),
+            ));
+        }
         self.inner.await_signal(spec).await
     }
 
@@ -1831,8 +2056,14 @@ impl ContextHandle for CapturingHandle {
         &self.capture.declared
     }
 
-    async fn pulse_downstream(&self, output: NodeOutput) -> WeftResult<()> {
+    async fn pulse_downstream(&self, output: NodeOutput, _wait_delivered: bool) -> WeftResult<()> {
+        // Same stance as the fake handle: the harness takes every
+        // yield instantly, so a delivery wait resolves immediately.
         self.capture.pulse(output)
+    }
+
+    fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
+        self.capture.set_max_buffered_items(port, items)
     }
 
     async fn close_port(&self, port: &str) -> WeftResult<()> {
@@ -2234,6 +2465,121 @@ mod tests {
         assert!(err.contains("declared no payload"), "{err}");
     }
 
+    /// A stream-consuming test node: drains its `rows` stream and
+    /// emits the gathered items, or (when `awaits`) calls
+    /// `await_signal` instead, which the rig must refuse.
+    struct StreamConsumerNode {
+        awaits: bool,
+    }
+    impl crate::node::NodeManifest for StreamConsumerNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            MANIFEST.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "RigStreamConsumer",
+                    "label": "Rig stream consumer",
+                    "description": "test-only stream consumer",
+                    "inputs": [
+                        {"name": "rows", "type": "Generator[Number]", "required": true}
+                    ],
+                    "outputs": [{"name": "reply", "type": "JsonDict"}]
+                }))
+                .expect("stream consumer manifest")
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for StreamConsumerNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            if self.awaits {
+                ctx.await_signal(crate::signal::timer::Timer {
+                    spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
+                })
+                .await?;
+                return Ok(());
+            }
+            let rows = ctx.inputs.get::<crate::generator::Generator<f64>>("rows")?;
+            let mut taken = Vec::new();
+            while let Some(n) = rows.next().await? {
+                taken.push(n);
+            }
+            ctx.pulse_downstream(NodeOutput::new().set("reply", json!({ "taken": taken })))
+                .await
+        }
+    }
+
+    /// The acceptance test for the rig's generator-input path: the
+    /// seeded array becomes a LIVE feed the body's pull loop drains
+    /// (the marker must stay resolvable for the whole run).
+    #[tokio::test]
+    async fn a_generator_input_feeds_the_bodys_pull_loop() {
+        let rig = FakeRig::new();
+        let outcome = rig
+            .run(&StreamConsumerNode { awaits: false }, json!({"rows": [1, 2, 3]}))
+            .await
+            .ok()
+            .expect("the consumer drains the seeded stream");
+        assert_eq!(outcome.outputs["reply"], json!({"taken": [1.0, 2.0, 3.0]}));
+    }
+
+    /// A stream consumer's `await_signal` is refused with the exact
+    /// production error, whatever the signal queue holds.
+    #[tokio::test]
+    async fn a_stream_consumers_await_signal_is_refused() {
+        let rig = FakeRig::new();
+        rig.signal(json!({"answer": 42}));
+        let err = rig
+            .run(&StreamConsumerNode { awaits: true }, json!({"rows": [1]}))
+            .await
+            .result
+            .expect_err("a stream consumer cannot durably suspend")
+            .to_string();
+        assert!(
+            err.contains(&crate::context::stream_consumer_await_signal_error(
+                NODE_UNDER_TEST_ID
+            )),
+            "{err}"
+        );
+    }
+
+    /// A body that emits then awaits is refused with the exact
+    /// production error (a durable suspension would re-emit on replay).
+    struct EmitThenAwaitNode;
+    impl crate::node::NodeManifest for EmitThenAwaitNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for EmitThenAwaitNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            ctx.pulse_downstream(NodeOutput::new().set("done", json!(true))).await?;
+            ctx.await_signal(crate::signal::timer::Timer {
+                spec: crate::signal::timer::TimerSpec::After { duration_ms: 1 },
+            })
+            .await?;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_emit_then_await_is_refused_like_production() {
+        let rig = FakeRig::new();
+        rig.signal(json!({"answer": 42}));
+        let err = rig
+            .run(&EmitThenAwaitNode, json!({}))
+            .await
+            .result
+            .expect_err("emit-then-durable-suspend would re-emit on replay")
+            .to_string();
+        assert!(
+            err.contains(&crate::context::emitted_then_await_signal_error(
+                NODE_UNDER_TEST_ID
+            )),
+            "{err}"
+        );
+    }
+
     struct WakeEchoNode;
     impl crate::node::NodeManifest for WakeEchoNode {
         fn manifest(&self) -> &'static NodeMetadata {
@@ -2338,7 +2684,7 @@ mod tests {
         assert!(err.contains("basic-tier, not fake"), "{err}");
         let err = basic
             .run_live(LiveRig::new(
-                Arc::new(|_, _| Err(WeftError::Config("unused".into()))),
+                Arc::new(|_, _, _| Err(WeftError::Config("unused".into()))),
                 Access::new("c", "svc", None),
             ))
             .await

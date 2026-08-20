@@ -76,8 +76,8 @@
         //   body.out -> loop__out.results (inside-in T?)
         //   loop__out.results (outer-out List[String | Null]) -> consumer.data
         let group_id = "myloop".to_string();
-        let loop_in_id = format!("{group_id}__in");
-        let loop_out_id = format!("{group_id}__out");
+        let loop_in_id = weft_core::project::boundary_in_id(&group_id);
+        let loop_out_id = weft_core::project::boundary_out_id(&group_id);
         let body_id = "body".to_string();
         let consumer_id = "consumer".to_string();
 
@@ -309,9 +309,17 @@
             pulse_ids: Vec::new(),
             error: None,
         };
-        handle_loop_boundary_firing(loop_in, &group, &lp.project, &edge_idx, pulses, journal, "test-pod", rt)
-            .await
-            .expect("LoopIn firing");
+        // The rig asserts on pulses + runtime state; the stream runtime
+        // is throwaway plumbing here (no stream loops in these
+        // fixtures).
+        let mut stream_rt =
+            crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
+        handle_loop_boundary_firing(
+            loop_in, &group, &lp.project, &edge_idx, pulses, journal,
+            "test-pod", rt, &mut stream_rt,
+        )
+        .await
+        .expect("LoopIn firing");
     }
 
     /// Helper: fire LoopOut for iteration `i` with the given writes.
@@ -335,9 +343,14 @@
             pulse_ids: Vec::new(),
             error: None,
         };
-        handle_loop_boundary_firing(loop_out, &group, &lp.project, &edge_idx, pulses, journal, "test-pod", rt)
-            .await
-            .expect("LoopOut firing");
+        let mut stream_rt =
+            crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
+        handle_loop_boundary_firing(
+            loop_out, &group, &lp.project, &edge_idx, pulses, journal,
+            "test-pod", rt, &mut stream_rt,
+        )
+        .await
+        .expect("LoopOut firing");
     }
 
     /// Layer-3 rig 1: parallel-map LoopIn fires per-iteration body pulses
@@ -738,10 +751,10 @@
             "BTreeMap-driven assembly preserves input order: {:?}", data[0].value);
     }
 
-    /// Layer-3 rig 9: compute_loop_iter_count zip-trim behavior with two
+    /// Layer-3 rig 9: compute_loop_iter_cap zip-trim behavior with two
     /// `over` ports of different lengths.
     #[test]
-    fn compute_iter_count_trims_to_shortest_with_trim_on() {
+    fn compute_iter_cap_trims_to_shortest_with_trim_on() {
         use crate::loop_runtime::LoopConfig;
         let cfg = LoopConfig {
             parallel: true,
@@ -753,14 +766,14 @@
         let input: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
             serde_json::json!({"a": [1, 2, 3, 4, 5], "b": [10, 20, 30]})
         ).unwrap();
-        let count = compute_loop_iter_count(&cfg, &input).expect("ok");
+        let count = compute_loop_iter_cap(&cfg, &input).expect("ok");
         assert_eq!(count, 3, "trims to shortest: {count}");
     }
 
-    /// Layer-3 rig 10: compute_loop_iter_count panics loud with
-    /// trim_on_mismatch=false and unequal lengths.
+    /// Layer-3 rig 10: compute_loop_iter_cap refuses a length mismatch
+    /// with trim_on_mismatch=false (a loud Err, no silent trim).
     #[test]
-    fn compute_iter_count_rejects_mismatch_with_trim_off() {
+    fn compute_iter_cap_rejects_mismatch_with_trim_off() {
         use crate::loop_runtime::LoopConfig;
         let cfg = LoopConfig {
             parallel: true,
@@ -772,13 +785,13 @@
         let input: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
             serde_json::json!({"a": [1, 2, 3], "b": [10, 20]})
         ).unwrap();
-        let err = compute_loop_iter_count(&cfg, &input).expect_err("must err on mismatch");
+        let err = compute_loop_iter_cap(&cfg, &input).expect_err("must err on mismatch");
         assert!(err.contains("mismatch"), "loud mismatch error: {err}");
     }
 
-    /// Layer-3 rig 11: max_iters cap applies in compute_iter_count.
+    /// Layer-3 rig 11: max_iters cap applies in compute_iter_cap.
     #[test]
-    fn compute_iter_count_caps_at_max_iters() {
+    fn compute_iter_cap_caps_at_max_iters() {
         use crate::loop_runtime::LoopConfig;
         let cfg = LoopConfig {
             parallel: true,
@@ -790,7 +803,7 @@
         let input: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
             serde_json::json!({"a": [1, 2, 3, 4, 5]})
         ).unwrap();
-        let count = compute_loop_iter_count(&cfg, &input).expect("ok");
+        let count = compute_loop_iter_cap(&cfg, &input).expect("ok");
         assert_eq!(count, 2, "max_iters caps: {count}");
     }
 
@@ -866,10 +879,10 @@
         };
         rt.ensure(key_inner_iter0.clone(), crate::loop_runtime::LoopConfig {
             parallel: false, over: vec![], carry: vec![], max_iters: Some(1), trim_on_mismatch: true,
-        }, 1, vec![]);
+        }, crate::loop_runtime::LoopItemSource::DoneDriven, Some(1), vec![]);
         rt.ensure(key_inner_iter1.clone(), crate::loop_runtime::LoopConfig {
             parallel: false, over: vec![], carry: vec![], max_iters: Some(1), trim_on_mismatch: true,
-        }, 1, vec![]);
+        }, crate::loop_runtime::LoopItemSource::DoneDriven, Some(1), vec![]);
         assert!(rt.get(&key_outer).is_some(), "outer instance lives");
         assert!(rt.get(&key_inner_iter0).is_some(), "inner instance at outer iter 0 lives");
         assert!(rt.get(&key_inner_iter1).is_some(), "inner instance at outer iter 1 lives");
@@ -888,8 +901,8 @@
     /// concat node and writes both `self.results` and `self.acc`.
     fn build_sequential_fold_project() -> LoopProject {
         let group_id = "fold".to_string();
-        let loop_in_id = format!("{group_id}__in");
-        let loop_out_id = format!("{group_id}__out");
+        let loop_in_id = weft_core::project::boundary_in_id(&group_id);
+        let loop_out_id = weft_core::project::boundary_out_id(&group_id);
         let body_id = "body".to_string();
         let consumer_id = "consumer".to_string();
         let loop_cfg = serde_json::json!({

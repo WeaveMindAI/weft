@@ -1690,11 +1690,14 @@ fn bare_names_resolve_only_inside_a_registry_scope() {
     assert_eq!(t.to_string(), "ChatHistory");
     let wire = t.wire_string();
     assert!(wire.starts_with("ChatHistory=List["), "{wire}");
-    assert_eq!(WeftType::parse(&wire).unwrap(), t);
+    // `==` on Named compares the NAME alone, so a round-trip must be
+    // asserted through `wire_string` (the total, order-preserving
+    // projection) or the body's survival goes unchecked.
+    assert_eq!(WeftType::parse(&wire).unwrap().wire_string(), wire);
     // Serde uses the wire form.
     let json = serde_json::to_string(&t).unwrap();
     let back: WeftType = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, t);
+    assert_eq!(back.wire_string(), wire);
 }
 
 #[test]
@@ -1711,7 +1714,8 @@ fn named_union_body_wire_form_is_unambiguous() {
     };
     let wire = named_union.wire_string();
     assert_eq!(wire, "Kind=(String | Number)");
-    assert_eq!(WeftType::parse(&wire).unwrap(), named_union);
+    // Compare through wire_string: `==` on Named ignores the body.
+    assert_eq!(WeftType::parse(&wire).unwrap().wire_string(), wire);
 
     // The un-parenthesized spelling is the OTHER type: a union whose
     // first member is named. Both directions round-trip.
@@ -1724,7 +1728,7 @@ fn named_union_body_wire_form_is_unambiguous() {
     ]);
     let wire = union_with_named.wire_string();
     assert_eq!(wire, "Kind=String | Number");
-    assert_eq!(WeftType::parse(&wire).unwrap(), union_with_named);
+    assert_eq!(WeftType::parse(&wire).unwrap().wire_string(), wire);
 
     // The common optional-port shape: a record-bodied named type beside
     // Null (braces protect the body, no parens needed).
@@ -1739,7 +1743,10 @@ fn named_union_body_wire_form_is_unambiguous() {
         },
         WeftType::Primitive(WeftPrimitive::Null),
     ]);
-    assert_eq!(WeftType::parse(&optional.wire_string()).unwrap(), optional);
+    assert_eq!(
+        WeftType::parse(&optional.wire_string()).unwrap().wire_string(),
+        optional.wire_string()
+    );
 
     // Plain paren grouping parses (and nests).
     assert_eq!(
@@ -1934,4 +1941,136 @@ fn installed_registry_is_idempotent_for_identical_content_only() {
     assert_eq!(*seen, *reg);
     // Outside the scope, bare names are gone again (builtin only).
     assert!(WeftType::parse("ChatMessage").is_none());
+}
+
+// ----- Generator[T] ---------------------------------------------------
+
+#[test]
+fn generator_parses_prints_and_round_trips() {
+    let g = WeftType::parse("Generator[Number]").expect("parses");
+    assert_eq!(g, WeftType::Generator(Box::new(WeftType::Primitive(WeftPrimitive::Number))));
+    assert_eq!(g.to_string(), "Generator[Number]");
+    assert_eq!(WeftType::parse(&g.to_string()), Some(g));
+    // Nested element types round-trip too.
+    let nested = WeftType::parse("Generator[List[String | Number]]").expect("parses");
+    assert_eq!(WeftType::parse(&nested.to_string()), Some(nested.clone()));
+    assert_eq!(WeftType::parse(&nested.wire_string()), Some(nested));
+    // `Generator` bare (no element) is not a type.
+    assert!(WeftType::parse("Generator").is_none());
+    // The name is reserved for user type declarations.
+    assert!(TypeRegistry::build(&[(
+        "Generator".into(),
+        "String".into(),
+        "test".into()
+    )])
+    .is_err());
+}
+
+#[test]
+fn generator_compatibility_is_invariant_and_never_decays() {
+    let g_num = WeftType::parse("Generator[Number]").unwrap();
+    let g_str = WeftType::parse("Generator[String]").unwrap();
+    let g_union = WeftType::parse("Generator[Number | String]").unwrap();
+    let num = WeftType::parse("Number").unwrap();
+    assert!(WeftType::is_compatible(&g_num, &g_num), "same element connects");
+    assert!(!WeftType::is_compatible(&g_num, &g_str), "different element refuses");
+    // Invariant: a narrower element does NOT flow into a wider one.
+    assert!(!WeftType::is_compatible(&g_num, &g_union));
+    assert!(!WeftType::is_compatible(&g_union, &g_num));
+    // A stream never decays into (or from) its element or a list.
+    assert!(!WeftType::is_compatible(&g_num, &num));
+    assert!(!WeftType::is_compatible(&num, &g_num));
+    assert!(!WeftType::is_compatible(&g_num, &WeftType::parse("List[Number]").unwrap()));
+    assert!(!WeftType::is_compatible(&WeftType::parse("List[Number]").unwrap(), &g_num));
+}
+
+#[test]
+fn generator_is_wire_only_with_no_literal_no_default_no_cast() {
+    let g = WeftType::parse("Generator[Number]").unwrap();
+    assert_eq!(g.default_exposure(), Exposure::Wire, "a live edge takes no literal");
+    assert_eq!(g.zero_value(), serde_json::Value::Null, "no honest zero for a stream");
+    assert!(g.cast_value(&serde_json::json!([1, 2, 3])).is_err(), "nothing casts into a stream");
+    assert!(WeftType::cast_allowed(&WeftType::parse("List[Number]").unwrap(), &g).is_err());
+    assert!(
+        WeftType::cast_allowed(&g, &WeftType::parse("String").unwrap()).is_err(),
+        "a stream does not stringify"
+    );
+}
+
+#[test]
+fn generator_with_unresolved_element_reads_as_unresolved_leaf() {
+    let g = WeftType::parse("Generator[T]").unwrap();
+    assert!(g.contains_unresolved_leaf(), "an unresolved element must resolve before use");
+    assert!(!WeftType::parse("Generator[Number]").unwrap().contains_unresolved_leaf());
+}
+
+#[test]
+fn generator_marker_validates_as_the_port_value() {
+    let g = WeftType::parse("Generator[Number]").unwrap();
+    let marker = serde_json::json!({ GENERATOR_MARKER_KEY: { "id": "00000000-0000-0000-0000-000000000000" } });
+    assert!(g.validate_value(&marker).is_ok(), "the live-handle marker is the port value");
+    assert!(g.validate_value(&serde_json::json!(1)).is_err(), "an item is not the port value");
+    assert!(g.validate_value(&serde_json::json!([1, 2])).is_err(), "a list is not a stream");
+}
+
+#[test]
+fn as_generator_peels_nominal_aliases_and_port_value_type_answers_the_element() {
+    // A nominal alias over a stream IS a stream: every generator rule
+    // (compiler and runtime) reads the port through `as_generator`, so
+    // the alias must peel exactly like the bare `Generator[T]`.
+    let bare = WeftType::parse("Generator[Number]").unwrap();
+    let number = WeftType::parse("Number").unwrap();
+    let alias = WeftType::Named { name: "Rows".into(), body: Box::new(bare.clone()) };
+    assert_eq!(bare.as_generator(), Some(&number));
+    assert_eq!(alias.as_generator(), Some(&number), "a nominal alias over a stream is a stream");
+    let chained = WeftType::Named { name: "F2".into(), body: Box::new(alias.clone()) };
+    assert_eq!(chained.as_generator(), Some(&number), "aliases chain; every layer peels");
+    assert_eq!(number.as_generator(), None);
+    // The port VALUE of a stream port is one item; anything else is itself.
+    assert_eq!(bare.port_value_type(), &number);
+    assert_eq!(alias.port_value_type(), &number);
+    assert_eq!(number.port_value_type(), &number);
+}
+
+#[test]
+fn a_declared_type_body_with_a_typevar_is_refused() {
+    // `T` is a node-scoped port variable; a declaration carrying one
+    // could only ever produce two same-named types with different
+    // bodies, which name-only nominal compatibility must never see.
+    let err = TypeRegistry::build(&[(
+        "MyBox".to_string(),
+        "List[T]".to_string(),
+        "test".to_string(),
+    )])
+    .expect_err("a typevar body must be refused");
+    assert!(err.contains("must be concrete"), "{err}");
+    assert!(err.contains("MyBox"), "{err}");
+}
+
+#[test]
+fn the_wire_named_form_refuses_a_typevar_body_but_stays_registry_independent() {
+    // The self-contained `Name=Body` wire form is the SECOND door a
+    // Named type can be built through; it enforces the one
+    // registry-independent half of the contract (no type variable in
+    // the body). Restatement agreement is the compiler's job.
+    assert!(WeftType::parse("MyBox=List[T]").is_none(), "a typevar body is refused");
+    // Parsing stays PURE: a wire string deserializes identically with
+    // or without a registry, even one whose declaration has since been
+    // EDITED (a resumed execution must get the exact shape it started
+    // on). Restatement agreement is the compiler's job
+    // (`named-type-conflict`), never the parser's.
+    let reg = std::sync::Arc::new(
+        TypeRegistry::build(&[(
+            "Feed".to_string(),
+            "Generator[String]".to_string(),
+            "test".to_string(),
+        )])
+        .expect("registry builds"),
+    );
+    reg.scoped(|| {
+        assert!(
+            WeftType::parse("Feed=Generator[Number]").is_some(),
+            "an old stored wire string keeps parsing after the declaration changed"
+        );
+    });
 }

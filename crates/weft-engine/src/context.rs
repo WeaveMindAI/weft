@@ -27,11 +27,9 @@ use futures::TryStreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use weft_core::bus::{
-    BusEntry, BusEntryKind, BusHandle, BusInner, BusLiveness, BusOptions, BusParticipant,
-    BusRegistry,
-};
+use weft_core::bus::{BusEntry, BusEntryKind, BusHandle, BusInner, BusOptions, BusRegistry};
 use weft_core::cancellation::CancellationFlag;
+use weft_core::liveness::{FiringLocation, WaitLiveness};
 use weft_core::context::{ContextHandle, LogLevel};
 use weft_core::error::{WeftError, WeftResult};
 use weft_core::node::NodeOutput;
@@ -40,6 +38,7 @@ use weft_core::weft_type::WeftType;
 use weft_core::Color;
 
 use crate::now_unix;
+use crate::wait_tracker::{DeliveryGate, WaitTracker};
 use weft_infra::InfraReader;
 use weft_journal::{ExecEvent, JournalClient};
 
@@ -382,30 +381,12 @@ pub struct BusCoordinator {
     /// drained); doubles as the marker-lookup table. Released by
     /// `shutdown()` AFTER the final drain has been acked.
     registry: BusRegistry,
-    /// Wake the loop's idle-`select!` when a node's bus state changes
-    /// (enters/leaves a wait, observes/parks, appends; participant
-    /// register/drop arrive as appends). The loop doesn't care WHO
-    /// changed; it just needs to re-check stuck.
-    bus_wait_notify: tokio::sync::Notify,
-    /// Per-NODE-EXECUTION bus liveness, keyed by `(node_id, frames)`.
-    /// Each entry holds the node's currently-live bus waits (keyed by
-    /// `WaitId`, because one task can `select!`/`join!` over several at
-    /// once). A node execution in a parallel loop has one entry per lane
-    /// (distinct frames), so lanes never conflate. Read by
-    /// `deadlock_provable`: the buses are stuck only when every in-flight
-    /// node task is parked here with EVERY one of its waits at its true
-    /// `notified.await` AND caught up on that wait's bus's CURRENT append
-    /// generation. A node that is computing (no map entry, or an entry
-    /// with any wait not parked) keeps the bus alive: it might still
-    /// send. A node woken by a send but still unpolled has not re-observed
-    /// since the append, so that wait reads as behind; a wait mid-
-    /// evaluation reads as not-parked. Either way the close is suppressed
-    /// under it, by construction rather than by a scheduler-fairness bet.
-    nodes: std::sync::Mutex<std::collections::HashMap<BusParticipant, NodeBusState>>,
-    /// Mint for `WaitId`s. Plain monotone counter; ids are never reused
-    /// within an execution, so a stale `exit_wait` can never address a
-    /// later wait.
-    next_wait_id: std::sync::atomic::AtomicU64,
+    /// The execution's shared in-process wait tracker. The bus is one
+    /// wait source among several (generator pulls and emission-delivery
+    /// waits register here too); the tracker owns the per-node liveness
+    /// map and `deadlock_provable`, so the drive loop's stuck-check has
+    /// ONE picture of every parked task. See `crate::wait_tracker`.
+    waits: Arc<WaitTracker>,
     /// Per-execution journal-pump wake. Buses signal this after every
     /// append (via `Weak<Notify>` they hold). The pump task awaits it
     /// and drains every live bus's unjournaled tail.
@@ -429,13 +410,12 @@ pub struct BusCoordinator {
 impl BusCoordinator {
     /// Construct the per-execution coordinator. The pump task is spun
     /// up by the loop driver, not here, because the loop owns the
-    /// journal client.
-    pub fn new() -> Arc<Self> {
+    /// journal client. `waits` is the execution's shared wait tracker,
+    /// owned by the execution (the bus is just one of its clients).
+    pub fn new(waits: Arc<WaitTracker>) -> Arc<Self> {
         Arc::new(Self {
             registry: BusRegistry::new(),
-            bus_wait_notify: tokio::sync::Notify::new(),
-            nodes: std::sync::Mutex::new(std::collections::HashMap::new()),
-            next_wait_id: std::sync::atomic::AtomicU64::new(0),
+            waits,
             journal_pump_notify: Arc::new(tokio::sync::Notify::new()),
             drain_complete_notify: Arc::new(tokio::sync::Notify::new()),
             pump_should_exit: std::sync::atomic::AtomicBool::new(false),
@@ -448,164 +428,24 @@ impl BusCoordinator {
         self.drain_complete_notify.clone()
     }
 
-    /// How many node executions are currently fully parked (every one of
-    /// their concurrent bus waits at its true park point). Logging /
-    /// diagnostics only: the stuck-check reads the count inside
-    /// `deadlock_provable`'s locked snapshot, never through this.
-    pub fn parked_nodes_count(&self) -> usize {
-        self.lock_nodes()
-            .values()
-            .filter(|s| Self::node_fully_parked(s))
-            .count()
-    }
-
-    /// A node counts as parked for the deadlock check only when it holds
-    /// at least one wait AND EVERY one of its concurrent waits is at its
-    /// true park point. A task `select!`ing over two cursors with one
-    /// branch still mid-evaluation (or not yet parked) is still working,
-    /// so it must not count. (`waits` is never empty for a live entry:
-    /// the entry is removed when its last wait exits.)
-    fn node_fully_parked(state: &NodeBusState) -> bool {
-        !state.waits.is_empty() && state.waits.values().all(|w| w.parked)
-    }
-
-    /// Test accessor: how many node executions currently have a liveness
-    /// entry (>= 1 live wait). Lets tests assert the map shape directly
-    /// (e.g. two registrations from one node collapse to one entry).
-    #[cfg(test)]
-    pub fn nodes_len(&self) -> usize {
-        self.lock_nodes().len()
-    }
-
-    /// Lock the liveness map. Taken only on the wait / wake / join /
-    /// leave / stuck-check paths, never on the message send path (an
-    /// append only bumps its bus's append-generation atomic and wakes
-    /// the loop).
-    fn lock_nodes(
-        &self,
-    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<BusParticipant, NodeBusState>> {
-        self.nodes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// True when EVERY one of the `in_flight` live node tasks is a node
-    /// execution PARKED at its true `notified.await` point (not mid-
-    /// evaluation) AND has observed its bus's CURRENT append generation
-    /// at its last condition evaluation. `in_flight` is the driver's
-    /// live-task count; the close fires only when the count of parked-
-    /// and-caught-up nodes equals it, i.e. no live task is off computing
-    /// (a computing task, or one reading a bus it never registered on,
-    /// might still send and unblock a peer). A node holding several bus
-    /// registrations is ONE task and ONE map entry, so it counts once:
-    /// this is the whole point of keying liveness on the node execution
-    /// rather than on each transient wait.
-    ///
-    /// - A node behind its bus's generation has an append it has not
-    ///   evaluated yet (typically a woken-but-unpolled receiver sitting
-    ///   in another worker thread's queue), so it is alive.
-    /// - A NOT-parked node is mid-evaluation: its `observed` fired, the
-    ///   evaluation has not returned, and it may be about to RESOLVE
-    ///   (find a message), not park. It is excluded from the parked
-    ///   count, so the count cannot reach `in_flight` under it. Closing
-    ///   under a succeeding evaluation would make its follow-up send hit
-    ///   `SendError::Closed` and kill a live conversation. `parked`
-    ///   fires only after every pre-park re-check failed, so `parked &&
-    ///   caught-up` means a provably fruitless evaluation followed by a
-    ///   real park.
-    ///
-    /// Per-bus generations are read UNDER each bus's log lock
-    /// (`append_gen_settled`): `push_entry` pushes the entry BEFORE
-    /// bumping the generation (both under the log lock), so an unlocked
-    /// read could see generation G while an entry past G is already in
-    /// the log, a torn read that could enable a close with an unconsumed
-    /// message in flight. The parked nodes' buses are snapshotted out of
-    /// the liveness map FIRST and the map lock released BEFORE any log
-    /// lock is taken, so this scan nests no locks. (No path takes a log
-    /// lock then the map lock either: `push_entry` runs under the log
-    /// lock but `on_append` only fires a `Notify`; a `WaitGuard` drop
-    /// runs `exit_wait` with no log lock held, since the cursor's inner
-    /// `log` guard drops before the outer guard. So the lock graph is
-    /// acyclic in both directions.)
-    ///
-    /// Soundness: an append landing between the map snapshot and a bus's
-    /// generation read makes that bus's settled generation exceed its
-    /// node's observed value, so the scan returns false. An append
-    /// cannot land AFTER a successful scan either: every sender is a
-    /// node task, a successful scan proved every in-flight task is a
-    /// parked node, and a parked node only wakes on an append, so there
-    /// is no task left that could send. A `true` here is therefore a
-    /// stable fact, not a racy snapshot.
-    pub fn deadlock_provable(&self, in_flight: usize) -> bool {
-        // Phase 1: snapshot every FULLY-PARKED node's waits (each wait's
-        // observed generation + bus) under ONE map lock. A node that is
-        // not fully parked (computing, or any wait mid-evaluation / not
-        // yet parked) is absent from the snapshot, so
-        // `parked nodes == in_flight` can only hold when no live task is
-        // off computing. Counting parked NODES (not waits) keeps one node
-        // = one in-flight task even when that node holds several
-        // concurrent waits. Done under one lock so the count and the
-        // per-node state come from the same instant.
-        let mut parked_node_count = 0usize;
-        let snapshot: Vec<(u64, std::sync::Weak<BusInner>)> = {
-            let nodes = self.lock_nodes();
-            let mut v = Vec::new();
-            for state in nodes.values() {
-                if Self::node_fully_parked(state) {
-                    parked_node_count += 1;
-                    for w in state.waits.values() {
-                        v.push((w.observed, w.bus.clone()));
-                    }
-                }
-            }
-            // Every in-flight task must be one of these fully-parked
-            // nodes. A computing task (no parked entry) makes the count
-            // fall short, so a busy peer keeps the bus alive.
-            if parked_node_count != in_flight {
-                return false;
-            }
-            v
-        };
-        // Phase 2: map lock released; read each wait's bus's settled
-        // generation under that bus's log lock. EVERY wait of every
-        // parked node must be caught up: a node parked on two buses is
-        // only deadlocked if neither bus has an unconsumed append.
-        snapshot.into_iter().all(|(observed, bus)| {
-            match bus.upgrade() {
-                Some(bus) => observed >= bus.append_gen_settled(),
-                // The wait's bus dropped between the snapshot and here
-                // (it left the wait concurrently and the execution let
-                // the bus go). State is in motion, so suppress the
-                // close; the exit's `exit_wait` woke the loop for a
-                // clean re-evaluation.
-                None => false,
-            }
-        })
-    }
-
     /// Mint a fresh bus with the provided options and register it,
     /// attributed to the minting node execution `node` (whose identity
-    /// keys its bus liveness). The registry pins the `Arc<BusInner>` (so
-    /// the pump's `Weak` always upgrades while the execution is live),
-    /// and the bus's engine hooks (liveness + journal-pump notify) are
-    /// `Weak` back to this coordinator. `Weak` on the engine side lets
-    /// the coordinator drop naturally at execution end; once gone, the
-    /// bus's hooks no-op. Errors on an invalid `window`.
+    /// keys its wait liveness). The registry pins the `Arc<BusInner>`
+    /// (so the pump's `Weak` always upgrades while the execution is
+    /// live); the bus's engine hooks (the shared wait tracker + the
+    /// journal-pump notify) are `Weak` on purpose so the coordinator
+    /// drops naturally at execution end; once gone, the bus's hooks
+    /// no-op. Errors on an invalid `window`.
     pub fn new_bus(
         self: &Arc<Self>,
         opts: BusOptions,
-        node: BusParticipant,
+        node: FiringLocation,
     ) -> Result<BusHandle, &'static str> {
-        let weak = Arc::downgrade(self) as std::sync::Weak<dyn BusLiveness>;
+        let weak = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
         let pump_notify_weak = Arc::downgrade(&self.journal_pump_notify);
         let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node))?;
         self.registry.insert(&bus);
         Ok(bus)
-    }
-
-    /// Wait-wake-up future the loop awaits in its idle-`select!`.
-    pub fn wait_notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.bus_wait_notify.notified()
     }
 
     /// Handle on the per-execution journal-pump wake-up. The pump task
@@ -635,7 +475,7 @@ impl BusCoordinator {
     pub fn lookup_bus(
         &self,
         marker: &serde_json::Value,
-        node: BusParticipant,
+        node: FiringLocation,
     ) -> Result<BusHandle, weft_core::bus::BusLookupError> {
         self.registry.lookup(marker, Some(node))
     }
@@ -779,186 +619,10 @@ impl Drop for BusCoordinator {
     }
 }
 
-/// One node execution's bus state in the coordinator's liveness map: the
-/// set of bus waits this node is currently inside, keyed by `WaitId`. A
-/// node is one async task but CAN hold several concurrent waits (a body
-/// that `select!`s or `join!`s over two cursors), so `waits` is a map,
-/// not a single slot. An entry exists exactly while the node has >= 1
-/// live wait; it is removed when its last wait exits. The node counts as
-/// "parked" for the deadlock check only when EVERY wait in `waits` is
-/// parked-and-caught-up (a task with any branch still live or mid-
-/// evaluation is still working). Plain fields: every read and write
-/// happens under the liveness mutex.
-struct NodeBusState {
-    waits: std::collections::HashMap<weft_core::bus::WaitId, WaitState>,
-}
-
-/// One bus wait. `bus` is the bus it is parked on (so the stuck-check can
-/// read that bus's append generation UNDER its log lock, see
-/// `deadlock_provable`); `observed` is the highest generation seen when
-/// this wait last (re-)evaluated its condition (`observed` hook); `parked`
-/// is whether it is at its true park point (`parked` hook; cleared by
-/// every `observed` because an evaluation in progress may resolve instead
-/// of parking). Lives from `enter_wait` to `exit_wait` (RAII via
-/// `WaitGuard` in weft-core).
-struct WaitState {
-    bus: std::sync::Weak<BusInner>,
-    observed: u64,
-    parked: bool,
-}
-
-impl BusLiveness for BusCoordinator {
-    fn enter_wait(
-        &self,
-        node: &BusParticipant,
-        bus: &std::sync::Arc<BusInner>,
-    ) -> weft_core::bus::WaitId {
-        let id = self
-            .next_wait_id
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            + 1;
-        // `observed: 0` registers the wait as conservatively BEHIND and
-        // `parked: false` as conservatively MID-EVALUATION (both suppress
-        // close) until its first `observed` / `parked`, which the wait
-        // loops fire before their first park by construction.
-        self.lock_nodes()
-            .entry(node.clone())
-            .or_insert_with(|| NodeBusState { waits: std::collections::HashMap::new() })
-            .waits
-            .insert(
-                id,
-                WaitState {
-                    bus: std::sync::Arc::downgrade(bus),
-                    observed: 0,
-                    parked: false,
-                },
-            );
-        // Use `notify_one` (NOT `notify_waiters`) so a wait-start that
-        // fires when the loop is NOT currently parked on `wait_notified`
-        // stores a permit. The next `wait_notified().enable()` consumes
-        // it and the loop wakes immediately. With `notify_waiters` the
-        // notification was lost in that window, and if no further
-        // wait-start arrived (because all peers are now blocked), the
-        // loop slept until the harness 10s deadline. Test:
-        // `hole4_mutual_deadlock_when_both_wait_for_names_that_never_come`
-        // flaked ~1 in 10 under parallel load before this change.
-        self.bus_wait_notify.notify_one();
-        id
-    }
-    fn exit_wait(&self, node: &BusParticipant, id: weft_core::bus::WaitId) {
-        // The `WaitGuard` lifecycle is symmetric (started on construct,
-        // ended on drop), so a missing wait here is a real pairing bug.
-        // Crash loud in BOTH dev and release: a silently-cleared wait
-        // would flip the stuck-check (an unparked node suppresses close)
-        // wrongly and the engine could hang or close early.
-        //
-        // CRITICAL: if this node has OTHER waits still live, the task is
-        // provably RUNNING right now (it is executing this guard drop, on
-        // its way to resolve a `select!`/`join!` branch and run that
-        // branch's code). Its sibling waits' `parked` flags are now stale
-        // (set before the task woke), and a stuck-check that read them
-        // would see the node as fully parked and could close buses out
-        // from under the resolving branch's follow-up send. So clear
-        // every surviving wait's `parked` flag (the node is not parked
-        // until every wait re-parks) AND wake each sibling's bus so its
-        // wait loop re-runs `observed` -> re-check -> `parked` and
-        // restores a truthful flag. Without the wake, a `join!` sibling
-        // that stays genuinely parked on `notified.await` would never
-        // re-run and the cleared flag would suppress a real deadlock
-        // forever (a hang). The buses are collected under the lock and
-        // woken AFTER releasing it, so no foreign code (even a future
-        // `wake_waiters` that grows a locked re-check) ever runs under
-        // the liveness map lock.
-        let mut wake: Vec<std::sync::Arc<BusInner>> = Vec::new();
-        {
-            let mut nodes = self.lock_nodes();
-            let entry = nodes
-                .get_mut(node)
-                .expect("exit_wait for unknown node: WaitGuard pairing broken");
-            let removed = entry.waits.remove(&id);
-            assert!(
-                removed.is_some(),
-                "exit_wait for unknown wait id {id}: WaitGuard pairing broken"
-            );
-            if entry.waits.is_empty() {
-                nodes.remove(node);
-            } else {
-                for w in entry.waits.values_mut() {
-                    w.parked = false;
-                    // A sibling present here has a live wait, and the wait
-                    // loops hold an `Arc<BusInner>` across the whole wait,
-                    // so this upgrade CANNOT fail. Crash loud if it does:
-                    // a cleared-but-unwoken sibling would suppress a real
-                    // deadlock forever (the hang this clear+wake prevents).
-                    wake.push(w.bus.upgrade().expect(
-                        "bus dropped while a sibling wait is live: the wait \
-                         loops hold an Arc<BusInner> across the whole wait",
-                    ));
-                }
-            }
-        }
-        for bus in wake {
-            bus.wake_waiters();
-        }
-        self.bus_wait_notify.notify_one();
-    }
-    fn on_append(&self) {
-        // A bus appended (send/register/close/drop). Wake the idle
-        // `select!` so the loop re-evaluates promptly (a stored permit if
-        // the loop is not currently parked, same discipline as
-        // `enter_wait`). The append itself is visible to the stuck-check
-        // through each bus's `append_gen_settled` (a parked wait that
-        // has not observed the new generation reads as behind / alive),
-        // so no separate generation counter is needed on the coordinator.
-        self.bus_wait_notify.notify_one();
-    }
-    fn observed(&self, node: &BusParticipant, id: weft_core::bus::WaitId) {
-        let mut nodes = self.lock_nodes();
-        let wait = nodes
-            .get_mut(node)
-            .and_then(|e| e.waits.get_mut(&id))
-            .expect("observed for unknown wait: WaitGuard pairing broken");
-        // Read the generation while waiting: the value is the
-        // ground-truth "everything appended up to here will be seen by
-        // the condition evaluation the caller runs next" (see the
-        // `BusLiveness::observed` contract in weft-core). The unlocked
-        // read (`append_gen_now`) is sound HERE because a lagging value
-        // only makes the wait read as behind, which is conservative; the
-        // close decision itself re-reads under the log lock
-        // (`deadlock_provable`).
-        wait.observed = wait
-            .bus
-            .upgrade()
-            .expect(
-                "bus dropped while a node is waiting on it: the wait \
-                 loops hold an Arc<BusInner> across the whole wait",
-            )
-            .append_gen_now();
-        // An evaluation is now in progress; it may RESOLVE rather than
-        // park. Mark not-parked so the stuck-check cannot close the
-        // buses out from under a succeeding evaluation (the resolved
-        // node's follow-up send would hit SendError::Closed).
-        wait.parked = false;
-        drop(nodes);
-        // A wait catching up can flip `deadlock_provable` to true; wake
-        // the loop so a deadlock that just became provable closes
-        // without waiting for an unrelated event.
-        self.bus_wait_notify.notify_one();
-    }
-    fn parked(&self, node: &BusParticipant, id: weft_core::bus::WaitId) {
-        let mut nodes = self.lock_nodes();
-        let wait = nodes
-            .get_mut(node)
-            .and_then(|e| e.waits.get_mut(&id))
-            .expect("parked for unknown wait: WaitGuard pairing broken");
-        wait.parked = true;
-        drop(nodes);
-        // The last wait parking can flip `deadlock_provable` to true (it
-        // is the final event before a deadlock is provable); wake the
-        // loop so the close fires without waiting for an unrelated event.
-        self.bus_wait_notify.notify_one();
-    }
-}
+// The per-node wait liveness (NodeWaitState, WaitState, enter/exit/
+// observed/parked, deadlock_provable) lives in `crate::wait_tracker`:
+// the bus shares it with every other in-process wait source
+// (generator pulls, emission-delivery waits).
 
 /// Bus-journal pump. One task per execution, spawned by the loop
 /// driver before the first node dispatches. Awaits the per-execution
@@ -1256,9 +920,22 @@ fn membership_event(color: Color, bus_id: &str, entry: &BusEntry) -> ExecEvent {
 /// per-execution `BusRegistry` on `BusCoordinator` and never ride on
 /// `EmitMsg`.
 pub struct EmitMsg {
-    pub node_id: String,
-    pub frames: weft_core::frames::LoopFrames,
+    /// The emitting firing's identity.
+    pub loc: FiringLocation,
     pub kind: EmitKind,
+    /// `Some` when this emission asked to wait for delivery
+    /// (`yield_downstream`): the producer's task is parked on
+    /// this gate; the loop driver arms it with the pulse ids the
+    /// emission created and it resolves at the existing absorb sites.
+    /// `None` for the fire-and-forget default.
+    pub delivery: Option<Arc<DeliveryGate>>,
+    /// The producer's declared per-stream un-taken buffer caps
+    /// (`set_max_buffered_items`) as snapshotted when this emission was
+    /// constructed (an `Arc` bump, not a map clone, per item), keyed by
+    /// output port. For a sequential body a declaration therefore
+    /// governs exactly the emissions after it; ports absent here use
+    /// [`weft_core::generator::DEFAULT_MAX_BUFFERED_ITEMS`].
+    pub stream_caps: Arc<HashMap<String, usize>>,
 }
 
 /// The SINGLE message a node task sends to the loop driver, over ONE
@@ -1273,10 +950,21 @@ pub struct EmitMsg {
 /// re-dispatch), an emit-then-immediately-return race.
 pub enum TaskMsg {
     Emission(EmitMsg),
+    /// A running consumer's pull took one generator item. The driver
+    /// absorbs the item's pulse (the take's durability rides a
+    /// `PulsesConsumed` journal row) and resolves any delivery gate
+    /// waiting on it. Rides the same FIFO channel as emissions and the
+    /// terminal, so a take is always applied before the consumer's own
+    /// terminal.
+    StreamItemTaken {
+        /// The consuming firing's identity.
+        loc: FiringLocation,
+        pulse_id: uuid::Uuid,
+    },
     Terminal {
-        node_id: String,
+        /// The terminating firing's identity.
+        loc: FiringLocation,
         color: Color,
-        frames: weft_core::frames::LoopFrames,
         outcome: NodeTaskOutcome,
     },
 }
@@ -1398,6 +1086,16 @@ impl JournalClient for PoisonOnWriteFailure {
     }
 }
 
+/// What one firing has done to its output ports, under ONE lock (see
+/// the `port_claims` field doc): the ports it mentioned (emitted or
+/// closed) and the generator ports it explicitly ENDED (`close_port`,
+/// the early end-of-stream verb; a yield after the end is a
+/// node-author bug and errors loud).
+#[derive(Default)]
+struct PortClaims {
+    mentioned: HashSet<String>,
+    ended_streams: HashSet<String>,
+}
 
 pub struct RunnerHandle {
     execution_id: String,
@@ -1467,10 +1165,44 @@ pub struct RunnerHandle {
     /// firing) and errors loud. Multiple `pulse_downstream` calls on
     /// DISJOINT ports are fine: that's the "release early then
     /// finalize" pattern (bus marker out, then `done` at the end).
-    mentioned_outputs: Mutex<HashSet<String>>,
-    /// Per-execution bus coordinator. Owns the `BusRegistry` (the source
-    /// of truth for "which buses are live this execution") and the park
-    /// counters the loop driver uses for dead-end detection.
+    /// `Generator[T]` ports are EXEMPT from the once-only claim (each
+    /// emission is one item of the stream) but still recorded here, so
+    /// the no-emission-before-a-durable-suspend guard covers yields
+    /// too. The once-only rule is not weakened by the exemption: it
+    /// exists because a second pulse at one `(color, frames)` key has
+    /// no identity a waiting consumer could reconcile, and a generator
+    /// consumer never reconciles: it fires once and pulls items in
+    /// arrival order.
+    ///
+    /// ONE lock for both sets: they answer the one question "what has
+    /// this firing done to port P", and every check reads both, so a
+    /// single lock makes the check-and-record atomic AND makes a
+    /// lock-order inversion between them unspellable (a cloned ctx used
+    /// from two spawned tasks could otherwise deadlock `close_port`
+    /// against `pulse_downstream`, invisibly to the stuck-detector).
+    port_claims: Mutex<PortClaims>,
+    /// Per-stream un-taken buffer caps this body declared
+    /// (`set_max_buffered_items`), keyed by output port. Each emission
+    /// carries the `Arc` snapshot current when the message was
+    /// CONSTRUCTED (a refcount bump, not a map clone, on the per-item
+    /// hot path), so for a sequential body a declaration governs
+    /// exactly the emissions after it; absent ports use
+    /// [`weft_core::generator::DEFAULT_MAX_BUFFERED_ITEMS`]. Declaring
+    /// caps concurrently with emitting from another task off a cloned
+    /// ctx has no ordering guarantee (the snapshot is
+    /// construction-time, not channel-time).
+    stream_caps: Mutex<Arc<HashMap<String, usize>>>,
+    /// Whether this node declares any `Generator[T]` INPUT. A stream
+    /// consumer must not `await_signal`: a durable suspension replays
+    /// the body from the top, and the already-pulled stream cannot be
+    /// replayed (the producer's items were consumed live).
+    has_generator_input: bool,
+    /// The execution's shared wait tracker: this firing's delivery
+    /// waits register here (its bus waits and generator pulls reach
+    /// the same tracker through their own sources).
+    waits: Arc<WaitTracker>,
+    /// Per-execution bus coordinator. Owns the `BusRegistry`, the
+    /// source of truth for which buses are live this execution.
     bus_coordinator: Arc<BusCoordinator>,
     /// Output ports this node declares in its metadata, name -> declared
     /// type. Used by `pulse_downstream` / `close_port` to reject emits on
@@ -1504,12 +1236,12 @@ pub struct RunnerHandle {
 }
 
 impl RunnerHandle {
-    /// This firing's bus-liveness identity: the node id plus its loop
+    /// This firing's wait-liveness identity: the node id plus its loop
     /// frame stack. A loop running the same body N times in parallel has
-    /// N distinct participants (one per frame), so their bus liveness
-    /// never conflates.
-    fn bus_participant(&self) -> BusParticipant {
-        (self.node_id.clone(), self.node_frames.clone())
+    /// N distinct firings (one per frame), so their wait liveness never
+    /// conflates.
+    fn firing_location(&self) -> FiringLocation {
+        FiringLocation::new(self.node_id.clone(), self.node_frames.clone())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1524,8 +1256,10 @@ impl RunnerHandle {
         pod_name: String,
         tenant_id: String,
         cancellation: Arc<CancellationFlag>,
+        waits: Arc<WaitTracker>,
         bus_coordinator: Arc<BusCoordinator>,
         declared_outputs: HashMap<String, WeftType>,
+        has_generator_input: bool,
     ) -> Self {
         Self {
             execution_id,
@@ -1543,7 +1277,10 @@ impl RunnerHandle {
             next_side_effect_index: AtomicU32::new(0),
             entry_register_count: AtomicU32::new(0),
             emit_tx: None,
-            mentioned_outputs: Mutex::new(HashSet::new()),
+            port_claims: Mutex::new(PortClaims::default()),
+            stream_caps: Mutex::new(Arc::new(HashMap::new())),
+            has_generator_input,
+            waits,
             bus_coordinator,
             declared_outputs,
             wake_payload: None,
@@ -1712,20 +1449,35 @@ impl RunnerHandle {
         Ok(())
     }
 
+    /// Whether this node declares `port` as a `Generator[T]` output
+    /// (a user alias whose body is one included).
+    fn is_generator_output(&self, port: &str) -> bool {
+        self.declared_outputs
+            .get(port)
+            .is_some_and(|t| t.as_generator().is_some())
+    }
+
     /// Claim a set of output ports for this firing under the
     /// one-emission-per-port rule. Errors loud the first time any port
     /// would be claimed twice (whether by `pulse_downstream` re-emit or
-    /// a `close_port` after an emit, in either order). The check is
-    /// transactional: if any port in `ports` collides, NONE is recorded,
-    /// so the caller sees a clean "this attempt failed" instead of a
-    /// partial mention that would poison later legitimate emissions.
+    /// a `close_port` after an emit, in either order). `Generator[T]`
+    /// ports are exempt from the once-only claim (every emission is one
+    /// item of the stream) but are refused after their explicit close
+    /// (a yield past the end). The check is transactional: if any port
+    /// in `ports` collides, NONE is recorded, so the caller sees a
+    /// clean "this attempt failed" instead of a partial mention that
+    /// would poison later legitimate emissions.
     fn mention_or_err(&self, ports: &[String]) -> WeftResult<()> {
-        let mut already = self
-            .mentioned_outputs
-            .lock()
-            .expect("mentioned_outputs poisoned");
+        let mut claims = self.lock_port_claims();
         for port_name in ports {
-            if already.contains(port_name) {
+            if claims.ended_streams.contains(port_name) {
+                return Err(WeftError::NodeExecution(format!(
+                    "node '{}' yielded on stream port '{}' after closing it; a close \
+                     ends the stream, nothing can follow it.",
+                    self.node_id, port_name
+                )));
+            }
+            if claims.mentioned.contains(port_name) && !self.is_generator_output(port_name) {
                 return Err(WeftError::NodeExecution(format!(
                     "node '{}' touched port '{}' twice in one firing. \
                      Each output port can be emitted or closed AT MOST ONCE per \
@@ -1736,15 +1488,34 @@ impl RunnerHandle {
             }
         }
         for port_name in ports {
-            already.insert(port_name.clone());
+            claims.mentioned.insert(port_name.clone());
         }
         Ok(())
+    }
+
+    fn lock_port_claims(&self) -> std::sync::MutexGuard<'_, PortClaims> {
+        self.port_claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_awaited_sequence(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::VecDeque<weft_core::primitive::AwaitedEntry>>
+    {
+        self.awaited_sequence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Ship an `EmitMsg` to the loop driver. Errors loud if the handle
     /// has no emit channel (runtime wiring bug) or the loop receiver is
     /// closed (loop dropped while the node task was still running).
-    fn send_emission(&self, kind: EmitKind) -> WeftResult<()> {
+    fn send_emission(
+        &self,
+        kind: EmitKind,
+        delivery: Option<Arc<DeliveryGate>>,
+    ) -> WeftResult<()> {
         let Some(tx) = self.emit_tx.as_ref() else {
             return Err(WeftError::Config(
                 "emission called on a handle with no emit channel \
@@ -1752,10 +1523,17 @@ impl RunnerHandle {
                     .into(),
             ));
         };
+        // Snapshot bound to a local so no lock is held across the send.
+        let stream_caps = self
+            .stream_caps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         tx.send(TaskMsg::Emission(EmitMsg {
-            node_id: self.node_id.clone(),
-            frames: self.node_frames.clone(),
+            loc: self.firing_location(),
             kind,
+            delivery,
+            stream_caps,
         }))
         .map_err(|_| {
             WeftError::Runtime(anyhow::anyhow!(
@@ -1965,6 +1743,7 @@ pub async fn ship_pulse_emissions(
                 frames: p.frames,
                 value: p.value,
                 closed: p.closed,
+                close_error: p.close_error,
                 at_unix: now_unix(),
             },
             pod_name,
@@ -2014,30 +1793,24 @@ impl ContextHandle for RunnerHandle {
         // the way it memoizes awaits/run), duplicating downstream
         // work. A node that holds a live bus must NOT durably suspend
         // anyway: it stays warm and uses bus.recv() instead.
-        if !self
-            .mentioned_outputs
-            .lock()
-            .expect("mentioned_outputs poisoned")
-            .is_empty()
-        {
-            return Err(WeftError::NodeExecution(format!(
-                "node '{}' called await_signal after pulse_downstream; a node that emits then \
-                 durably suspends would re-emit on replay. Emit after all awaits, or (for a \
-                 co-alive node) stay warm with bus.recv() instead of await_signal.",
-                self.node_id
-            )));
+        if !self.lock_port_claims().mentioned.is_empty() {
+            return Err(WeftError::NodeExecution(
+                weft_core::context::emitted_then_await_signal_error(&self.node_id),
+            ));
+        }
+        // A stream CONSUMER cannot durably suspend either: the resume
+        // replays the body from the top, and the items its earlier
+        // pulls consumed were delivered live and cannot be replayed.
+        if self.has_generator_input {
+            return Err(WeftError::NodeExecution(
+                weft_core::context::stream_consumer_await_signal_error(&self.node_id),
+            ));
         }
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
 
         // Pop the next pre-loaded entry (if any). Replay vs suspend
         // depends on whether its fire already arrived.
-        let next_entry = {
-            let mut seq = self
-                .awaited_sequence
-                .lock()
-                .expect("awaited_sequence mutex poisoned");
-            seq.pop_front()
-        };
+        let next_entry = self.lock_awaited_sequence().pop_front();
         if let Some(entry) = next_entry {
             // Sanity-check call_index alignment. If the journal's
             // sequence disagrees with our counter, something
@@ -2118,13 +1891,7 @@ impl ContextHandle for RunnerHandle {
     /// "fresh path" so the wrapper invokes the closure.
     async fn run_step(&self, name: &str) -> WeftResult<(u32, Option<Value>)> {
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
-        let next_entry = {
-            let mut seq = self
-                .awaited_sequence
-                .lock()
-                .expect("awaited_sequence mutex poisoned");
-            seq.pop_front()
-        };
+        let next_entry = self.lock_awaited_sequence().pop_front();
         match next_entry {
             Some(entry) => {
                 if entry.call_index != call_index {
@@ -2549,32 +2316,52 @@ impl ContextHandle for RunnerHandle {
 
     /// Fire downstream. Each output port the node mentions in
     /// `output` becomes a pulse on its outgoing edges; mentioned-but-
-    /// already-emitted ports error loud (one-emission-per-port rule).
+    /// already-emitted ports error loud (one-emission-per-port rule;
+    /// `Generator[T]` ports accept repeats, each emission one item).
     /// Calling `pulse_downstream` multiple times with DISJOINT ports
     /// is fine (release early then finalize); calling it twice with
-    /// OVERLAPPING ports is a node-author bug.
-    async fn pulse_downstream(&self, output: NodeOutput) -> WeftResult<()> {
+    /// OVERLAPPING non-generator ports is a node-author bug.
+    /// `wait_delivered` parks this body until every pulse the call
+    /// created has been absorbed (the consumer dispatched / the item
+    /// pulled), failing loudly when that can never happen.
+    async fn pulse_downstream(&self, output: NodeOutput, wait_delivered: bool) -> WeftResult<()> {
         let ports: Vec<String> = output.outputs.keys().cloned().collect();
         self.check_declared_outputs(&ports)?;
-        // Every port this call touches is claimed up front (the
-        // one-emission-per-port rule). A type-mismatched port is still
-        // "touched": it gets closed instead of emitted, so it must be
-        // claimed too, or a later legitimate emit on it would slip past.
-        self.mention_or_err(&ports)?;
 
-        // Runtime output-type check: each value must be compatible with
-        // its port's DECLARED type (which already reflects any narrowing
-        // the author applied in the node header). An incompatible value is
-        // refused: we record a non-terminal PortTypeMismatch and CLOSE the
-        // port (downstream sees null) instead of letting the wrong-typed
-        // value flow. Compatible ports emit together in one Values batch.
+        // Runtime output-type check, classification FIRST with no
+        // claims, no journaling, no sends: an error below must leave
+        // the call a clean no-op (a partial mention would refuse a
+        // later legitimate re-attempt as "touched twice"). Each value
+        // must be compatible with its port's DECLARED type (which
+        // already reflects any narrowing the author applied in the
+        // node header). An incompatible value on a plain port is
+        // refused: the port is recorded as a non-terminal
+        // PortTypeMismatch and CLOSED (downstream sees null) instead
+        // of letting the wrong-typed value flow.
+        //
+        // A GENERATOR port (asked via `as_generator`, so a nominal
+        // alias behaves identically) checks each emission against the
+        // ELEMENT type, and a mistyped item FAILS the whole call
+        // instead of closing the port: closing would silently end a
+        // live stream mid-flight and read downstream as a clean
+        // finish, which is exactly the masked-truncation failure the
+        // typed stream exists to prevent.
         let mut kept = NodeOutput::new();
-        let mut closed: Vec<String> = Vec::new();
+        let mut mismatched: Vec<(String, Value)> = Vec::new();
         for (port, value) in output.outputs {
-            match self.declared_outputs.get(&port) {
-                Some(declared) if !type_accepts(declared, &value) => {
-                    self.record_port_type_mismatch(&port, declared, &value).await;
-                    closed.push(port);
+            match self.declared_outputs.get(&port).map(|d| (d, d.as_generator())) {
+                Some((_, Some(element))) if !type_accepts(element, &value) => {
+                    return Err(WeftError::NodeExecution(format!(
+                        "node '{}' yielded a value on stream port '{}' that the element \
+                         type '{}' does not accept (got {})",
+                        self.node_id,
+                        port,
+                        element,
+                        WeftType::infer(&value),
+                    )));
+                }
+                Some((declared, None)) if !type_accepts(declared, &value) => {
+                    mismatched.push((port, value));
                 }
                 _ => {
                     kept.outputs.insert(port, value);
@@ -2582,12 +2369,69 @@ impl ContextHandle for RunnerHandle {
             }
         }
 
-        for port in closed {
-            self.send_emission(EmitKind::Close(port))?;
+        // The call is now known to proceed: claim every touched port
+        // (the one-emission-per-port rule). A type-mismatched port is
+        // still "touched": it gets closed instead of emitted, so it
+        // must be claimed too, or a later legitimate emit on it would
+        // slip past.
+        self.mention_or_err(&ports)?;
+        for (port, value) in mismatched {
+            let declared = self
+                .declared_outputs
+                .get(&port)
+                .expect("classified above from this same map");
+            self.record_port_type_mismatch(&port, declared, &value).await;
+            self.send_emission(EmitKind::Close(port), None)?;
         }
-        if !kept.outputs.is_empty() {
-            self.send_emission(EmitKind::Values(kept))?;
+        if !wait_delivered {
+            if !kept.outputs.is_empty() {
+                self.send_emission(EmitKind::Values(kept), None)?;
+            }
+            return Ok(());
         }
+        // Delivery-waiting emission that keeps no ports: NOTHING was
+        // emitted (empty output, or every value refused by its port's
+        // declared type). The caller's contract is "block until this
+        // was taken"; reporting success over a handoff that never
+        // happened would be a silent no-op, so fail loud instead.
+        if kept.outputs.is_empty() {
+            return Err(WeftError::NodeExecution(format!(
+                "node '{}' called yield_downstream but nothing was emitted (the output \
+                 was empty, or every value was refused by its port's declared type); \
+                 there is nothing whose delivery could be awaited",
+                self.node_id
+            )));
+        }
+        let gate = DeliveryGate::new();
+        self.send_emission(EmitKind::Values(kept), Some(gate.clone()))?;
+        let liveness = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
+        gate.wait_delivered(&liveness, self.firing_location()).await
+    }
+
+    fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
+        if !self.is_generator_output(port) {
+            return Err(WeftError::NodeExecution(format!(
+                "node '{}' called set_max_buffered_items on '{port}', which is not a \
+                 Generator output it declares",
+                self.node_id
+            )));
+        }
+        if items == 0 {
+            return Err(WeftError::NodeExecution(format!(
+                "node '{}': set_max_buffered_items(0) on '{port}'; a cap of 0 could never \
+                 accept even the first item",
+                self.node_id
+            )));
+        }
+        // Clone-on-write into a fresh Arc: emissions snapshot the Arc
+        // (cheap), so the map is never mutated behind a snapshot.
+        let mut caps = self
+            .stream_caps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut next = (**caps).clone();
+        next.insert(port.to_string(), items);
+        *caps = Arc::new(next);
         Ok(())
     }
 
@@ -2595,18 +2439,37 @@ impl ContextHandle for RunnerHandle {
     /// one-emission-per-port gate as `pulse_downstream`, then ships an
     /// `EmitKind::Close` so the loop driver emits a closure pulse on
     /// every outgoing edge of that port at this firing's frame stack, the
-    /// same shape the termination-time sweep would produce.
+    /// same shape the termination-time sweep would produce. On a
+    /// `Generator[T]` port this is the EARLY end-of-stream verb: legal
+    /// after any number of yields, once.
     async fn close_port(&self, port: &str) -> WeftResult<()> {
         let port = port.to_string();
         self.check_declared_outputs(std::slice::from_ref(&port))?;
-        self.mention_or_err(std::slice::from_ref(&port))?;
-        self.send_emission(EmitKind::Close(port))
+        if self.is_generator_output(&port) {
+            // One lock for the end-and-mention record (the same
+            // `port_claims` lock every emission check takes), so the
+            // claim is atomic and cannot order-invert against
+            // `mention_or_err`.
+            let mut claims = self.lock_port_claims();
+            if !claims.ended_streams.insert(port.clone()) {
+                return Err(WeftError::NodeExecution(format!(
+                    "node '{}' closed stream port '{}' twice; a stream ends once.",
+                    self.node_id, port
+                )));
+            }
+            // Also recorded as a mention so the no-emission-before-a-
+            // durable-suspend guard covers the explicit end too.
+            claims.mentioned.insert(port.clone());
+        } else {
+            self.mention_or_err(std::slice::from_ref(&port))?;
+        }
+        self.send_emission(EmitKind::Close(port), None)
     }
 
     fn create_bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)> {
         let handle = self
             .bus_coordinator
-            .new_bus(opts, self.bus_participant())
+            .new_bus(opts, self.firing_location())
             .map_err(|e| WeftError::Input(format!("ctx.create_bus on node '{}': {e}", self.node_id)))?;
         let marker = handle.marker();
         Ok((handle, marker))
@@ -2614,7 +2477,7 @@ impl ContextHandle for RunnerHandle {
 
     fn bus(&self, marker: &Value) -> WeftResult<BusHandle> {
         self.bus_coordinator
-            .lookup_bus(marker, self.bus_participant())
+            .lookup_bus(marker, self.firing_location())
             .map_err(|e| {
                 WeftError::Input(format!(
                     "ctx.bus on node '{}': {e}",
@@ -2815,8 +2678,10 @@ mod replay_tests {
             "pod-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
-            BusCoordinator::new(),
+            crate::wait_tracker::WaitTracker::new(),
+            BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
             HashMap::new(),
+            false,
         )
         .with_awaited_sequence(seq)
     }
@@ -2846,8 +2711,10 @@ mod replay_tests {
             "pod-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
-            BusCoordinator::new(),
+            crate::wait_tracker::WaitTracker::new(),
+            BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
             HashMap::new(),
+            false,
         )
     }
 
@@ -3105,8 +2972,10 @@ mod replay_tests {
             "worker-pod-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
-            BusCoordinator::new(),
+            crate::wait_tracker::WaitTracker::new(),
+            BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
             HashMap::new(),
+            false,
         ));
         ctx_over_arc(worker_handle).client(&scoped_access()).await.expect("worker opens");
 
@@ -3684,7 +3553,7 @@ mod bus_pump_tests {
     /// synthetic node identity at root frames is sufficient.
     fn new_bus(coord: &Arc<BusCoordinator>, opts: BusOptions) -> BusHandle {
         coord
-            .new_bus(opts, ("test-node".to_string(), Vec::new()))
+            .new_bus(opts, FiringLocation::new("test-node", Vec::new()))
             .expect("test BusOptions cannot fail")
     }
 
@@ -3692,12 +3561,19 @@ mod bus_pump_tests {
     /// at root frames, so liveness tests can drive distinct participants.
     fn new_bus_for(coord: &Arc<BusCoordinator>, node_id: &str) -> BusHandle {
         coord
-            .new_bus(BusOptions::default(), (node_id.to_string(), Vec::new()))
+            .new_bus(BusOptions::default(), FiringLocation::new(node_id, Vec::new()))
             .expect("test BusOptions cannot fail")
     }
 
-    fn participant(node_id: &str) -> weft_core::bus::BusParticipant {
-        (node_id.to_string(), Vec::new())
+    fn firing(node_id: &str) -> FiringLocation {
+        FiringLocation::new(node_id, Vec::new())
+    }
+
+    /// A bus handle's inner as the generic wait source the tracker
+    /// hooks take (the registry pins the inner Arc, so the borrowed
+    /// handle's later drop is harmless).
+    fn wait_src(b: &BusHandle) -> Arc<dyn weft_core::liveness::WaitSource> {
+        b.inner_arc()
     }
 
     /// Test helper: run the production shutdown sequence, then drop
@@ -3753,7 +3629,7 @@ mod bus_pump_tests {
     #[tokio::test]
     async fn pump_journals_full_lifecycle_in_offset_order() {
         let color = uuid::Uuid::new_v4();
-        let coord = BusCoordinator::new();
+        let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
         let pump = spawn_pump(&coord, journal.clone(), color);
 
@@ -3814,7 +3690,7 @@ mod bus_pump_tests {
         worker_threads: 4,
         async fn body() {
             let color = uuid::Uuid::new_v4();
-            let coord = BusCoordinator::new();
+            let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
             let journal = Arc::new(CaptureJournal::default());
             let pump = spawn_pump(&coord, journal.clone(), color);
 
@@ -3870,7 +3746,7 @@ mod bus_pump_tests {
     #[tokio::test]
     async fn pump_failure_surfaces_journal_degraded_on_next_send() {
         let color = uuid::Uuid::new_v4();
-        let coord = BusCoordinator::new();
+        let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
         let pump = spawn_pump(&coord, journal.clone(), color);
 
@@ -3917,7 +3793,7 @@ mod bus_pump_tests {
         worker_threads: 4,
         async fn body() {
             let color = uuid::Uuid::new_v4();
-            let coord = BusCoordinator::new();
+            let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
             let journal = Arc::new(CaptureJournal::default());
             let pump = spawn_pump(&coord, journal.clone(), color);
 
@@ -3974,7 +3850,7 @@ mod bus_pump_tests {
     #[tokio::test]
     async fn weak_only_registry_collects_bus_when_handles_drop() {
         let color = uuid::Uuid::new_v4();
-        let coord = BusCoordinator::new();
+        let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
         let pump = spawn_pump(&coord, journal.clone(), color);
 
@@ -4011,7 +3887,7 @@ mod bus_pump_tests {
     #[tokio::test]
     async fn pump_exits_when_coordinator_dropped_without_shutdown() {
         let color = uuid::Uuid::new_v4();
-        let coord = BusCoordinator::new();
+        let coord = BusCoordinator::new(crate::wait_tracker::WaitTracker::new());
         let journal = Arc::new(CaptureJournal::default());
         let pump = spawn_pump(&coord, journal.clone(), color);
         // Briefly let the pump start its first iteration so it has
@@ -4032,102 +3908,22 @@ mod bus_pump_tests {
     }
 
     // ───────────────────────────────────────────────────────────────
-    // Node-liveness deadlock detection. These drive the `BusLiveness`
-    // hooks directly (the same calls the wait loops make via WaitGuard)
-    // so the stuck-check's decision is tested deterministically, with no
-    // scheduler races. `deadlock_provable(in_flight)` is the predicate
-    // the driver gates `close_all()` on.
+    // Bus-integrated liveness checks: the tracker's own decision logic
+    // is unit-tested in `crate::wait_tracker` against a fake source;
+    // the tests here pin the BUS side of the contract (the append
+    // generation the bus reports, the registry interplay), driving the
+    // same hooks the wait loops fire via WaitGuard.
     // ───────────────────────────────────────────────────────────────
 
-    /// A node parked on a bus, caught up on its generation, with one
-    /// in-flight task, is a provable deadlock. The baseline the harder
-    /// cases below must NOT trip.
-    #[test]
-    fn single_parked_caught_up_node_is_deadlock() {
-        let coord = BusCoordinator::new();
-        let bus = new_bus_for(&coord, "a").inner_arc();
-        let a = participant("a");
-        let w = coord.enter_wait(&a, &bus);
-        coord.observed(&a, w); // sees generation 0 (no appends)
-        coord.parked(&a, w);
-        assert!(
-            coord.deadlock_provable(1),
-            "one in-flight task, parked and caught up: deadlock"
-        );
+    /// The execution-owned tracker plus a coordinator wired to it,
+    /// mirroring the driver's construction order.
+    fn coord_with_tracker() -> (Arc<crate::wait_tracker::WaitTracker>, Arc<BusCoordinator>) {
+        let waits = crate::wait_tracker::WaitTracker::new();
+        (waits.clone(), BusCoordinator::new(waits))
     }
 
-    /// THE CORE FIX, at the map level. A single node holds TWO concurrent
-    /// bus waits (a body that `select!`s over two cursors). It is one
-    /// async task = ONE in-flight task = ONE map entry, even with two
-    /// waits. `nodes_len()` proves the collapse directly; the node counts
-    /// as parked only when BOTH waits are parked (a select! with one
-    /// branch live is still working), and contributes exactly one toward
-    /// `in_flight`. The old per-waiter count saw two waiters and needed
-    /// `>= in_flight`, which a second wait could inflate.
-    #[test]
-    fn one_node_two_concurrent_waits_count_once() {
-        let coord = BusCoordinator::new();
-        let bus_x = new_bus_for(&coord, "a").inner_arc();
-        let bus_y = new_bus_for(&coord, "a").inner_arc();
-        let a = participant("a");
-        // Same node enters TWO waits (e.g. select! over two cursors).
-        let wx = coord.enter_wait(&a, &bus_x);
-        let wy = coord.enter_wait(&a, &bus_y);
-        assert_eq!(
-            coord.nodes_len(),
-            1,
-            "two concurrent waits from one node = one map entry"
-        );
-        // Only one branch parked: the task is still working (the other
-        // branch may resolve), so NOT counted as parked.
-        coord.observed(&a, wx);
-        coord.parked(&a, wx);
-        assert_eq!(
-            coord.parked_nodes_count(),
-            0,
-            "one wait parked, the other mid-evaluation: node still working"
-        );
-        assert!(!coord.deadlock_provable(1));
-        // Both branches parked and caught up: now the node is parked, and
-        // counts as exactly ONE in-flight task.
-        coord.observed(&a, wy);
-        coord.parked(&a, wy);
-        assert_eq!(coord.parked_nodes_count(), 1, "both waits parked: node parked");
-        assert!(
-            coord.deadlock_provable(1),
-            "one in-flight task fully parked despite holding two waits"
-        );
-    }
-
-    /// A node parked on bus X while another node keeps bus Y live: the
-    /// busy node is an in-flight task that is not parked, so the parked
-    /// count falls short of `in_flight` and the close is suppressed. The
-    /// multi-node "one bus stuck, another still working" case. A computing
-    /// task simply has no map entry (liveness is created on `enter_wait`,
-    /// not on registration), so `in_flight` alone accounts for it.
-    #[test]
-    fn computing_task_keeps_bus_alive() {
-        let coord = BusCoordinator::new();
-        let bus = new_bus_for(&coord, "a").inner_arc();
-        let a = participant("a");
-        let b = participant("b");
-        // 'a' parked; 'b' is an in-flight task off computing (no entry).
-        let wa = coord.enter_wait(&a, &bus);
-        coord.observed(&a, wa);
-        coord.parked(&a, wa);
-        assert_eq!(coord.nodes_len(), 1, "only the parked node has an entry");
-        assert!(
-            !coord.deadlock_provable(2),
-            "the computing task ('b') is an in-flight task not parked: no close"
-        );
-        // Once 'b' also parks caught-up, the deadlock becomes provable.
-        let wb = coord.enter_wait(&b, &bus);
-        coord.observed(&b, wb);
-        coord.parked(&b, wb);
-        assert!(
-            coord.deadlock_provable(2),
-            "both nodes parked and caught up: deadlock"
-        );
+    fn in_flight(locs: &[&FiringLocation]) -> std::collections::HashSet<FiringLocation> {
+        locs.iter().map(|l| (*l).clone()).collect()
     }
 
     /// A node woken by a send but still unpolled reads as BEHIND its
@@ -4138,29 +3934,29 @@ mod bus_pump_tests {
     /// bus's settled generation (1) > observed (0) -> not caught up.
     #[test]
     fn parked_node_behind_generation_is_not_deadlock() {
-        let coord = BusCoordinator::new();
+        let (waits, coord) = coord_with_tracker();
         // The sender is a DIFFERENT node 'b' (not the waiter), so the
         // test models a real two-party exchange, not a node sending to
         // itself.
         let mut producer = new_bus_for(&coord, "b");
-        let bus = producer.inner_arc();
-        let a = participant("a");
-        let w = coord.enter_wait(&a, &bus);
-        coord.observed(&a, w); // generation 0
-        coord.parked(&a, w);
+        let bus = wait_src(&producer);
+        let a = firing("a");
+        let w = waits.enter_wait(&a, &bus);
+        waits.observed(&a, w); // generation 0
+        waits.parked(&a, w);
         // A message lands (generation bumps) but 'a' has not re-observed.
         producer.register("producer").unwrap();
         producer.send("m", serde_json::json!(1)).unwrap();
         assert!(
-            !coord.deadlock_provable(1),
+            !waits.deadlock_provable(&in_flight(&[&a])),
             "parked node behind the bus generation has unconsumed input: alive"
         );
         // After re-observing the new generation and re-parking, it is a
         // deadlock again (nothing further will arrive).
-        coord.observed(&a, w);
-        coord.parked(&a, w);
+        waits.observed(&a, w);
+        waits.parked(&a, w);
         assert!(
-            coord.deadlock_provable(1),
+            waits.deadlock_provable(&in_flight(&[&a])),
             "re-observed and re-parked at the current generation: deadlock"
         );
     }
@@ -4172,45 +3968,27 @@ mod bus_pump_tests {
     /// because its Y-wait is behind.
     #[test]
     fn node_parked_on_two_buses_alive_if_either_has_unconsumed() {
-        let coord = BusCoordinator::new();
-        let bus_x = new_bus_for(&coord, "a").inner_arc();
+        let (waits, coord) = coord_with_tracker();
+        let bus_x = wait_src(&new_bus_for(&coord, "a"));
         let mut producer_y = new_bus_for(&coord, "b");
-        let bus_y = producer_y.inner_arc();
-        let a = participant("a");
-        let wx = coord.enter_wait(&a, &bus_x);
-        let wy = coord.enter_wait(&a, &bus_y);
+        let bus_y = wait_src(&producer_y);
+        let a = firing("a");
+        let wx = waits.enter_wait(&a, &bus_x);
+        let wy = waits.enter_wait(&a, &bus_y);
         // Both waits parked, both caught up at generation 0.
-        coord.observed(&a, wx);
-        coord.parked(&a, wx);
-        coord.observed(&a, wy);
-        coord.parked(&a, wy);
-        assert!(coord.deadlock_provable(1), "both waits caught up: deadlock");
+        waits.observed(&a, wx);
+        waits.parked(&a, wx);
+        waits.observed(&a, wy);
+        waits.parked(&a, wy);
+        assert!(waits.deadlock_provable(&in_flight(&[&a])), "both waits caught up: deadlock");
         // An append on bus Y (not yet observed by the Y-wait) revives the
         // node even though its X-wait is still caught up.
         producer_y.register("producer").unwrap();
         producer_y.send("m", serde_json::json!(1)).unwrap();
         assert!(
-            !coord.deadlock_provable(1),
+            !waits.deadlock_provable(&in_flight(&[&a])),
             "the Y-wait is behind its bus: the node has unconsumed input, alive"
         );
-    }
-
-    /// `exit_wait` for the last wait removes the node entry entirely (no
-    /// ghost participant). After a node leaves its wait, it stops being
-    /// counted; a phantom in_flight finds no parked node, so no false
-    /// close. Mirrors the real handle-drop / wait-cancel path.
-    #[test]
-    fn last_wait_exit_removes_node_entry() {
-        let coord = BusCoordinator::new();
-        let bus = new_bus_for(&coord, "a").inner_arc();
-        let a = participant("a");
-        let w = coord.enter_wait(&a, &bus);
-        coord.observed(&a, w);
-        coord.parked(&a, w);
-        assert_eq!(coord.parked_nodes_count(), 1);
-        coord.exit_wait(&a, w);
-        assert_eq!(coord.nodes_len(), 0, "node entry gone once its last wait exits");
-        assert!(!coord.deadlock_provable(1), "no parked nodes: not provable");
     }
 
     /// Dropping a REGISTERED handle after the bus is closed must not
@@ -4221,16 +3999,16 @@ mod bus_pump_tests {
     /// handle outliving close is harmless.
     #[test]
     fn registered_handle_drop_after_close_is_clean() {
-        let coord = BusCoordinator::new();
+        let (waits, coord) = coord_with_tracker();
         let mut bus = new_bus_for(&coord, "a");
         bus.register("a").unwrap();
         coord.close_all();
         // No liveness entry was ever created (the node never entered a
         // wait), and dropping the registered handle on a closed bus must
         // not panic.
-        assert_eq!(coord.nodes_len(), 0);
+        assert_eq!(waits.nodes_len(), 0);
         drop(bus);
-        assert_eq!(coord.nodes_len(), 0, "no ghost entry from a post-close drop");
+        assert_eq!(waits.nodes_len(), 0, "no ghost entry from a post-close drop");
     }
 
     /// Parallel-loop lanes: the SAME node body running at two different
@@ -4242,122 +4020,36 @@ mod bus_pump_tests {
     #[test]
     fn parallel_loop_lanes_are_independent_participants() {
         use weft_core::frames::LoopIteration;
-        let coord = BusCoordinator::new();
+        let (waits, coord) = coord_with_tracker();
         // Both lanes share a node id "worker" but differ in frame index.
-        let lane0 = ("worker".to_string(), vec![LoopIteration { index: 0 }]);
-        let lane1 = ("worker".to_string(), vec![LoopIteration { index: 1 }]);
-        let bus0 = coord
-            .new_bus(BusOptions::default(), lane0.clone())
-            .unwrap()
-            .inner_arc();
-        let bus1 = coord
-            .new_bus(BusOptions::default(), lane1.clone())
-            .unwrap()
-            .inner_arc();
+        let lane0 = FiringLocation::new("worker", vec![LoopIteration { index: 0 }]);
+        let lane1 = FiringLocation::new("worker", vec![LoopIteration { index: 1 }]);
+        let bus0 = wait_src(&coord.new_bus(BusOptions::default(), lane0.clone()).unwrap());
+        let bus1 = wait_src(&coord.new_bus(BusOptions::default(), lane1.clone()).unwrap());
         // Lane 0 parks (deadlocked). Lane 1 is an in-flight task still
         // computing (no wait yet).
-        let w0 = coord.enter_wait(&lane0, &bus0);
-        coord.observed(&lane0, w0);
-        coord.parked(&lane0, w0);
+        let w0 = waits.enter_wait(&lane0, &bus0);
+        waits.observed(&lane0, w0);
+        waits.parked(&lane0, w0);
         assert_eq!(
-            coord.nodes_len(),
+            waits.nodes_len(),
             1,
             "lanes are distinct entries: only lane 0 has parked"
         );
         assert!(
-            !coord.deadlock_provable(2),
+            !waits.deadlock_provable(&in_flight(&[&lane0, &lane1])),
             "lane 1 still computing keeps the buses alive"
         );
         // Lane 1 parks too: now both lanes are stuck. If frames were
         // ignored, lane1's enter_wait would land on lane0's entry and
         // parked_nodes_count would read 1, failing this assert.
-        let w1 = coord.enter_wait(&lane1, &bus1);
-        coord.observed(&lane1, w1);
-        coord.parked(&lane1, w1);
-        assert_eq!(coord.parked_nodes_count(), 2, "two distinct parked lanes");
+        let w1 = waits.enter_wait(&lane1, &bus1);
+        waits.observed(&lane1, w1);
+        waits.parked(&lane1, w1);
+        assert_eq!(waits.parked_nodes_count(), 2, "two distinct parked lanes");
         assert!(
-            coord.deadlock_provable(2),
+            waits.deadlock_provable(&in_flight(&[&lane0, &lane1])),
             "both lanes parked and caught up on their own buses: deadlock"
         );
-    }
-
-    /// A not-yet-parked wait (mid-evaluation: `observed` fired but not
-    /// `parked`) excludes its node, even if caught up, because the
-    /// evaluation may resolve. Pins the parked flag's role.
-    #[test]
-    fn mid_evaluation_node_suppresses_close() {
-        let coord = BusCoordinator::new();
-        let bus = new_bus_for(&coord, "a").inner_arc();
-        let a = participant("a");
-        let w = coord.enter_wait(&a, &bus);
-        coord.observed(&a, w); // caught up, but NOT parked
-        assert!(
-            !coord.deadlock_provable(1),
-            "a mid-evaluation wait may resolve; its node is excluded from the parked count"
-        );
-        coord.parked(&a, w);
-        assert!(coord.deadlock_provable(1), "now parked: deadlock");
-    }
-
-    /// REGRESSION (round-2 critical). When a node holds two concurrent
-    /// waits both parked, and ONE resolves (its guard drops -> exit_wait),
-    /// the node's task is provably running, so the surviving sibling's
-    /// `parked` flag must be CLEARED. Otherwise the node would read as
-    /// fully-parked in the window between the resolve and the task being
-    /// polled, and `deadlock_provable` could close buses under the
-    /// resolving branch's follow-up send. Pins that exit_wait clears
-    /// siblings: after one wait exits, the node is NOT a deadlock until
-    /// the surviving wait re-parks.
-    #[test]
-    fn exit_wait_clears_surviving_sibling_parked_flag() {
-        let coord = BusCoordinator::new();
-        let bus_x = new_bus_for(&coord, "a").inner_arc();
-        let bus_y = new_bus_for(&coord, "a").inner_arc();
-        let a = participant("a");
-        let wx = coord.enter_wait(&a, &bus_x);
-        let wy = coord.enter_wait(&a, &bus_y);
-        // Both waits parked and caught up: the node is fully parked.
-        coord.observed(&a, wx);
-        coord.parked(&a, wx);
-        coord.observed(&a, wy);
-        coord.parked(&a, wy);
-        assert!(coord.deadlock_provable(1), "both waits parked: deadlock");
-        // The wx branch resolves (its guard drops). The task is now
-        // running toward that branch's code; wy's parked flag is stale.
-        coord.exit_wait(&a, wx);
-        assert!(
-            !coord.deadlock_provable(1),
-            "sibling wy's parked flag cleared: node is running, not parked, no false close"
-        );
-        // The task re-parks wy (re-evaluated, still nothing): deadlock
-        // again, correctly.
-        coord.observed(&a, wy);
-        coord.parked(&a, wy);
-        assert!(
-            coord.deadlock_provable(1),
-            "wy re-parked caught-up: genuine deadlock re-proven"
-        );
-    }
-
-    /// The pairing asserts are load-bearing crash-loud contracts: an
-    /// `exit_wait` for a wait id that was never entered is a WaitGuard
-    /// pairing bug and must panic, not silently no-op (a silent miss
-    /// would corrupt the parked accounting).
-    #[test]
-    #[should_panic(expected = "exit_wait for unknown node")]
-    fn exit_wait_unknown_node_panics() {
-        let coord = BusCoordinator::new();
-        coord.exit_wait(&participant("ghost"), 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "observed for unknown wait")]
-    fn observed_unknown_wait_panics() {
-        let coord = BusCoordinator::new();
-        let bus = new_bus_for(&coord, "a").inner_arc();
-        let a = participant("a");
-        let w = coord.enter_wait(&a, &bus);
-        // A different (never-minted) id must not address this node's wait.
-        coord.observed(&a, w + 999);
     }
 }

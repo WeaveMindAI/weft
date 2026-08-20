@@ -99,7 +99,8 @@ export type DispatcherEvent =
   // Loop events. Carry the inspector groupId + parent_frames so
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
-  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; iter_count: number; parallel: boolean }
+  // SYNC: loop_instantiated <-> crates/weft-dispatcher/src/events.rs LoopInstantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
+  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; iter_cap: number | null; parallel: boolean }
   | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number }
   | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; done_vote?: boolean | null }
   | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; reason: LoopTerminationReason }
@@ -466,7 +467,7 @@ export class ExecutionFollower implements vscode.Disposable {
             kind: 'instantiated',
             groupId: e.group_id,
             parentFrames: e.parent_frames,
-            iterCount: e.iter_count,
+            iterCap: e.iter_cap,
             parallel: e.parallel,
           },
         });

@@ -238,7 +238,16 @@ vs statement; locked to statement for `"assignment"` inputs).
   already-built `Value` passes through untouched); chain `.set` for more
   ports; `.extend_from_object(json)` fans a JSON object's keys onto
   same-named ports. A port not present in the output emits no pulse
-  (downstream of it skips, the null-propagation rule).
+  (downstream of it skips, the null-propagation rule). A
+  `Generator[T]` output accepts repeated emissions (each one item of
+  the stream); every other port at most once per firing.
+- `ctx.yield_downstream(NodeOutput)`: the same emission, but
+  it does not return until the values were TAKEN (the consumer
+  dispatched; a stream item pulled). See the Streams section.
+- `ctx.set_max_buffered_items(port, n)`: for a stream producer that
+  emits without yielding, how many un-taken items its `Generator`
+  output may buffer before an emission fails (default 4096). See the
+  Streams section.
 - `.node_err("doing X")?` on any non-weft `Result` (an HTTP call, a
   parser) turns its error into a node failure reading "doing X: ...";
   on an `Option`, `None` becomes a failure carrying the message
@@ -1255,6 +1264,11 @@ What's NOT safe between awaits (wrap in `ctx.run`):
 - Reading environment variables that might change.
 - Anything that could differ between two runs of the same code.
 
+Emitting on (or closing) an output port BEFORE an `await_signal` is
+refused outright, not wrapped: the resume replays the body from the
+top and would touch the port twice. Emit and close after all awaits,
+or (for a co-alive node) stay warm with `bus.recv()` instead.
+
 If the runtime detects a drift (`ctx.run` at the same index where
 the journal has `ctx.await_signal`, or vice versa), the node fails
 with `NodeExecution` error explaining the issue. No silent
@@ -1523,6 +1537,96 @@ consumer reads it back off the handle (or the marker):
   carries every message in it (nothing lost, fewer rows), an ephemeral
   one carries the rollup (count + bytes per sender/kind). What travels
   the bus is untouched; this is only how the trail is stored.
+
+## Streams: `Generator[T]` ports
+
+A `Generator[T]` port is an ordinary typed port that accepts being
+emitted into repeatedly. That makes a PRODUCER trivial: yield items
+with the emission call you already use, keeping any state (an open
+connection, say) in plain Rust locals, and the stream ends when your
+body returns:
+
+```rust
+// metadata.json: { "name": "rows", "type": "Generator[Row]" }
+for row in read_rows(&file) {
+    if keep(&row) {
+        // The lock-step yield: returns once the consumer pulled this
+        // item. Plain `pulse_downstream` instead keeps your body
+        // running and buffers the item (bounded; see below).
+        // `set` takes a JSON value, so a custom struct goes through
+        // `serde_json::to_value` (or the `json!` macro).
+        ctx.yield_downstream(NodeOutput::new().set("rows", serde_json::to_value(row)?))
+            .await?;
+    }
+}
+// body returns: the engine closes the stream (an error closes it as
+// FAILED: the consumer's pull gets your error instead of a clean end).
+```
+
+The CONSUMER reads the stream from the input bag like any other input;
+the type does the work. The node fires once, on the first item, and
+pulls in its own code:
+
+```rust
+let rows = ctx.inputs.get::<Generator<Row>>("rows")?;
+while let Some(row) = rows.next().await? { /* one item at a time */ }
+```
+
+On the handle: `next()` (waiting take: `Ok(Some(item))`, `Ok(None)` on
+a clean end, the producer's error on a failed one), `try_next()` (no
+wait; distinguishes "nothing buffered yet" from "finished"), `drain()`
+(the whole stream as a `Vec`, erroring on a failed end rather than
+handing back a truncated list), and `end()` (the end marker, once the
+producer's side ended). Waiting is the language's job: none of these
+spin or make you re-check readiness. A pull that can never be
+satisfied (every remaining node provably waits on the others) is
+resolved by the engine's stuck-check as a FAILED stream, surfacing
+through `?` like any producer failure, never as a hang.
+
+An EMPTY stream still runs the consumer: a producer that closes
+without yielding delivers a stream whose first `next()` answers
+`Ok(None)`, so your post-loop code (a summary over zero rows, say)
+runs the same as over one row.
+
+A PRODUCER that emits with plain `pulse_downstream` runs ahead of the
+consumer's pulls; the un-taken items buffer on the edge. That buffer
+is bounded (`DEFAULT_MAX_BUFFERED_ITEMS`, currently 4096), and the
+emission past the bound fails the producer loudly (silent unbounded
+buffering would be a memory leak). A producer that deliberately runs
+far ahead declares its own bound:
+
+```rust
+ctx.set_max_buffered_items("rows", 100_000)?;
+```
+
+Only legal on a `Generator` output, refused for 0; it applies to the
+emissions that follow the call (before or between emissions both
+work). A `yield_downstream` producer never needs it (each yield waits
+for its pull, so the buffer never grows past one).
+
+Plain-`pulse_downstream` items are fire-and-forget: a consumer that
+returns early (took what it wanted and stopped pulling) simply never
+takes the rest, and the run completes with the leftovers dropped, like
+any value a finished node never read. When your producer must KNOW its
+items were consumed, that is what `yield_downstream` is for: a yield
+whose consumer finishes without taking it fails your body loudly.
+
+Rules to know: exactly one consumer per stream (broadcast is `Bus`
+territory), a `Loop` consumes a stream by naming the port in `over`
+(one item per iteration), a stream cannot cross a group boundary or
+sit inside a container, a `Generator` INPUT must be required (an
+unwired stream has no meaning), `close_port` on a generator output is
+the early end-of-stream verb (legal after any number of yields), and a
+stream consumer's body cannot `await_signal` (its resume would replay
+a body whose pulled items cannot be replayed).
+
+`yield_downstream` is not stream-specific: on an ORDINARY
+port it suspends your body until the downstream consumer of the value
+has actually been dispatched, a real synchronization point ("do not
+continue until the next stage started", e.g. a phone-call node that
+must not proceed until the answering node is live). It fails loudly
+when the delivery can never happen (the consumer skipped or finished
+without taking the value) instead of waiting forever.
 
 ## Storage: `ctx.storage`
 

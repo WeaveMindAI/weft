@@ -1,8 +1,8 @@
 {
   "type": "Range",
   "label": "Range",
-  "description": "Produce a list of numbers between `from` (inclusive) and `to` (exclusive), stepping by `step`. Commonly used to drive `Loop(over: [\"values\"])` for count-based iteration.",
-  "tags": ["number", "list", "range", "loop"],
+  "description": "Yield the numbers between `from` (inclusive) and `to` (exclusive) one at a time, stepping by `step`. Commonly used to drive `Loop(over: [\"values\"])` for count-based iteration; the loop pulls one number per iteration, so large ranges never sit in memory.",
+  "tags": ["number", "stream", "range", "loop"],
   "icon": "Hash",
   "color": "#64748b",
   "inputs": [
@@ -11,7 +11,7 @@
     { "name": "step", "type": "Number", "required": false, "default": 1 }
   ],
   "outputs": [
-    { "name": "values", "type": "List[Number]", "required": false }
+    { "name": "values", "type": "Generator[Number]", "required": false }
   ],
   "requires_infra": false
 }

@@ -1,5 +1,6 @@
-//! Range self-tests: the half-open walk in both directions and the
-//! loud config refusals.
+//! Range self-tests: the half-open walk in both directions (the rig
+//! collects the stream's yields into one array per port) and the loud
+//! config refusals.
 
 use serde_json::json;
 
@@ -13,6 +14,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("negative_step_walks_down", walks_down),
         NodeTest::fake("from_already_past_to_is_empty", already_past),
         NodeTest::fake("zero_step_fails_loud", zero_step),
+        NodeTest::fake("max_finite_step_yields_once_and_terminates", max_finite_step),
     ]
 }
 
@@ -42,5 +44,19 @@ async fn zero_step(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&RangeNode, json!({ "to": 3, "step": 0 })).await;
     let err = outcome.result.expect_err("zero step must refuse").to_string();
     assert!(err.contains("step cannot be zero"), "{err}");
+    Ok(())
+}
+
+async fn max_finite_step(rig: FakeRig) -> WeftResult<()> {
+    // JSON cannot spell Infinity or NaN, so the body's non-finite
+    // guard is a backstop no test input can reach; the numeric edge a
+    // test CAN pin is the largest finite step: one yield, then
+    // `cur += step` saturates past `to` and the walk terminates
+    // instead of spinning.
+    let outcome = rig
+        .run(&RangeNode, json!({ "to": 1, "step": f64::MAX }))
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["values"], json!([0.0]));
     Ok(())
 }

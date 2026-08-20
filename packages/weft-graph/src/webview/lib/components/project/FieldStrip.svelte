@@ -10,7 +10,7 @@
 	/// File-backed primitives render through the strip itself via the
 	/// `displayValueOf` / `readonlyKeys` / `headerBadge` capabilities.
 	import type { Snippet } from 'svelte';
-	import type { FieldDefinition } from '../../types';
+	import { declaredHomeValue, ownValue, type FieldDefinition } from '../../types';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { clampToRange } from '../../utils/input-field';
@@ -102,11 +102,17 @@
 	const fieldEditorRegistry = useFieldEditorRegistry();
 	$effect(() => fieldEditorRegistry?.register(fieldEditor.flush));
 
-	/// The field's stored value, routed by its home: a port-driven field
-	/// reads `portValues`, a config field reads `config`. This is the ONE
-	/// value lookup; every control below goes through it.
+	/// The saved editor height for a field, as the CSS declaration to
+	/// splice into its style (empty when none was stored).
+	function fieldHeight(field: FieldDefinition): string {
+		const h = ownValue(heights, field.key);
+		return typeof h === 'number' ? `height: ${h}px;` : '';
+	}
+
+	/// The field's stored value, from the one home its exposure names
+	/// (own-property-guarded; see `declaredHomeValue` in lib/types).
 	function fieldValue(field: FieldDefinition): unknown {
-		return field.portDriven ? portValues?.[field.key] : config?.[field.key];
+		return declaredHomeValue(portValues, config, field);
 	}
 
 	/// The field's identity for DOM ids and the debounced field editor.
@@ -132,10 +138,13 @@
 
 	function getDisplayValue(field: FieldDefinition): string {
 		const k = fieldKey(field);
-		// The override reads the CONFIG home (file-backed field content).
-		// A port-driven row shows its own literal, even when a same-named
-		// file-backed config field coexists.
-		const override = field.portDriven ? undefined : displayValueOf?.(field.key);
+		// File-backing is independent of the value's HOME: a file-backed
+		// field's resolved content can live in the port literal (enrich
+		// moves an `all`-exposure body literal there) while its marker
+		// stays in config, so the override applies to a port-driven row
+		// too. The parent answers null for a field that is not
+		// file-backed.
+		const override = displayValueOf?.(field.key);
 		if (override !== undefined) return fieldEditor.display(k, override);
 		const v = effectiveValue(field);
 		const storeStr = (v === undefined || v === null)
@@ -193,7 +202,7 @@
 		<!-- readonlyKeys comes from the CONFIG home (file-backed field
 		     states); a port-driven row is never file-backed, so it never
 		     inherits a same-named config sibling's lock. -->
-		{@const ro = !field.portDriven && (readonlyKeys?.has(field.key) ?? false)}
+		{@const ro = readonlyKeys?.has(field.key) ?? false}
 		<div class="space-y-1">
 			<div class="flex items-center justify-between">
 				<label for={domId(field)} class="text-[10px] text-muted-foreground font-medium block">
@@ -207,7 +216,7 @@
 					id={domId(field)}
 					readonly={ro}
 					class="text-xs px-2 py-1.5 rounded border-none outline-none font-mono nodrag nopan box-border block w-full {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'}"
-					style="resize: vertical; min-height: 60px; {heights?.[field.key] ? `height: ${heights[field.key]}px;` : ''}"
+					style="resize: vertical; min-height: 60px; {fieldHeight(field)}"
 					placeholder={field.placeholder}
 					value={getDisplayValue(field)}
 					onfocusin={(e) => e.currentTarget.classList.add('nowheel')}

@@ -8,7 +8,7 @@
 // Diffing against the node's current (projected) config keeps source ops to
 // exactly what changed.
 
-import type { EditOp } from '../../../protocol';
+import type { ConfigFieldSpan, EditOp } from '../../../protocol';
 import type { PortDefinition } from '../types';
 import { inputExposure } from '../types';
 import { formatConfigValue } from '../value-format';
@@ -98,7 +98,7 @@ export function diffPortLiteralOps(
   nodeId: string,
   updated: Record<string, unknown>,
   current: Record<string, unknown>,
-  spans: Record<string, { origin: 'inline' | 'connection' }>,
+  spans: Record<string, ConfigFieldSpan>,
   inputs: PortDefinition[],
 ): EditOp[] {
   const defaultForm = (key: string): 'inline' | 'connection' => {

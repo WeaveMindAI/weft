@@ -10,6 +10,8 @@ pub(crate) mod execution_driver;
 pub(crate) mod loop_runtime;
 pub(crate) mod metering;
 pub(crate) mod socket;
+pub(crate) mod stream_runtime;
+pub(crate) mod wait_tracker;
 pub mod run_pod;
 pub mod storage;
 // The node-test rig + runner. Feature-gated so ONLY the emitted

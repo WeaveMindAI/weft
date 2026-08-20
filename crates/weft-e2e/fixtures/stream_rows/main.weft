@@ -1,0 +1,24 @@
+# The motivating Generator case: a producer walks its rows ONCE, in one body
+# (its cursor is a plain Rust local, never squeezed through a carry port),
+# yields only the rows it decides to keep (comment rows are skipped), and a
+# sequential loop does per-row work as the rows arrive, gathering the results.
+#
+# The rig asserts: the loop ran once per KEPT row and the gather is exactly
+# the kept rows uppercased, in order.
+
+feed = RowFeed { rows: ["alpha", "#comment", "beta", "#note", "gamma"] }
+
+work = Loop(lines: Generator[String]) -> (out: List[String | Null]) {
+  parallel: false
+  over: ["lines"]
+
+  shout = ExecPython(s: String) -> (r: String) {
+    code: "return {'r': s.upper()}"
+  }
+  shout.s = self.lines
+  self.out = shout.r
+}
+work.lines = feed.kept
+
+sink = Debug
+sink.data = work.out

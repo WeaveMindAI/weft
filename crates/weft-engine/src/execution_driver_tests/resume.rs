@@ -64,6 +64,7 @@
                 frames: vec![],
                 value: json!("x"),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -104,7 +105,17 @@
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
         let mut awaited = HashMap::new();
-        apply_snapshot(snap, &mut pulses, &mut executions, &mut kicked, &mut awaited);
+        // No node in these fixtures consumes a stream, so no crashed
+        // firing is unresumable.
+        let project: weft_core::project::ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::nil(),
+            "nodes": [],
+            "edges": []
+        }))
+        .expect("empty project json");
+        let doomed =
+            apply_snapshot(&project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited);
+        assert!(doomed.is_empty(), "no stream consumers in these fixtures");
         (pulses, executions, kicked)
     }
 
@@ -114,6 +125,109 @@
             .and_then(|b| b.iter().find(|p| p.id.to_string() == pid))
             .map(|p| p.status)
             .expect("pulse present")
+    }
+
+    /// Project with a real stream edge plus a LoopIn boundary that
+    /// also declares a generator input, for the doomed-consumer
+    /// routing tests below.
+    fn stream_project() -> weft_core::project::ProjectDefinition {
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::nil(),
+            "nodes": [
+                {
+                    "id": "producer", "nodeType": "Yielder", "label": null,
+                    "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [],
+                    "outputs": [{ "name": "out", "portType": "Generator[Number]", "required": false }],
+                    "features": {}, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "consumer", "nodeType": "Taker", "label": null,
+                    "config": null, "position": { "x": 1.0, "y": 0.0 },
+                    "inputs": [{ "name": "in", "portType": "Generator[Number]", "required": true }],
+                    "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "work__in", "nodeType": "LoopIn", "label": null,
+                    "config": null, "position": { "x": 2.0, "y": 0.0 },
+                    "inputs": [{ "name": "rows", "portType": "Generator[Number]", "required": true }],
+                    "outputs": [],
+                    "features": {}, "scope": [],
+                    "groupBoundary": { "groupId": "work", "role": "In" },
+                    "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                { "id": "e", "source": "producer", "target": "consumer", "sourceHandle": "out", "targetHandle": "in" }
+            ],
+            "groups": []
+        }))
+        .expect("stream project")
+    }
+
+    fn crashed_running(node: &str) -> Vec<ExecEvent> {
+        vec![ExecEvent::NodeStarted {
+            color: color(),
+            node_id: node.into(),
+            frames: vec![],
+            input: json!({}),
+            pulses_absorbed: vec![],
+            closed_ports: vec![],
+            at_unix: 0,
+        }]
+    }
+
+    /// A crashed-Running STREAM CONSUMER is doomed (its already-pulled
+    /// items were removed durably, so a re-run would silently compute
+    /// over a truncated stream), and lands in the doomed set instead
+    /// of being re-dispatched.
+    #[test]
+    fn crashed_stream_consumer_is_doomed_not_redispatched() {
+        let snap = weft_journal::fold_to_snapshot(color(), &crashed_running("consumer"));
+        let mut pulses = PulseTable::default();
+        let mut executions = NodeExecutionTable::default();
+        let doomed = apply_snapshot(
+            &stream_project(), snap, &mut pulses, &mut executions,
+            &mut HashMap::new(), &mut HashMap::new(),
+        );
+        assert_eq!(
+            doomed,
+            vec![FiringLocation::new("consumer", vec![])],
+            "the crashed stream consumer must be doomed"
+        );
+    }
+
+    /// A crashed-Running node WITHOUT a generator input takes the
+    /// normal re-dispatch route, never the doomed one.
+    #[test]
+    fn crashed_plain_node_is_not_doomed() {
+        let snap = weft_journal::fold_to_snapshot(color(), &crashed_running("producer"));
+        let mut pulses = PulseTable::default();
+        let mut executions = NodeExecutionTable::default();
+        let doomed = apply_snapshot(
+            &stream_project(), snap, &mut pulses, &mut executions,
+            &mut HashMap::new(), &mut HashMap::new(),
+        );
+        assert!(doomed.is_empty(), "a plain crashed node re-dispatches, got {doomed:?}");
+    }
+
+    /// A crashed-Running LOOP BOUNDARY also declares a generator input
+    /// but is replay-safe by construction (journal-backed launched /
+    /// out_fired / stream_end), so dooming it would kill a fully
+    /// recoverable loop.
+    #[test]
+    fn crashed_loop_boundary_is_not_doomed() {
+        let snap = weft_journal::fold_to_snapshot(color(), &crashed_running("work__in"));
+        let mut pulses = PulseTable::default();
+        let mut executions = NodeExecutionTable::default();
+        let doomed = apply_snapshot(
+            &stream_project(), snap, &mut pulses, &mut executions,
+            &mut HashMap::new(), &mut HashMap::new(),
+        );
+        assert!(doomed.is_empty(), "a LoopIn resumes normally, got {doomed:?}");
     }
 
     #[test]

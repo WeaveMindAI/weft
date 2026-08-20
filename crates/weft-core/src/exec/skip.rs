@@ -14,6 +14,13 @@
 //!
 //! A user-emitted `null` on a required port is NOT a skip. Null is
 //! data the body has to interpret; the body runs.
+//!
+//! `Generator[T]` ports are exempt from every closure rule: a closure
+//! on a generator port is the stream's END, and an end with no items
+//! before it is the EMPTY STREAM, a value the body acts on (the
+//! documented pull contract answers `Ok(None)` immediately). Skipping
+//! the consumer there would make "zero items" behave differently from
+//! "one item", and the body's post-loop code would never run.
 
 use std::collections::HashSet;
 
@@ -35,8 +42,10 @@ pub fn check_should_skip(
     // Rule 1: any wired required port that arrived as a closure -> skip.
     // (`literal_filled` never overlaps `wired`: wires are authoritative
     // and config only fills unwired ports, so no config check here.)
+    // Generator ports are exempt: their closure is the empty stream,
+    // not "nothing is coming" (module doc).
     for port_name in required {
-        if !wired.contains(port_name) {
+        if !wired.contains(port_name) || is_generator_port(node, port_name) {
             continue;
         }
         if port_arrived_closed(node_pulses, frames, color, port_name) {
@@ -70,6 +79,12 @@ pub fn check_should_skip(
             if !wired.contains(port.name.as_str()) {
                 return true;
             }
+            // A wired generator port in a formed group has an arrival
+            // by construction, and even a closure-arrival is a live
+            // value (the empty stream): never dead.
+            if port.port_type.as_generator().is_some() {
+                return false;
+            }
             port_arrived_closed(node_pulses, frames, color, &port.name)
         });
         if all_dead {
@@ -89,6 +104,11 @@ pub fn check_should_skip(
             if !wired.contains(port_name.as_str()) {
                 return true;
             }
+            // A generator port's closure is the empty stream, a live
+            // value; it keeps its oneOf group satisfied.
+            if is_generator_port(node, port_name) {
+                return false;
+            }
             port_arrived_closed(node_pulses, frames, color, port_name)
         });
         if all_closed {
@@ -97,6 +117,12 @@ pub fn check_should_skip(
     }
 
     false
+}
+
+fn is_generator_port(node: &NodeDefinition, port_name: &str) -> bool {
+    node.inputs
+        .iter()
+        .any(|p| p.name == port_name && p.port_type.as_generator().is_some())
 }
 
 fn port_arrived_closed(
@@ -161,6 +187,40 @@ mod tests {
 
     fn closure_pulse(port: &str) -> Pulse {
         Pulse::closure(uuid::Uuid::nil(), Vec::new(), "n", port)
+    }
+
+    fn node_generator_required() -> crate::project::NodeDefinition {
+        serde_json::from_value(json!({
+            "id": "n",
+            "nodeType": "X",
+            "label": null,
+            "config": null,
+            "position": { "x": 0.0, "y": 0.0 },
+            "inputs": [{ "name": "rows", "portType": "Generator[Number]", "required": true }],
+            "outputs": [],
+            "features": {},
+            "scope": [],
+            "groupBoundary": null,
+            "requiresInfra": false,
+            "images": []
+        }))
+        .expect("node json")
+    }
+
+    #[test]
+    fn empty_stream_closure_on_a_generator_port_does_not_skip() {
+        // A closure on a Generator port is the EMPTY STREAM, a value
+        // the body consumes (`next()` answers Ok(None) right away),
+        // never a "nothing is coming" skip signal.
+        let node = node_generator_required();
+        let pulses = vec![closure_pulse("rows")];
+        let required: HashSet<&str> = ["rows"].into_iter().collect();
+        let wired: HashSet<&str> = ["rows"].into_iter().collect();
+        let literal_filled = HashSet::new();
+        assert!(
+            !check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled),
+            "an empty stream must RUN its consumer, not skip it"
+        );
     }
 
     #[test]

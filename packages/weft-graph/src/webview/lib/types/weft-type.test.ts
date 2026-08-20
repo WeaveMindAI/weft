@@ -106,6 +106,26 @@ describe('parseWeftType', () => {
 		}
 	});
 
+	it('never resolves an Object prototype key as a type or alias', () => {
+		// The alias table is a Map precisely so 'toString' & co can
+		// never resolve through the prototype chain; pin the crash
+		// class shut (a plain-object table made `parseWeftType('toString')`
+		// throw instead of returning null).
+		for (const s of ['toString', 'constructor', 'valueOf', 'hasOwnProperty', '__proto__']) {
+			expect(parseWeftType(s), s).toBeNull();
+		}
+		expect(isWeftTypeCompatible('toString', 'String')).toBe(false);
+	});
+
+	it('rejects a named body carrying a type variable', () => {
+		// Mirrors the backend's wire-parser gate: a declared body must
+		// be concrete, or two same-named types could carry different
+		// bodies under name-only nominal compatibility.
+		for (const s of ['MyBox=List[T]', 'MyBox=T_Auto', 'MyBox={a: T}', 'MyBox=MustOverride']) {
+			expect(parseWeftType(s), s).toBeNull();
+		}
+	});
+
 	it('parses type var inside List', () => {
 		const t = parseWeftType('List[T]');
 		expect(t?.kind).toBe('list');

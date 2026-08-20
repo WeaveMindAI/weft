@@ -21,6 +21,20 @@ import type {
   PortDefinition as V1Port,
 } from './lib/types';
 
+// THE TypeScript spelling of a group's boundary-node ids (the Rust
+// compiler mints these when it flattens a group). The two suffix
+// constants are the one definition; both directions (the builders
+// here and `parseBoundary` below) derive from them.
+// SYNC: BOUNDARY_IN, BOUNDARY_OUT <-> crates/weft-core/src/project.rs boundary_in_id, boundary_out_id
+const BOUNDARY_IN = '__in';
+const BOUNDARY_OUT = '__out';
+export function boundaryInId(groupId: string): string {
+  return `${groupId}${BOUNDARY_IN}`;
+}
+export function boundaryOutId(groupId: string): string {
+  return `${groupId}${BOUNDARY_OUT}`;
+}
+
 function toV1Port(p: HostPort | HostInput): V1Port {
   // An INPUT additionally carries its resolved editor surface
   // (exposure/widget/default/label/placeholder); a pure wire port
@@ -74,16 +88,18 @@ function toV1Edge(e: HostEdge, groupIds: Set<string>): V1Edge {
   };
 }
 
+// The inverse of `boundaryInId`/`boundaryOutId`, derived from the same
+// suffix constants so the two directions cannot drift.
 function parseBoundary(
   id: string,
   groupIds: Set<string>,
 ): { groupId: string; role: 'In' | 'Out' } | null {
-  if (id.endsWith('__in')) {
-    const gid = id.slice(0, -4);
+  if (id.endsWith(BOUNDARY_IN)) {
+    const gid = id.slice(0, -BOUNDARY_IN.length);
     if (groupIds.has(gid)) return { groupId: gid, role: 'In' };
   }
-  if (id.endsWith('__out')) {
-    const gid = id.slice(0, -5);
+  if (id.endsWith(BOUNDARY_OUT)) {
+    const gid = id.slice(0, -BOUNDARY_OUT.length);
     if (groupIds.has(gid)) return { groupId: gid, role: 'Out' };
   }
   return null;
@@ -206,8 +222,8 @@ export function translateProject(
   const groupIds = new Set(host.groups.map((g) => g.id));
   const passthroughIds = new Set<string>();
   for (const gid of groupIds) {
-    passthroughIds.add(`${gid}__in`);
-    passthroughIds.add(`${gid}__out`);
+    passthroughIds.add(boundaryInId(gid));
+    passthroughIds.add(boundaryOutId(gid));
   }
   const structuralNodes: NodeInstance[] = [];
   // Groups first (v1 requires parent-before-child order).

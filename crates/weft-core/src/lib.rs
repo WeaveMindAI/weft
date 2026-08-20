@@ -16,8 +16,12 @@ pub mod cancellation;
 pub mod context;
 pub mod error;
 pub mod exec;
-pub mod infra;
 pub mod frames;
+#[cfg(feature = "runtime")]
+pub mod generator;
+pub mod infra;
+#[cfg(feature = "runtime")]
+pub mod liveness;
 #[cfg(feature = "runtime")]
 pub mod net;
 pub mod node;
@@ -96,9 +100,14 @@ pub use reqwest;
 #[cfg(feature = "runtime")]
 pub use bus::{
     BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusMode, BusOptions,
-    BusLiveness, BusParticipant, BusRegistry, CursorError, RegisterError, SendError, WaitError,
-    WaitId,
+    BusRegistry, CursorError, RegisterError, SendError, WaitError,
 };
+#[cfg(feature = "runtime")]
+pub use liveness::{
+    FiringLocation, WaitId, WaitLiveness, WaitSource,
+};
+#[cfg(feature = "runtime")]
+pub use generator::{Generator, StreamEnd, TryNext};
 #[cfg(feature = "runtime")]
 pub use cancellation::CancellationFlag;
 #[cfg(feature = "runtime")]

@@ -346,6 +346,21 @@ pub enum GroupBoundaryRole {
     Out,
 }
 
+/// THE derivation of a group's IN-boundary node id. The compiler
+/// mints exactly this shape when it flattens a group (or a loop);
+/// the engine and the journal fold re-derive it. One definition so
+/// the convention cannot drift.
+// SYNC: boundary_in_id, boundary_out_id <-> packages/weft-graph/src/webview/host-bridge.ts BOUNDARY_IN, BOUNDARY_OUT
+pub fn boundary_in_id(group_id: &str) -> String {
+    format!("{group_id}__in")
+}
+
+/// THE derivation of a group's OUT-boundary node id; see
+/// [`boundary_in_id`].
+pub fn boundary_out_id(group_id: &str) -> String {
+    format!("{group_id}__out")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupBoundary {
     #[serde(rename = "groupId")]
