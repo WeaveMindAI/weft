@@ -218,57 +218,12 @@ impl InfrastructureManager for InfrastructureManagerImpl {
             }));
         }
 
-        // Enforce infra limits before provisioning
-        const MAX_GLOBAL_INFRA_DEPLOYMENTS: u64 = 10;
-        const MAX_USER_INFRA_DEPLOYMENTS: u64 = 2;
-
-        let global_count: u64 = ctx.run(|| async move {
-            let client = kube::Client::try_default().await
-                .map_err(|e| TerminalError::new(format!("K8s client: {}", e)))?;
-            let count = k8s_provisioner::count_running_infra_deployments(&client).await
-                .map_err(|e| TerminalError::new(e))?;
-            Ok(count as u64)
-        }).await?;
-
-        let user_id_for_limit = req.userId.clone();
-        let user_count: u64 = ctx.run(|| {
-            let uid = user_id_for_limit.clone();
-            async move {
-                if let Some(ref uid) = uid {
-                    let client = kube::Client::try_default().await
-                        .map_err(|e| TerminalError::new(format!("K8s client: {}", e)))?;
-                    let count = k8s_provisioner::count_running_infra_deployments_for_user(&client, uid).await
-                        .map_err(|e| TerminalError::new(e))?;
-                    Ok(count as u64)
-                } else {
-                    Ok(0u64)
-                }
-            }
-        }).await?;
-
-        tracing::info!(
-            "[START_ALL] infra limits check: global={}/{}, user={}/{}",
-            global_count, MAX_GLOBAL_INFRA_DEPLOYMENTS,
-            user_count, MAX_USER_INFRA_DEPLOYMENTS
-        );
-
-        if global_count >= MAX_GLOBAL_INFRA_DEPLOYMENTS {
-            return Ok(Json(InfraStatusResponse {
-                projectId: project_id,
-                status: "limit_reached".to_string(),
-                nodes: vec![],
-                executionId: None,
-            }));
-        }
-
-        if user_count >= MAX_USER_INFRA_DEPLOYMENTS {
-            return Ok(Json(InfraStatusResponse {
-                projectId: project_id,
-                status: "user_limit_reached".to_string(),
-                nodes: vec![],
-                executionId: None,
-            }));
-        }
+        // Capacity is admitted before dispatch, on the start route, where a
+        // refusal can still reach the caller: see `k8s_provisioner::inventory_of`
+        // and `check_capacity`. This handler is invoked fire-and-forget, so
+        // anything it returns is dropped, which is why the ceilings cannot live
+        // here. Provisioning itself asks the same question, so no route into
+        // it is ungated.
 
         let mut node_statuses = Vec::new();
         for node in &infra_nodes {

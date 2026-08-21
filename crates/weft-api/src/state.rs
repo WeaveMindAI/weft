@@ -18,6 +18,10 @@ pub struct AppState {
     /// never user-controlled URLs (the key would leak).
     pub http_client: reqwest::Client,
     pub node_registry: &'static weft_nodes::NodeTypeRegistry,
+    /// Built once at boot: every request that asks the cluster a question
+    /// reuses it, instead of re-reading credentials and rebuilding TLS.
+    /// `None` in local mode, where there is no cluster to ask.
+    pub kube_client: Option<kube::Client>,
 }
 
 impl AppState {
@@ -60,6 +64,26 @@ impl AppState {
                 .expect("failed to build internal HTTP client")
         };
 
+        // Built once so no request pays for reading credentials and building
+        // TLS again. Without it the API cannot answer how much is running, so
+        // it refuses to start infrastructure and says why, rather than taking
+        // the whole API down over a question most requests never ask.
+        let kube_client = if crate::routes::is_local_mode() {
+            None
+        } else {
+            match kube::Client::try_default().await {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::error!(
+                        "No cluster access ({}). Starting infrastructure will be refused until \
+                         this is fixed, because the deployment ceilings are counted from it.",
+                        e,
+                    );
+                    None
+                }
+            }
+        };
+
         Self {
             trigger_service: Arc::new(Mutex::new(TriggerService::with_registry(node_registry))),
             restate_url,
@@ -70,6 +94,7 @@ impl AppState {
             internal_api_key,
             http_client,
             node_registry,
+            kube_client,
         }
     }
     

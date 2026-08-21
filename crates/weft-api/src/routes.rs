@@ -14,6 +14,10 @@ use weft_nodes::{TriggerInfo, TriggerStartConfig};
 use weft_core::project::ProjectDefinition;
 use weft_core::executor_core::ProjectExecutionRequest;
 
+use weft_core::k8s_provisioner::NoCapacity;
+
+use crate::error_codes;
+use crate::error_codes::{capacity_unavailable, refusal};
 use crate::state::AppState;
 use crate::trigger_store;
 use crate::usage_store;
@@ -48,7 +52,11 @@ fn has_valid_internal_api_key(state: &AppState, headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn is_local_mode() -> bool {
+/// How long the caller waits for the cluster to say whether there is room.
+/// Internal, not a user-controlled operation, so a deadline is right here.
+const CAPACITY_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+pub fn is_local_mode() -> bool {
     std::env::var("DEPLOYMENT_MODE")
         .unwrap_or_else(|_| "cloud".to_string())
         .to_lowercase()
@@ -1251,14 +1259,22 @@ pub async fn start_infra(
     // Feature gate and credit check: skip in local mode
     if !is_local_mode() {
         if let Some(uid) = user_id {
-            let has_paid: bool = sqlx::query_scalar(
+            let has_paid: Result<Option<bool>, _> = sqlx::query_scalar(
                 "SELECT COALESCE(has_paid, false) FROM user_credits WHERE user_id = $1",
             )
             .bind(uid)
             .fetch_optional(&state.db_pool)
-            .await
-            .expect("DB error checking has_paid for infra start")
-            .unwrap_or(false);
+            .await;
+
+            let has_paid = match has_paid {
+                Ok(row) => row.unwrap_or(false),
+                Err(e) => {
+                    tracing::error!("[start_infra] cannot read credits for {}: {}", uid, e);
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                        "error": "Could not check your account right now. Try again in a moment."
+                    }))).into_response();
+                }
+            };
 
             if !has_paid {
                 return (StatusCode::PAYMENT_REQUIRED, Json(serde_json::json!({
@@ -1268,22 +1284,60 @@ pub async fn start_infra(
         }
     }
 
-    // Credit check: require $5 reserve per running infra instance (skip in local mode)
+    // Admission gates, all of them here: the dispatch below is fire-and-forget,
+    // so a refusal decided after it would never reach the caller and would leave
+    // the node provisioning forever. Both gates count running PROJECTS, which
+    // only the cluster knows, so one listing answers both.
     if !is_local_mode() {
-        if let Some(uid) = user_id {
-            let running_count: i64 = sqlx::query_scalar(
-                r#"
-                SELECT COUNT(*) FROM infra_pending_action ipa
-                JOIN projects p ON p.id::text = ipa.project_id
-                WHERE p.user_id = $1 AND ipa.action NOT IN ('stopping', 'terminating')
-                "#,
-            )
-            .bind(uid)
-            .fetch_one(&state.db_pool)
-            .await
-            .unwrap_or(0);
+        let client = match state.kube_client.as_ref() {
+            Some(c) => c,
+            None => {
+                tracing::error!("[start_infra] {} for {}: no cluster client", error_codes::INFRA_CAPACITY_UNKNOWN, project_id);
+                return capacity_unavailable();
+            }
+        };
 
-            if let Err(msg) = usage_store::check_infra_start_allowed(&state.db_pool, uid, running_count).await {
+        // Bound it well inside the client's own patience: the caller is waiting,
+        // and a wedged control plane must surface as a refusal it can retry, not
+        // as a request that outlives the browser.
+        let listing = tokio::time::timeout(
+            CAPACITY_LOOKUP_TIMEOUT,
+            weft_core::k8s_provisioner::list_running_infra(client),
+        ).await;
+
+        let running = match listing {
+            Ok(Ok(running)) => running,
+            Ok(Err(e)) => {
+                tracing::error!("[start_infra] {} for user {:?} project {}: {}",
+                    error_codes::INFRA_CAPACITY_UNKNOWN, user_id, project_id, e);
+                return capacity_unavailable();
+            }
+            Err(_) => {
+                tracing::error!("[start_infra] {} for user {:?} project {}: cluster did not answer within {:?}",
+                    error_codes::INFRA_CAPACITY_UNKNOWN, user_id, project_id, CAPACITY_LOOKUP_TIMEOUT);
+                return capacity_unavailable();
+            }
+        };
+
+        let inventory = weft_core::k8s_provisioner::inventory_of(&running, user_id, &project_id);
+
+        if let Err(no_capacity) = weft_core::k8s_provisioner::check_capacity(inventory) {
+            let code = match &no_capacity {
+                NoCapacity::Global { .. } => error_codes::INFRA_CAPACITY_GLOBAL,
+                NoCapacity::User { .. } => error_codes::INFRA_CAPACITY_USER,
+            };
+            tracing::warn!("[start_infra] {} refused for user {:?} project {}: {:?}",
+                code, user_id, project_id, no_capacity);
+            return refusal(StatusCode::CONFLICT, code, &no_capacity.to_string());
+        }
+
+        // Credit check: a $5 reserve per running project, plus this one. Runs
+        // after capacity so a user at their ceiling is told that, not told they
+        // are short of credits for a slot they cannot have anyway.
+        if let Some(uid) = user_id {
+            if let Err(msg) = usage_store::check_infra_credit_reserve(
+                &state.db_pool, uid, inventory.for_user as i64,
+            ).await {
                 return (StatusCode::PAYMENT_REQUIRED, Json(serde_json::json!({
                     "error": msg
                 }))).into_response();

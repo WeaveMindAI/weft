@@ -71,6 +71,12 @@ fn local_port_for_instance(instance_id: &str) -> u16 {
 /// infrastructure nodes are active.
 ///
 /// Returns NodeResult with `{ instanceId, endpointUrl }`.
+/// Whether infrastructure is being provisioned against a local cluster rather
+/// than a shared one.
+fn is_local_target() -> bool {
+    std::env::var("INFRASTRUCTURE_TARGET").as_deref() == Ok("local")
+}
+
 pub async fn infra_provision(
     ctx: &ExecutionContext,
     spec: &InfrastructureSpec,
@@ -104,6 +110,37 @@ pub async fn infra_provision(
         Err(e) => return NodeResult::failed(&format!("Failed to create K8s client: {}", e)),
     };
 
+    // The ceilings are enforced HERE, at the one point where infrastructure
+    // actually comes into existence. The start route refuses earlier so the
+    // user gets a readable answer, but that route is not the only way in:
+    // anything reaching this function must ask the same question, or the spend
+    // guard is only as good as the path taken to it.
+    //
+    // Keyed on the target, never on whether the caller supplied an owner: a
+    // request that simply omits one would otherwise opt itself out.
+    if !is_local_target() {
+        let running = match k8s_provisioner::list_running_infra(&k8s_client).await {
+            Ok(running) => running,
+            Err(e) => return NodeResult::failed(&format!(
+                "Cannot check whether there is room to start infrastructure: {}", e
+            )),
+        };
+        // A project with several infra nodes provisions them one at a time.
+        // The first one faces the ceilings; once any of its deployments is up
+        // the project has been admitted, and re-asking would strand a
+        // half-provisioned project that is already costing money.
+        let already_admitted = running
+            .iter()
+            .any(|r| r.owner.as_ref().map(|o| o.project_id.as_str()) == Some(project_id.as_str()));
+        if !already_admitted {
+            let inventory =
+                k8s_provisioner::inventory_of(&running, Some(&pctx.userId), &project_id);
+            if let Err(no_capacity) = k8s_provisioner::check_capacity(inventory) {
+                return NodeResult::failed(&no_capacity.to_string());
+            }
+        }
+    }
+
     if let Err(e) = k8s_provisioner::ensure_namespace(&k8s_client, &namespace).await {
         return NodeResult::failed(&format!("Failed to ensure namespace: {}", e));
     }
@@ -126,7 +163,7 @@ pub async fn infra_provision(
 
     // Build the action endpoint URL
     let sidecar_port = spec.actionEndpoint.port;
-    let is_local = std::env::var("INFRASTRUCTURE_TARGET").as_deref() == Ok("local");
+    let is_local = is_local_target();
     let endpoint_url = if is_local {
         let local_port = local_port_for_instance(&instance_id);
         // Kill any stale port-forward on this port (from a previous start cycle)
@@ -271,7 +308,7 @@ pub async fn infra_query_outputs(ctx: &ExecutionContext) -> NodeResult {
 
     // For local dev, ensure port-forward is alive (idempotent: if port is already
     // bound, kubectl will fail harmlessly and we proceed with the existing forward).
-    if std::env::var("INFRASTRUCTURE_TARGET").as_deref() == Ok("local") {
+    if is_local_target() {
         let local_port = local_port_for_instance(&instance_id);
         let namespace = ctx.input.get("namespace")
             .and_then(|v| v.as_str())

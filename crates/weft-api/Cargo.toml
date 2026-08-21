@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 weft-core = { path = "../weft-core" }
+kube.workspace = true
 weft-nodes = { path = "../weft-nodes" }
 tokio.workspace = true
 axum.workspace = true

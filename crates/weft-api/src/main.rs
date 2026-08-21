@@ -7,6 +7,7 @@ use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::sync::Arc;
 
+mod error_codes;
 mod routes;
 mod state;
 mod extension_tokens;

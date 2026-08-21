@@ -720,10 +720,10 @@ pub async fn get_balance(pool: &PgPool, user_id: &str) -> Result<f64, sqlx::Erro
     Ok(row.map(|(b,)| b).unwrap_or(0.0))
 }
 
-/// Check if a user has sufficient balance to start infrastructure.
-/// Requires $5 reserve per running infra instance (including the one about to start).
-/// Returns Ok(()) if allowed, Err(message) if not.
-pub async fn check_infra_start_allowed(
+/// Whether a user's balance covers the reserve for one more running project.
+/// Requires a $5 reserve per running project, including the one about to start.
+/// Capacity is a separate question, answered before this one.
+pub async fn check_infra_credit_reserve(
     pool: &PgPool,
     user_id: &str,
     current_running_count: i64,
@@ -735,7 +735,7 @@ pub async fn check_infra_start_allowed(
 
     if balance < required {
         Err(format!(
-            "Insufficient credits to start infrastructure. Balance: ${:.2}, required: ${:.2} (${:.2} reserve per running instance, {} currently running)",
+            "Insufficient credits to start infrastructure. Balance: ${:.2}, required: ${:.2} (${:.2} reserve per running project, {} currently running)",
             balance, required, 5.0, current_running_count
         ))
     } else {

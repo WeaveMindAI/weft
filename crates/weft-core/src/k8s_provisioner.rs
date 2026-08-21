@@ -580,8 +580,80 @@ async fn delete_single_resource(
     Ok(())
 }
 
-/// Count running infra deployments (replicas > 0) across all namespaces.
-pub async fn count_running_infra_deployments(client: &Client) -> Result<usize, String> {
+/// Who a running deployment belongs to. Both labels arrive together or not at
+/// all, so they live together: a deployment cannot know its project and not
+/// its user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfraOwner {
+    pub user_id: String,
+    pub project_id: String,
+}
+
+/// One infra deployment that is running right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningInfra {
+    /// Absent when the deployment carries no owner labels. It still costs
+    /// money, so it still fills a slot, but nothing can be attributed to a
+    /// user or reaped on their behalf, and only deleting it by hand frees the
+    /// slot back up.
+    pub owner: Option<InfraOwner>,
+    pub namespace: String,
+    pub name: String,
+    /// When the deployment object was created. Lets a caller tell recently
+    /// started infrastructure apart from infrastructure that has been up long
+    /// enough to have been accounted for.
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl RunningInfra {
+    /// How this deployment reads in a log line.
+    pub fn describe(&self) -> String {
+        format!("{}/{}", self.namespace, self.name)
+    }
+}
+
+/// Read one managed deployment, owner labels included when it carries them.
+///
+/// An unlabelled deployment is a real problem, but not one worth refusing
+/// every other user over: it is counted against the spend guard, reported by
+/// name, and left out of anyone's personal ceiling.
+fn running_from_item(item: &DynamicObject) -> RunningInfra {
+    let label = |key: &str| item.metadata.labels.as_ref().and_then(|l| l.get(key)).cloned();
+    let owner = match (label(LABEL_USER), label(LABEL_PROJECT)) {
+        (Some(user_id), Some(project_id)) => Some(InfraOwner { user_id, project_id }),
+        _ => None,
+    };
+    RunningInfra {
+        owner,
+        namespace: item.metadata.namespace.clone().unwrap_or_default(),
+        name: item.name_any(),
+        started_at: item
+            .metadata
+            .creation_timestamp
+            .as_ref()
+            .and_then(|t| chrono::DateTime::from_timestamp(t.0.as_second(), 0)),
+    }
+}
+
+/// Whether a deployment currently has pods asked for.
+///
+/// An absent `replicas` means one replica, which is what Kubernetes itself
+/// does with the field. Reading it as zero would hide a running deployment.
+fn is_running(item: &DynamicObject) -> bool {
+    item.data
+        .get("spec")
+        .and_then(|s| s.get("replicas"))
+        .and_then(|r| r.as_i64())
+        .unwrap_or(1)
+        > 0
+}
+
+/// Every infra deployment currently running, across all namespaces.
+///
+/// The cluster is the only place that knows this. The transitional flags kept
+/// alongside a start or stop are cleared the moment the transition lands, so a
+/// settled, running deployment leaves no record anywhere else.
+pub async fn list_running_infra(client: &Client) -> Result<Vec<RunningInfra>, String> {
     let label_selector = format!("{}=weavemind", LABEL_MANAGED_BY);
     let lp = ListParams::default().labels(&label_selector);
     let deploy_api: Api<DynamicObject> = Api::all_with(
@@ -592,39 +664,259 @@ pub async fn count_running_infra_deployments(client: &Client) -> Result<usize, S
     let list = deploy_api.list(&lp).await
         .map_err(|e| format!("Failed to list deployments: {}", e))?;
 
-    let count = list.items.iter().filter(|d| {
-        d.data.get("spec")
-            .and_then(|s| s.get("replicas"))
-            .and_then(|r| r.as_i64())
-            .unwrap_or(0) > 0
-    }).count();
+    let running: Vec<RunningInfra> =
+        list.items.iter().filter(|d| is_running(d)).map(running_from_item).collect();
 
-    Ok(count)
+    for orphan in running.iter().filter(|r| r.owner.is_none()) {
+        tracing::error!(
+            "Deployment {} is running and managed but carries no owner labels: it costs money \
+             that cannot be attributed, and nothing can stop it on an owner's behalf.",
+            orphan.describe(),
+        );
+    }
+
+    Ok(running)
 }
 
-/// Count running infra deployments (replicas > 0) for a specific user.
-pub async fn count_running_infra_deployments_for_user(
-    client: &Client,
-    user_id: &str,
-) -> Result<usize, String> {
-    let label_selector = format!("{}=weavemind,{}={}", LABEL_MANAGED_BY, LABEL_USER, user_id);
-    let lp = ListParams::default().labels(&label_selector);
-    let deploy_api: Api<DynamicObject> = Api::all_with(
-        client.clone(),
-        &ApiResource::from_gvk(&kube::api::GroupVersionKind::gvk("apps", "v1", "Deployment")),
-    );
+/// Ceiling on infra PROJECTS running at once, across all users. The cluster
+/// provisions nodes on demand, so this is a spend guard rather than a capacity
+/// one: every project past it costs real money.
+pub const MAX_GLOBAL_INFRA_PROJECTS: usize = 25;
 
-    let list = deploy_api.list(&lp).await
-        .map_err(|e| format!("Failed to list deployments for user {}: {}", user_id, e))?;
+/// Ceiling on infra projects running at once for one user. A project can hold
+/// several infra nodes, and they come up and down together, so the unit a user
+/// recognises is the project, not the deployment.
+pub const MAX_USER_INFRA_PROJECTS: usize = 2;
 
-    let count = list.items.iter().filter(|d| {
-        d.data.get("spec")
-            .and_then(|s| s.get("replicas"))
-            .and_then(|r| r.as_i64())
-            .unwrap_or(0) > 0
-    }).count();
+/// Why a project cannot start right now, and how far over the line it is.
+///
+/// The sentence lives here because more than one place answers a user with it,
+/// and two copies would drift. The status code and the error code stay with
+/// whoever is answering.
+#[derive(Debug, Clone)]
+pub enum NoCapacity {
+    /// The ceiling across all users, with the count that reached it.
+    Global { running: usize, ceiling: usize },
+    /// This user's own ceiling, with their count.
+    User { running: usize, ceiling: usize },
+}
 
-    Ok(count)
+impl std::fmt::Display for NoCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NoCapacity::Global { running, ceiling } => write!(
+                f, "Infrastructure is at capacity ({running}/{ceiling} projects running)."
+            ),
+            NoCapacity::User { running, ceiling } => write!(
+                f,
+                "You already have {running} projects running infrastructure (limit {ceiling}). \
+                 Stop or terminate one to free a slot."
+            ),
+        }
+    }
+}
+
+/// How many infra projects are running, from the two angles the ceilings care
+/// about. Counted in projects, matching the ceilings.
+#[derive(Debug, Clone, Copy)]
+pub struct InfraInventory {
+    pub global: usize,
+    pub for_user: usize,
+}
+
+/// Count running projects, cluster-wide and for one user.
+///
+/// `starting_project` is left out of both counts: restarting a project must
+/// never be refused because that same project is already up. Pure, so the
+/// counting is testable without a cluster.
+pub fn inventory_of(
+    running: &[RunningInfra],
+    user_id: Option<&str>,
+    starting_project: &str,
+) -> InfraInventory {
+    let others = || {
+        running
+            .iter()
+            .filter(|r| r.owner.as_ref().map(|o| o.project_id.as_str()) != Some(starting_project))
+    };
+
+    let mut projects: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // A deployment nobody owns still costs money, so it fills a slot of its
+    // own. It cannot count toward a user's ceiling: we do not know whose.
+    let mut unattributed = 0usize;
+    for infra in others() {
+        match &infra.owner {
+            Some(owner) => {
+                projects.insert(owner.project_id.as_str());
+            }
+            None => unattributed += 1,
+        }
+    }
+
+    let for_user = match user_id {
+        Some(uid) => others()
+            .filter_map(|r| r.owner.as_ref())
+            .filter(|o| o.user_id == uid)
+            .map(|o| o.project_id.as_str())
+            .collect::<std::collections::HashSet<&str>>()
+            .len(),
+        None => 0,
+    };
+
+    InfraInventory { global: projects.len() + unattributed, for_user }
+}
+
+/// Whether there is room to start one more project.
+pub fn check_capacity(inventory: InfraInventory) -> Result<(), NoCapacity> {
+    if inventory.global >= MAX_GLOBAL_INFRA_PROJECTS {
+        return Err(NoCapacity::Global {
+            running: inventory.global,
+            ceiling: MAX_GLOBAL_INFRA_PROJECTS,
+        });
+    }
+    if inventory.for_user >= MAX_USER_INFRA_PROJECTS {
+        return Err(NoCapacity::User {
+            running: inventory.for_user,
+            ceiling: MAX_USER_INFRA_PROJECTS,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    fn infra(user: &str, project: &str) -> RunningInfra {
+        RunningInfra {
+            owner: Some(InfraOwner { user_id: user.into(), project_id: project.into() }),
+            namespace: format!("wm-{}", user.to_lowercase()),
+            name: format!("wf-{project}-db"),
+            started_at: None,
+        }
+    }
+
+    fn orphan(name: &str) -> RunningInfra {
+        RunningInfra {
+            owner: None,
+            namespace: "wm-old".into(),
+            name: name.into(),
+            started_at: None,
+        }
+    }
+
+    fn deployment(replicas: Option<i64>, labels: &[(&str, &str)]) -> DynamicObject {
+        let mut obj = DynamicObject::new(
+            "wf-test-db",
+            &ApiResource::from_gvk(&kube::api::GroupVersionKind::gvk("apps", "v1", "Deployment")),
+        );
+        obj.metadata.namespace = Some("wm-test".into());
+        obj.metadata.labels = Some(labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        obj.data = match replicas {
+            Some(r) => serde_json::json!({ "spec": { "replicas": r } }),
+            None => serde_json::json!({ "spec": {} }),
+        };
+        obj
+    }
+
+    #[test]
+    fn an_omitted_replica_count_means_one() {
+        assert!(is_running(&deployment(None, &[])), "Kubernetes defaults replicas to 1");
+        assert!(is_running(&deployment(Some(1), &[])));
+        assert!(!is_running(&deployment(Some(0), &[])));
+    }
+
+    #[test]
+    fn owner_labels_are_read_off_the_deployment() {
+        let got = running_from_item(&deployment(Some(1), &[
+            (LABEL_USER, "UserA"), (LABEL_PROJECT, "p1"),
+        ]));
+        assert_eq!(got.owner, Some(InfraOwner { user_id: "UserA".into(), project_id: "p1".into() }));
+        assert_eq!(got.describe(), "wm-test/wf-test-db");
+    }
+
+    #[test]
+    fn a_deployment_missing_either_label_has_no_owner() {
+        assert!(running_from_item(&deployment(Some(1), &[(LABEL_PROJECT, "p1")])).owner.is_none());
+        assert!(running_from_item(&deployment(Some(1), &[(LABEL_USER, "UserA")])).owner.is_none());
+    }
+
+    #[test]
+    fn an_unowned_deployment_fills_a_slot_but_no_ones_ceiling() {
+        // It costs money, so the spend guard must see it. Nobody can be held to
+        // it, so it must not push a user over their own limit.
+        let running = [orphan("wf-ancient-db"), infra("UserA", "p1")];
+        let inv = inventory_of(&running, Some("UserA"), "p2");
+        assert_eq!(inv.global, 2);
+        assert_eq!(inv.for_user, 1);
+    }
+
+    #[test]
+    fn one_unowned_deployment_does_not_refuse_everyone_else() {
+        // The state production is actually in: a single unlabelled deployment
+        // left over from long ago must not stop anyone from starting.
+        let running = [orphan("wf-d7ce5e2a6591-db")];
+        assert!(check_capacity(inventory_of(&running, Some("UserA"), "p1")).is_ok());
+    }
+
+    #[test]
+    fn several_deployments_of_one_project_count_once() {
+        let running = [infra("UserA", "p1"), infra("UserA", "p1"), infra("UserA", "p2")];
+        let inv = inventory_of(&running, Some("UserA"), "p3");
+        assert_eq!(inv.global, 2);
+        assert_eq!(inv.for_user, 2);
+    }
+
+    #[test]
+    fn restarting_a_running_project_does_not_count_against_itself() {
+        let running = [infra("UserA", "p1"), infra("UserA", "p1")];
+        let inv = inventory_of(&running, Some("UserA"), "p1");
+        assert_eq!(inv.for_user, 0, "a project must not block its own restart");
+        assert_eq!(inv.global, 0);
+        assert!(check_capacity(inv).is_ok());
+    }
+
+    #[test]
+    fn user_ids_are_matched_exactly() {
+        let running = [infra("UserA", "p1"), infra("usera", "p2")];
+        let inv = inventory_of(&running, Some("UserA"), "p3");
+        assert_eq!(inv.for_user, 1, "ids differing only in case are different users");
+        assert_eq!(inv.global, 2);
+    }
+
+    #[test]
+    fn another_users_projects_fill_only_the_global_ceiling() {
+        let running: Vec<_> = (0..MAX_GLOBAL_INFRA_PROJECTS)
+            .map(|i| infra("Someone", &format!("p{i}")))
+            .collect();
+        let inv = inventory_of(&running, Some("UserA"), "mine");
+        assert_eq!(inv.for_user, 0);
+        assert!(matches!(check_capacity(inv), Err(NoCapacity::Global { .. })));
+    }
+
+    #[test]
+    fn the_global_ceiling_bites_before_the_users_own() {
+        let err = check_capacity(InfraInventory {
+            global: MAX_GLOBAL_INFRA_PROJECTS,
+            for_user: MAX_USER_INFRA_PROJECTS,
+        }).unwrap_err();
+        assert!(matches!(err, NoCapacity::Global { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_users_own_ceiling_stops_them_while_the_cluster_is_free() {
+        let err = check_capacity(InfraInventory { global: 0, for_user: MAX_USER_INFRA_PROJECTS })
+            .unwrap_err();
+        assert!(matches!(err, NoCapacity::User { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn the_last_free_slot_is_usable() {
+        assert!(check_capacity(InfraInventory {
+            global: MAX_GLOBAL_INFRA_PROJECTS - 1,
+            for_user: MAX_USER_INFRA_PROJECTS - 1,
+        }).is_ok());
+    }
 }
 
 fn parse_gvk(api_version: &str, kind: &str) -> kube::api::GroupVersionKind {
@@ -634,4 +926,36 @@ fn parse_gvk(api_version: &str, kind: &str) -> kube::api::GroupVersionKind {
         ("", api_version.as_ref())
     };
     kube::api::GroupVersionKind::gvk(group, version, kind)
+}
+
+/// Reads the real cluster the way the ceilings do. Ignored by default because
+/// it needs credentials; run it before a deploy to confirm the listing works
+/// against the cluster you are deploying to:
+///   KUBECONFIG=... cargo test -p weft-core live_cluster_inventory -- --ignored --nocapture
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_cluster_inventory() {
+        let client = Client::try_default().await.expect("no cluster credentials");
+        let running = list_running_infra(&client).await.expect("listing failed");
+
+        println!("running infra deployments: {}", running.len());
+        for infra in &running {
+            match &infra.owner {
+                Some(o) => println!("  {} user={} project={}", infra.describe(), o.user_id, o.project_id),
+                None => println!("  {} UNATTRIBUTED", infra.describe()),
+            }
+        }
+
+        let inventory = inventory_of(&running, None, "not-a-project");
+        println!("global={}/{}", inventory.global, MAX_GLOBAL_INFRA_PROJECTS);
+        assert!(
+            inventory.global <= running.len(),
+            "a project cannot count more slots than it has deployments"
+        );
+        println!("capacity says: {:?}", check_capacity(inventory));
+    }
 }
