@@ -1,0 +1,13 @@
+# The image installs its own dependencies and builds its own output. Copying
+# a local tree's versions in makes the build unreproducible, and pnpm aborts
+# when the copied modules directory disagrees with the lockfile.
+node_modules
+build
+.svelte-kit
+
+# Never bake local secrets into an image.
+.env
+.env.*
+!.env.example
+
+.git
