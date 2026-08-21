@@ -87,6 +87,36 @@ export function getAuthHeaders(): Record<string, string> {
     return { 'Authorization': `Bearer ${token}` };
 }
 
+/// Why a request was refused, in words a user can act on.
+///
+/// The API refuses with `{ error }`. Everything else (an empty body from a
+/// proxy, a non-JSON error page) still has to say something, so the status
+/// line is the floor: a blank toast tells the user nothing.
+// SYNC: refusal body <-> weft/crates/weft-api/src/error_codes.rs (refusal)
+export async function failureReason(response: Response): Promise<string> {
+	const body = await response.text().catch(() => '');
+	try {
+		const parsed = JSON.parse(body);
+		if (typeof parsed?.error === 'string' && parsed.error) return parsed.error;
+		// It parsed, so the body is a payload rather than a message. Showing
+		// the raw JSON would be worse than saying nothing useful.
+		return statusLine(response);
+	} catch {
+		// Not JSON. A short plain body is worth showing; a proxy's HTML error
+		// page is not.
+		const raw = body.trim();
+		return raw && raw.length <= 300 && !raw.startsWith('<') ? raw : statusLine(response);
+	}
+}
+
+/// The last resort, when the body says nothing usable. HTTP/2 drops the reason
+/// phrase, so the number has to stand on its own.
+function statusLine(response: Response): string {
+	return response.statusText
+		? `HTTP ${response.status} ${response.statusText}`
+		: `The server answered ${response.status}.`;
+}
+
 // Fetch wrapper that automatically injects auth headers for cloud mode
 export function authFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const headers = new Headers(init?.headers);

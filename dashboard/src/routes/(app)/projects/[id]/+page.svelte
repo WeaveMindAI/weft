@@ -21,7 +21,7 @@
 		loadRunningExecution,
 		clearRunningExecution,
 	} from "$lib/utils";
-	import { authFetch, api } from "$lib/config";
+	import { authFetch, api, failureReason } from "$lib/config";
 	import { Button } from "$lib/components/ui/button";
 	import ProjectEditor from "$lib/components/project/ProjectEditor.svelte";
 	import { buildNodeCatalog, buildShoppableNodes, resolveShoppedNodes, formatNodeCatalog } from '$lib/ai/node-catalog';
@@ -453,6 +453,18 @@
 
 	// Trigger detection: frontend graph vs backend state
 	let hasTriggersInFrontend = $derived(project?.nodes.some(n => triggerNodeTypes.has(n.nodeType)) ?? false);
+	// Named so the action bar can say WHICH nodes make this project trigger-driven:
+	// without them the missing Run button reads as a bug rather than a consequence.
+	// Counted rather than repeated, so five webhooks read as one entry, not five.
+	let triggerNodeLabels = $derived.by(() => {
+		const counts = new Map<string, number>();
+		for (const n of project?.nodes ?? []) {
+			if (!triggerNodeTypes.has(n.nodeType)) continue;
+			const label = NODE_TYPE_CONFIG[n.nodeType as NodeType]?.label ?? n.nodeType;
+			counts.set(label, (counts.get(label) ?? 0) + 1);
+		}
+		return [...counts].map(([label, count]) => (count > 1 ? `${label} x${count}` : label));
+	});
 	let hasTriggersInBackend = $derived(backendTriggers.some(t => t.projectId === (project?.id ?? '') && (t.status === 'Running' || t.status === 'Activating' || t.status === 'Deactivating')));
 	let hasTriggers = $derived(hasTriggersInFrontend || hasTriggersInBackend);
 
@@ -749,19 +761,13 @@
 				if (data.status === 'starting') {
 					toast.info('Infrastructure starting...');
 					startInfraPolling();
-				} else if (data.status === 'limit_reached') {
-					toast.error('Global infrastructure limit reached. Please contact us at support@weavemind.ai to increase your limit.');
-					isInfraLoading = false;
-				} else if (data.status === 'user_limit_reached') {
-					toast.error('You have reached your infrastructure limit (2 running). Please stop or terminate existing infrastructure, or contact us at support@weavemind.ai.');
-					isInfraLoading = false;
 				} else {
 					toast.success('Infrastructure started');
 					isInfraLoading = false;
 				}
 			} else {
-				const errorText = await response.text();
-				toast.error('Failed to start infrastructure', { description: errorText });
+				// The API says which limit was hit and what clears it.
+				toast.error('Failed to start infrastructure', { description: await failureReason(response) });
 				// Don't set infraStatus to 'failed' for payment/auth errors (4xx)
 				// because it shows retry/terminate buttons which don't apply.
 				// Only set 'failed' for server errors (5xx) where a retry might help.
@@ -829,7 +835,7 @@
 				const data = await response.json();
 				infraStatus = data.status as typeof infraStatus;
 			} else {
-				toast.error('Failed to stop infrastructure');
+				toast.error('Failed to stop infrastructure', { description: await failureReason(response) });
 				await checkInfraStatus();
 				isInfraLoading = false;
 				return;
@@ -857,7 +863,7 @@
 				const data = await response.json();
 				infraStatus = data.status as typeof infraStatus;
 			} else {
-				toast.error('Failed to terminate infrastructure');
+				toast.error('Failed to terminate infrastructure', { description: await failureReason(response) });
 				await checkInfraStatus();
 				isInfraLoading = false;
 				return;
@@ -1862,7 +1868,7 @@
 			});
 
 			if (!response.ok) {
-				const errorText = await response.text();
+				const errorText = await failureReason(response);
 				console.error('[Execution] Backend error:', errorText);
 				executionState = { ...executionState, isStarting: false };
 				alert(`Failed to start project: ${errorText}`);
@@ -2224,7 +2230,7 @@
 				<RunnerView
 					{project}
 					onUpdateNodeConfig={handleRunnerUpdateNodeConfig}
-					triggerState={{ hasTriggers, isActive: isProjectActive, isLoading: isCheckingStatus || isActivating, isStale: triggerStale }}
+					triggerState={{ hasTriggers, triggerNodeLabels, isActive: isProjectActive, isLoading: isCheckingStatus || isActivating, isStale: triggerStale }}
 					onToggleTrigger={toggleProjectActivation}
 					onResyncTrigger={resyncTrigger}
 					infraState={{ hasInfrastructure, hasInfraInFrontend, hasInfraInBackend, status: infraStatus, nodes: infraNodes, isLoading: isInfraLoading }}
@@ -2256,7 +2262,7 @@
 						onRun={runProject}
 						onStop={stopProject}
 						{executionState}
-						triggerState={{ hasTriggers, hasTriggersInFrontend, hasTriggersInBackend, isActive: isProjectActive, isLoading: isCheckingStatus || isActivating, hasError: statusCheckFailed, isStale: triggerStale }}
+						triggerState={{ hasTriggers, hasTriggersInFrontend, hasTriggersInBackend, triggerNodeLabels, isActive: isProjectActive, isLoading: isCheckingStatus || isActivating, hasError: statusCheckFailed, isStale: triggerStale }}
 						onToggleTrigger={toggleProjectActivation}
 						onResyncTrigger={resyncTrigger}
 						infraState={{ hasInfrastructure, hasInfraInFrontend, hasInfraInBackend, infraDiverged, status: infraStatus, nodes: infraNodes, isLoading: isInfraLoading }}

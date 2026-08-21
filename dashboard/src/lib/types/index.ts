@@ -966,3 +966,21 @@ export interface ProjectValidationResult {
 	nodeErrors: Map<string, ValidationError[]>;
 }
 
+
+/// The trigger half of the action bar's state. One definition, because it is
+/// threaded through several wrappers and a field added to only some of them
+/// silently reaches only some views.
+export interface TriggerState {
+	/// Whether the project runs from triggers at all, from the graph or from
+	/// what the backend still has registered.
+	hasTriggers: boolean;
+	hasTriggersInFrontend?: boolean;
+	hasTriggersInBackend?: boolean;
+	/// The trigger nodes in the graph, as the user sees them named, with a
+	/// count when the same kind appears more than once.
+	triggerNodeLabels?: string[];
+	isActive: boolean;
+	isLoading: boolean;
+	hasError?: boolean;
+	isStale?: boolean;
+}

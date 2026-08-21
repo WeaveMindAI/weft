@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { TriggerState } from '$lib/types';
 	import { SvelteFlow, Controls, Background, useSvelteFlow, useUpdateNodeInternals, type Node, type Edge, type Connection, SelectionMode, ConnectionLineType, MarkerType } from "@xyflow/svelte";
 	import { untrack, tick } from "svelte";
 	import "@xyflow/svelte/dist/style.css";
@@ -52,15 +53,7 @@
 			nodeStatuses: Record<string, string>;
 			nodeExecutions: import('$lib/types').NodeExecutionTable;
 		};
-		triggerState?: {
-			hasTriggers: boolean;
-			hasTriggersInFrontend: boolean;
-			hasTriggersInBackend: boolean;
-			isActive: boolean;
-			isLoading: boolean;
-			hasError?: boolean;
-			isStale?: boolean;
-		};
+		triggerState?: TriggerState;
 		onToggleTrigger?: () => void;
 		onResyncTrigger?: () => void;
 		infraState?: {

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { TriggerState } from '$lib/types';
 	import type { ProjectDefinition, Block, LiveDataItem, RunnerMode, RunnerTheme } from '$lib/types';
 	import ActionBar from './ActionBar.svelte';
 	import BlockList from '../runner/BlockList.svelte';
@@ -50,7 +51,7 @@
 	}: {
 		project: ProjectDefinition;
 		onUpdateNodeConfig: (nodeId: string, config: Record<string, unknown>) => void;
-		triggerState: { hasTriggers: boolean; isActive: boolean; isLoading: boolean; isStale?: boolean };
+		triggerState: TriggerState;
 		onToggleTrigger: () => void;
 		onResyncTrigger?: () => void;
 		infraState: { hasInfrastructure: boolean; hasInfraInFrontend?: boolean; hasInfraInBackend?: boolean; status: string; nodes?: Array<{ nodeId: string; nodeType: string; instanceId: string; status: string; backend?: string }>; isLoading: boolean };

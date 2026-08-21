@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { TriggerState } from '$lib/types';
 	import { SvelteFlowProvider } from "@xyflow/svelte";
 	import ProjectEditorInner from "./ProjectEditorInner.svelte";
 	import type { ProjectDefinition, ValidationError } from "$lib/types";
@@ -56,15 +57,7 @@
 			nodeStatuses: Record<string, string>;
 			nodeExecutions: import('$lib/types').NodeExecutionTable;
 		};
-		triggerState?: {
-			hasTriggers: boolean;
-			hasTriggersInFrontend: boolean;
-			hasTriggersInBackend: boolean;
-			isActive: boolean;
-			isLoading: boolean;
-			hasError?: boolean;
-			isStale?: boolean;
-		};
+		triggerState?: TriggerState;
 		onToggleTrigger?: () => void;
 		onResyncTrigger?: () => void;
 		infraState?: {

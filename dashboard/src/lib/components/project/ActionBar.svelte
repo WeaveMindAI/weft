@@ -1,4 +1,5 @@
 <script lang="ts">
+	import type { TriggerState } from '$lib/types';
 	import { Play, Square, Zap, ZapOff, Database, Loader2 } from '@lucide/svelte';
 
 	let {
@@ -32,15 +33,7 @@
 			nodes?: Array<{ nodeId: string; nodeType: string; instanceId: string; status: string; backend?: string }>;
 			isLoading: boolean;
 		};
-		triggerState?: {
-			hasTriggers: boolean;
-			hasTriggersInFrontend?: boolean;
-			hasTriggersInBackend?: boolean;
-			isActive: boolean;
-			isLoading: boolean;
-			hasError?: boolean;
-			isStale?: boolean;
-		};
+		triggerState?: TriggerState;
 		executionState?: { isRunning: boolean; isStarting?: boolean; isStopping?: boolean; activeEdges?: Set<string>; nodeOutputs?: Record<string, unknown>; nodeStatuses?: Record<string, string> };
 		onCheckInfraStatus?: () => void;
 		onStartInfra?: () => void;
@@ -60,6 +53,24 @@
 	} = $props();
 
 	const isCard = $derived(variant === 'card');
+
+	// Opened by click, so touch and keyboard reach it too.
+	let showTriggerHint = $state(false);
+	// It describes the current trigger state, so it must not outlive it.
+	$effect(() => {
+		triggerHint;
+		showTriggerHint = false;
+	});
+
+	const triggerLabels = $derived(triggerState?.triggerNodeLabels ?? []);
+
+	// A project with triggers runs from them, so it has no manual Run button.
+	// Say which nodes make that so, or the missing button reads as breakage.
+	const triggerHint = $derived(
+		triggerLabels.length
+			? `This project runs on its own, from ${triggerLabels.join(' and ')}. Remove ${triggerLabels.length > 1 ? 'those nodes' : 'that node'} in the editor if you want to run it by hand.`
+			: 'This project is still listening for events, so there is no manual Run. Click Deactivate to run it by hand.'
+	);
 
 	const infraBlocking = $derived(
 		infraState?.hasInfrastructure && (infraState.status !== 'running' || infraState.isLoading)
@@ -160,11 +171,27 @@
 					<p class="text-xs text-muted-foreground">
 						{triggerState.isActive ? 'Active: listening for events' : 'Inactive'}
 					</p>
+					<p class="text-xs text-muted-foreground mt-0.5">{triggerHint}</p>
 				</div>
 				{@render triggerButton()}
 			</div>
 		{:else}
 			{@render triggerButton()}
+			<span class="relative inline-flex items-center">
+				<button
+					type="button"
+					class="flex items-center justify-center w-5 h-5 rounded-full border border-zinc-200 bg-white text-zinc-400 text-[10px] hover:bg-zinc-50 mx-1"
+					aria-label="Why is there no Run button?"
+					aria-expanded={showTriggerHint}
+					onclick={() => (showTriggerHint = !showTriggerHint)}
+					onkeydown={(e) => { if (e.key === 'Escape') showTriggerHint = false; }}
+				>?</button>
+				{#if showTriggerHint}
+					<div class="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 w-64 p-2 rounded-lg bg-zinc-900 text-white text-xs shadow-xl z-30" role="note">
+						{triggerHint}
+					</div>
+				{/if}
+			</span>
 			{#if onToggleTriggerSubgraph}
 				<button
 					class="flex items-center justify-center w-7 h-7 rounded-lg transition-colors {showTriggerSubgraph ? 'bg-emerald-100 text-emerald-600 border border-emerald-200' : 'bg-white text-zinc-400 border border-zinc-200 hover:bg-zinc-50'}"
