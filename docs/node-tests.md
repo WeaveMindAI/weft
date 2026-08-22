@@ -253,7 +253,7 @@ interleave too. The report keeps declaration order either way.
 
 The whole catalog sweeps through `scripts/run-node-tests.sh`, which
 runs package by package and stops at the first failure (mirroring
-`run-e2e.sh`: `--from <package>` resumes a broken run, bare names
+`scripts/run-e2e.sh`: `--from <package>` resumes a broken run, bare names
 scope it, `--tier` picks tiers; on a live run the script passes
 `--yes`, since `--tier live` is already the opt-in and a sweep cannot
 stop on a prompt). `--parallel` runs every package at once and

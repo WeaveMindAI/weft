@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the catalog's node self-tests package-by-package, STOPPING at the
-# first failing package (the same discipline as crates/weft-e2e/run-e2e.sh:
+# first failing package (the same discipline as scripts/run-e2e.sh:
 # a failure halts right there so its output is the last thing on screen,
 # instead of burying it under the rest of the suite).
 #

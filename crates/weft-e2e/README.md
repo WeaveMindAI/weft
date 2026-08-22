@@ -12,8 +12,8 @@ Always via the runner. It runs one test binary at a time and STOPS at the first
 failure, leaving the cluster in that state for inspection:
 
 ```bash
-crates/weft-e2e/run-e2e.sh                # whole suite
-crates/weft-e2e/run-e2e.sh live_chat      # one test, by file name
+scripts/run-e2e.sh                # whole suite
+scripts/run-e2e.sh live_chat      # one test, by file name
 ```
 
 Need a subset or a flag? Add it to `run-e2e.sh`. Do NOT hand-write a `cargo test`

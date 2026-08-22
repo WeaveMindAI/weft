@@ -2,9 +2,8 @@
 
 Larger design work that's been surfaced but deferred. Not bugs (those
 get fixed inline); these are architecture decisions that need design
-before implementation. An entry that already has a full written plan
-links to a file in `todo_plans/` (the plan holds every detail; the
-entry here is just the pointer + one-paragraph what/why).
+before implementation. Each entry carries its own what/why; a written
+plan lives in `docs/` while it is being worked.
 
 ## Unify journal holes: a missing/corrupt event is a HOLE, fatal only on the resume frontier
 

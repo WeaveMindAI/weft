@@ -10,11 +10,11 @@
 # this script halts right there so you can look.
 #
 # Usage:
-#   crates/weft-e2e/run-e2e.sh                   # every test, in order, stop on first fail
-#   crates/weft-e2e/run-e2e.sh listener_move     # just these test binaries, in order
-#   crates/weft-e2e/run-e2e.sh --from storage    # the full ordered suite, but START at
-#                                                # the first test whose name contains
-#                                                # `storage`, skipping everything before it
+#   scripts/run-e2e.sh                   # every test, in order, stop on first fail
+#   scripts/run-e2e.sh listener_move     # just these test binaries, in order
+#   scripts/run-e2e.sh --from storage    # the full ordered suite, but START at
+#                                        # the first test whose name contains
+#                                        # `storage`, skipping everything before it
 #
 # `--from <name>` is the "resume where it broke" switch: when a mid-suite run
 # stops on a failure, re-run with `--from <that_test>` (a substring is enough) to
@@ -27,7 +27,8 @@
 # probes that are allowed).
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR/../.." || exit 1
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT" || exit 1
 
 # ---------- Auto-provisioned dependencies ----------
 # Everything a test needs that a local machine can serve is provisioned
@@ -107,16 +108,17 @@ if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
   fi
 fi
 
-# Test binaries are DISCOVERED from crates/weft-e2e/tests/*.rs (never a
+# Test binaries are DISCOVERED from the e2e crate's tests/*.rs (never a
 # hardcoded list, which silently drops a newly-added test if someone forgets
 # to update it). A new `tests/<name>.rs` is picked up automatically.
+E2E_TESTS="$REPO_ROOT/crates/weft-e2e/tests"
 mapfile -t DISCOVERED < <(
-  find "$SCRIPT_DIR/tests" -maxdepth 1 -name '*.rs' -printf '%f\n' \
+  find "$E2E_TESTS" -maxdepth 1 -name '*.rs' -printf '%f\n' \
     | sed 's/\.rs$//' \
     | sort
 )
 if [ ${#DISCOVERED[@]} -eq 0 ]; then
-  echo "no e2e test files found under $SCRIPT_DIR/tests" >&2
+  echo "no e2e test files found under $E2E_TESTS" >&2
   exit 1
 fi
 
@@ -161,13 +163,13 @@ if [ "${1:-}" = "--from" ]; then
   TESTS=("${ALL_TESTS[@]:$START}")
   echo "Resuming from '${ALL_TESTS[$START]}' (${#TESTS[@]} test(s) remaining)."
 else
-  # Bare test names (no flags): `run-e2e.sh openrouter storage`. An unknown
+  # Bare test names (no flags): `scripts/run-e2e.sh openrouter storage`. An unknown
   # flag would otherwise be taken for a test name and produce a baffling
   # cargo error, so reject it here with the usage.
   for arg in "$@"; do
     if [[ "$arg" == -* ]]; then
       echo "unknown option '$arg'." >&2
-      echo "usage: run-e2e.sh [--from <name>] [<test> ...]" >&2
+      echo "usage: scripts/run-e2e.sh [--from <name>] [<test> ...]" >&2
       echo "  no args      run every test, in order" >&2
       echo "  <test> ...   run only these (bare names, no --test)" >&2
       echo "  --from <n>   run the ordered suite starting at the first name containing <n>" >&2
