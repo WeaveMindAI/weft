@@ -1,5 +1,5 @@
-//! Form submission with a rendered schema. The consumer (browser
-//! extension, dashboard) reads `schema` to render a form; submission
+//! Form submission with a rendered schema. The consumer (the browser
+//! extension) reads `schema` to render a form; submission
 //! flows back through the dispatcher's task-callback URL.
 
 use serde::{Deserialize, Serialize};
@@ -18,8 +18,8 @@ pub struct Form {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Consumer label for token-scoped enumeration. Browser
-    /// extension, dashboard, etc. fetch signals tagged with the
+    /// Consumer label for token-scoped enumeration. Consumers (the
+    /// browser extension) fetch signals tagged with the
     /// matching string (e.g. `"human_in_the_loop"`). `None` = not
     /// listed in any consumer surface.
     ///
@@ -45,7 +45,7 @@ pub struct FormField {
     pub key: String,
     pub label: String,
     /// Render hint copied from the spec (component name + flags).
-    /// The dashboard / browser extension reads `render.component`
+    /// The browser extension reads `render.component`
     /// to pick the UI primitive.
     #[serde(default)]
     pub render: Value,

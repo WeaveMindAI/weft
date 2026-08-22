@@ -183,12 +183,21 @@ fn find_groups_for_node(
 
         let pulse_ids: Vec<uuid::Uuid> = group_pulses.iter().map(|p| p.id).collect();
 
+        // A generator port never lists as closed: its closure is the
+        // stream's END (an empty stream when no items preceded it), a
+        // value the firing consumes through its live feed, not a
+        // structural "nothing arrived" (see the skip module doc).
         let mut closed_ports: Vec<String> = wired
             .iter()
             .filter(|port_name| {
-                resolve_port_value(node_pulses, *color, frames, port_name)
-                    .map(|p| p.closed)
-                    .unwrap_or(false)
+                let is_generator = node
+                    .inputs
+                    .iter()
+                    .any(|p| p.name == **port_name && p.port_type.as_generator().is_some());
+                !is_generator
+                    && resolve_port_value(node_pulses, *color, frames, port_name)
+                        .map(|p| p.closed)
+                        .unwrap_or(false)
             })
             .map(|p| p.to_string())
             .collect();
@@ -334,19 +343,21 @@ pub fn build_kicked_input(node: &NodeDefinition, port_snapshot: Option<&Value>) 
 /// Check one incoming value against its input port type. THE single
 /// place input type enforcement lives.
 fn check_input(port: &crate::project::InputDefinition, value: &Value) -> InputCheck {
-    if value.is_null()
-        || port.port_type.is_unresolved()
-        || port.port_type.accepts_runtime_value(value)
-    {
+    // A generator port's pulses carry ITEMS: each value is checked
+    // against the ELEMENT type, never against `Generator[T]` itself
+    // (the whole-port handle only exists in the consumer's bag, built
+    // by the engine after this gate).
+    let declared = port.port_type.port_value_type();
+    if value.is_null() || declared.is_unresolved() || declared.accepts_runtime_value(value) {
         return InputCheck::Ok;
     }
-    if !port.required || port.port_type.contains_null() {
+    if !port.required || declared.contains_null() {
         return InputCheck::NullIt;
     }
     InputCheck::Fail(format!(
         "type mismatch on '{}': expected {}, got {}",
         port.name,
-        port.port_type,
+        declared,
         WeftType::infer(value)
     ))
 }

@@ -223,7 +223,47 @@ impl ExecutionContext {
     /// mentions, neither here nor via `close_port`, get a CLOSURE marker
     /// at termination so downstream consumers learn nothing's coming.
     pub async fn pulse_downstream(&self, output: crate::node::NodeOutput) -> WeftResult<()> {
-        self.handle.pulse_downstream(output).await
+        self.handle.pulse_downstream(output, false).await
+    }
+
+    /// [`Self::pulse_downstream`] that DOES NOT RETURN until the
+    /// emitted values have been taken by their consumers. What "taken"
+    /// means follows the port:
+    ///
+    /// - On an ordinary port, the downstream consumer of the value has
+    ///   actually been dispatched (it may first wait on its other
+    ///   inputs), so this is a real synchronization point: "do not
+    ///   continue until the next stage has really started". The
+    ///   motivating case is a phone-call node that must not proceed
+    ///   until the answering node is live.
+    /// - On a `Generator[T]` port, the consumer has PULLED this item:
+    ///   this is the lock-step yield. Emitting with plain
+    ///   `pulse_downstream` instead keeps the body running and buffers
+    ///   the item for a later pull (bounded; a producer that overruns
+    ///   the buffer fails loudly).
+    ///
+    /// Fails loudly instead of waiting forever when the delivery can
+    /// never happen: the consumer skipped, finished without taking the
+    /// item, or the engine proved a deadlock. An emission whose ports
+    /// have no consumers at all (unwired) is trivially delivered.
+    pub async fn yield_downstream(
+        &self,
+        output: crate::node::NodeOutput,
+    ) -> WeftResult<()> {
+        self.handle.pulse_downstream(output, true).await
+    }
+
+    /// Allow the stream on `port` (a `Generator[T]` output of this
+    /// node) to hold up to `items` un-taken items before a further
+    /// emission fails, instead of the default of
+    /// [`crate::generator::DEFAULT_MAX_BUFFERED_ITEMS`]. Only relevant
+    /// to a producer that emits with plain [`Self::pulse_downstream`]
+    /// (running ahead of the consumer's pulls); a
+    /// [`Self::yield_downstream`] producer never buffers more than one
+    /// item. Call it before (or between) emissions; it applies to the
+    /// emissions that follow.
+    pub fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
+        self.handle.set_max_buffered_items(port, items)
     }
 
     /// Build a `NodeOutput` by fanning a dynamic object's top-level keys
@@ -1450,6 +1490,35 @@ impl StorageHandle {
     }
 }
 
+/// THE error every tier answers when a body calls `await_signal`
+/// after it already touched an output port (emitted OR closed one): a
+/// durable suspension replays the body from the top, so the touch
+/// would fire twice. One definition so the engine and both node-test
+/// rigs refuse with the same words.
+pub fn emitted_then_await_signal_error(node_id: &str) -> String {
+    format!(
+        "node '{node_id}' called await_signal after emitting or closing an output \
+         port; a node that touches a port then durably suspends would touch it again \
+         on replay. Emit and close after all awaits, or (for a co-alive node) stay \
+         warm with bus.recv() instead of await_signal."
+    )
+}
+
+/// THE error every tier answers when a stream consumer's body calls
+/// `await_signal`: a durable suspension replays the body from the top,
+/// and the items its earlier pulls consumed were delivered live and
+/// cannot be replayed. One definition so the engine and both node-test
+/// rigs refuse with the same words (a node test must fail exactly
+/// where an execution would).
+pub fn stream_consumer_await_signal_error(node_id: &str) -> String {
+    format!(
+        "node '{node_id}' has a Generator input and called await_signal; a stream \
+         consumer's body cannot durably suspend (its resume would replay the body, \
+         and the already-pulled stream cannot be replayed). Do the waiting upstream \
+         or downstream of the stream consumer."
+    )
+}
+
 /// The runtime-facing handle. The engine crate implements this; the
 /// `Node` trait's execute receives an `ExecutionContext` that
 /// delegates to an implementation.
@@ -1543,12 +1612,34 @@ pub trait ContextHandle: Send + Sync {
 
     /// Fire downstream with `output`. The engine turns each mentioned
     /// output port into pulses on its outgoing edges, at the firing's
-    /// own frame stack. Each port can be emitted AT MOST ONCE per firing; a
-    /// second emission errors loud. Bus values are carried as plain
-    /// JSON markers (`{"__weft_bus__": {"id": "<uuid>", "mode":
-    /// "journaled" | "ephemeral"}}`); the live channel is resolved
-    /// per-consumer via the per-execution `BusRegistry`.
-    async fn pulse_downstream(&self, output: crate::node::NodeOutput) -> WeftResult<()>;
+    /// own frame stack. Each port can be emitted AT MOST ONCE per
+    /// firing, EXCEPT a `Generator[T]` port, which accepts being
+    /// emitted into repeatedly (each emission is one item of type `T`);
+    /// a second emission on any other port errors loud. Bus values are
+    /// carried as plain JSON markers (`{"__weft_bus__": {"id":
+    /// "<uuid>", "mode": "journaled" | "ephemeral"}}`); the live
+    /// channel is resolved per-consumer via the per-execution
+    /// `BusRegistry`.
+    ///
+    /// `wait_delivered: true` suspends the calling body until the
+    /// emitted values were TAKEN (an ordinary port's consumer was
+    /// dispatched; a generator item was pulled), failing loudly when
+    /// that can never happen. See
+    /// [`ExecutionContext::yield_downstream`].
+    async fn pulse_downstream(
+        &self,
+        output: crate::node::NodeOutput,
+        wait_delivered: bool,
+    ) -> WeftResult<()>;
+
+    /// Allow the stream on `port` (a declared `Generator[T]` output)
+    /// to hold up to `items` un-taken items before a further emission
+    /// fails, instead of the default
+    /// [`crate::generator::DEFAULT_MAX_BUFFERED_ITEMS`]. Applies to
+    /// emissions sent after the call. Errors loud on a port that is
+    /// not a Generator output, or `items` of 0 (a cap of 0 could never
+    /// accept even the first item).
+    fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()>;
 
     /// Emit a CLOSURE on `port` at the firing's own frame stack.
     /// Same one-emission-per-port rule as `pulse_downstream`: a port
@@ -1779,7 +1870,8 @@ mod value_bag_tests {
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
-        async fn pulse_downstream(&self, _: crate::node::NodeOutput) -> WeftResult<()> { unreachable!() }
+        async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
+        fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
         fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
         fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
@@ -1816,7 +1908,8 @@ mod value_bag_tests {
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
-        async fn pulse_downstream(&self, _: crate::node::NodeOutput) -> WeftResult<()> { unreachable!() }
+        async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
+        fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
         fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
         fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }

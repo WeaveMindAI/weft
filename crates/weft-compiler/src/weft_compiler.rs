@@ -2609,13 +2609,18 @@ fn flatten_group(
     };
 
     let elem_type = |ty: &weft_core::weft_type::WeftType| -> weft_core::weft_type::WeftType {
-        match ty {
-            weft_core::weft_type::WeftType::List(inner) => (**inner).clone(),
+        // `over` on a stream: the body's per-iteration port carries
+        // one item, exactly as a list's element does. `structural`
+        // peels nominal aliases so `type Rows = List[Number]` (or a
+        // stream alias) behaves like the spelled-out type.
+        match ty.structural() {
+            weft_core::weft_type::WeftType::Generator(inner)
+            | weft_core::weft_type::WeftType::List(inner) => (**inner).clone(),
             other => other.clone(),
         }
     };
 
-    let in_pt_id = format!("{}__in", group.id);
+    let in_pt_id = weft_core::project::boundary_in_id(&group.id);
     let in_pt_inputs: Vec<InputDefinition> = group.in_ports.iter().map(|p| {
         InputDefinition::from_wire_port(PortDefinition {
             name: p.name.clone(),
@@ -2703,7 +2708,7 @@ fn flatten_group(
         include_path: None,
     });
 
-    let out_pt_id = format!("{}__out", group.id);
+    let out_pt_id = weft_core::project::boundary_out_id(&group.id);
     let mut out_pt_inputs: Vec<InputDefinition> = group.out_ports.iter().map(|p| {
         let (ty, required) = if matches!(group.kind, GroupKind::Loop) {
             if loop_carry.contains(&p.name) {

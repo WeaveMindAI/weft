@@ -249,7 +249,7 @@ pub struct ExecutionSnapshot {
     /// instantly OR re-suspends if pending. This is what makes
     /// multiple sequential awaits within one node body work.
     #[serde(default)]
-    pub awaited_sequences: HashMap<(String, crate::frames::LoopFrames), Vec<AwaitedEntry>>,
+    pub awaited_sequences: HashMap<crate::liveness::FiringLocation, Vec<AwaitedEntry>>,
     /// Journal rows the fold could not apply because they were
     /// corrupted (unparseable UUID, broken invariants, etc.). Empty
     /// in the normal case. Surfaced to the inspector so the user sees
@@ -285,6 +285,13 @@ pub enum CorruptionSite {
     /// `ExecEvent::PulseEmitted` fold path (`push_pulse` UUID parse
     /// or `Pulse::from_journal_emit` invariant check).
     PulseEmitted,
+    /// `ExecEvent::PulsesConsumed` fold path (`parse_absorbed_ids` on
+    /// `pulse_ids`).
+    PulsesConsumed,
+    /// `ExecEvent::LoopStreamEnded` arrived for a `LoopInstanceKey`
+    /// with no preceding `LoopInstantiated`. Writer-order bug or row
+    /// loss.
+    LoopStreamEnded,
     /// `ExecEvent::NodeStarted` fold path (`parse_absorbed_ids` on
     /// `pulses_absorbed`).
     NodeStarted,
@@ -451,7 +458,11 @@ impl LoopWrite {
 /// instance's resolved config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopInstanceSnapshot {
-    pub iter_count: u32,
+    /// Effective iteration CAP (never "how many ran"; that is
+    /// `launched.len()`): the zip-trimmed, max-capped count for a
+    /// list-driven loop, the `max_iters` cap for done-driven and
+    /// stream-driven ones. `None` means uncapped.
+    pub iter_cap: Option<u32>,
     pub parallel: bool,
     pub max_iters: Option<u32>,
     /// Iter-input port names, in declared order. NOT optional: a
@@ -487,6 +498,25 @@ pub struct LoopInstanceSnapshot {
     pub outer_input: HashMap<String, Value>,
     /// `Some(reason)` once `LoopTerminated` has been recorded.
     pub terminated: Option<LoopTerminationReason>,
+    /// For a stream-driven loop, the stream's END once it arrived
+    /// (`LoopStreamEnded` row). DURABLE on purpose: the end's close
+    /// pulse is consumed the moment it routes, so a crash between
+    /// "stream ended" and "loop terminated" would otherwise resume a
+    /// loop that waits forever for a close that can never come again.
+    /// `None` for non-stream loops and while the stream is open.
+    pub stream_end: Option<StreamEnd>,
+}
+
+/// Why a stream ended: the wire vocabulary shared by the generator
+/// runtime (`crate::generator` re-exports it), the journal's loop
+/// snapshots, and the fold. `Finished` is the clean end; `Failed`
+/// carries the producer's error so a consumer's pull surfaces it
+/// through `?` instead of reading a truncated stream as complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StreamEnd {
+    Finished,
+    Failed { error: String },
 }
 
 // SYNC: LoopTerminationReason <-> packages/weft-graph/src/protocol.ts LoopTerminationReason

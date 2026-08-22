@@ -97,8 +97,12 @@ function materializeAutoTypeVars(t: WeftType, key: string): WeftType {
 				kind: 'record',
 				fields: t.fields.map(f => ({ ...f, ty: materializeAutoTypeVars(f.ty, key) })),
 			};
-		case 'named':
-			return { kind: 'named', name: t.name, body: materializeAutoTypeVars(t.body, key) };
+		case 'generator':
+			return { kind: 'generator', inner: materializeAutoTypeVars(t.inner, key) };
+		// No 'named' case: a declared body is concrete by construction
+		// (the Rust registry and wire parser both refuse a type
+		// variable inside one), so there is never a T_Auto to
+		// materialize beneath an alias.
 		default:
 			return t;
 	}

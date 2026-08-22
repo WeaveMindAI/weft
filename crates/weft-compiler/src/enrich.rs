@@ -564,20 +564,44 @@ fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
 /// Walk `port` and `other` in parallel and record every typevar in
 /// `port` that lines up with a RESOLVED subtree of `other`. Containers
 /// recurse positionally, records by field name; a union is never
-/// descended (which member aligns is ambiguous), and Named bodies need
-/// no walk (the registry refuses typevars inside declared bodies).
+/// descended (which member aligns is ambiguous). Nominal aliases peel
+/// (`structural()`) on both sides here, so an alias over a container
+/// binds exactly like the spelled-out type; substitution never needs
+/// to descend one, because a declared body is concrete by
+/// construction (the registry and the wire parser both refuse a type
+/// variable inside one).
 fn collect_type_var_bindings(
     port: &WeftType,
     other: &WeftType,
     out: &mut Vec<(String, WeftType)>,
 ) {
-    match (port, other) {
-        (WeftType::TypeVar(name), concrete) => {
-            if !concrete.contains_unresolved_leaf() {
-                out.push((name.clone(), concrete.clone()));
+    // Match on the STRUCTURAL types so a nominal alias behaves like
+    // its spelled-out body (`Feed = Generator[Number]` feeding a
+    // `Generator[T]` port binds `T = Number`); what gets BOUND is the
+    // unpeeled type, so the nominal name survives into the enriched
+    // shape.
+    match (port.structural(), other.structural()) {
+        (WeftType::TypeVar(name), _) => {
+            // A stream never instantiates a type variable, in either
+            // direction: a generic port receiving a whole stream would
+            // get the raw live-handle marker it cannot pull from, and
+            // a generic source cannot produce the live stream a
+            // Generator input needs. Validate's
+            // `generator-into-generic-port` rule reports both edges;
+            // leaving the var unbound here is what keeps the bad
+            // binding out of the enriched shape. (Element-wise binding
+            // through matching Generator ports happens below.)
+            if !other.contains_unresolved_leaf() && other.as_generator().is_none() {
+                out.push((name.clone(), other.clone()));
             }
         }
         (WeftType::List(a), WeftType::List(b)) => collect_type_var_bindings(a, b, out),
+        // Element-wise: `Generator[T]` wired to `Generator[Number]`
+        // binds `T = Number` (a generic stream CONSUMER is well-typed;
+        // only a bare `T` receiving a whole stream is refused above).
+        (WeftType::Generator(a), WeftType::Generator(b)) => {
+            collect_type_var_bindings(a, b, out)
+        }
         (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => {
             collect_type_var_bindings(ak, bk, out);
             collect_type_var_bindings(av, bv, out);
@@ -618,7 +642,9 @@ fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bo
             *ty = concrete.clone();
             true
         }
-        WeftType::List(inner) => replace_in_type(inner, var_name, concrete),
+        WeftType::List(inner) | WeftType::Generator(inner) => {
+            replace_in_type(inner, var_name, concrete)
+        }
         WeftType::Dict(key, val) => {
             let a = replace_in_type(key, var_name, concrete);
             let b = replace_in_type(val, var_name, concrete);
@@ -628,6 +654,22 @@ fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bo
             let mut any = false;
             for m in members.iter_mut() {
                 any |= replace_in_type(m, var_name, concrete);
+            }
+            any
+        }
+        // Substitution rewrites every shape a typevar can OCCUR in,
+        // a superset of the shapes collection binds through: collection
+        // never descends a union, but a union member's `T` is the same
+        // node-scoped variable a sibling port binds, so it must be
+        // rewritten here or the port stays half-resolved and validate
+        // reports unresolved-typevar on an edge that already
+        // determined the type. No `Named` arm: the registry refuses a
+        // declared body carrying a type variable, so an alias body
+        // never holds one.
+        WeftType::Record(fields) => {
+            let mut any = false;
+            for f in fields.iter_mut() {
+                any |= replace_in_type(&mut f.ty, var_name, concrete);
             }
             any
         }
@@ -689,6 +731,9 @@ fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
     match t {
         WeftType::TypeVar(n) if n == "T_Auto" => WeftType::type_var(&format!("T__{key}")),
         WeftType::List(inner) => WeftType::List(Box::new(materialize_auto_type_vars(inner, key))),
+        WeftType::Generator(inner) => {
+            WeftType::Generator(Box::new(materialize_auto_type_vars(inner, key)))
+        }
         WeftType::Dict(k, v) => WeftType::Dict(
             Box::new(materialize_auto_type_vars(k, key)),
             Box::new(materialize_auto_type_vars(v, key)),
@@ -706,10 +751,12 @@ fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
                 })
                 .collect(),
         ),
-        WeftType::Named { name, body } => WeftType::Named {
-            name: name.clone(),
-            body: Box::new(materialize_auto_type_vars(body, key)),
-        },
+        // No `Named` arm: a declared body is concrete by construction
+        // (the registry and the wire parser both refuse a type
+        // variable inside one), so there is never a `T_Auto` to
+        // materialize beneath an alias, and rebuilding the body here
+        // would be the door to two same-named types with different
+        // bodies.
         other => other.clone(),
     }
 }
@@ -723,5 +770,92 @@ fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> Por
         required: !is_output,
         description: None,
         synthesized_from_carry: false,
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::*;
+
+    fn parse(s: &str) -> WeftType {
+        weft_core::weft_type::WeftType::parse(s).expect("type parses")
+    }
+
+    /// Layer-1: element-wise binding through Generator ports, and
+    /// through a NOMINAL ALIAS of one (the match peels `structural()`,
+    /// and what binds is the unpeeled type so the alias name survives).
+    #[test]
+    fn generator_element_binds_through_nominal_aliases() {
+        // Bare: Generator[T] <- Generator[Number] binds T = Number.
+        let mut out = Vec::new();
+        collect_type_var_bindings(
+            &parse("Generator[T]"),
+            &parse("Generator[Number]"),
+            &mut out,
+        );
+        assert_eq!(out, vec![("T".to_string(), parse("Number"))]);
+
+        // Aliased source: Feed = Generator[Number] binds the same.
+        let feed = WeftType::Named {
+            name: "Feed".into(),
+            body: Box::new(parse("Generator[Number]")),
+        };
+        let mut out = Vec::new();
+        collect_type_var_bindings(&parse("Generator[T]"), &feed, &mut out);
+        assert_eq!(out, vec![("T".to_string(), parse("Number"))]);
+
+        // Aliased LIST source into List[T] binds T to the alias's
+        // element too (same peel, and the UNPEELED element binds).
+        let history = WeftType::Named {
+            name: "ChatHistory".into(),
+            body: Box::new(parse("List[Number]")),
+        };
+        let mut out = Vec::new();
+        collect_type_var_bindings(&parse("List[T]"), &history, &mut out);
+        assert_eq!(out, vec![("T".to_string(), parse("Number"))]);
+
+        // A bare T never binds from a WHOLE stream, aliased or not.
+        let mut out = Vec::new();
+        collect_type_var_bindings(&parse("T"), &feed, &mut out);
+        assert!(out.is_empty(), "a whole stream never instantiates a typevar: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod substitution_tests {
+    use super::*;
+
+    fn parse(s: &str) -> WeftType {
+        weft_core::weft_type::WeftType::parse(s).expect("type parses")
+    }
+
+    /// Layer-1 invariant: substitution rewrites every shape a typevar
+    /// can occur in, so a collected binding never leaves a port
+    /// half-resolved. (No Named case: the registry refuses a declared
+    /// body carrying a type variable, so an alias body never holds
+    /// one.)
+    #[test]
+    fn substitution_rewrites_every_shape_a_typevar_can_occur_in() {
+        // A record field carrying the var.
+        let mut rec = parse("{a: T, b: String}");
+        assert!(replace_in_type(&mut rec, "T", &parse("Number")));
+        assert_eq!(rec, parse("{a: Number, b: String}"));
+
+        // A generator element carrying the var.
+        let mut gen = parse("Generator[T]");
+        assert!(replace_in_type(&mut gen, "T", &parse("Number")));
+        assert_eq!(gen, parse("Generator[Number]"));
+
+        // A union member carrying the var: collection never binds
+        // THROUGH a union, but the var is node-scoped, so a sibling
+        // port's binding must resolve it here too.
+        let mut union = parse("T | Null");
+        assert!(replace_in_type(&mut union, "T", &parse("Number")));
+        assert_eq!(union, parse("Number | Null"));
+
+        // A dict value carrying the var.
+        let mut dict = parse("Dict[String, T]");
+        assert!(replace_in_type(&mut dict, "T", &parse("Number")));
+        assert_eq!(dict, parse("Dict[String, Number]"));
     }
 }

@@ -15,8 +15,12 @@ use crate::pulse::PulseTable;
 /// - `None`: still work to do (pending pulses or non-terminal
 ///   executions).
 pub fn check_completion(pulses: &PulseTable, executions: &NodeExecutionTable) -> Option<bool> {
+    // `in_flight` (not `is_pending`): a ROUTED pulse sits in a live
+    // sink awaiting its take, which is still work; declaring the
+    // execution complete over it would silently drop a delivered-but-
+    // untaken stream item.
     for bucket in pulses.values() {
-        if bucket.iter().any(|p| p.status.is_pending()) {
+        if bucket.iter().any(|p| p.status.in_flight()) {
             return None;
         }
     }

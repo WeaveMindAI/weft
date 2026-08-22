@@ -1,5 +1,5 @@
 //! Server-Sent Events endpoints. Clients (CLI `weft follow`, the VS
-//! Code extension's right sidebar, the ops dashboard) subscribe to
+//! Code extension's right sidebar) subscribe to
 //! a per-project stream. The dispatcher's EventBus (in-memory
 //! broadcast channel per project) is the source.
 

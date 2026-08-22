@@ -10,6 +10,7 @@ use weft_core::node::{
     Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
 };
 use weft_core::project::{NodeDefinition, Span};
+use weft_core::weft_type::WeftType;
 use weft_core::ProjectDefinition;
 
 use crate::{Diagnostic, Severity};
@@ -39,6 +40,21 @@ pub fn validate_with_mode(
     catalog: &dyn MetadataCatalog,
     mode: ValidationMode,
 ) -> Vec<Diagnostic> {
+    // The catalog's type registry is scoped around the WHOLE run, so
+    // every rule that resolves a declared name (named-type-conflict's
+    // registry half in particular) sees the project's table on every
+    // caller, not just the ones that remembered to scope it (the
+    // build path once forgot, silently no-op-ing the rule). The scope
+    // stack is re-entrant, so already-scoped callers nest harmlessly.
+    let registry = catalog.type_registry();
+    registry.scoped(|| validate_scoped(project, catalog, mode))
+}
+
+fn validate_scoped(
+    project: &ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    mode: ValidationMode,
+) -> Vec<Diagnostic> {
     let mut d = Vec::new();
     check_duplicates(project, &mut d);
     check_edge_node_refs(project, &mut d);
@@ -53,7 +69,360 @@ pub fn validate_with_mode(
     check_declarative_rules(project, catalog, mode, &mut d);
     check_reserved_names(project, catalog, &mut d);
     check_graph_shape(project, &mut d);
+    check_generator_wiring(project, &mut d);
+    check_named_type_conflicts(project, &mut d);
     d
+}
+
+/// named-type-conflict: nominal compatibility compares the NAME alone
+/// ("one name, one body" is the contract), so every restatement of a
+/// named type across the project's ports must carry the same body, and
+/// must match the registry's declaration when one is in scope. This is
+/// the AUTHORING half of the guarantee; the parser only enforces the
+/// registry-independent half (a body must be concrete), because
+/// deserialization must stay a pure function of the string (a stored
+/// project keeps parsing after its declaration is edited).
+fn check_named_type_conflicts(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    fn walk<'t>(ty: &'t WeftType, out: &mut Vec<(&'t str, &'t WeftType)>) {
+        match ty {
+            WeftType::Named { name, body } => {
+                out.push((name, body));
+                walk(body, out);
+            }
+            WeftType::List(inner) | WeftType::Generator(inner) => walk(inner, out),
+            WeftType::Dict(k, v) => {
+                walk(k, out);
+                walk(v, out);
+            }
+            WeftType::Union(members) => members.iter().for_each(|m| walk(m, out)),
+            WeftType::Record(fields) => fields.iter().for_each(|f| walk(&f.ty, out)),
+            _ => {}
+        }
+    }
+
+    let registry = weft_core::weft_type::TypeRegistry::current();
+    let mut seen: std::collections::HashMap<&str, (&WeftType, String)> =
+        std::collections::HashMap::new();
+    for node in &project.nodes {
+        let span = node.header_span_or_default();
+        let ports = node
+            .inputs
+            .iter()
+            .map(|p| (&p.name, &p.port_type))
+            .chain(node.outputs.iter().map(|p| (&p.name, &p.port_type)));
+        for (port_name, port_type) in ports {
+            let mut named = Vec::new();
+            walk(port_type, &mut named);
+            for (name, body) in named {
+                let site = format!("{}.{}", node.id, port_name);
+                if let Some(weft_core::weft_type::WeftType::Named { body: declared, .. }) =
+                    registry.lookup(name)
+                {
+                    if declared.as_ref() != body {
+                        push(d, span, Severity::Error, "named-type-conflict",
+                            format!(
+                                "port '{site}' restates type `{name}` as `{body}`, but \
+                                 it is declared as `{declared}`; a named type has one \
+                                 body everywhere"
+                            ));
+                        continue;
+                    }
+                }
+                match seen.get(name) {
+                    None => {
+                        seen.insert(name, (body, site));
+                    }
+                    Some((first_body, first_site)) if *first_body != body => {
+                        push(d, span, Severity::Error, "named-type-conflict",
+                            format!(
+                                "type `{name}` appears with two different bodies: \
+                                 `{first_body}` at '{first_site}' and `{body}` at \
+                                 '{site}'; a named type has one body everywhere"
+                            ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// `Generator[T]` wiring rules. A stream is a typed, one-directional,
+/// live edge between exactly two running node bodies, which pins down
+/// three things the rest of the type system does not:
+///
+/// - generator-multiple-consumers: a Generator OUTPUT feeds exactly ONE
+///   input. Two consumers on one stream is a question with no defined
+///   answer (do both see every item, or do they race?); fanning out is
+///   Bus territory. (Many-to-one needs nothing here: the general
+///   `duplicate-input-port` rule already forbids two edges into any
+///   input.)
+/// - generator-through-group: a stream cannot cross a plain Group
+///   boundary (a Passthrough forwards ONE value per firing, not a live
+///   item flow) nor a loop's boundary except as the loop's own `over`
+///   port (checked by `check_loop_config`). Put the producer and its
+///   consumer in the same scope.
+/// - generator-in-container: `Generator[T]` is a PORT type only. Nested
+///   inside a List/Dict/Record/Union it would make the stream a value
+///   to store or copy, which it is not.
+fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    /// Any `Generator` anywhere in `ty` (nominal bodies included).
+    fn contains_generator(ty: &WeftType) -> bool {
+        match ty {
+            WeftType::Generator(_) => true,
+            WeftType::List(inner) => contains_generator(inner),
+            WeftType::Dict(k, v) => contains_generator(k) || contains_generator(v),
+            WeftType::Union(members) => members.iter().any(contains_generator),
+            WeftType::Record(fields) => fields.iter().any(|f| contains_generator(&f.ty)),
+            WeftType::Named { body, .. } => contains_generator(body),
+            _ => false,
+        }
+    }
+
+    /// A `Generator` anywhere BELOW the root position. The root itself
+    /// may be a stream (directly, or through a nominal alias like
+    /// `type Rows = Generator[Number]`, which `as_generator` peels);
+    /// any deeper occurrence makes the stream a storable value, which
+    /// it is not.
+    fn generator_below_root(ty: &WeftType) -> bool {
+        match ty.as_generator() {
+            Some(element) => contains_generator(element),
+            None => contains_generator(ty),
+        }
+    }
+
+    let by_id: std::collections::HashMap<&str, &NodeDefinition> =
+        project.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+
+    for node in &project.nodes {
+        let span = node.header_span_or_default();
+        for port in &node.inputs {
+            if generator_below_root(&port.port_type) {
+                push(d, span, Severity::Error, "generator-in-container",
+                    format!(
+                        "input '{}.{}: {}': Generator[T] is a port type; a stream cannot \
+                         sit inside a list, dict, record, or union",
+                        node.id, port.name, port.port_type
+                    ));
+            }
+            // An unwired stream has no meaning: a stream cannot be
+            // defaulted and has no zero value (the port's runtime
+            // value is a live handle the engine installs), so a
+            // Generator input must always be wired, which is what
+            // `required` without a default guarantees. Only PASSTHROUGH
+            // boundaries are exempt: their `required` shape is a
+            // flatten artifact, never a user declaration, and their
+            // stream ports are already reported by the boundary-node
+            // rule below. A LoopIn's `required` mirrors the user's own
+            // `over` declaration (a stream `over` port is legal), so
+            // it stays under this rule: an optional stream `over`
+            // would otherwise compile as an unwirable loop.
+            if node.node_type != "Passthrough"
+                && port.port_type.as_generator().is_some()
+                && (!port.required || port.default.is_some())
+            {
+                push(d, span, Severity::Error, "generator-input-must-be-required",
+                    format!(
+                        "input '{}.{}': a Generator input must be required and cannot \
+                         have a default; a stream has no zero value, so an unwired \
+                         stream port could never be satisfied",
+                        node.id, port.name
+                    ));
+            }
+        }
+        for port in &node.outputs {
+            if generator_below_root(&port.port_type) {
+                push(d, span, Severity::Error, "generator-in-container",
+                    format!(
+                        "output '{}.{}: {}': Generator[T] is a port type; a stream cannot \
+                         sit inside a list, dict, record, or union",
+                        node.id, port.name, port.port_type
+                    ));
+            }
+            if port.port_type.as_generator().is_some() {
+                let consumers = project
+                    .edges
+                    .iter()
+                    .filter(|e| {
+                        e.source == node.id && e.source_handle.as_deref() == Some(&port.name)
+                    })
+                    .count();
+                if consumers > 1 {
+                    push(d, span, Severity::Error, "generator-multiple-consumers",
+                        format!(
+                            "stream '{}.{}' feeds {consumers} inputs; a Generator output \
+                             connects to exactly ONE consumer (a stream has one taker). \
+                             To broadcast, use a Bus",
+                            node.id, port.name
+                        ));
+                }
+            }
+        }
+    }
+
+    // Group boundaries: a plain-Group boundary forwards one value per
+    // firing, so a stream's items cannot flow through it. The ban
+    // lives on the BOUNDARY NODE, not on edges: a stream-typed port on
+    // a boundary Passthrough is the crossing itself, whichever side is
+    // wired (the project's own ENTRY boundary has no incoming edge at
+    // all, so an edge-based rule would let a stream-typed project
+    // input compile clean and ship an unsatisfiable graph). One port,
+    // one diagnostic, by construction. The project-interface boundary
+    // (the root anonymous component's `__in`/`__out`) gets its own
+    // wording: there IS no outer scope to move the producer into.
+    let root_group_ids: std::collections::HashSet<&str> = project
+        .groups
+        .iter()
+        .filter(|g| g.parent_group_id.is_none() && g.anonymous)
+        .map(|g| g.id.as_str())
+        .collect();
+    for node in &project.nodes {
+        let Some(gb) = node.group_boundary.as_ref() else { continue };
+        if node.node_type != "Passthrough" {
+            continue;
+        }
+        let span = node.header_span_or_default();
+        // A Passthrough forwards, so each port appears as an input AND
+        // an output; one NAME is one crossing and one diagnostic.
+        let stream_ports: std::collections::BTreeSet<&str> = node
+            .inputs
+            .iter()
+            .map(|p| (&p.name, &p.port_type))
+            .chain(node.outputs.iter().map(|p| (&p.name, &p.port_type)))
+            .filter(|(_, ty)| ty.as_generator().is_some())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        for port_name in stream_ports {
+            if root_group_ids.contains(gb.group_id.as_str()) {
+                push(d, span, Severity::Error, "generator-through-group",
+                    format!(
+                        "'{port_name}' declares a stream on the project's {} boundary; an \
+                         execution's inputs and outputs are values, not live edges. \
+                         Produce (or consume) the stream inside the project instead",
+                        match gb.role {
+                            weft_core::project::GroupBoundaryRole::In => "input",
+                            weft_core::project::GroupBoundaryRole::Out => "output",
+                        },
+                    ));
+            } else {
+                push(d, span, Severity::Error, "generator-through-group",
+                    format!(
+                        "'{port_name}' carries a stream across the boundary of group \
+                         '{}'; a stream is a live edge between two running nodes. Put the \
+                         producer and its consumer in the same scope (a loop consumes a \
+                         stream only through its own `over`)",
+                        gb.group_id,
+                    ));
+            }
+        }
+    }
+
+    for edge in &project.edges {
+        let (Some(src), Some(tgt)) =
+            (by_id.get(edge.source.as_str()), by_id.get(edge.target.as_str()))
+        else {
+            continue;
+        };
+        let src_generator = src
+            .outputs
+            .iter()
+            .find(|p| Some(p.name.as_str()) == edge.source_handle.as_deref())
+            .is_some_and(|p| p.port_type.as_generator().is_some());
+        let tgt_generator = tgt
+            .inputs
+            .iter()
+            .find(|p| Some(p.name.as_str()) == edge.target_handle.as_deref())
+            .is_some_and(|p| p.port_type.as_generator().is_some());
+        if !src_generator && !tgt_generator {
+            continue;
+        }
+        let span = edge.span.unwrap_or_default();
+        // A stream flowing into a generic `T` port would instantiate
+        // the variable with a live handle nobody pulls (the consumer
+        // receives the raw marker and hangs the producer at its buffer
+        // cap); the enrich pass refuses the binding, and this rule
+        // names the real problem at the edge.
+        if src_generator && !tgt_generator {
+            // "Generic" is ANY unresolved leaf, at any depth (`T`,
+            // `List[T]`, `Dict[String, T]`, `MustOverride`): enrich
+            // refused the binding for all of them (a stream never
+            // instantiates a typevar), and check_type_compat stays
+            // quiet on this edge because THIS rule owns it, so the
+            // predicates must be one condition, not two that drift.
+            let tgt_port = tgt
+                .inputs
+                .iter()
+                .find(|p| Some(p.name.as_str()) == edge.target_handle.as_deref());
+            let tgt_generic =
+                tgt_port.is_some_and(|p| p.port_type.contains_unresolved_leaf());
+            if tgt_generic {
+                push(d, span, Severity::Error, "generator-into-generic-port",
+                    format!(
+                        "edge '{}.{} -> {}.{}': the source is a stream, and the target \
+                         declares '{}', a generic type that cannot consume one. A stream \
+                         needs a port declared Generator[T]; to inspect items, consume \
+                         the stream in a node and emit what you want to see",
+                        edge.source,
+                        edge.source_handle.as_deref().unwrap_or("?"),
+                        edge.target,
+                        edge.target_handle.as_deref().unwrap_or("?"),
+                        tgt_port.map(|p| p.port_type.to_string()).unwrap_or_default(),
+                    ));
+                continue;
+            }
+        }
+        // The mirror direction: a generic SOURCE cannot produce the
+        // live stream a `Generator` input needs (enrich refuses that
+        // binding too), and "connect it to something concrete" would
+        // mislead here exactly as it would above.
+        if tgt_generator && !src_generator {
+            let src_port = src
+                .outputs
+                .iter()
+                .find(|p| Some(p.name.as_str()) == edge.source_handle.as_deref());
+            let src_generic =
+                src_port.is_some_and(|p| p.port_type.contains_unresolved_leaf());
+            if src_generic {
+                push(d, span, Severity::Error, "generator-into-generic-port",
+                    format!(
+                        "edge '{}.{} -> {}.{}': the target is a stream port, and the \
+                         source declares '{}', a generic type that cannot produce one. \
+                         Declare the source output as Generator[T] (or feed the port \
+                         from a real stream producer)",
+                        edge.source,
+                        edge.source_handle.as_deref().unwrap_or("?"),
+                        edge.target,
+                        edge.target_handle.as_deref().unwrap_or("?"),
+                        src_port.map(|p| p.port_type.to_string()).unwrap_or_default(),
+                    ));
+                continue;
+            }
+        }
+        // Loop boundaries: a stream INTO LoopOut (a gather/carry) has
+        // no meaning, and a stream OUT of a LoopOut cannot exist
+        // (nothing inside can produce one across the boundary); the
+        // LoopIn side's rules live in `check_loop_config`
+        // (`generator-not-iterated`), so it is deliberately NOT
+        // re-reported here. Group (Passthrough) boundaries are banned
+        // on the boundary NODE above, not per edge.
+        // The target arm needs no generator guard: the early return
+        // above already proved one endpoint of this edge is a stream.
+        let banned_endpoint =
+            tgt.node_type == "LoopOut" || (src.node_type == "LoopOut" && src_generator);
+        if banned_endpoint {
+            push(d, span, Severity::Error, "generator-through-group",
+                format!(
+                    "edge '{}.{} -> {}.{}' carries a stream across a loop boundary; a \
+                     stream is a live edge between two running nodes. Put the producer \
+                     and its consumer in the same scope (a loop consumes a stream only \
+                     through its own `over`)",
+                    edge.source,
+                    edge.source_handle.as_deref().unwrap_or("?"),
+                    edge.target,
+                    edge.target_handle.as_deref().unwrap_or("?"),
+                ));
+        }
+    }
 }
 
 // There is deliberately NO compile-time permission check: source holds
@@ -678,6 +1047,33 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             continue;
         }
 
+        // A stream source into an unresolved NON-STREAM target: the
+        // `generator-into-generic-port` rule (check_generator_wiring)
+        // owns this edge WHOLE, MustOverride and TypeVar alike; its
+        // predicate is the same `contains_unresolved_leaf`, so the two
+        // cannot drift. Stacking must-override-unmet or
+        // unresolved-typevar on top would give contradictory advice
+        // ("declare a concrete type" vs "declare Generator[T]"). A
+        // stream-typed target is NOT that rule's edge (it skips
+        // generator-to-generator pairs): enrich binds its element
+        // type element-wise, so it falls through here and reports
+        // only when the element is genuinely unresolvable (a
+        // `Generator[T]` port with nothing concrete upstream).
+        if src_port.port_type.as_generator().is_some()
+            && tgt_port.port_type.as_generator().is_none()
+            && tgt_port.port_type.contains_unresolved_leaf()
+        {
+            continue;
+        }
+        // The mirror direction the same rule owns: a generic source
+        // wired into a stream-typed target.
+        if tgt_port.port_type.as_generator().is_some()
+            && src_port.port_type.as_generator().is_none()
+            && src_port.port_type.contains_unresolved_leaf()
+        {
+            continue;
+        }
+
         if src_port.port_type.is_must_override() {
             push(d, span, Severity::Error, "must-override-unmet",
                 format!(
@@ -1277,7 +1673,7 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // A `self.done` write inside a nested loop's body targets that
         // nested loop's `__out`, never this one, so the check is
         // naturally scope-local.
-        let loop_out_id = format!("{gid}__out");
+        let loop_out_id = weft_core::project::boundary_out_id(gid);
         let done_wired = project.edges.iter().any(|e| {
             e.target == loop_out_id && e.target_handle.as_deref() == Some("done")
         });
@@ -1341,19 +1737,71 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             }
         }
 
-        // over ports must exist on LoopIn and be List[T].
+        // over ports must exist on LoopIn and be List[T] or
+        // Generator[T]. A stream in `over` must be ALONE: zipping a
+        // stream against a list (or another stream) has no defined
+        // count to trim against, and the runtime pulls exactly one
+        // stream per loop.
+        let mut over_has_stream = false;
         for p in &over {
             match in_node.inputs.iter().find(|x| &x.name == p) {
                 None => {
                     push(d, span_for("over"), Severity::Error, "loop-over-unknown-port",
                         format!("loop '{gid}': 'over' references unknown input port '{p}'"));
                 }
-                Some(port) => {
-                    if !matches!(port.port_type, weft_core::weft_type::WeftType::List(_)) {
-                        push(d, span_for("over"), Severity::Error, "over-not-a-list",
-                            format!("loop '{gid}': 'over' port '{p}' must be List[T], got {}", port.port_type));
-                    }
+                Some(port) if port.port_type.as_generator().is_some() => {
+                    over_has_stream = true;
                 }
+                Some(port) => match port.port_type.structural() {
+                    weft_core::weft_type::WeftType::List(_) => {}
+                    other => {
+                        push(d, span_for("over"), Severity::Error, "over-not-a-list",
+                            format!(
+                                "loop '{gid}': 'over' port '{p}' must be List[T] or \
+                                 Generator[T], got {other}"
+                            ));
+                    }
+                },
+            }
+        }
+        if over_has_stream && over.len() > 1 {
+            push(d, span_for("over"), Severity::Error, "over-stream-not-alone",
+                format!(
+                    "loop '{gid}': a Generator port in 'over' must be the ONLY over port \
+                     (a loop iterates one stream at a time; zip upstream if you need more)"
+                ));
+        }
+        // A Generator input on the loop that is NOT the over port has
+        // no meaning: LoopIn broadcasts every non-over input verbatim
+        // into each iteration, and a stream cannot be copied per
+        // iteration (it is a live edge with one taker).
+        for port in &in_node.inputs {
+            if port.port_type.as_generator().is_some() && !over.contains(&port.name) {
+                push(d, span, Severity::Error, "generator-not-iterated",
+                    format!(
+                        "loop '{gid}': Generator input '{}' must be iterated (`over: \
+                         [\"{}\"]`); a stream cannot broadcast into the loop body",
+                        port.name, port.name
+                    ));
+            }
+        }
+        // A stream cannot be carried between iterations either: a
+        // carry value round-trips the journal as JSON, and a stream is
+        // a live edge.
+        for p in &carry {
+            let carried_generator = out_node
+                .outputs
+                .iter()
+                .find(|x| &x.name == p)
+                .map(|x| x.port_type.as_generator().is_some())
+                .unwrap_or(false);
+            if carried_generator {
+                push(d, span_for("carry"), Severity::Error, "generator-not-carriable",
+                    format!(
+                        "loop '{gid}': carry port '{p}' is a Generator; a stream is a live \
+                         edge between two running nodes and cannot be carried across \
+                         iterations"
+                    ));
             }
         }
         // Carry ports: the output side is the source of truth; the
@@ -1505,7 +1953,7 @@ fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic
         .groups
         .iter()
         .find(|g| g.parent_group_id.is_none() && g.anonymous)
-        .map(|g| format!("{}__out", g.id));
+        .map(|g| weft_core::project::boundary_out_id(&g.id));
 
     let outputs: Vec<&str> = if let Some(ref out_pt) = component_out {
         // The component's output sink: everything upstream of the group's

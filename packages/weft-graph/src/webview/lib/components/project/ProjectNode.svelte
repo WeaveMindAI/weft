@@ -3,7 +3,7 @@
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
-	import { inputExposure } from "../../types";
+	import { declaredHomeValue, inputExposure, ownValue, storedValueOf } from "../../types";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
 	import CodeEditor from "../CodeEditor.svelte";
@@ -11,7 +11,7 @@
 	import CopyButton from "../ui/CopyButton.svelte";
 	import { buildSpecMap, deriveInputsFromFields, deriveOutputsFromFields, isValidFieldKey, type FormFieldDef, type FormFieldSpec } from '../../utils/form-field-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "../../utils/status";
-	import type { FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
+	import type { ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
@@ -45,7 +45,7 @@
 			/// Body-set PORT values + their written forms, the two-home
 			/// twin of `config` (see NodeInstance.portLiterals).
 			portLiterals?: Record<string, unknown>;
-			portLiteralSpans?: Record<string, { origin: 'inline' | 'connection' }>;
+			portLiteralSpans?: Record<string, ConfigFieldSpan>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: NodeFeatures;
@@ -157,9 +157,7 @@
 	 *  `portLiterals` / `portLiteralSpans` maps of the definition: one
 	 *  home per name, separate from config). */
 	const portLiterals = $derived((data.portLiterals as Record<string, unknown>) ?? {});
-	const portLiteralSpans = $derived(
-		(data.portLiteralSpans as Record<string, { origin: 'inline' | 'connection' }>) ?? {},
-	);
+	const portLiteralSpans = $derived(data.portLiteralSpans ?? {});
 
 	/** Input ports satisfied by a body-set literal and no edge. These
 	 *  render with the 'empty-dotted' port marker to signal "filled from
@@ -198,7 +196,8 @@
 	 *  the braces form on its first write, except on an assignment-only
 	 *  input, where the statement form is the only legal one. */
 	function portFieldForm(key: string): 'inline' | 'connection' {
-		return portLiteralSpans[key]?.origin ?? (portFieldLocked(key) ? 'connection' : 'inline');
+		const span = ownValue(portLiteralSpans, key) as ConfigFieldSpan | undefined;
+		return span?.origin ?? (portFieldLocked(key) ? 'connection' : 'inline');
 	}
 
 	/** An assignment-only input's field is locked to the statement form:
@@ -250,7 +249,7 @@
 		const side = spec.output !== undefined ? latestExecution?.output : latestExecution?.input;
 		const port = spec.output ?? spec.input;
 		if (typeof side !== 'object' || side === null || port === undefined) return null;
-		return parseFileValue((side as Record<string, unknown>)[port]);
+		return parseFileValue(ownValue(side as Record<string, unknown>, port));
 	});
 
 	// Check if node has expandable content (fields, run location option, debug preview, etc.)
@@ -391,7 +390,7 @@
 	function handleTextareaResize(fieldKey: string, height: number) {
 		if (data.onUpdate) {
 			const currentHeights = (data.config?.textareaHeights as Record<string, number>) || {};
-			if (currentHeights[fieldKey] !== height) {
+			if (ownValue(currentHeights, fieldKey) !== height) {
 				data.onUpdate({
 					config: { 
 						...data.config, 
@@ -468,11 +467,15 @@
 	 *  field sets/clears it); nothing text-shaped exists to display, and
 	 *  routing its edits into a file write would clobber the media file. */
 	function fileRefOf(key: string): { path: string; type: string; marker: 'file' | 'asset' } | null {
-		// A name's value lives in exactly ONE home (the compiler moves
-		// port-driven values into portLiterals), so read both: a marker on
-		// a port-driven input must be found there or its edits would
-		// clobber the ref with a raw string.
-		const v = portLiterals[key] ?? (data.config as Record<string, unknown>)?.[key];
+		// CONFIG home only, and that is the whole story: the host bridge
+		// puts every `@file`/`@asset` marker into config (never into a
+		// port literal), and every consumer of this chain is config-
+		// scoped too (FieldStrip asks only for non-port-driven fields,
+		// `updateConfig` writes config, the chip renders in the config
+		// branch). Reading the port literal first would let a
+		// same-named port literal impose its marker on the config
+		// field that legitimately shares its name.
+		const v = ownValue(data.config as Record<string, unknown> | undefined, key);
 		if (!isFileRefValue(v)) return null;
 		return typeReferencesFile(v.__weftFileRef.type) ? null : v.__weftFileRef;
 	}
@@ -483,7 +486,7 @@
 	function fileFieldState(key: string): { path: string; marker: 'file' | 'asset'; content?: string; error?: string; loading: boolean } | null {
 		const ref = fileRefOf(key);
 		if (!ref) return null;
-		const entry = data.fileContents?.[ref.path];
+		const entry = ownValue(data.fileContents, ref.path) as FileContent | undefined;
 		// Undefined (not delivered) OR an explicit `{loading}` (bytes still being
 		// fetched lazily) both render the non-interactive loading state.
 		if (entry === undefined || 'loading' in entry) return { path: ref.path, marker: ref.marker, loading: true };
@@ -559,7 +562,7 @@
 	/// `updateConfig` (which routes a `@file` field's edit into the
 	/// referenced file's content); switching the marker edits the marker.
 	function switchFileMarker(key: string) {
-		const v = (data.config as Record<string, unknown>)?.[key];
+		const v = ownValue(data.config as Record<string, unknown> | undefined, key);
 		if (!isFileRefValue(v)) return;
 		const r = v.__weftFileRef;
 		const flipped = { __weftFileRef: { ...r, marker: r.marker === 'file' ? 'asset' as const : 'file' as const } };
@@ -638,10 +641,19 @@
 		data.onUpdate({ portLiterals: next });
 	}
 
-	/** Route a field edit to its home: a port-driven field writes the
-	 *  port's body literal, everything else the config field. */
+	/** Route a field edit. FILE-BACKING WINS over the value's home, and
+	 *  that ordering is the whole rule: a `@file`/`@asset` marker always
+	 *  lives in config, but the resolved CONTENT may have been moved
+	 *  into the port literal (enrich does that for an `all`-exposure
+	 *  input written in the body). Saving such an edit to the port
+	 *  literal would rewrite the source line with the entire file and
+	 *  destroy the reference, so a file-backed field always routes to
+	 *  the file write; only a plain field goes to its declared home
+	 *  (port literal vs config). THE one routing rule; every control
+	 *  calls this. */
 	function updateFieldValue(key: string, value: unknown, portDriven?: boolean) {
-		if (portDriven) updatePortLiteral(key, value);
+		if (fileFieldState(key)) updateConfig(key, value as Parameters<typeof updateConfig>[1]);
+		else if (portDriven) updatePortLiteral(key, value);
 		else updateConfig(key, value as Parameters<typeof updateConfig>[1]);
 	}
 
@@ -659,10 +671,8 @@
 	/** The stored raw value behind a field, read from the home its
 	 *  exposure routes to (port literal vs config). Every custom-field
 	 *  renderer reads through this so no branch hardcodes a home. */
-	function fieldHomeValue(field: FieldDefinition): unknown {
-		return field.portDriven
-			? portLiterals[field.key]
-			: (data.config as Record<string, unknown>)?.[field.key];
+	function declaredValue(field: FieldDefinition): unknown {
+		return declaredHomeValue(portLiterals, data.config, field);
 	}
 
 	/** Resolve a remote_select's authenticating access STRUCTURALLY.
@@ -688,7 +698,7 @@
 		if (accessInputIsOwnWidget(accessInput)) {
 			const service = typeConfig.service?.service;
 			if (!service) return null;
-			const handle = (data.config as Record<string, unknown>)?.[accessInput];
+			const handle = ownValue(data.config as Record<string, unknown> | undefined, accessInput);
 			const grantId =
 				handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 			return typeof grantId === 'string' ? { accessId: grantId, service } : null;
@@ -710,7 +720,7 @@
 		const srcInputs = (srcData.inputs ?? tpl?.defaultInputs ?? []) as PortDefinition[];
 		const connectInput = srcInputs.find((i) => i.widget?.kind === 'access');
 		if (!connectInput) return null;
-		const handle = srcData.config?.[connectInput.name];
+		const handle = ownValue(srcData.config as Record<string, unknown> | undefined, connectInput.name);
 		const grantId =
 			handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 		return typeof grantId === 'string' ? { accessId: grantId, service } : null;
@@ -888,8 +898,7 @@
 	function remoteSelectParents(field: FieldDefinition): Record<string, string> {
 		const out: Record<string, string> = {};
 		for (const parent of field.dependsOn ?? []) {
-			const v =
-				portLiterals[parent] ?? (data.config as Record<string, unknown>)?.[parent];
+			const v = storedValueOf(portLiterals, data.config, parent);
 			if (typeof v === 'string' && v) out[parent] = v;
 		}
 		return out;
@@ -908,7 +917,7 @@
 		// The EFFECTIVE value: the set value, else the input's declared
 		// default (what the runtime would supply). Same rule FieldStrip
 		// applies to the primitive controls.
-		const v = fieldHomeValue(field) ?? field.defaultValue;
+		const v = declaredValue(field) ?? field.defaultValue;
 		const storeStr = (v === undefined || v === null) ? '' : (typeof v === 'string' ? v : JSON.stringify(v, null, 2));
 		return fieldEditor.display(field.key, storeStr);
 	}
@@ -1629,7 +1638,7 @@
 					{#if field.portDriven}
 						{@const locked = portFieldLocked(field.key)}
 						{@const form = portFieldForm(field.key)}
-						{@const hasValue = portLiterals[field.key] !== undefined && portLiterals[field.key] !== null}
+						{@const hasValue = ownValue(portLiterals, field.key) !== undefined && ownValue(portLiterals, field.key) !== null}
 						<!-- The form-toggle marker: which SOURCE FORM this port's
 						     value is written in. Braces `{ }` vs statement `=`;
 						     a wired-only port is locked to the statement form.
@@ -1706,11 +1715,7 @@
 										// home the field's exposure routes to (port literal vs
 										// config), same as every control.
 										const value = emptyToUnset(newValue);
-										if (fileFieldState(field.key)) {
-											updateConfig(field.key, value);
-										} else {
-											updateFieldValue(field.key, value, field.portDriven);
-										}
+										updateFieldValue(field.key, value, field.portDriven);
 									}}
 								/>
 							</div>
@@ -1724,7 +1729,7 @@
 									spec={typeConfig.service}
 									projectApp={typeConfig.accessApps?.[typeConfig.service.service]}
 									nodeType={data.nodeType}
-									value={fieldHomeValue(field) as { id: string; identity?: string } | undefined}
+									value={declaredValue(field) as { id: string; identity?: string } | undefined}
 									onUpdate={(v) => updateFieldValue(field.key, v, field.portDriven)}
 								/>
 							{:else}
@@ -1739,7 +1744,7 @@
 							     (no worker, no data flow at edit time). -->
 							<RemoteSelectField
 								{field}
-								value={fieldHomeValue(field) as string | undefined}
+								value={declaredValue(field) as string | undefined}
 								accessRef={field.access ? traceAccessRef(field.access) : null}
 								accessIsOwnField={accessInputIsOwnWidget(field.access)}
 								grantedScopes={field.access ? (tracedGrants[field.access]?.scopes ?? null) : null}
@@ -1753,7 +1758,7 @@
 							     onto the same-named input port (or the node reads from
 							     config). Source never holds storage keys. -->
 							<FileDropField
-								value={fieldHomeValue(field)}
+								value={declaredValue(field)}
 								accept={field.accept}
 								fileType={field.fileType}
 								onUpdate={(ref) => updateFieldValue(field.key, ref, field.portDriven)}

@@ -109,10 +109,51 @@ impl SettledRun {
             .collect()
     }
 
+    /// Compare two journalled values the way WEFT's type system does,
+    /// which for numbers is by VALUE, not by JSON spelling. A weft
+    /// `Number` is one type (the engine's own zero for it is the
+    /// integer `0`, and its runtime check accepts either spelling), so
+    /// `0` and `0.0` are the same value; which one reaches the journal
+    /// only records whether the producing node happened to be Rust
+    /// (f64) or Python (int). Asserting on that accident makes a test
+    /// fail when a fixture swaps producers without changing its
+    /// result, which is exactly what it must not do.
+    ///
+    /// The bridge is deliberately narrow: two INTEGERS still compare
+    /// exactly (no f64 round-trip, so nothing above 2^53 can collapse
+    /// into a false match); only an integer-vs-float pair converts.
+    /// Everything else (strings, bools, shapes, key sets, ordering) is
+    /// still exact.
+    fn same_weft_value(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => {
+                if x.is_f64() || y.is_f64() {
+                    match (x.as_f64(), y.as_f64()) {
+                        (Some(xf), Some(yf)) => xf == yf,
+                        _ => x == y,
+                    }
+                } else {
+                    x == y
+                }
+            }
+            (Value::Array(xs), Value::Array(ys)) => {
+                xs.len() == ys.len()
+                    && xs.iter().zip(ys).all(|(x, y)| Self::same_weft_value(x, y))
+            }
+            (Value::Object(xs), Value::Object(ys)) => {
+                xs.len() == ys.len()
+                    && xs.iter().all(|(k, x)| {
+                        ys.get(k).is_some_and(|y| Self::same_weft_value(x, y))
+                    })
+            }
+            _ => a == b,
+        }
+    }
+
     /// Assert a node produced `expected` on its first firing.
     pub fn assert_output(&self, node: &str, expected: &Value) -> Result<&Self> {
         match self.output_of(node) {
-            Some(got) if &got == expected => Ok(self),
+            Some(got) if Self::same_weft_value(&got, expected) => Ok(self),
             Some(got) => bail!(
                 "node '{node}' output mismatch\n  expected: {expected}\n  got:      {got}"
             ),
@@ -147,7 +188,7 @@ impl SettledRun {
         })?;
         let got = input.get(port);
         match got {
-            Some(v) if v == expected => Ok(self),
+            Some(v) if Self::same_weft_value(v, expected) => Ok(self),
             Some(v) => bail!(
                 "node '{node}' input port '{port}' mismatch\n  expected: {expected}\n  got:      {v}"
             ),
@@ -233,7 +274,7 @@ impl SettledRun {
                  loop_instantiated: {:?}",
                 self.replay
                     .by_kind("loop_instantiated")
-                    .map(|e| e.field("iter_count").cloned().unwrap_or(Value::Null))
+                    .map(|e| e.field("iter_cap").cloned().unwrap_or(Value::Null))
                     .collect::<Vec<_>>()
             );
         }
@@ -335,5 +376,41 @@ impl SettledRun {
     /// when a check recurs, so tests read as intent.
     pub fn replay(&self) -> &Replay {
         &self.replay
+    }
+}
+
+#[cfg(test)]
+mod same_weft_value_tests {
+    use super::SettledRun;
+    use serde_json::json;
+
+    /// A weft Number is one type whatever its JSON spelling, so an
+    /// assertion must not break when a fixture swaps a Rust producer
+    /// (emits `0.0`) for a Python one (emits `0`), or the other way.
+    #[test]
+    fn integer_and_float_spellings_of_one_number_match() {
+        assert!(SettledRun::same_weft_value(&json!(0), &json!(0.0)));
+        assert!(SettledRun::same_weft_value(&json!([0, 2, 4]), &json!([0.0, 2.0, 4.0])));
+        assert!(SettledRun::same_weft_value(
+            &json!({"a": [1], "b": {"c": 2}}),
+            &json!({"a": [1.0], "b": {"c": 2.0}})
+        ));
+    }
+
+    /// The bridge is narrow on purpose: it must not turn a real
+    /// mismatch into a pass, and two INTEGERS never round-trip through
+    /// f64 (so nothing above 2^53 can collapse into a false match).
+    #[test]
+    fn it_never_hides_a_real_difference() {
+        assert!(!SettledRun::same_weft_value(&json!(1), &json!(2)));
+        assert!(!SettledRun::same_weft_value(&json!(0), &json!("0")));
+        assert!(!SettledRun::same_weft_value(&json!([1, 2]), &json!([1, 2, 3])));
+        assert!(!SettledRun::same_weft_value(&json!({"a": 1}), &json!({"a": 1, "b": 2})));
+        assert!(!SettledRun::same_weft_value(&json!(null), &json!(0)));
+        // Distinct integers that share one f64: exact-compared, so they differ.
+        assert!(!SettledRun::same_weft_value(
+            &json!(9_007_199_254_740_993_u64),
+            &json!(9_007_199_254_740_992_u64)
+        ));
     }
 }

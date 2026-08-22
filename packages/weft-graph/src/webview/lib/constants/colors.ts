@@ -46,6 +46,8 @@ function colorForParsed(t: WeftType): string {
 		case 'must_override': return PORT_TYPE_COLORS.MustOverride;
 		case 'bus': return PORT_TYPE_COLORS.Bus;
 		case 'access': return PORT_TYPE_COLORS.Access;
+		// A stream colors as its element: the wire carries items of T.
+		case 'generator': return colorForParsed(t.inner);
 	}
 }
 

@@ -6,6 +6,8 @@
 // edit-server. Format, one entry per line:
 //   scopedId @layout x y [WxH] [expanded|collapsed] [configCollapsed]
 
+import { bareRecord } from './types';
+
 export interface LayoutEntry {
   x: number;
   y: number;
@@ -83,7 +85,9 @@ function matchToEntry(match: RegExpMatchArray): [string, LayoutEntry] {
 }
 
 export function parseLayoutCode(layoutCode: string, verb: LayoutVerb = LAYOUT_VERB): Record<string, LayoutEntry> {
-  const map: Record<string, LayoutEntry> = {};
+  // Keyed by node id (user-chosen), so no inherited entries: see
+  // `bareRecord`.
+  const map: Record<string, LayoutEntry> = bareRecord();
   if (!layoutCode) return map;
   const re = entryRe(verb);
   for (const line of layoutCode.split('\n')) {

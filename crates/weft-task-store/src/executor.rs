@@ -378,7 +378,7 @@ where
 ///   - `Finished(Ok(Ok(value)))`: → `tasks::complete`.
 ///   - `Finished(Ok(Err(e)))`: → `tasks::fail` with the error message.
 ///   - `Finished(Err(panic))`: → `tasks::fail` with a "panic: ..."
-///     prefix so the dashboard can flag it visibly. Without this
+///     prefix so clients can flag it visibly. Without this
 ///     layering, a panicking executor would ride the JoinSet's
 ///     JoinError up and get discarded by `try_join_next`, and the row
 ///     would sit `claimed` until the lease expired.

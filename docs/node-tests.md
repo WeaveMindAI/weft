@@ -109,13 +109,20 @@ test with its message, never the whole run.
   connection answers (`conn.value(name)`).
 - `rig.signal(payload)`: queue a payload for the node's next
   `ctx.await_signal` (mid-flow suspensions). An await with an empty
-  queue fails loud.
+  queue fails loud. The rig also refuses `await_signal` exactly where
+  an execution would, whatever the queue holds: after the body has
+  emitted on or closed any output port, and always for a node that
+  declares a `Generator` input (a stream consumer cannot durably
+  suspend).
 - `rig.wake(payload)`: the wake payload (`ctx.wake`) for the next run;
   how a trigger's firing is emulated.
 - `rig.run(node, inputs)` / `rig.run_setup_trigger(node, inputs)`:
   run the body. `inputs` is a JSON object of input name to value;
-  declared metadata defaults fill anything absent. Returns a
-  `RunOutcome`: the body's result, the emitted outputs by port, the
+  declared metadata defaults fill anything absent. A `Generator[T]`
+  input takes its value as a plain JSON ARRAY of items: the rig
+  pre-loads a live, already-finished feed with them, so the body's
+  `ctx.inputs.get::<Generator<T>>` pull loop runs unmodified. Returns
+  a `RunOutcome`: the body's result, the emitted outputs by port, the
   closed ports.
 - `rig.requests()` / `rig.assert_sent(method, path)`: the request log.
 - `rig.registered_signals()` / `rig.logs()`: what `register_signal`

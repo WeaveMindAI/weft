@@ -14,6 +14,24 @@ use crate::project::{Edge, EdgeIndex, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
 use crate::Color;
 
+/// Whether `edge` lands on a `Generator[T]` input port. Generator ports
+/// deliberately step outside the one-pulse-per-key reasoning: their
+/// consumer fires once and then PULLS, taking items in arrival order,
+/// so successive pulses at the same key are never ambiguous to it. The
+/// fan-in collision checks and the same-value dedup below therefore do
+/// not apply to them (two equal items are two items), and a closure
+/// (the stream's end) coexists with still-buffered items instead of
+/// being dropped against them.
+fn edge_targets_generator(project: &ProjectDefinition, edge: &Edge) -> bool {
+    let handle = edge.target_handle.as_deref().unwrap_or("default");
+    project
+        .nodes
+        .iter()
+        .find(|n| n.id == edge.target)
+        .and_then(|n| n.inputs.iter().find(|p| p.name == handle))
+        .is_some_and(|p| p.port_type.as_generator().is_some())
+}
+
 
 /// Process a node's output: emit pulses ONLY for the output ports the
 /// node mentioned in `output`. Ports the node didn't mention this call
@@ -74,6 +92,12 @@ pub fn postprocess_output(
             )));
         }
         for edge in outgoing.iter().filter(|e| e.source_handle.as_deref() == Some(port_name.as_str())) {
+            // Generator targets take repeated pulses by design; the
+            // fan-in collision reasoning below is about single-shot
+            // ports and does not apply (see `edge_targets_generator`).
+            if edge_targets_generator(project, edge) {
+                continue;
+            }
             let target_handle = edge.target_handle.as_deref().unwrap_or("default");
             // Cross-firing collision: another in-flight data pulse at
             // the same fan-in key with a DIFFERENT value.
@@ -125,6 +149,7 @@ pub fn postprocess_output(
     for (port_name, value) in output_obj {
         mentioned.insert(port_name.clone());
         emit_single(
+            project,
             node_id,
             &outgoing,
             port_name,
@@ -144,7 +169,12 @@ pub fn postprocess_output(
 /// - Closure already pending: append the data pulse anyway; both stay
 ///   in the table. `resolve_port_value` prefers the non-closed pulse
 ///   at read time.
+/// - Generator target: append unconditionally. Repeated pulses are the
+///   port's contract, and two EQUAL items are two items (the dedup
+///   would silently drop one).
+#[allow(clippy::too_many_arguments)]
 fn emit_single(
+    project: &ProjectDefinition,
     source_node: &str,
     outgoing: &[&Edge],
     port: &str,
@@ -160,16 +190,17 @@ fn emit_single(
         }
         let target_handle = edge.target_handle.as_deref().unwrap_or("default");
 
-        let already_present_same_value = pulses.get(&edge.target).map(|ps| {
-            ps.iter().any(|p| {
-                p.status.is_pending()
-                    && p.color == color
-                    && &p.frames == frames
-                    && p.target_port == target_handle
-                    && !p.closed
-                    && p.value == *value
-            })
-        }).unwrap_or(false);
+        let already_present_same_value = !edge_targets_generator(project, edge)
+            && pulses.get(&edge.target).map(|ps| {
+                ps.iter().any(|p| {
+                    p.status.is_pending()
+                        && p.color == color
+                        && &p.frames == frames
+                        && p.target_port == target_handle
+                        && !p.closed
+                        && p.value == *value
+                })
+            }).unwrap_or(false);
         if already_present_same_value {
             continue;
         }
@@ -198,6 +229,17 @@ fn emit_single(
 /// (loop boundary nodes on per-iteration firings) do so at the call
 /// site by NOT invoking this function. Keeping the language layer
 /// free of node-name strings is the invariant.
+///
+/// GENERATOR output ports are swept whether or not they were
+/// mentioned: on a generator, "mentioned" means "yielded at least
+/// once", not "finished", and the closure IS the stream's end (the
+/// consumer's pull reads it as "finished"). `failure` is the firing's
+/// error when this sweep runs on a failure path: it rides the
+/// generator ports' closures as a FAILED end, so the consumer's pull
+/// surfaces the producer's error through `?` instead of reading a
+/// clean finish over a truncated stream. Ordinary ports never carry
+/// it: their consumers act on the closure itself (skip / missing
+/// input).
 pub fn close_unmentioned_downstream(
     node_id: &str,
     mentioned: &HashSet<String>,
@@ -207,6 +249,7 @@ pub fn close_unmentioned_downstream(
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
     emissions: &mut Vec<PulseEmission>,
+    failure: Option<&str>,
 ) -> WeftResult<()> {
     let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
         // Same impossible state as `postprocess_output`'s node lookup;
@@ -219,10 +262,15 @@ pub fn close_unmentioned_downstream(
     };
     let outgoing = edge_idx.get_outgoing(project, node_id);
     for port in &node.outputs {
-        if mentioned.contains(&port.name) {
+        let is_generator = port.port_type.as_generator().is_some();
+        if mentioned.contains(&port.name) && !is_generator {
             continue;
         }
-        emit_closure_on_outgoing(node_id, &port.name, color, frames, &outgoing, pulses, emissions);
+        let close_error = if is_generator { failure } else { None };
+        emit_closure_on_outgoing(
+            project, node_id, &port.name, color, frames, close_error, &outgoing, pulses,
+            emissions,
+        );
     }
     Ok(())
 }
@@ -263,16 +311,26 @@ pub fn emit_port_closure(
         }
     }
     let outgoing = edge_idx.get_outgoing(project, node_id);
-    emit_closure_on_outgoing(node_id, port_name, color, frames, &outgoing, pulses, emissions);
+    emit_closure_on_outgoing(
+        project, node_id, port_name, color, frames, None, &outgoing, pulses, emissions,
+    );
     Ok(())
 }
 
-/// Shared closure-emit helper.
+/// Shared closure-emit helper. On a NORMAL target port, a closure is
+/// suppressed by anything already pending at the key (a data pulse
+/// outranks it forever; a closure is single-shot). On a GENERATOR
+/// target port, buffered items and the closure coexist (the items are
+/// taken first, then the end); only a closure already pending dedups a
+/// second one.
+#[allow(clippy::too_many_arguments)]
 fn emit_closure_on_outgoing(
+    project: &ProjectDefinition,
     node_id: &str,
     port_name: &str,
     color: Color,
     frames: &LoopFrames,
+    close_error: Option<&str>,
     outgoing: &[&Edge],
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
@@ -282,6 +340,7 @@ fn emit_closure_on_outgoing(
         .filter(|e| e.source_handle.as_deref() == Some(port_name))
     {
         let target_handle = edge.target_handle.as_deref().unwrap_or("default");
+        let generator_target = edge_targets_generator(project, edge);
 
         let already_present = pulses
             .get(&edge.target)
@@ -291,6 +350,7 @@ fn emit_closure_on_outgoing(
                         && p.color == color
                         && &p.frames == frames
                         && p.target_port == target_handle
+                        && (!generator_target || p.closed)
                 })
             })
             .unwrap_or(false);
@@ -298,11 +358,12 @@ fn emit_closure_on_outgoing(
             continue;
         }
 
-        let pulse = Pulse::closure(
+        let pulse = Pulse::closure_with_error(
             color,
             frames.clone(),
             edge.target.clone(),
             target_handle.to_string(),
+            close_error.filter(|_| generator_target).map(str::to_string),
         );
         emissions.push(PulseEmission {
             pulse: pulse.clone(),
@@ -318,6 +379,22 @@ mod fan_in_tests {
     use super::*;
     use crate::project::Edge;
     use serde_json::json;
+
+    /// Minimal project for the emit-level tests: a `consumer` with a
+    /// plain `in` input (the emit helpers only inspect the TARGET
+    /// port's type; the provenance strings the tests pass as source
+    /// node ids never resolve).
+    fn direct_project() -> ProjectDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [node("src", vec!["out"], vec![]), node("consumer", vec![], vec!["in"])],
+            "edges": [],
+            "groups": [],
+            "createdAt": "1970-01-01T00:00:00Z",
+            "updatedAt": "1970-01-01T00:00:00Z",
+        }))
+        .expect("test project")
+    }
 
     fn edge(source_handle: &str, target: &str, target_handle: &str) -> Edge {
         Edge {
@@ -339,8 +416,9 @@ mod fan_in_tests {
         let color = uuid::Uuid::nil();
         let frames: LoopFrames = Vec::new();
 
-        emit_single("src1", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions);
-        emit_single("src2", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions);
+        let project = direct_project();
+        emit_single(&project, "src1", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions);
+        emit_single(&project, "src2", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions);
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
         let pending: Vec<_> = consumer_bucket
@@ -359,11 +437,12 @@ mod fan_in_tests {
         let color = uuid::Uuid::nil();
         let frames: LoopFrames = Vec::new();
 
+        let project = direct_project();
         emit_closure_on_outgoing(
-            "src1", "out", color, &frames, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src1", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_single(
-            "src2", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions,
+            &project, "src2", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
@@ -387,12 +466,13 @@ mod fan_in_tests {
         let color = uuid::Uuid::nil();
         let frames: LoopFrames = Vec::new();
 
+        let project = direct_project();
         emit_single(
-            "src1", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions,
+            &project, "src1", &outgoing_refs, "out", &json!(42), color, &frames, &mut pulses, &mut emissions,
         );
         let emissions_before = emissions.len();
         emit_closure_on_outgoing(
-            "src2", "out", color, &frames, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src2", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         assert_eq!(
             emissions.len(),
@@ -582,11 +662,12 @@ mod fan_in_tests {
         let color = uuid::Uuid::nil();
         let frames: LoopFrames = Vec::new();
 
+        let project = direct_project();
         emit_closure_on_outgoing(
-            "src1", "out", color, &frames, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src1", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_closure_on_outgoing(
-            "src2", "out", color, &frames, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src2", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");

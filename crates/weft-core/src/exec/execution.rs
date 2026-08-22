@@ -98,7 +98,7 @@ pub struct PortWarning {
 pub type NodeExecutionTable = BTreeMap<String, Vec<NodeExecution>>;
 
 /// Aggregate status for a node derived from all its executions.
-/// Used by the dashboard and by SSE events.
+/// Used by SSE events.
 pub fn summarize_status(executions: &[NodeExecution]) -> String {
     if executions.is_empty() {
         return "pending".to_string();

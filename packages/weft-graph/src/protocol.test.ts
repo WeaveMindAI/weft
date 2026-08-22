@@ -13,6 +13,21 @@ describe('typeReferencesFile', () => {
 			expect(typeReferencesFile(t), t).toBe(false);
 		}
 	});
+
+	it('answers structurally: a dict KEY is an index, never a stored value', () => {
+		// Mirrors Rust's Dict(_, v) arm; the old token regex could not
+		// tell the two positions apart.
+		expect(typeReferencesFile('Dict[String, Image]')).toBe(true);
+		expect(typeReferencesFile('Dict[Image, String]')).toBe(false);
+	});
+
+	it('rejects a stream whatever its element mentions, through chained aliases too', () => {
+		// A generator port's value is a live handle, never a file; wire
+		// aliases spell as `Name=Body` and chain.
+		for (const t of ['Generator[Image]', 'Frames=Generator[Image]', 'F2=Frames=Generator[Image]']) {
+			expect(typeReferencesFile(t), t).toBe(false);
+		}
+	});
 });
 
 // SYNC-covered peer: crates/weft-core/src/storage/mod.rs FileHandle::from_value

@@ -1,0 +1,15 @@
+{
+  "type": "RowFeed",
+  "label": "Row feed",
+  "description": "Walk the configured rows once and yield only the ones that are not comments (rows starting with '#'), as a stream.",
+  "tags": ["test", "stream"],
+  "icon": "Rows3",
+  "color": "#64748b",
+  "inputs": [
+    { "name": "rows", "type": "List[String]", "required": true }
+  ],
+  "outputs": [
+    { "name": "kept", "type": "Generator[String]", "required": false }
+  ],
+  "requires_infra": false
+}

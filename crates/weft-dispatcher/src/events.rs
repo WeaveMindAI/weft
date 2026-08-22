@@ -59,12 +59,16 @@ pub enum DispatcherEvent {
     PortTypeMismatch { color: Color, node: String, frames: LoopFrames, port: String, expected: String, actual: String, project_id: String },
     /// A loop instance was created at `parent_frames`. The inspector
     /// uses this to render a "Loop opened" marker at the loop's box.
+    // SYNC: LoopInstantiated <-> extension-vscode/src/execFollower.ts loop_instantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
     LoopInstantiated {
         color: Color,
         project_id: String,
         group_id: String,
         parent_frames: LoopFrames,
-        iter_count: u32,
+        /// Effective iteration CAP; `None` for an uncapped loop (a
+        /// done-driven or stream-driven loop with no `max_iters`),
+        /// whose iteration count is unknowable up front.
+        iter_cap: Option<u32>,
         parallel: bool,
     },
     /// An iteration of the loop launched. Inspector renders an

@@ -1,0 +1,24 @@
+# Range driving a stream loop: the catalog's count-based producer
+# yields 0..5 one number at a time, and a sequential loop doubles each
+# as it arrives (its documented headline use: the loop pulls one number
+# per iteration, so large ranges never sit in memory).
+#
+# The rig asserts: the loop launched 5 iterations and the gather is
+# [0,2,4,6,8].
+
+nums = Range { to: 5 }
+
+doubler = Loop(values: Generator[Number]) -> (results: List[Number | Null]) {
+  parallel: false
+  over: ["values"]
+
+  step = ExecPython(n: Number) -> (out: Number) {
+    code: "return {'out': n * 2}"
+  }
+  step.n = self.values
+  self.results = step.out
+}
+doubler.values = nums.values
+
+out = Debug
+out.data = doubler.results

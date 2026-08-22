@@ -107,7 +107,7 @@
 					<button
 						type="button"
 						class="flex w-full items-center gap-2 border-b border-border/50 px-3 py-2 text-left transition-colors hover:bg-muted/60 {ok ? '' : 'opacity-45'}"
-						title={ok ? file.key : `${file.filename} — doesn't match ${accept}, but you can still pick it`}
+						title={ok ? file.key : `${file.filename} doesn't match ${accept}, but you can still pick it`}
 						onclick={() => onPick(file.key)}
 					>
 						<Icon class="w-4 h-4 text-muted-foreground shrink-0" />

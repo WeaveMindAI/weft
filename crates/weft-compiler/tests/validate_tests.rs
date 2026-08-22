@@ -1357,3 +1357,644 @@ out.data = c.value
     );
 }
 
+
+// ----- Generator[T] wiring rules -------------------------------------
+
+#[test]
+fn clean_stream_loop_over_a_generator_validates() {
+    // The flagship shape: Range yields a stream, the loop pulls one
+    // number per iteration. No generator- or loop-specific errors.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+my = Loop(values: Generator[Number]) -> (results: List[Number | Null]) {
+    parallel: false
+    over: ["values"]
+    p = ExecPython(n: Number) -> (out: Number) { code: "return {'out': n * 2}" }
+    p.n = self.values
+    self.results = p.out
+}
+my.values = nums.values
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "expected a clean stream loop, got {:?}", errors(&d));
+}
+
+#[test]
+fn a_parallel_stream_loop_validates_clean() {
+    // Parallel mode over a stream is a supported shape (the runtime
+    // launches a lane per arriving item); pin that no rule rejects it.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+my = Loop(values: Generator[Number]) -> (results: List[Number | Null]) {
+    parallel: true
+    over: ["values"]
+    p = ExecPython(n: Number) -> (out: Number) { code: "return {'out': n * 2}" }
+    p.n = self.values
+    self.results = p.out
+}
+my.values = nums.values
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "expected a clean parallel stream loop, got {:?}", errors(&d));
+}
+
+#[test]
+fn a_stream_in_over_must_be_alone() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+my = Loop(values: Generator[Number], names: List[String]) -> (results: List[Number | Null]) {
+    over: ["values", "names"]
+    p = ExecPython(n: Number) -> (out: Number) { code: "return {'out': n}" }
+    p.n = self.values
+    self.results = p.out
+}
+my.values = nums.values
+my.names = @json(["a"])
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"over-stream-not-alone"),
+        "expected over-stream-not-alone, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_generator_loop_input_outside_over_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+my = Loop(rows: Generator[Number], items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.rows = nums.values
+my.items = @json(["a"])
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-not-iterated"),
+        "expected generator-not-iterated, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_stream_with_two_consumers_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+a = ExecPython(rows: Generator[Number]) -> (done: Boolean) { code: "return {'done': True}" }
+b = ExecPython(rows: Generator[Number]) -> (done: Boolean) { code: "return {'done': True}" }
+a.rows = nums.values
+b.rows = nums.values
+out = Debug
+out.data = a.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-multiple-consumers"),
+        "expected generator-multiple-consumers, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_stream_crossing_a_group_boundary_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 3 }
+grp = Group(vals: Generator[Number]) -> (done: Boolean) {
+    c = ExecPython(rows: Generator[Number]) -> (done: Boolean) { code: "return {'done': True}" }
+    c.rows = self.vals
+    self.done = c.done
+}
+grp.vals = nums.values
+out = Debug
+out.data = grp.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-through-group"),
+        "expected generator-through-group, got {:?}",
+        codes(&d)
+    );
+    // One crossing, ONE diagnostic: the ban lives on the boundary
+    // node, and the synthesized boundary's flatten shape must not
+    // stack extra rules (generator-input-must-be-required) on top.
+    assert_eq!(
+        errors(&d).len(),
+        1,
+        "one stream crossing reports exactly once, got {:?}",
+        codes(&d)
+    );
+}
+
+/// A stream declared on the PROJECT'S OWN input boundary has no
+/// incoming edge at all, so an edge-based rule would let it compile
+/// clean and ship an unsatisfiable graph (nothing can hand an
+/// execution a live stream as an input).
+#[test]
+fn a_stream_on_the_projects_input_boundary_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+Group(rows: Generator[Number]) -> (done: Boolean) {
+    p = ExecPython(rows: Generator[Number]) -> (done: Boolean) { code: "return {'done': True}" }
+    p.rows = self.rows
+    self.done = p.done
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-through-group"),
+        "expected generator-through-group on the project input boundary, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_generator_nested_in_a_container_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+p = ExecPython(xs: List[Generator[Number]]) -> (done: Boolean) { code: "return {'done': True}" }
+out = Debug
+out.data = p.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-in-container"),
+        "expected generator-in-container, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_stream_cannot_be_carried_between_iterations() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String | Null], acc: Generator[Number]) {
+    over: ["items"]
+    carry: ["acc"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.items = @json(["a"])
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-not-carriable"),
+        "expected generator-not-carriable, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_stream_into_a_generic_port_is_rejected() {
+    // The single most likely user mistake: Range straight into Debug.
+    // Debug's `data` is a generic `T`; without a dedicated rule the
+    // binding would compile and the consumer would receive the raw
+    // handle marker it never pulls (the producer then dies at its
+    // buffer cap with a misleading backpressure error at runtime).
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+out = Debug
+out.data = nums.values
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-into-generic-port"),
+        "expected generator-into-generic-port, got {:?}",
+        codes(&d)
+    );
+    // This rule OWNS the edge's error: the leftover unbound `T` must
+    // not also surface as unresolved-typevar ("connect it to something
+    // concrete" would mislead: the port IS connected).
+    assert!(
+        !codes(&d).contains(&"unresolved-typevar"),
+        "the generic-port rule owns the edge; got {:?}",
+        codes(&d)
+    );
+}
+
+/// A loop's stream `over` port mirrors the user's own declaration, so
+/// marking it optional must still be rejected: an optional stream
+/// would compile as a loop nothing can ever wire or satisfy.
+#[test]
+fn an_optional_stream_over_port_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+my = Loop(values: Generator[Number]?) -> (results: List[Number | Null]) {
+    over: ["values"]
+    p = ExecPython(n: Number) -> (out: Number) { code: "return {'out': n}" }
+    p.n = self.values
+    self.results = p.out
+}
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-input-must-be-required"),
+        "expected generator-input-must-be-required on the loop's over port, got {:?}",
+        codes(&d)
+    );
+}
+
+/// The mirror of the stream-into-generic ban: a generic SOURCE cannot
+/// produce the live stream a Generator input needs, and the rule owns
+/// that edge too (no misleading unresolved-typevar stacked on it).
+#[test]
+fn a_generic_source_into_a_stream_port_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+seed = ExecPython() -> (out: T) { code: "return {'out': 1}" }
+p = ExecPython(rows: Generator[Number]) -> (done: Boolean) { code: "return {'done': True}" }
+p.rows = seed.out
+out = Debug
+out.data = p.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-into-generic-port"),
+        "expected generator-into-generic-port on the generic source, got {:?}",
+        codes(&d)
+    );
+    assert!(
+        !d.iter().any(|e| {
+            e.code.as_deref() == Some("unresolved-typevar") && e.message.contains("seed.out")
+        }),
+        "the generic-port rule owns the edge, got {d:?}"
+    );
+}
+
+/// A generic stream CONSUMER is well-typed: `Generator[T]` wired to a
+/// `Generator[Number]` source binds `T = Number` element-wise and
+/// compiles clean (only a bare `T` receiving a whole stream is
+/// refused).
+#[test]
+fn a_generic_stream_port_binds_its_element_from_the_source() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+p = ExecPython(rows: Generator[T]) -> (done: Boolean) { code: "return {'done': True}" }
+p.rows = nums.values
+out = Debug
+out.data = p.done
+"#,
+    );
+    let rows = project
+        .nodes
+        .iter()
+        .find(|n| n.id == "p")
+        .and_then(|n| n.inputs.iter().find(|i| i.name == "rows"))
+        .expect("p.rows present");
+    assert_eq!(
+        rows.port_type.to_string(),
+        "Generator[Number]",
+        "the element binds from the source"
+    );
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "a bound generic stream port is clean: {:?}", errors(&d));
+}
+
+/// A MustOverride target (an unknown declared type) behind a stream
+/// source is ONE mistake with one owner: `generator-into-generic-port`
+/// reports it, and `must-override-unmet` stays quiet (its "declare a
+/// concrete type" advice would contradict "declare Generator[T]").
+#[test]
+fn a_stream_into_a_must_override_port_reports_once() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+p = ExecPython(xs: Blah) -> (done: Boolean) { code: "return {'done': True}" }
+p.xs = nums.values
+out = Debug
+out.data = p.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-into-generic-port"),
+        "expected generator-into-generic-port, got {:?}",
+        codes(&d)
+    );
+    // The stream edge reports ONCE: no must-override-unmet stacked on
+    // it, and no unresolved-typevar naming its target port. (Other
+    // edges may still report their own problems: the unknown type
+    // aborts enrichment, so Debug's generic stays unbound.)
+    assert!(
+        !codes(&d).contains(&"must-override-unmet"),
+        "the generic-port rule owns the stream edge, got {:?}",
+        codes(&d)
+    );
+    assert!(
+        !d.iter().any(|e| {
+            e.code.as_deref() == Some("unresolved-typevar") && e.message.contains("p.xs")
+        }),
+        "no unresolved-typevar on the stream edge's target, got {d:?}"
+    );
+}
+
+/// "Generic" means any unresolved leaf at any depth, not just a bare
+/// `T`: enrich refuses the binding for all of them, so without this
+/// rule a stream into `List[T]` would compile with ZERO diagnostics.
+#[test]
+fn a_stream_into_a_container_of_typevars_is_rejected() {
+    for target in ["xs: List[T]", "xs: Dict[String, T]"] {
+        let (project, _) = parse_enrich_lenient(&format!(
+            r#"
+nums = Range {{ to: 5 }}
+p = ExecPython({target}) -> (done: Boolean) {{ code: "return {{'done': True}}" }}
+p.xs = nums.values
+out = Debug
+out.data = p.done
+"#
+        ));
+        let d = validate(&project, &catalog());
+        assert!(
+            codes(&d).contains(&"generator-into-generic-port"),
+            "{target}: expected generator-into-generic-port, got {:?}",
+            codes(&d)
+        );
+    }
+}
+
+#[test]
+fn a_stream_element_type_mismatch_is_rejected() {
+    // Generator is invariant in T: Number items never satisfy a
+    // String stream port.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+p = ExecPython(rows: Generator[String]) -> (done: Boolean) { code: "return {'done': True}" }
+p.rows = nums.values
+out = Debug
+out.data = p.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"type-mismatch"),
+        "expected type-mismatch, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_generator_of_generators_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+p = ExecPython(xs: Generator[Generator[Number]]) -> (done: Boolean) { code: "return {'done': True}" }
+out = Debug
+out.data = p.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-in-container"),
+        "expected generator-in-container for Generator[Generator[..]], got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_generator_nested_in_an_output_container_is_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+p = ExecPython() -> (xs: List[Generator[Number]]) { code: "return {'xs': []}" }
+out = Debug
+out.data = p.xs
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-in-container"),
+        "expected generator-in-container on the OUTPUT side, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn an_optional_generator_input_is_rejected() {
+    // An unwired stream has no meaning (no zero value, no default), so
+    // a Generator input must be required.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+p = ExecPython(rows: Generator[Number]?) -> (done: Boolean) { code: "return {'done': True}" }
+p.rows = nums.values
+out = Debug
+out.data = p.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-input-must-be-required"),
+        "expected generator-input-must-be-required, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_stream_into_a_loop_gather_port_is_rejected() {
+    // A gather is a per-iteration VALUE write; a stream wired into the
+    // loop's outward boundary has no meaning.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+my = Loop(items: List[String]) -> (results: List[String | Null], rows: Generator[Number]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+    self.rows = nums.values
+}
+my.items = @json(["a"])
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"generator-through-group"),
+        "expected generator-through-group on the LoopOut edge, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn two_streams_in_over_are_rejected() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+a = Range { to: 5 }
+b = Range { to: 5 }
+my = Loop(xs: Generator[Number], ys: Generator[Number]) -> (results: List[Number | Null]) {
+    over: ["xs", "ys"]
+    p = ExecPython(n: Number, m: Number) -> (out: Number) { code: "return {'out': n}" }
+    p.n = self.xs
+    p.m = self.ys
+    self.results = p.out
+}
+my.xs = a.values
+my.ys = b.values
+out = Debug
+out.data = my.results
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"over-stream-not-alone"),
+        "expected over-stream-not-alone for two streams, got {:?}",
+        codes(&d)
+    );
+}
+
+#[test]
+fn a_stream_into_a_plain_list_input_is_a_type_mismatch() {
+    // The old workaround shape (Range's list into a List port) now
+    // reads as what it is: a stream is not a list.
+    let (project, _) = parse_enrich_lenient(
+        r#"
+nums = Range { to: 5 }
+p = ExecPython(xs: List[Number]) -> (done: Boolean) { code: "return {'done': True}" }
+p.xs = nums.values
+out = Debug
+out.data = p.done
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"type-mismatch"),
+        "expected type-mismatch, got {:?}",
+        codes(&d)
+    );
+}
+
+/// named-type-conflict: two ports restating one type name with two
+/// different bodies must be a loud error (nominal compatibility
+/// compares the name alone, so a silent fork would wire mismatched
+/// shapes together). Built by mutating enriched port types, because
+/// the wire form (`Name=Body`) is not weft-source syntax.
+#[test]
+fn a_named_type_restated_with_two_bodies_is_rejected() {
+    let mut project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+b = Debug
+b.data = a.value
+"#,
+    );
+    let named = |body: &str| weft_core::weft_type::WeftType::Named {
+        name: "Feed".into(),
+        body: Box::new(weft_core::weft_type::WeftType::parse(body).expect("body parses")),
+    };
+    project
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "a")
+        .and_then(|n| n.outputs.first_mut())
+        .expect("a.value present")
+        .port_type = named("Generator[Number]");
+    project
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "b")
+        .and_then(|n| n.inputs.first_mut())
+        .expect("b.data present")
+        .port_type = named("Generator[String]");
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"named-type-conflict"),
+        "expected named-type-conflict, got {:?}",
+        codes(&d)
+    );
+}
+
+/// The registry half of named-type-conflict: a port restating a name
+/// the catalog's registry DECLARES with a different body errors, and
+/// the scope travels with `validate` itself (a caller cannot forget
+/// it; the build path once did, silently no-op-ing this half).
+#[test]
+fn a_restatement_contradicting_the_declared_type_is_rejected() {
+    struct DeclaringCatalog {
+        inner: FsCatalog,
+        registry: std::sync::Arc<weft_core::weft_type::TypeRegistry>,
+    }
+    impl weft_core::node::MetadataCatalog for DeclaringCatalog {
+        fn lookup(&self, node_type: &str) -> Option<&weft_core::node::NodeMetadata> {
+            self.inner.lookup(node_type)
+        }
+        fn all(&self) -> Vec<&weft_core::node::NodeMetadata> {
+            self.inner.all()
+        }
+        fn type_registry(&self) -> std::sync::Arc<weft_core::weft_type::TypeRegistry> {
+            self.registry.clone()
+        }
+    }
+    let declaring = DeclaringCatalog {
+        inner: catalog(),
+        registry: std::sync::Arc::new(
+            weft_core::weft_type::TypeRegistry::build(&[(
+                "Feed".to_string(),
+                "Generator[Number]".to_string(),
+                "test".to_string(),
+            )])
+            .expect("registry builds"),
+        ),
+    };
+    let mut project = parse_enrich(
+        r#"
+a = Text { value: "x" }
+out = Debug
+out.data = a.value
+"#,
+    );
+    project
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "a")
+        .and_then(|n| n.outputs.first_mut())
+        .expect("a.value present")
+        .port_type = weft_core::weft_type::WeftType::Named {
+        name: "Feed".into(),
+        body: Box::new(weft_core::weft_type::WeftType::parse("Generator[String]").expect("parses")),
+    };
+    let d = validate(&project, &declaring);
+    assert!(
+        d.iter().any(|e| {
+            e.code.as_deref() == Some("named-type-conflict")
+                && e.message.contains("declared as")
+        }),
+        "expected the registry half of named-type-conflict, got {:?}",
+        codes(&d)
+    );
+}

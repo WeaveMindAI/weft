@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! define_primitives {
     ($($variant:ident),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        // SYNC: WeftPrimitive <-> packages/weft-graph/src/protocol.ts WeftPrimitive
         pub enum WeftPrimitive {
             $($variant),+
         }
@@ -85,8 +86,7 @@ pub enum FileKind {
 
 impl FileKind {
     /// The on-wire sentinel key that tags a value of this kind.
-    // SYNC: FileKind::marker_key <-> packages/weft-graph/src/protocol.ts STORED_FILE_MARKERS,
-    //       packages/weft-graph/src/webview/lib/types/index.ts STORED_FILE_MARKER_TYPES
+    // SYNC: FileKind::marker_key <-> packages/weft-graph/src/protocol.ts STORED_FILE_MARKER_TYPES
     pub fn marker_key(self) -> &'static str {
         match self {
             FileKind::Image => "__weft_image__",
@@ -207,6 +207,13 @@ impl Exposure {
     }
 }
 
+/// The sentinel key of the generator handle value the engine places in
+/// a consumer's input bag (`{"__weft_generator__": {"id": "<uuid>"}}`).
+/// Same shape family as the bus / stored-file / access markers. Lives
+/// here (not in the runtime-gated `generator` module) because the type
+/// gate (`validate_value`) must recognise it in every build.
+pub const GENERATOR_MARKER_KEY: &str = "__weft_generator__";
+
 /// One resolved type declaration: the body a name expands to, and
 /// whether the name is NOMINAL (user-declared: the name is the contract,
 /// values wire only into the same name) or pure display sugar (the
@@ -279,6 +286,7 @@ impl TypeRegistry {
         })
     }
 
+
     /// Every user-declared (nominal) entry as `(name, authored body
     /// string)`, for shipping to surfaces that parse type strings
     /// themselves (the editor).
@@ -325,6 +333,21 @@ impl TypeRegistry {
                     std::sync::Arc::new(registry.clone()).scoped_ref(|| WeftType::parse(body_str));
                 match parsed {
                     Some(body) => {
+                        // A declared body must be CONCRETE: `T` is a
+                        // node-scoped port variable, and the language
+                        // has no parameterized nominal types, so a var
+                        // in a declaration could only ever produce two
+                        // same-named types with different bodies (which
+                        // name-only nominal compatibility must never
+                        // see).
+                        if body.contains_unresolved_leaf() {
+                            return Err(format!(
+                                "{origin}: type `{name}`: a declared type body must be \
+                                 concrete; `{body_str}` carries a type variable, which \
+                                 is a node-scoped port concept and cannot appear in a \
+                                 declaration"
+                            ));
+                        }
                         if let Some(existing) = registry.entries.get(name.as_str()) {
                             if existing.nominal && existing.body == body {
                                 // Identical redeclaration: absorbed.
@@ -376,6 +399,7 @@ impl TypeRegistry {
     /// letter, not colliding with anything the type language already
     /// means (a primitive, a container keyword, a special type, a
     /// TypeVar shape).
+    // SYNC: named-name rule <-> packages/weft-graph/src/protocol.ts parseSingleType (Name=Body arm)
     fn check_declarable_name(name: &str) -> Result<(), std::string::String> {
         let mut chars = name.chars();
         let valid_ident = chars.next().is_some_and(|c| c.is_ascii_uppercase())
@@ -386,7 +410,10 @@ impl TypeRegistry {
                 .into());
         }
         let reserved = WeftPrimitive::from_str(name).is_some()
-            || matches!(name, "List" | "Dict" | "JsonDict" | "Bus" | "Access" | "MustOverride")
+            || matches!(
+                name,
+                "List" | "Dict" | "JsonDict" | "Bus" | "Access" | "Generator" | "MustOverride"
+            )
             || WeftType::UNION_ALIASES.iter().any(|(alias, _)| *alias == name)
             || is_type_var_name(name);
         if reserved {
@@ -490,6 +517,15 @@ pub enum WeftType {
     /// service wiring fails loud at runtime). Wired-only: the marker is
     /// minted by an access node, never typed as a literal.
     Access,
+    /// A typed, one-directional, terminating stream: `Generator[T]`.
+    /// The port itself accepts being emitted into multiple times; every
+    /// item is checked against the element type `T`, the consumer pulls
+    /// them one at a time, and the stream ends when the producer's body
+    /// returns. Exactly one producer feeds exactly one consumer (a
+    /// stream has one taker, compiler-enforced). Wired-only: the
+    /// consumer's bag value is a live runtime handle, never a literal.
+    // SYNC: WeftType::Generator <-> packages/weft-graph/src/protocol.ts WeftType 'generator'
+    Generator(Box<WeftType>),
     /// Dict with KNOWN field names and per-field types:
     /// `{ role: String, name?: String }`. `?` marks an optional field.
     /// Validation is strict: a value carrying an undeclared key does not
@@ -516,21 +552,30 @@ pub enum WeftType {
     MustOverride,
 }
 
-/// Structural equality, with two deliberate departures from a derive:
-/// record fields compare as a SET (declaration order is display-only),
-/// and a `Named` equals only a same-named `Named` (the name IS the
-/// contract; bodies of same-named types are identical by construction,
-/// the registry refuses conflicting redeclarations).
+/// Structural equality, with three deliberate departures from a
+/// derive: record fields and union members compare as a SET
+/// (declaration order is display-only, and `is_compatible` already
+/// treats unions as sets), and a `Named` equals only a same-named
+/// `Named`. The name IS the contract: same-named bodies are made to
+/// agree by the compiler's `named-type-conflict` rule (the registry
+/// refuses conflicting DECLARATIONS, and the compiler refuses a wire
+/// restatement that contradicts one), never by the parser, so a
+/// stored string can legitimately carry an out-of-date body and
+/// name-only comparison is the deliberate nominal choice.
+// SYNC: PartialEq for WeftType <-> packages/weft-graph/src/protocol.ts weftTypesEqual
 impl PartialEq for WeftType {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (WeftType::Primitive(a), WeftType::Primitive(b)) => a == b,
             (WeftType::List(a), WeftType::List(b)) => a == b,
             (WeftType::Dict(ak, av), WeftType::Dict(bk, bv)) => ak == bk && av == bv,
-            (WeftType::Union(a), WeftType::Union(b)) => a == b,
+            (WeftType::Union(a), WeftType::Union(b)) => {
+                a.len() == b.len() && a.iter().all(|m| b.contains(m))
+            }
             (WeftType::JsonDict, WeftType::JsonDict) => true,
             (WeftType::Bus, WeftType::Bus) => true,
             (WeftType::Access, WeftType::Access) => true,
+            (WeftType::Generator(a), WeftType::Generator(b)) => a == b,
             (WeftType::Record(a), WeftType::Record(b)) => {
                 a.len() == b.len()
                     && a.iter().all(|fa| {
@@ -561,6 +606,7 @@ impl WeftType {
         WeftType::Dict(Box::new(key), Box::new(value))
     }
 
+    // SYNC: WeftType::union <-> packages/weft-graph/src/protocol.ts union normalization (parseWeftType's union arm)
     pub fn union(mut types: Vec<WeftType>) -> Self {
         let mut flat = Vec::new();
         for t in types.drain(..) {
@@ -605,7 +651,7 @@ impl WeftType {
     ///   spreadsheet/zip is not "media").
     /// - `File`: any stored file: media plus the Blob catch-all (and,
     ///   later, Document/Text/Presentation as they become first-class).
-    // SYNC: WeftType::UNION_ALIASES <-> packages/weft-graph/src/webview/lib/types/index.ts NAMED_UNIONS
+    // SYNC: WeftType::UNION_ALIASES <-> packages/weft-graph/src/protocol.ts NAMED_UNIONS
     const UNION_ALIASES: &'static [(&'static str, &'static [WeftPrimitive])] = &[
         ("Media", &[WeftPrimitive::Image, WeftPrimitive::Video, WeftPrimitive::Audio]),
         (
@@ -740,6 +786,39 @@ impl WeftType {
         !self.references_file()
     }
 
+    /// The generator behind this type, peeling nominal wrappers: a
+    /// `Generator[T]` directly, or a `Named` whose body is one (a user
+    /// alias like `type Rows = Generator[Number]`). Every "is this
+    /// port a stream" decision (compiler wiring rules, engine routing,
+    /// dispatch deferral) asks THIS, so an alias behaves identically
+    /// to the spelled-out type everywhere.
+    pub fn as_generator(&self) -> Option<&WeftType> {
+        match self.structural() {
+            WeftType::Generator(inner) => Some(inner),
+            _ => None,
+        }
+    }
+
+    /// The structural type behind any chain of nominal aliases: `self`
+    /// unless it is `Named`, else the innermost non-`Named` body.
+    /// Every structural pattern-match on a possibly-aliased type goes
+    /// through this so an alias behaves identically to the spelled-out
+    /// type.
+    pub fn structural(&self) -> &WeftType {
+        match self {
+            WeftType::Named { body, .. } => body.structural(),
+            other => other,
+        }
+    }
+
+    /// The type a VALUE arriving on a port of this type is checked
+    /// against: the element type for a stream (`Generator[T]` pulses
+    /// carry items of `T`; the whole-port handle only exists in the
+    /// consumer's bag), the type itself otherwise.
+    pub fn port_value_type(&self) -> &WeftType {
+        self.as_generator().unwrap_or(self)
+    }
+
     // SYNC: references_file <-> packages/weft-graph/src/protocol.ts typeReferencesFile
     pub fn references_file(&self) -> bool {
         match self {
@@ -749,9 +828,13 @@ impl WeftType {
             WeftType::Union(types) => types.iter().any(|t| t.references_file()),
             WeftType::Record(fields) => fields.iter().any(|f| f.ty.references_file()),
             WeftType::Named { body, .. } => body.references_file(),
+            // A generator's port value is a live handle; its ITEMS may
+            // reference files, but nothing about the port value itself
+            // is a file to cast or pick, so it sits with Bus here.
             WeftType::JsonDict
             | WeftType::Bus
             | WeftType::Access
+            | WeftType::Generator(_)
             | WeftType::TypeVar(_)
             | WeftType::MustOverride => false,
         }
@@ -808,6 +891,9 @@ impl WeftType {
             WeftType::Named { body, .. } => body.default_exposure(),
             WeftType::Bus => Exposure::Wire,
             WeftType::Access => Exposure::Wire,
+            // A stream is a live edge between two running bodies:
+            // wires alone, like a Bus.
+            WeftType::Generator(_) => Exposure::Wire,
             WeftType::TypeVar(_) => Exposure::Assignment,
             WeftType::MustOverride => Exposure::Assignment,
         }
@@ -878,9 +964,11 @@ impl WeftType {
                 }
             }
             WeftType::Named { body, .. } => body.zero_value(),
-            WeftType::Bus | WeftType::Access | WeftType::TypeVar(_) | WeftType::MustOverride => {
-                Value::Null
-            }
+            WeftType::Bus
+            | WeftType::Access
+            | WeftType::Generator(_)
+            | WeftType::TypeVar(_)
+            | WeftType::MustOverride => Value::Null,
         }
     }
 
@@ -895,6 +983,7 @@ impl WeftType {
     /// the compile-time edge validator (an edge from `List[T]` to `T`
     /// is a real type mismatch; to iterate a list, wrap the consumer
     /// in a `Loop(over: [...])`).
+    // SYNC: is_compatible (Named/Record arms) <-> packages/weft-graph/src/webview/lib/types/index.ts isCompatible
     pub fn is_compatible(source: &WeftType, target: &WeftType) -> bool {
         if source.is_unresolved() || target.is_unresolved() {
             return true;
@@ -923,10 +1012,20 @@ impl WeftType {
             // An access connects only to an access; the KIND/service is
             // checked at runtime resolution, not by the type system.
             (WeftType::Access, WeftType::Access) => true,
+            // A generator connects only to a same-element generator
+            // (invariant in T, checked both ways): the stream contract
+            // is one type end to end, so no variance-driven surprise
+            // where an item flows into a widened consumer. A plain `T`
+            // never accepts a `Generator[T]` and vice versa.
+            // SYNC: generator compatibility <-> packages/weft-graph/src/webview/lib/types/index.ts isCompatible
+            (WeftType::Generator(a), WeftType::Generator(b)) => {
+                Self::is_compatible(a, b) && Self::is_compatible(b, a)
+            }
             // A NAMED type is nominal: the name is the contract, so only
-            // the same name flows in. (Bodies of same-named types are
-            // identical by construction; the registry refuses
-            // conflicting redeclarations.)
+            // the same name flows in. Same-named bodies are made to
+            // agree by the compiler's `named-type-conflict` rule (not
+            // by the parser, which stays registry-independent), so
+            // name-only comparison is the deliberate nominal choice.
             (WeftType::Named { name: a, .. }, WeftType::Named { name: b, .. }) => a == b,
             // Records: the target's contract decides. Every source field
             // must be declared on the target (strict unknown keys), every
@@ -1145,7 +1244,7 @@ impl WeftType {
         // compatibility fast path), so nothing invents a file.
         if self.is_unresolved()
             || self.is_file_valued()
-            || matches!(self, WeftType::Bus | WeftType::Access)
+            || matches!(self, WeftType::Bus | WeftType::Access | WeftType::Generator(_))
         {
             return Err(format!("no cast into {self}"));
         }
@@ -1353,7 +1452,8 @@ impl WeftType {
             };
         }
         let text_serializable = |t: &WeftType| {
-            !t.references_file() && !matches!(t, WeftType::Bus | WeftType::Access)
+            !t.references_file()
+                && !matches!(t, WeftType::Bus | WeftType::Access | WeftType::Generator(_))
         };
         let object_shaped = |t: &WeftType| {
             matches!(
@@ -1535,6 +1635,19 @@ impl WeftType {
                     mismatch(path)
                 }
             }
+            // A generator PORT value is the live-handle marker; the
+            // items themselves are validated per emission against the
+            // element type, never through this whole-value gate.
+            WeftType::Generator(_) => {
+                if value
+                    .as_object()
+                    .is_some_and(|o| o.contains_key(GENERATOR_MARKER_KEY))
+                {
+                    Ok(())
+                } else {
+                    mismatch(path)
+                }
+            }
             WeftType::TypeVar(_) | WeftType::MustOverride => Err(format!(
                 "{}: cannot validate against unresolved type {self}",
                 here(path)
@@ -1578,10 +1691,13 @@ impl WeftType {
     /// (a nested unresolved leaf is as unusable as a bare one), and the
     /// runtime gate falls back to the structural check when one slipped
     /// through.
+    // SYNC: contains_unresolved_leaf <-> packages/weft-graph/src/protocol.ts containsUnresolvedLeaf
     pub fn contains_unresolved_leaf(&self) -> bool {
         match self {
             WeftType::TypeVar(_) | WeftType::MustOverride => true,
-            WeftType::List(inner) => inner.contains_unresolved_leaf(),
+            WeftType::List(inner) | WeftType::Generator(inner) => {
+                inner.contains_unresolved_leaf()
+            }
             WeftType::Dict(k, v) => k.contains_unresolved_leaf() || v.contains_unresolved_leaf(),
             WeftType::Union(members) => members.iter().any(|m| m.contains_unresolved_leaf()),
             WeftType::Record(fields) => fields.iter().any(|f| f.ty.contains_unresolved_leaf()),
@@ -1609,7 +1725,8 @@ impl WeftType {
             | WeftType::JsonDict
             | WeftType::Record(_)
             | WeftType::Bus
-            | WeftType::Access => value.is_object(),
+            | WeftType::Access
+            | WeftType::Generator(_) => value.is_object(),
             WeftType::Union(members) => members.iter().any(|m| m.shallow_matches(value)),
             WeftType::Named { body, .. } => body.shallow_matches(value),
             WeftType::TypeVar(_) | WeftType::MustOverride => false,
@@ -1618,6 +1735,7 @@ impl WeftType {
 
     /// Unify a list of types into a single type.
     /// If all are identical, return that type. Otherwise, return a Union (deduplicated).
+    // SYNC: unify_types <-> packages/weft-graph/src/webview/lib/types/index.ts unifyTypes
     fn unify_types(types: &[WeftType]) -> WeftType {
         if types.is_empty() {
             return WeftType::Primitive(WeftPrimitive::Empty);
@@ -1654,7 +1772,7 @@ impl WeftType {
     ///        "String | Number", "Media", "T", "T1", "T2", "MustOverride",
     ///        "List[T]", "Dict[String, T1 | T2]"
     /// Invalid: "Any", "List", "Dict", "Foo"
-    // SYNC: WeftType::parse <-> packages/weft-graph/src/webview/lib/types/index.ts parseWeftType
+    // SYNC: WeftType::parse <-> packages/weft-graph/src/protocol.ts parseWeftType
     pub fn parse(s: &str) -> Option<Self> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
@@ -1733,6 +1851,7 @@ impl WeftType {
 fn parse_single_type(s: &str) -> Option<WeftType> {
     let s = s.trim();
 
+    // SYNC: paren group <-> packages/weft-graph/src/protocol.ts parseSingleType (paren arm)
     // Parenthesized group: `(A | B)` is the type inside. Exists so a
     // named type's union body has an unambiguous wire form
     // (`Kind=(A | B)` vs the union `Kind=A | B`). Only strip when the
@@ -1752,6 +1871,23 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
         let body = s[eq + 1..].trim();
         if TypeRegistry::check_declarable_name(name).is_ok() {
             let body = WeftType::parse(body)?;
+            // A named type's whole contract is "one name, one body"
+            // (equality and compatibility compare the NAME alone), so
+            // this second construction door enforces the same
+            // concreteness the registry enforces at declaration: no
+            // type variable in the body, ever (no legitimate wire
+            // string carries one). Parsing stays a PURE function of
+            // the string on purpose: a stored project or journal row
+            // must deserialize with no registry (and must keep
+            // deserializing after the declaration is edited, so a
+            // resumed execution gets the exact shape it started on);
+            // agreement between same-named restatements is an
+            // AUTHORING rule, enforced by the compiler's
+            // `named-type-conflict` validation.
+            // SYNC: named-body concreteness <-> packages/weft-graph/src/protocol.ts parseSingleType (Name=Body arm)
+            if body.contains_unresolved_leaf() {
+                return None;
+            }
             return Some(WeftType::Named { name: name.to_string(), body: Box::new(body) });
         }
         return None;
@@ -1815,6 +1951,10 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
             "List" => {
                 let inner_type = WeftType::parse(inner)?;
                 Some(WeftType::List(Box::new(inner_type)))
+            }
+            "Generator" => {
+                let inner_type = WeftType::parse(inner)?;
+                Some(WeftType::Generator(Box::new(inner_type)))
             }
             "Dict" => {
                 let parts = split_top_level(inner, ',');
@@ -1936,6 +2076,7 @@ impl WeftType {
     /// source and metadata), true is the WIRE form (`Name=Body`, fully
     /// self-contained, what serialization emits so a stored type string
     /// resolves in any process with no registry).
+    // SYNC: fmt_with <-> packages/weft-graph/src/webview/lib/types/index.ts weftTypeToString, weftTypeToWireString
     fn fmt_with(&self, out: &mut std::string::String, wire: bool) {
         use std::fmt::Write;
         match self {
@@ -1971,6 +2112,11 @@ impl WeftType {
             WeftType::JsonDict => out.push_str("JsonDict"),
             WeftType::Bus => out.push_str("Bus"),
             WeftType::Access => out.push_str("Access"),
+            WeftType::Generator(inner) => {
+                out.push_str("Generator[");
+                inner.fmt_with(out, wire);
+                out.push(']');
+            }
             WeftType::Record(fields) => {
                 out.push('{');
                 for (i, field) in fields.iter().enumerate() {
@@ -2010,6 +2156,7 @@ impl WeftType {
     /// parsing the result never needs a registry. This is what
     /// `Serialize` emits (stored projects, journals, editor payloads);
     /// `Display` stays the authored bare-name form.
+    // SYNC: wire_string <-> packages/weft-graph/src/webview/lib/types/index.ts weftTypeToWireString
     pub fn wire_string(&self) -> std::string::String {
         let mut out = std::string::String::new();
         self.fmt_with(&mut out, true);

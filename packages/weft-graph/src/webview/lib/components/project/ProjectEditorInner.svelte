@@ -11,9 +11,10 @@
 	import ActionBar from "./ActionBar.svelte";
 	import NodeTagsEditor from "./NodeTagsEditor.svelte";
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
+	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
 	import type { EditOp, TextEdit } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
@@ -808,7 +809,7 @@
 					nodeId,
 					updates.portLiterals,
 					(foldNode?.portLiterals as Record<string, unknown> | undefined) ?? {},
-					(foldNode?.portLiteralSpans as Record<string, { origin: 'inline' | 'connection' }> | undefined) ?? {},
+					foldNode?.portLiteralSpans ?? {},
 					foldNode?.inputs ?? [],
 				));
 			}
@@ -1156,7 +1157,7 @@
 					// twin of `config` (ProjectNode renders these as the
 					// marker-carrying port fields).
 					portLiterals: (n as typeof n & { portLiterals?: Record<string, unknown> }).portLiterals,
-					portLiteralSpans: (n as typeof n & { portLiteralSpans?: Record<string, unknown> }).portLiteralSpans,
+					portLiteralSpans: n.portLiteralSpans,
 					features: n.features,
 					includePath: (n as typeof n & { includePath?: string }).includePath,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
@@ -1374,7 +1375,11 @@
 		if (busesByNodeCache.ref === busParticipantsByBus) {
 			busesByNode = busesByNodeCache.value;
 		} else {
-			busesByNode = {};
+			// Prototype-free: node ids come off the wire, and a node named
+			// 'constructor' would otherwise make `??=` read Object's own
+			// constructor (truthy, so no array is created) and throw on
+			// `.push`, killing the whole overlay build.
+			busesByNode = Object.create(null) as Record<string, string[]>;
 			for (const [busId, participants] of Object.entries(busParticipantsByBus)) {
 				for (const nodeId of participants) {
 					(busesByNode[nodeId] ??= []).push(busId);
@@ -1476,9 +1481,9 @@
 					if (isContainerNodeType(nodeType)) {
 						const groupId = n.id;
 
-						// Boundary passthrough executions (compiled IDs follow {groupId}__in / {groupId}__out)
-						const inExecs = nodeExecutions[execKey(`${groupId}__in`)] || [];
-						const outExecs = nodeExecutions[execKey(`${groupId}__out`)] || [];
+						// Boundary passthrough executions (one id derivation: host-bridge)
+						const inExecs = nodeExecutions[execKey(boundaryInId(groupId))] || [];
+						const outExecs = nodeExecutions[execKey(boundaryOutId(groupId))] || [];
 
 						// Collect internal node executions via scope field (against the
 						// CURRENT projected nodes, not the stale initial prop).
@@ -1597,9 +1602,12 @@
 						nodeType,
 						features: n.data.features as { isTrigger?: boolean } | undefined,
 					});
+					// Own-property reads: node ids come off the wire, and a
+					// node literally named 'constructor' would otherwise
+					// resolve a prototype function as its feed.
 					const bodyFeed =
-						role === 'infra' ? ctx.infraFeedByNode?.[n.id]
-						: role === 'signal' ? ctx.signalFeedByNode?.[n.id]
+						role === 'infra' ? ownValue(ctx.infraFeedByNode, n.id)
+						: role === 'signal' ? ownValue(ctx.signalFeedByNode, n.id)
 						: undefined;
 
 					// Subgraph highlight wins the class slot while active; the
@@ -2479,7 +2487,7 @@
 	function vetoLiteralDrivenTarget(target: string, targetHandle: string | null | undefined): boolean {
 		const targetPort = (targetHandle || 'value').replace(/__inner$/, '');
 		const targetNode = fold.project.nodes.find((n) => n.id === target);
-		const literal = (targetNode?.portLiterals as Record<string, unknown> | undefined)?.[targetPort];
+		const literal = ownValue(targetNode?.portLiterals as Record<string, unknown> | undefined, targetPort);
 		if (literal === undefined || literal === null) return false;
 		toast.error(`'${targetPort}' is driven by a config assignment; unset it first to drive it with an edge.`);
 		return true;

@@ -131,8 +131,10 @@
 //! all is the stuck-detector: it tracks, per NODE EXECUTION, whether
 //! that node is parked inside a bus wait with nothing to read, so when
 //! every participant node is parked it can declare deadlock and close
-//! every bus. Hence `BusLiveness`, `WaitGuard`, `enter_wait`,
-//! `exit_wait`. Two concepts, two names, no overlap.
+//! every bus. Hence `WaitLiveness` and the `wait_on` protocol (which
+//! pairs `enter_wait`/`exit_wait` internally); those live in
+//! `crate::liveness`, which the bus plugs into as one `WaitSource`
+//! among several. Two concepts, two names, no overlap.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -143,6 +145,8 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+use crate::liveness::{no_liveness, wait_on, FiringLocation, WaitLiveness, WaitSource};
 
 // ----- Public types ----------------------------------------------------
 
@@ -566,160 +570,31 @@ pub enum CursorError {
     WrongPayload { expected: &'static str, requested: &'static str },
 }
 
-/// Identity of one node EXECUTION: the node id plus its loop-frame
-/// stack. A loop running the same node body N times in parallel is N
-/// distinct executions, one per frame, each with its own bus liveness.
-/// This is the key the engine's stuck-check uses to tell "this lane is
-/// waiting forever" from "this lane is still computing".
-pub type BusParticipant = (String, crate::frames::LoopFrames);
+// ----- Wait liveness (shared with every in-process wait) --------------
+//
+// The wait-tracking vocabulary the bus reports through (FiringLocation,
+// WaitId, WaitLiveness, WaitSource, wait_on) lives in
+// `crate::liveness`: the generator's pulls and the engine's
+// delivery-waits park through the exact same tracker, so the engine's
+// stuck-check sees every in-process wait in one place. The bus is one
+// WaitSource among several; its generation is the log's append
+// generation.
 
-/// A single bus wait's identity within the engine's liveness map. One
-/// node execution can hold SEVERAL concurrent waits at once (a body that
-/// `tokio::select!`s or `join!`s over two cursors, or two `wait_for`s),
-/// each its own `WaitGuard`; the id keeps their parked/observed state
-/// separate under the one node entry. Minted by `enter_wait`, meaningless
-/// outside the engine (`NoLiveness` returns 0).
-pub type WaitId = u64;
-
-/// Node-liveness hook the engine wires up so its stuck-check can tell
-/// "every node on this bus is parked forever" (real deadlock) from
-/// "one node waits while another still computes" (still working).
-///
-/// Liveness is attached to the NODE EXECUTION (`(node_id, frames)`), not
-/// to each bus registration: the unit that is "computing" or "waiting"
-/// is the async task, and a node holding several bus registrations is
-/// still one task. A task CAN be inside several bus waits at once
-/// (select!/join! over two cursors), so each wait is tracked under its
-/// own `WaitId`; the node counts as parked for the deadlock check only
-/// when EVERY one of its concurrent waits is parked-and-caught-up (a
-/// select! task with any branch still live or mid-evaluation is still
-/// working). Paired via RAII (`WaitGuard`): every `enter_wait` is
-/// followed by exactly one `exit_wait` for the same id, even if the
-/// awaiting future is cancelled mid-await.
-pub trait BusLiveness: Send + Sync {
-    /// A node entered a bus wait on `bus`. Mints and returns a `WaitId`
-    /// the other per-wait hooks key on. The engine stores a `Weak` on
-    /// the bus (so the stuck-check can read its append generation) and
-    /// marks this wait actively waiting but NOT yet parked. The `bus` is
-    /// needed so later `observed` calls can read THIS bus's current
-    /// generation without the wait loop re-passing it.
-    fn enter_wait(&self, node: &BusParticipant, bus: &Arc<BusInner>) -> WaitId;
-    /// The wait `id` under `node` ended (resolved or cancelled). Removes
-    /// its slot; the node entry is dropped once it holds no more waits.
-    fn exit_wait(&self, node: &BusParticipant, id: WaitId);
-    /// Called on every log APPEND (send / register / close / drop, all
-    /// funnel through `push_entry`). The engine's stuck-check uses this
-    /// as the ground-truth "something happened on a bus" signal: an
-    /// append that lands while a node is parked must suppress a stuck
-    /// declaration, because the parked node has new input to consume.
-    /// Relying on scheduler fairness (a single `yield_now`) to observe
-    /// the woken node instead is a race that closes live conversations.
-    fn on_append(&self);
-    /// The wait `id` under `node` is about to (re-)evaluate its wait
-    /// condition. The engine records its bus's CURRENT append generation
-    /// as this wait's observed generation, and marks this wait NOT
-    /// parked. Contract on the caller (the wait loops below): after
-    /// calling this, a full condition evaluation runs BEFORE the next
-    /// park, so "observed >= G" provably means "this wait's evaluation
-    /// saw every append up to generation G" (the generation bumps under
-    /// the same log lock as the append, after the entry lands, so any
-    /// evaluation that starts after the bump sees the entry). The
-    /// stuck-check closes buses only when EVERY parked node has every
-    /// wait caught up on its bus's current generation: a node woken by a
-    /// send but still unpolled in another worker thread's queue is
-    /// behind by construction, so a live conversation can never be torn
-    /// down under it.
-    ///
-    /// Marking NOT parked matters too: an evaluation in progress may be
-    /// about to SUCCEED, and a stuck-close under a succeeding evaluation
-    /// would tear down a live conversation (the resolved node's
-    /// follow-up send hits `SendError::Closed`).
-    fn observed(&self, node: &BusParticipant, id: WaitId);
-    /// The wait `id` under `node` is at its TRUE park point: every
-    /// pre-park re-check has run, the condition did not resolve, and the
-    /// very next thing the wait does is `notified.await`. The stuck-check
-    /// requires every wait of every in-flight node to be parked (and
-    /// caught up) before closing: a wait between `observed` and its park
-    /// is mid-evaluation and may resolve, so it suppresses the close.
-    /// The flag flips back to false at the next `observed` (every wake
-    /// re-evaluates before any re-park, by construction of the wait
-    /// loops).
-    fn parked(&self, node: &BusParticipant, id: WaitId);
-}
-
-// ----- Inner state and stubs ------------------------------------------
-
-/// Concrete zero-state type used to spell `Weak<dyn BusLiveness>` when
-/// no engine is attached: `Weak::<NoLiveness>::new()` constructs an
-/// empty pointer that coerces into the trait-object Weak. `dyn` traits
-/// can't be passed to `Weak::new` directly because `dyn Trait` is
-/// unsized.
-struct NoLiveness;
-impl BusLiveness for NoLiveness {
-    fn enter_wait(&self, _node: &BusParticipant, _bus: &Arc<BusInner>) -> WaitId {
-        0
+/// The bus as a [`WaitSource`]: its state-change generation is the
+/// log's append generation (every send / register / close / drop
+/// funnels through `push_entry`, which bumps it under the log lock).
+impl WaitSource for BusInner {
+    fn gen_now(&self) -> u64 {
+        self.append_gen_now()
     }
-    fn exit_wait(&self, _node: &BusParticipant, _id: WaitId) {}
-    fn on_append(&self) {}
-    fn observed(&self, _node: &BusParticipant, _id: WaitId) {}
-    fn parked(&self, _node: &BusParticipant, _id: WaitId) {}
-}
-
-/// RAII guard around a single cursor wait. Constructor calls
-/// `enter_wait`; Drop calls `exit_wait`. Drop fires whether the
-/// awaiting future returns normally OR is cancelled mid-await (e.g. the
-/// loop aborts a stuck task), so the engine's liveness map stays
-/// consistent. Carries the node-execution identity so every hook keys
-/// on the right participant. A guard with no node identity (a bus not
-/// minted by an engine-driven node) is a no-op.
-struct WaitGuard {
-    liveness: Option<(Arc<dyn BusLiveness>, BusParticipant, WaitId)>,
-}
-
-impl WaitGuard {
-    fn new(
-        liveness_weak: &Weak<dyn BusLiveness>,
-        node: &Option<BusParticipant>,
-        bus: &Arc<BusInner>,
-    ) -> Self {
-        let liveness = match (liveness_weak.upgrade(), node) {
-            (Some(w), Some(node)) => {
-                let id = w.enter_wait(node, bus);
-                Some((w, node.clone(), id))
-            }
-            _ => None,
-        };
-        Self { liveness }
+    fn settled_gen(&self) -> u64 {
+        self.append_gen_settled()
     }
-
-    /// Record "I am about to evaluate my wait condition" with the
-    /// engine (see `BusLiveness::observed` for the contract: a full
-    /// condition evaluation MUST follow this call before the next park).
-    /// The wait loops call this immediately before every condition
-    /// evaluation that can lead to a park.
-    fn record_observed(&self) {
-        if let Some((w, node, id)) = &self.liveness {
-            w.observed(node, *id);
-        }
+    fn wake_waiters(&self) {
+        BusInner::wake_waiters(self)
     }
-
-    /// Record "I am at my true park point" with the engine (see
-    /// `BusLiveness::parked`). The wait loops call this immediately
-    /// before `notified.await`, AFTER every lost-wakeup re-check, so a
-    /// set parked flag provably means "this wait's last evaluation did
-    /// not resolve and it is now awaiting".
-    fn record_parked(&self) {
-        if let Some((w, node, id)) = &self.liveness {
-            w.parked(node, *id);
-        }
-    }
-}
-
-impl Drop for WaitGuard {
-    fn drop(&mut self) {
-        if let Some((w, node, id)) = &self.liveness {
-            w.exit_wait(node, *id);
-        }
+    fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.log_notify.notified()
     }
 }
 
@@ -865,13 +740,14 @@ pub struct BusInner {
     /// Engine node-liveness hook. `Weak::new()` outside an engine-driven
     /// execution; set once at bus creation via
     /// `BusHandle::create_with_engine`. Fired at every cursor wait via
-    /// `WaitGuard` and at every append via `push_entry`.
-    liveness: Weak<dyn BusLiveness>,
+    /// the shared `wait_on` protocol and at every append via
+    /// `push_entry`.
+    liveness: Weak<dyn WaitLiveness>,
     /// Per-bus append generation: bumped on every `push_entry`, under
     /// the same log lock, AFTER the entry lands. The engine's liveness
     /// map holds a `Weak<BusInner>` per parked node and compares each
     /// parked node's observed generation against `append_gen_settled`
-    /// (locked read; see `BusLiveness::observed`). Never read on the
+    /// (locked read; see `WaitLiveness::observed`). Never read on the
     /// send path beyond the one `fetch_add`; all comparison cost lives
     /// on the engine's stuck-check.
     append_gen: AtomicU64,
@@ -914,7 +790,7 @@ impl BusInner {
     }
 
     /// The bus's current append generation, read WITHOUT the log lock.
-    /// Suitable for the observe path only (`BusLiveness::observed`): a
+    /// Suitable for the observe path only (`WaitLiveness::observed`): a
     /// value read here may lag an entry that already landed in the log
     /// (`push_entry` pushes first, bumps after), which is conservative
     /// for the stuck-check (the waiter reads as behind). Never use it
@@ -981,7 +857,7 @@ impl BusInner {
         // log_notify gives cursors, surfaced to the engine as a
         // generation bump it can compare across its idle window.
         if let Some(w) = self.liveness.upgrade() {
-            w.on_append();
+            w.on_source_event();
         }
         offset
     }
@@ -1181,7 +1057,7 @@ pub struct BusHandle {
     /// registers, are attributed to this node execution. Forked handles
     /// (`new_handle`) inherit it, because a forked handle is still the
     /// SAME node grabbing a second grip on the bus.
-    node: Option<BusParticipant>,
+    node: Option<FiringLocation>,
 }
 
 impl BusHandle {
@@ -1218,12 +1094,7 @@ impl BusHandle {
     /// Create with explicit options, no engine hooks. Errors on an
     /// invalid `window`.
     pub fn create_with_options(opts: BusOptions) -> Result<Self, &'static str> {
-        Self::create_with_engine(
-            opts,
-            Weak::<NoLiveness>::new() as Weak<dyn BusLiveness>,
-            Weak::<Notify>::new(),
-            None,
-        )
+        Self::create_with_engine(opts, no_liveness(), Weak::<Notify>::new(), None)
     }
 
     /// Create with options + engine hooks. The liveness hook fires
@@ -1234,9 +1105,9 @@ impl BusHandle {
     /// invalid `window` (must be >= 1 when `ephemeral=true`).
     pub fn create_with_engine(
         opts: BusOptions,
-        liveness: Weak<dyn BusLiveness>,
+        liveness: Weak<dyn WaitLiveness>,
         journal_pump_notify: Weak<Notify>,
-        node: Option<BusParticipant>,
+        node: Option<FiringLocation>,
     ) -> Result<Self, &'static str> {
         let window = opts.window.unwrap_or(DEFAULT_BUS_WINDOW);
         if window == 0 {
@@ -1280,7 +1151,7 @@ impl BusHandle {
     /// `BusRegistry::lookup` to hand a consumer a fresh handle on a bus
     /// the producer already created; the consumer's own node identity
     /// (not the producer's) keys its liveness.
-    pub(crate) fn from_inner(inner: Arc<BusInner>, node: Option<BusParticipant>) -> Self {
+    pub(crate) fn from_inner(inner: Arc<BusInner>, node: Option<FiringLocation>) -> Self {
         Self {
             inner,
             registration: None,
@@ -1579,11 +1450,12 @@ impl BusHandle {
     /// is a two-line predicate to add here the moment a real consumer
     /// needs one.
     ///
-    /// Holds exactly ONE `WaitGuard` (one `WaitId`) across the entire
-    /// call: the wait's observed/parked state in the engine's liveness
-    /// map stays continuous across wakes instead of being re-minted at
-    /// the conservative not-parked baseline on each wake, which would
-    /// keep deferring a provable deadlock.
+    /// Runs the shared wait protocol (`liveness::wait_on`), which
+    /// holds exactly ONE wait registration (one `WaitId`) across the
+    /// entire call: the wait's observed/parked state in the engine's
+    /// liveness map stays continuous across wakes instead of being
+    /// re-minted at the conservative not-parked baseline on each wake,
+    /// which would keep deferring a provable deadlock.
     async fn wait_for_joins<F>(&self, mut pred: F) -> Result<(), WaitError>
     where
         F: FnMut(&HashSet<String>) -> bool + Send + Sync,
@@ -1594,7 +1466,7 @@ impl BusHandle {
         // entry was found first). Both reads happen under the log
         // lock so they see one consistent snapshot (register and
         // close both mutate under it).
-        let mut check = || -> Option<Result<(), WaitError>> {
+        let check = || -> Option<Result<(), WaitError>> {
             let _log = self.inner.lock_log();
             let seen = self
                 .inner
@@ -1609,38 +1481,12 @@ impl BusHandle {
             }
             None
         };
-        if let Some(r) = check() {
-            return r;
-        }
-        // ONE guard for the whole wait. The engine sees this node as
-        // present from the first park until resolution.
-        let guard = WaitGuard::new(&self.inner.liveness, &self.node, &self.inner);
-        loop {
-            let notified = self.inner.log_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            // Record the bus's current append generation BEFORE the
-            // check: every append at or below the recorded generation
-            // is visible to this `check()` (the generation bumps under
-            // the same log lock the check reads under, after the entry
-            // lands), so the engine's stuck-check can trust "observed
-            // == current" as "this waiter saw everything and still
-            // parked": a genuine wait, not an unconsumed message.
-            guard.record_observed();
-            // Re-check after arming: a register/close that landed
-            // between the last check and the arm would otherwise be
-            // a lost wake-up.
-            if let Some(r) = check() {
-                return r;
-            }
-            // TRUE park point: every re-check ran and did not resolve.
-            // Flag it so the engine's stuck-check knows this waiter is
-            // genuinely parked, not mid-evaluation (a mid-evaluation
-            // waiter may be about to resolve; closing under it would
-            // kill a live conversation).
-            guard.record_parked();
-            notified.await;
-        }
+        // The shared wait protocol (`liveness::wait_on`) holds ONE
+        // guard for the whole wait, arms before every check (no lost
+        // wakeup) and records observed under the same generation
+        // discipline the stuck-check relies on.
+        let source = self.inner.clone() as Arc<dyn WaitSource>;
+        wait_on(&self.inner.liveness, &self.node, &source, check).await
     }
 
     // ----- lifecycle ---------------------------------------------
@@ -1748,7 +1594,7 @@ pub struct BusCursor {
     /// handle that minted it), or `None` outside an engine-driven node.
     /// Keys this cursor's waits in the engine's liveness map, so a node
     /// parked in `next()` is correctly attributed.
-    node: Option<BusParticipant>,
+    node: Option<FiringLocation>,
 }
 
 impl BusCursor {
@@ -1756,7 +1602,7 @@ impl BusCursor {
         inner: Weak<BusInner>,
         next_offset: u64,
         filter: Option<CursorFilter>,
-        node: Option<BusParticipant>,
+        node: Option<FiringLocation>,
     ) -> Self {
         Self {
             inner,
@@ -1865,165 +1711,97 @@ impl BusCursor {
         let Some(inner) = self.inner.upgrade() else {
             return None;
         };
-        // One WaitGuard (one WaitId) per `next()` call, not per loop
-        // iteration: the wait's observed/parked state in the engine's
-        // liveness map stays continuous across spurious wakes and
-        // re-scans instead of resetting to the not-parked baseline each
-        // time, which would keep deferring a provable deadlock.
-        let mut guard: Option<WaitGuard> = None;
-        loop {
-            // Record the bus's current append generation BEFORE the
-            // search (only once registered as a waiter; the first
-            // iteration runs unregistered). Every append at or below
-            // the recorded generation is visible to the search below
-            // (the generation bumps under the same log lock, after the
-            // entry lands), so the engine's stuck-check can trust
-            // "observed == current" as "this waiter saw everything and
-            // still parked". A receiver woken by a send but not yet
-            // polled has NOT recorded the send's generation, so it
-            // reads as behind and the close is suppressed under it.
-            if let Some(g) = &guard {
-                g.record_observed();
-            }
-            let next_after_search = {
-                let log = inner.lock_log();
-                // The scan starts at the first RETAINED entry at or past the
-                // cursor's offset: an offset inside a trimmed span (only
-                // `Message` entries are ever evicted; membership entries are
-                // always retained, so nothing the consumer needs hides in a
-                // gap) is silently bridged, and the cursor only ever moves
-                // FORWARD, never skipping a retained entry.
-                let mut idx = log.partition_point(|e| e.offset < self.next_offset);
-                let len = log.len();
-                let mut chosen: Option<BusEntry> = None;
-                while idx < len {
-                    let entry = &log[idx];
-                    if matches!(entry.kind, BusEntryKind::Closed) {
-                        self.next_offset = entry.offset;
-                        return None;
-                    }
-                    let needs_ephemeral_resolve = matches!(
-                        &entry.kind,
-                        BusEntryKind::Message { payload, .. } if payload.is_none()
+        // One destructure splits the borrows: the closure takes the
+        // cursor position and filter, the wait keeps the node identity.
+        let Self { next_offset, filter, node, .. } = self;
+        // The full search under the log lock is the wait condition:
+        // `Some(Some(entry))` on a hit, `Some(None)` at end-of-stream,
+        // `None` parks. The shared protocol (`liveness::wait_on`)
+        // holds one guard across the whole call and arms before every
+        // search, so a send landing mid-search can never be a lost
+        // wakeup, and "observed == current" provably means "this
+        // waiter saw everything and still parked".
+        let search_inner = inner.clone();
+        let evaluate = move || -> Option<Option<BusEntry>> {
+            let log = search_inner.lock_log();
+            // The scan starts at the first RETAINED entry at or past the
+            // cursor's offset: an offset inside a trimmed span (only
+            // `Message` entries are ever evicted; membership entries are
+            // always retained, so nothing the consumer needs hides in a
+            // gap) is silently bridged, and the cursor only ever moves
+            // FORWARD, never skipping a retained entry.
+            let mut idx = log.partition_point(|e| e.offset < *next_offset);
+            let len = log.len();
+            while idx < len {
+                let entry = &log[idx];
+                if matches!(entry.kind, BusEntryKind::Closed) {
+                    *next_offset = entry.offset;
+                    return Some(None);
+                }
+                let needs_ephemeral_resolve = matches!(
+                    &entry.kind,
+                    BusEntryKind::Message { payload, .. } if payload.is_none()
+                );
+                let resolved_entry: Option<BusEntry> = if needs_ephemeral_resolve {
+                    let store = search_inner.ephemeral_store.as_ref().expect(
+                        "Message with payload=None on a non-ephemeral bus is impossible \
+                         by construction (send routes ephemeral payloads into the store)",
                     );
-                    let resolved_entry: Option<BusEntry> = if needs_ephemeral_resolve {
-                        let store = inner.ephemeral_store.as_ref().expect(
-                            "Message with payload=None on a non-ephemeral bus is impossible \
-                             by construction (send routes ephemeral payloads into the store)",
-                        );
-                        // A RETAINED Message always has a resident
-                        // payload (send evicts the log entry in the
-                        // same locked section that evicts the
-                        // payload); a miss panics inside
-                        // `get_resident`.
-                        let value = store.get_resident(entry.offset);
-                        let BusEntryKind::Message {
-                            from,
-                            msg_kind,
-                            payload_byte_size,
-                            ..
-                        } = &entry.kind
-                        else {
-                            unreachable!("needs_ephemeral_resolve guards Message variant");
-                        };
-                        Some(BusEntry {
-                            offset: entry.offset,
-                            at_unix: entry.at_unix,
-                            kind: BusEntryKind::Message {
-                                from: from.clone(),
-                                msg_kind: msg_kind.clone(),
-                                payload: Some(value),
-                                payload_byte_size: *payload_byte_size,
-                            },
-                        })
-                    } else {
-                        None
+                    // A RETAINED Message always has a resident
+                    // payload (send evicts the log entry in the
+                    // same locked section that evicts the
+                    // payload); a miss panics inside
+                    // `get_resident`.
+                    let value = store.get_resident(entry.offset);
+                    let BusEntryKind::Message {
+                        from,
+                        msg_kind,
+                        payload_byte_size,
+                        ..
+                    } = &entry.kind
+                    else {
+                        unreachable!("needs_ephemeral_resolve guards Message variant");
                     };
-                    let entry_for_filter: &BusEntry =
-                        resolved_entry.as_ref().unwrap_or(entry);
-                    let allow =
-                        self.filter.as_ref().map_or(true, |f| f(entry_for_filter));
-                    if !allow {
-                        idx += 1;
-                        continue;
-                    }
-                    self.next_offset = entry.offset + 1;
-                    chosen = Some(resolved_entry.unwrap_or_else(|| entry.clone()));
-                    break;
-                }
-                if chosen.is_none() && idx >= len {
-                    // Scan reached the tail without a hit; next read
-                    // resumes at the tail offset (one past the last
-                    // retained entry, so filter-rejected entries are not
-                    // rescanned). Never moved backward so a cursor
-                    // positioned past the tail keeps its place.
-                    self.next_offset = self
-                        .next_offset
-                        .max(log.last().map(|e| e.offset + 1).unwrap_or(0));
-                    if inner.closed.load(Ordering::Acquire) {
-                        // The log is closed and this cursor is at (or
-                        // started past) its tail. Under the log lock,
-                        // `closed` implies the `Closed` entry is
-                        // already in the log, so a cursor past the
-                        // tail has consumed or skipped it: this is
-                        // end-of-stream. Without this return, the
-                        // closed-flag `continue` below would re-loop
-                        // BEFORE the park forever: a zero-await-point
-                        // busy loop pinning a worker thread at 100%
-                        // CPU that even a surrounding timeout cannot
-                        // interrupt.
-                        return None;
-                    }
-                }
-                chosen
-            };
-            if let Some(entry) = next_after_search {
-                return Some(entry);
-            }
-            // No matching entry available. Park on log_notify and
-            // re-check on wake. Two completion cases: closed flag
-            // flips (we return None on the next iteration) or new
-            // entry lands.
-            if guard.is_none() {
-                let g = WaitGuard::new(&inner.liveness, &self.node, &inner);
-                // Record at registration: the closed-flag + tail-offset
-                // re-checks below ARE a full park-condition evaluation
-                // (any append at or below the recorded generation makes
-                // `log_len() > next_offset` true and `continue`s into
-                // the full search), so the `observed` contract holds for
-                // this first registered iteration too.
-                g.record_observed();
-                guard = Some(g);
-            }
-            let notified = inner.log_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if inner.closed.load(Ordering::Acquire) {
-                // Re-loop: the close may have appended a Closed entry
-                // we still need to find by offset.
-                continue;
-            }
-            // Re-check the log length under lock before parking: a new
-            // entry may have landed between the snapshot above and
-            // here.
-            {
-                let len = inner.log_len();
-                if len > self.next_offset {
+                    Some(BusEntry {
+                        offset: entry.offset,
+                        at_unix: entry.at_unix,
+                        kind: BusEntryKind::Message {
+                            from: from.clone(),
+                            msg_kind: msg_kind.clone(),
+                            payload: Some(value),
+                            payload_byte_size: *payload_byte_size,
+                        },
+                    })
+                } else {
+                    None
+                };
+                let entry_for_filter: &BusEntry = resolved_entry.as_ref().unwrap_or(entry);
+                let allow = filter.as_ref().map_or(true, |f| f(entry_for_filter));
+                if !allow {
+                    idx += 1;
                     continue;
                 }
+                *next_offset = entry.offset + 1;
+                return Some(Some(resolved_entry.unwrap_or_else(|| entry.clone())));
             }
-            // TRUE park point: every re-check ran and did not resolve.
-            // Flag it so the engine's stuck-check knows this waiter is
-            // genuinely parked, not mid-search (a mid-search cursor may
-            // be about to return a message; closing under it would make
-            // the consumer's reply send hit `SendError::Closed`). The
-            // flag flips back at the next `record_observed` (loop top).
-            guard
-                .as_ref()
-                .expect("guard is registered before the park point")
-                .record_parked();
-            notified.await;
-        }
+            // Scan reached the tail without a hit; next read resumes at
+            // the tail offset (one past the last retained entry, so
+            // filter-rejected entries are not rescanned). Never moved
+            // backward so a cursor positioned past the tail keeps its
+            // place.
+            *next_offset = (*next_offset).max(log.last().map(|e| e.offset + 1).unwrap_or(0));
+            if search_inner.closed.load(Ordering::Acquire) {
+                // The log is closed and this cursor is at (or started
+                // past) its tail. Under the log lock, `closed` implies
+                // the `Closed` entry is already in the log, so a cursor
+                // past the tail has consumed or skipped it: this is
+                // end-of-stream.
+                return Some(None);
+            }
+            None
+        };
+        let source = inner.clone() as Arc<dyn WaitSource>;
+        wait_on(&inner.liveness, node, &source, evaluate).await
     }
 }
 
@@ -2080,7 +1858,7 @@ impl BusRegistry {
     pub fn lookup(
         &self,
         marker: &Value,
-        node: Option<BusParticipant>,
+        node: Option<FiringLocation>,
     ) -> Result<BusHandle, BusLookupError> {
         let id_str = crate::weft_type::WeftType::bus_marker_id(marker)
             .ok_or(BusLookupError::NotABusMarker)?;

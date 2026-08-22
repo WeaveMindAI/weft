@@ -182,17 +182,46 @@ pub enum ExecEvent {
         frames: LoopFrames,
         value: Value,
         closed: bool,
+        /// Only ever `Some` on a closure targeting a generator port:
+        /// the stream ended because its producer FAILED with this
+        /// error (see `Pulse::close_error`). Always written (a `None`
+        /// serializes as `null`): a missing field must fail
+        /// deserialization as the truncated row it is, never silently
+        /// read as "no error".
+        close_error: Option<String>,
+        at_unix: u64,
+    },
+
+    /// Pulses a live in-process sink consumed OUTSIDE a dispatch: a
+    /// running consumer's pull took a generator item, or the engine
+    /// dropped items whose consumer already finished. Dispatch-time
+    /// absorption rides `NodeStarted`/`NodeResumed`; this event is the
+    /// same durability for the take path, so a refold never sees a
+    /// taken item as Pending beside a terminal consumer record (which
+    /// would re-dispatch the consumer, a double run).
+    ///
+    /// TODO: every stream item costs one `PulseEmitted` + one of these
+    /// (a journal write each); a multi-million-item stream needs
+    /// windowed writes (the bus already batches its appends this way)
+    /// before that volume is real.
+    PulsesConsumed {
+        color: Color,
+        /// The consuming node (the pulses' target).
+        node_id: String,
+        frames: LoopFrames,
+        pulse_ids: Vec<String>,
         at_unix: u64,
     },
 
     /// A `Loop` instance was created at `parent_frames` when `LoopIn`
-    /// first fired for the loop. Carries the resolved iteration count
-    /// (after zip-trim and `max_iters` cap) and the config snapshot.
+    /// first fired for the loop. Carries the resolved iteration cap
+    /// (after zip-trim and `max_iters` cap; `None` means uncapped)
+    /// and the config snapshot.
     LoopInstantiated {
         color: Color,
         group_id: String,
         parent_frames: LoopFrames,
-        iter_count: u32,
+        iter_cap: Option<u32>,
         parallel: bool,
         max_iters: Option<u32>,
         /// Iter-input port names. Persisted because the rehydrate
@@ -240,6 +269,16 @@ pub enum ExecEvent {
         parent_frames: LoopFrames,
         index: u32,
         body_emissions: Vec<LaunchedEmission>,
+        /// When this iteration's `over` item came from a STREAM
+        /// (`over` on a `Generator[T]` port): the item pulse this
+        /// launch consumed, absorbed by the fold in the same atomic
+        /// row as the launch marker. `None` for list-driven and
+        /// done-driven loops. Always written (`null` for the non-
+        /// stream sources): a missing field must fail
+        /// deserialization, never silently fold as "not a stream
+        /// launch" (which would leave the item pulse un-absorbed and
+        /// re-deliver it).
+        stream_pulse: Option<String>,
         at_unix: u64,
     },
 
@@ -261,6 +300,20 @@ pub enum ExecEvent {
         gather_writes: HashMap<String, weft_core::primitive::LoopWrite>,
         carry_writes: HashMap<String, weft_core::primitive::LoopWrite>,
         done_vote: Option<bool>,
+        at_unix: u64,
+    },
+
+    /// The stream driving a stream-`over` loop ENDED. Durable on
+    /// purpose: the end's close pulse is consumed the moment it
+    /// routes, so without this row a crash between "stream ended" and
+    /// "loop terminated" (an iteration still in flight) would resume a
+    /// loop that waits forever for a close that can never arrive
+    /// again. Folds into the instance snapshot's `stream_end`.
+    LoopStreamEnded {
+        color: Color,
+        group_id: String,
+        parent_frames: LoopFrames,
+        end: weft_core::primitive::StreamEnd,
         at_unix: u64,
     },
 
@@ -498,6 +551,9 @@ pub struct LaunchedEmission {
     pub frames: LoopFrames,
     pub value: Value,
     pub closed: bool,
+    /// See `PulseEmitted::close_error` (always written, same
+    /// truncated-row posture).
+    pub close_error: Option<String>,
 }
 
 impl From<weft_core::exec::PulseEmission> for LaunchedEmission {
@@ -512,6 +568,7 @@ impl From<weft_core::exec::PulseEmission> for LaunchedEmission {
             frames: p.frames,
             value: p.value,
             closed: p.closed,
+            close_error: p.close_error,
         }
     }
 }
@@ -529,9 +586,11 @@ impl ExecEvent {
             | Self::NodeResumed { color, .. }
             | Self::NodeCancelled { color, .. }
             | Self::PulseEmitted { color, .. }
+            | Self::PulsesConsumed { color, .. }
             | Self::LoopInstantiated { color, .. }
             | Self::LoopIterationLaunched { color, .. }
             | Self::LoopOutFired { color, .. }
+            | Self::LoopStreamEnded { color, .. }
             | Self::LoopTerminated { color, .. }
             | Self::SuspensionRegistered { color, .. }
             | Self::SuspensionResolved { color, .. }
@@ -566,9 +625,11 @@ impl ExecEvent {
             Self::NodeResumed { .. } => "node_resumed",
             Self::NodeCancelled { .. } => "node_cancelled",
             Self::PulseEmitted { .. } => "pulse_emitted",
+            Self::PulsesConsumed { .. } => "pulses_consumed",
             Self::LoopInstantiated { .. } => "loop_instantiated",
             Self::LoopIterationLaunched { .. } => "loop_iteration_launched",
             Self::LoopOutFired { .. } => "loop_out_fired",
+            Self::LoopStreamEnded { .. } => "loop_stream_ended",
             Self::LoopTerminated { .. } => "loop_terminated",
             Self::SuspensionRegistered { .. } => "suspension_registered",
             Self::SuspensionResolved { .. } => "suspension_resolved",
@@ -606,7 +667,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
     let mut kicked: HashMap<String, KickedNode> = HashMap::new();
     let mut loop_instances: HashMap<LoopInstanceKey, LoopInstanceSnapshot> = HashMap::new();
     let mut awaited_sequences: HashMap<
-        (String, weft_core::frames::LoopFrames),
+        weft_core::liveness::FiringLocation,
         Vec<weft_core::primitive::AwaitedEntry>,
     > = HashMap::new();
     let mut corruptions: Vec<JournalCorruption> = Vec::new();
@@ -637,6 +698,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
         target_port: &str,
         value: Value,
         closed: bool,
+        close_error: Option<String>,
     ) {
         let id = match pulse_id.parse::<uuid::Uuid>() {
             Ok(id) => id,
@@ -658,6 +720,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
             target_port.to_string(),
             value,
             closed,
+            close_error,
         ) {
             Ok(p) => p,
             Err(reason) => {
@@ -704,6 +767,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 &e.target_port,
                 e.value.clone(),
                 e.closed,
+                e.close_error.clone(),
             );
         }
     }
@@ -754,6 +818,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 frames,
                 value,
                 closed,
+                close_error,
                 ..
             } => {
                 push_pulse(
@@ -767,7 +832,33 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                     target_port,
                     value.clone(),
                     *closed,
+                    close_error.clone(),
                 );
+            }
+            ExecEvent::PulsesConsumed { color: c, node_id, pulse_ids, .. } => {
+                // The take path's durability: REMOVE the consumed
+                // pulses from the table, byte-identical to what the
+                // live driver does (`consume_stream_pulses` removes,
+                // never tombstones: a long stream would otherwise grow
+                // the bucket by one spent entry per item, turning
+                // every per-pass scan of a REFOLDED worker quadratic
+                // where the live worker's is not). Safe because
+                // consumed stream pulses are never un-absorb targets
+                // (a stream consumer is never re-run). Deliberately
+                // NOT recorded on the consuming record's
+                // `pulses_absorbed`: that list exists for the
+                // resume-time un-absorb, which never applies here, and
+                // a long stream would grow the record by one uuid per
+                // item forever.
+                let ids = parse_absorbed_ids(
+                    pulse_ids,
+                    &mut corruptions,
+                    CorruptionSite::PulsesConsumed,
+                    *c,
+                );
+                if let Some(bucket) = pulses.get_mut(node_id) {
+                    bucket.retain(|p| !ids.contains(&p.id));
+                }
             }
             ExecEvent::NodeStarted { node_id, frames, input, pulses_absorbed, at_unix, color: c, closed_ports: _ } => {
                 let absorbed_uuids = parse_absorbed_ids(pulses_absorbed, &mut corruptions, CorruptionSite::NodeStarted, *c);
@@ -952,7 +1043,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 }
             }
             ExecEvent::LoopInstantiated {
-                color: c, group_id, parent_frames, iter_count, parallel, max_iters,
+                color: c, group_id, parent_frames, iter_cap, parallel, max_iters,
                 over, carry, trim_on_mismatch, outer_input, initial_carry, ..
             } => {
                 let key = LoopInstanceKey {
@@ -963,7 +1054,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 loop_instances
                     .entry(key)
                     .or_insert_with(|| LoopInstanceSnapshot {
-                        iter_count: *iter_count,
+                        iter_cap: *iter_cap,
                         parallel: *parallel,
                         max_iters: *max_iters,
                         over: over.clone(),
@@ -979,10 +1070,30 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         carry_values: initial_carry.clone(),
                         outer_input: outer_input.clone(),
                         terminated: None,
+                        stream_end: None,
                     });
             }
+            ExecEvent::LoopStreamEnded { color: c, group_id, parent_frames, end, .. } => {
+                let key = LoopInstanceKey {
+                    group_id: group_id.clone(),
+                    parent_frames: parent_frames.clone(),
+                    color: *c,
+                };
+                match loop_instances.get_mut(&key) {
+                    Some(inst) => inst.stream_end = Some(end.clone()),
+                    None => report_corruption(
+                        &mut corruptions,
+                        *c,
+                        CorruptionSite::LoopStreamEnded,
+                        format!(
+                            "LoopStreamEnded at group_id={group_id} parent_frames={parent_frames:?} \
+                             with no prior LoopInstantiated"
+                        ),
+                    ),
+                }
+            }
             ExecEvent::LoopIterationLaunched {
-                color: c, group_id, parent_frames, index, body_emissions, ..
+                color: c, group_id, parent_frames, index, body_emissions, stream_pulse, ..
             } => {
                 // Replay the carried body pulses exactly as the
                 // `PulseEmitted` arm does (same `push_pulse` helper):
@@ -1001,7 +1112,41 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         &e.target_port,
                         e.value.clone(),
                         e.closed,
+                        e.close_error.clone(),
                     );
+                }
+                // A stream-driven launch consumed one item pulse; it is
+                // consumed in the SAME atomic row as the launch marker,
+                // so a refold never re-delivers a launched item. The
+                // pulse targets exactly the loop's LoopIn bucket
+                // (`{group_id}__in`, the compiler's boundary id), and
+                // it is REMOVED to match the live table byte for byte
+                // (see the `PulsesConsumed` arm). O(one bucket), not a
+                // scan of every node's pulses per launched iteration.
+                if let Some(sp) = stream_pulse {
+                    match sp.parse::<uuid::Uuid>() {
+                        Ok(id) => {
+                            let loop_in_id = weft_core::project::boundary_in_id(group_id);
+                            match pulses.get_mut(&loop_in_id) {
+                                Some(bucket) => bucket.retain(|p| p.id != id),
+                                None => report_corruption(
+                                    &mut corruptions,
+                                    *c,
+                                    CorruptionSite::LoopIterationLaunched,
+                                    format!(
+                                        "stream_pulse={sp} names a pulse but LoopIn \
+                                         '{loop_in_id}' has no pulse bucket"
+                                    ),
+                                ),
+                            }
+                        }
+                        Err(e) => report_corruption(
+                            &mut corruptions,
+                            *c,
+                            CorruptionSite::LoopIterationLaunched,
+                            format!("stream_pulse={sp:?} unparseable: {e}"),
+                        ),
+                    }
                 }
                 let key = LoopInstanceKey {
                     group_id: group_id.clone(),
@@ -1081,6 +1226,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         &e.target_port,
                         e.value.clone(),
                         e.closed,
+                        e.close_error.clone(),
                     );
                 }
                 let key = LoopInstanceKey {
@@ -1113,7 +1259,8 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         call_index: *call_index,
                     },
                 );
-                let key = (node_id.clone(), frames.clone());
+                let key =
+                    weft_core::liveness::FiringLocation::new(node_id.clone(), frames.clone());
                 // Close the out-of-order window: a fire can journal
                 // SuspensionResolved BEFORE the register executor journals
                 // SuspensionRegistered (the two are written by independent
@@ -1140,7 +1287,8 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
             ExecEvent::RunOutput {
                 node_id, frames, call_index, name, value, ..
             } => {
-                let key = (node_id.clone(), frames.clone());
+                let key =
+                    weft_core::liveness::FiringLocation::new(node_id.clone(), frames.clone());
                 awaited_sequences
                     .entry(key)
                     .or_default()
@@ -1319,6 +1467,7 @@ mod fold_pulse_tests {
                 frames: frames(&[]),
                 value: json!(1),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -1355,6 +1504,7 @@ mod fold_pulse_tests {
                 frames: frames(&[]),
                 value: json!(42),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -1420,6 +1570,7 @@ mod fold_pulse_tests {
                 frames: body_frames.clone(),
                 value: json!(i * 8),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             });
             events.push(ExecEvent::NodeStarted {
@@ -1530,7 +1681,7 @@ mod fold_pulse_tests {
             color: color(),
             group_id: "lp".into(),
             parent_frames: frames(&[]),
-            iter_count: 5,
+            iter_cap: Some(5),
             parallel: true,
             max_iters: None,
             over: vec!["items".into()],
@@ -1561,7 +1712,9 @@ mod fold_pulse_tests {
                     frames: body_frames.clone(),
                     value: json!(i),
                     closed: false,
+                    close_error: None,
                 }],
+                stream_pulse: None,
                 at_unix: 0,
             });
             events.push(ExecEvent::NodeStarted {
@@ -1723,7 +1876,7 @@ mod fold_pulse_tests {
                 color: color(),
                 group_id: "lp".into(),
                 parent_frames: frames(&[]),
-                iter_count: 3,
+                iter_cap: Some(3),
                 parallel: false,
                 max_iters: None,
                 over: vec!["items".into()],
@@ -1757,7 +1910,9 @@ mod fold_pulse_tests {
                     frames: frames(&[frame(1)]),
                     value: json!(2),
                     closed: false,
+                    close_error: None,
                 }],
+                stream_pulse: None,
                 at_unix: 0,
             },
         ];
@@ -1800,7 +1955,7 @@ mod fold_pulse_tests {
                 color: color(),
                 group_id: "lp".into(),
                 parent_frames: frames(&[]),
-                iter_count: 1,
+                iter_cap: Some(1),
                 parallel: false,
                 max_iters: None,
                 over: vec!["items".into()],
@@ -1824,6 +1979,7 @@ mod fold_pulse_tests {
                     frames: frames(&[]),
                     value: json!([10]),
                     closed: false,
+                    close_error: None,
                 }],
                 at_unix: 0,
             },
@@ -1884,6 +2040,7 @@ mod fold_pulse_tests {
                     frames: frames(&[]),
                     value: json!(null),
                     closed: true,
+                    close_error: None,
                 }],
                 at_unix: 0,
             },
@@ -1939,6 +2096,7 @@ mod fold_pulse_tests {
                 frames: frames(&[]),
                 value: json!(7),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -2027,7 +2185,7 @@ mod fold_pulse_tests {
         ];
 
         let snap = fold_to_snapshot(color(), &events);
-        let key = ("review".to_string(), f.clone());
+        let key = weft_core::liveness::FiringLocation::new("review", f.clone());
         let seq = snap
             .awaited_sequences
             .get(&key)
@@ -2091,6 +2249,7 @@ mod fold_pulse_tests {
                 frames: frames(&[]),
                 value: json!(1),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -2119,6 +2278,7 @@ mod fold_pulse_tests {
                 frames: frames(&[]),
                 value: json!(2),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeResumed {
@@ -2173,6 +2333,7 @@ mod fold_pulse_tests {
                 frames: frames(&[]),
                 value: json!(1),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -2202,6 +2363,7 @@ mod fold_pulse_tests {
                 frames: frames(&[]),
                 value: json!(2),
                 closed: false,
+                close_error: None,
                 at_unix: 0,
             },
             ExecEvent::NodeStarted {
@@ -2304,7 +2466,7 @@ mod fold_pulse_tests {
             },
         ];
         let snap = fold_to_snapshot(color(), &events);
-        let key = ("review".to_string(), f);
+        let key = weft_core::liveness::FiringLocation::new("review", f);
         let seq = snap.awaited_sequences.get(&key).expect("awaited sequence");
         assert_eq!(seq.len(), 1);
         match &seq[0].kind {
@@ -2476,5 +2638,134 @@ mod caller_event_wire_tests {
         let snap = fold_to_snapshot(color(), &events);
         assert!(snap.executions.is_empty(), "caller events create no node state");
         assert!(snap.corruptions.is_empty(), "caller events fold cleanly");
+    }
+
+    /// The stream wire shapes round-trip with their INTERESTING states
+    /// populated: a failed stream close, a stream-driven launch, a
+    /// consume row, and the durable stream end. Fixtures elsewhere use
+    /// `None` everywhere, which never exercises the field's encoding.
+    #[test]
+    fn stream_wire_shapes_round_trip() {
+        round_trip(ExecEvent::PulsesConsumed {
+            color: color(),
+            node_id: "consumer".into(),
+            frames: vec![],
+            pulse_ids: vec![uuid::Uuid::new_v4().to_string()],
+            at_unix: 7,
+        });
+        round_trip(ExecEvent::PulseEmitted {
+            color: color(),
+            pulse_id: uuid::Uuid::new_v4().to_string(),
+            source_node: "producer".into(),
+            source_port: "rows".into(),
+            target_node: "consumer".into(),
+            target_port: "in".into(),
+            frames: vec![],
+            value: serde_json::Value::Null,
+            closed: true,
+            close_error: Some("boom".into()),
+            at_unix: 7,
+        });
+        round_trip(ExecEvent::LoopIterationLaunched {
+            color: color(),
+            group_id: "lp".into(),
+            parent_frames: vec![],
+            index: 3,
+            body_emissions: vec![LaunchedEmission {
+                pulse_id: uuid::Uuid::new_v4().to_string(),
+                source_node: "lp__in".into(),
+                source_port: "item".into(),
+                target_node: "body".into(),
+                target_port: "n".into(),
+                frames: vec![weft_core::frames::LoopIteration { index: 3 }],
+                value: serde_json::json!(42),
+                closed: false,
+                close_error: None,
+            }],
+            stream_pulse: Some(uuid::Uuid::new_v4().to_string()),
+            at_unix: 7,
+        });
+        round_trip(ExecEvent::LoopStreamEnded {
+            color: color(),
+            group_id: "lp".into(),
+            parent_frames: vec![],
+            end: weft_core::primitive::StreamEnd::Failed { error: "upstream broke".into() },
+            at_unix: 7,
+        });
+        round_trip(ExecEvent::LoopStreamEnded {
+            color: color(),
+            group_id: "lp".into(),
+            parent_frames: vec![],
+            end: weft_core::primitive::StreamEnd::Finished,
+            at_unix: 8,
+        });
+    }
+
+    /// `PulsesConsumed` folds as REMOVAL, byte-identical to the live
+    /// table (a refolded long stream must not carry a tombstone per
+    /// spent item), and the durable `LoopStreamEnded` lands on the
+    /// instance snapshot so a resumed loop knows its stream ended.
+    #[test]
+    fn pulses_consumed_removes_and_loop_stream_end_is_durable() {
+        let pid = uuid::Uuid::new_v4();
+        let events = vec![
+            ExecEvent::LoopInstantiated {
+                color: color(),
+                group_id: "lp".into(),
+                parent_frames: vec![],
+                iter_cap: None,
+                parallel: false,
+                max_iters: None,
+                over: vec!["rows".into()],
+                carry: vec![],
+                trim_on_mismatch: true,
+                outer_input: HashMap::new(),
+                initial_carry: HashMap::new(),
+                at_unix: 0,
+            },
+            ExecEvent::PulseEmitted {
+                color: color(),
+                pulse_id: pid.to_string(),
+                source_node: "producer".into(),
+                source_port: "rows".into(),
+                target_node: "consumer".into(),
+                target_port: "in".into(),
+                frames: vec![],
+                value: serde_json::json!(1),
+                closed: false,
+                close_error: None,
+                at_unix: 1,
+            },
+            ExecEvent::PulsesConsumed {
+                color: color(),
+                node_id: "consumer".into(),
+                frames: vec![],
+                pulse_ids: vec![pid.to_string()],
+                at_unix: 2,
+            },
+            ExecEvent::LoopStreamEnded {
+                color: color(),
+                group_id: "lp".into(),
+                parent_frames: vec![],
+                end: weft_core::primitive::StreamEnd::Finished,
+                at_unix: 3,
+            },
+        ];
+        let snap = fold_to_snapshot(color(), &events);
+        assert!(
+            snap.pulses.get("consumer").map(|b| b.is_empty()).unwrap_or(true),
+            "a consumed stream pulse is REMOVED, not tombstoned"
+        );
+        let key = weft_core::primitive::LoopInstanceKey {
+            group_id: "lp".into(),
+            parent_frames: vec![],
+            color: color(),
+        };
+        assert_eq!(
+            snap.loop_instances.get(&key).and_then(|i| i.stream_end.clone()),
+            Some(weft_core::primitive::StreamEnd::Finished),
+            "the stream's end survives the fold"
+        );
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
     }
 }

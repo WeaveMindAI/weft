@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, HashMap};
 use serde_json::Value;
 
 use weft_core::frames::{LoopFrames, LoopIteration};
+use weft_core::generator::{StreamBuffer, StreamEnd};
 use weft_core::primitive::{
     LoopInstanceKey, LoopInstanceSnapshot, LoopTerminationReason, LoopWrite,
 };
@@ -118,14 +119,87 @@ fn parse_port_list(cfg: &Value, field: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// Where a loop's per-iteration items come from and how it learns
+/// there is no next one. The one question every loop answers, with
+/// three instances of the one shape:
+///
+/// - `Lists`: `over` on `List[T]` ports; the count is known up front
+///   (zip-trim + `max_iters` cap) and exhaustion is `index + 1 >=
+///   iter_cap`.
+/// - `DoneDriven`: no `over`; iterations launch until a `self.done`
+///   vote or the `max_iters` cap (`iter_cap` is the cap, `u32::MAX`
+///   when uncapped: the compiler already rejects a sequential loop
+///   with none of the three terminators).
+/// - `Stream`: `over` on ONE `Generator[T]` port; items arrive over
+///   time (routed in by the engine as the producer yields) and
+///   exhaustion is the stream's end. Sequential mode launches the next
+///   iteration when the previous one finished AND an item is buffered;
+///   parallel mode launches a lane per arriving item, up to the cap.
+#[derive(Debug, Clone)]
+pub enum LoopItemSource {
+    Lists,
+    DoneDriven,
+    Stream(LoopStreamState),
+}
+
+/// The live state of a stream-driven loop's item source: the shared
+/// [`StreamBuffer`] (the ONE implementation of "delivered but not yet
+/// taken, and has it ended", also behind every consumer feed) plus the
+/// port it serves. Buffered items still count as in-flight pulses in
+/// the engine's table (status Routed); an item's pulse is absorbed
+/// when its iteration launches (journaled atomically inside
+/// `LoopIterationLaunched.stream_pulse`).
+#[derive(Clone)]
+pub struct LoopStreamState {
+    /// The one `over` port the stream feeds.
+    pub port: String,
+    buf: StreamBuffer,
+}
+
+impl std::fmt::Debug for LoopStreamState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoopStreamState")
+            .field("port", &self.port)
+            .field("buffered", &self.buf.buffered_len())
+            .field("end", &self.buf.end())
+            .finish()
+    }
+}
+
+impl LoopStreamState {
+    /// A stream source for `port`. `end` seeds an already-ended stream
+    /// on the rehydrate path (the snapshot's durable `stream_end`); a
+    /// fresh instantiation passes `None`.
+    pub fn new(port: impl Into<String>, end: Option<StreamEnd>) -> Self {
+        let mut buf = StreamBuffer::new();
+        if let Some(end) = end {
+            buf.close(end);
+        }
+        Self { port: port.into(), buf }
+    }
+}
+
+/// One buffered stream item: the pulse that carried it (absorbed at
+/// launch) plus its value.
+#[derive(Debug, Clone)]
+pub struct LoopStreamItem {
+    pub pulse: uuid::Uuid,
+    pub value: Value,
+}
+
 /// A single live loop. Engine code reads/writes through
 /// `LoopRuntime` so the snapshot serialization stays in one place.
 #[derive(Debug, Clone)]
 pub struct LoopInstance {
     pub key: LoopInstanceKey,
     pub config: LoopConfig,
-    /// Effective iteration count after zip-trim + max_iters cap.
-    pub iter_count: u32,
+    /// Where iterations' items come from; see [`LoopItemSource`].
+    pub source: LoopItemSource,
+    /// Effective iteration CAP (never "how many ran"; that is
+    /// `launched.len()`): for `Lists` the zip-trimmed, max-capped
+    /// count; for `DoneDriven` and `Stream` the `max_iters` cap.
+    /// `None` means uncapped.
+    pub iter_cap: Option<u32>,
     /// Declared gather-output port names (LoopOut's outward outputs
     /// minus the carry names). Captured at instantiation so the
     /// outward emit assembles a list for EVERY declared gather port,
@@ -156,13 +230,15 @@ impl LoopInstance {
     pub fn new(
         key: LoopInstanceKey,
         config: LoopConfig,
-        iter_count: u32,
+        source: LoopItemSource,
+        iter_cap: Option<u32>,
         gather_ports: Vec<String>,
     ) -> Self {
         Self {
             key,
             config,
-            iter_count,
+            source,
+            iter_cap,
             gather_ports,
             launched: Vec::new(),
             out_fired: Vec::new(),
@@ -185,6 +261,7 @@ impl LoopInstance {
     pub fn from_snapshot(
         key: LoopInstanceKey,
         snap: &LoopInstanceSnapshot,
+        source: LoopItemSource,
         gather_ports: Vec<String>,
     ) -> Self {
         let gather_lists = snap.gather_lists.iter().map(|(k, m)| {
@@ -201,7 +278,8 @@ impl LoopInstance {
         Self {
             key,
             config,
-            iter_count: snap.iter_count,
+            source,
+            iter_cap: snap.iter_cap,
             gather_ports,
             launched: snap.launched.clone(),
             out_fired: snap.out_fired.clone(),
@@ -211,15 +289,30 @@ impl LoopInstance {
             terminated: snap.terminated,
         }
     }
+
+    /// The next iteration index to launch: one past the highest
+    /// launched index. NOT `launched.len()`: `launched` can be
+    /// non-contiguous after a partial launch failure, and a
+    /// length-derived index would re-use an already-launched slot,
+    /// overwriting its gather entry. Shared by `stream_push` and the
+    /// outward list length. NOT by `record_loop_out`: there the next
+    /// launch is the SUCCESSOR of the just-fired iteration (`index +
+    /// 1`), and its replay guard depends on that (a replayed LoopOut
+    /// must find its successor already launched and go idle, never
+    /// jump past in-flight iterations to a fresh index).
+    pub fn next_index(&self) -> u32 {
+        self.launched.iter().copied().max().map(|m| m + 1).unwrap_or(0)
+    }
 }
 
 /// What the engine should do next after a `LoopOut` firing was recorded.
 #[derive(Debug, Clone)]
 pub enum LoopAdvance {
-    /// Launch the next iteration. Carries the iteration index and the
-    /// per-iteration `over`/broadcast/`index` values the engine should
-    /// emit on `LoopIn`'s inside outputs at the body's frame stack.
-    LaunchNext { index: u32 },
+    /// Launch the next iteration. Carries the iteration index; for a
+    /// stream-driven loop it also carries the buffered item this
+    /// iteration consumes (the engine absorbs the item's pulse
+    /// atomically with the launch row).
+    LaunchNext { index: u32, stream_item: Option<LoopStreamItem> },
     /// Loop has terminated. Engine should emit the assembled outward
     /// pulses on `LoopOut`'s outer outputs at the parent frame stack.
     /// `gather` carries a list for EVERY declared gather port (even
@@ -262,14 +355,17 @@ impl LoopRuntime {
         &mut self,
         key: LoopInstanceKey,
         config: LoopConfig,
-        iter_count: u32,
+        source: LoopItemSource,
+        iter_cap: Option<u32>,
         gather_ports: Vec<String>,
     ) -> bool {
         if self.instances.contains_key(&key) {
             return false;
         }
-        self.instances
-            .insert(key.clone(), LoopInstance::new(key, config, iter_count, gather_ports));
+        self.instances.insert(
+            key.clone(),
+            LoopInstance::new(key, config, source, iter_cap, gather_ports),
+        );
         true
     }
 
@@ -374,31 +470,17 @@ impl LoopRuntime {
         }
 
         let done = done_vote.unwrap_or(false);
-        // Termination-reason precedence: when `iter_count` was capped
+        // Termination-reason precedence: when `iter_cap` was capped
         // at `max_iters` AND the loop reached the cap, BOTH conditions
         // are true at the last iteration. Check max FIRST so the
         // reason names the binding constraint.
         let max_reached = inst.config.max_iters.map(|m| index + 1 >= m).unwrap_or(false);
-        let over_exhausted = index + 1 >= inst.iter_count;
+        let over_exhausted = inst.iter_cap.is_some_and(|cap| index + 1 >= cap);
 
         // Decide next action.
         if inst.config.parallel {
-            // All launched once at instantiation. Check if all have fired LoopOut.
-            if inst.out_fired.len() as u32 >= inst.iter_count {
-                // Termination reason: in parallel, LoopOuts fire out
-                // of order, so the completing firing's `index` is
-                // arbitrary. We can't ask "did THIS index hit
-                // max_iters?" the way sequential mode does. The
-                // binding constraint is fully captured by the
-                // relationship between `iter_count` (the cap that
-                // actually ran) and `max_iters`: if they're equal,
-                // max was the binding constraint.
-                let reason = if inst.config.max_iters == Some(inst.iter_count) {
-                    LoopTerminationReason::MaxItersReached
-                } else {
-                    LoopTerminationReason::OverExhausted
-                };
-                return Ok(self.emit_outward(key, reason));
+            if let Some(advance) = Self::parallel_completion(inst) {
+                return Ok(self.emit_outward(key, advance));
             }
             return Ok(LoopAdvance::Idle);
         }
@@ -410,20 +492,274 @@ impl LoopRuntime {
         if max_reached {
             return Ok(self.emit_outward(key, LoopTerminationReason::MaxItersReached));
         }
-        if over_exhausted {
-            return Ok(self.emit_outward(key, LoopTerminationReason::OverExhausted));
+        match &mut inst.source {
+            LoopItemSource::Lists | LoopItemSource::DoneDriven => {
+                if over_exhausted {
+                    return Ok(self.emit_outward(key, LoopTerminationReason::OverExhausted));
+                }
+                let next = index + 1;
+                if inst.launched.contains(&next) {
+                    // Crash-resume replay: this LoopOut firing already
+                    // dispatched its LaunchNext before the crash (the
+                    // `LoopIterationLaunched` row for `next` is in the
+                    // journal, which is the only way it enters
+                    // `launched` on rehydrate). Re-launching would
+                    // duplicate the iteration's body pulses and re-run
+                    // its body.
+                    return Ok(LoopAdvance::Idle);
+                }
+                Ok(LoopAdvance::LaunchNext { index: next, stream_item: None })
+            }
+            LoopItemSource::Stream(st) => {
+                let next = index + 1;
+                if inst.launched.contains(&next) {
+                    // Same crash-resume replay guard as the counted
+                    // sources: the successor is already launched.
+                    return Ok(LoopAdvance::Idle);
+                }
+                if let Some((pulse, value)) = st.buf.pop() {
+                    return Ok(LoopAdvance::LaunchNext {
+                        index: next,
+                        stream_item: Some(LoopStreamItem { pulse, value }),
+                    });
+                }
+                let end = st.buf.end().cloned();
+                let port = st.port.clone();
+                match end {
+                    Some(StreamEnd::Finished) => {
+                        Ok(self.emit_outward(key, LoopTerminationReason::OverExhausted))
+                    }
+                    Some(StreamEnd::Failed { error }) => Err(format!(
+                        "the stream feeding loop '{}' over '{port}' failed upstream: {error}",
+                        key.group_id,
+                    )),
+                    // Stream still open, nothing buffered: idle until
+                    // the engine routes the next item (or the end) in.
+                    None => Ok(LoopAdvance::Idle),
+                }
+            }
         }
-        let next = index + 1;
-        if inst.launched.contains(&next) {
-            // Crash-resume replay: this LoopOut firing already
-            // dispatched its LaunchNext before the crash (the
-            // `LoopIterationLaunched` row for `next` is in the
-            // journal, which is the only way it enters `launched` on
-            // rehydrate). Re-launching would duplicate the
-            // iteration's body pulses and re-run its body.
+    }
+
+    /// Parallel-mode completion check: `Some(reason)` when every
+    /// launched lane has fired its LoopOut AND no further lane can
+    /// launch. In parallel, LoopOuts fire out of order, so the
+    /// completing firing's `index` is arbitrary; the binding constraint
+    /// is read from the instance's own state, ordering-independent.
+    fn parallel_completion(inst: &LoopInstance) -> Option<LoopTerminationReason> {
+        let all_fired = inst.out_fired.len() >= inst.launched.len();
+        match &inst.source {
+            LoopItemSource::Lists | LoopItemSource::DoneDriven => {
+                if inst.iter_cap.is_some_and(|cap| inst.out_fired.len() as u32 >= cap) {
+                    // If `iter_cap` equals `max_iters`, max was the
+                    // binding constraint.
+                    Some(if inst.config.max_iters == inst.iter_cap {
+                        LoopTerminationReason::MaxItersReached
+                    } else {
+                        LoopTerminationReason::OverExhausted
+                    })
+                } else {
+                    None
+                }
+            }
+            LoopItemSource::Stream(st) => {
+                if !all_fired {
+                    return None;
+                }
+                if inst.iter_cap.is_some_and(|cap| inst.launched.len() as u32 >= cap) {
+                    // The cap bound the loop before the stream ended.
+                    return Some(LoopTerminationReason::MaxItersReached);
+                }
+                match st.buf.end() {
+                    Some(StreamEnd::Finished) if st.buf.buffered_len() == 0 => {
+                        Some(LoopTerminationReason::OverExhausted)
+                    }
+                    // A failed end terminates via the stream_close /
+                    // record_loop_out error paths, never as a clean
+                    // completion.
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// A stream item arrived for a stream-driven loop. Buffers it, or
+    /// launches the next iteration with it when the loop is ready
+    /// (sequential: every launched iteration has fired its LoopOut;
+    /// parallel: immediately, up to the `max_iters` cap). Errors on an
+    /// instance whose source is not a stream or a terminated instance
+    /// (engine routing bugs: the routing pass drops post-termination
+    /// items itself).
+    pub fn stream_push(
+        &mut self,
+        key: &LoopInstanceKey,
+        item: LoopStreamItem,
+    ) -> Result<LoopAdvance, String> {
+        let inst = self.instances.get_mut(key).ok_or_else(|| {
+            format!("stream item for loop '{}' with no LoopInstance", key.group_id)
+        })?;
+        if inst.terminated.is_some() {
+            return Err(format!(
+                "stream item routed to loop '{}' after it terminated; the routing pass \
+                 drops these, so this is an engine routing bug",
+                key.group_id
+            ));
+        }
+        let parallel = inst.config.parallel;
+        let cap = inst.iter_cap;
+        let next_index = inst.next_index();
+        let launched = inst.launched.len() as u32;
+        let below_cap = cap.map_or(true, |c| launched < c);
+        let ready = if parallel {
+            below_cap
+        } else {
+            // Sequential: ready exactly when every launched iteration
+            // has fired its LoopOut (nothing in flight). Derived, not
+            // stored, so a rehydrated instance is correct by
+            // construction.
+            inst.out_fired.len() == inst.launched.len() && below_cap
+        };
+        let LoopItemSource::Stream(st) = &mut inst.source else {
+            return Err(format!(
+                "stream item routed to loop '{}' whose over is not a stream; engine \
+                 routing bug",
+                key.group_id
+            ));
+        };
+        if ready {
+            return Ok(LoopAdvance::LaunchNext { index: next_index, stream_item: Some(item) });
+        }
+        // `reinstate`, not `push`: an item CAN legitimately land after
+        // the recorded end here. The drive's at-least-once re-fold
+        // path re-routes buffered items (their pulses refold Pending)
+        // into a fresh instance whose durable `stream_end` is already
+        // seeded, so "after the end" is re-delivery order, not arrival
+        // order. Arrival order is guarded where it exists: a producer
+        // cannot emit past its close, and the router routes each
+        // pending pulse once. Every end-honoring decision in this file
+        // reads the buffer first, so a reinstated item always launches
+        // before the end terminates the loop.
+        st.buf.reinstate(item.pulse, item.value);
+        Ok(LoopAdvance::Idle)
+    }
+
+    /// The stream feeding a stream-driven loop ended. Records the end
+    /// and, when the loop is already idle (nothing in flight, nothing
+    /// buffered), terminates it: cleanly on `Finished`, as a loud loop
+    /// failure on `Failed` (a loop over a failed stream must never emit
+    /// a gather that looks complete). When work is still in flight, the
+    /// termination happens at the last LoopOut instead.
+    pub fn stream_close(
+        &mut self,
+        key: &LoopInstanceKey,
+        end: StreamEnd,
+    ) -> Result<LoopAdvance, String> {
+        let inst = self.instances.get_mut(key).ok_or_else(|| {
+            format!("stream close for loop '{}' with no LoopInstance", key.group_id)
+        })?;
+        let LoopItemSource::Stream(st) = &mut inst.source else {
+            return Err(format!(
+                "stream close routed to loop '{}' whose over is not a stream; engine \
+                 routing bug",
+                key.group_id
+            ));
+        };
+        st.buf.close(end);
+        self.settle_stream_end(key)
+    }
+
+    /// Evaluate an ALREADY-RECORDED stream end: the ONE derivation of
+    /// "does this end terminate the loop now", shared by the live close
+    /// (`stream_close`) and the rehydrate sweep (a resumed instance
+    /// whose durable `stream_end` was seeded; its close pulse is gone,
+    /// so nothing else would ever re-evaluate it). `Idle` when no end
+    /// is recorded or work remains (in-flight lanes settle at their
+    /// last LoopOut; buffered/pending items settle through
+    /// `stream_push`).
+    pub fn settle_stream_end(&mut self, key: &LoopInstanceKey) -> Result<LoopAdvance, String> {
+        let inst = self.instances.get_mut(key).ok_or_else(|| {
+            format!("stream end settle for loop '{}' with no LoopInstance", key.group_id)
+        })?;
+        let LoopItemSource::Stream(st) = &mut inst.source else {
+            return Err(format!(
+                "stream end settle for loop '{}' whose over is not a stream; engine \
+                 routing bug",
+                key.group_id
+            ));
+        };
+        let settled_end = st.buf.end().cloned();
+        let port = st.port.clone();
+        let queue_empty = st.buf.buffered_len() == 0;
+        if inst.terminated.is_some() || settled_end.is_none() {
             return Ok(LoopAdvance::Idle);
         }
-        Ok(LoopAdvance::LaunchNext { index: next })
+        if let Some(StreamEnd::Failed { error }) = settled_end {
+            // Fail the loop NOW, whatever is in flight: lanes still
+            // running land on the already-terminated-Failed guard.
+            return Err(format!(
+                "the stream feeding loop '{}' over '{port}' failed upstream: {error}",
+                key.group_id,
+            ));
+        }
+        if inst.config.parallel {
+            if let Some(reason) = Self::parallel_completion(inst) {
+                return Ok(self.emit_outward(key, reason));
+            }
+            return Ok(LoopAdvance::Idle);
+        }
+        // Sequential: only an idle loop terminates here; otherwise the
+        // last LoopOut's advance sees the end.
+        let idle = inst.out_fired.len() == inst.launched.len();
+        if idle && queue_empty {
+            return Ok(self.emit_outward(key, LoopTerminationReason::OverExhausted));
+        }
+        Ok(LoopAdvance::Idle)
+    }
+
+    /// Live stream-driven instances whose end is already recorded, as
+    /// `(key, stream port, end)`. The rehydrate sweep asks this to
+    /// find loops whose durable `stream_end` needs re-evaluating; the
+    /// end kind rides along because a `Failed` end settles
+    /// unconditionally while a `Finished` one defers to items still
+    /// pending re-delivery.
+    pub fn stream_instances_with_recorded_end(
+        &self,
+    ) -> Vec<(LoopInstanceKey, String, StreamEnd)> {
+        self.instances
+            .iter()
+            .filter(|(_, inst)| inst.terminated.is_none())
+            .filter_map(|(key, inst)| match &inst.source {
+                LoopItemSource::Stream(st) => st
+                    .buf
+                    .end()
+                    .map(|end| (key.clone(), st.port.clone(), end.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drain a terminated stream-driven loop's still-buffered items,
+    /// returning their pulse ids so the engine absorbs them (they will
+    /// never launch; leaving them routed would block completion
+    /// forever). `Ok(empty)` for a non-stream loop (the callers run on
+    /// generic termination paths); a MISSING instance is an engine bug
+    /// and errors loudly, because silently answering "nothing
+    /// buffered" for the wrong key would leave the real key's items
+    /// routed forever.
+    pub fn drain_stream_leftovers(
+        &mut self,
+        key: &LoopInstanceKey,
+    ) -> Result<Vec<uuid::Uuid>, String> {
+        let inst = self.instances.get_mut(key).ok_or_else(|| {
+            format!(
+                "drain_stream_leftovers for loop '{}' with no LoopInstance; engine bug",
+                key.group_id
+            )
+        })?;
+        match &mut inst.source {
+            LoopItemSource::Stream(st) => Ok(st.buf.drain()),
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Mark an instance as terminated and assemble the outward emit
@@ -443,10 +779,10 @@ impl LoopRuntime {
         inst.terminated = Some(reason);
         // List length = number of iterations actually launched. In
         // normal flow (contiguous launches) this equals
-        // `launched.len()`; we compute as `max + 1` so a non-
-        // contiguous launched (partial launch failure) still
-        // produces a list whose indices align with the journal.
-        let count = inst.launched.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        // `launched.len()`; `next_index` computes `max + 1` so a non-
+        // contiguous launched (partial launch failure) still produces
+        // a list whose indices align with the journal.
+        let count = inst.next_index();
         let mut gather: HashMap<String, Vec<Option<Value>>> = HashMap::new();
         // Walk every DECLARED gather port (not just keys present in
         // `gather_lists`). A port no iteration touched produces a
@@ -546,7 +882,7 @@ mod tests {
     fn sequential_over_exhausted() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        rt.ensure(k.clone(), cfg(false, &["items"], &[], None), 3, vec!["result".into()]);
+        rt.ensure(k.clone(), cfg(false, &["items"], &[], None), LoopItemSource::Lists, Some(3),vec!["result".into()]);
 
         for i in 0..3 {
             rt.record_launched(&k, i);
@@ -554,7 +890,9 @@ mod tests {
             g.insert("result".to_string(), val(serde_json::json!(i)));
             let advance = rt.record_loop_out(&k, i, g, HashMap::new(), Some(false)).unwrap();
             match (i, &advance) {
-                (0 | 1, LoopAdvance::LaunchNext { index }) => assert_eq!(*index, i + 1),
+                (0 | 1, LoopAdvance::LaunchNext { index, stream_item: None }) => {
+                    assert_eq!(*index, i + 1)
+                }
                 (2, LoopAdvance::EmitOutward { reason, gather, .. }) => {
                     assert_eq!(*reason, LoopTerminationReason::OverExhausted);
                     assert_eq!(gather["result"].len(), 3);
@@ -568,7 +906,7 @@ mod tests {
     fn parallel_termination_when_all_fired() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        rt.ensure(k.clone(), cfg(true, &["items"], &[], None), 3, vec![]);
+        rt.ensure(k.clone(), cfg(true, &["items"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
         for i in 0..3 {
             rt.record_launched(&k, i);
         }
@@ -588,7 +926,7 @@ mod tests {
     fn done_vote_terminates_loop() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        rt.ensure(k.clone(), cfg(false, &[], &["acc"], Some(100)), 100, vec![]);
+        rt.ensure(k.clone(), cfg(false, &[], &["acc"], Some(100)), LoopItemSource::DoneDriven, Some(100),vec![]);
         rt.record_launched(&k, 0);
         let advance = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(true)).unwrap();
         match advance {
@@ -603,7 +941,7 @@ mod tests {
     fn carry_keep_previous_on_closure() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        rt.ensure(k.clone(), cfg(false, &[], &["acc"], Some(5)), 5, vec![]);
+        rt.ensure(k.clone(), cfg(false, &[], &["acc"], Some(5)), LoopItemSource::DoneDriven, Some(5),vec![]);
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), val(serde_json::json!("first")));
         rt.record_launched(&k, 0);
@@ -625,7 +963,7 @@ mod tests {
     fn carry_written_null_distinct_from_closed() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        rt.ensure(k.clone(), cfg(false, &[], &["acc"], Some(5)), 5, vec![]);
+        rt.ensure(k.clone(), cfg(false, &[], &["acc"], Some(5)), LoopItemSource::DoneDriven, Some(5),vec![]);
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), val(serde_json::json!("first")));
         rt.record_launched(&k, 0);
@@ -650,7 +988,8 @@ mod tests {
         rt.ensure(
             k.clone(),
             cfg(false, &["items"], &[], None),
-            3,
+            LoopItemSource::Lists,
+            Some(3),
             vec!["result".into(), "errors".into()],
         );
         for i in 0..3 {
@@ -679,7 +1018,7 @@ mod tests {
         let mut rt = LoopRuntime::new();
         let mut k = key();
         k.parent_frames = vec![LoopIteration { index: 0 }];
-        rt.ensure(k.clone(), cfg(false, &["x"], &[], None), 5, vec![]);
+        rt.ensure(k.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(5),vec![]);
         let outer_frames = vec![LoopIteration { index: 0 }];
         rt.cancel_inside(&outer_frames, Uuid::nil());
         let inst = rt.get(&k).expect("instance");
@@ -704,8 +1043,8 @@ mod tests {
             parent_frames: vec![LoopIteration { index: 1 }],
             color: Uuid::nil(),
         };
-        rt.ensure(inst_0.clone(), cfg(false, &["x"], &[], None), 3, vec![]);
-        rt.ensure(inst_1.clone(), cfg(false, &["x"], &[], None), 3, vec![]);
+        rt.ensure(inst_0.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
+        rt.ensure(inst_1.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
         rt.cancel_inside(&vec![LoopIteration { index: 0 }], Uuid::nil());
         assert_eq!(
             rt.get(&inst_0).unwrap().terminated,
@@ -735,8 +1074,8 @@ mod tests {
             parent_frames: vec![LoopIteration { index: 0 }],
             color: Uuid::nil(),
         };
-        rt.ensure(outer_key.clone(), cfg(false, &["x"], &[], None), 3, vec![]);
-        rt.ensure(inner_key.clone(), cfg(false, &["y"], &[], None), 3, vec![]);
+        rt.ensure(outer_key.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
+        rt.ensure(inner_key.clone(), cfg(false, &["y"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
         rt.cancel_inside(&Vec::new(), Uuid::nil());
         assert_eq!(
             rt.get(&outer_key).unwrap().terminated,
@@ -746,6 +1085,142 @@ mod tests {
             rt.get(&inner_key).unwrap().terminated,
             Some(LoopTerminationReason::Cancelled),
         );
+    }
+
+    fn stream_source(port: &str) -> LoopItemSource {
+        LoopItemSource::Stream(LoopStreamState::new(port, None))
+    }
+
+    fn item(v: i64) -> LoopStreamItem {
+        LoopStreamItem { pulse: Uuid::new_v4(), value: serde_json::json!(v) }
+    }
+
+    #[test]
+    fn a_zero_item_stream_terminates_with_an_empty_gather() {
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(k.clone(), cfg(false, &["rows"], &[], None), stream_source("rows"), None,vec!["result".into()]);
+        let advance = rt.stream_close(&k, StreamEnd::Finished).unwrap();
+        match advance {
+            LoopAdvance::EmitOutward { reason, gather, .. } => {
+                assert_eq!(reason, LoopTerminationReason::OverExhausted);
+                assert_eq!(gather["result"].len(), 0, "zero iterations, an empty list");
+            }
+            other => panic!("expected emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sequential_stream_buffers_while_an_iteration_is_in_flight() {
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(k.clone(), cfg(false, &["rows"], &[], None), stream_source("rows"), None,vec![]);
+        // First item launches iteration 0.
+        let a = rt.stream_push(&k, item(10)).unwrap();
+        assert!(matches!(a, LoopAdvance::LaunchNext { index: 0, stream_item: Some(_) }), "{a:?}");
+        rt.record_launched(&k, 0);
+        // Second item buffers (iteration 0 in flight).
+        let b = rt.stream_push(&k, item(11)).unwrap();
+        assert!(matches!(b, LoopAdvance::Idle), "{b:?}");
+        // Iteration 0's LoopOut pops the buffered item as iteration 1.
+        let c = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        match c {
+            LoopAdvance::LaunchNext { index: 1, stream_item: Some(it) } => {
+                assert_eq!(it.value, serde_json::json!(11));
+            }
+            other => panic!("expected LaunchNext(1) with the buffered item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stream_that_ends_while_an_iteration_runs_terminates_at_its_loop_out() {
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(k.clone(), cfg(false, &["rows"], &[], None), stream_source("rows"), None,vec!["result".into()]);
+        let _ = rt.stream_push(&k, item(10)).unwrap();
+        rt.record_launched(&k, 0);
+        // The end arrives mid-iteration: not idle-terminatable yet.
+        let a = rt.stream_close(&k, StreamEnd::Finished).unwrap();
+        assert!(matches!(a, LoopAdvance::Idle), "{a:?}");
+        // The last LoopOut sees the end and emits outward.
+        let b = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        assert!(
+            matches!(b, LoopAdvance::EmitOutward { reason: LoopTerminationReason::OverExhausted, .. }),
+            "{b:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_stream_end_is_a_loud_loop_failure() {
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(k.clone(), cfg(false, &["rows"], &[], None), stream_source("rows"), None,vec![]);
+        let err = rt.stream_close(&k, StreamEnd::Failed { error: "boom".into() }).unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        // A LoopOut landing after the mid-flight failure path
+        // terminated the instance is inert (the driver terminates via
+        // fail_loop_from_stream; model that with cancel).
+    }
+
+    #[test]
+    fn a_rehydrated_stream_loop_knows_its_durable_end() {
+        // The crash shape the durable `stream_end` exists for: the end
+        // arrived (its close pulse consumed for good), iteration 0
+        // still in flight, worker dies. The rehydrated instance is
+        // seeded with the end; iteration 0's LoopOut must terminate
+        // the loop instead of idling forever for a close that can
+        // never arrive again.
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(
+            k.clone(),
+            cfg(false, &["rows"], &[], None),
+            LoopItemSource::Stream(LoopStreamState::new("rows", Some(StreamEnd::Finished))),
+            None,
+            vec!["result".into()],
+        );
+        rt.record_launched(&k, 0);
+        let advance = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        assert!(
+            matches!(advance, LoopAdvance::EmitOutward { reason: LoopTerminationReason::OverExhausted, .. }),
+            "the seeded end terminates the resumed loop, got {advance:?}"
+        );
+    }
+
+    #[test]
+    fn a_reinstated_item_launches_before_a_seeded_end_terminates() {
+        // Refold re-delivery: an item that arrived before the end
+        // refolds Pending and re-routes AFTER the seeded end; it must
+        // buffer (reinstate) and launch, never error and never be
+        // outrun by the end.
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(
+            k.clone(),
+            cfg(false, &["rows"], &[], None),
+            LoopItemSource::Stream(LoopStreamState::new("rows", Some(StreamEnd::Finished))),
+            None,
+            vec![],
+        );
+        rt.record_launched(&k, 0);
+        // Iteration 0 (launched pre-crash) is in flight; the refolded
+        // item re-routes now.
+        let a = rt.stream_push(&k, item(11)).unwrap();
+        assert!(matches!(a, LoopAdvance::Idle), "{a:?}");
+        let b = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        match b {
+            LoopAdvance::LaunchNext { index: 1, stream_item: Some(it) } => {
+                assert_eq!(it.value, serde_json::json!(11), "the reinstated item launches");
+            }
+            other => panic!("the buffered item outranks the end, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_stream_leftovers_is_loud_on_a_missing_instance() {
+        let mut rt = LoopRuntime::new();
+        let err = rt.drain_stream_leftovers(&key()).unwrap_err();
+        assert!(err.contains("no LoopInstance"), "{err}");
     }
 
     /// `LoopOut` firing for a key with no instance is corruption,
@@ -764,7 +1239,7 @@ mod tests {
         );
     }
 
-    /// When `iter_count` was capped at `max_iters` AND the loop hits
+    /// When `iter_cap` was capped at `max_iters` AND the loop hits
     /// the cap, the termination reason names the binding constraint
     /// (`MaxItersReached`), not the symptomatic one
     /// (`OverExhausted`). This is what the inspector renders.
@@ -772,20 +1247,20 @@ mod tests {
     fn max_iters_binding_constraint_reports_max_iters_reason() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        // over is 10 long, max_iters = 3 → iter_count capped to 3.
+        // over is 10 long, max_iters = 3 → iter_cap capped to 3.
         // Sequential: at index 2 (the last) both over_exhausted and
         // max_reached fire. Launches mirror the engine's real call
         // sequence: iteration 0 at instantiation, each subsequent one
         // recorded when its `LaunchNext` is dispatched (pre-recording
         // future launches would trip the replay guard, correctly).
-        rt.ensure(k.clone(), cfg(false, &["items"], &[], Some(3)), 3, vec![]);
+        rt.ensure(k.clone(), cfg(false, &["items"], &[], Some(3)), LoopItemSource::Lists, Some(3),vec![]);
         rt.record_launched(&k, 0);
         for i in 0..2 {
             let advance = rt
                 .record_loop_out(&k, i, HashMap::new(), HashMap::new(), Some(false))
                 .unwrap();
             match advance {
-                LoopAdvance::LaunchNext { index } => rt.record_launched(&k, index),
+                LoopAdvance::LaunchNext { index, stream_item: None } => rt.record_launched(&k, index),
                 other => panic!("expected LaunchNext, got {other:?}"),
             }
         }
@@ -809,14 +1284,14 @@ mod tests {
     fn replayed_loop_out_does_not_relaunch_an_already_launched_iteration() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        rt.ensure(k.clone(), cfg(false, &["items"], &[], None), 3, vec![]);
+        rt.ensure(k.clone(), cfg(false, &["items"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
         rt.record_launched(&k, 0);
         // Live firing: LoopOut@0 dispatches LaunchNext(1).
         let advance = rt
             .record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false))
             .unwrap();
         match advance {
-            LoopAdvance::LaunchNext { index } => rt.record_launched(&k, index),
+            LoopAdvance::LaunchNext { index, stream_item: None } => rt.record_launched(&k, index),
             other => panic!("expected LaunchNext, got {other:?}"),
         }
         // Crash-resume replay of the SAME LoopOut@0 firing: iteration
@@ -836,14 +1311,14 @@ mod tests {
     /// keyed on the firing's `index` (the earlier shape: `max_reached
     /// = index + 1 >= max_iters`) would miss this case when the
     /// completing firing happens to be a low index. The reason must
-    /// be determined from the instance's `iter_count` vs `max_iters`
+    /// be determined from the instance's `iter_cap` vs `max_iters`
     /// relationship, which is ordering-independent.
     #[test]
     fn parallel_max_iters_binding_constraint_reports_max_iters_reason_regardless_of_order() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        // over is 10 long, max_iters = 3 → iter_count capped to 3.
-        rt.ensure(k.clone(), cfg(true, &["items"], &[], Some(3)), 3, vec![]);
+        // over is 10 long, max_iters = 3 → iter_cap capped to 3.
+        rt.ensure(k.clone(), cfg(true, &["items"], &[], Some(3)), LoopItemSource::Lists, Some(3),vec![]);
         for i in 0..3 {
             rt.record_launched(&k, i);
         }
@@ -875,7 +1350,7 @@ mod tests {
     fn late_loop_out_after_termination_is_idle() {
         let mut rt = LoopRuntime::new();
         let k = key();
-        rt.ensure(k.clone(), cfg(false, &["items"], &[], None), 5, vec!["result".into()]);
+        rt.ensure(k.clone(), cfg(false, &["items"], &[], None), LoopItemSource::Lists, Some(5),vec!["result".into()]);
         rt.record_launched(&k, 0);
         // Externally cancel the instance (simulates cancel_inside).
         rt.cancel_inside(&Vec::new(), Uuid::nil());

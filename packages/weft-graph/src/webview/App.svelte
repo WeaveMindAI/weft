@@ -10,6 +10,7 @@
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';
   import type { ProjectDefinition as V1Project, NodeExecution, ExecutionState } from './lib/types';
+  import { bareRecord } from './lib/types';
   import type { ActionBarState, ActionAvailability, DeactivationSpec, NodeFeedState, TextEdit, EditOp, FileContent, Diagnostic, ProjectDefinition as ProtocolProject, HostMessage, WebviewMessage } from '../protocol';
   import type { EditRpcResult } from './lib/projection/types';
   import type { Snippet } from 'svelte';
@@ -217,11 +218,11 @@
   // the bus marker JSON.
   let executionState = $state<ExecutionState>({
     isRunning: false,
-    nodeOutputs: {},
-    nodeExecutions: {},
-    busLogByBus: {},
-    busMetaByBus: {},
-    busParticipantsByBus: {},
+    nodeOutputs: bareRecord(),
+    nodeExecutions: bareRecord(),
+    busLogByBus: bareRecord(),
+    busMetaByBus: bareRecord(),
+    busParticipantsByBus: bareRecord(),
     journalCorruptions: [],
     loopEventsByGroup: {},
     callerLog: [],
@@ -249,8 +250,8 @@
   //   - everything else → no body-panel; modal inspector only.
   // Each feed entry is `NodeFeedState`: ok with items, or error with a
   // message. NEVER a fallback to execution data on the wrong feed.
-  let infraFeedByNode = $state<Record<string, NodeFeedState>>({});
-  let signalFeedByNode = $state<Record<string, NodeFeedState>>({});
+  let infraFeedByNode = $state<Record<string, NodeFeedState>>(bareRecord());
+  let signalFeedByNode = $state<Record<string, NodeFeedState>>(bareRecord());
 
   // Source-derived flags: does the project DECLARE infra / trigger
   // nodes. Driven by every truth carrier (parseResult, editApplied,
@@ -413,11 +414,11 @@
       if (msg.kind === 'execReset') {
         executionState = {
           isRunning: true,
-          nodeOutputs: {},
-          nodeExecutions: {},
-          busLogByBus: {},
-          busMetaByBus: {},
-          busParticipantsByBus: {},
+          nodeOutputs: bareRecord(),
+          nodeExecutions: bareRecord(),
+          busLogByBus: bareRecord(),
+          busMetaByBus: bareRecord(),
+          busParticipantsByBus: bareRecord(),
           journalCorruptions: [],
           loopEventsByGroup: {},
           callerLog: [],
@@ -441,7 +442,7 @@
         const now = Date.now();
         const isTerminal = (s: NodeExecution['status']) =>
           s === 'completed' || s === 'failed' || s === 'skipped' || s === 'cancelled';
-        const rows = { ...executionState.nodeExecutions };
+        const rows = bareRecord(executionState.nodeExecutions);
         for (const [nodeId, history] of Object.entries(rows)) {
           if (history.some((r) => !isTerminal(r.status))) {
             rows[nodeId] = history.map((r) =>
@@ -482,12 +483,11 @@
           return;
         }
         const warning = { port: msg.port, expected: msg.expected, actual: msg.actual };
-        executionState.nodeExecutions = {
-          ...executionState.nodeExecutions,
+        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
           [msg.nodeId]: rows.map((r, i) =>
             i === idx ? { ...r, portWarnings: [...existing, warning] } : r,
           ),
-        };
+        });
         return;
       }
       if (msg.kind === 'execCost') {
@@ -512,8 +512,7 @@
         if (seen.includes(msg.costId)) {
           return;
         }
-        executionState.nodeExecutions = {
-          ...executionState.nodeExecutions,
+        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
           [msg.nodeId]: rows.map((r, i) =>
             i === idx
               ? {
@@ -528,7 +527,7 @@
                 }
               : r,
           ),
-        };
+        });
         return;
       }
       if (msg.kind === 'execEvent') {
@@ -612,20 +611,18 @@
             return updated;
           });
         }
-        executionState.nodeExecutions = {
-          ...executionState.nodeExecutions,
+        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
           [e.nodeId]: nextRows,
-        };
+        });
         // Debug preview (`features.showDebugPreview`) reads its
         // last output from `executionState.nodeOutputs[id]`. Update
         // it on completion. Earlier this rode the liveData channel;
         // now it taps the exec event directly so the body-panel
         // feeds (infra / signal display) cannot interfere.
         if (state === 'completed' && e.output !== undefined) {
-          executionState.nodeOutputs = {
-            ...executionState.nodeOutputs,
+          executionState.nodeOutputs = bareRecord(executionState.nodeOutputs, {
             [e.nodeId]: e.output,
-          };
+          });
         }
         return;
       }
@@ -642,10 +639,9 @@
         if (seenBusKeys.has(busKey)) return;
         seenBusKeys.add(busKey);
         const log = executionState.busLogByBus[busId] ?? [];
-        executionState.busLogByBus = {
-          ...executionState.busLogByBus,
+        executionState.busLogByBus = bareRecord(executionState.busLogByBus, {
           [busId]: [...log, msg.event],
-        };
+        });
         return;
       }
       if (msg.kind === 'callerEvent') {
@@ -698,10 +694,9 @@
         if (!set.has(msg.nodeId)) {
           const next = new Set(set);
           next.add(msg.nodeId);
-          executionState.busParticipantsByBus = {
-            ...executionState.busParticipantsByBus,
+          executionState.busParticipantsByBus = bareRecord(executionState.busParticipantsByBus, {
             [msg.busId]: next,
-          };
+          });
         }
         // Bus mode is immutable per bus (the marker carries it from
         // creation). Pin the first-seen meta: divergence is a
@@ -717,10 +712,9 @@
             );
           }
         } else {
-          executionState.busMetaByBus = {
-            ...executionState.busMetaByBus,
+          executionState.busMetaByBus = bareRecord(executionState.busMetaByBus, {
             [msg.busId]: msg.meta,
-          };
+          });
         }
         return;
       }
@@ -762,14 +756,14 @@
         // the previous tick: pollers are independent, errors are
         // user-visible, no fallback.
         const { nodeId, ...feed } = msg;
-        infraFeedByNode = { ...infraFeedByNode, [nodeId]: feed };
+        infraFeedByNode = bareRecord(infraFeedByNode, { [nodeId]: feed });
         return;
       }
       if (msg.kind === 'signalDisplay') {
         // Listener /display tick for one trigger node. Overwrite
         // semantics same as infraLive.
         const { nodeId, ...feed } = msg;
-        signalFeedByNode = { ...signalFeedByNode, [nodeId]: feed };
+        signalFeedByNode = bareRecord(signalFeedByNode, { [nodeId]: feed });
         return;
       }
     });

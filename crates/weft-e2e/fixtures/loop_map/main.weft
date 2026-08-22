@@ -1,10 +1,15 @@
-# A sequential map loop: Range produces [0,1,2,3,4]; the loop doubles each
-# element; the assembled List[Number | Null] flows to Debug.
+# A sequential map loop over a LIST: the source emits [0, 1, 2, 3, 4]
+# as one List value, the loop iterates it (count known up front) and
+# doubles each element; the assembled List[Number | Null] flows to
+# Debug. The stream-driven loop shape has its own gate (stream_rows);
+# this fixture keeps the list-driven path covered end to end.
 #
 # The rig asserts: the loop launched 5 iterations and the final list is
 # [0,2,4,6,8].
 
-nums = Range { to: 5 }
+src = ExecPython() -> (items: List[Number]) {
+  code: "return {'items': [0, 1, 2, 3, 4]}"
+}
 
 doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
   parallel: false
@@ -16,7 +21,7 @@ doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
   step.n = self.values
   self.results = step.out
 }
-doubler.values = nums.values
+doubler.values = src.items
 
 out = Debug
 out.data = doubler.results

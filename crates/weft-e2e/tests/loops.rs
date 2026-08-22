@@ -1,4 +1,5 @@
-//! Loop: a sequential map over a Range, doubling each element.
+//! Loop: a sequential map over a LIST, doubling each element (the
+//! stream-driven loop path is gated by `stream_rows`).
 #![cfg(feature = "e2e")]
 
 use serde_json::json;
@@ -11,11 +12,13 @@ async fn sequential_map_doubles_each_element() -> anyhow::Result<()> {
 
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
-    // Range { to: 5 } -> 5 iterations.
+    // Five list elements -> 5 iterations.
     settled.assert_loop_iterations("doubler", 5)?;
-    // The assembled list reaches Debug's `data` input. weft Numbers are f64, so
-    // the JSON carries floats (0.0, not 0).
-    settled.assert_input("out", "data", &json!([0.0, 2.0, 4.0, 6.0, 8.0]))?;
+    // The assembled list reaches Debug's `data` input. A weft Number is
+    // one type whatever its JSON spelling, and the rig compares numbers
+    // by value, so this passes whether the producer emitted `0` (this
+    // fixture's Python source) or `0.0` (a Rust node).
+    settled.assert_input("out", "data", &json!([0, 2, 4, 6, 8]))?;
 
     project.finish().await
 }
