@@ -4,7 +4,7 @@
 // request; a failed fetch is never cached (the rejection reaches every
 // caller, and the next read retries). Writers (Forget, a successful
 // connect) invalidate their service so the next read refetches.
-import { accessCall } from '../../../vscode';
+import { accessCall } from '../../../host';
 import type { GrantSummary } from '../../../../protocol';
 
 const cache = new Map<string, Promise<GrantSummary[]>>();

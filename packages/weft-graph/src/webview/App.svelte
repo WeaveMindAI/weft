@@ -5,7 +5,7 @@
   import ProjectEditor from './lib/components/project/ProjectEditor.svelte';
   import GraphToolbar from './lib/components/project/GraphToolbar.svelte';
   import DeactivationPicker from './lib/components/project/DeactivationPicker.svelte';
-  import { send, onMessage, teardownTransport, hostRequest, cancelPendingHostRequests, HostRequestCancelled } from './vscode';
+  import { send, onMessage, teardownTransport, hostRequest, cancelPendingHostRequests, HostRequestCancelled } from './host';
   import { registerCatalog, setCatalog } from './lib/nodes';
   import { translateProject } from './host-bridge';
   import { nodeIsTrigger, nodeRequiresInfra } from './lib/utils/node-roles';

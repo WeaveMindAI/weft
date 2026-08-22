@@ -2,12 +2,13 @@
 // receives messages back. Lives in the shared package so any host can reuse one
 // graph renderer; the editor talks to whatever host is injected.
 //
-// The module keeps its original `send` / `onMessage` / `resolveStoredFileUrl`
-// surface (so the many components that import them are unchanged), but routes
-// through an injectable `HostTransport`. The default transport is the VS Code
-// webview API when `acquireVsCodeApi` exists; a non-VS-Code host calls
-// `setHostTransport(...)` once, before mount, with a transport backed by the
-// dispatcher HTTP API.
+// Components import `send` / `onMessage` / `resolveStoredFileUrl` from here and
+// know nothing about who is on the other end. Everything routes through an
+// injectable `HostTransport`. Adding a host means writing one transport and
+// calling `setHostTransport(...)` once before mount: nothing else in the editor
+// changes. Two exist today, a VS Code webview and the website's dispatcher HTTP
+// client, and VS Code's is the default only because `acquireVsCodeApi` being
+// present is a reliable way to detect it.
 
 import type { HostMessage, WebviewMessage } from '../protocol';
 

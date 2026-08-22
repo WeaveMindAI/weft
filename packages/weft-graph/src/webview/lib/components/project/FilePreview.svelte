@@ -3,7 +3,7 @@
 	import type PlyrType from 'plyr';
 	import 'plyr/dist/plyr.css';
 	import type { FileValueWire } from '../../../../protocol';
-	import { send, resolveStoredFileUrl } from '../../../vscode';
+	import { send, resolveStoredFileUrl } from '../../../host';
 
 	// The node body's inline file renderer (`features.display`).
 	// `mode='media'` renders the file by its OWN mime type: an image

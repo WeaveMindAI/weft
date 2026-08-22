@@ -12,7 +12,7 @@
 	// to three optional parts (a mint button, a foldable guide unfolded
 	// by default, the paste fields); there is deliberately no mode
 	// switch and no second tab.
-	import { accessCall, openExternalUrl } from '../../../vscode';
+	import { accessCall, openExternalUrl } from '../../../host';
 	import type { AccessSpecWire, AppRegistration, Door, GrantSummary } from '../../../../protocol';
 	import { defaultPermissions, guideSteps, ownFields, tickablePermissions } from './own-fields';
 	import { grantsForService, invalidateGrants } from './grants-cache.svelte';

@@ -3,7 +3,7 @@
 	// driven entirely by the service's declared catalogue. Ticked once
 	// at connect time; the ticks drive the consent URL, the generated
 	// guide, and what the connection records. Never a live setting.
-	import { openExternalUrl } from '../../../vscode';
+	import { openExternalUrl } from '../../../host';
 	import type { Permission } from '../../../../protocol';
 
 	let {

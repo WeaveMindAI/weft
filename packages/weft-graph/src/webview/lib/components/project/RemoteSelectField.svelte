@@ -15,7 +15,7 @@
 	// The stored value is the bare id (the node reads exactly that, and
 	// it is what the field's declared String type honestly holds); the
 	// human label is a display cache in this component.
-	import { accessCall, openExternalUrl } from '../../../vscode';
+	import { accessCall, openExternalUrl } from '../../../host';
 	import type { FieldDefinition } from '../../types';
 	import type { ResourceSource } from '../../../../protocol';
 

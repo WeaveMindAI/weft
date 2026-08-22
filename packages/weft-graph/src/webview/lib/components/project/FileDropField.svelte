@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Upload, FolderOpen, Link, FileAudio, FileVideo, FileImage, FileText, X } from '@lucide/svelte';
-	import { pickAsset } from '../../../vscode';
+	import { pickAsset } from '../../../host';
 	import { acceptForFileType, guessMime } from '../../utils/file-browser';
 	import { isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import FilePickerModal from './FilePickerModal.svelte';

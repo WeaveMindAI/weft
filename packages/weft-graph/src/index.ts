@@ -42,8 +42,8 @@ export { diffConfigOps, diffPortLiteralOps } from './webview/lib/projection/conf
 // bar's backend projection through it.
 
 // The host seam: a consumer outside VS Code injects its transport before mount.
-export { setHostTransport, teardownTransport, send, onMessage, resolveStoredFileUrl } from './webview/vscode';
-export type { HostTransport } from './webview/vscode';
+export { setHostTransport, teardownTransport, send, onMessage, resolveStoredFileUrl } from './webview/host';
+export type { HostTransport } from './webview/host';
 
 // The panel-slot seam: `App` takes `leftPanel` / `rightPanel` snippets, each
 // handed the full `EditorContext` (all live editor state + the host channel), so

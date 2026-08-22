@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Search, FileAudio, FileVideo, FileImage, FileText, X } from '@lucide/svelte';
-	import { listRuntimeFiles } from '../../../vscode';
+	import { listRuntimeFiles } from '../../../host';
 	import { matchesAccept } from '../../utils/file-browser';
 
 	// "Pick a stored file": lists the project's RUNTIME files (its stored
