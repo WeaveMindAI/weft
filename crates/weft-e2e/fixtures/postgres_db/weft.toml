@@ -1,0 +1,4 @@
+[package]
+name = "e2e_postgres_db"
+id = "00000000-0000-0000-0000-000000000052"
+version = "0.1.0"

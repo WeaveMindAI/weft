@@ -54,7 +54,6 @@ pub async fn run_core_migrations(pool: &sqlx::PgPool) -> anyhow::Result<crate::P
         &[
             &crate::listener::GROUP,
             &crate::supervisor_pool::GROUP,
-            &crate::namespace_registry::GROUP,
             &weft_task_store::tasks::GROUP,
             &weft_task_store::worker_pod::GROUP,
             &weft_access_store::GROUP,

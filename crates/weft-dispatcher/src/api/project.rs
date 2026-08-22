@@ -288,28 +288,16 @@ pub async fn remove(
     // remain in the listener leaves dangling registrations that
     // outlive their owning project.
     deactivate_project(&state, id).await?;
-    // Tear down infra: issues a supervisor terminate command, waits
-    // up to 120s for completion (unless --force), then drops all
-    // infra_* rows and deletes the project namespace. MUST succeed:
-    // if any of the DB cascade writes fail, the project row stays
-    // (so a retry replays cleanly). Step 2 (supervisor wait) and
-    // step 4 (namespace delete) inside `delete_project` are still
-    // log-and-continue for the cluster-unreachable case; only DB
-    // writes are fail-loud.
-    crate::api::infra::delete_project(&state, id, query.force).await?;
-    // Reclaim the project's instance-specific stored data through the ONE hook.
-    // The default frees the project's `project/`-scoped runtime files; a reclaimer
-    // that also stores project content elsewhere (a versioned project-editing
-    // history) extends it. `shared/`-scoped runtime files are the owner's and are
-    // deliberately NOT touched (they outlive the project). MUST run before the
-    // project row is dropped: a row-cascade would otherwise erase the bookkeeping
-    // this reclaim reads, stranding bytes. A failure aborts the rm (a retry
-    // replays cleanly).
     // The project's OWNING tenant is its `project.tenant_id`, the same source that
-    // keyed its stored data. `tenant_router` is a request-routing lookup (the
-    // default returns `local` for every project), NOT the resource owner, so using
-    // it here would key the reclaim by the wrong tenant and miss the project's
-    // runtime files + version-history refs.
+    // keyed everything of the project's that lives outside the project row: its
+    // stored data, and the connections its nodes published. `tenant_router` is a
+    // request-routing lookup (the default returns `local` for every project), NOT
+    // the resource owner, so using it here would key those by the wrong tenant and
+    // find nothing.
+    //
+    // Resolved ONCE, here, before anything starts deleting: every step below needs
+    // it, and a lookup repeated after a step has already run could come back empty
+    // and leave that step silently skipped.
     let tenant = state
         .projects
         .tenant_for(id)
@@ -318,6 +306,23 @@ pub async fn remove(
         // The row vanished mid-remove (a concurrent rm won): that IS
         // rm's desired end state, so it gets the marker too.
         .ok_or(StatusError::NotMyProject)?;
+    // Tear down infra: issues a supervisor terminate command, waits
+    // up to 120s for completion (unless --force), then drops all
+    // infra_* rows and deletes the project namespace. MUST succeed:
+    // if any of the DB cascade writes fail, the project row stays
+    // (so a retry replays cleanly). Step 2 (supervisor wait) and
+    // step 4 (namespace delete) inside `delete_project` are still
+    // log-and-continue for the cluster-unreachable case; only DB
+    // writes are fail-loud.
+    crate::api::infra::delete_project(&state, id, &tenant, query.force).await?;
+    // Reclaim the project's instance-specific stored data through the ONE hook.
+    // The default frees the project's `project/`-scoped runtime files; a reclaimer
+    // that also stores project content elsewhere (a versioned project-editing
+    // history) extends it. `shared/`-scoped runtime files are the owner's and are
+    // deliberately NOT touched (they outlive the project). MUST run before the
+    // project row is dropped: a row-cascade would otherwise erase the bookkeeping
+    // this reclaim reads, stranding bytes. A failure aborts the rm (a retry
+    // replays cleanly).
     state
         .project_reclaimer
         .reclaim(&state, tenant.as_str(), id)

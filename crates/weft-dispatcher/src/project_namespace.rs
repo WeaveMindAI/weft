@@ -30,7 +30,7 @@ use anyhow::Result;
 /// never torn down (it is cluster-singleton infrastructure). Cross-
 /// tenant isolation inside it is a blanket pod-to-pod-deny
 /// NetworkPolicy: workers never talk to each other.
-// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-broker/src/auth.rs SHARED_WORKER_NAMESPACE, crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
+// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
 pub const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
 
 /// The k8s namespace a project's WORKER pods run in, the single source
@@ -58,10 +58,9 @@ pub fn worker_namespace(has_infra: bool, tenant: &str, project_id: &str) -> Stri
 /// dashes (truncated UUIDs do), but `short_label` collapses all
 /// runs of dashes to one, so neither side can produce a `--`. This
 /// keeps the namespace name an unambiguous join of its two parts.
-/// Tenant resolution itself does NOT parse this string: the broker
-/// looks the namespace up in the `weft_namespace_tenant` registry
-/// (written by `ensure` below), so a tenant can never forge their
-/// tenant id by crafting a namespace name.
+/// Nothing resolves a tenant from this string, and nothing resolves
+/// one from the namespace at all: the broker identifies a worker by
+/// its pod, so a crafted namespace name names nobody.
 pub fn name_for(tenant: &str, project_id: &str) -> String {
     let t = short_label(tenant, 12);
     let p = short_label(project_id, 12);
@@ -399,17 +398,11 @@ roleRef:
 /// gated on the project declaring infra) and on cleanup retries.
 /// A no-infra project never reaches here: its worker lives in the
 /// shared worker namespace, so it never gets a per-project namespace.
-/// Writes the `(namespace, tenant_id)` row to the namespace registry
-/// alongside the kubectl apply so the broker's TokenReview path can
-/// resolve the tenant without parsing the namespace string.
 pub async fn ensure(
-    pool: &sqlx::PgPool,
     kube: &dyn weft_platform_traits::KubeClient,
     args: &ProjectNamespaceArgs<'_>,
 ) -> Result<()> {
-    let manifest = render(args);
-    kube.apply_yaml(&manifest).await?;
-    crate::namespace_registry::register(pool, args.namespace, args.tenant_id).await
+    kube.apply_yaml(&render(args)).await
 }
 
 /// Delete the entire namespace. Used by `weft rm` (after the
@@ -504,8 +497,8 @@ mod tests {
         let n = name_for("local", "88d7eec8-6ffc-4cb4-8582-380fd65f2643");
         // The double-dash is the unambiguous separator between
         // tenant + project, keeping the namespace name a lossless
-        // join of its two parts (tenant resolution itself is via the
-        // weft_namespace_tenant registry, not string parsing).
+        // join of its two parts. Nothing resolves a tenant by parsing
+        // it; the name is for humans reading `kubectl get ns`.
         assert!(n.contains("--"), "{n}");
         assert!(n.starts_with("wft-project-local--"), "{n}");
     }

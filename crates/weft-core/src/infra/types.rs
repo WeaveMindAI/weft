@@ -506,6 +506,36 @@ impl Probe {
         }
     }
 
+    /// For a service that answers the readiness question ITSELF: run
+    /// its own check inside the container (`pg_isready`, `redis-cli
+    /// ping`). The honest probe for anything that accepts connections
+    /// before it is actually serving, which most databases do.
+    pub fn exec(command: Vec<String>) -> Self {
+        Self {
+            kind: ProbeKind::Exec { command },
+            initial_delay_seconds: 0,
+            period_seconds: default_period_seconds(),
+            timeout_seconds: default_timeout_seconds(),
+            success_threshold: default_success_threshold(),
+            failure_threshold: default_failure_threshold(),
+        }
+    }
+
+    /// For a service that speaks its own protocol rather than HTTP and
+    /// ships no check of its own: ready once it accepts connections on
+    /// `port`. Weaker than [`Self::exec`], which is what a service that
+    /// can answer for itself should use.
+    pub fn tcp(port: u16) -> Self {
+        Self {
+            kind: ProbeKind::Tcp { port },
+            initial_delay_seconds: 0,
+            period_seconds: default_period_seconds(),
+            timeout_seconds: default_timeout_seconds(),
+            success_threshold: default_success_threshold(),
+            failure_threshold: default_failure_threshold(),
+        }
+    }
+
     pub fn with_initial_delay(mut self, seconds: i32) -> Self {
         self.initial_delay_seconds = seconds;
         self

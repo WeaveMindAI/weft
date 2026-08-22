@@ -27,10 +27,10 @@
 //!         connection port (live caller connections). The signed routing
 //!         token is the second gate inside the worker.
 //!
-//! It does NOT register a `weft_namespace_tenant` row: this namespace
-//! maps to no single tenant. A worker here resolves its tenant from its
-//! own pod identity (`worker_pod` row) in the broker, NOT from the
-//! namespace. See `weft_broker::auth`.
+//! It carries no tenant of its own: it holds many. Every worker,
+//! here or in a project's own namespace, is identified in the broker
+//! by its pod (`worker_pod` row -> project -> tenant), never by the
+//! namespace it sits in. See `weft_broker::auth`.
 
 use anyhow::Result;
 use weft_platform_traits::KubeClient;

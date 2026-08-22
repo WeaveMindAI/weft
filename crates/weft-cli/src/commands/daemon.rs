@@ -65,6 +65,13 @@ pub struct ClusterConfig {
     /// Cluster Pod CIDR. Passed to the dispatcher for NetworkPolicy
     /// rendering. kind's default is `10.244.0.0/16`.
     pub pod_cidr: String,
+    /// The cluster DNS Service's address, for the public proxy's
+    /// nginx `resolver`. Empty means "ask the cluster", which is the
+    /// normal path; every Kubernetes distribution names that Service
+    /// `kube-system/kube-dns`, and WEFT_CLUSTER_DNS_IP is for one that
+    /// does not. Validated as an IP address where the manifests are
+    /// rendered, like the CIDRs.
+    pub cluster_dns_ip: String,
     /// `kind` for local dev (uses `kind create` + `kind load`);
     /// `k8s` for targeting an external cluster (skips kind
     /// bootstrap, images come from whatever registry the
@@ -131,6 +138,8 @@ impl ClusterConfig {
             .unwrap_or_else(|_| "10.96.0.0/12".into());
         let pod_cidr = std::env::var("WEFT_CLUSTER_POD_CIDR")
             .unwrap_or_else(|_| "10.244.0.0/16".into());
+        let cluster_dns_ip =
+            std::env::var("WEFT_CLUSTER_DNS_IP").unwrap_or_default().trim().to_string();
         let backend = match std::env::var("WEFT_CLUSTER_BACKEND")
             .as_deref()
             .ok()
@@ -154,6 +163,7 @@ impl ClusterConfig {
             seaweed_port,
             service_cidr,
             pod_cidr,
+            cluster_dns_ip,
             backend,
         }
     }
@@ -940,10 +950,18 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
         // Teardown closes a PUBLIC surface, so every kubectl step is
         // checked: reporting success while the tunnel still serves
         // would leave the operator believing a door is shut that is
-        // not. The args value is irrelevant to a delete (kubectl
-        // matches on kind/name), any valid one renders the manifest
-        // parseable.
-        kubectl_delete_rendered(&manifest, &[("TUNNEL_ARGS", quick_args.to_string())]).await?;
+        // not. Neither substituted value reaches the cluster on this
+        // path (kubectl deletes by kind/name and never reads the
+        // bodies); they only have to render the manifest parseable, so
+        // a delete never depends on the cluster still answering.
+        kubectl_delete_rendered(
+            &manifest,
+            &[
+                ("TUNNEL_ARGS", quick_args.to_string()),
+                ("CLUSTER_DNS", "127.0.0.1".to_string()),
+            ],
+        )
+        .await?;
         delete_tunnel_token_secret().await?;
         let out = kubectl(&[
             "-n",
@@ -1005,8 +1023,14 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
         .expect("deploy/k8s has a parent")
         .join("public-page");
     let page_changed = apply_public_page_configmap(&page_dir).await?;
-    let manifest_changed =
-        kubectl_apply_changed(&manifest, &[("TUNNEL_ARGS", tunnel_args.to_string())]).await?;
+    let manifest_changed = kubectl_apply_changed(
+        &manifest,
+        &[
+            ("TUNNEL_ARGS", tunnel_args.to_string()),
+            ("CLUSTER_DNS", cluster_dns_ip().await?),
+        ],
+    )
+    .await?;
     if secret_changed {
         let status = kubectl(&[
             "-n",
@@ -1575,6 +1599,70 @@ async fn kind_network_gateway_ipv4() -> Result<String> {
         .find(|g| g.contains('.') && !g.contains(':'))
         .map(str::to_string)
         .ok_or_else(|| anyhow::anyhow!("no IPv4 gateway on the kind docker network"))
+}
+
+/// The cluster DNS Service's address, for nginx's `resolver`.
+///
+/// READ from the cluster, where its sibling `apiserver_clusterip`
+/// DERIVES from the configured service CIDR. The difference is what
+/// each is for: that one renders a NetworkPolicy, which must be
+/// buildable with nothing but configuration, while a resolver pointing
+/// at the wrong address turns every proxied request into a lookup
+/// failure, so this one asks.
+///
+/// `kube-dns` is the Service name every Kubernetes distribution uses;
+/// `WEFT_CLUSTER_DNS_IP` names the address directly for one that does
+/// not.
+///
+/// A configured address is PARSED, like the CIDRs beside it, and a
+/// value that is not an IP address fails here naming the variable.
+/// The alternative is the failure this whole directive exists to
+/// prevent, arriving silently: nginx accepts almost any token as a
+/// resolver, starts happily, passes the rollout gate, and then fails
+/// every proxied request with nothing anywhere naming the cause.
+async fn cluster_dns_ip() -> Result<String> {
+    if let Some(configured) = configured_dns_ip(&cluster_config().cluster_dns_ip)? {
+        return Ok(configured);
+    }
+    let out = kubectl(&[
+        "-n",
+        "kube-system",
+        "get",
+        "service",
+        "kube-dns",
+        "-o",
+        "jsonpath={.spec.clusterIP}",
+    ])
+    .output()
+    .await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "reading the cluster DNS service address failed: {}. Set WEFT_CLUSTER_DNS_IP if \
+             this cluster's DNS Service is not kube-system/kube-dns.",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if ip.is_empty() {
+        anyhow::bail!(
+            "the cluster DNS service (kube-system/kube-dns) has no address; set \
+             WEFT_CLUSTER_DNS_IP to this cluster's DNS Service address"
+        );
+    }
+    Ok(ip)
+}
+
+/// The DNS address an operator configured, or `None` when they
+/// configured none. Anything that is not an IP address is refused
+/// here, naming the variable, rather than reaching nginx.
+fn configured_dns_ip(raw: &str) -> Result<Option<String>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    raw.parse::<std::net::IpAddr>()
+        .map_err(|e| anyhow::anyhow!("WEFT_CLUSTER_DNS_IP='{raw}': {e}"))?;
+    Ok(Some(raw.to_string()))
 }
 
 /// An endpoint URL's host, classified for the store egress opening.
@@ -2480,7 +2568,8 @@ fn signal_term(pid: i32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apiserver_clusterip, canonical_tunnel_hostname, check_cidr, endpoint_host, EndpointHost,
+        apiserver_clusterip, canonical_tunnel_hostname, check_cidr, configured_dns_ip,
+        endpoint_host, EndpointHost,
     };
 
     #[test]
@@ -2545,6 +2634,25 @@ mod tests {
         // IPv6: same network+1 derivation (the egress /32 is security-critical).
         assert_eq!(apiserver_clusterip("fd00::/108").unwrap(), "fd00::1");
         assert!(apiserver_clusterip("garbage").is_err());
+    }
+
+    /// A resolver address nginx would accept as a token but never
+    /// resolve with is the exact failure the directive exists to
+    /// prevent, so a configured one is parsed rather than trusted.
+    #[test]
+    fn a_configured_dns_address_must_be_an_ip() {
+        assert_eq!(configured_dns_ip("10.96.0.10").unwrap().as_deref(), Some("10.96.0.10"));
+        assert_eq!(configured_dns_ip("  10.96.0.10  ").unwrap().as_deref(), Some("10.96.0.10"));
+        assert_eq!(configured_dns_ip("fd00::a").unwrap().as_deref(), Some("fd00::a"));
+        // Unset means "ask the cluster", which is the normal path.
+        assert!(configured_dns_ip("").unwrap().is_none());
+        assert!(configured_dns_ip("   ").unwrap().is_none());
+        // A hostname, an address with a port, and a typo all read as
+        // valid nginx tokens and none of them resolve.
+        for bad in ["kube-dns.kube-system.svc", "10.96.0.10:53", "10.96.0", "hello"] {
+            let e = configured_dns_ip(bad).expect_err("{bad} must be refused");
+            assert!(e.to_string().contains("WEFT_CLUSTER_DNS_IP"), "{e}");
+        }
     }
 
     #[test]

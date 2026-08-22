@@ -31,9 +31,11 @@ main way to misread it:
  RECIPE (AccessSpec)          REGISTERED APP                 CONNECTION (grant row)
  in the access node's         in the operator's apps file    in the access store (Postgres)
  metadata.json                (WEFT_ACCESS_APPS_FILE)
- written by: the node         written by: the operator       created by: a user connecting;
- author (any user;            running this weft (trusted;    one row per connected account
- untrusted input)             holds real secrets)
+ written by: the node         written by: the operator       created by: a user connecting,
+ author (any user;            running this weft (trusted;    or by a node publishing one for
+ untrusted input)             holds real secrets)            something it runs itself;
+                                                             one row per account, or per
+                                                             node running its own service
 ──────────────────────────   ────────────────────────────   ───────────────────────────────
  describes the SERVICE,       one OAuth app weft itself      one account, hooked up:
  true for everybody:          signs users in with:            · who (identity)
@@ -127,6 +129,28 @@ connection to what the node needs.
 
 After that the connection appears in the picker for every project of
 the tenant; picking it stores only its id on the node.
+
+**The other way one gets made.** A node that RUNS a service itself (a
+database it provisions) publishes a connection to it instead of asking
+a person to connect one: `ctx.publish_access(values)`, with
+the same values a person would have pasted, checked against the same
+recipe. The node declares the service in its metadata (`"publishes"`)
+and the compiler attaches the recipe at build time, because a built
+project carries only the node types its graph uses and so usually does
+not include the service's access node. Downstream nodes cannot tell
+the two apart, and do not need to.
+
+A published recipe describes something the project itself runs, so it
+is refused unless it looks like one: settings only (no consent flow),
+no provider events, no connect-time check. The compiler says so at
+build time, and the store refuses it again at write time, because the
+values arrive from a worker.
+
+Such a row is the node's: publishing again updates it rather than
+adding a second, and terminating the node's infra deletes it, so it
+lives exactly as long as the thing it opens. It is ALWAYS `their-own`
+owned, whatever the node sends: nothing a node publishes can resolve
+to the runtime's credential.
 
 **Doors.** At most two kinds, and hidden when not offered, never
 greyed: `shared` (a credential this weft holds: a registered app for a

@@ -1,0 +1,78 @@
+{
+  "type": "PostgresAccess",
+  "label": "Postgres Access",
+  "description": "Connect to a Postgres database with its host, port, database name, user and password. Works with any Postgres: a managed one (Neon, Supabase, RDS, Cloud SQL), a server you run, or one on your own machine. The password is stored sealed and never travels on a wire between nodes.",
+  "tags": [
+    "postgres",
+    "database",
+    "sql",
+    "access"
+  ],
+  "icon": "Database",
+  "color": "#336791",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "exposure": "config",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Database"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "required": false,
+      "description": "The database's access: wire it into the Postgres query and write nodes."
+    }
+  ],
+  "service": {
+    "service": "postgres",
+    "label": "Postgres",
+    "identity": "{user}@{host}/{database}",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "host",
+          "label": "Host",
+          "secret": false,
+          "placeholder": "db.example.com"
+        },
+        {
+          "name": "port",
+          "label": "Port",
+          "secret": false,
+          "optional": true,
+          "placeholder": "5432"
+        },
+        {
+          "name": "database",
+          "label": "Database",
+          "secret": false,
+          "placeholder": "postgres"
+        },
+        {
+          "name": "user",
+          "label": "User",
+          "secret": false,
+          "placeholder": "postgres"
+        },
+        {
+          "name": "password",
+          "label": "Password"
+        },
+        {
+          "name": "sslmode",
+          "label": "TLS",
+          "secret": false,
+          "optional": true,
+          "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+        }
+      ]
+    }
+  }
+}

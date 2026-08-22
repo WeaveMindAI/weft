@@ -31,19 +31,12 @@ use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
 
-/// Map a store error to an HTTP status. ONE mapping
-/// (`weft_access_store::client_status`) serves every surface fronting
-/// the store, so the dispatcher and the broker answer identically.
+/// A store error as this surface answers it. The mapping itself lives
+/// in the store (`client_error`), so the dispatcher and the broker
+/// answer identically by construction rather than by copy.
 fn access_err(e: anyhow::Error) -> ApiError {
-    match weft_access_store::client_status(&e) {
-        Some((status, msg)) => {
-            (StatusCode::from_u16(status).expect("store status codes are valid"), msg)
-        }
-        None => {
-            tracing::error!(target: "weft_dispatcher::access", "access store error: {e:#}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "access store error".into())
-        }
-    }
+    let (status, message) = weft_access_store::client_error(e);
+    (StatusCode::from_u16(status).expect("store status codes are valid"), message)
 }
 
 /// The callback URL a tenant registers at the provider. Shown by the

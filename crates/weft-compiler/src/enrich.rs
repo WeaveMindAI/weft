@@ -401,6 +401,31 @@ pub fn enrich_collecting(
         node.features = meta.features.clone();
         node.requires_infra = meta.requires_infra;
         node.images = meta.images.clone();
+        // A node that hands out a connection to something it runs
+        // itself carries that service's recipe from here on. Resolved
+        // now, against the WHOLE catalog, because the built worker
+        // ships only the node types this project uses and so usually
+        // does not include the service's own access node.
+        if let Some(service) = &meta.publishes {
+            match weft_core::access::spec::spec_for_service(catalog.all(), service) {
+                // Refused HERE too, not only where the connection is
+                // finally written: a recipe shape a published
+                // connection cannot have is an authoring mistake, and
+                // it belongs on the author's screen at build time.
+                Some(spec) => match weft_core::access::spec::publishable_fields(spec) {
+                    Ok(_) => node.published_service = Some(spec.clone()),
+                    Err(message) => errors.push(EnrichError { span: node_span, message }),
+                },
+                None => errors.push(EnrichError {
+                    span: node_span,
+                    message: format!(
+                        "node '{}' publishes a '{service}' connection, but no node in the \
+                         catalog declares that service",
+                        node.id
+                    ),
+                }),
+            }
+        }
         normalize_port_literals(node);
     }
 

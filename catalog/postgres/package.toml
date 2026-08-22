@@ -1,17 +1,19 @@
 [package]
 name = "postgres"
 
-# The Postgres nodes: run queries and write rows over a user-supplied
-# connection string. A database credential is not an HTTP credential,
-# so it rides an ordinary input rather than the access system (the
-# documented carve-out for non-HTTP credentials).
+# The Postgres nodes: run queries and write rows against the wired
+# database connection. The connection stores the host, database, user
+# and password; a connection whose credential signs no request simply
+# declares no auth steps and carries values, the same shape the mail
+# nodes use.
 [dependencies]
 async-trait = "0.1"
 serde_json = "1"
+bytes = "1"
 tokio = "1"
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1", "with-chrono-0_4"] }
 tokio-postgres-rustls = "0.13"
-rustls = "0.23"
-webpki-roots = "0.26"
 chrono = "0.4"
-uuid = { version = "1", features = ["v4"] }
+rust_decimal = { version = "1", features = ["db-postgres"] }
+url = "2"
+uuid = "1"

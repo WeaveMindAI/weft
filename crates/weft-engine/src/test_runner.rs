@@ -237,6 +237,7 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
                             &broker_url,
                             std::path::Path::new(&broker_token_path),
                         ),
+                        catalog,
                         pod_name,
                         tenant_id,
                         project_id,

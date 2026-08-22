@@ -37,14 +37,6 @@ pub(crate) const INFRA_SUPERVISOR_SA: &str = "weft-infra-supervisor-sa";
 pub(crate) const DISPATCHER_SA: &str = "weft-dispatcher";
 pub(crate) const DISPATCHER_NS: &str = "weft-system";
 
-/// The shared worker namespace: holds no-infra workers from MANY
-/// tenants, so it maps to no single tenant and has NO
-/// `weft_namespace_tenant` row. A worker here resolves its tenant from
-/// its own pod identity (`worker_pod` row -> project -> tenant), not
-/// from the namespace. See `extract_identity`.
-// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-dispatcher/src/project_namespace.rs SHARED_WORKER_NAMESPACE, crates/weft-e2e/tests/worker_placement.rs SHARED_WORKER_NAMESPACE
-pub(crate) const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// Pooled listener: a trusted control-plane service that holds
@@ -111,7 +103,11 @@ impl Role {
 /// own tenant for writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallerScope {
-    Tenant(String),
+    /// A worker, pinned to ONE project of ONE tenant. Both are read
+    /// from the pod's own kubelet-stamped identity and the row the
+    /// dispatcher wrote for it, never from anything the pod supplies,
+    /// so a handler can hold a request to them.
+    Tenant { tenant: String, project: String },
     ControlPlane,
 }
 
@@ -120,7 +116,16 @@ impl CallerScope {
     /// control-plane caller that is not pinned to any single tenant.
     pub fn pinned_tenant(&self) -> Option<&str> {
         match self {
-            Self::Tenant(t) => Some(t),
+            Self::Tenant { tenant, .. } => Some(tenant),
+            Self::ControlPlane => None,
+        }
+    }
+
+    /// The project this caller is pinned to, or `None` for a
+    /// control-plane caller that acts for any of them.
+    pub fn pinned_project(&self) -> Option<&str> {
+        match self {
+            Self::Tenant { project, .. } => Some(project),
             Self::ControlPlane => None,
         }
     }
@@ -326,51 +331,17 @@ pub async fn resolve_storage_caller(
     match reviewed.sa_name.as_str() {
         DISPATCHER_SA if reviewed.namespace == DISPATCHER_NS => Ok(CallerAuth::ControlPlane),
         WORKER_SA => {
-            // Resolve the worker's project AND tenant. Two worker-hosting
-            // shapes, told apart by namespace (mirrors `storage_authorize`'s
-            // old logic, which this replaces):
-            //  - PER-PROJECT namespace: the namespace IS the project, so the
-            //    one `project` row whose `project_namespace` matches gives
-            //    both ids from a single source of truth. The registration
-            //    gate is preserved by write ordering (the dispatcher writes
-            //    the namespace->tenant registry row before stamping
-            //    `project_namespace`).
-            //  - SHARED namespace: maps to no project, so resolve from the
-            //    worker's OWN unforgeable pod identity (kubelet-stamped
-            //    pod_name -> the dispatcher-written `worker_pod` row ->
-            //    project -> tenant).
-            let row: Option<(String, String)> =
-                if reviewed.namespace == SHARED_WORKER_NAMESPACE {
-                    let pod_name = reviewed.pod_name.as_deref().ok_or((
-                        StatusCode::FORBIDDEN,
-                        "shared-namespace worker token carries no pod_name".to_string(),
-                    ))?;
-                    sqlx::query_as(
-                        "SELECT p.id::text, p.tenant_id \
-                         FROM worker_pod wp JOIN project p ON p.id::text = wp.project_id \
-                         WHERE wp.pod_name = $1",
-                    )
-                    .bind(pod_name)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
-                } else {
-                    sqlx::query_as(
-                        "SELECT id::text, tenant_id FROM project WHERE project_namespace = $1",
-                    )
-                    .bind(&reviewed.namespace)
-                    .fetch_optional(&state.pool)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?
-                };
-            let (project_id, tenant_id) = row.ok_or((
-                StatusCode::FORBIDDEN,
-                format!(
-                    "could not resolve a project for worker in namespace '{}' (pod {:?}); \
-                     not a registered project namespace and no matching worker_pod row",
-                    reviewed.namespace, reviewed.pod_name
-                ),
-            ))?;
+            // Who this worker is, from its own unforgeable identity.
+            // One resolver, shared with `extract_identity`, so the two
+            // planes cannot end up with different ideas of a caller.
+            let resolved = crate::scope::lookup_worker_scope(
+                &state.scope_cache,
+                &state.pool,
+                &reviewed.namespace,
+                reviewed.pod_name.as_deref(),
+            )
+            .await?;
+            let (project_id, tenant_id) = (resolved.project, resolved.tenant);
             let color = match color {
                 None => None,
                 Some(color) => {
@@ -434,19 +405,6 @@ pub(crate) async fn control_plane(
     }
 }
 
-/// Resolve the namespace's owning tenant. Authoritative lookup: the
-/// dispatcher writes a row to `weft_namespace_tenant` whenever it
-/// creates a namespace, so the broker doesn't have to parse the
-/// namespace string (which would be unsafe if a tenant could create
-/// their own namespaces). A missing row = unrecognized namespace =
-/// 403. Cached in the scope cache.
-pub async fn namespace_tenant(
-    state: &Arc<BrokerState>,
-    namespace: &str,
-) -> Result<String, (StatusCode, String)> {
-    crate::scope::lookup_namespace_tenant(&state.scope_cache, &state.pool, namespace).await
-}
-
 /// Axum-extractor backend: reviewed token + role table + tenant
 /// resolution. Reject patterns on top of `reviewed_token`:
 ///   - SA name not in our role table → 403 (`weft-{role}-sa` only)
@@ -477,16 +435,15 @@ pub async fn extract_identity(
     // anything the pod supplies.
     let scope = if role.is_control_plane() {
         CallerScope::ControlPlane
-    } else if reviewed.namespace == SHARED_WORKER_NAMESPACE {
-        let pod_name = reviewed.pod_name.as_deref().ok_or((
-            StatusCode::FORBIDDEN,
-            "shared-namespace worker token carries no pod_name; cannot resolve tenant".to_string(),
-        ))?;
-        CallerScope::Tenant(
-            crate::scope::lookup_pod_tenant(&state.scope_cache, &state.pool, pod_name).await?,
-        )
     } else {
-        CallerScope::Tenant(namespace_tenant(state, &reviewed.namespace).await?)
+        let resolved = crate::scope::lookup_worker_scope(
+            &state.scope_cache,
+            &state.pool,
+            &reviewed.namespace,
+            reviewed.pod_name.as_deref(),
+        )
+        .await?;
+        CallerScope::Tenant { tenant: resolved.tenant, project: resolved.project }
     };
     Ok(CallerIdentity {
         scope,

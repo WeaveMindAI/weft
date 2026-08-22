@@ -136,6 +136,8 @@ export interface NodeFeaturesWire {
   liveEndpoint?: string;
 }
 
+// SYNC: NodeDefinition (the editor-visible subset; backend-only fields like
+// `images` and `publishedService` live only on the peer) <-> crates/weft-core/src/project.rs NodeDefinition
 export interface NodeDefinition {
   id: string;
   nodeType: string;

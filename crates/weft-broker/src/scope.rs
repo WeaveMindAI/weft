@@ -27,6 +27,7 @@ use sqlx::postgres::PgPool;
 use tokio::sync::Mutex;
 
 use crate::auth::CallerIdentity;
+use crate::handlers::internal;
 
 /// Cache size per resource kind. 100k is well above any realistic
 /// active-color count and avoids the perf cliff DashMap's "drop
@@ -44,9 +45,10 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 pub struct ScopeCache {
     project_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
-    color_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
-    signal_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
-    namespace_to_tenant: Arc<Mutex<LruCache<String, (String, Instant)>>>,
+    color_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
+    signal_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
+    /// A worker's own (tenant, project), keyed by the pod it is.
+    worker_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
 }
 
 impl ScopeCache {
@@ -54,9 +56,9 @@ impl ScopeCache {
         let cap = NonZeroUsize::new(CACHE_CAPACITY).expect("non-zero capacity");
         Self {
             project_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
-            color_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
-            signal_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
-            namespace_to_tenant: Arc::new(Mutex::new(LruCache::new(cap))),
+            color_to_scope: Arc::new(Mutex::new(LruCache::new(cap))),
+            signal_to_scope: Arc::new(Mutex::new(LruCache::new(cap))),
+            worker_to_scope: Arc::new(Mutex::new(LruCache::new(cap))),
         }
     }
 }
@@ -67,10 +69,10 @@ impl Default for ScopeCache {
     }
 }
 
-async fn cache_get(
-    map: &Mutex<LruCache<String, (String, Instant)>>,
+async fn cache_get<V: Clone>(
+    map: &Mutex<LruCache<String, (V, Instant)>>,
     key: &str,
-) -> Option<String> {
+) -> Option<V> {
     let mut g = map.lock().await;
     let entry = g.get(key)?;
     if entry.1.elapsed() < CACHE_TTL {
@@ -82,11 +84,7 @@ async fn cache_get(
     }
 }
 
-async fn cache_put(
-    map: &Mutex<LruCache<String, (String, Instant)>>,
-    key: String,
-    value: String,
-) {
+async fn cache_put<V>(map: &Mutex<LruCache<String, (V, Instant)>>, key: String, value: V) {
     let mut g = map.lock().await;
     g.put(key, (value, Instant::now()));
 }
@@ -104,21 +102,31 @@ pub async fn require_project_owned_by(
     project_id: &str,
 ) -> Result<String, (StatusCode, String)> {
     let tenant = lookup_project_tenant(cache, pool, project_id).await?;
-    enforce_scope(caller, "project", project_id, &tenant)?;
-    Ok(tenant)
+    let owner = ProjectScope { tenant, project: project_id.to_string() };
+    enforce_scope(caller, "project", project_id, &owner)?;
+    Ok(owner.tenant)
 }
 
-/// Resolve `color`'s owning tenant, enforcing ownership. See
+/// WHOSE an execution is: the tenant that owns it and the project it
+/// belongs to. One row answers both, so they are read together and
+/// can never be a stale tenant against a live project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectScope {
+    pub tenant: String,
+    pub project: String,
+}
+
+/// Resolve who `color` belongs to, enforcing ownership. See
 /// `require_project_owned_by` for the tenant-vs-control-plane rule.
-pub async fn require_color_owned_by(
+pub async fn require_color_scope(
     cache: &ScopeCache,
     pool: &PgPool,
     caller: &CallerIdentity,
     color: &str,
-) -> Result<String, (StatusCode, String)> {
-    let tenant = lookup_color_tenant(cache, pool, color).await?;
-    enforce_scope(caller, "color", color, &tenant)?;
-    Ok(tenant)
+) -> Result<ProjectScope, (StatusCode, String)> {
+    let scope = lookup_color_scope(cache, pool, color).await?;
+    enforce_scope(caller, "color", color, &scope)?;
+    Ok(scope)
 }
 
 /// Resolve a signal `token`'s owning tenant, enforcing ownership. See
@@ -133,25 +141,9 @@ pub async fn require_signal_owned_by(
     caller: &CallerIdentity,
     token: &str,
 ) -> Result<String, (StatusCode, String)> {
-    let tenant = lookup_signal_tenant(cache, pool, token).await?;
-    enforce_scope(caller, "signal", token, &tenant)?;
-    Ok(tenant)
-}
-
-/// Resolve the tenant for a namespace named in a request body,
-/// enforcing ownership. For a tenant-scoped caller, 403 unless it is
-/// the caller's tenant. For a control-plane caller (pooled supervisor),
-/// any namespace registered to a real tenant is allowed; returns that
-/// tenant. A namespace with no registered tenant is a 403 regardless.
-pub async fn require_namespace_owned_by(
-    cache: &ScopeCache,
-    pool: &PgPool,
-    caller: &CallerIdentity,
-    namespace: &str,
-) -> Result<String, (StatusCode, String)> {
-    let tenant = lookup_namespace_tenant(cache, pool, namespace).await?;
-    enforce_scope(caller, "namespace", namespace, &tenant)?;
-    Ok(tenant)
+    let owner = lookup_signal_scope(cache, pool, token).await?;
+    enforce_scope(caller, "signal", token, &owner)?;
+    Ok(owner.tenant)
 }
 
 /// Enforce a caller's scope against a tenant named directly in a
@@ -181,16 +173,28 @@ fn enforce_scope(
     caller: &CallerIdentity,
     kind: &str,
     resource: &str,
-    resource_tenant: &str,
+    owner: &ProjectScope,
 ) -> Result<(), (StatusCode, String)> {
-    match caller.scope.pinned_tenant() {
-        Some(caller_tenant) if caller_tenant != resource_tenant => {
-            log_denied(caller, kind, resource, resource_tenant);
-            Err((StatusCode::FORBIDDEN, format!("{kind} not owned by caller")))
-        }
-        // Pinned and matching, or control-plane (not pinned): allowed.
-        _ => Ok(()),
+    let Some(caller_tenant) = caller.scope.pinned_tenant() else {
+        // Control plane: not pinned to anything, trusted to act for
+        // any tenant, validated per-op against the resource itself.
+        return Ok(());
+    };
+    if caller_tenant != owner.tenant {
+        log_denied(caller, kind, resource, &owner.tenant);
+        return Err((StatusCode::FORBIDDEN, format!("{kind} not owned by caller")));
     }
+    // A pinned caller is ONE project's, not one tenant's. A sibling
+    // project of the same tenant is no more its business than another
+    // tenant's would be: it is where that project's definition, its
+    // infrastructure and its credentials live, and the caller can
+    // name one in a request body. Checked HERE so no verb can be the
+    // one that forgot to ask.
+    if caller.scope.pinned_project().is_some_and(|p| p != owner.project) {
+        log_denied(caller, &format!("{kind} (project)"), resource, &owner.project);
+        return Err((StatusCode::FORBIDDEN, format!("{kind} belongs to a different project")));
+    }
+    Ok(())
 }
 
 async fn lookup_project_tenant(
@@ -205,7 +209,7 @@ async fn lookup_project_tenant(
         .bind(project_id)
         .fetch_optional(pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project lookup: {e}")))?;
+        .map_err(|e| internal(anyhow::anyhow!("project lookup: {e}")))?;
     let tenant = row
         .ok_or((StatusCode::NOT_FOUND, "unknown project".into()))?
         .0;
@@ -218,108 +222,136 @@ async fn lookup_project_tenant(
     Ok(tenant)
 }
 
-async fn lookup_color_tenant(
+async fn lookup_color_scope(
     cache: &ScopeCache,
     pool: &PgPool,
     color: &str,
-) -> Result<String, (StatusCode, String)> {
-    if let Some(t) = cache_get(&cache.color_to_tenant, color).await {
-        return Ok(t);
+) -> Result<ProjectScope, (StatusCode, String)> {
+    if let Some(scope) = cache_get(&cache.color_to_scope, color).await {
+        return Ok(scope);
     }
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT tenant_id FROM execution_color WHERE color = $1")
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT tenant_id, project_id FROM execution_color WHERE color = $1")
             .bind(color)
             .fetch_optional(pool)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("color lookup: {e}")))?;
-    let tenant = row
-        .ok_or((StatusCode::NOT_FOUND, "unknown color".into()))?
-        .0;
-    cache_put(&cache.color_to_tenant, color.to_string(), tenant.clone()).await;
-    Ok(tenant)
+            .map_err(|e| internal(anyhow::anyhow!("color lookup: {e}")))?;
+    let (tenant, project) = row.ok_or((StatusCode::NOT_FOUND, "unknown color".into()))?;
+    let scope = ProjectScope { tenant, project };
+    cache_put(&cache.color_to_scope, color.to_string(), scope.clone()).await;
+    Ok(scope)
 }
 
-async fn lookup_signal_tenant(
+async fn lookup_signal_scope(
     cache: &ScopeCache,
     pool: &PgPool,
     token: &str,
-) -> Result<String, (StatusCode, String)> {
-    if let Some(t) = cache_get(&cache.signal_to_tenant, token).await {
-        return Ok(t);
+) -> Result<ProjectScope, (StatusCode, String)> {
+    if let Some(scope) = cache_get(&cache.signal_to_scope, token).await {
+        return Ok(scope);
     }
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT tenant_id FROM signal WHERE token = $1",
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT tenant_id, project_id FROM signal WHERE token = $1",
     )
     .bind(token)
     .fetch_optional(pool)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal lookup: {e}")))?;
-    let tenant = row
-        .ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?
-        .0;
-    cache_put(&cache.signal_to_tenant, token.to_string(), tenant.clone()).await;
-    Ok(tenant)
+    .map_err(|e| internal(anyhow::anyhow!("signal lookup: {e}")))?;
+    let (tenant, project) = row.ok_or((StatusCode::NOT_FOUND, "unknown signal token".into()))?;
+    let scope = ProjectScope { tenant, project };
+    cache_put(&cache.signal_to_scope, token.to_string(), scope.clone()).await;
+    Ok(scope)
 }
 
-/// Namespace -> tenant, from the registry the dispatcher writes at
-/// namespace-creation time. 403 on a namespace it never created.
-pub async fn lookup_namespace_tenant(
-    cache: &ScopeCache,
+
+/// Pod -> project. The pod's `worker_pod` row is written by the
+/// dispatcher before the pod is created, and the token's `pod_name` is
+/// kubelet-stamped and unforgeable, so this resolves from trusted
+/// state only, never from anything the pod itself supplies. 403 on a
+/// pod with no row (forged, or already retired).
+async fn lookup_pod_scope(
     pool: &PgPool,
     namespace: &str,
-) -> Result<String, (StatusCode, String)> {
-    if let Some(t) = cache_get(&cache.namespace_to_tenant, namespace).await {
-        return Ok(t);
-    }
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT tenant_id FROM weft_namespace_tenant WHERE namespace = $1",
+    pod_name: &str,
+) -> Result<ProjectScope, (StatusCode, String)> {
+    // Matched on the namespace AS WELL AS the name. A pod name is
+    // unique within its namespace, not across the cluster, so a name
+    // on its own is not an identity: two namespaces may each hold a
+    // pod called the same thing. Both halves come from the verified
+    // token, and the row records both, so there is no reason to ask
+    // with only one of them.
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT p.id::text, p.tenant_id \
+         FROM worker_pod wp JOIN project p ON p.id::text = wp.project_id \
+         WHERE wp.pod_name = $1 AND wp.namespace = $2",
     )
+    .bind(pod_name)
     .bind(namespace)
     .fetch_optional(pool)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("namespace lookup: {e}")))?;
-    let tenant = row
-        .ok_or((
-            StatusCode::FORBIDDEN,
-            format!(
-                "namespace '{namespace}' is not registered to any tenant; only namespaces \
-                 the dispatcher created can authenticate"
-            ),
-        ))?
-        .0;
-    cache_put(&cache.namespace_to_tenant, namespace.to_string(), tenant.clone()).await;
-    Ok(tenant)
+    .map_err(|e| internal(anyhow::anyhow!("worker_pod lookup: {e}")))?;
+    let (project, tenant) = row.ok_or((
+        StatusCode::FORBIDDEN,
+        format!(
+            "pod '{namespace}/{pod_name}' has no worker_pod row; a worker must have \
+             been spawned by the dispatcher to authenticate"
+        ),
+    ))?;
+    Ok(ProjectScope { tenant, project })
 }
 
-/// Pod -> tenant, for a worker in the shared namespace (where the
-/// namespace maps to no single tenant). The pod's `worker_pod` row,
-/// written by the dispatcher at spawn time, names the project; the
-/// project names the tenant. The token's `pod_name` is kubelet-stamped
-/// and unforgeable, and the row is dispatcher-written, so this resolves
-/// the tenant from trusted state only (never from anything the pod
-/// itself supplies). 403 on a pod with no row (forged / already GC'd).
-/// The project leg reuses the `project_to_tenant` cache.
-pub async fn lookup_pod_tenant(
+/// WHICH project a worker is, from its own unforgeable identity.
+///
+/// The pod, always. Its name is stamped into the token by the kubelet
+/// and handed back by the apiserver when the token is reviewed, so it
+/// is the caller's identity rather than the caller's claim, and the
+/// `worker_pod` row naming its project was written by the dispatcher
+/// before the pod existed.
+///
+/// The pod and NOT the namespace it sits in, even though a namespace
+/// could answer the same question for the workers that have one of
+/// their own. Three reasons, in order:
+///
+///   - Only some workers have a namespace to themselves; the rest
+///     share one. Answering from the pod answers for all of them the
+///     same way, so there is one rule rather than two that have to
+///     agree.
+///   - A namespace's record has to be torn down when the namespace
+///     is, and the delete is asynchronous, so a pod still draining
+///     inside a terminating namespace outlives the record that
+///     identifies it. The pod's own record is retired against the pod
+///     itself and so cannot be early.
+///   - A namespace admits a token that is not bound to any pod at
+///     all (one minted by hand). This refuses it, because a token
+///     with no pod behind it has no identity here.
+///
+/// Nothing read here comes from the pod, which is what lets a handler
+/// hold a request to the project this returns.
+///
+/// ONE definition, because every plane that authenticates a worker
+/// asks this same question, and two answers to it would be two
+/// different ideas of who a caller is.
+pub async fn lookup_worker_scope(
     cache: &ScopeCache,
     pool: &PgPool,
-    pod_name: &str,
-) -> Result<String, (StatusCode, String)> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT project_id FROM worker_pod WHERE pod_name = $1")
-            .bind(pod_name)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("worker_pod lookup: {e}")))?;
-    let project_id = row
-        .ok_or((
-            StatusCode::FORBIDDEN,
-            format!(
-                "pod '{pod_name}' has no worker_pod row; a shared-namespace worker must have \
-                 been spawned by the dispatcher to authenticate"
-            ),
-        ))?
-        .0;
-    lookup_project_tenant(cache, pool, &project_id).await
+    namespace: &str,
+    pod_name: Option<&str>,
+) -> Result<ProjectScope, (StatusCode, String)> {
+    let pod_name = pod_name.ok_or((
+        StatusCode::FORBIDDEN,
+        "worker token is not bound to a pod, so it names no project".to_string(),
+    ))?;
+    // Cached because this runs on EVERY authenticated request. The key
+    // is the pod's full identity, and a pod belongs to one project for
+    // its whole life, so a cached answer cannot become wrong; the TTL
+    // is what eventually forgets a retired one.
+    let key = format!("{namespace}/{pod_name}");
+    if let Some(scope) = cache_get(&cache.worker_to_scope, &key).await {
+        return Ok(scope);
+    }
+    let scope = lookup_pod_scope(pool, namespace, pod_name).await?;
+    cache_put(&cache.worker_to_scope, key, scope.clone()).await;
+    Ok(scope)
 }
 
 fn log_denied(caller: &CallerIdentity, kind: &str, requested: &str, owner: &str) {
@@ -342,7 +374,10 @@ mod tests {
 
     fn tenant_caller(tenant: &str) -> CallerIdentity {
         CallerIdentity {
-            scope: CallerScope::Tenant(tenant.to_string()),
+            scope: CallerScope::Tenant {
+                tenant: tenant.to_string(),
+                project: format!("{tenant}-project"),
+            },
             role: Role::Worker,
             namespace: format!("wft-{tenant}"),
             pod_name: Some("pod-x".into()),
@@ -358,27 +393,47 @@ mod tests {
         }
     }
 
+    fn owned_by(tenant: &str, project: &str) -> ProjectScope {
+        ProjectScope { tenant: tenant.into(), project: project.into() }
+    }
+
     #[test]
     fn tenant_caller_matching_resource_passes() {
         let caller = tenant_caller("acme");
-        assert!(enforce_scope(&caller, "project", "p1", "acme").is_ok());
+        assert!(enforce_scope(&caller, "project", "p1", &owned_by("acme", "acme-project")).is_ok());
     }
 
     #[test]
     fn tenant_caller_foreign_resource_rejected() {
         let caller = tenant_caller("acme");
-        let err = enforce_scope(&caller, "project", "p1", "globex").unwrap_err();
+        let err = enforce_scope(&caller, "project", "p1", &owned_by("globex", "globex-project"))
+            .unwrap_err();
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    /// A worker is ONE project's. A sibling project of its own tenant
+    /// holds that project's definition, its infrastructure and its
+    /// credentials, and the caller can name one in a request body, so
+    /// the tenant matching is not enough on its own.
+    #[test]
+    fn tenant_caller_sibling_project_rejected() {
+        let caller = tenant_caller("acme");
+        let err = enforce_scope(&caller, "project", "p2", &owned_by("acme", "another-project"))
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err.1.contains("different project"), "{}", err.1);
     }
 
     #[test]
     fn control_plane_caller_any_resource_passes() {
         // The whole point of the trusted pooled pod: it acts for any
-        // tenant. Both a listener and a supervisor are control-plane.
+        // tenant, and any project inside it. Both a listener and a
+        // supervisor are control-plane.
         for role in [Role::Listener, Role::InfraSupervisor] {
             let caller = control_plane_caller(role);
             assert!(
-                enforce_scope(&caller, "signal", "tok", "any-tenant").is_ok(),
+                enforce_scope(&caller, "signal", "tok", &owned_by("any-tenant", "any-project"))
+                    .is_ok(),
                 "control-plane {role:?} must pass for any tenant"
             );
         }

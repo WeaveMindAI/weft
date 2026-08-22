@@ -140,6 +140,12 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         // credential source for an ours-owned row).
         .route("/v1/access/resolve", post(handlers::resolve_connection))
         .route("/v1/access/close", post(handlers::release_connection))
+        // A node handing out a connection to something it runs itself
+        // (the database its own infra spec brought up). Worker-only,
+        // and the row it writes is always the user's own credential:
+        // publishing can never reach the runtime's.
+        .route("/v1/access/publish", post(handlers::publish_access))
+        .route("/v1/access/published", post(handlers::published_access))
         // Signals (listener-only rehydrate read, by placement = pod)
         .route(
             "/v1/signal/list_for_pod",

@@ -922,6 +922,72 @@ quiet bare request. See `catalog/google/sheets_read` for the worked
 example: works signed in (Sheets API) and with nothing but a share
 link (public CSV export), one shared parsing step.
 
+### Handing out a connection to something your node runs
+
+A node that runs a service ITSELF (a database it provisions) hands out
+a connection to it, so the nodes downstream reach it exactly like one
+a person connected. Declare the service in `metadata.json` and give
+the node an `Access` output to hand it out on:
+
+```json
+"publishes": "postgres",
+"outputs": [{ "name": "access", "type": "Access", "required": false }]
+```
+
+The service's recipe stays where it always lives, on that service's
+access node; the compiler looks it up and attaches it to your node at
+build time. That is why the name has to be declared rather than passed
+at run time: a built project carries only the node types its graph
+uses, so the access node is usually not in there, while the compiler
+sees the whole catalog. A name nothing declares fails the build.
+
+Then in `run`:
+
+```rust
+let values = BTreeMap::from([
+    ("host".into(), host), ("database".into(), db),
+    ("user".into(), user), ("password".into(), password),
+]);
+let access = ctx.publish_access(values).await?;
+ctx.pulse_downstream(NodeOutput::new().set("access", access)).await
+```
+
+The call names no service: your metadata already did, and saying it
+twice is a way for the two to disagree. `values` are the service's own
+declared fields, the same ones a person would have filled in, and
+anything else is refused right there.
+
+The connection belongs to your node: publishing again updates it
+instead of leaving a second one behind, and terminating the node's
+infra deletes it, so it lives exactly as long as the thing it opens.
+It is always the user's own credential; a published connection can
+never resolve to the runtime's.
+
+**Ask for a once-only secret once.** A well-built service mints its
+password on first boot and refuses to say it twice (see "Return the
+same spec every time"). So read it from your own connection on later
+runs, never from the service again:
+
+```rust
+let password = match ctx.published_access().await? {
+    Some(mine) => ctx.open(&mine).await?.value("password")?.to_string(),
+    None => ask_the_container(&ctx).await?,
+};
+```
+
+The two arms run on different runs, so they must not disagree about
+the memoized steps a replay walks back through: give them the same
+sequence of `ctx.run` / `ctx.await_signal` calls, or none at all (see
+the deterministic-replay rule). Do not reason that a body with no
+suspension point is safe from this: a body is re-run from the top not
+only on resume but also when its worker dies mid-node, and it then
+meets its own journal.
+
+`catalog/postgres/database` is the worked example. It retires the
+password only once a connection holds it, and asks again on every run
+rather than only the one that read it, so a run that dies in between
+cannot leave a service nothing can sign in to.
+
 ### Picking resources: the `remote_select` widget
 
 A connection says WHICH ACCOUNT; almost every real node then needs
@@ -1760,6 +1826,24 @@ The split is the rule: **provision_infra describes infra, run produces
 pulses.** Provisioning can do async work (a registry lookup) but its
 job is the spec.
 
+### Return the same spec every time
+
+`provision_infra` runs on `weft infra start | restart | upgrade`, and
+on nothing else (`run` and `activate` only check that infra is already
+Running and refuse otherwise). Those verbs get used many times, so your
+spec gets built many times.
+
+The supervisor compares the spec you return against what is already
+applied. Identical, and it does nothing. Different, and it changes the
+cluster. So build the spec only from your inputs and your node's
+identity: no clocks, no random values, no generated passwords.
+
+If your service needs a password, the container generates it on first
+boot and keeps it on its own volume, and `run` asks the container for
+it. Never put it in the spec: you would generate a different one on
+every start, while the container keeps answering to the first, and no
+restart would ever fix it.
+
 ```rust
 async fn provision_infra(&self, _ctx: InfraProvisionContext, _input: ValueBag)
     -> WeftResult<InfraSpec>
@@ -1846,15 +1930,26 @@ endpoint chains; a bad spec fails the apply loud (the node shows
 At fire time, the node resolves an endpoint **by name**:
 
 ```rust
-let api = ctx.endpoint("api").await?;     // one broker round-trip, caches the URL
+let api = ctx.endpoint("api").await?;     // resolves, then waits until it answers
 let out = api.call(EndpointMethod::Get, "/outputs", None).await?;  // HTTP
 let url = api.url();                       // bare service URL (no path, no trailing /)
+let (host, port) = api.host_and_port()?;   // for a client that takes the two apart
 ```
 
 `ctx.endpoint("api")` returns an `EndpointHandle` that caches the
 cluster-internal URL (`<scheme>://<instance>-<name>.<ns>.svc.cluster.local:<port>`).
-`.url()` is the bare URL; `.call(method, path, body)` does one HTTP
-round-trip against it. The endpoint resolves only when the **whole
+`.url()` is the bare URL; `.host_and_port()` splits it for a client
+that stores the two separately (every database client does);
+`.call(method, path, body)` does one HTTP round-trip against it.
+
+**It does not return until something answers on that address.** An
+address exists as soon as the infrastructure is accepted, which is
+before your container has finished starting, so this waits out the
+gap for you and your first call never lands on a refused connection.
+There is no time limit, because your workload's first boot is yours
+and no number would be the right one to give up at: a wait that is
+taking a while says so in the node's own log every few seconds, and
+`weft stop` ends the run. The endpoint resolves only when the **whole
 node is running** (all its units up): an endpoint is a front door to
 the node, so a request must not land while a sibling unit is degraded.
 

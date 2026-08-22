@@ -40,7 +40,7 @@ pub async fn journal_record(
         return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
     }
     let color = req.event.color();
-    scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &color.to_string())
+    scope::require_color_scope(&state.scope_cache, &state.pool, &caller, &color.to_string())
         .await?;
     // Pod-name binding: the caller can only journal under its own
     // bound pod. Without this check, a worker could stamp a sibling's
@@ -95,7 +95,7 @@ pub async fn journal_fetch(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<JournalFetchRequest>,
 ) -> Resp<JournalFetchResponse> {
-    scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color).await?;
+    scope::require_color_scope(&state.scope_cache, &state.pool, &caller, &req.color).await?;
     let color: weft_core::Color = req
         .color
         .parse()
@@ -109,7 +109,7 @@ pub async fn journal_has_terminal(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<JournalHasTerminalRequest>,
 ) -> Resp<JournalHasTerminalResponse> {
-    scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, &req.color).await?;
+    scope::require_color_scope(&state.scope_cache, &state.pool, &caller, &req.color).await?;
     let color: weft_core::Color = req
         .color
         .parse()
@@ -278,8 +278,9 @@ pub async fn task_enqueue_dedup(
         merge_anchor_tenant(&mut anchor_tenant, t)?;
     }
     if let Some(color) = req.spec.color.as_deref() {
-        let t = scope::require_color_owned_by(&state.scope_cache, &state.pool, &caller, color).await?;
-        merge_anchor_tenant(&mut anchor_tenant, t)?;
+        let scope =
+            scope::require_color_scope(&state.scope_cache, &state.pool, &caller, color).await?;
+        merge_anchor_tenant(&mut anchor_tenant, scope.tenant)?;
     }
     if kind == TaskKind::FireSignal.as_str() {
         // Listener held-event fire: the signal token is the tenant
@@ -641,18 +642,22 @@ pub async fn project_fetch_definition(
 
 // ---------- Connections ----------
 
-/// The worker-caller prologue every connection verb shares: the caller
-/// must be a worker, and the color it names must belong to a tenant it
-/// may act for. Hands back that tenant.
-async fn require_worker_color(
+/// The worker-caller prologue every connection verb shares: WHOSE
+/// execution this caller is acting for. The caller must be a worker,
+/// and the colour it names must be one it may act for.
+///
+/// The ownership rule itself lives in `require_color_scope`, which
+/// every colour-named verb goes through, so this adds only the
+/// role gate: connections are a worker's business and nobody else's.
+async fn worker_execution_scope(
     state: &BrokerState,
     caller: &crate::auth::CallerIdentity,
     color: &str,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<scope::ProjectScope, (StatusCode, String)> {
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
-    scope::require_color_owned_by(&state.scope_cache, &state.pool, caller, color).await
+    scope::require_color_scope(&state.scope_cache, &state.pool, caller, color).await
 }
 
 /// Worker resolves a connection for one firing. The store fetches the
@@ -673,7 +678,8 @@ pub async fn resolve_connection(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<ResolveConnectionRequest>,
 ) -> Resp<ResolveConnectionResponse> {
-    let tenant = require_worker_color(&state, &caller, &req.color).await?;
+    let owner = worker_execution_scope(&state, &caller, &req.color).await?;
+    let tenant = owner.tenant.clone();
     let connection_id: uuid::Uuid = req.connection_id.parse().map_err(|_| {
         (StatusCode::BAD_REQUEST, format!("malformed connection id '{}'", req.connection_id))
     })?;
@@ -715,7 +721,7 @@ pub async fn resolve_connection(
             let key_req = crate::credential::KeyRequest {
                 tenant,
                 color: req.color.clone(),
-                project_id: req.project_id,
+                project_id: owner.project.clone(),
                 node_id: req.node_id,
                 frames: req.frames,
                 node_type: req.node_type,
@@ -769,11 +775,105 @@ pub async fn release_connection(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<ReleaseConnectionRequest>,
 ) -> Resp<ReleaseConnectionResponse> {
-    let tenant = require_worker_color(&state, &caller, &req.color).await?;
+    let tenant = worker_execution_scope(&state, &caller, &req.color).await?.tenant;
     for value in req.values.values() {
         state.credentials.close(&state.pool, value, &tenant).await.map_err(internal)?;
     }
     Ok(Json(ReleaseConnectionResponse {}))
+}
+
+/// A node publishes a connection to something it runs itself. The
+/// store keys the row on (tenant, project, node, service), so a
+/// second publish updates the first row rather than piling up.
+///
+/// Nothing the caller says about WHERE the row lands is trusted: the
+/// project comes from the execution's own row, so a worker cannot
+/// publish into a sibling project (or into a project that does not
+/// exist, which would leave a row the cleanup path can never reach).
+/// The row is always the user's own credential, and the store refuses
+/// any recipe shape that could later make weft call out on the
+/// tenant's behalf.
+pub async fn publish_access(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(mut req): Json<PublishAccessRequest>,
+) -> Resp<PublishAccessResponse> {
+    let owner = publisher_scope(&state, &caller, &req.color, &mut req.node_id).await?;
+    if req.spec.service != req.service {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "publishing '{}' with the recipe for '{}'",
+                req.service, req.spec.service
+            ),
+        ));
+    }
+    let done = weft_access_store::publish_grant(
+        &state.pool,
+        &owner.tenant,
+        weft_access_store::PublishAccess {
+            spec: req.spec,
+            project_id: owner.project,
+            node_id: req.node_id,
+            values: req.values,
+            label: req.label,
+        },
+    )
+    .await
+    .map_err(store_err)?;
+    Ok(Json(PublishAccessResponse {
+        connection: weft_broker_client::protocol::PublishedConnection {
+            connection_id: done.grant.id.to_string(),
+            identity: done.grant.identity,
+        },
+    }))
+}
+
+/// The connection this node published for this service, if any. How a
+/// node finds what it opened last time instead of asking the thing it
+/// runs for its credentials a second time.
+pub async fn published_access(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(mut req): Json<PublishedAccessRequest>,
+) -> Resp<PublishedAccessResponse> {
+    let owner = publisher_scope(&state, &caller, &req.color, &mut req.node_id).await?;
+    let found = weft_access_store::published_grant(
+        &state.pool,
+        &owner.tenant,
+        &owner.project,
+        &req.node_id,
+        &req.service,
+    )
+    .await
+    .map_err(store_err)?;
+    Ok(Json(match found {
+        Some(g) => PublishedAccessResponse::Published {
+            connection: weft_broker_client::protocol::PublishedConnection {
+                connection_id: g.id.to_string(),
+                identity: g.identity,
+            },
+        },
+        None => PublishedAccessResponse::NothingPublished,
+    }))
+}
+
+/// Where a publish is allowed to land: the execution's own tenant and
+/// project. `node_id` is trimmed in place, so the caller's own field
+/// is the key the row is written under.
+///
+/// Authorization first, then the shape of the request: a caller with
+/// no business here should hear that, not a complaint about its
+/// arguments.
+async fn publisher_scope(
+    state: &BrokerState,
+    caller: &crate::auth::CallerIdentity,
+    color: &str,
+    node_id: &mut String,
+) -> Result<scope::ProjectScope, (StatusCode, String)> {
+    let owner = worker_execution_scope(state, caller, color).await?;
+    require_node_id(node_id)?;
+    Ok(owner)
 }
 
 // ---------- Supervisor surface ----------
@@ -1269,10 +1369,10 @@ fn rollup_sql(units_expr: &str) -> String {
 pub async fn supervisor_set_status(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorSetStatusRequest>,
+    Json(mut req): Json<SupervisorSetStatusRequest>,
 ) -> Resp<SupervisorSetStatusResponse> {
     require_supervisor(&caller)?;
-    require_node_id(&req.node_id)?;
+    require_node_id(&mut req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
         .await?;
     // Per-unit (`unit = Some`): set that unit's status inside
@@ -1507,10 +1607,10 @@ async fn write_apply_row(
 pub async fn supervisor_set_applied(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorSetAppliedRequest>,
+    Json(mut req): Json<SupervisorSetAppliedRequest>,
 ) -> Resp<SupervisorSetAppliedResponse> {
     require_supervisor(&caller)?;
-    require_node_id(&req.node_id)?;
+    require_node_id(&mut req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
         .await?;
     let endpoints_json = serde_json::to_value(&req.endpoints)
@@ -1549,10 +1649,10 @@ pub async fn supervisor_set_applied(
 pub async fn supervisor_set_provisioning(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorSetProvisioningRequest>,
+    Json(mut req): Json<SupervisorSetProvisioningRequest>,
 ) -> Resp<SupervisorSetProvisioningResponse> {
     require_supervisor(&caller)?;
-    require_node_id(&req.node_id)?;
+    require_node_id(&mut req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
         .await?;
     let units_json = serde_json::to_value(&req.units)
@@ -1743,9 +1843,9 @@ pub async fn supervisor_project_image_tags(
 pub async fn infra_enqueue_apply(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<InfraEnqueueApplyRequest>,
+    Json(mut req): Json<InfraEnqueueApplyRequest>,
 ) -> Resp<InfraEnqueueApplyResponse> {
-    require_node_id(&req.node_id)?;
+    require_node_id(&mut req.node_id)?;
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
@@ -1869,12 +1969,13 @@ pub async fn infra_wait_apply(
 pub async fn supervisor_remove_node(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorRemoveNodeRequest>,
+    Json(mut req): Json<SupervisorRemoveNodeRequest>,
 ) -> Resp<SupervisorRemoveNodeResponse> {
     require_supervisor(&caller)?;
-    require_node_id(&req.node_id)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
-        .await?;
+    require_node_id(&mut req.node_id)?;
+    let tenant =
+        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
+            .await?;
     // Ownership gate: only the pod that currently OWNS the project may
     // cascade-delete its infra_node + cancel its pending commands. A
     // supervisor that lost ownership mid-Terminate must NOT wipe rows
@@ -1945,9 +2046,32 @@ pub async fn supervisor_remove_node(
     .execute(&mut *tx)
     .await
     .map_err(|e| internal(anyhow::anyhow!("cancel pending commands: {e}")))?;
+    // A connection this node published opens the very thing being
+    // removed, so it goes with it: its credentials would otherwise
+    // name a database that no longer exists, and nothing downstream
+    // could use or clean it.
+    let published = weft_access_store::delete_published_grants(
+        &mut *tx,
+        &tenant,
+        &req.project_id,
+        Some(&req.node_id),
+    )
+    .await
+    .map_err(|e| internal(anyhow::anyhow!("delete published connections: {e}")))?;
     tx.commit()
         .await
         .map_err(|e| internal(anyhow::anyhow!("commit: {e}")))?;
+    // Logged AFTER the commit. A line saying rows were removed, on a
+    // transaction that then failed to commit, is a log that lies.
+    if published > 0 {
+        tracing::info!(
+            target: "weft_broker",
+            project_id = %req.project_id,
+            node_id = %req.node_id,
+            published,
+            "removed the connections this node published"
+        );
+    }
     Ok(Json(SupervisorRemoveNodeResponse {
         removed: res.rows_affected() > 0,
     }))
@@ -2166,13 +2290,24 @@ pub async fn supervisor_command_cancel_requested(
     ))
 }
 
-/// Reject empty-string `node_id` at the handler boundary.
+/// Hold `node_id` to what a row may be keyed on, TRIMMING IT IN PLACE
+/// so every later read of it is already the key.
+///
+/// In place, rather than handing a trimmed copy back, because a
+/// caller can ignore a returned value and five of them did: they
+/// validated the trimmed form and then persisted the padded one.
 /// Persisting an empty key (or matching against one) corrupts the
-/// per-node indexes; better to bail at 400 than silently shape
-/// the DB around it.
-fn require_node_id(node_id: &str) -> Result<(), (StatusCode, String)> {
-    if node_id.is_empty() {
+/// per-node indexes, and persisting a padded one is worse, because
+/// `"db"` and `" db"` are two keys for one node, so the credential a
+/// node published under one spelling survives the cleanup that names
+/// the other.
+fn require_node_id(node_id: &mut String) -> Result<(), (StatusCode, String)> {
+    let trimmed = node_id.trim();
+    if trimmed.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "node_id required".into()));
+    }
+    if trimmed.len() != node_id.len() {
+        *node_id = trimmed.to_string();
     }
     Ok(())
 }
@@ -2341,8 +2476,28 @@ async fn require_worker_pod_owned_by(
         .map(|_| ())
 }
 
-fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+/// A store error as this surface answers it. The mapping itself lives
+/// in the store (`client_error`), so the broker and the dispatcher
+/// cannot drift on what a store failure looks like.
+pub(crate) fn store_err(e: anyhow::Error) -> (StatusCode, String) {
+    let (status, message) = weft_access_store::client_error(e);
+    (StatusCode::from_u16(status).expect("store status codes are valid"), message)
+}
+
+/// A failure that is OURS, not the caller's: logged here with its
+/// cause chain, and answered opaquely.
+///
+/// Opaque because the callers on this surface include workers, which
+/// run tenant-authored code. A sqlx error's Display names tables and
+/// columns, and echoing one hands the untrusted side a description of
+/// our schema. The operator loses nothing: the log has strictly more
+/// than the response ever did.
+///
+/// ONE definition for the whole broker, so no surface can be the one
+/// that answers differently.
+pub(crate) fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
+    tracing::error!(target: "weft_broker", "internal: {e:#}");
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
 }
 
 #[cfg(test)]

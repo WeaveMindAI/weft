@@ -30,7 +30,6 @@ pub mod journal_bridge;
 pub mod lease;
 pub mod lifecycle_claimer;
 pub mod listener;
-pub mod namespace_registry;
 pub mod pg_wake;
 pub mod placement;
 pub mod project_namespace;

@@ -206,6 +206,23 @@ pub struct NodeMetadata {
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+
+    /// The service this node hands out a connection to, for a node
+    /// that opens something it runs ITSELF (a database it provisions).
+    /// Names the service whose recipe the published connection is
+    /// held to; the compiler resolves that recipe from the catalog at
+    /// enrich time, so a name nothing declares is a build error rather
+    /// than a surprise at run time.
+    ///
+    /// A node declaring this must also declare an `Access` OUTPUT: the
+    /// connection it publishes is what that output carries.
+    ///
+    /// Backend-only (the compiler's enrich-time recipe resolution),
+    /// deliberately not mirrored in the editor's `CatalogEntry`: the
+    /// connect control keys off an access widget, and a publishing
+    /// node has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publishes: Option<String>,
     /// Node-level semantic constraints. Small, extensible, boolean-ish
     /// flags; anything with structure gets its own top-level key (like
     /// `display` below).
@@ -367,7 +384,9 @@ impl NodeMetadata {
     /// optionless picker can never be filled). A declared `default` must
     /// type-check against the input's type, and a number widget's default
     /// must sit inside its declared min/max, so a default the runtime
-    /// would later reject fails the metadata load instead.
+    /// would later reject fails the metadata load instead. A node that
+    /// `publishes` a service names it the way a service is named, and
+    /// declares the `Access` output it hands the connection out on.
     pub fn validate_semantics(&self) -> Result<(), String> {
         if let Some(display) = &self.display {
             let port = match (&display.input, &display.output) {
@@ -592,6 +611,26 @@ impl NodeMetadata {
                         }
                     }
                 }
+            }
+        }
+        if let Some(service) = &self.publishes {
+            // The SAME rule an `AccessSpec.service` is held to (that is
+            // what this name has to match), not a lookalike.
+            if !is_valid_provider_name(service) {
+                return Err(format!(
+                    "`publishes` names a service, so it takes a service name \
+                     (lowercase letters, digits and underscores): '{service}' is not one"
+                ));
+            }
+            if !self
+                .outputs
+                .iter()
+                .any(|o| matches!(o.port_type, crate::weft_type::WeftType::Access))
+            {
+                return Err(format!(
+                    "this node publishes a '{service}' connection but declares no Access \
+                     output to hand it out on"
+                ));
             }
         }
         if let Some(spec) = &self.service {
@@ -1799,6 +1838,40 @@ mod input_semantics_tests {
             m
         })
         .unwrap()
+    }
+
+    /// A node that hands out a connection to a service it runs
+    /// itself: the two rules that keeps honest are that the name IS a
+    /// service name, and that there is an output to hand the
+    /// connection out on.
+    #[test]
+    fn a_publishing_node_needs_a_service_name_and_an_access_output() {
+        let publishing = |service: &str, outputs: Vec<OutputSpec>| {
+            let mut m = metadata_with(vec![]);
+            m.publishes = Some(service.into());
+            m.outputs = outputs;
+            m
+        };
+        let access_out = || OutputSpec {
+            name: "access".into(),
+            port_type: WeftType::Access,
+            required: false,
+            description: None,
+        };
+
+        publishing("postgres", vec![access_out()])
+            .validate_semantics()
+            .expect("a service name plus an Access output is the whole rule");
+
+        let e = publishing("Postgres-DB", vec![access_out()])
+            .validate_semantics()
+            .expect_err("a name that is not a service name refuses");
+        assert!(e.contains("is not one"), "{e}");
+
+        let e = publishing("postgres", vec![])
+            .validate_semantics()
+            .expect_err("nothing to hand the connection out on refuses");
+        assert!(e.contains("no Access output"), "{e}");
     }
 
     fn input(name: &str, ty: WeftType) -> InputSpec {

@@ -1,11 +1,11 @@
-//! PostgresExecuteQuery: run any SQL against a user-supplied
-//! database, with `$1`-style parameters, and emit the answered rows.
+//! PostgresExecuteQuery: run any SQL against the wired database, with
+//! `$1`-style parameters, and emit the answered rows.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 use super::postgres::{connect, query_json};
 
@@ -23,11 +23,12 @@ impl Node for PostgresExecuteQueryNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let conn_str: String = ctx.inputs.get("connectionString")?;
+        let account: Access = ctx.inputs.get("account")?;
         let query: String = ctx.inputs.get("query")?;
         let params: Vec<Value> = ctx.inputs.list("params")?;
 
-        let client = connect(&ctx, &conn_str).await?;
+        let conn = ctx.open(&account).await?;
+        let client = connect(&ctx, &conn).await?;
         let rows = query_json(&client, &query, &params).await?;
         let count = rows.len() as f64;
         ctx.pulse_downstream(NodeOutput::new().set("rows", json!(rows)).set("count", count))

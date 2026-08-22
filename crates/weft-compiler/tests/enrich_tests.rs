@@ -451,3 +451,34 @@ out.data = human.test_approved
         "a header port matching no derived port must be a custom-port error: {err}"
     );
 }
+
+/// A node that hands out a connection to something it runs itself
+/// carries that service's recipe from compile time onward. The worker
+/// ships only the node types the project uses, so the service's own
+/// access node is usually absent from it; resolving here, against the
+/// whole catalog, is what makes publishing work without the user
+/// dropping an unused access node into their graph.
+#[test]
+fn enrich_carries_the_recipe_a_node_publishes_against() {
+    let source = r#"
+db = PostgresDatabase
+q = PostgresExecuteQuery { query: "SELECT 1" }
+q.account = db.access
+out = Debug
+out.data = q.rows
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let db = project.nodes.iter().find(|n| n.id == "db").unwrap();
+    let spec = db
+        .published_service
+        .as_ref()
+        .expect("the database node carries the recipe it publishes against");
+    assert_eq!(spec.service, "postgres");
+    assert!(
+        spec.own_fields().iter().any(|f| f.name == "password"),
+        "the recipe is the real one, fields and all"
+    );
+    let q = project.nodes.iter().find(|n| n.id == "q").unwrap();
+    assert!(q.published_service.is_none(), "a node that publishes nothing carries nothing");
+}

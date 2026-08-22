@@ -513,6 +513,20 @@ impl BrokerAccessClient {
     ) -> Result<ReleaseConnectionResponse> {
         self.http.post("/v1/access/close", req).await
     }
+
+    pub async fn publish_access(
+        &self,
+        req: &PublishAccessRequest,
+    ) -> Result<PublishAccessResponse> {
+        self.http.post("/v1/access/publish", req).await
+    }
+
+    pub async fn published_access(
+        &self,
+        req: &PublishedAccessRequest,
+    ) -> Result<PublishedAccessResponse> {
+        self.http.post("/v1/access/published", req).await
+    }
 }
 
 // ---------- Project (worker fetches own definition) ----------

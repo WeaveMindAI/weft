@@ -1159,6 +1159,66 @@ pub fn worker_value_names_of(steps: &[AuthStep]) -> Result<Vec<String>, String> 
     Ok(names)
 }
 
+/// What a recipe must look like to describe something a project RUNS
+/// ITSELF, rather than a third party it calls.
+///
+/// Such a service has no provider behind it: nothing to consent to,
+/// no events it pushes, no connect-time call to make. Saying that once
+/// is what lets the compiler refuse it at build time (where the author
+/// is looking) and the store refuse it at write time (where the input
+/// is untrusted), without the two drifting apart.
+///
+/// Hands back the settings a publisher fills, because the caller that
+/// needs them is the caller that just proved they exist. Returning
+/// them here is what keeps a `let else { unreachable!() }` out of a
+/// request handler serving untrusted callers.
+pub fn publishable_fields(spec: &AccessSpec) -> Result<&[CredentialField], String> {
+    let Acquisition::Static { fields } = &spec.acquisition else {
+        return Err(format!(
+            "a node publishes a connection to something it runs itself, which is described \
+             by its stored settings alone; the '{}' service is acquired another way",
+            spec.service
+        ));
+    };
+    if !spec.events.is_empty() {
+        return Err(format!(
+            "the '{}' service reports provider events, which a service a project runs \
+             itself cannot",
+            spec.service
+        ));
+    }
+    if spec.test.is_some() {
+        return Err(format!(
+            "the '{}' service declares a connect-time check, which has no meaning for a \
+             service a project runs itself",
+            spec.service
+        ));
+    }
+    Ok(fields)
+}
+
+/// The recipe for `service`, from whichever node's metadata declares
+/// it.
+///
+/// Discovery refuses a second node claiming one service, so a catalog
+/// built from a node tree has exactly one answer. That is a guarantee
+/// of the DISCOVERY, not of this function: hand it a registry built
+/// another way and the first match wins, so give it the metadata a
+/// discovered catalog produced.
+///
+/// ONE definition, because two places need it and they must not be
+/// able to disagree: the compiler resolves it against the whole
+/// catalog to stamp a publishing node's definition, and a node-test
+/// rig resolves it against the package under test.
+pub fn spec_for_service<'a>(
+    metadata: impl IntoIterator<Item = &'a crate::node::NodeMetadata>,
+    service: &str,
+) -> Option<&'a AccessSpec> {
+    metadata
+        .into_iter()
+        .find_map(|m| m.service.as_ref().filter(|spec| spec.service == service))
+}
+
 impl AccessSpec {
     /// Every template this spec declares, for validation and for
     /// computing the worker handoff set (the auth steps' placeholders).

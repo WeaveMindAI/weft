@@ -348,8 +348,14 @@ impl ExecutionContext {
     /// Resolve one of this node's declared endpoints to a handle.
     /// `name` matches an `Endpoint.name` from the InfraSpec the node
     /// returned during `provision_infra`. One broker round-trip; the
-    /// returned handle caches the URL and exposes `.url()` (sync)
-    /// and `.call(...)` (HTTP) without further lookups.
+    /// returned handle caches the URL and exposes `.url()` (sync),
+    /// `.host_and_port()` and `.call(...)` (HTTP) without further
+    /// lookups.
+    ///
+    /// The address is handed over only once something ANSWERS on it. A
+    /// workload is marked ready a moment before the cluster routes to
+    /// it, so anything dialling straight away would be refused; this
+    /// waits that gap out, whatever the node speaks next.
     ///
     /// Valid in:
     ///   - `Phase::InfraSetup` AFTER provision + apply have succeeded;
@@ -444,6 +450,43 @@ impl ExecutionContext {
             Some(access) => Ok(self.open(access).await?.client().clone()),
             None => Ok(self.handle.plain_http()),
         }
+    }
+
+    /// Publish a connection to something THIS node runs itself: the
+    /// database its own `provision_infra` brought up, whose
+    /// credentials it read back off the running container. Answers the
+    /// [`crate::access::Access`] to put on an output port; downstream
+    /// nodes then use it exactly like one a person connected.
+    ///
+    /// `values` are the service's own declared fields, the same ones a
+    /// person would have filled in, and the runtime refuses anything
+    /// else: a missing required field or a name the service does not
+    /// declare fails here, at the node that published it.
+    ///
+    /// The connection belongs to this node. Publishing again updates
+    /// it instead of leaving a second one behind, and terminating the
+    /// node's infra deletes it, so it lives exactly as long as the
+    /// thing it opens. It is always the user's own credential; a
+    /// published connection can never resolve to the runtime's.
+    ///
+    /// A credential the running thing hands out only once (the sane
+    /// design: it mints its password on first boot and refuses to say
+    /// it twice) is read back from [`Self::published_access`] on later
+    /// runs, never from the container again.
+    pub async fn publish_access(
+        &self,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> WeftResult<crate::access::Access> {
+        self.handle.publish_access(values).await
+    }
+
+    /// The connection this node published, or `None` if it has not
+    /// published one yet. The read-back half of
+    /// [`Self::publish_access`]: `ctx.open` on it hands back the values
+    /// stored the first time, so a once-only credential is asked for
+    /// once in the life of the thing that owns it.
+    pub async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> {
+        self.handle.published_access().await
     }
 
     // ----- Side-effect primitives ------------------------------------
@@ -946,7 +989,7 @@ pub enum LogLevel {
 /// HTTP method for [`EndpointHandle::call`]. GET / POST cover the
 /// catalog node patterns today. Add PUT / DELETE / PATCH when a
 /// real need surfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EndpointMethod {
     Get,
     Post,
@@ -969,7 +1012,66 @@ pub struct EndpointHandle {
     url: String,
 }
 
+/// The host and port an infra endpoint URL addresses.
+///
+/// ONE definition: the runtime needs it to know whether the address
+/// answers yet, and a node needs it to hand the two halves to a client
+/// that stores them apart (every database client does). A default port
+/// counts as a port, which is the trap in doing this by hand: an
+/// address on 80 carries no explicit port and must not read as "no
+/// port at all".
+pub fn endpoint_host_and_port(url: &str) -> WeftResult<(String, u16)> {
+    host_and_port_of(&parse_endpoint(url)?, url)
+}
+
+/// The `host:port` an endpoint URL is dialled at, or `None` when there
+/// is nothing to dial: a UDP endpoint has no connection to open.
+///
+/// Here beside [`endpoint_host_and_port`], so the URL is parsed once
+/// and the "not a URL" refusal is worded once. An address that is not
+/// a URL with a host and a port is refused rather than guessed at.
+pub fn endpoint_socket_address(url: &str) -> WeftResult<Option<String>> {
+    let parsed = parse_endpoint(url)?;
+    if parsed.scheme() == "udp" {
+        return Ok(None);
+    }
+    let (host, port) = host_and_port_of(&parsed, url)?;
+    // A bare IPv6 host has to go back inside brackets to be a socket
+    // address; every other host is already one.
+    Ok(Some(if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }))
+}
+
+fn parse_endpoint(url: &str) -> WeftResult<url::Url> {
+    url::Url::parse(url)
+        .map_err(|e| WeftError::Config(format!("the endpoint address '{url}' is not a URL: {e}")))
+}
+
+fn host_and_port_of(parsed: &url::Url, url: &str) -> WeftResult<(String, u16)> {
+    match (parsed.host_str(), parsed.port_or_known_default()) {
+        // An IPv6 host is bracketed inside a URL and bare everywhere
+        // else; hand back what a client dials, not what a URL writes.
+        (Some(host), Some(port)) => Ok((
+            host.trim_start_matches('[').trim_end_matches(']').to_string(),
+            port,
+        )),
+        _ => Err(WeftError::Config(format!(
+            "the endpoint address '{url}' carries no host and port"
+        ))),
+    }
+}
+
 impl EndpointHandle {
+    /// The host and port this endpoint answers on, for a client that
+    /// stores the two apart (every database client does) rather than
+    /// taking a URL.
+    pub fn host_and_port(&self) -> WeftResult<(String, u16)> {
+        endpoint_host_and_port(&self.url)
+    }
+
     /// Cluster-internal URL of this endpoint. No broker call; the
     /// URL was resolved by `ctx.endpoint(name)`.
     pub fn url(&self) -> &str {
@@ -1418,6 +1520,13 @@ pub trait ContextHandle: Send + Sync {
         access: &crate::access::Access,
         window: std::time::Duration,
     ) -> WeftResult<crate::access::OpenedConnection>;
+    /// Backs [`ExecutionContext::publish_access`].
+    async fn publish_access(
+        &self,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> WeftResult<crate::access::Access>;
+    /// Backs [`ExecutionContext::published_access`].
+    async fn published_access(&self) -> WeftResult<Option<crate::access::Access>>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 
@@ -1568,6 +1677,52 @@ pub trait ContextHandle: Send + Sync {
     fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>>;
 }
 
+/// Splitting an endpoint address: the one place that knows a default
+/// port still counts as a port.
+#[cfg(test)]
+mod endpoint_address_tests {
+    use super::{endpoint_host_and_port, endpoint_socket_address};
+
+    #[test]
+    fn an_address_splits_into_host_and_port() {
+        assert_eq!(
+            endpoint_host_and_port("http://db-sql.ns.svc.cluster.local:5432").unwrap(),
+            ("db-sql.ns.svc.cluster.local".to_string(), 5432)
+        );
+        // A default port is written nowhere in the URL and must still
+        // come back: reading it as "no port" would silently skip
+        // everything keyed on having one.
+        assert_eq!(
+            endpoint_host_and_port("http://svc.ns.svc.cluster.local").unwrap(),
+            ("svc.ns.svc.cluster.local".to_string(), 80)
+        );
+        // Brackets belong to the URL, not to the host a client dials.
+        assert_eq!(
+            endpoint_host_and_port("http://[::1]:5432").unwrap(),
+            ("::1".to_string(), 5432)
+        );
+        assert!(endpoint_host_and_port("not a url").is_err());
+    }
+
+    /// The address a client actually dials. A UDP endpoint has
+    /// nothing to connect to and says so with `None`; anything that
+    /// is not a URL with a host and a port is refused rather than
+    /// guessed at.
+    #[test]
+    fn an_endpoint_url_becomes_a_socket_address() {
+        let dialled = |url| endpoint_socket_address(url).map(|a| a.unwrap_or_default());
+        assert_eq!(
+            dialled("http://db-sql.ns.svc.cluster.local:5432").unwrap(),
+            "db-sql.ns.svc.cluster.local:5432"
+        );
+        assert_eq!(dialled("http://svc.ns.svc.cluster.local").unwrap(), "svc.ns.svc.cluster.local:80");
+        // Bare in a connection's host field, bracketed in an address.
+        assert_eq!(dialled("http://[::1]:5432").unwrap(), "[::1]:5432");
+        assert_eq!(endpoint_socket_address("udp://silent.svc:9999").unwrap(), None);
+        assert!(endpoint_socket_address("not a url").is_err());
+    }
+}
+
 #[cfg(test)]
 mod value_bag_tests {
     use super::*;
@@ -1619,6 +1774,8 @@ mod value_bag_tests {
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
         async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
+        async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
+        async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
@@ -1654,6 +1811,8 @@ mod value_bag_tests {
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
         async fn open_connection(&self, _: &crate::access::Access, _: std::time::Duration) -> WeftResult<crate::access::OpenedConnection> { unreachable!() }
+        async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
+        async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }

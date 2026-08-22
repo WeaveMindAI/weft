@@ -27,7 +27,7 @@
 use weft_e2e::{ensure, infra, platform::Platform, project::Project, run};
 
 /// The shared worker namespace name.
-// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-dispatcher/src/project_namespace.rs SHARED_WORKER_NAMESPACE, crates/weft-broker/src/auth.rs SHARED_WORKER_NAMESPACE
+// SYNC: SHARED_WORKER_NAMESPACE <-> crates/weft-dispatcher/src/project_namespace.rs SHARED_WORKER_NAMESPACE
 const SHARED_WORKER_NAMESPACE: &str = "wft-shared-workers";
 const INFRA_NODE: &str = "svc";
 

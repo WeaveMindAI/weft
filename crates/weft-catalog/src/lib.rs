@@ -548,6 +548,26 @@ impl DiscoverCtx<'_> {
             })?;
             return Ok(false);
         }
+        // A service is found BY NAME, by the store that keeps its
+        // connections and by the compiler resolving what a node
+        // publishes. Two nodes claiming one name make that lookup a
+        // coin toss, so it is refused here, where the other identity
+        // collisions are.
+        if let Some(service) = entry.metadata.service.as_ref().map(|s| s.service.clone()) {
+            if let Some(existing) = self
+                .cat
+                .entries
+                .values()
+                .find(|e| e.metadata.service.as_ref().is_some_and(|s| s.service == service))
+            {
+                self.soft_fail(CatalogError::ServiceCollision {
+                    service,
+                    first: existing.node_type.clone(),
+                    second: entry.node_type.clone(),
+                })?;
+                return Ok(false);
+            }
+        }
         self.cat.entries.insert(entry.node_type.clone(), entry);
         Ok(true)
     }
@@ -669,6 +689,14 @@ enum NodeDirEntry {
     File(PathBuf),
 }
 
+impl NodeDirEntry {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Dir(p) | Self::File(p) => p,
+        }
+    }
+}
+
 /// Read a directory's immediate children under the node-tree policy:
 /// never follow symlinks, skip `NODE_TREE_EXCLUDE` names. The single
 /// traversal mechanic for discovery; `visit_dir` recurses its dirs and
@@ -706,6 +734,14 @@ fn read_node_dir(dir: &Path) -> Result<Vec<NodeDirEntry>, CatalogError> {
             out.push(NodeDirEntry::File(child.path()));
         }
     }
+    // Sorted, because `fs::read_dir` order is the filesystem's, not
+    // the tree's. Every decision the walk makes by ARRIVING somewhere
+    // first rides on this: which of two nodes claiming one identity is
+    // the one reported as the original, and, under a lenient policy
+    // (which warns and skips rather than failing), which of them
+    // vanishes from the catalog. Unsorted, that answer changes per
+    // machine.
+    out.sort_by(|a, b| a.path().cmp(b.path()));
     Ok(out)
 }
 
@@ -1031,6 +1067,16 @@ pub enum CatalogError {
         first: PathBuf,
         second: PathBuf,
     },
+    #[error(
+        "the '{service}' service is declared by two nodes ({first} and {second}); a service \
+         names one sign-in, and everything that stores or publishes a connection finds it \
+         by that name alone"
+    )]
+    ServiceCollision {
+        service: String,
+        first: String,
+        second: String,
+    },
     #[error("package name '{name}' declared twice: {first} and {second}")]
     PackageNameCollision {
         name: String,
@@ -1125,14 +1171,14 @@ mod package_tests {
         assert_eq!(pkg.shared_rs.len(), 1, "should have form_helpers.rs");
     }
 
-    /// WhatsApp triad: bridge is the infra (requires_infra + locally
+    /// Bailey triad: bridge is the infra (requires_infra + locally
     /// built image), receive is a trigger (no infra), send is a
     /// normal Fire-phase node (no infra). All three must load from
     /// the catalog so the package compiles into a project binary.
     #[test]
-    fn whatsapp_triad_loaded() {
+    fn bailey_triad_loaded() {
         let cat = FsCatalog::discover(&stdlib_root()).unwrap();
-        let bridge = cat.entry("WhatsAppBridge").expect("WhatsAppBridge missing");
+        let bridge = cat.entry("BaileyBridge").expect("BaileyBridge missing");
         assert!(bridge.metadata.requires_infra, "bridge must be infra");
         assert_eq!(
             bridge.metadata.images,
@@ -1145,26 +1191,23 @@ mod package_tests {
             "bridge opts into /live by naming the endpoint that serves it",
         );
 
-        let recv = cat.entry("WhatsAppReceive").expect("WhatsAppReceive missing");
+        let recv = cat.entry("BaileyReceive").expect("BaileyReceive missing");
         assert!(!recv.metadata.requires_infra, "receive must NOT require infra");
         assert!(recv.metadata.features.is_trigger, "receive is a trigger");
 
-        let send = cat.entry("WhatsAppSend").expect("WhatsAppSend missing");
+        let send = cat.entry("BaileySend").expect("BaileySend missing");
         assert!(!send.metadata.requires_infra, "send must NOT require infra");
         assert!(!send.metadata.features.is_trigger, "send is a normal node");
 
         // The three must live under the same package so the codegen
         // bundles them together. (`package_of` returns the package
         // descriptor for any node_type in it.)
-        let pkg = cat.package_of("WhatsAppBridge").expect("bridge package");
-        assert_eq!(
-            pkg.name, "whatsapp",
-            "WhatsApp triad must share a package",
-        );
+        let pkg = cat.package_of("BaileyBridge").expect("bridge package");
+        assert_eq!(pkg.name, "bailey", "the Bailey triad must share a package");
         assert!(
-            pkg.node_types.iter().any(|t| t == "WhatsAppBridge")
-                && pkg.node_types.iter().any(|t| t == "WhatsAppReceive")
-                && pkg.node_types.iter().any(|t| t == "WhatsAppSend"),
+            pkg.node_types.iter().any(|t| t == "BaileyBridge")
+                && pkg.node_types.iter().any(|t| t == "BaileyReceive")
+                && pkg.node_types.iter().any(|t| t == "BaileySend"),
             "package must contain all three node types, got {:?}",
             pkg.node_types,
         );

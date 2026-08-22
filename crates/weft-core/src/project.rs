@@ -169,7 +169,8 @@ pub fn is_internal_config_key(key: &str) -> bool {
     key.starts_with('_') || key == "parentId"
 }
 
-// SYNC: NodeDefinition <-> packages/weft-graph/src/protocol.ts NodeDefinition
+// SYNC: NodeDefinition (the editor-visible subset; backend-only fields like
+// `images` and `publishedService` stay here) <-> packages/weft-graph/src/protocol.ts NodeDefinition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDefinition {
     pub id: String,
@@ -208,6 +209,15 @@ pub struct NodeDefinition {
     /// the dispatcher.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// The recipe for the service this node publishes a connection to
+    /// (`ctx.publish_access`), resolved from the catalog at enrich
+    /// time from the node metadata's `publishes` name. Carried on the
+    /// definition rather than looked up at run time: a worker only
+    /// ships the node types its project uses, so the service's own
+    /// access node is usually absent from it, while the compiler sees
+    /// the whole catalog.
+    #[serde(default, rename = "publishedService", skip_serializing_if = "Option::is_none")]
+    pub published_service: Option<crate::access::spec::AccessSpec>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -663,6 +673,7 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra: false,
             images: vec![],
+            published_service: None,
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
             config_spans: Default::default(),
@@ -750,6 +761,7 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra,
             images: vec![],
+            published_service: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),

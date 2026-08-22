@@ -134,8 +134,8 @@ pub use weft_node_derive::NodeManifest;
 pub use node::{Node, NodeCatalog};
 #[cfg(feature = "runtime")]
 pub use node_test::{
-    fixture_spec, fixture_spec_like, with_cleanup, FakeRig, LiveRig, NodeTest, NodeTestInfo,
-    RunOutcome, SentRequest, TestTier,
+    fixture_spec, fixture_spec_like, with_cleanup, EndpointCall, FakeRig, LiveRig, NodeTest,
+    NodeTestInfo, RunOutcome, SentRequest, TestTier,
 };
 pub use primitive::{
     AwaitedEntry, AwaitedEntryKind, ExecutionSnapshot, KickedNode, SignalAuth,

@@ -2,10 +2,10 @@
 //! and emit the inserted row (RETURNING *).
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 use super::postgres::{connect, query_json, quote_ident};
 
@@ -40,7 +40,7 @@ impl Node for PostgresInsertRowNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let conn_str: String = ctx.inputs.get("connectionString")?;
+        let account: Access = ctx.inputs.get("account")?;
         let table: String = ctx.inputs.get("table")?;
         let values: Value = ctx.inputs.get("values")?;
 
@@ -51,9 +51,18 @@ impl Node for PostgresInsertRowNode {
         let params: Vec<Value> = obj.values().cloned().collect();
         let sql = insert_sql(&table, &columns)?;
 
-        let client = connect(&ctx, &conn_str).await?;
+        let conn = ctx.open(&account).await?;
+        let client = connect(&ctx, &conn).await?;
         let rows = query_json(&client, &sql, &params).await?;
-        let row = rows.into_iter().next().unwrap_or(json!({}));
+        // `RETURNING *` answers exactly one row for one inserted row;
+        // none means the insert was discarded (a rule or trigger on
+        // the table), and inventing an empty row would send a
+        // downstream node something that was never stored.
+        let Some(row) = rows.into_iter().next() else {
+            weft::node_bail!(
+                "the insert stored no row: the table has a rule or trigger that discarded it"
+            );
+        };
         ctx.pulse_downstream(NodeOutput::new().set("row", row)).await
     }
 }

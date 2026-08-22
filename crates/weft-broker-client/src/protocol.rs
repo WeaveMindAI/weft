@@ -506,10 +506,11 @@ pub struct InfraEndpointUrlResponse {
 /// billable and every cost record must be attributable to a firing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveConnectionRequest {
-    /// The requesting execution; the broker resolves + enforces the
-    /// owning tenant from it.
+    /// The requesting execution. The broker resolves the owning tenant
+    /// AND project from it and enforces both, so neither is taken from
+    /// this request: a credential policy that decides per project must
+    /// not be deciding on a name the worker chose.
     pub color: String,
-    pub project_id: String,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate, so anything the
     /// runtime later books against this connection (a measured cost)
@@ -538,6 +539,75 @@ pub struct ResolveConnectionRequest {
     /// and the runtime may retire it after (the crash backstop for a
     /// worker that dies without releasing).
     pub expected_duration_secs: u64,
+}
+
+/// A node handing out a connection to something it runs itself, and
+/// the question that precedes it ("did I already publish one?").
+/// `values` are the service's own declared fields, exactly what a
+/// person would have pasted; the store refuses anything else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishAccessRequest {
+    /// The publishing execution. The broker resolves the owning tenant
+    /// AND project from it, so neither is taken from this request.
+    pub color: String,
+    /// The publishing node. Its connection: publishing again updates
+    /// that one row, and terminating the node deletes it.
+    pub node_id: String,
+    pub service: String,
+    /// The service's own recipe, from the catalog the worker ships.
+    pub spec: weft_core::AccessSpec,
+    pub values: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// The published connection, as both publish verbs answer it. ONE
+/// shape, so a connection read back is the same value as the one just
+/// published (an identity that appeared on the first run and vanished
+/// on the second was the bug this shape prevents).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedConnection {
+    pub connection_id: String,
+    pub identity: Option<String>,
+}
+
+/// The reference the publisher gets back, to put on its output port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishAccessResponse {
+    pub connection: PublishedConnection,
+}
+
+/// "Which connection did this node publish for this service, if any?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishedAccessRequest {
+    pub color: String,
+    pub node_id: String,
+    pub service: String,
+}
+
+/// The answer: the published connection, or nothing published yet.
+///
+/// Two answers, told apart by a tag that must be THERE. An
+/// `Option<PublishedConnection>` field would not do: serde reads a
+/// missing key as `None`, so a peer that does not speak this shape
+/// would be understood as saying "nothing published" rather than
+/// failing. That is the difference between a node reading back the
+/// connection it holds and one asking a database for a password it
+/// already gave away, then telling its user the data is unreachable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PublishedAccessResponse {
+    Published { connection: PublishedConnection },
+    NothingPublished,
+}
+
+impl PublishedAccessResponse {
+    pub fn connection(self) -> Option<PublishedConnection> {
+        match self {
+            Self::Published { connection } => Some(connection),
+            Self::NothingPublished => None,
+        }
+    }
 }
 
 /// The worker handoff: EXACTLY the stored values the service's declared
@@ -1655,6 +1725,56 @@ mod supervisor_protocol_tests {
     use serde_json::json;
 
     #[test]
+    fn publish_access_round_trip() {
+        // The request carries no project: the broker resolves that
+        // from the execution, so a worker cannot name someone else's.
+        let spec: weft_core::AccessSpec = serde_json::from_value(json!({
+            "service": "postgres",
+            "acquisition": { "kind": "static", "fields": [{ "name": "host" }] },
+        }))
+        .unwrap();
+        let req = PublishAccessRequest {
+            color: "c1".into(),
+            node_id: "db".into(),
+            service: "postgres".into(),
+            spec,
+            values: [("host".to_string(), "db.svc".to_string())].into_iter().collect(),
+            label: Some("db".into()),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["color"], "c1");
+        assert_eq!(v["node_id"], "db");
+        assert_eq!(v["values"]["host"], "db.svc");
+        assert!(v.get("project_id").is_none(), "the project is never on the wire");
+
+        // Both verbs answer the SAME shape, so a connection read back
+        // is the same value as the one published.
+        let published: PublishAccessResponse = serde_json::from_value(json!({
+            "connection": { "connection_id": "id-1", "identity": "weft@db/app" },
+        }))
+        .unwrap();
+        assert_eq!(published.connection.connection_id, "id-1");
+        assert_eq!(published.connection.identity.as_deref(), Some("weft@db/app"));
+
+        // Each answer names itself, so a peer that does not speak
+        // this shape fails here rather than being read as the
+        // perfectly plausible "nothing published yet".
+        let none: PublishedAccessResponse =
+            serde_json::from_value(json!({ "state": "nothing_published" })).unwrap();
+        assert!(none.connection().is_none(), "nothing published yet");
+        assert!(
+            serde_json::from_value::<PublishedAccessResponse>(json!({})).is_err(),
+            "an untagged answer is refused, not read as nothing published"
+        );
+        let some: PublishedAccessResponse = serde_json::from_value(json!({
+            "state": "published",
+            "connection": { "connection_id": "id-1", "identity": null },
+        }))
+        .unwrap();
+        assert_eq!(some.connection().expect("a connection").connection_id, "id-1");
+    }
+
+    #[test]
     fn project_fetch_definition_round_trip() {
         let req = ProjectFetchDefinitionRequest {
             project_id: "p1".into(),
@@ -1829,7 +1949,6 @@ mod supervisor_protocol_tests {
     fn resolve_connection_request_round_trip() {
         let req = ResolveConnectionRequest {
             color: "c1".into(),
-            project_id: "p1".into(),
             node_id: "ask".into(),
             frames: vec![weft_core::LoopIteration { index: 3 }],
             node_type: "openrouter.inference".into(),
@@ -1846,7 +1965,9 @@ mod supervisor_protocol_tests {
         assert_eq!(
             v,
             json!({
-                "color": "c1", "project_id": "p1", "node_id": "ask",
+                // No project: the broker resolves it from the colour,
+                // so a worker never names one.
+                "color": "c1", "node_id": "ask",
                 "frames": [{"index": 3}], "node_type": "openrouter.inference",
                 "connection_id": "11111111-2222-3333-4444-555555555555",
                 "service": "openrouter",

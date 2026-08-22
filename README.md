@@ -130,7 +130,7 @@ weft/
 │   ├── live/           #   HTTP endpoints, websockets
 │   ├── logic/          #   Gate (conditional routing)
 │   ├── triggers/       #   Cron
-│   ├── whatsapp/       #   WhatsApp bridge + send/receive
+│   ├── bailey/         #   WhatsApp bridge + send/receive
 │   └── ...             #   Slack, GitHub, Google, storage, Telegram
 ├── crates/
 │   ├── weft-core/      #   Type system, pulse model, the Node trait

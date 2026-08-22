@@ -23,10 +23,11 @@ mod subscriptions;
 pub use crypt::{open_json, open_str, seal_json, seal_str};
 
 pub use flows::{
-    begin_oauth, begin_picker, complete_oauth, connect_direct, delete_grant, finish_picker,
-    list_grants, load_picker, sweep_expired_connects, take_connect_result, BeginOAuth,
-    BeginPicker, CompletedConnect, ConnectDirect, MintAppRequest, MintAppResponse, OAuthComplete,
-    PickerSession, SharedDoorPick, StartedOAuth,
+    begin_oauth, begin_picker, complete_oauth, connect_direct, delete_grant,
+    delete_published_grants, finish_picker, list_grants, load_picker, publish_grant,
+    published_grant, sweep_expired_connects, take_connect_result, BeginOAuth, BeginPicker,
+    CompletedConnect, ConnectDirect, MintAppRequest, MintAppResponse, OAuthComplete,
+    PickerSession, PublishAccess, PublishedGrant, SharedDoorPick, StartedOAuth,
 };
 pub use subscriptions::{
     drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
@@ -129,12 +130,29 @@ pub enum AccessError {
 /// `None` = internal: the edge logs the chain itself and answers 500
 /// without echoing detail. ONE mapping so every surface fronting the
 /// store (dispatcher and broker) answers identically.
-pub fn client_status(e: &anyhow::Error) -> Option<(u16, String)> {
+fn client_status(e: &anyhow::Error) -> Option<(u16, String)> {
     match e.downcast_ref::<AccessError>() {
         Some(AccessError::NotFound) => Some((404, format!("{e}"))),
         Some(AccessError::Invalid(_)) => Some((400, format!("{e}"))),
         Some(AccessError::NeedsReconnect { .. }) => Some((409, format!("{e}"))),
         None => None,
+    }
+}
+
+/// A store error as a surface should ANSWER it: the client-fixable
+/// classes keep their status and message, and anything else is logged
+/// here (with its cause chain, which the caller must not echo) and
+/// answered opaquely.
+///
+/// ONE definition, so the dispatcher and the broker cannot drift on
+/// what a store failure looks like or on what leaks with it.
+pub fn client_error(e: anyhow::Error) -> (u16, String) {
+    match client_status(&e) {
+        Some(answer) => answer,
+        None => {
+            tracing::error!(target: "weft_access_store", "access store error: {e:#}");
+            (500, "access store error".to_string())
+        }
     }
 }
 
@@ -211,12 +229,26 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- so routing filters on this against the verifying
             -- recipe's hash.
             events_recipe_hash TEXT,
+            -- Set ONLY on a connection a node published for something
+            -- it runs itself (`ctx.publish_access`): the id of that
+            -- node. NULL on every connection a person made, which is
+            -- what tells the two apart. A published connection is
+            -- owned by its node: republishing finds it instead of
+            -- making a second one, and terminating the node deletes
+            -- it, so it lives exactly as long as the thing it opens.
+            published_by_node TEXT,
             expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS access_grant_tenant_service
             ON access_grant (tenant_id, service);
+        -- A node publishes ONE connection per service it runs, so
+        -- republishing is a lookup on this key, and two racing runs
+        -- cannot leave two rows behind.
+        CREATE UNIQUE INDEX IF NOT EXISTS access_grant_published
+            ON access_grant (tenant_id, project_id, published_by_node, service)
+            WHERE published_by_node IS NOT NULL;
         -- The inbound-event lookup: an incoming push names a service
         -- and an account, and must find every connection to it
         -- without knowing a tenant (which is the point: the push

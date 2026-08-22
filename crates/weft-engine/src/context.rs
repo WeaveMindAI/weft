@@ -247,6 +247,16 @@ pub trait AccessBroker: Send + Sync {
         &self,
         req: &weft_broker_client::protocol::ReleaseConnectionRequest,
     ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse>;
+
+    async fn publish_access(
+        &self,
+        req: &weft_broker_client::protocol::PublishAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::PublishAccessResponse>;
+
+    async fn published_access(
+        &self,
+        req: &weft_broker_client::protocol::PublishedAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse>;
 }
 
 #[async_trait]
@@ -256,6 +266,20 @@ impl AccessBroker for weft_broker_client::client::BrokerAccessClient {
         req: &weft_broker_client::protocol::ResolveConnectionRequest,
     ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse> {
         self.resolve_connection(req).await
+    }
+
+    async fn publish_access(
+        &self,
+        req: &weft_broker_client::protocol::PublishAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::PublishAccessResponse> {
+        self.publish_access(req).await
+    }
+
+    async fn published_access(
+        &self,
+        req: &weft_broker_client::protocol::PublishedAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse> {
+        self.published_access(req).await
     }
 
     async fn release_connection(
@@ -282,6 +306,8 @@ pub struct FakeAccessBroker {
     /// The value maps of every release received, in order.
     pub released:
         std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>,
+    /// Every publish received, in order.
+    pub published: std::sync::Mutex<Vec<weft_broker_client::protocol::PublishAccessRequest>>,
 }
 
 #[cfg(test)]
@@ -292,6 +318,7 @@ impl FakeAccessBroker {
             connections: std::sync::Mutex::new(HashMap::new()),
             resolved: std::sync::Mutex::new(Vec::new()),
             released: std::sync::Mutex::new(Vec::new()),
+            published: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -359,6 +386,48 @@ impl AccessBroker for FakeAccessBroker {
     ) -> anyhow::Result<weft_broker_client::protocol::ReleaseConnectionResponse> {
         self.released.lock().unwrap().push(req.values.clone());
         Ok(weft_broker_client::protocol::ReleaseConnectionResponse {})
+    }
+
+    async fn publish_access(
+        &self,
+        req: &weft_broker_client::protocol::PublishAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::PublishAccessResponse> {
+        self.published.lock().unwrap().push(req.clone());
+        Ok(weft_broker_client::protocol::PublishAccessResponse {
+            connection: published_connection(&req.node_id, &req.service),
+        })
+    }
+
+    async fn published_access(
+        &self,
+        req: &weft_broker_client::protocol::PublishedAccessRequest,
+    ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse> {
+        let found = self
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.node_id == req.node_id && p.service == req.service);
+        Ok(match found {
+            true => weft_broker_client::protocol::PublishedAccessResponse::Published {
+                connection: published_connection(&req.node_id, &req.service),
+            },
+            false => weft_broker_client::protocol::PublishedAccessResponse::NothingPublished,
+        })
+    }
+}
+
+/// The one connection a node publishes, as the fake answers it from
+/// both verbs: publishing and reading back hand out the same value,
+/// which is the property production guarantees.
+#[cfg(test)]
+fn published_connection(
+    node_id: &str,
+    service: &str,
+) -> weft_broker_client::protocol::PublishedConnection {
+    weft_broker_client::protocol::PublishedConnection {
+        connection_id: format!("published-{node_id}-{service}"),
+        identity: Some(format!("{service} run by {node_id}")),
     }
 }
 
@@ -1412,6 +1481,11 @@ pub struct RunnerHandle {
     /// Broker-backed clients: journal writes, task enqueue, and
     /// infra reads (infra endpoint lookup) all flow through here.
     clients: EngineClients,
+    /// The recipe for the service THIS node publishes a connection to,
+    /// resolved by the compiler and carried on the node's definition.
+    /// `None` for the overwhelming majority of nodes, which publish
+    /// nothing.
+    published_service: Option<weft_core::AccessSpec>,
     /// k8s Pod name stamped on every journal write so the fencing
     /// trigger can reject writes from a Pod that has been drained or
     /// reaped.
@@ -1521,6 +1595,7 @@ impl RunnerHandle {
         node_type: String,
         node_frames: weft_core::frames::LoopFrames,
         clients: EngineClients,
+        published_service: Option<weft_core::AccessSpec>,
         pod_name: String,
         tenant_id: String,
         cancellation: Arc<CancellationFlag>,
@@ -1535,6 +1610,7 @@ impl RunnerHandle {
             node_type,
             node_frames,
             clients,
+            published_service,
             pod_name,
             tenant_id,
             cancellation,
@@ -1550,6 +1626,44 @@ impl RunnerHandle {
             caller_connection: None,
             opened_accesses: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The recipe this node publishes against, from its own metadata
+    /// (resolved by the compiler). The service is not something the
+    /// body says: it is declared once, in `publishes`, and read from
+    /// here, so a body and its metadata cannot disagree about it.
+    /// Wait for an address to answer, saying where the wait has got
+    /// to on THIS node's own output.
+    ///
+    /// The breadcrumb goes through the journal like any other node
+    /// log, so a run that is waiting on a slow workload says so where
+    /// the person watching it is already looking.
+    async fn wait_until_routable_logging(&self, url: &str, name: &str) -> WeftResult<()> {
+        let lines = std::sync::Mutex::new(Vec::<String>::new());
+        let outcome = wait_until_routable(
+            url,
+            name,
+            self.clients.clock.as_ref(),
+            self.cancellation.as_ref(),
+            &|line: String| lines.lock().expect("breadcrumbs").push(line),
+        )
+        .await;
+        // Shipped after the wait rather than inside it: the sink is
+        // called from a plain closure, and journaling is async.
+        for line in lines.into_inner().expect("breadcrumbs") {
+            self.log(LogLevel::Info, line).await?;
+        }
+        outcome
+    }
+
+    fn published_spec(&self) -> WeftResult<weft_core::AccessSpec> {
+        self.published_service.clone().ok_or_else(|| {
+            WeftError::Config(
+                "this node hands out a connection to a service it runs, but its metadata \
+                 does not say which: add `\"publishes\": \"<service>\"` to it"
+                    .to_string(),
+            )
+        })
     }
 
     /// Release every runtime-owned connection this firing opened (the
@@ -2350,14 +2464,16 @@ impl ContextHandle for RunnerHandle {
             .endpoint_url(&self.project_id, &self.node_id, name)
             .await
             .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
-        endpoint.ok_or_else(|| {
+        let url = endpoint.ok_or_else(|| {
             WeftError::Config(format!(
                 "endpoint '{}' for node '{}' is not available; either the infra isn't running \
                  or the endpoint name is not declared. Check `weft infra status` and the node's \
                  InfraSpec.endpoints list.",
                 name, self.node_id
             ))
-        })
+        })?;
+        self.wait_until_routable_logging(&url, &format!("endpoint '{name}'")).await?;
+        Ok(url)
     }
 
     async fn endpoint_call(
@@ -2379,9 +2495,34 @@ impl ContextHandle for RunnerHandle {
                 r
             }
         };
-        let resp = req.send().await.map_err(|e| {
-            WeftError::Runtime(anyhow::anyhow!("endpoint_call {url}: {e}"))
-        })?;
+        let Some(first) = req.try_clone() else {
+            return Err(WeftError::Runtime(anyhow::anyhow!(
+                "endpoint_call {url}: the request body cannot be retried"
+            )));
+        };
+        let resp = match first.send().await {
+            Ok(resp) => resp,
+            // A CONNECT failure means the address stopped answering
+            // between being resolved and being called, which is the
+            // same routing gap `ctx.endpoint` waits out and the same
+            // way out: wait for it to come back, then ask once more.
+            // A handle is resolved once and used across several
+            // calls, so the workload restarting mid-run lands here
+            // rather than at resolution.
+            //
+            // Only a connect failure. A refusal from the service, a
+            // timeout, a TLS failure: those are ANSWERS, and they
+            // surface immediately.
+            Err(e) if e.is_connect() => {
+                self.wait_until_routable_logging(base, "this node's own service").await?;
+                req.send().await.map_err(|e| {
+                    WeftError::Runtime(anyhow::anyhow!("endpoint_call {url}: {e}"))
+                })?
+            }
+            Err(e) => {
+                return Err(WeftError::Runtime(anyhow::anyhow!("endpoint_call {url}: {e}")))
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -2441,6 +2582,49 @@ impl ContextHandle for RunnerHandle {
         Ok(())
     }
 
+    async fn publish_access(
+        &self,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> WeftResult<weft_core::access::Access> {
+        let spec = self.published_spec()?;
+        let service = spec.service.clone();
+        let req = weft_broker_client::protocol::PublishAccessRequest {
+            color: self.color.to_string(),
+            node_id: self.node_id.clone(),
+            service: service.clone(),
+            spec,
+            values,
+            // The connection list's middle column. The node id reads
+            // as what it is: the thing in this project that opened it.
+            label: Some(self.node_id.clone()),
+        };
+        let resp = self.clients.access_broker.publish_access(&req).await.map_err(|e| {
+            WeftError::NodeExecution(format!("publish the '{service}' connection: {e:#}"))
+        })?;
+        Ok(weft_core::access::Access::new(
+            resp.connection.connection_id,
+            service,
+            resp.connection.identity,
+        ))
+    }
+
+    async fn published_access(&self) -> WeftResult<Option<weft_core::access::Access>> {
+        let service = self.published_spec()?.service.clone();
+        let req = weft_broker_client::protocol::PublishedAccessRequest {
+            color: self.color.to_string(),
+            node_id: self.node_id.clone(),
+            service: service.clone(),
+        };
+        let resp = self.clients.access_broker.published_access(&req).await.map_err(|e| {
+            WeftError::NodeExecution(format!(
+                "look up the '{service}' connection this node published: {e:#}"
+            ))
+        })?;
+        Ok(resp
+            .connection()
+            .map(|c| weft_core::access::Access::new(c.connection_id, service, c.identity)))
+    }
+
     async fn open_connection(
         &self,
         access: &weft_core::access::Access,
@@ -2449,7 +2633,6 @@ impl ContextHandle for RunnerHandle {
         let service = access.service().to_string();
         let req = weft_broker_client::protocol::ResolveConnectionRequest {
             color: self.color.to_string(),
-            project_id: self.project_id.clone(),
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
             node_type: self.node_type.clone(),
@@ -2710,6 +2893,132 @@ async fn enqueue_register_signal_task(
     }
 }
 
+/// Gap between connection attempts while waiting for an endpoint's
+/// address to start answering.
+const ENDPOINT_ROUTABLE_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+/// How often a wait that is still going says so. Long enough not to
+/// fill the log, short enough that a stuck endpoint is visible in the
+/// node's own output rather than guessed at.
+const ENDPOINT_WAITING_BREADCRUMB: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Hold an endpoint's address back until something is actually
+/// answering on it, then hand it over.
+///
+/// A workload is marked ready BEFORE the cluster writes the routing
+/// rules that make its address answer, so anything that dials the
+/// instant weft reports the infra running lands in that gap and gets
+/// its connection refused. Waiting where a node RESOLVES an address
+/// means the guarantee holds for whatever it speaks next: HTTP, a
+/// database protocol, a raw socket. A node author never sees this,
+/// which is the point.
+///
+/// Only the reachability of the address is waited on, by opening a TCP
+/// connection and dropping it: nothing is sent, so this says nothing
+/// about the service being READY, which is what its own readiness
+/// probe is for. A UDP endpoint is handed over unchecked, having
+/// nothing to connect to; an address that is not a URL with a host
+/// and a port is refused.
+///
+/// NO deadline. An address is handed out as soon as the infra is
+/// APPLIED, which is before the container has finished booting, so
+/// what this waits on is the user's own workload starting: an image
+/// pull, a database initialising its files. Putting a bound on that
+/// would fail somebody's node for having a slow first boot. The wait
+/// says where it has got to every so often, and ends the moment the
+/// execution is cancelled, which is what `weft stop` and Ctrl+C do.
+async fn wait_until_routable(
+    url: &str,
+    name: &str,
+    clock: &dyn weft_platform_traits::clock::Clock,
+    cancel: &CancellationFlag,
+    say: &(dyn Fn(String) + Send + Sync),
+) -> WeftResult<()> {
+    let Some(address) = weft_core::context::endpoint_socket_address(url)? else {
+        return Ok(());
+    };
+    wait_until_answering(&address, clock, cancel, name, say, |address| async move {
+        // A blackholed address (SYNs dropped rather than refused)
+        // would otherwise sit in one connect for the kernel's whole
+        // retry schedule.
+        match tokio::time::timeout(
+            ENDPOINT_ROUTABLE_RETRY * 4,
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("the address accepted no connection in time".to_string()),
+        }
+    })
+    .await
+    .map_err(|last| {
+        // The only way out of this wait is cancellation, and the
+        // engine already has one word for that. Reporting it as a
+        // runtime failure would make a stopped run look like a broken
+        // one.
+        tracing::info!(
+            target: "weft_engine::endpoint",
+            endpoint = %name,
+            address = %address,
+            last_error = %last,
+            "gave up waiting for this node's own service: the execution was cancelled"
+        );
+        WeftError::Cancelled
+    })
+}
+
+/// Try `dial` until it succeeds or the execution is cancelled,
+/// resting on the clock in between and saying where it has got to
+/// every so often.
+///
+/// The dialling is a parameter so the waiting can be tested for what
+/// it promises (it returns the instant the address answers, it keeps
+/// going for as long as the workload takes, it ends on cancellation)
+/// without opening a socket, which would put the test back at the
+/// mercy of whether the host refuses a dead port or silently drops
+/// it.
+async fn wait_until_answering<F, Fut>(
+    address: &str,
+    clock: &dyn weft_platform_traits::clock::Clock,
+    cancel: &CancellationFlag,
+    name: &str,
+    say: &(dyn Fn(String) + Send + Sync),
+    dial: F,
+) -> Result<(), String>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let started = clock.now();
+    let mut said = started;
+    let mut last;
+    loop {
+        match dial(address.to_string()).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+        if cancel.is_cancelled() {
+            return Err(last);
+        }
+        // Waiting silently for a workload that never comes up is the
+        // shape that leaves someone staring at a stalled run with
+        // nothing to go on. Said on the NODE's own output, which is
+        // where they are already looking, not only in a pod log they
+        // would have to know to go and find.
+        if clock.now().duration_since(said) >= ENDPOINT_WAITING_BREADCRUMB {
+            said = clock.now();
+            let waited = clock.now().duration_since(started).as_secs();
+            say(format!(
+                "waiting for {name} at {address} to start answering ({waited}s so far; last \
+                 attempt: {last}). It answers once the workload has finished starting. \
+                 `weft stop` ends the run."
+            ));
+        }
+        clock.sleep(ENDPOINT_ROUTABLE_RETRY).await;
+    }
+}
+
 /// Process-wide `reqwest::Client` for the engine's outbound HTTP
 /// (endpoint calls + storage put_from_url fetches). One per worker
 /// process so the connection pool stays warm across calls inside a
@@ -2812,6 +3121,7 @@ mod replay_tests {
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
+            None,
             "pod-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
@@ -2843,6 +3153,7 @@ mod replay_tests {
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
+            None,
             "pod-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
@@ -3102,6 +3413,7 @@ mod replay_tests {
             "OpensConnection".into(),
             weft_core::frames::LoopFrames::default(),
             worker_clients,
+            None,
             "worker-pod-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
@@ -3127,6 +3439,7 @@ mod replay_tests {
         };
         let runner = crate::test_rig::LiveTestRunner::new(
             test_clients,
+            test_catalog(),
             "test-pod-1".into(),
             "tenant-1".into(),
             "project-1".into(),
@@ -3143,8 +3456,10 @@ mod replay_tests {
         assert_eq!(w.len(), 1, "worker resolves once");
         assert_eq!(t.len(), 1, "test resolves once");
         let (w, t) = (&w[0], &t[0]);
+        // The colour is the whole scope: the broker resolves the
+        // tenant and the project from it, so a matching colour IS a
+        // matching project.
         assert_eq!(w.color, t.color, "same execution color -> same broker tenant/owner gate");
-        assert_eq!(w.project_id, t.project_id, "same project scope");
         assert_eq!(w.service, t.service, "same service");
         assert_eq!(w.connection_id, t.connection_id, "same grant");
         assert_eq!(
@@ -3315,6 +3630,26 @@ mod replay_tests {
                 outcome_message: None,
             })
         }
+    }
+
+    /// A catalog with no nodes: these tests never publish, and a node
+    /// it cannot find declares nothing, which is the honest answer for
+    /// an empty catalog.
+    ///
+    /// Gated like its one caller, which builds a handle only when the
+    /// node-test surface is compiled in.
+    #[cfg(feature = "node-tests")]
+    fn test_catalog() -> &'static dyn weft_core::NodeCatalog {
+        struct Empty;
+        impl weft_core::NodeCatalog for Empty {
+            fn lookup(&self, _node_type: &str) -> Option<&'static dyn weft_core::node::Node> {
+                None
+            }
+            fn all(&self) -> Vec<&'static str> {
+                Vec::new()
+            }
+        }
+        &Empty
     }
 
     struct NoopProject;
@@ -4359,5 +4694,136 @@ mod bus_pump_tests {
         let w = coord.enter_wait(&a, &bus);
         // A different (never-minted) id must not address this node's wait.
         coord.observed(&a, w + 999);
+    }
+}
+
+
+/// The endpoint-address wait: an infra address is handed to a node
+/// only once something answers on it.
+///
+/// No sockets here. Whether a dead port is REFUSED or silently
+/// dropped is the host's choice, and a test that binds one is really
+/// testing the machine it runs on. The dialling is a parameter
+/// precisely so these can drive it.
+#[cfg(test)]
+mod endpoint_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use weft_core::CancellationFlag;
+    use weft_platform_traits::clock::FakeClock;
+
+    /// A sink the tests ignore. The one test that cares about
+    /// breadcrumbs collects them instead.
+    fn say(_: String) {}
+
+    /// The gap this covers is real: an address that is not routable
+    /// YET must be waited out, and the wait must end the moment
+    /// something answers there.
+    #[tokio::test]
+    async fn an_endpoint_is_held_back_until_something_answers_on_it() {
+        let attempts = AtomicUsize::new(0);
+        let clock = FakeClock::new();
+        let cancel = CancellationFlag::new();
+        super::wait_until_answering("db.svc:5432", clock.as_ref(), &cancel, "sql", &say, |_| async {
+            // Refused twice, exactly like a workload still booting,
+            // then answering.
+            match attempts.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err("connection refused".to_string()),
+                _ => Ok(()),
+            }
+        })
+        .await
+        .expect("the wait ends when the address starts answering");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3, "it stopped the moment it got an answer");
+    }
+
+    /// A workload that takes a long time to boot is WAITED for, not
+    /// failed. There is no bound to hit: the address is handed out as
+    /// soon as the infra is applied, so what this waits on is the
+    /// user's own container starting, and no number is the right
+    /// number to give up at.
+    #[tokio::test]
+    async fn a_slow_workload_is_waited_for_however_long_it_takes() {
+        let attempts = AtomicUsize::new(0);
+        let clock = FakeClock::new();
+        let cancel = CancellationFlag::new();
+        // Far past any deadline this used to have.
+        let slow = 10_000;
+        super::wait_until_answering("db.svc:5432", clock.as_ref(), &cancel, "sql", &say, |_| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) < slow {
+                Err("connection refused".to_string())
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .expect("a slow boot is not a failure");
+        assert_eq!(attempts.load(Ordering::SeqCst), slow + 1);
+    }
+
+    /// Stopping the execution ends the wait. That is the way out of a
+    /// workload that never comes up, and why not having a deadline is
+    /// safe rather than a hang.
+    #[tokio::test]
+    async fn cancelling_the_execution_ends_the_wait() {
+        let clock = FakeClock::new();
+        let cancel = Arc::new(CancellationFlag::new());
+        let armed = cancel.clone();
+        let attempts = AtomicUsize::new(0);
+        let last = super::wait_until_answering(
+            "db.svc:5432",
+            clock.as_ref(),
+            &cancel,
+            "sql",
+            &say,
+            |_| {
+                // Cancelled while the very first attempt is in flight,
+                // exactly as `weft stop` would.
+                armed.cancel();
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err("connection refused".to_string()) }
+            },
+        )
+        .await
+        .expect_err("a cancelled wait gives up");
+        assert_eq!(last, "connection refused", "and says what it last saw");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "without trying again");
+    }
+
+    /// A wait that is taking a while SAYS SO, on the node's own
+    /// output, naming how long it has waited and the way out. A silent
+    /// stall is the thing a user cannot act on.
+    #[tokio::test]
+    async fn a_long_wait_says_where_it_has_got_to() {
+        let clock = FakeClock::new();
+        let cancel = CancellationFlag::new();
+        let said = std::sync::Mutex::new(Vec::<String>::new());
+        let attempts = AtomicUsize::new(0);
+        // Long enough to cross the breadcrumb interval several times.
+        let slow = 1_000;
+        super::wait_until_answering(
+            "db.svc:5432",
+            clock.as_ref(),
+            &cancel,
+            "endpoint 'sql'",
+            &|line: String| said.lock().expect("said").push(line),
+            |_| async {
+                if attempts.fetch_add(1, Ordering::SeqCst) < slow {
+                    Err("connection refused".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("a slow boot is not a failure");
+
+        let said = said.into_inner().expect("said");
+        assert!(!said.is_empty(), "a long wait must not be silent");
+        let first = &said[0];
+        assert!(first.contains("endpoint 'sql'"), "it names the endpoint: {first}");
+        assert!(first.contains("db.svc:5432"), "and the address: {first}");
+        assert!(first.contains("weft stop"), "and the way out: {first}");
     }
 }

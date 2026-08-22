@@ -1582,3 +1582,222 @@ async fn a_finished_pick_lands_its_grants_on_the_row(pool: PgPool) {
     assert_eq!(scopes, vec!["base.read".to_string(), "drive.file".to_string()]);
     assert!(!row.permissions_verified, "the pick never upgrades verification");
 }
+
+// ---------- Published connections (a node opens what it runs) ----------
+
+/// The recipe a node publishes against: settings only, no provider
+/// behind it, which is exactly what the store insists on.
+fn published_spec() -> AccessSpec {
+    serde_json::from_value(json!({
+        "service": "selfrun",
+        "acquisition": { "kind": "static", "fields": [
+            { "name": "host" },
+            { "name": "password" },
+            { "name": "port", "optional": true },
+        ]},
+        "identity": "{host}"
+    }))
+    .unwrap()
+}
+
+fn publish(values: &[(&str, &str)]) -> weft_access_store::PublishAccess {
+    weft_access_store::PublishAccess {
+        spec: published_spec(),
+        project_id: "project-1".into(),
+        node_id: "db".into(),
+        values: values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        label: Some("db".into()),
+    }
+}
+
+/// A node's connection is keyed by the NODE, not the moment: it
+/// publishes once and updates thereafter, so a database that keeps
+/// answering on a new address never leaves a second connection behind.
+#[sqlx::test]
+async fn publishing_twice_updates_one_connection(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let first = weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        publish(&[("host", "db.old"), ("password", "p")]),
+    )
+    .await
+    .expect("first publish");
+
+    let second = weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        publish(&[("host", "db.new"), ("password", "p")]),
+    )
+    .await
+    .expect("second publish");
+
+    assert_eq!(first.grant.id, second.grant.id, "the node's one connection, updated");
+    assert_eq!(second.grant.identity.as_deref(), Some("db.new"));
+    assert_eq!(list_grants(&pool, TENANT_A, Some("selfrun")).await.unwrap().len(), 1);
+
+    let found = weft_access_store::published_grant(&pool, TENANT_A, "project-1", "db", "selfrun")
+        .await
+        .expect("look up")
+        .expect("the node finds what it published");
+    assert_eq!(found.id, first.grant.id);
+    assert!(
+        weft_access_store::published_grant(&pool, TENANT_A, "project-1", "other", "selfrun")
+            .await
+            .unwrap()
+            .is_none(),
+        "another node published nothing"
+    );
+}
+
+/// The shapes a published recipe may not have. Each one would later
+/// have weft act on a third party's behalf for a service that has no
+/// third party, and the values arrive from a worker.
+#[sqlx::test]
+async fn a_published_recipe_describes_something_the_project_runs(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let refused = |spec: serde_json::Value| {
+        let mut req = publish(&[("host", "db"), ("password", "p")]);
+        req.spec = serde_json::from_value(spec).unwrap();
+        req
+    };
+
+    let e = weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        refused(json!({
+            "service": "selfrun",
+            "acquisition": { "kind": "static", "fields": [{ "name": "host" }, { "name": "password" }] },
+            "events": { "push": {
+                "fields": { "id": "body.id" },
+                "account": { "value": "host", "path": "body.host" },
+                "webhook": {
+                    "verify": { "kind": "hmac",
+                                "signature_header": "X-Sig",
+                                "concat": "{body}" }
+                }
+            }},
+        })),
+    )
+    .await
+    .expect_err("a service that reports provider events");
+    assert!(e.to_string().contains("provider events"), "{e}");
+
+    let e = weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        refused(json!({
+            "service": "selfrun",
+            "acquisition": { "kind": "static", "fields": [{ "name": "host" }, { "name": "password" }] },
+            "test": { "url": "http://example.invalid/whoami" },
+        })),
+    )
+    .await
+    .expect_err("a connect-time call");
+    assert!(e.to_string().contains("connect-time check"), "{e}");
+
+    // The shape a worker would actually reach for: a recipe with a
+    // real provider behind it, whose token URL the control plane
+    // would then be the one to call.
+    let e = weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        refused(json!({
+            "service": "selfrun",
+            "acquisition": {
+                "kind": "oauth2",
+                "grant": { "kind": "client_credentials" },
+                "token_url": "http://attacker.invalid/token",
+            },
+        })),
+    )
+    .await
+    .expect_err("a service acquired through a provider");
+    assert!(e.to_string().contains("acquired another way"), "{e}");
+
+    // A value the service does not declare is refused on the publish
+    // path too, not only where a person pastes one.
+    let mut extra = publish(&[("host", "db"), ("password", "p")]);
+    extra.values.insert("hostname".into(), "db".into());
+    let e = weft_access_store::publish_grant(&pool, TENANT_A, extra)
+        .await
+        .expect_err("an undeclared value");
+    assert!(e.to_string().contains("no value named 'hostname'"), "{e}");
+
+    // A blank required value is missing, not stored: an empty password
+    // would fail at the database instead of here.
+    let e = weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        publish(&[("host", "db"), ("password", "  ")]),
+    )
+    .await
+    .expect_err("a blank password");
+    assert!(e.to_string().contains("'password' is required"), "{e}");
+
+    assert!(
+        list_grants(&pool, TENANT_A, Some("selfrun")).await.unwrap().is_empty(),
+        "nothing refused was written"
+    );
+}
+
+/// Cleanup takes the node's connections and leaves a person's alone,
+/// whether one node goes or the whole project does.
+#[sqlx::test]
+async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        publish(&[("host", "db"), ("password", "p")]),
+    )
+    .await
+    .expect("publish");
+
+    // A person's connection in the same project, for the same service.
+    let spec = published_spec();
+    let theirs = connect_direct(
+        &pool,
+        TENANT_A,
+        ConnectDirect {
+            spec,
+            door: Door::Own,
+            values: [("host".to_string(), "elsewhere".to_string()),
+                     ("password".to_string(), "p".to_string())]
+                .into_iter()
+                .collect(),
+            label: Some("mine".into()),
+            permissions: vec![],
+            registration: None,
+            paste: false,
+            project_id: Some("project-1".into()),
+        },
+    )
+    .await
+    .expect("a person connects one too");
+
+    let dropped =
+        weft_access_store::delete_published_grants(&pool, TENANT_A, "project-1", Some("db"))
+            .await
+            .expect("delete for one node");
+    assert_eq!(dropped, 1);
+    let left = list_grants(&pool, TENANT_A, Some("selfrun")).await.unwrap();
+    assert_eq!(left.len(), 1, "the person's connection stays");
+    assert_eq!(left[0].id, theirs.grant.id);
+
+    // The project-wide sweep is the same rule with no node named.
+    weft_access_store::publish_grant(
+        &pool,
+        TENANT_A,
+        publish(&[("host", "db"), ("password", "p")]),
+    )
+    .await
+    .expect("publish again");
+    let dropped = weft_access_store::delete_published_grants(&pool, TENANT_A, "project-1", None)
+        .await
+        .expect("delete for the project");
+    assert_eq!(dropped, 1);
+    let left = list_grants(&pool, TENANT_A, Some("selfrun")).await.unwrap();
+    assert_eq!(left.len(), 1, "still only the person's");
+    assert_eq!(left[0].id, theirs.grant.id);
+}

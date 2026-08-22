@@ -1,0 +1,35 @@
+# A Postgres the project runs itself. The database node brings the
+# server up and hands out a connection; the query nodes use that
+# connection like any other, without a password anywhere in the graph.
+#
+# The three statements run in order because each one waits on the
+# previous one's rows: create the table (idempotent, so a second run
+# is a no-op), write a row, then read back exactly the row that was
+# written. The read's `$1` is the row the write returned, so the value
+# has to survive the whole way out to weft and back into the database.
+#
+# The `params` edges into `write` and `read` are what ORDER them; a
+# statement's placeholder count has to match what its edge carries, so
+# `create` must keep returning no rows and `write` exactly one.
+
+db = PostgresDatabase
+
+create = PostgresExecuteQuery {
+  query: "CREATE TABLE IF NOT EXISTS notes (id serial primary key, body text)"
+}
+create.account = db.access
+
+write = PostgresExecuteQuery {
+  query: "INSERT INTO notes (body) VALUES ('__E2E_BODY__') RETURNING body"
+}
+write.account = db.access
+write.params = create.rows
+
+read = PostgresExecuteQuery {
+  query: "SELECT body FROM notes WHERE body = ($1::jsonb ->> 'body') ORDER BY id"
+}
+read.account = db.access
+read.params = write.rows
+
+out = Debug
+out.data = read.rows

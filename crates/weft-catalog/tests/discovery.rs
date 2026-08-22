@@ -124,6 +124,54 @@ fn duplicate_node_type_is_hard_error() {
     }
 }
 
+/// Two nodes claiming the same SERVICE is ambiguous the same way two
+/// claiming one type is: everything that stores or publishes a
+/// connection finds the service by name alone, so a second claimant
+/// would make that a coin toss.
+///
+/// The names in the message are pinned too. The walk decides who is
+/// the original by arriving there first, and the filesystem's own
+/// order is not the tree's, so an unsorted walk would blame a
+/// different node per machine.
+#[test]
+fn duplicate_service_is_hard_error() {
+    fn write_service_node(dir: &Path, node_type: &str, service: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("metadata.json"),
+            format!(
+                r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "",
+                      "inputs": [{{ "name": "account", "type": "Access",
+                                    "exposure": "config",
+                                    "widget": {{ "kind": "access" }} }}],
+                      "outputs": [],
+                      "service": {{ "service": "{service}",
+                                    "acquisition": {{ "kind": "static",
+                                                      "fields": [{{ "name": "host" }}] }} }} }}"#
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("mod.rs"), "// node impl\n").unwrap();
+    }
+
+    for _ in 0..8 {
+        let tmp = tempfile::tempdir().unwrap();
+        let nodes = tmp.path().join("nodes");
+        write_service_node(&nodes.join("bbb"), "Second", "shared");
+        write_service_node(&nodes.join("aaa"), "First", "shared");
+
+        let err = FsCatalog::discover(&nodes).expect_err("service collision must error");
+        match err {
+            CatalogError::ServiceCollision { service, first, second } => {
+                assert_eq!(service, "shared");
+                assert_eq!(first, "First", "the node the walk reaches first, every time");
+                assert_eq!(second, "Second");
+            }
+            other => panic!("expected ServiceCollision, got {other:?}"),
+        }
+    }
+}
+
 /// A package with no member nodes (no subdir with metadata.json) is an
 /// error: an empty package is almost certainly a mistake.
 #[test]

@@ -11,14 +11,16 @@
   "color": "#336791",
   "inputs": [
     {
-      "name": "connectionString",
-      "type": "String",
+      "name": "account",
+      "type": "Access",
       "required": true,
-      "widget": {
-        "kind": "password"
-      },
-      "label": "Connection string",
-      "placeholder": "postgres://user:password@host:5432/db"
+      "requiresValues": [
+        "host",
+        "database",
+        "user",
+        "password"
+      ],
+      "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output)."
     },
     {
       "name": "table",
@@ -38,7 +40,7 @@
       "name": "row",
       "type": "JsonDict",
       "required": false,
-      "description": "The inserted row as the database stored it."
+      "description": "The inserted row as the database stored it. The node fails rather than emitting nothing: if the table has a rule or trigger that discards the insert, no row was stored and there is nothing to pass on."
     }
   ],
   "features": {

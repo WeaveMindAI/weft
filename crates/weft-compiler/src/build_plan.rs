@@ -116,7 +116,7 @@ pub fn plan_build_from(
     // from the already-resolved definition. `build_project` does NOT recompile
     // from source: it validates + codegens this definition, whose `@asset`
     // refs the caller already resolved into concrete file values.
-    let staged = crate::build::build_project(project, definition, catalog, true, builder_base_image)?;
+    let staged = crate::build::build_project(project, definition, catalog, builder_base_image)?;
     let binary_hash = staged.content_hash.clone();
 
     let mut images = vec![PlannedImage {

@@ -5,7 +5,7 @@
 //! authoritative hashes here before staging the build context. One definition, no
 //! two-hashers-drift hazard.
 //!
-//! Four project-level hashes split the user-visible drift signals
+//! Three project-level hashes split the user-visible drift signals
 //! cleanly along their reason for changing, plus one pure content hash
 //! of the uploaded source set (`compute_source_hash`) used as the
 //! create-time storage key + build-dedup key BEFORE any compile:
@@ -58,7 +58,13 @@
 //!       The engine runs InfraSetup; engine or toolchain changes can
 //!       change the running infra's behavior.
 //!
-//! Plus one per-image hash kept as docker-tag plumbing only:
+//! Two per-PACKAGE hashes cover node-test staleness rather than
+//! project drift, documented on their own functions:
+//! `compute_node_test_hash` (is a package's cached test
+//! binary/image current) and `compute_node_test_outcome_hash` (can a
+//! recorded live-tier pass still be trusted).
+//!
+//! Plus two hashes that are docker-tag plumbing only:
 //!
 //! - **`compute_image_hash`**: per-image source dir hash. Used as the
 //!   docker image tag suffix with the FULL content hash
@@ -66,6 +72,12 @@
 //!   `image_set::infra_image_tag`, matching the worker tag's full-hash
 //!   form) so a stale image source produces a fresh image. NOT a drift
 //!   signal anymore: drift is the project-level `infra_hash` exclusively.
+//!
+//! - **`compute_builder_base_hash`**: global (not per project) hash of
+//!   the worker build environment, tagging the shared
+//!   `weft-builder-base:<hash>` image. Shares its inputs with the
+//!   binary and infra hashes, so an edit to the engine or the
+//!   toolchain moves all three together.
 //!
 //! Implementation note: SHA-256 hex-encoded. Hash inputs are ordered
 //! deterministically (sorted file walks, sorted node lists), so the
@@ -111,6 +123,13 @@ pub type SourceHash = String;
 ///   `includePath` (an interface-parse-only pointer to an `@include`d file;
 ///   the file's PATH is non-semantic, its expanded topology is what runs).
 /// - per edge: `span`. Per group: `span` / `headerSpan`.
+///
+/// `publishedService` IS hashed, and it is the one enriched field that
+/// carries ANOTHER node's metadata (the recipe a publishing node hands
+/// connections out against). It has to be: the worker reads the recipe
+/// from the definition, and no other hash covers a node the project's
+/// graph does not reference. The cost is that editing that recipe, even
+/// cosmetically, flips this hash for every project that publishes it.
 pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<SourceHash> {
     let mut hasher = Sha256::new();
     hasher.update(b"weft-definition-v1\n");

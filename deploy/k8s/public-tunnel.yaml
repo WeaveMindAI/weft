@@ -25,8 +25,6 @@
 #         hostname (the token rides the weft-tunnel-token Secret). The
 #         hostname -> proxy routing lives in the tunnel's Cloudflare
 #         dashboard config.
-# SYNC: weft-public-proxy locations <-> weavemind/setup-cloud.sh
-#       ensure_public_tunnel (the same allowlist, host-container form)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -36,6 +34,20 @@ data:
   default.conf: |
     server {
       listen 8080;
+      # Resolve the dispatcher PER REQUEST, not at startup. nginx
+      # resolves a literal hostname in proxy_pass once, while reading
+      # its config, and refuses to start at all when that name does not
+      # exist yet. The dispatcher is applied AFTER this proxy (its
+      # manifest needs the tunnel's address, which only exists once the
+      # tunnel is up), so on a fresh cluster a literal upstream would
+      # crash-loop the proxy forever. Going through a variable defers
+      # the lookup to request time, so this proxy starts whether or
+      # not the dispatcher exists yet. A request arriving before it
+      # does gets a 502 and a resolve failure in this log, instead of
+      # a crash-looping pod that blocks the whole install. The
+      # resolver is the cluster's own DNS.
+      resolver ${CLUSTER_DNS} valid=10s ipv6=off;
+      set $dispatcher http://weft-dispatcher.weft-system.svc.cluster.local:9999;
       # Provider pushes can be sizeable (a queue envelope with an
       # encoded event); match the dispatcher's own public fire cap.
       client_max_body_size 2m;
@@ -43,13 +55,13 @@ data:
       # dispatcher sees the real client and the tunnel's https, not
       # "the proxy pod over http".
       location /events/ {
-        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_pass $dispatcher;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
       }
       location /signal/ {
-        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_pass $dispatcher;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
@@ -59,7 +71,7 @@ data:
       # the path is the credential; the route answers 404 for anything
       # else, same trust shape as the fire tokens above.
       location /public/files/ {
-        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_pass $dispatcher;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
@@ -70,7 +82,7 @@ data:
       # reachable from outside; the code in the query is a one-time
       # single-use grant the dispatcher validates.
       location = /access/oauth/callback {
-        proxy_pass http://weft-dispatcher.weft-system.svc.cluster.local:9999;
+        proxy_pass $dispatcher;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;

@@ -31,6 +31,7 @@ use weft_broker_client::protocol::{
     SubscriptionEnsureResponse,
 };
 
+use crate::handlers::internal;
 use crate::auth::{AuthedCaller, Role};
 use crate::state::BrokerState;
 
@@ -46,10 +47,6 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         .route("/v1/events/verify", post(events_verify))
 }
 
-fn internal<E: std::fmt::Display>(e: E) -> ApiError {
-    tracing::error!(target: "weft_broker::events", "internal: {e:#}");
-    (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
-}
 
 fn listener_only(caller: &crate::auth::CallerIdentity) -> Result<(), ApiError> {
     if caller.role != Role::Listener {
@@ -92,7 +89,7 @@ async fn listener_resolve(
         &req.required_values,
     )
     .await
-    .map_err(store_err)?;
+    .map_err(crate::handlers::store_err)?;
     // The store's answer IS the wire shape: one definition, no copy.
     Ok(Json(source))
 }
@@ -133,7 +130,7 @@ async fn subscription_ensure(
         },
     )
     .await
-    .map_err(store_err)?;
+    .map_err(crate::handlers::store_err)?;
     Ok(Json(SubscriptionEnsureResponse {
         expires_at_unix: ensured.expires_at.map(|t| t.timestamp()),
     }))
@@ -150,17 +147,8 @@ async fn subscription_drop(
     let dropped =
         weft_access_store::drop_subscriptions_for_signal(&state.pool, &req.tenant, &req.signal_token)
             .await
-            .map_err(store_err)?;
+            .map_err(crate::handlers::store_err)?;
     Ok(Json(serde_json::json!({ "dropped": dropped })))
-}
-
-fn store_err(e: anyhow::Error) -> ApiError {
-    match weft_access_store::client_status(&e) {
-        Some((status, msg)) => {
-            (StatusCode::from_u16(status).expect("store status codes are valid"), msg)
-        }
-        None => internal(e),
-    }
 }
 
 // ---------- The receive surface ----------

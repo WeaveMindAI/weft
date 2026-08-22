@@ -243,6 +243,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         group_boundary: None,
         requires_infra: false,
         images: Vec::new(),
+        published_service: None,
         span: None,
         header_span: None,
         config_spans: Default::default(),

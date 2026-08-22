@@ -47,21 +47,6 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         .route("/v1/access/admin/picker-token", post(picker_token))
 }
 
-/// Map a store error: client-fixable classes keep their status and
-/// message (the dispatcher relays them verbatim to the editor), the
-/// rest logs here and answers an opaque 500.
-fn access_err(e: anyhow::Error) -> ApiError {
-    match weft_access_store::client_status(&e) {
-        Some((status, msg)) => {
-            (StatusCode::from_u16(status).expect("store status codes are valid"), msg)
-        }
-        None => {
-            tracing::error!(target: "weft_broker::access_admin", "access store error: {e:#}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "access store error".into())
-        }
-    }
-}
-
 /// A shared-door failure is caller-fixable configuration (the fix is
 /// the apps file or picking the other door): keep the message.
 fn shared_app_err(e: anyhow::Error) -> ApiError {
@@ -151,7 +136,7 @@ async fn connect_direct(
     weft_access_store::connect_direct(&state.pool, &req.tenant, inner)
         .await
         .map(Json)
-        .map_err(access_err)
+        .map_err(crate::handlers::store_err)
 }
 
 /// POST /v1/access/admin/oauth/begin: park a pending browser consent
@@ -172,7 +157,7 @@ async fn oauth_begin(
     weft_access_store::begin_oauth(&state.pool, &req.tenant, inner)
         .await
         .map(Json)
-        .map_err(access_err)
+        .map_err(crate::handlers::store_err)
 }
 
 /// The door probe's request: the service's spec (for the catalogue the
@@ -204,7 +189,7 @@ async fn doors(
     // before any connection exists.
     weft_access_store::record_events_recipes(&state.pool, &q.spec)
         .await
-        .map_err(access_err)?;
+        .map_err(crate::handlers::store_err)?;
     if !q.spec.doors.contains(&Door::Shared) {
         return Ok(Json(DoorsAnswer { shared_apps: vec![], shared_credential: false }));
     }
@@ -316,7 +301,7 @@ async fn oauth_complete(
     weft_access_store::complete_oauth(&state.pool, &req.state, &req.code)
         .await
         .map(Json)
-        .map_err(access_err)
+        .map_err(crate::handlers::store_err)
 }
 
 /// POST /v1/access/admin/lookup: run a `remote_select` list source
@@ -332,7 +317,7 @@ async fn lookup(
     control_plane(&state, &headers).await?;
     let inner = &req.inner;
     let url = weft_access_store::lookup_url(&inner.lookup, &inner.query, &inner.parents)
-        .map_err(access_err)?;
+        .map_err(crate::handlers::store_err)?;
     let cursor = inner.cursor.as_deref();
     // A `public` source is credential-free by declaration: no resolve,
     // no signing, whatever connection the node may hold. https only:
@@ -347,7 +332,7 @@ async fn lookup(
         return weft_access_store::lookup(None, &inner.lookup, cursor, &url)
             .await
             .map(Json)
-            .map_err(access_err);
+            .map_err(crate::handlers::store_err);
     }
     let Some(access_id) = inner.access_id else {
         return Err(shared_app_err(anyhow::anyhow!(
@@ -363,7 +348,7 @@ async fn lookup(
         &[],
     )
     .await
-    .map_err(access_err)?;
+    .map_err(crate::handlers::store_err)?;
     if resolved.owner == weft_core::CredentialOwner::Ours {
         // A REFUSAL is policy text the editor shows verbatim; an
         // internal failure answers opaquely (its message may quote
@@ -396,12 +381,12 @@ async fn lookup(
                 "closing a design-time credential failed: {e:#}"
             );
         }
-        return page.map(Json).map_err(access_err);
+        return page.map(Json).map_err(crate::handlers::store_err);
     }
     weft_access_store::lookup(Some(&resolved), &inner.lookup, cursor, &url)
         .await
         .map(Json)
-        .map_err(access_err)
+        .map_err(crate::handlers::store_err)
 }
 
 /// POST /v1/access/admin/granted: read a `granted` source off the
@@ -425,7 +410,7 @@ async fn granted(
     )
     .await
     .map(Json)
-    .map_err(access_err)
+    .map_err(crate::handlers::store_err)
 }
 
 /// A provider chooser widget (Google Picker class) runs in the
@@ -467,7 +452,7 @@ async fn picker_token(
         &[],
     )
     .await
-    .map_err(access_err)?;
+    .map_err(crate::handlers::store_err)?;
     if resolved.owner != weft_core::CredentialOwner::TheirOwn {
         return Err((
             StatusCode::FORBIDDEN,

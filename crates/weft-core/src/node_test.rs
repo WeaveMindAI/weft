@@ -468,6 +468,19 @@ impl RunOutcome {
         }
     }
 
+    /// The message the body refused with: the mirror of [`Self::ok`],
+    /// for a test whose whole point is that the node says no. A run
+    /// that SUCCEEDED here is the failure, and says so.
+    pub fn failure(self) -> WeftResult<String> {
+        match self.result {
+            Err(e) => Ok(e.to_string()),
+            Ok(()) => Err(WeftError::NodeExecution(format!(
+                "the node was expected to refuse, but it succeeded and emitted {:?}",
+                self.outputs.keys().collect::<Vec<_>>()
+            ))),
+        }
+    }
+
     /// The value emitted on `port`, loud when the body never emitted it.
     pub fn output(&self, port: &str) -> WeftResult<&Value> {
         self.outputs.get(port).ok_or_else(|| {
@@ -619,6 +632,10 @@ struct FakeState {
     /// Stored values the fake's opened connections answer
     /// (`conn.value(name)`), keyed by service then value name.
     connection_values: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
+    /// Services this run published a connection for, so
+    /// `published_access` answers "already published" exactly when the
+    /// node did publish, and answers None on the first run.
+    published: Mutex<std::collections::BTreeSet<String>>,
     /// Declared granted permissions by service. A service with no
     /// declaration skips the required-permissions check entirely (a
     /// real granted set can also be unknowable); a declared set is
@@ -637,7 +654,45 @@ struct FakeState {
     next_storage_key: AtomicU64,
     /// Every `ctx.log` line, in order.
     logs: Mutex<Vec<(LogLevel, String)>>,
+    /// The infra endpoints this node's own infrastructure answers on,
+    /// by endpoint name. Declared by `endpoint`; an undeclared name
+    /// fails the way an unprovisioned one does in a real run.
+    endpoints: Mutex<BTreeMap<String, String>>,
+    /// Canned answers, keyed by WHICH endpoint was called as well as
+    /// the method and path, and popped in order.
+    ///
+    /// A queue rather than one standing answer, because the
+    /// interesting nodes ask the same question twice and act on the
+    /// answer CHANGING (a service that says no and then yes). Keyed by
+    /// the endpoint because a node with two of them calling the wrong
+    /// one is a real bug, and a fake that answered either identically
+    /// would pass it.
+    endpoint_answers: Mutex<BTreeMap<(String, EndpointMethod, String), VecDeque<CannedAnswer>>>,
+    /// Every endpoint call the node made, in order.
+    endpoint_calls: Mutex<Vec<EndpointCall>>,
     cancellation: Arc<CancellationFlag>,
+}
+
+/// One call a node made to its own infrastructure, as the fake
+/// recorded it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndpointCall {
+    /// The endpoint the call went to, by the name the node resolved.
+    pub endpoint: String,
+    pub method: EndpointMethod,
+    pub path: String,
+    pub body: Option<Value>,
+}
+
+/// What the fake answers one endpoint call with: a body, or the
+/// refusal a real service gives. Both are declarable, because a node
+/// that only ever sees success is a node whose failure handling is
+/// untested, and a real service answers 503 while it is still coming
+/// up.
+#[derive(Debug, Clone)]
+enum CannedAnswer {
+    Body(Value),
+    Refusal { status: u16, body: String },
 }
 
 impl FakeState {
@@ -660,12 +715,16 @@ impl FakeState {
             wake: Mutex::new(None),
             registered_signals: Mutex::new(Vec::new()),
             connection_values: Mutex::new(BTreeMap::new()),
+            published: Mutex::new(std::collections::BTreeSet::new()),
             connection_permissions: Mutex::new(BTreeMap::new()),
             output_types: Mutex::new(HashMap::new()),
             buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
+            endpoints: Mutex::new(BTreeMap::new()),
+            endpoint_answers: Mutex::new(BTreeMap::new()),
+            endpoint_calls: Mutex::new(Vec::new()),
             cancellation: Arc::new(CancellationFlag::new()),
         })
     }
@@ -783,6 +842,109 @@ impl FakeRig {
         self.state.output_types.lock().unwrap().insert(port.to_string(), ty);
     }
 
+    /// What the node published as `service`'s connection, or `None` if
+    /// it has not published one. For a test asserting on a node that
+    /// opens something it runs itself.
+    pub fn published_values(&self, service: &str) -> Option<BTreeMap<String, String>> {
+        if !self.state.published.lock().unwrap().contains(service) {
+            return None;
+        }
+        Some(
+            self.state
+                .connection_values
+                .lock()
+                .unwrap()
+                .get(service)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Declare that this node published `service`'s connection on an
+    /// earlier run, holding these values. The second-run state: the
+    /// node finds its own connection instead of asking the thing it
+    /// runs for credentials again.
+    pub fn published_connection(&self, service: &str, values: &[(&str, &str)]) {
+        let values: BTreeMap<String, String> =
+            values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        self.state.connection_values.lock().unwrap().insert(service.to_string(), values);
+        self.state.published.lock().unwrap().insert(service.to_string());
+    }
+
+    /// Declare that this node's own infrastructure answers on `name`
+    /// at `url`. Without this, `ctx.endpoint(name)` fails the way it
+    /// does when the infra is not running.
+    pub fn declare_endpoint(&self, name: &str, url: &str) {
+        let mut endpoints = self.state.endpoints.lock().unwrap();
+        // Two endpoints on one address would make a call ambiguous,
+        // and the fake would answer the wrong one's canned reply
+        // while the test went green. In a real project two endpoints
+        // never share an address either.
+        if let Some((taken, _)) =
+            endpoints.iter().find(|(taken, declared)| *taken != name && *declared == url)
+        {
+            panic!("endpoint '{taken}' is already declared at {url}; give '{name}' its own");
+        }
+        endpoints.insert(name.to_string(), url.to_string());
+    }
+
+    /// Declare what the NEXT call to `path` on the `endpoint` endpoint
+    /// answers. Call it once per expected call, in order.
+    ///
+    /// A call with no answer left fails, which is the point: the test
+    /// says exactly what the node is expected to ask, so an extra
+    /// question it should not have needed to ask surfaces instead of
+    /// being quietly answered.
+    pub fn answer_endpoint(
+        &self,
+        endpoint: &str,
+        method: EndpointMethod,
+        path: &str,
+        answer: Value,
+    ) {
+        self.queue_answer(endpoint, method, path, CannedAnswer::Body(answer));
+    }
+
+    /// Declare that the next call to `path` on `endpoint` is REFUSED
+    /// with this status and body, the way a real service refuses one
+    /// it is not ready for.
+    pub fn refuse_endpoint(
+        &self,
+        endpoint: &str,
+        method: EndpointMethod,
+        path: &str,
+        status: u16,
+        body: &str,
+    ) {
+        self.queue_answer(
+            endpoint,
+            method,
+            path,
+            CannedAnswer::Refusal { status, body: body.to_string() },
+        );
+    }
+
+    fn queue_answer(
+        &self,
+        endpoint: &str,
+        method: EndpointMethod,
+        path: &str,
+        answer: CannedAnswer,
+    ) {
+        self.state
+            .endpoint_answers
+            .lock()
+            .unwrap()
+            .entry((endpoint.to_string(), method, path.to_string()))
+            .or_default()
+            .push_back(answer);
+    }
+
+    /// Every call the node made to its own infrastructure, in order.
+    pub fn endpoint_calls(&self) -> Vec<EndpointCall> {
+        self.state.endpoint_calls.lock().unwrap().clone()
+    }
+
     /// Declare a stored value `service`'s opened connection answers
     /// (`conn.value(name)` / `conn.opt_value(name)`), e.g. an IMAP host.
     pub fn connection_value(&self, service: &str, name: &str, value: &str) {
@@ -879,6 +1041,7 @@ impl FakeRig {
             state: self.state.clone(),
             capture: Capture::new(outputs),
             wake,
+            publishes: manifest.publishes.clone(),
             run_step_index: AtomicU32::new(0),
         });
         let ctx = test_context(manifest, bag, handle.clone());
@@ -1183,10 +1346,29 @@ struct TestHandle {
     state: Arc<FakeState>,
     capture: Capture,
     wake: Option<Value>,
+    /// The service this node declares it publishes a connection to
+    /// (`publishes` in its metadata), so the fake answers exactly what
+    /// production does: the service comes from the declaration, never
+    /// from the body.
+    publishes: Option<String>,
     /// `ctx.run` memo-step counter. There is no journal here, so every
     /// step is fresh; the counter only keeps the call/record indices
     /// aligned with the trait contract.
     run_step_index: AtomicU32,
+}
+
+impl TestHandle {
+    /// The service the node under test declares it publishes, or the
+    /// same refusal production gives a node that declares none.
+    fn published_service(&self) -> WeftResult<String> {
+        self.publishes.clone().ok_or_else(|| {
+            WeftError::Config(
+                "this node hands out a connection to a service it runs, but its metadata \
+                 does not say which: add `\"publishes\": \"<service>\"` to it"
+                    .to_string(),
+            )
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -1217,18 +1399,63 @@ impl ContextHandle for TestHandle {
         Ok(())
     }
 
-    async fn endpoint_url(&self, _name: &str) -> WeftResult<String> {
-        Err(unsupported("infra endpoints"))
+    async fn endpoint_url(&self, name: &str) -> WeftResult<String> {
+        self.state.endpoints.lock().unwrap().get(name).cloned().ok_or_else(|| {
+            WeftError::Config(format!(
+                "the node asked for its '{name}' endpoint but the test declared no address \
+                 for it; declare one with rig.declare_endpoint(\"{name}\", \"http://..\") \
+                 before rig.run(..)"
+            ))
+        })
     }
 
     async fn endpoint_call(
         &self,
-        _url: &str,
-        _method: EndpointMethod,
-        _path: &str,
-        _body: Option<Value>,
+        url: &str,
+        method: EndpointMethod,
+        path: &str,
+        body: Option<Value>,
     ) -> WeftResult<Value> {
-        Err(unsupported("infra endpoints"))
+        // Which endpoint this URL belongs to. Production builds the
+        // request from the base address, so a node calling the wrong
+        // one of its endpoints reaches a different service; recording
+        // the name is what lets a test see that.
+        let endpoint = self
+            .state
+            .endpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, declared)| declared.as_str() == url)
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| url.to_string());
+        self.state.endpoint_calls.lock().unwrap().push(EndpointCall {
+            endpoint: endpoint.clone(),
+            method,
+            path: path.to_string(),
+            body,
+        });
+        let answer = self
+            .state
+            .endpoint_answers
+            .lock()
+            .unwrap()
+            .get_mut(&(endpoint.clone(), method, path.to_string()))
+            .and_then(VecDeque::pop_front);
+        match answer {
+            Some(CannedAnswer::Body(v)) => Ok(v),
+            // Worded exactly as production words it, so a node that
+            // matches on a refusal is tested against the real text.
+            // SYNC: refusal wording <-> crates/weft-engine/src/context.rs endpoint_call
+            Some(CannedAnswer::Refusal { status, body }) => Err(WeftError::Runtime(
+                anyhow::anyhow!("endpoint_call {url}{path} returned {status}: {body}"),
+            )),
+            None => Err(WeftError::Config(format!(
+                "the node called {method:?} {path} on its '{endpoint}' endpoint but the \
+                 test has no answer left for it; declare one with rig.answer_endpoint(..) \
+                 per expected call, before rig.run(..)"
+            ))),
+        }
     }
 
     async fn run_step(&self, _name: &str) -> WeftResult<(u32, Option<Value>)> {
@@ -1238,6 +1465,34 @@ impl ContextHandle for TestHandle {
 
     async fn run_record(&self, _name: &str, _call_index: u32, _value: &Value) -> WeftResult<()> {
         Ok(())
+    }
+
+    /// Publishing in the fake rig writes the values into the same map
+    /// `open_connection` reads, so a node that publishes and then opens
+    /// what it published behaves as it does in production. The service
+    /// comes from the node's own `publishes` declaration, exactly as it
+    /// does in a real run, so a node that declares nothing fails here
+    /// the same way.
+    async fn publish_access(&self, values: BTreeMap<String, String>) -> WeftResult<Access> {
+        let service = self.published_service()?;
+        self.state
+            .connection_values
+            .lock()
+            .unwrap()
+            .insert(service.clone(), values);
+        self.state.published.lock().unwrap().insert(service.clone());
+        Ok(Access::new("fake-connection", service, None))
+    }
+
+    async fn published_access(&self) -> WeftResult<Option<Access>> {
+        let service = self.published_service()?;
+        Ok(self
+            .state
+            .published
+            .lock()
+            .unwrap()
+            .contains(&service)
+            .then(|| Access::new("fake-connection", service, None)))
     }
 
     async fn open_connection(
@@ -1809,6 +2064,14 @@ impl ContextHandle for CapturingHandle {
         window: std::time::Duration,
     ) -> WeftResult<OpenedConnection> {
         self.inner.open_connection(access, window).await
+    }
+
+    async fn publish_access(&self, values: BTreeMap<String, String>) -> WeftResult<Access> {
+        self.inner.publish_access(values).await
+    }
+
+    async fn published_access(&self) -> WeftResult<Option<Access>> {
+        self.inner.published_access().await
     }
 
     // A delegating wrapper forwards EVERY trait method, including

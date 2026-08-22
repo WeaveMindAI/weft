@@ -1106,7 +1106,7 @@ async fn ensure_project_namespace_if_infra(
         ingress_namespace: &state.cluster_ingress_namespace,
         control_plane_namespace: &state.control_plane_namespace,
     };
-    crate::project_namespace::ensure(&state.pg_pool, &*state.kube, &args)
+    crate::project_namespace::ensure(&*state.kube, &args)
         .await
         .map_err(|e| {
             (
@@ -1132,11 +1132,11 @@ async fn ensure_project_namespace_if_infra(
 }
 
 /// TEARDOWN half: if the project no longer declares infra AND no live
-/// infra state remains, delete the per-project namespace + clear the
-/// row + delete its `weft_namespace_tenant` registry row. Runs at the
-/// sync landing flip, AFTER `reconcile_worker` has kill-then-respawned
-/// the worker into the shared pool, so we never delete a namespace
-/// that still hosts the project's worker.
+/// infra state remains, delete the per-project namespace and clear the
+/// row pointing at it. Runs at the sync landing flip, AFTER
+/// `reconcile_worker` has kill-then-respawned the worker into the
+/// shared pool, so we never delete a namespace that still hosts the
+/// project's worker.
 ///
 /// The live-rows guard is Model 1's never-silently-kill guarantee: an
 /// orphaned infra node whose terminate timed out still has an
@@ -1151,10 +1151,10 @@ async fn ensure_project_namespace_if_infra(
 /// make the supervisor flap kubectl against a gone namespace. So clear
 /// first, delete second; a crash between leaves only an empty orphan
 /// namespace (reclaimed on project rm or by a manual delete), never a
-/// live-advertised dead namespace. The registry row is deleted LAST
-/// (after the namespace object): while the namespace exists in k8s, its
-/// row must exist too (the broker's TokenReview resolves pod tenancy
-/// from it).
+/// live-advertised dead namespace. Nothing else has to be retired in
+/// step with the namespace object: a worker inside it is identified by
+/// its pod, not by where it sits, so a namespace that lingers while it
+/// terminates takes nobody's identity with it.
 async fn teardown_project_namespace_if_no_infra(
     state: &DispatcherState,
     id: uuid::Uuid,
@@ -1205,6 +1205,9 @@ async fn teardown_project_namespace_if_no_infra(
             )
         })?;
     // ... then delete the now-unadvertised, now-worker-less namespace.
+    // Nothing about a worker's identity hangs off this namespace, so
+    // there is no record to retire in step with it: a worker is known
+    // by its pod, whose row outlives the pod itself.
     if let Err(e) = crate::project_namespace::delete(&*state.kube, &existing).await {
         tracing::warn!(
             target: "weft_dispatcher::api::infra",
@@ -1212,21 +1215,6 @@ async fn teardown_project_namespace_if_no_infra(
             project_id = %project_id_str,
             "delete now-infra-less project namespace failed (continuing); \
              row already cleared so no supervisor manages it"
-        );
-        // Keep the registry row while the k8s namespace object may
-        // still exist (broker TokenReview needs it); the next sync
-        // retries the delete and then drops the row.
-        return Ok(());
-    }
-    // ... and finally drop the namespace's tenant-registry row, so a
-    // torn-down namespace leaves no dangling auth mapping behind.
-    if let Err(e) = crate::namespace_registry::delete(&state.pg_pool, &existing).await {
-        tracing::warn!(
-            target: "weft_dispatcher::api::infra",
-            error = %e,
-            namespace = %existing,
-            "delete weft_namespace_tenant row failed (continuing); harmless until \
-             the next sync retries (an unmapped namespace only over-restricts)"
         );
     }
     Ok(())
@@ -1433,6 +1421,7 @@ async fn reap_orphans(
 pub async fn delete_project(
     state: &DispatcherState,
     id: uuid::Uuid,
+    tenant: &str,
     force: bool,
 ) -> Result<(), (StatusCode, String)> {
     let project_id = id.to_string();
@@ -1543,6 +1532,21 @@ pub async fn delete_project(
                 format!("infra_lifecycle_command::remove_project: {e}"),
             )
         })?;
+    // The connections this project's nodes published opened services
+    // this project ran; with the project gone they name nothing. The
+    // per-node cleanup on terminate does not cover this path (a forced
+    // delete does not WAIT for the terminate to land, and a project
+    // with no infra rows never issues one at all), and a credential
+    // nobody can place is exactly the junk the cleanup rule forbids. Connections a PERSON
+    // connected are untouched: those are theirs.
+    weft_access_store::delete_published_grants(&state.pg_pool, tenant, &project_id, None)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("delete the connections this project's nodes published: {e}"),
+            )
+        })?;
     // Step 4: delete the project's own k8s namespace. Clear the row
     // FIRST then delete (same ordering as the sync-time teardown): a
     // cleared row pointing at a not-yet-deleted namespace is benign,
@@ -1572,29 +1576,13 @@ pub async fn delete_project(
                 "clear project_namespace row failed (continuing)"
             );
         }
-        match project_namespace::delete(&*state.kube, &ns).await {
-            Ok(()) => {
-                // Namespace gone from k8s: drop its tenant-registry
-                // row too (same ordering rule as the sync-time
-                // teardown: row outlives the namespace object, never
-                // the reverse).
-                if let Err(e) = crate::namespace_registry::delete(&state.pg_pool, &ns).await {
-                    tracing::warn!(
-                        target: "weft_dispatcher::api::infra",
-                        error = %e,
-                        namespace = %ns,
-                        "delete weft_namespace_tenant row failed (continuing)"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "weft_dispatcher::api::infra",
-                    error = %e,
-                    project_id = %project_id,
-                    "delete project namespace failed (continuing); row already cleared"
-                );
-            }
+        if let Err(e) = project_namespace::delete(&*state.kube, &ns).await {
+            tracing::warn!(
+                target: "weft_dispatcher::api::infra",
+                error = %e,
+                project_id = %project_id,
+                "delete project namespace failed (continuing); row already cleared"
+            );
         }
     }
     // Step 5: release the project's exclusive supervisor lease

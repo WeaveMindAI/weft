@@ -1350,6 +1350,7 @@ async fn drive(
                 node_def.node_type.clone(),
                 group.frames.clone(),
                 clients.clone(),
+                node_def.published_service.clone(),
                 pod_name.to_string(),
                 tenant_id.to_string(),
                 cancellation.clone(),

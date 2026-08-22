@@ -307,6 +307,7 @@ pub async fn connect_direct(
             spec: &stored,
             registration: &None,
             project_id: req.project_id,
+            published_by_node: None,
             values: BTreeMap::new(),
             granted: Vec::new(),
             verified: false,
@@ -323,28 +324,14 @@ pub async fn connect_direct(
     let mut expires_at: Option<chrono::DateTime<chrono::Utc>> = None;
     match &spec.acquisition {
         Acquisition::Static { fields } => {
-            for f in fields {
-                let empty = values.get(&f.name).map_or(true, |v| v.trim().is_empty());
-                if empty && !f.optional {
-                    return Err(AccessError::Invalid(format!(
-                        "field '{}' is required",
-                        f.name
-                    ))
-                    .into());
-                }
-            }
-            // The service's all-or-nothing groups: a half-filled one
-            // (a mail server with no port) and a connect filling none
-            // are both refused here, naming the fix.
-            weft_core::access::spec::capability_shortfall(&spec.capabilities, |name| {
-                values.get(name).is_some_and(|v| !v.trim().is_empty())
-            })
-            .map_err(AccessError::Invalid)?;
-            // An optional field left blank stores nothing, so later
-            // reads see "missing" rather than an empty secret.
-            values.retain(|_, v| !v.trim().is_empty());
+            values = storable_values(&spec, fields, values)?;
         }
-        Acquisition::MintJwt { .. } => {
+        Acquisition::MintJwt { fields, .. } => {
+            // Held to the same rule as any other pasted set: these are
+            // the fields a PERSON filled in, and a missing or blank one
+            // would otherwise fail somewhere inside the mint instead of
+            // naming itself here.
+            values = storable_values(&spec, fields, values)?;
             // Mint + exchange once now, so a bad key/id fails at
             // connect instead of at first run. The minted token is
             // stored like any other value and re-minted lazily on
@@ -395,6 +382,7 @@ pub async fn connect_direct(
         spec,
         registration: &req.registration,
         project_id: req.project_id,
+        published_by_node: None,
         values,
         granted,
         verified,
@@ -468,12 +456,18 @@ pub(crate) fn value_names_of(values: &BTreeMap<String, String>) -> Value {
     Value::Array(values.keys().map(|k| Value::String(k.clone())).collect())
 }
 
-/// Everything one grant INSERT needs; the single write path for both
-/// direct connects, so the column list exists once.
+/// Everything one grant INSERT needs. The single write path for every
+/// way a connection comes into being (a person pasting one, a browser
+/// consent finishing, and a node publishing one for something it
+/// runs), so the column list exists once and cannot drift between
+/// them. A re-consent that rotates an EXISTING row is the one write
+/// that is not an insert, and updates in place.
 struct NewGrant<'a> {
     spec: &'a AccessSpec,
     registration: &'a Option<AppRegistration>,
     project_id: Option<String>,
+    /// Set only by [`publish_grant`]; a person's connect leaves it None.
+    published_by_node: Option<String>,
     values: BTreeMap<String, String>,
     granted: Vec<String>,
     verified: bool,
@@ -484,21 +478,93 @@ struct NewGrant<'a> {
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// `values` reduced to what may actually be STORED for `spec`, or the
+/// reason they cannot be: every required field present and non-blank,
+/// no name the service does not declare, the service's all-or-nothing
+/// groups satisfied, and blanks dropped so a later read sees "missing"
+/// rather than an empty secret.
+///
+/// The gate for every set of values a PERSON or a NODE supplied: a
+/// pasted connection, a minted one, and one a node published all
+/// answer the same questions and are held to the same standard. A
+/// browser consent is the one that does not come through here, and
+/// cannot: its values are the provider's own answer to the token
+/// exchange, not fields anybody filled in.
+fn storable_values(
+    spec: &AccessSpec,
+    fields: &[CredentialField],
+    mut values: BTreeMap<String, String>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    for f in fields {
+        let empty = values.get(&f.name).map_or(true, |v| v.trim().is_empty());
+        if empty && !f.optional {
+            return Err(AccessError::Invalid(format!("field '{}' is required", f.name)).into());
+        }
+    }
+    if let Some(unknown) = values.keys().find(|k| !fields.iter().any(|f| &&f.name == k)) {
+        return Err(AccessError::Invalid(format!(
+            "the '{}' service declares no value named '{unknown}'",
+            spec.service
+        ))
+        .into());
+    }
+    weft_core::access::spec::capability_shortfall(&spec.capabilities, |name| {
+        values.get(name).is_some_and(|v| !v.trim().is_empty())
+    })
+    .map_err(AccessError::Invalid)?;
+    values.retain(|_, v| !v.trim().is_empty());
+    Ok(values)
+}
+
 async fn insert_grant(
     pool: &PgPool,
     tenant: &str,
     grant: NewGrant<'_>,
 ) -> anyhow::Result<CompletedConnect> {
-    let id = uuid::Uuid::new_v4();
-    sqlx::query(
+    // A node's published connection REPLACES the one it published
+    // before (its key is the node, not the moment), so the same write
+    // serves a first publish and a re-publish. A person's connect has
+    // no such key and always inserts. One statement either way, so the
+    // column list exists once.
+    //
+    // EVERY non-key column is written, not a chosen subset. The row
+    // becomes exactly what was just built, so a column added to the
+    // INSERT above can never be quietly left stale on a re-publish
+    // (which nothing would catch: the answer returned to the caller
+    // reports the new value while the row keeps the old one).
+    let upsert = if grant.published_by_node.is_some() {
+        " ON CONFLICT (tenant_id, project_id, published_by_node, service)
+            WHERE published_by_node IS NOT NULL
+          DO UPDATE SET
+             registration_sealed = EXCLUDED.registration_sealed,
+             client_id = EXCLUDED.client_id,
+             spec_json = EXCLUDED.spec_json,
+             events_recipe_hash = EXCLUDED.events_recipe_hash,
+             values_sealed = EXCLUDED.values_sealed,
+             value_names = EXCLUDED.value_names,
+             granted_scopes = EXCLUDED.granted_scopes,
+             permissions_verified = EXCLUDED.permissions_verified,
+             owner = EXCLUDED.owner,
+             door = EXCLUDED.door,
+             label = EXCLUDED.label,
+             identity = EXCLUDED.identity,
+             provider_account = EXCLUDED.provider_account,
+             expires_at = EXCLUDED.expires_at,
+             updated_at = now()"
+    } else {
+        ""
+    };
+    let id: uuid::Uuid = sqlx::query_scalar(&format!(
         "INSERT INTO access_grant
            (id, tenant_id, service, registration_sealed, client_id, project_id, spec_json,
             events_recipe_hash, values_sealed, value_names, granted_scopes,
-            permissions_verified, owner, door, label, identity, provider_account, expires_at)
+            permissions_verified, owner, door, label, identity, provider_account, expires_at,
+            published_by_node)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                 $18)",
-    )
-    .bind(id)
+                 $18, $19){upsert}
+         RETURNING id"
+    ))
+    .bind(uuid::Uuid::new_v4())
     .bind(tenant)
     .bind(&grant.spec.service)
     .bind(registration_snapshot(grant.registration)?)
@@ -516,7 +582,8 @@ async fn insert_grant(
     .bind(&grant.identity)
     .bind(provider_account_of(grant.spec, &grant.values))
     .bind(grant.expires_at)
-    .execute(pool)
+    .bind(&grant.published_by_node)
+    .fetch_one(pool)
     .await?;
     Ok(CompletedConnect {
         grant: GrantSummary {
@@ -1216,41 +1283,34 @@ async fn finish_connect(
             (id, None, union)
         }
         None => {
-            let id = uuid::Uuid::new_v4();
             let project = match spec.grants {
                 GrantCoexistence::Exclusive => None,
                 GrantCoexistence::Coexisting => project_id.clone(),
             };
-            sqlx::query(
-                "INSERT INTO access_grant
-                   (id, tenant_id, service, registration_sealed, client_id, project_id,
-                    spec_json, events_recipe_hash, values_sealed, value_names,
-                    granted_scopes, permissions_verified, owner, door, label,
-                    identity, provider_account, expires_at)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                         $16, $17, $18)",
+            // The same write path a pasted connection and a published
+            // one take. A consent is a third way a connection comes
+            // into being, and it earns nothing by spelling the column
+            // list out a third time.
+            let done = insert_grant(
+                pool,
+                &tenant,
+                NewGrant {
+                    spec: &spec,
+                    registration: &Some(registration.clone()),
+                    project_id: project.clone(),
+                    published_by_node: None,
+                    values: values.clone(),
+                    granted: granted.clone(),
+                    verified,
+                    owner: CredentialOwner::TheirOwn,
+                    door,
+                    label: label.clone(),
+                    identity: identity.clone(),
+                    expires_at,
+                },
             )
-            .bind(id)
-            .bind(&tenant)
-            .bind(&service)
-            .bind(crate::seal_json(&serde_json::to_value(&registration)?)?)
-            .bind(&registration.client_id)
-            .bind(&project)
-            .bind(&spec_json)
-            .bind(crate::resolve::events_recipe_hash(&spec.events))
-            .bind(crate::seal_json(&serde_json::to_value(&values)?)?)
-            .bind(value_names_of(&values))
-            .bind(serde_json::to_value(&granted)?)
-            .bind(verified)
-            .bind(owner_str(CredentialOwner::TheirOwn))
-            .bind(door_str(door))
-            .bind(&label)
-            .bind(&identity)
-            .bind(provider_account_of(&spec, &values))
-            .bind(expires_at)
-            .execute(pool)
             .await?;
-            (id, project, granted)
+            (done.grant.id, project, granted)
         }
     };
 
@@ -1451,6 +1511,58 @@ fn head_of(body: &str) -> String {
 mod tests {
     use super::*;
 
+    fn field(name: &str, optional: bool) -> CredentialField {
+        CredentialField {
+            name: name.into(),
+            label: None,
+            optional,
+            secret: false,
+            placeholder: None,
+        }
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// The gate every set of values a person or a node supplied
+    /// passes. A blank required value is MISSING, not stored: a
+    /// downstream node would otherwise get an empty password and fail
+    /// at the provider instead of here.
+    #[test]
+    fn the_value_check_holds_a_pasted_and_a_published_connection_to_one_rule() {
+        // The spec DECLARES the two fields the check is run against,
+        // so the rule and the recipe cannot be a mismatched pair the
+        // production callers could never produce.
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "pg",
+            "acquisition": { "kind": "static", "fields": [
+                { "name": "host" },
+                { "name": "port", "optional": true },
+            ]},
+        }))
+        .expect("a static spec");
+        let fields = [field("host", false), field("port", true)];
+        let check = |vals| storable_values(&spec, &fields, vals);
+
+        check(values(&[("host", "db"), ("port", "5432")])).expect("a complete set passes");
+
+        let kept = check(values(&[("host", "db"), ("port", "   ")]))
+            .expect("a blank optional passes");
+        assert!(!kept.contains_key("port"), "a blank optional stores nothing");
+
+        let e = check(values(&[("port", "5432")])).expect_err("required missing");
+        assert!(e.to_string().contains("'host' is required"), "{e}");
+
+        let e = check(values(&[("host", "  ")]))
+            .expect_err("a blank required value is missing");
+        assert!(e.to_string().contains("'host' is required"), "{e}");
+
+        let e = check(values(&[("host", "db"), ("hostname", "db")]))
+            .expect_err("undeclared name");
+        assert!(e.to_string().contains("no value named 'hostname'"), "{e}");
+    }
+
     /// What lands on the row: only an authoritative rung with a
     /// provider-produced set records VERIFIED; a non-authoritative
     /// rung records the claimed ticks even when something echoed, and
@@ -1509,4 +1621,132 @@ mod tests {
         values.insert(GRANTED_PERMISSIONS_CAPTURE.into(), "a b,c".into());
         assert_eq!(introspected_permissions(&values).unwrap(), vec!["a", "b", "c"]);
     }
+}
+
+// ---------- Published connections (a node opens what it runs) ----------
+
+/// A node handing out a connection to something it runs itself: the
+/// database its own infra spec brought up, whose credentials the node
+/// read back off the running container. The values are the service's
+/// own declared fields, exactly what a person would have pasted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublishAccess {
+    pub spec: AccessSpec,
+    pub project_id: String,
+    /// The node doing the publishing. Its connection, so a second
+    /// publish updates that one row instead of piling up a new one,
+    /// and terminating the node takes it away with it.
+    pub node_id: String,
+    pub values: BTreeMap<String, String>,
+    pub label: Option<String>,
+}
+
+/// Store the connection a node published, or update the one it
+/// published before.
+///
+/// A published connection describes a service the user's OWN project
+/// runs: there is no provider behind it, no consent to renew, nothing
+/// for weft to call on its behalf. The recipe is held to exactly that
+/// shape here, because unlike every other spec that reaches this store
+/// (authored node metadata, validated at load) this one arrives from a
+/// worker, which runs tenant code. A recipe carrying provider events
+/// or a connect-time call would later have the CONTROL PLANE make an
+/// HTTP request the tenant chose, from inside the cluster; refusing
+/// those shapes is what makes that unreachable rather than unlikely.
+///
+/// Always the user's own credential: nothing published can resolve to
+/// the runtime's, whatever the caller sends.
+pub async fn publish_grant(
+    pool: &PgPool,
+    tenant: &str,
+    req: PublishAccess,
+) -> anyhow::Result<CompletedConnect> {
+    let PublishAccess { spec, project_id, node_id, values, label } = req;
+    spec.validate().map_err(AccessError::Invalid)?;
+    let fields =
+        weft_core::access::spec::publishable_fields(&spec).map_err(AccessError::Invalid)?;
+    let values = storable_values(&spec, fields, values)?;
+    let identity = resolve_identity(&spec, &values)?;
+    insert_grant(
+        pool,
+        tenant,
+        NewGrant {
+            spec: &spec,
+            registration: &None,
+            project_id: Some(project_id),
+            published_by_node: Some(node_id),
+            values,
+            granted: Vec::new(),
+            verified: false,
+            owner: CredentialOwner::TheirOwn,
+            door: Door::Own,
+            label,
+            identity,
+            expires_at: None,
+        },
+    )
+    .await
+}
+
+/// What a node's published connection IS to everyone downstream: the
+/// reference to open it with, plus the identity that names it in a
+/// list. The same pair the publish answers, so a connection read back
+/// is the same value as the one published.
+pub struct PublishedGrant {
+    pub id: uuid::Uuid,
+    pub identity: Option<String>,
+}
+
+/// The connection this node published for `service`, if it has one.
+/// The node's own read-back path: it republishes with the credential
+/// it stored the first time rather than asking the container again.
+pub async fn published_grant(
+    pool: &PgPool,
+    tenant: &str,
+    project_id: &str,
+    node_id: &str,
+    service: &str,
+) -> anyhow::Result<Option<PublishedGrant>> {
+    let row: Option<(uuid::Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT id, identity FROM access_grant
+         WHERE tenant_id = $1 AND project_id = $2 AND published_by_node = $3
+           AND service = $4",
+    )
+    .bind(tenant)
+    .bind(project_id)
+    .bind(node_id)
+    .bind(service)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(id, identity)| PublishedGrant { id, identity }))
+}
+
+/// Drop every connection a node published. Called when its infra is
+/// terminated: the credentials open something that no longer exists,
+/// and a connection nobody can use is junk.
+/// Takes an executor rather than the pool so the caller can run it
+/// inside the transaction that removes the node itself: the node and
+/// the connection it published go away together or not at all.
+///
+/// `node_id` of `None` drops every published connection in the
+/// project, for the path where the whole project goes (there is no
+/// node left to name). A connection a PERSON made is never touched by
+/// either: it is theirs, listed and deletable tenant-wide.
+pub async fn delete_published_grants<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    tenant: &str,
+    project_id: &str,
+    node_id: Option<&str>,
+) -> anyhow::Result<u64> {
+    Ok(sqlx::query(
+        "DELETE FROM access_grant
+         WHERE tenant_id = $1 AND project_id = $2 AND published_by_node IS NOT NULL
+           AND ($3::text IS NULL OR published_by_node = $3)",
+    )
+    .bind(tenant)
+    .bind(project_id)
+    .bind(node_id)
+    .execute(executor)
+    .await?
+    .rows_affected())
 }
