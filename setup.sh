@@ -742,7 +742,20 @@ if [[ $build_cli -eq 1 ]]; then
     # setup, and the case where the cap matters most) measures as 0
     # without it. A non-numeric measurement skips the cap (wiping on
     # an unreadable measurement is the dangerous direction).
-    target_gb="$(du -sBG -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1 | tr -d 'G')"
+    # POSIX `du -sk`, not GNU's `-BG`: BSD du (macOS) rejects `-BG` with
+    # a usage error (exit 64), and under `set -euo pipefail` that aborted
+    # the entire install. It only bit on the SECOND install onward, since
+    # the first has no target/ yet and the guard above skips it, which is
+    # why it survived: `./setup.sh` is documented as re-runnable.
+    # `|| true` keeps a partial-read failure on the "could not measure"
+    # path below rather than killing the script.
+    target_kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1 || true)"
+    # KiB -> whole GiB, rounded UP so the cap keeps GNU `-BG`'s ceiling.
+    if [[ "${target_kb}" =~ ^[0-9]+$ ]]; then
+      target_gb=$(( (target_kb + 1048575) / 1048576 ))
+    else
+      target_gb=""
+    fi
     if [[ ! "${target_gb}" =~ ^[0-9]+$ ]]; then
       warn "could not measure target/; skipping the size cap"
     elif [[ "${target_gb}" -gt "${target_cap_gb}" ]]; then
