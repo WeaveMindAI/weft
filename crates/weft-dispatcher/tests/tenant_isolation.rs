@@ -11,8 +11,10 @@
 use chrono::Utc;
 use uuid::Uuid;
 use weft_core::ProjectDefinition;
+use weft_dispatcher::authenticator::authorize_execution;
 use weft_dispatcher::journal::{ExecutionQuery, SignalToken, Journal, MockJournal};
 use weft_dispatcher::project_store::{MockProjectStore, ProjectStoreOps};
+use weft_dispatcher::tenant::TenantId;
 
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
@@ -128,6 +130,63 @@ async fn list_executions_is_scoped_to_the_caller_tenant() {
 }
 
 #[tokio::test]
+async fn an_executions_owner_outlives_its_project() {
+    // An execution deliberately outlives its project: `weft rm` takes
+    // the project, the journal keeps the record of what ran, and
+    // `weft clean` is what removes the record. So ownership must be
+    // answerable from the execution's OWN row forever.
+    //
+    // The regression: authorization used to resolve the color to a
+    // project and then ask the PROJECT STORE who owned it. After a
+    // `weft rm` that store has no answer, so every execution of a
+    // removed project became un-replayable and UNDELETABLE, listed
+    // forever with `weft clean` refusing them 404. Both fields now
+    // come off the stamped row, which nothing can delete out from
+    // under it.
+    let store = MockProjectStore::new();
+    let journal = MockJournal::new();
+    let project = Uuid::new_v4();
+    let project_id = project.to_string();
+    register(&store, project, "doomed", TENANT_A).await;
+    journal.set_project_tenant(&project_id, TENANT_A);
+    let color = Uuid::new_v4();
+    journal.record_event(&started(color, &project_id)).await.unwrap();
+
+    let owner = journal.execution_owner(color).await.unwrap().expect("owner while alive");
+    assert_eq!(owner.tenant, TENANT_A);
+    assert_eq!(owner.project_id, project_id);
+
+    // The project goes; the project store forgets it entirely.
+    store.remove(project).await.expect("remove project");
+    assert_eq!(store.tenant_for(project).await.unwrap(), None, "project really gone");
+
+    // The execution's ownership is unchanged.
+    let after = journal.execution_owner(color).await.unwrap().expect("owner after removal");
+    assert_eq!(after, owner, "ownership is stamped, not re-derived");
+    // And it is still listed, so what the listing shows stays actionable.
+    let q = ExecutionQuery { limit: 100, ..Default::default() };
+    assert_eq!(journal.list_executions(TENANT_A, &q).await.unwrap().total, 1);
+
+    // THE gate itself, with no project store in reach at all: the
+    // owner is authorized (so replay and `weft clean` work), and a
+    // stranger gets the same 404 an unknown color gets.
+    let granted = authorize_execution(&journal, &TenantId(TENANT_A.to_string()), color)
+        .await
+        .expect("the owner may still reach its execution");
+    assert_eq!(granted.project_id, project_id);
+    let (refused, _) =
+        authorize_execution(&journal, &TenantId(TENANT_B.to_string()), color)
+            .await
+            .expect_err("a stranger may not");
+    assert_eq!(refused, axum::http::StatusCode::NOT_FOUND);
+    let (unknown, _) =
+        authorize_execution(&journal, &TenantId(TENANT_A.to_string()), Uuid::new_v4())
+            .await
+            .expect_err("an unknown color is refused the same way");
+    assert_eq!(unknown, axum::http::StatusCode::NOT_FOUND, "no existence leak");
+}
+
+#[tokio::test]
 async fn signal_tokens_are_scoped_to_the_caller_tenant() {
     let journal = MockJournal::new();
     let tok_a = token("hash-a", TENANT_A);
@@ -162,6 +221,7 @@ fn started(color: Uuid, project_id: &str) -> weft_journal::ExecEvent {
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("h".to_string()),
         node_test: false,
+        subgraph: None,
         at_unix: 0,
     }
 }

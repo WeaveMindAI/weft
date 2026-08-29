@@ -50,6 +50,16 @@ pub enum ExecEvent {
         /// must not touch it.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         node_test: bool,
+        /// The node set this execution is allowed to dispatch, or
+        /// `None` for the whole graph. A manual run aimed at targets
+        /// journals its computed subgraph here, so the engine skips
+        /// everything outside it (`OutsideThisRun`) and a resume
+        /// rebuilds the same boundary; a trigger-fired execution
+        /// carries `None`. (Named `subgraph`, not `scope`:
+        /// `NodeDefinition.scope` is a node's group-nesting path, a
+        /// different thing entirely.)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subgraph: Option<Vec<String>>,
         at_unix: u64,
     },
 
@@ -119,6 +129,15 @@ pub enum ExecEvent {
         node_id: String,
         frames: LoopFrames,
         closed_ports: Vec<String>,
+        /// WHY the node did not run: the author's `_should_flow` said
+        /// no, or an input it needed never arrived. A decision and a
+        /// consequence look the same on the graph without this.
+        /// Optional on the WIRE only, because journal rows are frozen
+        /// history: a row written before this field existed reads as
+        /// `None` and renders as "reason not recorded". Every writer
+        /// journals `Some`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<weft_core::exec::skip::SkipReason>,
         /// See `NodeFailed.closure_emissions`: the skip's unmentioned-port
         /// closures ride here atomically with the terminal marker.
         closure_emissions: Vec<LaunchedEmission>,
@@ -1029,7 +1048,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                     }
                 }
             }
-            ExecEvent::NodeSkipped { node_id, frames, at_unix, color: c, closed_ports: _, closure_emissions } => {
+            ExecEvent::NodeSkipped { node_id, frames, at_unix, color: c, closed_ports: _, reason: _, closure_emissions } => {
                 replay_terminal_closures(&mut pulses, &mut corruptions, CorruptionSite::NodeSkipped, *c, closure_emissions);
                 if let Some(execs) = executions.get_mut(node_id) {
                     if let Some(e) = execs
@@ -1423,6 +1442,7 @@ mod fold_pulse_tests {
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("test-hash".into()),
                 node_test: false,
+                subgraph: None,
                 at_unix: 0,
             },
             ExecEvent::NodeKicked {
@@ -2507,6 +2527,70 @@ mod caller_event_wire_tests {
         );
     }
 
+    /// A skip carries WHY, and the reason survives the wire with its
+    /// payload: the inspector reads `did_not_flow` (a decision) apart
+    /// from `required_input_closed` (a consequence), and the port name
+    /// rides along.
+    #[test]
+    fn node_skipped_round_trips_its_reason() {
+        for reason in [
+            weft_core::exec::skip::SkipReason::DidNotFlow,
+            weft_core::exec::skip::SkipReason::FlowClosed,
+            weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "answer".into() },
+            weft_core::exec::skip::SkipReason::EveryInputClosed,
+            weft_core::exec::skip::SkipReason::OneOfGroupClosed {
+                ports: vec!["email".into(), "phone".into()],
+            },
+            weft_core::exec::skip::SkipReason::OutsideThisRun,
+        ] {
+            let skipped = ExecEvent::NodeSkipped {
+                color: color(),
+                node_id: "reply".into(),
+                frames: Vec::new(),
+                closed_ports: vec!["answer".into()],
+                reason: Some(reason.clone()),
+                closure_emissions: Vec::new(),
+                at_unix: 3,
+            };
+            let json = serde_json::to_value(&skipped).unwrap();
+            assert!(
+                json["reason"]["kind"].is_string(),
+                "the reason is tagged by `kind` so a reader can switch on it: {json}"
+            );
+            round_trip(skipped);
+        }
+
+        // The payload survives, not just the tag.
+        let with_port = serde_json::to_value(ExecEvent::NodeSkipped {
+            color: color(),
+            node_id: "reply".into(),
+            frames: Vec::new(),
+            closed_ports: Vec::new(),
+            reason: Some(weft_core::exec::skip::SkipReason::RequiredInputClosed {
+                port: "answer".into(),
+            }),
+            closure_emissions: Vec::new(),
+            at_unix: 3,
+        })
+        .unwrap();
+        assert_eq!(with_port["reason"]["kind"], "required_input_closed");
+        assert_eq!(with_port["reason"]["port"], "answer");
+
+        // A row from before the field existed (no `reason` key) still
+        // decodes: journal rows are frozen history.
+        let old = serde_json::json!({
+            "kind": "node_skipped",
+            "color": color(),
+            "node_id": "reply",
+            "frames": [],
+            "closed_ports": [],
+            "closure_emissions": [],
+            "at_unix": 3,
+        });
+        let decoded: ExecEvent = serde_json::from_value(old).expect("old row decodes");
+        assert!(matches!(decoded, ExecEvent::NodeSkipped { reason: None, .. }));
+    }
+
     /// `ExecutionStarted` in both shapes: a project run (hash present,
     /// `node_test` omitted from the wire since it is false) and a node
     /// self-test (no hash, `node_test: true` on the wire).
@@ -2519,11 +2603,26 @@ mod caller_event_wire_tests {
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
             node_test: false,
+            subgraph: None,
             at_unix: 7,
         };
         let json = serde_json::to_value(&started).unwrap();
         assert!(json.get("node_test").is_none(), "false is omitted from the wire: {json}");
+        assert!(json.get("subgraph").is_none(), "no subgraph is omitted from the wire: {json}");
         round_trip(started);
+
+        // A manual run aimed at targets journals its subgraph as scope.
+        let scoped = ExecEvent::ExecutionStarted {
+            color: color(),
+            project_id: "p".into(),
+            entry_node: "src".into(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: Some("h".into()),
+            node_test: false,
+            subgraph: Some(vec!["out".into(), "src".into()]),
+            at_unix: 7,
+        };
+        round_trip(scoped);
 
         let test_started = ExecEvent::ExecutionStarted {
             color: color(),
@@ -2532,6 +2631,7 @@ mod caller_event_wire_tests {
             phase: weft_core::context::Phase::Fire,
             definition_hash: None,
             node_test: true,
+            subgraph: None,
             at_unix: 7,
         };
         let json = serde_json::to_value(&test_started).unwrap();

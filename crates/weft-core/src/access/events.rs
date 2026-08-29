@@ -1039,7 +1039,7 @@ mod tests {
     /// load, never a silent default at runtime.
     #[test]
     fn a_typoed_socket_key_is_refused_at_validate() {
-        let mut raw = serde_json::to_value(&slack_events()).unwrap();
+        let mut raw = serde_json::to_value(slack_events()).unwrap();
         raw["socket"]["evnt_path"] = serde_json::json!("payload.event");
         let spec: EventsSpec = serde_json::from_value(raw).expect("still parses");
         let err = spec.validate("slack").expect_err("the typo must refuse");

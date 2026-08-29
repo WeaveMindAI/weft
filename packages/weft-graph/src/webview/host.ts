@@ -251,23 +251,25 @@ export async function resolveStoredFileUrl(key: string): Promise<string> {
   return r.url;
 }
 
-/// Ask the host to produce an asset-ref path for the file-drop field: with
-/// `dropped` the host stores the bytes as `assets/<name>` and returns that
-/// path; without, it runs its own picker (VS Code: the native dialog, whose
-/// pick is referenced in place). Resolves to the path, `null` on user cancel,
-/// rejects on failure.
+/// Ask the host to produce asset-ref paths for the file-drop field: with
+/// `dropped` the host stores those bytes as `assets/<name>` and returns
+/// their paths; without, it runs its own picker (VS Code: the native
+/// dialog, which selects several when `multiple` and references each pick
+/// in place). Resolves to the paths, empty on user cancel, rejects on
+/// failure.
 export async function pickAsset(
   accept: string | undefined,
-  dropped?: { name: string; bytesBase64: string },
-): Promise<string | null> {
+  options?: { multiple?: boolean; dropped?: { name: string; bytesBase64: string }[] },
+): Promise<string[]> {
   const reply = await hostRequest('assetPicked', (requestId) => ({
     kind: 'pickAsset',
     requestId,
     accept,
-    dropped,
+    multiple: options?.multiple,
+    dropped: options?.dropped,
   }));
   if (reply.error !== undefined) throw new Error(reply.error);
-  return reply.path ?? null;
+  return reply.paths ?? [];
 }
 
 /// The project's STORED runtime files (for the "pick a stored file" picker):

@@ -18,6 +18,10 @@ export function attachDiagnostics(context: vscode.ExtensionContext, parseServer:
 
   const schedule = (doc: vscode.TextDocument, reloadCatalog = false) => {
     if (doc.languageId !== 'weft') return;
+    // A revision from source control (the left side of a diff) is not the
+    // working tree: validating it squiggles a file nobody can fix, against
+    // a catalog that has moved on since.
+    if (doc.uri.scheme !== 'file') return;
     const debounce = vscode.workspace
       .getConfiguration('weft.validate')
       .get<number>('debounceMs', 500);

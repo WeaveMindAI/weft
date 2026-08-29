@@ -2,7 +2,7 @@
 	import { Upload, FolderOpen, Link, FileAudio, FileVideo, FileImage, FileText, X } from '@lucide/svelte';
 	import { pickAsset } from '../../../host';
 	import { acceptForFileType, guessMime } from '../../utils/file-browser';
-	import { isFileRefValue, type WeftFileRefValue } from '../../value-format';
+	import { fileRefsOf, type WeftFileRefValue } from '../../value-format';
 	import FilePickerModal from './FilePickerModal.svelte';
 
 	// The file-drop config field. Its value is an `@asset("<path-or-url-or-key>",
@@ -20,27 +20,53 @@
 		value,
 		accept,
 		fileType,
+		multiple = false,
 		onUpdate,
 	}: {
 		value: unknown;
 		accept: string | undefined;
 		fileType: string | undefined;
-		// A WeftFileRefValue to set, or null to clear (routes to removeConfig).
-		onUpdate: (ref: WeftFileRefValue | null) => void;
+		/// The port holds SEVERAL files, so the field keeps a list: every
+		/// add appends, each row removes itself, and the value written is
+		/// a list of refs. A single-file port is the same control with one
+		/// row and no list.
+		multiple?: boolean;
+		// The value to set: one ref, a list of them when the port takes
+		// several, or null to clear (routes to removeConfig).
+		onUpdate: (ref: WeftFileRefValue | WeftFileRefValue[] | null) => void;
 	} = $props();
 
 	const declaredType = $derived(fileType ?? 'File');
 	const effectiveAccept = $derived(acceptForFileType(fileType, accept));
-	const current = $derived(isFileRefValue(value) ? value.__weftFileRef : null);
-	const currentIsUrl = $derived(
-		current !== null && (current.path.startsWith('http://') || current.path.startsWith('https://')),
-	);
+	// The files this field currently names, read from whichever shape the
+	// value arrives in: the structural ref a file-backed config field
+	// carries, or the marker text a port literal holds.
+	const refs = $derived(fileRefsOf(value));
+	// A single-file port SHOWS its first file even when the source names
+	// several (hand-written `[@asset(a), @asset(b)]` on a non-multiple
+	// port): hiding a value that exists, then overwriting it on the next
+	// pick, would silently lose data. The extras render as a loud row.
+	const current = $derived(!multiple && refs.length > 0 ? refs[0].__weftFileRef : null);
+
+	function isUrl(path: string): boolean {
+		return path.startsWith('http://') || path.startsWith('https://');
+	}
 	// A tenant-less storage key (`project/<id>/<file>` etc.): a stored runtime
 	// file picked from the project's storage, not a folder path.
 	// SYNC: key shape <-> crates/weft-core/src/storage/key.rs is_scope_key
-	const currentIsStored = $derived(
-		current !== null && /^(exec|project|shared|asset)\/[^/]+\/[^/]+$/.test(current.path),
-	);
+	function isStored(path: string): boolean {
+		return /^(exec|project|shared|asset)\/[^/]+\/[^/]+$/.test(path);
+	}
+	function originOf(path: string): string {
+		return isUrl(path) ? 'external URL' : isStored(path) ? 'stored file' : 'project asset';
+	}
+	function iconFor(path: string) {
+		const mime = guessMime(path);
+		return mime.startsWith('audio/') ? FileAudio
+			: mime.startsWith('video/') ? FileVideo
+			: mime.startsWith('image/') ? FileImage
+			: FileText;
+	}
 
 	let errorMsg = $state<string | null>(null);
 	let busy = $state(false);
@@ -49,25 +75,36 @@
 	let showUrlInput = $state(false);
 	let urlText = $state('');
 
-	const Icon = $derived.by(() => {
-		const mime = current ? guessMime(current.path) : '';
-		return mime.startsWith('audio/') ? FileAudio
-			: mime.startsWith('video/') ? FileVideo
-			: mime.startsWith('image/') ? FileImage
-			: FileText;
-	});
-
-	function setPath(path: string) {
-		errorMsg = null;
-		onUpdate({ __weftFileRef: { path, type: declaredType, marker: 'asset' } });
+	function refFor(path: string): WeftFileRefValue {
+		return { __weftFileRef: { path, type: declaredType, marker: 'asset' } };
 	}
 
-	async function pick(dropped?: { name: string; bytesBase64: string }) {
+	/// Write the field's files. A single-file port carries the ref itself
+	/// (or null when emptied); a multi-file one carries the list, and an
+	/// emptied list clears the value the same way.
+	function write(next: WeftFileRefValue[]) {
+		errorMsg = null;
+		if (!multiple) {
+			onUpdate(next[0] ?? null);
+			return;
+		}
+		onUpdate(next.length > 0 ? next : null);
+	}
+
+	function addPaths(paths: string[]) {
+		if (paths.length === 0) return;
+		write(multiple ? [...refs, ...paths.map(refFor)] : [refFor(paths[0])]);
+	}
+
+	function removeAt(index: number) {
+		write(refs.filter((_, at) => at !== index));
+	}
+
+	async function pick(dropped?: { name: string; bytesBase64: string }[]) {
 		errorMsg = null;
 		busy = true;
 		try {
-			const path = await pickAsset(effectiveAccept, dropped);
-			if (path !== null) setPath(path);
+			addPaths(await pickAsset(effectiveAccept, { multiple, dropped }));
 		} catch (err) {
 			errorMsg = err instanceof Error ? err.message : 'pick failed';
 		} finally {
@@ -75,21 +112,28 @@
 		}
 	}
 
-	async function onDrop(e: DragEvent) {
-		e.preventDefault();
-		dragging = false;
-		if (busy) return;
-		const file = e.dataTransfer?.files?.[0];
-		if (!file) return;
-		// The browser hides a dropped file's OS path, so the bytes travel to
-		// the host, which stores them as a project file under assets/.
+	/// A dropped file's bytes, base64, for the host to store under
+	/// `assets/`: the browser hides the file's OS path, so the bytes are
+	/// what can travel.
+	async function encode(file: File): Promise<{ name: string; bytesBase64: string }> {
 		const buf = new Uint8Array(await file.arrayBuffer());
 		let bin = '';
 		const CHUNK = 0x8000;
 		for (let i = 0; i < buf.length; i += CHUNK) {
 			bin += String.fromCharCode(...buf.subarray(i, i + CHUNK));
 		}
-		void pick({ name: file.name, bytesBase64: btoa(bin) });
+		return { name: file.name, bytesBase64: btoa(bin) };
+	}
+
+	async function onDrop(e: DragEvent) {
+		e.preventDefault();
+		dragging = false;
+		if (busy) return;
+		const dropped = Array.from(e.dataTransfer?.files ?? []);
+		if (dropped.length === 0) return;
+		// A single-file field takes the first even when several are dropped.
+		const files = multiple ? dropped : dropped.slice(0, 1);
+		void pick(await Promise.all(files.map(encode)));
 	}
 
 	function submitUrl() {
@@ -107,11 +151,7 @@
 		}
 		urlText = '';
 		showUrlInput = false;
-		setPath(trimmed);
-	}
-
-	function clear() {
-		onUpdate(null);
+		addPaths([trimmed]);
 	}
 </script>
 
@@ -124,24 +164,65 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="nodrag nopan nowheel" onclick={(e) => e.stopPropagation()}>
 	{#if current}
+		{@const Icon = iconFor(current.path)}
 		<div class="flex items-center gap-2 rounded border border-border bg-muted/40 p-2">
 			<Icon class="w-4 h-4 text-muted-foreground shrink-0" />
 			<div class="min-w-0 flex-1">
 				<div class="truncate text-[11px] font-mono text-foreground" title={current.path}>{current.path}</div>
 				<div class="text-[10px] text-muted-foreground">
-					{currentIsUrl ? 'external URL' : currentIsStored ? 'stored file' : 'project asset'} · {current.type}
+					{originOf(current.path)} · {current.type}
 				</div>
 			</div>
 			<button
 				class="text-muted-foreground hover:text-destructive transition-colors shrink-0"
 				title="Remove file"
 				disabled={busy}
-				onclick={clear}
+				onclick={() => removeAt(0)}
 			>
 				<X class="w-4 h-4" />
 			</button>
 		</div>
+		{#if refs.length > 1}
+			<div class="mt-1 rounded border border-rose-200 bg-rose-50 px-2 py-1.5 text-[10px] text-rose-600">
+				This port takes one file but the source names {refs.length}; remove the extras:
+				{#each refs.slice(1) as ref, i}
+					<div class="flex items-center gap-1">
+						<span class="min-w-0 flex-1 truncate font-mono" title={ref.__weftFileRef.path}>{ref.__weftFileRef.path}</span>
+						<button
+							type="button"
+							class="shrink-0 hover:text-destructive"
+							title="Remove {ref.__weftFileRef.path}"
+							disabled={busy}
+							onclick={() => removeAt(i + 1)}
+						>&times;</button>
+					</div>
+				{/each}
+			</div>
+		{/if}
 	{:else}
+		<!-- A port that takes several: the files it holds sit above the
+		     zone, one row each, in the order they were added. -->
+		{#if multiple && refs.length > 0}
+			<div class="mb-1 space-y-1">
+				{#each refs as ref, i}
+					{@const path = ref.__weftFileRef.path}
+					{@const RowIcon = iconFor(path)}
+					<div class="group flex items-center gap-2 rounded bg-muted pl-2 pr-1 py-1">
+						<RowIcon class="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+						<span class="min-w-0 flex-1 truncate text-[11px] font-mono" title={path}>{path}</span>
+						<span class="shrink-0 text-[10px] text-muted-foreground">{originOf(path)}</span>
+						<button
+							type="button"
+							class="shrink-0 w-4 h-4 grid place-items-center rounded text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive hover:bg-background transition"
+							title="Remove"
+							aria-label="Remove {path}"
+							disabled={busy}
+							onclick={() => removeAt(i)}
+						>&times;</button>
+					</div>
+				{/each}
+			</div>
+		{/if}
 		<button
 			type="button"
 			class="flex w-full flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed px-3 py-6 text-center transition-colors
@@ -155,7 +236,13 @@
 		>
 			<Upload class="w-5 h-5 text-muted-foreground" />
 			<div class="text-[11px] text-muted-foreground">
-				<span class="font-medium text-foreground">{busy ? 'Picking…' : 'Click to pick a file'}</span>
+				<span class="font-medium text-foreground">
+					{busy
+						? 'Picking…'
+						: multiple
+							? refs.length > 0 ? 'Click to add more files' : 'Click to pick files'
+							: 'Click to pick a file'}
+				</span>
 				{busy ? '' : ' or drag and drop'}
 			</div>
 			{#if effectiveAccept}
@@ -208,7 +295,7 @@
 {#if showPicker}
 	<FilePickerModal
 		accept={effectiveAccept}
-		onPick={(path) => { showPicker = false; setPath(path); }}
+		onPick={(path) => { showPicker = false; addPaths([path]); }}
 		onClose={() => (showPicker = false)}
 	/>
 {/if}

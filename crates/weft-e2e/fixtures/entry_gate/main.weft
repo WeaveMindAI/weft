@@ -1,0 +1,15 @@
+# An ENTRY node turned off by a written `_should_flow: false`. Entry
+# nodes have no incoming wires, so this is the one branching shape the
+# wired-guard fixture (skip/) cannot reach: the decision has to be read
+# from the node's own braces at kick time. The rig asserts the node is
+# skipped with reason `did_not_flow` (a decision, distinct from the
+# consequence `required_input_closed` its consumer gets), its body never
+# produced a value, and the run still completes.
+
+gated = Text {
+  value: "never produced"
+  _should_flow: false
+}
+
+out = Debug
+out.data = gated.value

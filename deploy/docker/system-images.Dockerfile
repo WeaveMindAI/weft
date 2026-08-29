@@ -51,8 +51,9 @@ COPY crates ./crates
 # concurrently, and cargo's registry lock
 # file lives OUTSIDE the mounted dir while the shared target dir must
 # not see two cargo invocations at once.
-# SYNC: the `-p ... --bin ...` package list <-> SYSTEM_IMAGE_BINARIES in
-#       crates/weft-cli/src/images.rs (seeds the staleness-stamp closure)
+# SYNC: the `-p ... --bin ...` package list <-> the `ensure_system_image`
+#       crate names in `provision_images`,
+#       crates/weft-cli/src/commands/daemon.rs
 RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=weft-cargo-target-system,target=/build/target,sharing=locked \
     cargo build --release \

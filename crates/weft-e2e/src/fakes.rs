@@ -235,7 +235,7 @@ async fn hanging_handler(State(state): State<HangingState>) -> impl IntoResponse
     // client sees an incomplete-body transport error, exactly what a source
     // that dies mid-transfer looks like.
     const CHUNK: usize = 64 * 1024;
-    let chunks = (state.sent + CHUNK - 1) / CHUNK;
+    let chunks = state.sent.div_ceil(CHUNK);
     let data = futures::stream::iter((0..chunks).map(move |i| {
         let start = i * CHUNK;
         let end = (start + CHUNK).min(state.sent);
@@ -533,7 +533,7 @@ async fn serve_socket(
             std::mem::take(&mut *q)
         };
         for frame in pending {
-            if ws.send(Message::Text(frame.into())).await.is_err() {
+            if ws.send(Message::Text(frame)).await.is_err() {
                 return;
             }
         }

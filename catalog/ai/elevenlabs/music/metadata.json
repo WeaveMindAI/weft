@@ -19,6 +19,7 @@
     {
       "name": "prompt",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "What the track should sound like: style, mood, instruments, lyrics.",
       "placeholder": "A slow lo-fi hip hop beat with warm piano chords"

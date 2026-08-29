@@ -2,8 +2,9 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, AI streaming edits.",
-  "version": "0.2.200",
+  "version": "0.2.236",
   "publisher": "weavemind",
+  "packageManager": "pnpm@10.32.1",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -29,6 +30,27 @@
         ],
         "configuration": "./language-configuration.json"
       }
+    ],
+    "grammars": [
+      {
+        "language": "weft",
+        "scopeName": "source.weft",
+        "path": "./syntaxes/weft.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.weft.codeblock",
+        "path": "./syntaxes/weft-markdown-injection.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.weft": "weft"
+        }
+      }
+    ],
+    "markdown.previewScripts": [
+      "./markdown-preview/hljs.js",
+      "./markdown-preview/highlight-weft.js"
     ],
     "commands": [
       {
@@ -191,12 +213,13 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "pnpm run compile && pnpm run bundle:webview",
+    "vscode:prepublish": "pnpm run compile && pnpm run bundle:webview && pnpm run bundle:markdown-preview",
     "compile": "tsc -p ./ && pnpm run check:webview",
     "check:webview": "svelte-check --tsconfig ./tsconfig.webview.json",
     "test": "vitest run",
     "watch": "tsc -watch -p ./",
     "bundle:webview": "vite build --config vite.webview.config.mjs",
+    "bundle:markdown-preview": "vite build --config vite.markdown-preview.config.mjs",
     "bundle:webview:watch": "vite build --watch --config vite.webview.config.mjs"
   },
   "devDependencies": {
@@ -206,11 +229,12 @@
     "@types/vscode": "^1.90.0",
     "@xyflow/svelte": "^1.5.2",
     "bits-ui": "^2.1.0",
-    "plyr": "^3.8.4",
     "clsx": "^2.1.1",
-    "elkjs": "^0.11.1",
+    "elkjs": "^0.12.0",
+    "highlight.js": "^11.12.0",
     "lucide-svelte": "^0.477.0",
     "mode-watcher": "^1.1.0",
+    "plyr": "^3.8.4",
     "svelte": "^5.0.0",
     "svelte-check": "^4.4.8",
     "tailwind-merge": "^3.5.0",

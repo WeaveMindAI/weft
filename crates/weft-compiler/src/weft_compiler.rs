@@ -9,6 +9,11 @@
 
 use uuid::Uuid;
 
+// The marker's byte length is the LEXER's rule: the raw-JSON walk in
+// `quote_markers` must bound markers exactly the way the tokenizer
+// would, or the two would disagree about where a marker ends inside a
+// compound value.
+use crate::cst::lexer::marker_len;
 use crate::file_reader::CompileFs;
 
 use weft_core::node::NodeFeatures;
@@ -50,8 +55,8 @@ impl std::fmt::Display for CompileError {
 // ─── Intermediate Representations ────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-struct ParsedPort {
-    name: String,
+pub(crate) struct ParsedPort {
+    pub(crate) name: String,
     port_type: WeftType,
     required: bool,
     /// True iff this port was auto-synthesized by the loop-lowering pass
@@ -85,6 +90,9 @@ struct ParsedNode {
     header_span: Option<Span>,
     /// Span + origin (inline vs connection-line) per config field name.
     config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// Config keys written with the `?` marker (`answer?: src.port`),
+    /// which makes the port that key creates optional.
+    optional_ports: std::collections::BTreeSet<String>,
     /// Resolved `@file(...)` references per config field name. Populated by
     /// the file-ref resolution pass; carried to NodeDefinition so the editor
     /// knows which fields are file-backed.
@@ -93,6 +101,21 @@ struct ParsedNode {
     /// of the included `.weft` file. The editor renders this node as an
     /// expandable group that navigates into the file.
     include_path: Option<String>,
+}
+
+/// What lowering a node body produced: the config map plus the per-key
+/// facts later passes read off it. One struct rather than a fistful of
+/// `&mut` out-params, so adding a fact does not widen every signature
+/// between here and the caller.
+#[derive(Debug, Default)]
+struct LoweredBody {
+    config: serde_json::Map<String, serde_json::Value>,
+    label: Option<String>,
+    config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
+    /// Keys written `key?:`, which make the port that key creates optional.
+    optional_ports: std::collections::BTreeSet<String>,
+    /// `@require_one_of(...)` groups written inside the body.
+    one_of_required: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +164,16 @@ struct ParsedGroup {
     /// The group's description: the plain `# ...` comment that is the first
     /// body line, text without the `# `. None when absent or empty.
     description: Option<String>,
+    /// LITERALS written on this container's interface ports: `g.x = "hi"`
+    /// from outside, or `_should_flow: false` in the braces. They land on
+    /// the In boundary node, which is the node those ports belong to, and
+    /// the runtime reads them exactly as it reads a node's own. A wired
+    /// value is an ordinary edge and rides in `connections` instead.
+    port_literals: serde_json::Map<String, serde_json::Value>,
+    /// Where each `port_literals` entry was written, and in WHICH FORM
+    /// (a braces field or a `g.x = ...` statement). An edit rewrites the
+    /// value where it already lives, so the author's spelling survives.
+    port_literal_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
 }
 
 impl ParsedGroup {
@@ -190,6 +223,10 @@ pub(crate) struct ParsedInclude {
     /// Source range of the `alias = @include(...)` decl (the include IS its
     /// header), used both for diagnostics and as the opaque node's span.
     pub span: Span,
+    /// Values written on the alias's ports (`c.raw = "hi"`). An alias has
+    /// no ports of its own until the include resolves, so they wait here
+    /// and land on whatever it resolves to.
+    pending_literals: Vec<LiteralFill>,
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -380,8 +417,14 @@ fn resolve_includes(
             continue;
         }
         match resolve_one_include(&inc, fs, mode, in_progress) {
-            Ok(IncludeResult::Group(group)) => state.groups.push(*group),
-            Ok(IncludeResult::Node(node)) => state.nodes.push(*node),
+            Ok(IncludeResult::Group(mut group)) => {
+                apply_pending_literals(&inc, &mut group, errors);
+                state.groups.push(*group);
+            }
+            Ok(IncludeResult::Node(mut node)) => {
+                apply_pending_literals_to_node(&inc, &mut node, errors);
+                state.nodes.push(*node);
+            }
             Err(msg) => errors.push(CompileError::at(inc.span, msg)),
         }
     }
@@ -408,8 +451,12 @@ fn resolve_group_includes(
             continue;
         }
         match resolve_one_include(&inc, fs, mode, in_progress) {
-            Ok(IncludeResult::Group(g)) => group.child_groups.push(*g),
+            Ok(IncludeResult::Group(mut g)) => {
+                apply_pending_literals(&inc, &mut g, errors);
+                group.child_groups.push(*g);
+            }
             Ok(IncludeResult::Node(mut n)) => {
+                apply_pending_literals_to_node(&inc, &mut n, errors);
                 // The opaque interface node is a member of this group (its id
                 // is already scoped `group.child`); set parent_id so flatten
                 // assigns it the group's scope, like any other child node.
@@ -423,6 +470,32 @@ fn resolve_group_includes(
     }
     for child in &mut group.child_groups {
         resolve_group_includes(child, fs, mode, in_progress, errors);
+    }
+}
+
+/// Land an alias's pending port values on the group the include resolved
+/// to: they are values on that group's interface ports, exactly as if the
+/// group had been written in this file.
+fn apply_pending_literals(
+    inc: &ParsedInclude,
+    group: &mut ParsedGroup,
+    errors: &mut Vec<CompileError>,
+) {
+    for fill in &inc.pending_literals {
+        apply_container_literal_fill(fill, group, errors);
+    }
+}
+
+/// The same values, landing on the opaque node an interface-mode include
+/// resolves to: that node carries the group's ports, so they are its
+/// config fields.
+fn apply_pending_literals_to_node(
+    inc: &ParsedInclude,
+    node: &mut ParsedNode,
+    errors: &mut Vec<CompileError>,
+) {
+    for fill in &inc.pending_literals {
+        apply_literal_fill(fill, &mut node.config, &mut node.config_spans, errors);
     }
 }
 
@@ -509,6 +582,7 @@ fn resolve_one_include(
                 span: Some(inc.span),
                 header_span: Some(inc.span),
                 config_spans: Default::default(),
+                optional_ports: Default::default(),
                 file_refs: Default::default(),
                 include_path: Some(inc.path.clone()),
             };
@@ -733,6 +807,7 @@ fn detect_structural_errors(node: &crate::cst::SyntaxNode, li: &LineIndex, error
 /// and extracting it is the one subtle, shared piece (telling a literal RHS from
 /// a `src.port` edge); WHERE the value goes (and whether a missing target is an
 /// error or an edge) is scope policy the caller owns.
+#[derive(Debug, Clone)]
 struct LiteralFill {
     target_id: String,
     port: String,
@@ -776,21 +851,55 @@ fn apply_literal_fill(
     }
 }
 
+/// Apply a recognized literal fill to a CONTAINER's interface port
+/// (`g.x = "hi"`, `g._should_flow = false`). The value lands on the group's
+/// In boundary node, whose ports these are. A key naming no such port
+/// pushes its own error here; either way the fill is consumed.
+fn apply_container_literal_fill(
+    fill: &LiteralFill,
+    group: &mut ParsedGroup,
+    errors: &mut Vec<CompileError>,
+) {
+    let declared = group.in_ports.iter().any(|p| p.name == fill.port)
+        || fill.port == weft_core::exec::skip::SHOULD_FLOW_PORT;
+    if !declared {
+        errors.push(CompileError::at(
+            fill.span,
+            format!(
+                "'{}' has no input port '{}'. Its ports are the ones in its signature, plus `_should_flow`",
+                fill.target_id, fill.port
+            ),
+        ));
+        return;
+    }
+    if let Some(k) = store_value_text(&fill.port, &fill.value, &mut group.port_literals, fill.span, errors) {
+        group.port_literal_spans.insert(k, ConfigFieldSpan::connection(fill.span));
+    }
+}
+
 /// Lower a top-level CONNECTION. A literal RHS (`node.port = "v"`) fills that
-/// NODE's config. A literal to anything else (a group/include alias, an
-/// undeclared target) has no config to fill: it falls through to
-/// `lower_connection`, which rejects the bare literal loudly (only a node's own
-/// port takes a literal; a group/include port is driven by wiring). Otherwise
-/// (an endpoint or inline-expr RHS) it is an edge / node synthesis.
+/// NODE's config, and the same written on a group or loop's interface port
+/// fills the container. A literal to anything else (an include alias, an
+/// undeclared target) has nothing to fill: it falls through to
+/// `lower_connection`, which rejects the bare literal loudly. Otherwise (an
+/// endpoint or inline-expr RHS) it is an edge / node synthesis.
 fn lower_top_level_connection(conn: &crate::cst::SyntaxNode, li: &LineIndex, state: &mut ParseState, inline: &mut InlineScope) {
     if let Some(fill) = literal_config_fill(conn, li) {
         if let Some(node) = state.nodes.iter_mut().find(|n| n.id == fill.target_id) {
             apply_literal_fill(&fill, &mut node.config, &mut node.config_spans, &mut state.errors);
             return;
         }
-        // Not a node: a literal can't fill a group/include/undeclared port. Fall
-        // through; `lower_connection` emits the single "cannot assign a literal"
-        // error (no phantom empty-source edge).
+        if let Some(group) = state.groups.iter_mut().find(|g| g.id == fill.target_id) {
+            apply_container_literal_fill(&fill, group, &mut state.errors);
+            return;
+        }
+        if let Some(inc) = state.includes.iter_mut().find(|i| i.alias == fill.target_id) {
+            inc.pending_literals.push(fill);
+            return;
+        }
+        // Neither: a literal can't fill an include alias or an undeclared
+        // port. Fall through; `lower_connection` emits the single "cannot
+        // assign a literal" error (no phantom empty-source edge).
     }
     // No enclosing group, so an inline-expr RHS synthesizes its anon node at the
     // file root (scope None).
@@ -941,11 +1050,32 @@ fn reject_reserved_local(local_id: &str, span: Span, errors: &mut Vec<CompileErr
     false
 }
 
+/// Every `_`-prefixed key a node body may carry. Four, and they are the
+/// whole reserved namespace: the label, the tags, the output flag, and
+/// the port that decides whether the node runs. Anything else starting
+/// with `_` is refused, so the namespace stays available.
+///
+/// `_label` is lowered before this list is consulted (it becomes
+/// `node.label`, never a config value), so it appears here as the
+/// vocabulary, not as a config key the parser stores.
+// SYNC: RESERVED_CONFIG_KEYS <-> docs/src/language/syntax.md (Reserved keys),
+// packages/weft-syntax/weft.tmLanguage.json, packages/weft-syntax/highlight-weft.js,
+// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+pub const RESERVED_CONFIG_KEYS: &[&str] = &[
+    "_label",
+    weft_core::tag::TAGS_CONFIG_KEY,
+    "_is_output",
+    weft_core::exec::skip::SHOULD_FLOW_PORT,
+];
+
 /// The canonical list of type names the language reserves. The SINGLE
 /// source of truth: identifier reservation, catalog node-type
 /// reservation, and any future surface that needs to know "is this name
 /// taken by the language" all consult this list. To add a new reserved
 /// type, append it here and every consumer picks it up.
+// SYNC: RESERVED_TYPE_KEYWORDS <-> packages/weft-syntax/weft.tmLanguage.json,
+// packages/weft-syntax/highlight-weft.js,
+// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
 pub const RESERVED_TYPE_KEYWORDS: &[&str] =
     &["Group", "Passthrough", "Loop", "LoopIn", "LoopOut"];
 
@@ -964,6 +1094,15 @@ pub fn is_reserved_type_keyword(name: &str) -> bool {
 pub fn is_reserved_local(id: &str) -> bool {
     id == "self" || is_reserved_type_keyword(id) || id.contains("__")
 }
+
+/// The bare words the language colours besides types and config keys:
+/// the `self` boundary keyword and the boolean literals. The
+/// highlighting-vocabulary test sources them here so the grammar files
+/// and the compiler cannot drift on the list.
+// SYNC: RESERVED_WORDS <-> packages/weft-syntax/weft.tmLanguage.json,
+// packages/weft-syntax/highlight-weft.js,
+// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+pub const RESERVED_WORDS: &[&str] = &["self", "true", "false"];
 
 /// The header IDENT (the decl's local id) and the type name, from a HEADER node.
 fn header_id_and_type(header: &crate::cst::SyntaxNode) -> (String, String) {
@@ -1067,7 +1206,20 @@ fn read_loop_port_list(
     span: Span,
     errors: &mut Vec<CompileError>,
 ) -> Vec<String> {
-    let Some(arr) = cfg.and_then(|c| c.get(key)).and_then(|v| v.as_array()) else {
+    let Some(value) = cfg.and_then(|c| c.get(key)) else {
+        return Vec::new();
+    };
+    // A scalar (`carry: "acc"`) is a shape mistake, never a silent
+    // empty list: dropping it would run the loop with no carry and
+    // surface as an unrelated downstream error.
+    let Some(arr) = value.as_array() else {
+        errors.push(CompileError::at(
+            span,
+            format!(
+                "loop '{loop_id}': [loop-config-malformed] '{key}' must be a LIST of \
+                 port names, e.g. `{key}: [{value}]`; got {value}"
+            ),
+        ));
         return Vec::new();
     };
     let mut out = Vec::with_capacity(arr.len());
@@ -1075,7 +1227,7 @@ fn read_loop_port_list(
         match v.as_str() {
             Some(s) => out.push(s.to_string()),
             None => errors.push(CompileError::at(
-                span.clone(),
+                span,
                 format!(
                     "loop '{loop_id}': [loop-config-malformed] '{key}[{i}]' must be a port name (string); got {v}"
                 ),
@@ -1101,7 +1253,7 @@ fn validate_loop_port_list(
 /// Read a loop config port list AFTER `read_loop_port_list` already
 /// vetted it during lowering. Trusted: non-string entries are not
 /// expected and would indicate a caller skipped lowering.
-fn read_loop_port_list_vetted(
+pub(crate) fn read_loop_port_list_vetted(
     cfg: Option<&serde_json::Map<String, serde_json::Value>>,
     key: &str,
 ) -> Vec<String> {
@@ -1169,31 +1321,29 @@ fn lower_node(
     let id = scoped(parent, &local_id);
     let (in_ports, out_ports, one_of_required) = lower_header_ports(header.syntax(), li, errors);
 
-    let mut config = serde_json::Map::new();
-    let mut label = None;
-    let mut config_spans: std::collections::BTreeMap<String, ConfigFieldSpan> = Default::default();
+    let mut body_out = LoweredBody::default();
     let mut one_of_required = one_of_required;
-    let mut body_oor = Vec::new();
     if let Some(body) = n.body() {
         // The inline host is this node's RAW local; its group scope is `parent`.
         // An inline-expr config value synthesizes its anon node `{local}__field`
         // raw, scoped to `g.node__field` by lower_group (one scope pass).
-        lower_config_body(&body, &local_id, parent, li, &mut config, &mut label, &mut config_spans, inline, &mut body_oor, errors);
+        lower_config_body(&body, &local_id, parent, li, &mut body_out, inline, errors);
     }
-    one_of_required.extend(body_oor);
+    one_of_required.extend(body_out.one_of_required);
 
     Some(ParsedNode {
         id,
         node_type,
-        label,
-        config,
+        label: body_out.label,
+        config: body_out.config,
         parent_id: parent.map(|p| p.to_string()),
         in_ports,
         out_ports,
         one_of_required,
         span: Some(li.span_of(n.syntax())),
         header_span: Some(li.span_of(header.syntax())),
-        config_spans,
+        config_spans: body_out.config_spans,
+        optional_ports: body_out.optional_ports,
         file_refs: Default::default(),
         include_path: None,
     })
@@ -1209,18 +1359,15 @@ fn lower_config_body(
     host_local: &str,
     group_scope: Option<&str>,
     li: &LineIndex,
-    config: &mut serde_json::Map<String, serde_json::Value>,
-    label: &mut Option<String>,
-    config_spans: &mut std::collections::BTreeMap<String, ConfigFieldSpan>,
+    out: &mut LoweredBody,
     inline: &mut InlineScope,
-    body_oor: &mut Vec<Vec<String>>,
     errors: &mut Vec<CompileError>,
 ) {
     use crate::cst::SyntaxKind as K;
     for child in body.syntax().children() {
         match child.kind() {
             K::CONFIG_FIELD | K::LABEL_FIELD => {
-                lower_config_field(&child, host_local, group_scope, li, config, label, config_spans, inline, errors);
+                lower_config_field(&child, host_local, group_scope, li, out, inline, errors);
             }
             K::CONNECTION => {
                 // Inside a node body, `host.key = <literal>` is a config-origin
@@ -1229,7 +1376,7 @@ fn lower_config_body(
                 let fill = literal_config_fill(&child, li)
                     .filter(|f| f.target_id == host_local);
                 match fill {
-                    Some(f) => apply_literal_fill(&f, config, config_spans, errors),
+                    Some(f) => apply_literal_fill(&f, &mut out.config, &mut out.config_spans, errors),
                     None => {
                         if let Some(conn) = lower_connection(&child, group_scope, li, inline, errors) {
                             inline.connections.push(conn);
@@ -1238,10 +1385,10 @@ fn lower_config_body(
                 }
             }
             K::DIRECTIVE => {
-                // @require_one_of inside a config block: collected into
-                // `body_oor` for the caller to merge onto the node/group.
+                // @require_one_of inside a config block: collected for the
+                // caller to merge onto the node/group.
                 if let Some(g) = lower_directive_require_one_of(&child, li, errors) {
-                    body_oor.push(g);
+                    out.one_of_required.push(g);
                 }
             }
             _ => {}
@@ -1258,9 +1405,7 @@ fn lower_config_field(
     host_local: &str,
     group_scope: Option<&str>,
     li: &LineIndex,
-    config: &mut serde_json::Map<String, serde_json::Value>,
-    label: &mut Option<String>,
-    config_spans: &mut std::collections::BTreeMap<String, ConfigFieldSpan>,
+    out: &mut LoweredBody,
     inline: &mut InlineScope,
     errors: &mut Vec<CompileError>,
 ) {
@@ -1273,6 +1418,20 @@ fn lower_config_field(
         .map(|t| t.text().to_string());
     let Some(key) = key else { return };
     let span = li.span_of(field);
+    // `key?:` marks the port this field creates as optional. Recorded for
+    // every key; enrich rejects it on a key that creates no port, where it
+    // would silently mean nothing.
+    // Only the tokens BEFORE the colon: a stray `?` on the value side
+    // must not mark the port optional (the parser only ever bumps `?`
+    // between key and colon, and this check mirrors that grammar).
+    if field
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .take_while(|t| t.kind() != K::COLON)
+        .any(|t| t.kind() == K::QUESTION)
+    {
+        out.optional_ports.insert(key.clone());
+    }
 
     // The value: the element(s) after the COLON. Find the value node/token.
     let value_node = field.children().find(|n| matches!(n.kind(), K::INLINE_EXPR | K::JSON_VALUE | K::ENDPOINT));
@@ -1308,21 +1467,21 @@ fn lower_config_field(
     if field.kind() == K::LABEL_FIELD {
         // The label has ONE home (`node.label`); set twice is a loud error, the
         // same rule `store_value_text` enforces for config keys.
-        if label.is_some() {
+        if out.label.is_some() {
             errors.push(CompileError::at(span, "duplicate '_label' field: a node's label may be set only once".to_string()));
             return;
         }
         // A label must be a quoted string / heredoc; a bare `_label: raw` fails loud.
         if let Some(text) = parse_label_value(&value_text, span, errors) {
-            *label = Some(text);
-            config_spans.insert("_label".to_string(), ConfigFieldSpan::inline(span));
+            out.label = Some(text);
+            out.config_spans.insert("_label".to_string(), ConfigFieldSpan::inline(span));
         }
         return;
     }
     // Heredoc / JSON / scalar: hand the value text to the value-store helper.
-    let stored = store_value_text(&key, &value_text, config, span, errors);
+    let stored = store_value_text(&key, &value_text, &mut out.config, span, errors);
     if let Some(k) = stored {
-        config_spans.insert(k, ConfigFieldSpan::inline(span));
+        out.config_spans.insert(k, ConfigFieldSpan::inline(span));
     }
 }
 
@@ -1385,15 +1544,12 @@ fn lower_inline_expr(
     // nested host is THIS anon node (raw `anon_id`), and it shares this node's
     // group scope (all inline children are flattened siblings in one group), so
     // thread `parent_id` unchanged.
-    let mut config = serde_json::Map::new();
-    let mut label = None;
-    let mut config_spans: std::collections::BTreeMap<String, ConfigFieldSpan> = Default::default();
-    let mut body_oor = Vec::new();
+    let mut body_out = LoweredBody::default();
     let mut one_of_required = one_of_required;
     if let Some(body) = inline_node.children().find(|n| n.kind() == K::BODY).and_then(crate::cst::nodes::Body::cast) {
-        lower_config_body(&body, &anon_id, parent_id, li, &mut config, &mut label, &mut config_spans, inline, &mut body_oor, errors);
+        lower_config_body(&body, &anon_id, parent_id, li, &mut body_out, inline, errors);
     }
-    one_of_required.extend(body_oor);
+    one_of_required.extend(body_out.one_of_required);
 
     // The required trailing `.port` (the inline expr's output read into the field).
     let output_port = inline_expr_dot_port(inline_node);
@@ -1405,8 +1561,8 @@ fn lower_inline_expr(
     inline.nodes.push(ParsedNode {
         id: anon_id.clone(),
         node_type,
-        label,
-        config,
+        label: body_out.label,
+        config: body_out.config,
         // The inline node lives in the host's group scope; setting parent_id makes
         // its `scope` array match its (post-rescope) group-scoped `id`. Without it
         // the id became `g.b__field` but scope was [].
@@ -1416,7 +1572,8 @@ fn lower_inline_expr(
         one_of_required,
         span: Some(li.span_of(inline_node)),
         header_span: None,
-        config_spans,
+        config_spans: body_out.config_spans,
+        optional_ports: body_out.optional_ports,
         file_refs: Default::default(),
         include_path: None,
     });
@@ -1538,7 +1695,7 @@ fn store_value_text(
     errors: &mut Vec<CompileError>,
 ) -> Option<String> {
     if config.contains_key(key) {
-        errors.push(CompileError::at(span, format!("duplicate config field '{key}': a node's config key may be set only once (as a body field `{key}: ...` OR a connection `node.{key} = ...`, not both)")));
+        errors.push(CompileError::at(span, format!("duplicate config field '{key}': it may be set only once (as a body field `{key}: ...` OR a connection `<name>.{key} = ...`, not both)")));
         return None;
     }
     // Heredoc (multiline string): strip fences, single leading/trailing newline,
@@ -1719,6 +1876,8 @@ fn lower_group(
         includes: Vec::new(),
         loop_config: None,
         loop_config_spans: Default::default(),
+        port_literals: Default::default(),
+        port_literal_spans: Default::default(),
         span: Some(li.span_of(g.syntax())),
         header_span: Some(header_span),
         description: g.description().map(|d| d.text()).filter(|s| !s.is_empty()),
@@ -1763,6 +1922,8 @@ fn lower_loop(
         includes: Vec::new(),
         loop_config: Some(serde_json::Map::new()),
         loop_config_spans: Default::default(),
+        port_literals: Default::default(),
+        port_literal_spans: Default::default(),
         span: Some(li.span_of(l.syntax())),
         header_span: Some(header_span),
         description: l.description().map(|d| d.text()).filter(|s| !s.is_empty()),
@@ -1805,67 +1966,99 @@ fn lower_grouplike_body(
     let mut conn_nodes: Vec<crate::cst::SyntaxNode> = Vec::new();
     for child in body.syntax().children() {
         match child.kind() {
-            K::CONFIG_FIELD => match group.kind {
-                GroupKind::Loop => {
-                    // Loop config field. Parse via the shared helper and
-                    // copy each value into the loop_config map. Key/value
-                    // SEMANTICS (known keys, types, required `parallel`)
-                    // are validate's job; lowering rejects only what
-                    // validate can never see because it would vanish or
-                    // corrupt the shape before validate runs.
-                    let mut tmp_cfg: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-                    let mut tmp_spans: std::collections::BTreeMap<String, ConfigFieldSpan> = Default::default();
-                    let mut tmp_label: Option<String> = None;
-                    let mut tmp_inline = InlineScope::default();
-                    lower_config_field(
-                        &child,
-                        &id,
-                        parent,
-                        li,
-                        &mut tmp_cfg,
-                        &mut tmp_label,
-                        &mut tmp_spans,
-                        &mut tmp_inline,
-                        errors,
-                    );
-                    // An inline expression as a loop-config value would
-                    // synthesize helper nodes that nothing wires up; the
-                    // value itself would silently disappear.
-                    if !tmp_inline.nodes.is_empty() || !tmp_inline.connections.is_empty() {
-                        errors.push(CompileError::at(
-                            li.span_of(&child),
-                            format!("loop '{id}': inline expressions are not valid loop config values"),
-                        ));
-                    }
-                    if let Some(cfg) = group.loop_config.as_mut() {
-                        for (k, v) in tmp_cfg {
-                            // `parentId` is the boundary pointer flatten
-                            // merges into the LoopIn config; a user key
-                            // with that name would clobber the loop's
-                            // wiring before validate could object.
-                            if k == "parentId" {
-                                errors.push(CompileError::at(
-                                    li.span_of(&child),
-                                    format!("loop '{id}': 'parentId' is a reserved loop config key"),
-                                ));
-                                continue;
-                            }
-                            cfg.insert(k, v);
-                        }
-                    }
-                    for (k, sp) in tmp_spans {
-                        group.loop_config_spans.insert(k, sp);
-                    }
+            K::CONFIG_FIELD => {
+                // ONE path for both kinds. Parse the field with the shared
+                // helper, then place it: `_should_flow` belongs to the
+                // boundary NODE (it decides whether the subgraph runs at
+                // all), a loop's own knobs belong to its config, and a
+                // plain group has nowhere else to put a field.
+                let noun = match group.kind {
+                    GroupKind::Loop => "loop",
+                    GroupKind::Group => "group",
+                };
+                let mut tmp_body = LoweredBody::default();
+                let mut tmp_inline = InlineScope::default();
+                lower_config_field(&child, &id, parent, li, &mut tmp_body, &mut tmp_inline, errors);
+                let field_span = li.span_of(&child);
+                // A WIRED value (`_should_flow: check.allowed`) lowered to
+                // an edge targeting this group, plus any inline node it
+                // synthesized. That edge is exactly what the outside form
+                // would have produced, so it joins the group's own
+                // connections and gets rescoped to the In boundary with
+                // every other endpoint.
+                let wired_flow = tmp_inline
+                    .connections
+                    .iter()
+                    .any(|c| c.target_port == weft_core::exec::skip::SHOULD_FLOW_PORT);
+                if wired_flow {
+                    group.nodes.extend(std::mem::take(&mut tmp_inline.nodes));
+                    group.connections.extend(std::mem::take(&mut tmp_inline.connections));
                 }
-                GroupKind::Group => {
-                    // Falling into the catch-all would silently eat the
-                    // field; plain groups carry no config block.
+                if !tmp_inline.nodes.is_empty() || !tmp_inline.connections.is_empty() {
+                    // Everything else: an inline expression as a config
+                    // value would synthesize helper nodes that nothing
+                    // wires up, and the value itself would disappear.
                     errors.push(CompileError::at(
-                        li.span_of(&child),
-                        format!("group '{id}': groups do not take config fields; did you mean a Loop?"),
+                        field_span,
+                        format!("{noun} '{id}': inline expressions are not valid {noun} config values"),
                     ));
                 }
-            },
+                for (key, value) in tmp_body.config {
+                    if key == weft_core::exec::skip::SHOULD_FLOW_PORT {
+                        group.port_literal_spans
+                            .insert(key.clone(), ConfigFieldSpan::inline(field_span));
+                        group.port_literals.insert(key, value);
+                        continue;
+                    }
+                    if key.starts_with('_') {
+                        errors.push(CompileError::at(
+                            field_span,
+                            format!(
+                                "{noun} '{id}': '{key}' is not a field a {noun} takes. The only \
+                                 reserved field here is `_should_flow`, which decides whether the \
+                                 whole {noun} runs"
+                            ),
+                        ));
+                        continue;
+                    }
+                    match group.loop_config.as_mut() {
+                        // `parentId` is the boundary pointer flatten merges
+                        // into the LoopIn config; a user key with that name
+                        // would clobber the loop's wiring before validate
+                        // could object.
+                        Some(_) if key == "parentId" => errors.push(CompileError::at(
+                            field_span,
+                            format!("loop '{id}': 'parentId' is a reserved loop config key"),
+                        )),
+                        // A loop's own knobs (`over`, `parallel`, ...).
+                        // Key/value SEMANTICS are validate's job; lowering
+                        // rejects only what validate can never see because
+                        // it would vanish before validate runs.
+                        Some(cfg) => {
+                            cfg.insert(key, value);
+                        }
+                        // A plain group has no config block: falling
+                        // through would silently eat the field.
+                        None => errors.push(CompileError::at(
+                            field_span,
+                            format!(
+                                "group '{id}': groups take no config fields beyond \
+                                 `_should_flow`; did you mean a Loop?"
+                            ),
+                        )),
+                    }
+                }
+                for (key, span) in tmp_body.config_spans {
+                    // `_should_flow` is a PORT literal, homed in
+                    // `port_literal_spans` above; a loop-config span for
+                    // it would show the editor a knob with no value.
+                    if matches!(group.kind, GroupKind::Loop)
+                        && key != weft_core::exec::skip::SHOULD_FLOW_PORT
+                    {
+                        group.loop_config_spans.insert(key, span);
+                    }
+                }
+            }
             K::LABEL_FIELD => {
                 // Falling into the catch-all would silently drop the
                 // label; neither group-like decl carries one.
@@ -1992,14 +2185,33 @@ fn lower_grouplike_body(
     // own anon node + edge into this scratch scope, merged below.
     let mut conn_inline = InlineScope::default();
     for cn in conn_nodes {
-        let fill = literal_config_fill(&cn, li)
-            .and_then(|f| group.nodes.iter_mut().find(|n| local_of(&n.id) == f.target_id).map(|n| (f, n)));
-        match fill {
-            Some((f, node)) => apply_literal_fill(&f, &mut node.config, &mut node.config_spans, errors),
-            None => {
-                if let Some(c) = lower_connection(&cn, Some(&id), li, &mut conn_inline, errors) {
-                    group.connections.push(c);
+        let fill = literal_config_fill(&cn, li);
+        // A literal targets a local CHILD, which is either a node (fills
+        // its config) or a nested container (fills its interface port).
+        let filled = match &fill {
+            Some(f) => {
+                if let Some(node) = group.nodes.iter_mut().find(|n| local_of(&n.id) == f.target_id) {
+                    apply_literal_fill(f, &mut node.config, &mut node.config_spans, errors);
+                    true
+                } else if let Some(child) =
+                    group.child_groups.iter_mut().find(|g| local_of(&g.id) == f.target_id)
+                {
+                    apply_container_literal_fill(f, child, errors);
+                    true
+                } else if let Some(inc) =
+                    group.includes.iter_mut().find(|i| local_of(&i.alias) == f.target_id)
+                {
+                    inc.pending_literals.push(f.clone());
+                    true
+                } else {
+                    false
                 }
+            }
+            None => false,
+        };
+        if !filled {
+            if let Some(c) = lower_connection(&cn, Some(&id), li, &mut conn_inline, errors) {
+                group.connections.push(c);
             }
         }
     }
@@ -2095,12 +2307,39 @@ fn lower_include(
     }
     // `parse_include_arg` parses the `("path")` arg form; pass the marker's
     // parenthesized body (the single home for marker-arg extraction).
-    let after = format!("({})", crate::cst::marker::args_raw(marker.text())?);
-    let path = parse_include_arg(&after).ok()?;
+    // A malformed marker is LOUD, never a silently dropped include: an
+    // unclosed paren or a spaced one would otherwise compile to a
+    // project missing the included nodes with no diagnostic at all.
+    let body = match crate::cst::marker::args(marker.text()) {
+        crate::cst::marker::MarkerArgs::Args(body) => body,
+        shape => {
+            let msg = match shape {
+                crate::cst::marker::MarkerArgs::Unclosed => {
+                    "@include is missing its closing parenthesis"
+                }
+                crate::cst::marker::MarkerArgs::TrailingText => {
+                    "@include(\"path\") must stand alone: remove the text after the \
+                     closing parenthesis"
+                }
+                _ => "@include needs (\"path\") directly after the name (no space before `(`)",
+            };
+            errors.push(CompileError::at(li.span_of(i.syntax()), msg.to_string()));
+            return None;
+        }
+    };
+    let after = format!("({body})");
+    let path = match parse_include_arg(&after) {
+        Ok(path) => path,
+        Err(e) => {
+            errors.push(CompileError::at(li.span_of(i.syntax()), e));
+            return None;
+        }
+    };
     Some(ParsedInclude {
         alias: scoped(parent, &alias_local),
         path,
         span: li.span_of(i.syntax()),
+        pending_literals: Vec::new(),
     })
 }
 
@@ -2121,7 +2360,7 @@ fn scoped(parent: Option<&str>, local: &str) -> String {
 /// Parse a single port declaration.
 /// Port declaration syntax: `name: Type` (required by default) or
 /// `name: Type?` (optional). No prefix characters.
-fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
+pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
     let s = trimmed.trim();
     let rest = s;
     let (name, port_type, optional) = if let Some(colon_pos) = rest.find(':') {
@@ -2173,7 +2412,7 @@ fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
 
     Ok(ParsedPort {
         name: name.to_string(),
-        port_type: port_type,
+        port_type,
         required: !optional, // v2: required by default, ? makes optional
         synthesized_from_carry: false,
         type_error: None,
@@ -2230,16 +2469,94 @@ fn parse_include_arg(after: &str) -> Result<String, String> {
 /// Parses one `key: value` pair into `config`. Returns the key actually
 /// stored (so the caller can record its source span), or `None` if the line
 /// wasn't a valid pair or the value was rejected.
+/// A JSON literal's text with every `@file`/`@asset` marker inside it
+/// quoted, so `[@asset("a.png", Image)]` reads as
+/// `["@asset(\"a.png\", Image)"]`: exactly the string a marker becomes
+/// when it stands alone as a config value, so nothing downstream needs
+/// to know whether a marker sat at the top or inside a list.
+///
+/// Text already inside a JSON string is left alone, so a genuine string
+/// that mentions `@asset(...)` stays that string.
+fn quote_markers(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            // Whole characters, never bytes: pushing a byte of a
+            // multi-byte character as a char would mojibake every
+            // non-ASCII string.
+            let ch = raw[i..].chars().next().expect("i sits on a char boundary");
+            out.push(ch);
+            i += ch.len_utf8();
+            if ch == '\\' {
+                // An escape and the character it escapes travel
+                // together, so a `\"` never reads as the string's end.
+                if let Some(next) = raw[i..].chars().next() {
+                    out.push(next);
+                    i += next.len_utf8();
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if b == b'@' {
+            let len = marker_len(&raw[i..]);
+            let marker = &raw[i..i + len];
+            // Only the two real markers, WITH an argument list, get
+            // quoted. Anything else that starts with `@` (a typo'd
+            // `@aset(...)`, a bare `@`, a bare `@file` with no parens)
+            // rides through unquoted so the JSON reader fails loud on
+            // the text as written, never silently coerced to a string
+            // the node would receive as literal marker text.
+            let name = crate::cst::marker::directive(marker);
+            if (name != "file" && name != "asset")
+                || !crate::cst::marker::has_abutting_args(marker)
+            {
+                out.push('@');
+                i += 1;
+                continue;
+            }
+            out.push('"');
+            for ch in marker.chars() {
+                match ch {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    other => out.push(other),
+                }
+            }
+            out.push('"');
+            i += len;
+            continue;
+        }
+        // Multi-byte UTF-8 rides through on its leading byte's iteration:
+        // push the whole char and skip its width.
+        let ch = raw[i..].chars().next().expect("i is on a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+
 fn parse_kv(
     s: &str,
     config: &mut serde_json::Map<String, serde_json::Value>,
     span: Span,
     errors: &mut Vec<CompileError>,
 ) -> Option<String> {
-    let colon_pos = match s.find(':') {
-        Some(p) => p,
-        None => return None,
-    };
+    let colon_pos = s.find(':')?;
     let key = s[..colon_pos].trim();
     let raw = s[colon_pos + 1..].trim();
 
@@ -2271,16 +2588,17 @@ fn parse_kv(
         errors.push(CompileError::at(span, "a node's label is set with a body field `_label: \"...\"`, not a connection `node._label = ...`".to_string()));
         return None;
     }
-    // Other reserved internal keys (`_is_output`, `_tags`) ARE config keys (read
-    // from `config` downstream); anything else with a leading underscore is
-    // rejected so the user doesn't collide with a future reserved field.
+    // The other reserved keys ARE config keys (read from `config`
+    // downstream); anything else with a leading underscore is rejected so
+    // the user doesn't collide with a future reserved field.
     if key.starts_with('_') {
-        const ALLOWED: &[&str] = &["_is_output", weft_core::tag::TAGS_CONFIG_KEY];
-        if !ALLOWED.contains(&key) {
+        // `_label` never reaches here (it is handled above), so the
+        // allowed set is the reserved list minus that one.
+        if !RESERVED_CONFIG_KEYS.contains(&key) {
             errors.push(CompileError::at(span, format!(
                 "'{key}' starts with '_' which is reserved for internal config keys. \
                  Allowed reserved keys: {}",
-                ALLOWED.join(", ")
+                RESERVED_CONFIG_KEYS.join(", ")
             )));
             return None;
         }
@@ -2314,9 +2632,16 @@ fn parse_kv(
     } else if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
         serde_json::Value::String(unescape(&raw[1..raw.len() - 1]))
     } else if raw.starts_with('[') || raw.starts_with('{') {
-        // JSON array/object. Malformed JSON is NOT silently coerced to a string
-        // (that hid `[a, b]`-style typos); it fails loud.
-        match serde_json::from_str(raw) {
+        // JSON array/object. A `@file`/`@asset` marker inside one is a
+        // VALUE like any other (a list of attachments is a list of
+        // markers), and a marker's value IS its own text, so each one is
+        // quoted into the string it would be at the top level and the
+        // whole thing is read by one JSON reader.
+        //
+        // Malformed JSON is NOT silently coerced to a string (that hid
+        // `[a, b]`-style typos); it fails loud, quoting what was written
+        // rather than the rewritten text.
+        match serde_json::from_str(&quote_markers(raw)) {
             Ok(v) => v,
             Err(e) => {
                 errors.push(CompileError::at(span, format!(
@@ -2545,9 +2870,11 @@ fn collect_group_definitions(
         child_group_ids,
         node_ids,
         anonymous: group.anonymous,
-        span: group.span.clone(),
-        header_span: group.header_span.clone(),
+        span: group.span,
+        header_span: group.header_span,
         description: group.description.clone(),
+        port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        port_literal_spans: group.port_literal_spans.clone(),
     });
 
     for child in &group.child_groups {
@@ -2621,7 +2948,7 @@ fn flatten_group(
     };
 
     let in_pt_id = weft_core::project::boundary_in_id(&group.id);
-    let in_pt_inputs: Vec<InputDefinition> = group.in_ports.iter().map(|p| {
+    let mut in_pt_inputs: Vec<InputDefinition> = group.in_ports.iter().map(|p| {
         InputDefinition::from_wire_port(PortDefinition {
             name: p.name.clone(),
             port_type: p.port_type.clone(),
@@ -2630,6 +2957,25 @@ fn flatten_group(
             synthesized_from_carry: p.synthesized_from_carry,
         })
     }).collect();
+    // A group or loop takes `_should_flow` like any node, on its IN
+    // boundary: a closure or a `false` there skips the boundary, and the
+    // skip cascades through every child, so guarding a subgraph is the
+    // same one line as guarding a node. Enrich gives every catalog node
+    // this port; boundary nodes are built here instead, so it is added
+    // here. The Out boundary never takes one: it forwards whatever
+    // reached it, and a group that did not run has nothing to forward.
+    in_pt_inputs.push(InputDefinition::from_wire_port(PortDefinition {
+        name: weft_core::exec::skip::SHOULD_FLOW_PORT.to_string(),
+        // Its OWN type variable, never a `T` the group's ports might
+        // also use.
+        port_type: weft_core::weft_type::WeftType::type_var("T__should_flow"),
+        required: false,
+        description: Some(
+            "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn."
+                .to_string(),
+        ),
+        synthesized_from_carry: false,
+    }));
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
         let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
             elem_type(&p.port_type)
@@ -2659,8 +3005,10 @@ fn flatten_group(
         });
     }
 
-    let mut in_features = NodeFeatures::default();
-    in_features.one_of_required = group.one_of_required.clone();
+    let in_features = NodeFeatures {
+        one_of_required: group.one_of_required.clone(),
+        ..NodeFeatures::default()
+    };
     // Stash loop config on the boundary node's `config` JSON so the
     // engine reads it without a separate registry. parentId is kept so
     // the existing webview rendering doesn't break.
@@ -2702,8 +3050,12 @@ fn flatten_group(
         span: None,
         header_span: None,
         config_spans: loop_spans,
-        port_literals: Default::default(),
-        port_literal_spans: Default::default(),
+        optional_ports: Default::default(),
+        // Literals written on the container's interface ports. Enrich never
+        // sees a boundary node, so what it would normally move onto the port
+        // is placed here.
+        port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        port_literal_spans: group.port_literal_spans.clone(),
         file_refs: Default::default(),
         include_path: None,
     });
@@ -2773,6 +3125,7 @@ fn flatten_group(
         span: None,
         header_span: None,
         config_spans: Default::default(),
+        optional_ports: Default::default(),
         port_literals: Default::default(),
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
@@ -2826,8 +3179,10 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         description: None,
         synthesized_from_carry: false,
     }).collect();
-    let mut features = NodeFeatures::default();
-    features.one_of_required = pn.one_of_required.clone();
+    let features = NodeFeatures {
+        one_of_required: pn.one_of_required.clone(),
+        ..NodeFeatures::default()
+    };
     let scope = match &pn.parent_id {
         Some(pid) => build_scope_chain(pid),
         None => vec![],
@@ -2849,6 +3204,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),
+        optional_ports: pn.optional_ports.clone(),
         // Populated by the enrich normalization once the full port list
         // is known; the parser leaves every body value in `config`.
         port_literals: Default::default(),

@@ -62,10 +62,10 @@ function toTemplate(entry: CatalogEntry): NodeTemplate {
 		defaultOutputs: (entry.outputs ?? []).map(toOutputPort),
 		features: entry.features,
 		display: entry.display,
-		// `weft describe-nodes` ships the field-type vocabulary inline
-		// for nodes whose features.hasFormSchema is true; the
-		// form_builder editor reads it via `typeConfig.formFieldSpecs`.
-		formFieldSpecs: entry.formFieldSpecs,
+		// `weft describe-nodes` ships the entry-kind vocabulary inline
+		// for a node whose ports come from its own config; the
+		// entry-list editor reads it via `typeConfig.portsFromConfig`.
+		portsFromConfig: entry.portsFromConfig,
 		// The service recipe (personal access nodes only): the connect
 		// flow reads which fields to paste / whether a consent runs.
 		service: entry.service,

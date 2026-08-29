@@ -1,0 +1,52 @@
+# A WhatsApp support bot that knows when to ask.
+#
+# The model answers each message and rates how sensitive the request is.
+# A routine answer goes straight back to the customer; a sensitive one
+# waits for a person to approve it.
+
+whatsapp = BaileyBridge
+
+ask = BaileyReceive { endpointUrl: whatsapp.endpointUrl }
+
+draft = LlmInference -> (answer: String, sensitivity: String) {
+  parseJson: true
+  prompt: ask.content
+  provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider
+  params: LlmParams { systemPrompt: @file("prompts/support.md"), temperature: 0.75 }.params
+}
+
+# Exactly one of these two says yes, the other stays quiet
+route = Switch {
+  value: draft.sensitivity
+  cases: [
+    { "kind": "equals", "value": "high", "port": "needsAPerson" },
+    { "kind": "otherwise", "port": "goAhead" }
+  ]
+}
+
+review = HumanQuery {
+  _should_flow: route.needsAPerson
+  title: "Send this answer?"
+  fields: [
+    { "kind": "display", "key": "from" },
+    { "kind": "display", "key": "question" },
+    { "kind": "display", "key": "answer" },
+    { "kind": "approve_reject", "key": "send" }
+  ]
+  from: ask.pushName
+  question: ask.content
+  answer: draft.answer
+}
+
+allowed = FirstInOrder {
+  approved: review.send_approved
+  automatic: route.goAhead
+}
+
+reply = BaileySend {
+  _is_output: true
+  _should_flow: allowed.value
+  endpointUrl: whatsapp.endpointUrl
+  to: ask.chatId
+  message: draft.answer
+}

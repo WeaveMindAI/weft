@@ -3,7 +3,7 @@
 	import type { NodeExecution } from '../../types';
 	import type { BusInspectorEvent, BusMeta, CorruptionSite, LoopInspectorEvent, LoopIteration } from '../../../../protocol';
 	import { parseFileValue } from '../../../../protocol';
-	import { displayStatus, getStatusIcon } from '../../utils/status';
+	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
 	import JsonTree from './JsonTree.svelte';
 	import FileCard from './FileCard.svelte';
 	import CopyButton from '../ui/CopyButton.svelte';
@@ -370,7 +370,7 @@
 							{selected.status === 'waiting_for_input' ? 'Waiting for input...' : 'Running...'}
 						</div>
 					{:else if selected.status === 'skipped'}
-						<div class="text-[11px] text-zinc-500">Skipped</div>
+						<div class="text-[11px] text-zinc-500">Skipped: {skipReasonText(selected.skipReason)}</div>
 					{:else}
 						<div class="text-[11px] text-zinc-500">{displayStatus(selected.status)}</div>
 					{/if}

@@ -12,8 +12,10 @@
 //!     journal schema must be applied BEFORE this group.
 //!   - `executor`: `TaskExecutor` and `WorkerTaskKind` traits, plus
 //!     the dispatcher and worker picker loops.
-//!   - `schema_guard`: the fingerprint-stamped schema runner every
-//!     boot routes its `SchemaGroup`s through.
+//!   - `schema_guard`: the schema runner every boot routes its
+//!     `SchemaGroup`s through. It builds a new database from the canonical
+//!     `CREATE TABLE` text and carries an existing one forward with the
+//!     group's migration files.
 
 pub mod executor;
 pub mod kinds;
@@ -22,7 +24,7 @@ pub mod tasks;
 pub mod traits;
 pub mod worker_pod;
 
-pub use schema_guard::{apply_groups, SchemaGroup};
+pub use schema_guard::{apply_groups, Migration, SchemaGroup};
 
 pub use executor::{
     run_dispatcher_picker, run_worker_picker, TaskExecutor, TaskRegistry, TaskRegistryBuilder,

@@ -1,20 +1,22 @@
 <script lang="ts">
-	import { Handle, Position, NodeResizer, type ResizeParams } from "@xyflow/svelte";
+	import { Handle, Position, NodeResizer, useEdges, type ResizeParams } from "@xyflow/svelte";
 	import { Group, RotateCw, Maximize2, Minimize2, ChevronDown, ChevronRight } from '@lucide/svelte';
-	import { isLoopNodeType } from "../../types";
+	import { isLoopNodeType, containerHasConfigStrip } from "../../types";
 	import { NODE_TYPE_CONFIG } from '../../nodes';
 	import type { NodeDataUpdates, PortDefinition, NodeExecution, FieldDefinition } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
-	import { GROUP_PORTS_TOP_PX, LOOP_CONFIG_STRIP_BAR_PX, LOOP_CONFIG_STRIP_OPEN_PX } from "../../constants/loop-layout";
+	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx } from "../../constants/container-layout";
 	import { createPortContextMenu, buildPortMenuItems } from '../../utils/port-context-menu';
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
 	import { portMarkerStyle } from '../../utils/port-marker';
 	import ExecutionInspector from './ExecutionInspector.svelte';
+	import FlowDock from './FlowDock.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_INNER_SOURCE_HANDLE, SIMPLIFIED_INNER_TARGET_HANDLE, SIMPLIFIED_LOOP_INDEX_HANDLE, SIMPLIFIED_LOOP_DONE_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import { GROUP_COLOR, LOOP_COLOR } from "../../constants/colors";
+	import { SHOULD_FLOW_PORT } from "../../../../protocol";
 	import FieldStrip from './FieldStrip.svelte';
-	import { LOOP_CONFIG_FIELDS } from '../../utils/input-field';
+	import { LOOP_CONFIG_FIELDS, fieldForInput, nextPortLiterals, shouldFlowField } from '../../utils/input-field';
 
 	// Group interface ports cannot take a body-set literal (see the rule
 	// enforced in enrichment's validate_required_ports). Pass an empty set to
@@ -31,6 +33,9 @@
 			/// per side (+ inner dots for children, + loop index/done).
 			simplified?: boolean;
 			config: Record<string, unknown>;
+			/// Body-set PORT values. A container's only entry today is
+			/// `_should_flow`, written as a literal in its braces.
+			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: { oneOfRequired?: string[][] };
@@ -60,7 +65,32 @@
 	} = $props();
 
 	const inputs = $derived((data.inputs ?? []) as PortDefinition[]);
+	const edgesState = useEdges();
+	// `_should_flow` decides whether the whole container runs, so it docks
+	// as a square in the top-left corner instead of joining the interface
+	// ports. Filled means something answers it: a wire, or a literal
+	// written in the braces.
+	const flowConnected = $derived(
+		edgesState.current.some((e) => e.target === id && e.targetHandle === SHOULD_FLOW_PORT)
+			|| (data.portLiterals as Record<string, unknown> | undefined)?.[SHOULD_FLOW_PORT] !== undefined
+	);
 	const outputs = $derived((data.outputs ?? []) as PortDefinition[]);
+	// Simplified view draws a dot only when an edge attaches to it: structure
+	// is not editable there, so an unwired dot would be pure decoration. The
+	// live edges are the merged __simp_* ones (flow wires collapse onto the
+	// outer in dot), so each dot's own handle id is the test.
+	const simpDotConnected = $derived.by(() => {
+		const c = { in: false, out: false, innerSrc: false, innerTgt: false, loopIndex: false, loopDone: false };
+		for (const e of edgesState.current) {
+			if (e.target === id && e.targetHandle === SIMPLIFIED_IN_HANDLE) c.in = true;
+			if (e.source === id && e.sourceHandle === SIMPLIFIED_OUT_HANDLE) c.out = true;
+			if (e.source === id && e.sourceHandle === SIMPLIFIED_INNER_SOURCE_HANDLE) c.innerSrc = true;
+			if (e.target === id && e.targetHandle === SIMPLIFIED_INNER_TARGET_HANDLE) c.innerTgt = true;
+			if (e.source === id && e.sourceHandle === SIMPLIFIED_LOOP_INDEX_HANDLE) c.loopIndex = true;
+			if (e.target === id && e.targetHandle === SIMPLIFIED_LOOP_DONE_HANDLE) c.loopDone = true;
+		}
+		return c;
+	});
 	const carryPortNames = $derived(new Set(
 		isLoopNodeType(data.nodeType)
 			? ((data.config?.carry as string[] | undefined) ?? [])
@@ -95,8 +125,34 @@
 	/// role chosen via right-click on each port, so the strip only shows
 	const loopFields: FieldDefinition[] = $derived(isLoop ? LOOP_CONFIG_FIELDS : []);
 
-	function updateLoopConfig(key: string, value: unknown) {
+	const portLiterals = $derived((data.portLiterals as Record<string, unknown> | undefined) ?? {});
+	/// One field per interface port carrying a WRITTEN VALUE. A port fed
+	/// by a wire is driven by that wire, so it has no entry here and no
+	/// field: the strip only ever shows values the source actually
+	/// spells out.
+	const portFields: FieldDefinition[] = $derived(
+		Object.keys(portLiterals).map((key) => {
+			if (key === SHOULD_FLOW_PORT) return shouldFlowField('container');
+			const port = inputs.find((p) => p.name === key);
+			return port
+				? fieldForInput(port)
+				: ({ key, label: key, type: 'textarea', portDriven: true } as FieldDefinition);
+		}),
+	);
+	const stripFields: FieldDefinition[] = $derived([...portFields, ...loopFields]);
+	const hasConfigStrip = $derived(
+		!data.simplified && containerHasConfigStrip(data.nodeType, portLiterals),
+	);
+
+	function updateStripField(key: string, value: unknown, portDriven?: boolean) {
 		if (!data.onUpdate) return;
+		if (portDriven) {
+			// Same write rule as ProjectNode's port strip: a cleared
+			// control DELETES the literal, so the source can go back to
+			// saying nothing about the port.
+			data.onUpdate({ portLiterals: nextPortLiterals(portLiterals, key, value) });
+			return;
+		}
 		data.onUpdate({ config: { ...data.config, [key]: value } });
 	}
 
@@ -118,12 +174,16 @@
 
 	const minExpandedHeight = $derived(computeMinHeight(inputs.length, outputs.length));
 
-	/// Y offset of the side-port columns: the loop config strip (open or
-	/// collapsed bar) pushes them below the header.
-	const portsTop = $derived(
-		GROUP_PORTS_TOP_PX +
-			(isLoop && !data.simplified ? (configCollapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX) : 0),
-	);
+	/// The rendered strip's actual height, measured off the DOM: the
+	/// strip grows with its field list (one row per written port
+	/// literal), so a constant here would paint the side-port dots
+	/// under a tall strip.
+	let stripMeasuredPx = $state(0);
+
+	/// Y offset of the side-port columns: the config strip (open or
+	/// collapsed bar) pushes them below the header by however tall it
+	/// really is.
+	const portsTop = $derived(GROUP_PORTS_TOP_PX + (hasConfigStrip ? stripMeasuredPx : 0));
 
 	// Auto-enforce minimum height when ports change or on load. This is a LAYOUT
 	// change only: send just the `height` key, NOT the whole spread config. The
@@ -342,7 +402,9 @@
 		const portsBlock = data.simplified ? 0 : Math.max(visibleInputs, visibleOutputs) * 30 + 24;
 		const headerArea = 44;
 		const bodyMin = 220; // breathing room for at least a couple of child nodes
-		const configArea = loopExtras ? (collapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX) : 0;
+		const configArea = hasConfigStrip
+			? (collapsed ? CONFIG_STRIP_BAR_PX : configStripOpenPx(stripFields.length))
+			: 0;
 		return headerArea + configArea + portsBlock + bodyMin;
 	}
 
@@ -460,16 +522,24 @@
 	}
 </script>
 
+{#snippet flowDock(topPx: number)}
+	<FlowDock top={topPx} subject={isLoop ? 'loop' : 'group'} connected={flowConnected} />
+{/snippet}
+
 {#if isExpanded}
 <!-- ═══════════════ EXPANDED: container envelope ═══════════════ -->
 <NodeResizer
 	minWidth={250}
 	minHeight={Math.max(200, minExpandedHeight)}
-	isVisible={selected}
+	isVisible={selected && !data.simplified}
 	lineStyle="border-color: hsl(var(--primary)); border-width: 2px;"
 	handleStyle="background-color: hsl(var(--primary)); width: 10px; height: 10px; border-radius: 2px;"
 	onResizeEnd={handleResizeEnd}
 />
+
+{#if !data.simplified}
+	{@render flowDock(14)}
+{/if}
 
 <div class="expanded-container" class:selected>
 	<div class="expanded-header">
@@ -501,27 +571,30 @@
 		</div>
 	</div>
 
-	{#if isLoop && !data.simplified}
-		<!-- Loop config strip: own collapse independent of the box. Hidden in
-		     simplified view (no config there). -->
+	{#if hasConfigStrip}
+		<!-- Config strip: the loop's knobs, and every interface port with a
+		     value written on it. Own collapse, independent of the box.
+		     Hidden in simplified view (no config there). -->
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<!-- svelte-ignore a11y_click_events_have_key_events -->
-		<div class="loop-config-strip nodrag nopan" onclick={(e) => e.stopPropagation()}>
-			<button class="loop-config-toggle" onclick={toggleConfigCollapsed} title={configCollapsed ? 'Show loop config' : 'Hide loop config'}>
+		<div class="config-strip nodrag nopan" style="--strip-color: {containerColor};" bind:clientHeight={stripMeasuredPx} onclick={(e) => e.stopPropagation()}>
+			<button class="config-toggle" onclick={toggleConfigCollapsed} title={configCollapsed ? 'Show config' : 'Hide config'}>
 				{#if configCollapsed}
 					<ChevronRight size={11} />
 				{:else}
 					<ChevronDown size={11} />
 				{/if}
-				<span class="loop-config-toggle-label">Config</span>
+				<span class="config-toggle-label">Config</span>
 			</button>
 			{#if !configCollapsed}
-				<div class="loop-config-fields">
+				<div class="config-fields">
 					<FieldStrip
-						fields={loopFields}
+						fields={stripFields}
 						config={(data.config as Record<string, unknown>) ?? {}}
+						portValues={portLiterals}
 						idPrefix={id}
-						onUpdate={updateLoopConfig}
+						onUpdate={updateStripField}
+						onClear={(key) => updateStripField(key, null, true)}
 					/>
 				</div>
 			{/if}
@@ -536,15 +609,19 @@
 			     inner-source dot below. -->
 			<div class="expanded-port-block">
 				<div class="expanded-port-dots">
-					<Handle type="target" position={Position.Left} id={SIMPLIFIED_IN_HANDLE}
-						style={simplifiedDotStyle(GROUP_COLOR)}
-						class="!rounded-full !relative !inset-auto !transform-none" />
-					<Handle type="source" position={Position.Right} id={SIMPLIFIED_INNER_SOURCE_HANDLE}
-						style={simplifiedDotStyle(GROUP_COLOR)}
-						class="!rounded-full !relative !inset-auto !transform-none" />
+					{#if simpDotConnected.in}
+						<Handle type="target" position={Position.Left} id={SIMPLIFIED_IN_HANDLE}
+							style={simplifiedDotStyle(GROUP_COLOR)}
+							class="!rounded-full !relative !inset-auto !transform-none" />
+					{/if}
+					{#if simpDotConnected.innerSrc}
+						<Handle type="source" position={Position.Right} id={SIMPLIFIED_INNER_SOURCE_HANDLE}
+							style={simplifiedDotStyle(GROUP_COLOR)}
+							class="!rounded-full !relative !inset-auto !transform-none" />
+					{/if}
 				</div>
 			</div>
-			{#if isLoop}
+			{#if isLoop && simpDotConnected.loopIndex}
 				<div class="expanded-port-block implicit-port" title="self.index (current iteration)">
 					<div class="expanded-port-label-row"><span class="implicit-glyph">∗</span><span class="expanded-port-label">index</span></div>
 					<div class="expanded-port-dots">
@@ -649,15 +726,19 @@
 			     inner-target dot below. -->
 			<div class="expanded-port-block expanded-port-block-right">
 				<div class="expanded-port-dots expanded-port-dots-right">
-					<Handle type="target" position={Position.Left} id={SIMPLIFIED_INNER_TARGET_HANDLE}
-						style={simplifiedDotStyle(GROUP_COLOR)}
-						class="!rounded-full !relative !inset-auto !transform-none" />
-					<Handle type="source" position={Position.Right} id={SIMPLIFIED_OUT_HANDLE}
-						style={simplifiedDotStyle(GROUP_COLOR)}
-						class="!rounded-full !relative !inset-auto !transform-none" />
+					{#if simpDotConnected.innerTgt}
+						<Handle type="target" position={Position.Left} id={SIMPLIFIED_INNER_TARGET_HANDLE}
+							style={simplifiedDotStyle(GROUP_COLOR)}
+							class="!rounded-full !relative !inset-auto !transform-none" />
+					{/if}
+					{#if simpDotConnected.out}
+						<Handle type="source" position={Position.Right} id={SIMPLIFIED_OUT_HANDLE}
+							style={simplifiedDotStyle(GROUP_COLOR)}
+							class="!rounded-full !relative !inset-auto !transform-none" />
+					{/if}
 				</div>
 			</div>
-			{#if isLoop}
+			{#if isLoop && simpDotConnected.loopDone}
 				<div class="expanded-port-block expanded-port-block-right implicit-port" title="self.done (write true to terminate loop)">
 					<div class="expanded-port-label-row expanded-port-label-row-right"><span class="expanded-port-label">done</span><span class="implicit-glyph">∗</span></div>
 					<div class="expanded-port-dots expanded-port-dots-right">
@@ -752,8 +833,10 @@
 
 {:else if data.simplified}
 <!-- ═══════════════ COLLAPSED + SIMPLIFIED: a square, like a plain node ═══════════════ -->
-<Handle type="target" position={Position.Left} id={SIMPLIFIED_IN_HANDLE}
-	style="top: 50%; {simplifiedDotStyle(containerColor)}" />
+{#if simpDotConnected.in}
+	<Handle type="target" position={Position.Left} id={SIMPLIFIED_IN_HANDLE}
+		style="top: 50%; {simplifiedDotStyle(containerColor)}" />
+{/if}
 <div class="simplified-node rounded-lg select-none" class:selected
 	style="width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: {SIMPLIFIED_SQUARE_PAD_PX}px; background: rgba(255,255,255,0.95); border: 1px solid {selected ? containerColor : 'rgba(0,0,0,0.08)'}; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);">
 	<div class="absolute top-1 right-1 flex items-center gap-0.5 nodrag nopan">
@@ -772,10 +855,13 @@
 	{/if}
 	</div>
 </div>
-<Handle type="source" position={Position.Right} id={SIMPLIFIED_OUT_HANDLE}
-	style="top: 50%; {simplifiedDotStyle(containerColor)}" />
+{#if simpDotConnected.out}
+	<Handle type="source" position={Position.Right} id={SIMPLIFIED_OUT_HANDLE}
+		style="top: 50%; {simplifiedDotStyle(containerColor)}" />
+{/if}
 {:else}
 <!-- ═══════════════ COLLAPSED: looks like a regular node ═══════════════ -->
+{@render flowDock(18)}
 <div class="collapsed-node" class:selected>
 	<!-- Color accent bar -->
 	<div class="collapsed-accent"></div>
@@ -949,8 +1035,8 @@
 <style>
 	/* SYNC: container hex colors <-> ../../constants/colors.ts GROUP_COLOR (#52525b)
 	   / LOOP_COLOR (#8b5cf6). Svelte scoped CSS can't read a TS const, so these
-	   rules restate the hex (and the loop violet also appears alpha-blended as
-	   rgba(139,92,246,...) in .loop-config-strip). Change one side, change both. */
+	   rules restate the hex. The config strip takes its colour from the
+	   container instead, through the `--strip-color` property set inline. */
 	/* ═══════════════ EXPANDED MODE ═══════════════ */
 	.expanded-container {
 		width: 100%;
@@ -983,18 +1069,18 @@
 		backdrop-filter: blur(4px);
 	}
 
-	.loop-config-strip {
-		background: rgba(139, 92, 246, 0.04);
-		border-bottom: 1px solid rgba(139, 92, 246, 0.2);
+	.config-strip {
+		background: color-mix(in srgb, var(--strip-color) 4%, transparent);
+		border-bottom: 1px solid color-mix(in srgb, var(--strip-color) 20%, transparent);
 		padding: 4px 10px 6px 10px;
 		font-size: 11px;
 	}
 
-	.loop-config-toggle {
+	.config-toggle {
 		display: flex;
 		align-items: center;
 		gap: 3px;
-		color: #8b5cf6;
+		color: var(--strip-color);
 		font-size: 10px;
 		font-weight: 600;
 		padding: 2px 0;
@@ -1003,23 +1089,23 @@
 		cursor: pointer;
 	}
 
-	.loop-config-toggle:hover {
+	.config-toggle:hover {
 		opacity: 0.8;
 	}
 
-	.loop-config-toggle-label {
+	.config-toggle-label {
 		text-transform: uppercase;
 		letter-spacing: 0.05em;
 	}
 
-	.loop-config-fields {
+	.config-fields {
 		display: flex;
 		flex-direction: column;
 		gap: 5px;
 		margin-top: 4px;
 	}
 
-	/* `top` comes inline from `portsTop` (loop-layout constants), so the
+	/* `top` comes inline from `portsTop` (container-layout constants), so the
 	 * rendered strip offset and ELK's padding share one source. */
 	.expanded-side-ports {
 		position: absolute;

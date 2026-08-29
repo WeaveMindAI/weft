@@ -15,7 +15,7 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 fn fields() -> serde_json::Value {
-    json!([{ "fieldType": "approve_reject", "key": "decision" }])
+    json!([{ "kind": "approve_reject", "key": "decision" }])
 }
 
 async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
@@ -35,7 +35,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn approval_maps(rig: FakeRig) -> WeftResult<()> {
-    // The compiler's hasFormSchema merge derives these ports; the rig
+    // The compiler derives these ports from `portsFromConfig`; the rig
     // plays that role.
     rig.output_type("decision_approved", WeftType::parse("Boolean").expect("Boolean parses"));
     rig.output_type("decision_rejected", WeftType::parse("Boolean").expect("Boolean parses"));

@@ -170,37 +170,40 @@ pub async fn authorize_project(
     }
 }
 
-/// Authorize a caller against an execution (identified by its color): the
-/// execution's project must exist AND belong to the caller's tenant. Resolves
-/// color to its project via the journal, then reuses `authorize_project`, so
-/// execution access inherits the exact same project-ownership rule. Returns the
-/// resolved project id on success (handlers often need it next).
+/// Authorize a caller against an execution (identified by its color):
+/// the tenant STAMPED on the execution when it was born must be the
+/// caller's. Returns the execution's owner (tenant + project id), which
+/// handlers need next.
 ///
-/// A color with no project mapping is `NOT_FOUND` (same as cross-tenant: no
-/// existence leak). A corrupt mapping (a color row pointing at no/garbage
-/// project) is a real server fault, surfaced as `INTERNAL_SERVER_ERROR`.
+/// Deliberately NOT `authorize_project` on the execution's project: an
+/// execution outlives its project (the journal is the record of what
+/// ran, and `weft rm` takes only the project), so asking the project
+/// store made every execution of a removed project un-replayable and
+/// UNDELETABLE, with `weft clean` (the documented way to remove them)
+/// refused on the rows that needed it most. The stamped tenant is
+/// equally strict, because a project cannot change tenant, and it
+/// cannot be deleted out from under the row.
+///
+/// A color with no `execution_color` row is `NOT_FOUND`, the same
+/// answer as a cross-tenant color, so neither leaks the other's
+/// existence.
+/// Takes the JOURNAL, not the whole state: the execution's own row is
+/// the only thing this consults, and saying so in the signature is
+/// what keeps a future edit from reaching for the project store again.
 pub async fn authorize_execution(
-    state: &DispatcherState,
+    journal: &dyn crate::journal::Journal,
     caller: &TenantId,
     color: weft_core::Color,
-) -> Result<String, (StatusCode, String)> {
-    let project_id = match state.journal.execution_project(color).await {
-        Ok(crate::journal::ColorLookup::Found(p)) => p,
-        Ok(crate::journal::ColorLookup::NotFound) => {
-            return Err((StatusCode::NOT_FOUND, "not found".to_string()))
-        }
-        Ok(crate::journal::ColorLookup::Corrupt) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "execution mapping corrupt".to_string(),
-            ))
-        }
+) -> Result<crate::journal::ExecutionOwner, (StatusCode, String)> {
+    let owner = match journal.execution_owner(color).await {
+        Ok(Some(o)) => o,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "not found".to_string())),
         Err(e) => {
             tracing::warn!(
                 target: "weft_dispatcher::auth",
                 color = %color,
                 error = %e,
-                "execution_project failed during authorization"
+                "execution_owner failed during authorization"
             );
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -208,11 +211,10 @@ pub async fn authorize_execution(
             ));
         }
     };
-    let id = project_id
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "execution mapping corrupt".to_string()))?;
-    authorize_project(state, caller, id).await?;
-    Ok(project_id)
+    if owner.tenant != caller.as_str() {
+        return Err((StatusCode::NOT_FOUND, "not found".to_string()));
+    }
+    Ok(owner)
 }
 
 #[cfg(test)]

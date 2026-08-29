@@ -572,6 +572,7 @@
               framesKey,
               input: e.input,
               closedPorts: e.closedPorts,
+              skipReason: e.skipReason,
               output: e.output,
             },
           ];
@@ -607,6 +608,12 @@
             // labels for skipped firings as well as running ones.
             if (e.closedPorts !== undefined) {
               updated.closedPorts = e.closedPorts;
+            }
+            // Why the firing did not run, on a skip. The inspector says
+            // it in words: a decision reads differently from an input
+            // that never arrived.
+            if (e.skipReason !== undefined) {
+              updated.skipReason = e.skipReason;
             }
             return updated;
           });
@@ -845,9 +852,9 @@
   // a worker, and forwards the message to the host. The host's
   // CLI runner emits progress events that drive every UI
   // transition; the webview never sets transitional flags itself.
-  function onRun() {
+  function onRun(targets: string[] = []) {
     editorRef?.flushAllPendingSaves?.();
-    send({ kind: 'runProject' });
+    send({ kind: 'runProject', targets });
   }
   // Stop is generic now: the host inspects the bar's current
   // state and either kills the spawned CLI process group
@@ -1041,6 +1048,29 @@
             {/snippet}
           </GraphToolbar>
     {#key viewGeneration}
+    <!-- Failure wall for the editor: an uncaught throw in its render or
+         effects would otherwise kill the whole webview SILENTLY, and the
+         panel is a singleton, so every file opened afterwards would show
+         the same blank canvas until a window reload. Fail loud instead:
+         name the error on screen and offer a remount. -->
+    <svelte:boundary>
+      {#snippet failed(error, reset)}
+        <div class="absolute inset-0 flex flex-col items-center justify-center gap-3 p-8 text-center">
+          <div class="text-sm font-semibold text-red-600">The graph view crashed</div>
+          <div class="max-w-xl text-xs text-muted-foreground break-words">
+            {error instanceof Error ? error.message : String(error)}
+          </div>
+          <!-- Bumping the key remounts the whole {#key} block, boundary
+               included, which IS the reset; calling the snippet's reset()
+               too would run against a block already being torn down. -->
+          <button
+            class="px-3 py-1.5 rounded bg-primary text-primary-foreground text-xs"
+            onclick={() => { viewGeneration += 1; }}
+          >
+            Reload the graph
+          </button>
+        </div>
+      {/snippet}
     <ProjectEditor
       bind:this={editorRef}
       {project}
@@ -1080,6 +1110,7 @@
       {infraFeedByNode}
       {signalFeedByNode}
     />
+    </svelte:boundary>
     {/key}
     <!-- Keyed on the intent so each OPEN remounts the picker fresh at its
          defaults. Without this, the picker is mounted once and only toggled open,

@@ -33,13 +33,15 @@ const FETCH_LIMIT: i64 = 500;
 pub const INFRA_EVENT_CHANNEL: &str = "weft_infra_event";
 
 /// Seed this bridge's cursor row in `dispatcher_cursor` (the table is
-/// `journal_bridge::GROUP`'s, ordered before this group at boot). Creates
-/// no table of its own, so `tables` is empty. The seed row's key literal
-/// is `CURSOR_KEY` (static DDL cannot bind).
+/// `journal_bridge::GROUP`'s; seeds run after every group's DDL, so
+/// list order carries no constraint). Creates no table of its own, so
+/// `tables` is empty. The seed row's key literal is `CURSOR_KEY`
+/// (static DDL cannot bind).
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "infra_event_bridge_cursor",
     tables: &[],
-    ddl: &[
+    ddl: &[],
+    seed: &[
         "INSERT INTO dispatcher_cursor (key, last_id) VALUES ('infra_event_bridge', 0) \
          ON CONFLICT (key) DO NOTHING",
     ],

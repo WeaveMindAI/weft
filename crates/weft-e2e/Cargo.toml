@@ -89,3 +89,6 @@ weft-task-store = { workspace = true, optional = true }
 # daemon's setup reads OPENROUTER_API_KEY from) so a test that spends on a
 # real key finds it without the operator re-exporting it into the test shell.
 dotenvy = { version = "0.15", optional = true }
+
+[lints]
+workspace = true

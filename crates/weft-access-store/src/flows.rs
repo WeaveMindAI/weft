@@ -324,14 +324,14 @@ pub async fn connect_direct(
     let mut expires_at: Option<chrono::DateTime<chrono::Utc>> = None;
     match &spec.acquisition {
         Acquisition::Static { fields } => {
-            values = storable_values(&spec, fields, values)?;
+            values = storable_values(spec, fields, values)?;
         }
         Acquisition::MintJwt { fields, .. } => {
             // Held to the same rule as any other pasted set: these are
             // the fields a PERSON filled in, and a missing or blank one
             // would otherwise fail somewhere inside the mint instead of
             // naming itself here.
-            values = storable_values(&spec, fields, values)?;
+            values = storable_values(spec, fields, values)?;
             // Mint + exchange once now, so a bad key/id fails at
             // connect instead of at first run. The minted token is
             // stored like any other value and re-minted lazily on
@@ -496,7 +496,7 @@ fn storable_values(
     mut values: BTreeMap<String, String>,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     for f in fields {
-        let empty = values.get(&f.name).map_or(true, |v| v.trim().is_empty());
+        let empty = values.get(&f.name).is_none_or(|v| v.trim().is_empty());
         if empty && !f.optional {
             return Err(AccessError::Invalid(format!("field '{}' is required", f.name)).into());
         }

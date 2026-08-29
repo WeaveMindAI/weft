@@ -30,23 +30,15 @@ use weft_core::Color;
 /// longer decodes: a PERMANENT poison, so callers must word their
 /// failure honestly ("journal row for color X is corrupt; see
 /// dispatcher logs") and must NOT retry (retrying cannot fix it;
-/// pollers that would loop on an `Err` skip instead).
+/// pollers that would loop on an `Err` skip instead). The one
+/// producer of `Corrupt` is `execution_definition_hash`: the
+/// project/tenant lookups read the `execution_color` mirror and
+/// answer `Option` instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorLookup<T> {
     Found(T),
     NotFound,
     Corrupt,
-}
-
-impl<T> ColorLookup<T> {
-    /// Collapse to `Option` when the caller treats an unknown and a
-    /// corrupt color identically (e.g. "skip this row").
-    pub fn found(self) -> Option<T> {
-        match self {
-            Self::Found(t) => Some(t),
-            Self::NotFound | Self::Corrupt => None,
-        }
-    }
 }
 
 #[async_trait]
@@ -66,8 +58,27 @@ pub trait Journal: Send + Sync {
         dedup_key: &str,
     ) -> anyhow::Result<()>;
 
-    /// Full ordered event log for a color.
-    async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>>;
+    /// Full ordered event log for a color, for DISPLAY: undecodable
+    /// rows come back as their error text instead of failing the read,
+    /// so the inspector renders what exists and names the rows it
+    /// cannot. The one required read; [`Journal::events_log`] is
+    /// derived from it.
+    async fn events_log_lossy(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)>;
+
+    /// The same log for STATE-REBUILDING (the cancel writers, stall
+    /// re-folds): a row that no longer decodes fails the WHOLE read,
+    /// naming the color and `weft clean`, because a fold over a
+    /// partial log rebuilds a state that never existed.
+    async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>> {
+        let (events, bad) = self.events_log_lossy(color).await?;
+        match bad.into_iter().next() {
+            Some(reason) => Err(anyhow::Error::msg(reason)),
+            None => Ok(events),
+        }
+    }
 
     // ----- Atomic execution birth / teardown --------------------------
     //
@@ -144,19 +155,21 @@ pub trait Journal: Send + Sync {
     async fn revoke_signal_token(&self, id: uuid::Uuid, tenant: &str) -> anyhow::Result<bool>;
 
     // ----- Derived views over the event log --------------------------
+    //
+    // An execution OUTLIVES its project on purpose: the journal is the
+    // record of what ran, and it stays readable after the project is
+    // removed. So everything about ownership is read from the
+    // `execution_color` row, stamped in the same transaction as
+    // `ExecutionStarted` and never rewritten, and NEVER re-derived
+    // from the project store (which the user can delete out from under
+    // it, once leaving 216 executions listed and undeletable because
+    // authorization asked a table that no longer had the answer).
 
-    /// Look up which project a color belongs to. Walks the event
-    /// log for the first `ExecutionStarted` event. `NotFound` if
-    /// the color is unknown; `Corrupt` if the row no longer decodes.
-    async fn execution_project(&self, color: Color) -> anyhow::Result<ColorLookup<String>>;
-
-    /// The tenant a color's execution was STARTED under, from its
-    /// `execution_color` row (stamped at start, frozen for the run's life).
-    /// This is the authoritative owner for keying the execution's storage,
-    /// and it OUTLIVES a project deletion (the row is journal-side, not the
-    /// mutable project store), so a terminate sweep can resolve it even for a
-    /// since-deleted project. `NotFound` if the color is unknown.
-    async fn execution_tenant(&self, color: Color) -> anyhow::Result<ColorLookup<String>>;
+    /// Who an execution belongs to, read from its `execution_color`
+    /// row: BOTH fields in one lookup, because they are one fact about
+    /// one row and reading them apart is how they drift. `None` if the
+    /// color is unknown.
+    async fn execution_owner(&self, color: Color) -> anyhow::Result<Option<ExecutionOwner>>;
 
     /// Look up the `definition_hash` an execution was STARTED with.
     /// Resume task producers use this to stamp the resume payload,
@@ -403,6 +416,22 @@ impl SignalRegistration {
 
 // ----- Public types -----------------------------------------------
 
+/// Who an execution belongs to: the project it ran for, and the tenant
+/// that owns it. Both are stamped on the `execution_color` row when the
+/// execution is born and frozen for its life (a project cannot change
+/// tenant: re-registering is guarded to the same one).
+///
+/// The TENANT is the authority. It keys the execution's storage prefix,
+/// it decides who may read or delete the execution, and unlike the
+/// project row it cannot be deleted out from under the execution. The
+/// project id rides along for attribution (which project's event stream
+/// a replay belongs on) and may name a project that no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOwner {
+    pub project_id: String,
+    pub tenant: String,
+}
+
 // SYNC: ExecutionSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
 //       extension-vscode/src/sidebar/executions.ts (ExecutionSummary)
 #[derive(Debug, Clone, serde::Serialize)]
@@ -410,6 +439,10 @@ pub struct ExecutionSummary {
     pub color: Color,
     pub project_id: String,
     pub entry_node: String,
+    /// One of `running`, `completed`, `failed`, `cancelled`, or
+    /// `corrupt` (the row no longer decodes; `entry_node` is empty
+    /// then, and the row is listed so it can be inspected via replay
+    /// and deleted).
     pub status: String,
     pub started_at: u64,
     pub completed_at: Option<u64>,

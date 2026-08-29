@@ -15,7 +15,7 @@ import type { DispatcherClient } from './dispatcher';
 import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
-import { textTabsForPath } from './tabs';
+import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
@@ -64,7 +64,7 @@ export class GraphViewController {
   /// while it was in flight (see triggerParse).
   private parseSeq = 0;
   // Host-side callbacks wired by extension.ts.
-  private runHandler: (() => void) | undefined;
+  private runHandler: ((targets: string[]) => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
   /// Hooks fired when the user triggers an action that spawns an
@@ -99,10 +99,6 @@ export class GraphViewController {
   /// race the webview's listener registration and get dropped on
   /// VS Code restart with a .weft already open.
   private readyHandler: (() => void) | undefined;
-  /// Called every time a parse succeeds. Extension uses this to
-  /// schedule a debounced status refetch so live source edits keep
-  /// the action bar's drift signals (source / infra) current.
-  private parseSuccessHandler: (() => void) | undefined;
   // One entry per (project, infra node) we're polling /live for.
   // Keyed by nodeId. Cleared on parseResult and dispose. Posts
   // `infraLive` messages to the webview.
@@ -131,7 +127,7 @@ export class GraphViewController {
 
   /** Called by extension.ts so sidebar-initiated runs and action-bar
    *  clicks route through the same business logic. */
-  setRunHandler(fn: () => void): void { this.runHandler = fn; }
+  setRunHandler(fn: (targets: string[]) => void): void { this.runHandler = fn; }
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
   setLifecycleStartHandler(fn: () => void): void {
@@ -183,9 +179,6 @@ export class GraphViewController {
   }
   setReadyHandler(fn: () => void): void {
     this.readyHandler = fn;
-  }
-  setParseSuccessHandler(fn: () => void): void {
-    this.parseSuccessHandler = fn;
   }
 
   setCliStatusHandler(fn: () => Promise<void>): void {
@@ -303,8 +296,18 @@ export class GraphViewController {
           void this.shipFileContents(this.fileBaseDir, this.fileRelPaths);
         }
       }),
-      vscode.window.onDidChangeActiveTextEditor((ed) => {
-        if (ed && ed.document.languageId === 'weft') {
+      vscode.window.onDidChangeActiveTextEditor(async (ed) => {
+        // Reading a diff is reviewing: the open graph keeps showing what it
+        // was showing rather than repointing at a comparison. One tick so
+        // the tab model reflects this focus change, then only proceed if
+        // the editor is still the active one.
+        if (!ed) return;
+        await afterTabModelSettles();
+        // The panel can tear down during the wait; resuming would
+        // register a nodes-dir watcher onDispose already swept.
+        if (this.panel === undefined) return;
+        if (vscode.window.activeTextEditor !== ed) return;
+        if (ed.document.languageId === 'weft' && !isReviewDoc(ed.document)) {
           // Focusing a DIFFERENT .weft tab is a fresh context (a whole new
           // graph), not an include navigation (navigateInto sets watchedDoc to
           // its target before this fires, so that case sees no change here).
@@ -645,7 +648,6 @@ export class GraphViewController {
     this.freshMount = false;
     this.syncInfraLivePollers(response);
     this.syncSignalDisplayPollers(response);
-    this.parseSuccessHandler?.();
   }
 
   /** Compare the latest parse to the set of infra nodes we're
@@ -708,11 +710,17 @@ export class GraphViewController {
           : [];
         this.post({ kind: 'infraLive', nodeId, state: 'ok', items });
       } catch (err) {
-        // 404 = infra not provisioned. Anything else (BAD_GATEWAY,
-        // network) is a real failure; surface the underlying message.
-        const error = err instanceof HttpError && err.status === 404
-          ? "Infra not running. Start it from the project's action bar."
-          : err instanceof Error ? err.message : String(err);
+        // 404 = the infra endpoint does not exist for this node yet
+        // (not provisioned). A distinct RESTING state, never collapsed
+        // into a healthy empty list: the webview renders it as its own
+        // affordance, and stale items from a previous run clear.
+        // Anything else (BAD_GATEWAY, network) is a real failure;
+        // surface the underlying message.
+        if (err instanceof HttpError && err.status === 404) {
+          this.post({ kind: 'infraLive', nodeId, state: 'absent' });
+          return;
+        }
+        const error = err instanceof Error ? err.message : String(err);
         this.post({ kind: 'infraLive', nodeId, state: 'error', error });
       }
     };
@@ -770,12 +778,17 @@ export class GraphViewController {
         const items = signalDisplayToLiveItems(body);
         this.post({ kind: 'signalDisplay', nodeId, state: 'ok', items });
       } catch (err) {
-        // 404 = signal not registered (project not activated, or
-        // trigger setup failed). Anything else (listener down,
-        // BAD_GATEWAY) is a real failure; surface the message.
-        const error = err instanceof HttpError && err.status === 404
-          ? "Trigger not registered. Activate the project from the action bar."
-          : err instanceof Error ? err.message : String(err);
+        // 404 = the signal is not registered (the project is not
+        // activated, or its trigger setup failed and never registered).
+        // A distinct RESTING state, never collapsed into a healthy
+        // empty list; stale items from a previous activation clear.
+        // Anything else (listener down, BAD_GATEWAY) is a real
+        // failure; surface it.
+        if (err instanceof HttpError && err.status === 404) {
+          this.post({ kind: 'signalDisplay', nodeId, state: 'absent' });
+          return;
+        }
+        const error = err instanceof Error ? err.message : String(err);
         this.post({ kind: 'signalDisplay', nodeId, state: 'error', error });
       }
     };
@@ -1002,7 +1015,7 @@ export class GraphViewController {
         console[msg.level]('[weft/webview]', msg.message);
         break;
       case 'runProject':
-        this.runHandler?.();
+        this.runHandler?.(msg.targets ?? []);
         break;
       case 'infraStart':
         void this.dispatchVerb('infra', ['start']);
@@ -1105,7 +1118,7 @@ export class GraphViewController {
         void vscode.env.openExternal(vscode.Uri.parse(msg.url));
         break;
       case 'pickAsset':
-        void this.runPickAsset(msg.requestId, msg.accept, msg.dropped);
+        void this.runPickAsset(msg.requestId, msg.accept, msg.multiple ?? false, msg.dropped);
         break;
       case 'listRuntimeFiles':
         void this.runListRuntimeFiles(msg.requestId);
@@ -1258,7 +1271,8 @@ export class GraphViewController {
   private async runPickAsset(
     requestId: number,
     accept: string | undefined,
-    dropped: { name: string; bytesBase64: string } | undefined,
+    multiple: boolean,
+    dropped: { name: string; bytesBase64: string }[] | undefined,
   ): Promise<void> {
     try {
       const docPath = this.watchedDoc?.uri.fsPath;
@@ -1268,46 +1282,58 @@ export class GraphViewController {
         return;
       }
       if (dropped) {
-        const assetsDir = nodePath.join(root, 'assets');
-        await vscode.workspace.fs.createDirectory(vscode.Uri.file(assetsDir));
-        const bytes = Buffer.from(dropped.bytesBase64, 'base64');
-        // A clean leaf name; collisions get a numeric suffix rather than
-        // silently clobbering a different existing file.
-        const leaf = dropped.name.replace(/[\\/]/g, '_');
-        let candidate = leaf;
-        for (let n = 1; ; n++) {
-          const full = nodePath.join(assetsDir, candidate);
-          try {
-            await vscode.workspace.fs.stat(vscode.Uri.file(full));
-          } catch {
-            await vscode.workspace.fs.writeFile(vscode.Uri.file(full), bytes);
-            break;
-          }
-          const dot = leaf.lastIndexOf('.');
-          candidate = dot > 0 ? `${leaf.slice(0, dot)}-${n}${leaf.slice(dot)}` : `${leaf}-${n}`;
+        const paths: string[] = [];
+        for (const file of dropped) {
+          paths.push(await this.storeDroppedFile(root, file));
         }
-        this.post({ kind: 'assetPicked', requestId, path: `assets/${candidate}` });
+        this.post({ kind: 'assetPicked', requestId, paths });
         return;
       }
       const picked = await vscode.window.showOpenDialog({
-        canSelectMany: false,
+        canSelectMany: multiple,
         filters: dialogFiltersForAccept(accept),
       });
-      const fsPath = picked?.[0]?.fsPath;
-      if (!fsPath) {
-        this.post({ kind: 'assetPicked', requestId }); // user cancelled
-        return;
-      }
-      const rel = nodePath.relative(root, fsPath);
-      const inProject = !rel.startsWith('..') && !nodePath.isAbsolute(rel);
-      const path = inProject ? rel.split(nodePath.sep).join('/') : fsPath;
-      this.post({ kind: 'assetPicked', requestId, path });
+      // A pick outside the project is referenced by its absolute path; one
+      // inside is referenced relative to the project, so the ref travels
+      // with the project.
+      const paths = (picked ?? []).map((uri) => {
+        const rel = nodePath.relative(root, uri.fsPath);
+        const inProject = !rel.startsWith('..') && !nodePath.isAbsolute(rel);
+        return inProject ? rel.split(nodePath.sep).join('/') : uri.fsPath;
+      });
+      this.post({ kind: 'assetPicked', requestId, paths });
     } catch (e) {
       this.post({
         kind: 'assetPicked',
         requestId,
         error: e instanceof Error ? e.message : String(e),
       });
+    }
+  }
+
+  /// Store one dropped file under the project's `assets/`, and hand back
+  /// the path a ref writes. The browser hides a dropped file's OS path, so
+  /// its bytes are what travels; a name collision takes a numeric suffix
+  /// rather than clobbering a different file that happens to share a name.
+  private async storeDroppedFile(
+    root: string,
+    file: { name: string; bytesBase64: string },
+  ): Promise<string> {
+    const assetsDir = nodePath.join(root, 'assets');
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(assetsDir));
+    const bytes = Buffer.from(file.bytesBase64, 'base64');
+    const leaf = file.name.replace(/[\\/]/g, '_');
+    let candidate = leaf;
+    for (let n = 1; ; n++) {
+      const full = nodePath.join(assetsDir, candidate);
+      try {
+        await vscode.workspace.fs.stat(vscode.Uri.file(full));
+      } catch {
+        await vscode.workspace.fs.writeFile(vscode.Uri.file(full), bytes);
+        return `assets/${candidate}`;
+      }
+      const dot = leaf.lastIndexOf('.');
+      candidate = dot > 0 ? `${leaf.slice(0, dot)}-${n}${leaf.slice(dot)}` : `${leaf}-${n}`;
     }
   }
 

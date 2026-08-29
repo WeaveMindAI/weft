@@ -43,6 +43,7 @@
     {
       "name": "content",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "description": "Plain-text body: one paragraph per line."
     },

@@ -244,20 +244,17 @@ pub struct NodeMetadata {
     /// wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub validate: Vec<ValidationRule>,
-    /// Form-field vocabulary for nodes whose `features.has_form_schema`
-    /// is true (which field types a form config may use, and what ports
-    /// each materializes). Empty for everything else. Multi-node
-    /// packages declare it once in the package root's partial
-    /// `metadata.json` (HumanQuery and HumanTrigger share one
-    /// vocabulary); every member inherits it via the catalog's
-    /// package-defaults merge unless its own file carries the key.
-    #[serde(
-        default,
-        rename = "formFieldSpecs",
-        alias = "form_field_specs",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub form_field_specs: Vec<FormFieldSpec>,
+    /// This node's ports come from a LIST in its own config: which
+    /// config key holds the list, which entry kinds it may use, and
+    /// what ports each kind materializes. `None` for everything else.
+    /// A form is one thing built with it (`HumanQuery` over `fields`),
+    /// a switch is another (`Switch` over `cases`). Multi-node packages
+    /// declare it once in the package root's partial `metadata.json`
+    /// (HumanQuery and HumanTrigger share one vocabulary); every member
+    /// inherits it via the catalog's package-defaults merge unless its
+    /// own file carries the key.
+    #[serde(default, rename = "portsFromConfig", skip_serializing_if = "Option::is_none")]
+    pub ports_from_config: Option<PortsFromConfig>,
     /// The service recipe, present ONLY on an ACCESS NODE (the node
     /// owning the connect for a service). Declares how a connection is
     /// acquired, how requests are authenticated, the permission
@@ -434,7 +431,29 @@ impl NodeMetadata {
                     input.name
                 ));
             }
+            // Every node gets `_should_flow` from the language (the port
+            // that decides whether it runs). A node type declaring its
+            // own would shadow that decision with node data.
+            if input.name == crate::exec::skip::SHOULD_FLOW_PORT {
+                return Err(format!(
+                    "input '{}' is the language's own port (it decides whether a node runs); a node type cannot declare it",
+                    input.name
+                ));
+            }
             match input.effective_widget() {
+                // The entry-list editor draws the kinds a node's
+                // `portsFromConfig` declares, so on any other input it
+                // would render an empty dropdown nobody can use.
+                Widget::EntryList
+                    if self.ports_from_config.as_ref().map(|p| p.field.as_str())
+                        != Some(input.name.as_str()) =>
+                {
+                    return Err(format!(
+                        "input '{}': an entry_list widget edits the list this node's ports \
+                         come from, so `portsFromConfig.field` must name it",
+                        input.name
+                    ));
+                }
                 Widget::Select { options } | Widget::Multiselect { options }
                     if options.is_empty() =>
                 {
@@ -580,10 +599,14 @@ impl NodeMetadata {
                 Widget::Access { .. } => Some(WeftType::Access),
                 // textarea is the GENERIC value editor (the derived
                 // default for structural types: the value is edited as
-                // JSON text), so it constrains nothing. form_builder
-                // edits the form-schema blob, file_drop a file marker;
-                // both are shape-checked elsewhere.
-                Widget::Textarea | Widget::FormBuilder | Widget::FileDrop { .. } => None,
+                // JSON text), so it constrains nothing. entry_list edits
+                // the config-entry list, file_drop a file marker, and
+                // text_list a list of short strings; all three are
+                // shape-checked elsewhere.
+                Widget::Textarea
+                | Widget::EntryList
+                | Widget::TextList
+                | Widget::FileDrop { .. } => None,
             };
             if let Some(value_type) = widget_value_type {
                 if !WeftType::is_compatible(&value_type, &input.input_type) {
@@ -618,6 +641,73 @@ impl NodeMetadata {
                             ));
                         }
                     }
+                }
+            }
+        }
+        if let Some(ports) = &self.ports_from_config {
+            // The list a node derives ports from lives under a key it
+            // DECLARES, so that key is an ordinary config input like
+            // any other: the editor edits it, and validate's
+            // undeclared-config-key check needs no exemption for it.
+            if !self.inputs.iter().any(|i| i.name == ports.field) {
+                return Err(format!(
+                    "portsFromConfig reads config key '{}', which this node does not \
+                     declare as an input",
+                    ports.field
+                ));
+            }
+            // `matchInput` is the input the compiler checks entry
+            // values against; naming a port that does not exist would
+            // resolve to nothing and silently disable every value
+            // check downstream, so refuse it here.
+            if let Some(name) = &ports.match_input {
+                if !self.inputs.iter().any(|i| i.name == *name) {
+                    return Err(format!(
+                        "portsFromConfig matches entries against input '{name}', which \
+                         this node does not declare"
+                    ));
+                }
+            }
+            let mut kinds: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for spec in &ports.specs {
+                if spec.kind.is_empty() {
+                    return Err("portsFromConfig: every spec needs a `kind`".into());
+                }
+                if !kinds.insert(spec.kind.as_str()) {
+                    return Err(format!(
+                        "portsFromConfig: two specs claim kind '{}'; an entry would match \
+                         both",
+                        spec.kind
+                    ));
+                }
+                if spec.key_field.is_empty() {
+                    return Err(format!(
+                        "portsFromConfig: spec '{}' has an empty `keyField` (the entry key \
+                         holding its port name)",
+                        spec.kind
+                    ));
+                }
+                for field in &spec.fields {
+                    if let Some(problem) = field.declaration_problem() {
+                        return Err(format!("portsFromConfig: spec '{}' {problem}", spec.kind));
+                    }
+                }
+                if spec.fields.iter().any(|f| f.needs_matched_input())
+                    && ports.match_input.is_none()
+                {
+                    return Err(format!(
+                        "portsFromConfig: spec '{}' asks for a value measured against what \
+                         the entries match on, so `matchInput` must name the input they are \
+                         matched against",
+                        spec.kind
+                    ));
+                }
+                if spec.adds_inputs.is_empty() && spec.adds_outputs.is_empty() {
+                    return Err(format!(
+                        "portsFromConfig: spec '{}' adds no ports, so an entry of that kind \
+                         would do nothing",
+                        spec.kind
+                    ));
                 }
             }
         }
@@ -672,8 +762,8 @@ impl NodeMetadata {
         Ok(())
     }
 
-    /// A copy with every input's `exposure` and `widget` RESOLVED to
-    /// their effective values (the author's explicit choice, else the
+    /// A copy with every input's `exposure` and `widget`, and every
+    /// config entry field's `widget`, RESOLVED to their effective values (the author's explicit choice, else the
     /// type-derived default). This is what ships on the wire to the
     /// editor, so the editor never re-derives either; resolving is
     /// idempotent (a resolved metadata re-parses to itself).
@@ -682,6 +772,16 @@ impl NodeMetadata {
         for input in &mut out.inputs {
             input.exposure = Some(input.exposure.unwrap_or_else(|| input.input_type.default_exposure()));
             input.widget = Some(input.effective_widget());
+        }
+        // A config entry kind's own fields resolve the same way, so the
+        // editor draws a control for every one of them without knowing
+        // what the key means.
+        if let Some(ports) = &mut out.ports_from_config {
+            for spec in &mut ports.specs {
+                for field in &mut spec.fields {
+                    field.widget = Some(field.resolved_widget());
+                }
+            }
         }
         out
     }
@@ -701,20 +801,20 @@ pub struct ValidationRule {
 /// Severity level of a validation rule. Controls when the rule runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ValidationLevel {
     /// Checked at parse / edit time. Missing these is a code error.
+    #[default]
     Structural,
-    /// Checked only at run time (e.g. missing credentials). The
-    /// editor does not flag these so the AI builder and the human
-    /// user can sketch a project without filling secrets.
+    /// Not checked when a project is BUILT (e.g. missing
+    /// credentials), so an AI builder or a human can compile a
+    /// project they are still sketching, secrets unfilled. The
+    /// editor's Problems panel does report them: it validates in
+    /// `ValidationMode::Runtime` (see `weft-cli`'s `do_validate`),
+    /// the only mode that runs them.
     Runtime,
 }
 
-impl Default for ValidationLevel {
-    fn default() -> Self {
-        ValidationLevel::Structural
-    }
-}
 
 /// Diagnostic body emitted when a rule fires. Placeholder tokens in
 /// `message` are replaced from the evaluation context: `{id}` for the
@@ -739,18 +839,15 @@ pub struct RuleDiagnostic {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RuleSeverity {
+    #[default]
     Error,
     Warning,
     Info,
     Hint,
 }
 
-impl Default for RuleSeverity {
-    fn default() -> Self {
-        RuleSeverity::Error
-    }
-}
 
 /// Closed-grammar condition language. Each variant is evaluated
 /// against a `RuleContext` (the node being validated + the enriched
@@ -864,10 +961,23 @@ pub struct NodeFeatures {
     /// Same for outputs.
     #[serde(default, rename = "canAddOutputPorts", skip_serializing_if = "std::ops::Not::not")]
     pub can_add_output_ports: bool,
-    /// The node derives ports from a FormBuilder field at compile
-    /// time. See `form_field_specs` for the derivation rules.
-    #[serde(default, rename = "hasFormSchema", skip_serializing_if = "std::ops::Not::not")]
-    pub has_form_schema: bool,
+    /// The node's created input ports are OPTIONAL by default (a
+    /// closure on one does not skip the node). For node types whose
+    /// extra inputs are optional by nature, `FirstInOrder` being the
+    /// one that needs it. Without it a created port is required, like
+    /// a declared one. A `?` on the config key overrides either way.
+    #[serde(default, rename = "optionalCustomInputs", skip_serializing_if = "std::ops::Not::not")]
+    pub optional_custom_inputs: bool,
+    /// The type every CREATED input port takes (a port a config key
+    /// makes on a node that accepts custom inputs). `None` means each
+    /// created port gets its own type variable, so it takes whatever
+    /// its wire carries, independently of its siblings. Naming a shared
+    /// variable (`T`) instead makes every created input and the output
+    /// that uses `T` one type, which is what a join wants: two branches
+    /// of different types then fail to unify instead of silently
+    /// meeting at an unresolved port.
+    #[serde(default, rename = "customInputType", skip_serializing_if = "Option::is_none")]
+    pub custom_input_type: Option<WeftType>,
     /// Marks the node as a trigger (fires executions from external
     /// events rather than running as part of an execution).
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
@@ -912,11 +1022,38 @@ pub struct NodeFeatures {
     pub hidden: bool,
 }
 
-/// Describes how a config field of a given type contributes to a
-/// node's ports at compile time. Used by nodes with
-/// `has_form_schema` (HumanQuery, runner triggers). The enrich pass
-/// reads this, iterates the configured fields, and materializes
-/// inputs/outputs on the NodeDefinition.
+/// Where a node's ports come from when they come from its own config:
+/// the config key holding the list, and the entry kinds that list may
+/// use. One object rather than a flag plus a list, so "this node
+/// derives ports" and "here is how" cannot drift apart.
+// SYNC: PortsFromConfig <-> packages/weft-graph/src/protocol.ts PortsFromConfigWire
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortsFromConfig {
+    /// The config key holding the entry list (`"fields"` for a form,
+    /// `"cases"` for a switch). The value must be a JSON array; a
+    /// missing key means no derived ports.
+    pub field: String,
+    /// The node input the entries are matched AGAINST, when they compete
+    /// and only one wins (a switch's `value`). It is what lets the
+    /// compiler hold a test to a value that input could actually hold:
+    /// `equals: 5` against a String input is a compile error, not a
+    /// branch that silently never fires. Absent for a list whose entries
+    /// all contribute (a form's fields).
+    #[serde(default, rename = "matchInput", skip_serializing_if = "Option::is_none")]
+    pub match_input: Option<String>,
+    /// The entry kinds this node accepts, and the ports each one adds.
+    pub specs: Vec<PortSpec>,
+}
+
+impl PortsFromConfig {
+    /// The spec matching an entry's `kind`, or None when the entry
+    /// names a kind this node does not accept.
+    pub fn spec_for(&self, kind: &str) -> Option<&PortSpec> {
+        self.specs.iter().find(|s| s.kind == kind)
+    }
+}
+
 /// A field type's render metadata: which UI primitive draws it and the
 /// primitive's flags. Typed (not a raw `Value`) so the loud-load
 /// guarantee holds here too: a typo'd key inside `render` fails the
@@ -943,53 +1080,260 @@ pub enum FormFieldSource {
     Input,
 }
 
-// SYNC: FormFieldSpec <-> packages/weft-graph/src/protocol.ts FormFieldSpecWire
+/// How one kind of config entry contributes to a node's ports at
+/// compile time. The enrich pass reads the list named by
+/// [`PortsFromConfig::field`], matches each entry's `kind` here, and
+/// materializes the inputs/outputs onto the NodeDefinition.
+// SYNC: PortSpec <-> packages/weft-graph/src/protocol.ts PortSpecWire
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FormFieldSpec {
-    /// Value of the field's `field_type` (or `field_type.kind`)
-    /// this spec matches (e.g. "text_input", "approve_reject").
-    /// Wire shape is camelCase across every field on this struct
-    /// so VS Code + browser extension can read the same TS
-    /// interface without per-field bridging. The snake_case
-    /// aliases let us still load the on-disk JSON files (which
-    /// pre-date this rename).
-    #[serde(rename = "fieldType", alias = "field_type")]
-    pub field_type: String,
-    /// Human-readable label for the form_builder editor's
-    /// dropdown (e.g. "Text input", "Approve / Reject").
+pub struct PortSpec {
+    /// Value of the entry's `kind` this spec matches (e.g.
+    /// "text_input", "approve_reject", "case"). Wire shape is
+    /// camelCase across every field on this struct so VS Code + browser
+    /// extension can read the same TS interface without per-field
+    /// bridging.
+    pub kind: String,
+    /// The entry key holding the port NAME this spec's templates
+    /// substitute for `{key}`. `"key"` for a form field, `"port"` for a
+    /// switch case, so an entry reads in its own vocabulary instead of
+    /// borrowing another's.
+    #[serde(default = "default_key_field", rename = "keyField")]
+    pub key_field: String,
+    /// Human-readable label for the entry-list editor's dropdown
+    /// (e.g. "Text input", "Approve / Reject", "is exactly this value").
     #[serde(default)]
     pub label: String,
-    /// Default render metadata applied to the field if not
-    /// overridden in the weft source. The browser extension reads
-    /// `render.component` (and its sibling flags)
-    /// to pick a UI primitive without knowing field-type strings.
-    pub render: FormFieldRender,
-    /// Config keys the form_builder editor must collect when the
-    /// user adds this field type (e.g. ["options"] for a static
-    /// select). The editor validates these before saving.
-    #[serde(default, rename = "requiredConfig", alias = "required_config")]
-    pub required_config: Vec<String>,
-    /// Config keys the editor exposes but doesn't require (e.g.
-    /// "approveLabel" / "rejectLabel" for approve_reject).
-    #[serde(default, rename = "optionalConfig", alias = "optional_config")]
-    pub optional_config: Vec<String>,
-    #[serde(default, rename = "addsInputs", alias = "adds_inputs")]
-    pub adds_inputs: Vec<FormFieldPort>,
-    #[serde(default, rename = "addsOutputs", alias = "adds_outputs")]
-    pub adds_outputs: Vec<FormFieldPort>,
+    /// Default render metadata applied to the entry if not overridden
+    /// in the weft source. The browser extension reads
+    /// `render.component` (and its sibling flags) to pick a UI
+    /// primitive without knowing kind strings. `None` for a kind
+    /// nothing renders, a switch case being the one that has no form
+    /// behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render: Option<FormFieldRender>,
+    /// What this kind asks the author to fill in: a form field's
+    /// `label`, a select's `options`, a case's `value`. Each carries the
+    /// shape its value must have and the control the editor draws for
+    /// it, so a node invents a kind without anything downstream
+    /// learning that kind's name.
+    ///
+    /// An entry is a whole declaration, or just a NAME: `"placeholder"`
+    /// is the one-line String field of that name, which is what most
+    /// of them are. See [`spec_fields`].
+    #[serde(default, deserialize_with = "spec_fields", skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<SpecField>,
+    /// This kind takes anything, so it is the branch reached when no
+    /// earlier entry matched. At most one entry in a list may be one,
+    /// and it goes last.
+    #[serde(default, rename = "catchAll", skip_serializing_if = "std::ops::Not::not")]
+    pub catch_all: bool,
+    #[serde(default, rename = "addsInputs")]
+    pub adds_inputs: Vec<PortTemplate>,
+    #[serde(default, rename = "addsOutputs")]
+    pub adds_outputs: Vec<PortTemplate>,
 }
 
+/// A spec's field list, where an entry may be a whole declaration or
+/// just a name. `"placeholder"` means exactly this:
+///
+/// ```json
+/// { "key": "placeholder", "label": "Placeholder", "shape": "typed", "valueType": "String" }
+/// ```
+///
+/// which is what a label, a placeholder, and most one-line settings
+/// are, so writing six lines for each of them is how eleven kinds ended
+/// up repeating themselves.
+fn spec_fields<'de, D>(deserializer: D) -> Result<Vec<SpecField>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|entry| match entry {
+            serde_json::Value::String(key) => Ok(SpecField::named(&key)),
+            // Deserialized here rather than through an untagged enum so
+            // a mistyped key still names itself in the error.
+            object => serde_json::from_value(object).map_err(D::Error::custom),
+        })
+        .collect()
+}
+
+/// The label a shorthand field shows: its key, read as words.
+/// `minLength` and `min_length` both become "Min Length".
+fn label_from_key(key: &str) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut chars = key.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '_' || ch == '-' || ch == ' ' {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            continue;
+        }
+        // A capital opens a new word, unless it opens this one (`ID`
+        // stays whole) or continues an acronym. An acronym ends where
+        // a lowercase follows: the last capital of `HTTPMethod` opens
+        // `Method`, leaving `HTTP` whole. The one exception is a
+        // single lowercase letter that ENDS the word: that is a plural
+        // tail (`IDs`, `URLs`), not a new word. A capitalized non-
+        // acronym word after a single-letter prefix (`OAuthToken`)
+        // still splits wrong ("O Auth Token"); no shorthand key uses
+        // that shape today.
+        if ch.is_uppercase() && !word.is_empty() {
+            let after_acronym = word.ends_with(char::is_uppercase)
+                && chars.peek().is_some_and(|next| next.is_lowercase());
+            let plural_tail = after_acronym && {
+                let mut rest = chars.clone();
+                rest.next(); // the lowercase the peek saw
+                rest.peek().is_none_or(|c| !c.is_alphanumeric())
+            };
+            if (!word.ends_with(char::is_uppercase) || after_acronym) && !plural_tail {
+                words.push(std::mem::take(&mut word));
+            }
+        }
+        word.push(ch);
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+        .iter()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One value a kind asks the author to supply, and what that value has
+/// to be. The compiler holds the value to its shape and the editor draws
+/// `widget` for it, so neither needs to know what any node means by the
+/// key.
+// SYNC: SpecField <-> packages/weft-graph/src/protocol.ts SpecFieldWire
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FormFieldPort {
-    #[serde(rename = "nameTemplate", alias = "name_template", alias = "name")]
+pub struct SpecField {
+    /// The entry key this value lives under (`options`, `value`, `min`).
+    pub key: String,
+    /// One line for the editor's label and the docs.
+    #[serde(default)]
+    pub label: String,
+    /// Whether an entry of this kind is incomplete without it.
+    #[serde(default)]
+    pub required: bool,
+    pub shape: SpecShape,
+    /// The declared type, for `shape: "typed"` and only for it. The
+    /// pairing is checked at metadata load.
+    #[serde(default, rename = "valueType", skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<WeftType>,
+    /// The control the editor draws. Defaults from the shape at
+    /// metadata load, so a spec only says this to override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub widget: Option<Widget>,
+}
+
+impl SpecField {
+    /// The field a shorthand entry means: a one-line String box, named
+    /// and labelled after the key. The widget is named rather than left
+    /// to the shape, whose default for a String is a text AREA.
+    fn named(key: &str) -> Self {
+        SpecField {
+            key: key.to_string(),
+            label: label_from_key(key),
+            required: false,
+            shape: SpecShape::Typed,
+            value_type: Some(WeftType::primitive(crate::weft_type::WeftPrimitive::String)),
+            widget: Some(Widget::Text),
+        }
+    }
+
+    /// Whether checking this value needs to know what the entries are
+    /// matched against.
+    pub fn needs_matched_input(&self) -> bool {
+        self.shape != SpecShape::Typed
+    }
+
+    /// The control to draw, the declared one or the shape's default.
+    pub fn resolved_widget(&self) -> Widget {
+        self.widget.clone().unwrap_or_else(|| match self.shape {
+            SpecShape::Typed => match &self.value_type {
+                Some(t) => Widget::default_for_type(t),
+                None => Widget::Text,
+            },
+            SpecShape::Number => Widget::Number { min: None, max: None, step: None },
+            SpecShape::ValueList => Widget::TextList,
+            SpecShape::Value | SpecShape::Element | SpecShape::Regex => Widget::Text,
+        })
+    }
+
+    /// What is wrong with this field's declaration, or `None`. The
+    /// `typed` shape is the only one carrying a type, so a type beside
+    /// any other shape (or a missing one beside `typed`) is a spec
+    /// nothing could check.
+    fn declaration_problem(&self) -> Option<String> {
+        match (self.shape, &self.value_type) {
+            (SpecShape::Typed, None) => {
+                Some(format!("field '{}' is `typed`, so it must name a `valueType`", self.key))
+            }
+            (shape, Some(_)) if shape != SpecShape::Typed => Some(format!(
+                "field '{}' carries a `valueType`, which only a `typed` field takes",
+                self.key
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// What a [`SpecField`]'s value has to be: a value of a declared type,
+/// or a shape measured against the input the entries are matched on,
+/// which is what lets the compiler refuse `equals: 5` on a String
+/// without knowing what `equals` means.
+// SYNC: SpecShape <-> packages/weft-graph/src/protocol.ts SpecFieldWire.shape
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SpecShape {
+    /// A value of the declared `valueType` (`options: List[String]`).
+    Typed,
+    /// One value the matched input could hold (`equals: "high"`).
+    Value,
+    /// A list of them (`in: ["high", "urgent"]`).
+    ValueList,
+    /// A number, whatever the matched input holds (`gte: 3`).
+    Number,
+    /// ONE ELEMENT of what the matched input holds: an item when it
+    /// holds a list, a piece of text when it holds text
+    /// (`contains: "err"`). An input that holds neither has nothing to
+    /// look inside, which the compiler says so.
+    Element,
+    /// A regular expression, checked at compile time so a broken one
+    /// never reaches a run.
+    Regex,
+}
+
+/// The default [`PortSpec::key_field`]: a form field names its port
+/// with `key`, and that is the shape every existing spec uses.
+fn default_key_field() -> String {
+    "key".to_string()
+}
+
+// SYNC: PortTemplate <-> packages/weft-graph/src/protocol.ts PortTemplateWire
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortTemplate {
+    #[serde(rename = "nameTemplate")]
     pub name_template: String,
-    #[serde(rename = "portType", alias = "port_type")]
+    #[serde(rename = "portType")]
     pub port_type: WeftType,
 }
 
-impl FormFieldPort {
+impl PortTemplate {
     pub fn new(name_template: impl Into<String>, type_str: &str) -> Self {
         Self {
             name_template: name_template.into(),
@@ -999,9 +1343,9 @@ impl FormFieldPort {
     }
 
     /// Port template accepting any type, independent from sibling
-    /// ports. See `T_Auto` handling in enrich.
+    /// ports. See [`AUTO_TYPE_VAR`].
     pub fn any(name_template: impl Into<String>) -> Self {
-        Self { name_template: name_template.into(), port_type: WeftType::type_var("T_Auto") }
+        Self { name_template: name_template.into(), port_type: WeftType::type_var(AUTO_TYPE_VAR) }
     }
 
     pub fn resolve_name(&self, key: &str) -> String {
@@ -1055,7 +1399,7 @@ pub trait NodeCatalog: Send + Sync {
 // NAMING CONVENTION (the three stages a graph concept lives through):
 //   *Spec       = authored intent (metadata.json / a registration): blanks are
 //                 meaningful ("derive from the type", "decide later"). InputSpec,
-//                 OutputSpec, FormFieldSpec, SignalSpec, InfraSpec.
+//                 OutputSpec, PortSpec, SignalSpec, InfraSpec.
 //   Parsed*     = raw from .weft source, pre-enrichment (compiler-internal).
 //   *Definition = compiled, fully resolved; the editor and runtime trust it
 //                 blindly and never re-derive. NodeDefinition, InputDefinition,
@@ -1185,6 +1529,9 @@ pub enum Widget {
     Checkbox,
     Select { options: Vec<String> },
     Multiselect { options: Vec<String> },
+    /// A list of short text values the author adds and removes one at a
+    /// time (a select's options, the values a case matches).
+    TextList,
     Password,
     /// The connection picker on an ACCESS NODE (the node whose
     /// metadata carries the `service` recipe). Renders the connection
@@ -1222,7 +1569,9 @@ pub enum Widget {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         free_text: bool,
     },
-    FormBuilder,
+    /// Build the list of config entries a node's ports come from: pick
+    /// a kind, name the port it adds, fill in what that kind asks for.
+    EntryList,
     /// Editor file picker: the user picks a project file (drop/browse) or
     /// pastes a URL, and the input's value becomes a media
     /// `@asset("<path-or-url>", <Type>)` ref. The pre-build asset sync
@@ -1242,6 +1591,11 @@ pub enum Widget {
         accept: Option<String>,
         #[serde(default = "file_drop_default_type", rename = "type")]
         file_type: crate::weft_type::WeftType,
+        /// The port takes several files (`List[Audio]`, or a
+        /// `Media | List[Media]` that accepts one or many), so the
+        /// control holds a list and writes one marker per file.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        multiple: bool,
     },
 }
 
@@ -1261,29 +1615,48 @@ impl Widget {
             Widget::Checkbox => "checkbox",
             Widget::Select { .. } => "select",
             Widget::Multiselect { .. } => "multiselect",
+            Widget::TextList => "text_list",
             Widget::Password => "password",
             Widget::Access { .. } => "access",
             Widget::RemoteSelect { .. } => "remote_select",
-            Widget::FormBuilder => "form_builder",
+            Widget::EntryList => "entry_list",
             Widget::FileDrop { .. } => "file_drop",
         }
     }
 
-    /// The ONE WeftType -> default-widget mapping. A file-valued type
-    /// gets the drop/pick control (its accept filter derives from the
-    /// same type), Boolean a checkbox, Number a number box, and
-    /// everything else (String, JSON-ish containers, mixed unions) a
-    /// text area: JSON is typed as text, exactly like the source, and
-    /// the compiler type-checks the literal against the declared type.
+    /// The ONE WeftType -> default-widget mapping. A type that can hold
+    /// one file gets the drop/pick control (its accept filter derives
+    /// from the file half of the type, which is also what it writes),
+    /// Boolean a checkbox, Number a number box, a list of
+    /// strings the add-one-at-a-time list (typing `["a", "b"]` by hand
+    /// into a text area is worse at every length), and everything else
+    /// (String, JSON-ish containers, mixed unions) a text area: JSON is
+    /// typed as text, exactly like the source, and the compiler
+    /// type-checks the literal against the declared type.
     pub fn default_for_type(ty: &WeftType) -> Widget {
-        if ty.is_file_valued() {
-            return Widget::FileDrop { accept: None, file_type: ty.clone() };
+        if let Some(files) = ty.file_control() {
+            return Widget::FileDrop {
+                accept: None,
+                file_type: files.file_type,
+                multiple: files.multiple,
+            };
         }
         match ty {
             WeftType::Primitive(crate::weft_type::WeftPrimitive::Boolean) => Widget::Checkbox,
             WeftType::Primitive(crate::weft_type::WeftPrimitive::Number) => {
                 Widget::Number { min: None, max: None, step: None }
             }
+            WeftType::List(inner)
+                if **inner
+                    == WeftType::Primitive(crate::weft_type::WeftPrimitive::String) =>
+            {
+                Widget::TextList
+            }
+            // A plain String is a single-line box; a field that really
+            // holds prose (a prompt, a message body) declares
+            // `"widget": {"kind": "textarea"}` in its metadata.
+            WeftType::Primitive(crate::weft_type::WeftPrimitive::String) => Widget::Text,
+            // Everything else edits as JSON text, which wraps.
             _ => Widget::Textarea,
         }
     }
@@ -1694,6 +2067,167 @@ mod deny_unknown_tests {
 }
 
 #[cfg(test)]
+mod spec_field_tests {
+    use super::*;
+
+    fn spec(json: serde_json::Value) -> PortSpec {
+        serde_json::from_value(json).unwrap()
+    }
+
+    /// A field written as a name is the one-line String box of that
+    /// name, so the kinds that only want a label and a placeholder say
+    /// exactly that.
+    #[test]
+    fn a_named_field_expands_to_a_one_line_box() {
+        let text_input = spec(serde_json::json!({
+            "kind": "text_input", "label": "Text input",
+            "fields": ["label", "placeholder"],
+            "addsOutputs": [{ "nameTemplate": "{key}", "portType": "String" }]
+        }));
+        let keys: Vec<&str> = text_input.fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["label", "placeholder"]);
+        let placeholder = &text_input.fields[1];
+        assert_eq!(placeholder.label, "Placeholder");
+        assert_eq!(placeholder.shape, SpecShape::Typed);
+        assert_eq!(placeholder.value_type, Some(WeftType::parse("String").unwrap()));
+        assert_eq!(placeholder.resolved_widget().kind_name(), "text");
+        assert!(!placeholder.required);
+    }
+
+    /// The two forms mix in one list, in the order they are written.
+    #[test]
+    fn a_list_mixes_names_and_declarations() {
+        let select = spec(serde_json::json!({
+            "kind": "select", "label": "Select",
+            "fields": [
+                "label",
+                { "key": "options", "label": "Options", "shape": "typed",
+                  "valueType": "List[String]", "required": true }
+            ],
+            "addsOutputs": [{ "nameTemplate": "{key}", "portType": "String" }]
+        }));
+        let keys: Vec<&str> = select.fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["label", "options"]);
+        assert!(select.fields[1].required, "a written declaration keeps everything it said");
+    }
+
+    /// A kind nobody reads on a screen asks for neither, which is what
+    /// a switch case is.
+    #[test]
+    fn a_kind_that_names_none_gets_none() {
+        let case = spec(serde_json::json!({
+            "kind": "equals", "keyField": "port", "label": "is exactly this value",
+            "fields": [{ "key": "value", "shape": "value", "required": true }],
+            "addsOutputs": [{ "nameTemplate": "{key}", "portType": "Boolean" }]
+        }));
+        let keys: Vec<&str> = case.fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["value"]);
+    }
+
+    /// A mistyped key inside a written declaration still names itself,
+    /// rather than the list failing as a whole.
+    #[test]
+    fn a_mistyped_key_still_names_itself() {
+        let bad = serde_json::from_value::<PortSpec>(serde_json::json!({
+            "kind": "select", "label": "Select",
+            "fields": [{ "key": "options", "shape": "typed", "valueType": "List[String]",
+                         "requried": true }],
+            "addsOutputs": [{ "nameTemplate": "{key}", "portType": "String" }]
+        }));
+        let message = bad.expect_err("an unknown key fails the load").to_string();
+        assert!(message.contains("requried"), "the error names the key: {message}");
+    }
+
+    /// A key with more than one word in it reads as words.
+    #[test]
+    fn a_named_field_reads_its_key_as_words() {
+        assert_eq!(SpecField::named("placeholder").label, "Placeholder");
+        assert_eq!(SpecField::named("min_length").label, "Min Length");
+        assert_eq!(SpecField::named("minLength").label, "Min Length");
+        assert_eq!(SpecField::named("ID").label, "ID");
+        assert_eq!(SpecField::named("HTTPMethod").label, "HTTP Method");
+        // A single lowercase tail on an acronym is a plural, not a word.
+        assert_eq!(SpecField::named("IDs").label, "IDs");
+        assert_eq!(SpecField::named("channelURLs").label, "Channel URLs");
+    }
+}
+
+#[cfg(test)]
+mod widget_default_tests {
+    use super::*;
+    use crate::weft_type::{WeftPrimitive, WeftType};
+
+    /// What control a `typed` spec field draws when it declares no
+    /// widget. A `List[String]` (a select's options, a switch's cases)
+    /// gets the add-one-at-a-time list; everything list-shaped that is
+    /// not strings stays a text area, where JSON is the honest form.
+    #[test]
+    fn a_list_of_strings_gets_the_list_editor() {
+        let strings = WeftType::List(Box::new(WeftType::Primitive(WeftPrimitive::String)));
+        assert_eq!(Widget::default_for_type(&strings).kind_name(), "text_list");
+
+        let numbers = WeftType::List(Box::new(WeftType::Primitive(WeftPrimitive::Number)));
+        assert_eq!(Widget::default_for_type(&numbers).kind_name(), "textarea");
+
+        // A plain String is a single line; a prose field declares
+        // `textarea` explicitly in its metadata.
+        assert_eq!(
+            Widget::default_for_type(&WeftType::Primitive(WeftPrimitive::String)).kind_name(),
+            "text"
+        );
+        assert_eq!(
+            Widget::default_for_type(&WeftType::Primitive(WeftPrimitive::Boolean)).kind_name(),
+            "checkbox"
+        );
+    }
+
+    /// A port holding files gets the picker, one file or many: a plain
+    /// `List[Media]` picks with `multiple`, and a union like
+    /// `Media | List[Media]` picks too. A union mixing files with a
+    /// non-file keeps the text area.
+    fn file_drop(ty: &str) -> (String, bool) {
+        match Widget::default_for_type(&WeftType::parse(ty).expect("parses")) {
+            Widget::FileDrop { file_type, multiple, .. } => (file_type.to_string(), multiple),
+            other => panic!("expected a file drop for {ty}, got {}", other.kind_name()),
+        }
+    }
+
+    #[test]
+    fn a_port_holding_files_gets_the_picker() {
+        // One file, and the type it writes is the one it picks.
+        assert_eq!(file_drop("Image"), ("Image".to_string(), false));
+
+        // Several: the control holds a list and writes one marker each.
+        assert_eq!(file_drop("List[Audio]"), ("Audio".to_string(), true));
+
+        // One or several: still the multi control, and the type it
+        // writes is the file half, never the whole union.
+        assert_eq!(file_drop("Media | List[Media]"), ("Media".to_string(), true));
+        assert_eq!(file_drop("File | List[File]"), ("File".to_string(), true));
+    }
+
+    #[test]
+    fn a_union_mixing_a_file_with_anything_else_keeps_the_text_area() {
+        // A picker would take the other half of the union away.
+        let either = WeftType::parse("String | Image").expect("parses");
+        assert_eq!(Widget::default_for_type(&either).kind_name(), "textarea");
+    }
+
+    /// The field the screenshot was taken of: a multi-select form field
+    /// declares `options: List[String]` with no widget, so it must draw
+    /// the list editor rather than a JSON text area.
+    #[test]
+    fn a_spec_fields_options_draw_the_list_editor() {
+        let field: SpecField = serde_json::from_value(serde_json::json!({
+            "key": "options", "label": "Options",
+            "shape": "typed", "valueType": "List[String]", "required": true
+        }))
+        .unwrap();
+        assert_eq!(field.resolved_widget().kind_name(), "text_list");
+    }
+}
+
+#[cfg(test)]
 mod catalog_wire_tests {
     use super::*;
 
@@ -1726,17 +2260,27 @@ mod catalog_wire_tests {
                   "widget": { "kind": "remote_select", "access": "grant",
                               "sources": [{ "kind": "granted", "from": "sheets" }], "depends_on": ["pick"] } },
                 { "name": "img", "type": "Image",
-                  "widget": { "kind": "file_drop", "type": "Image", "accept": "image/png" } }
+                  "widget": { "kind": "file_drop", "type": "Image", "accept": "image/png" } },
+                { "name": "fields", "type": "List[JsonDict]", "exposure": "config",
+                  "widget": { "kind": "entry_list" } }
             ],
             "outputs": [{ "name": "out", "type": "String" }],
             "features": { "oneOfRequired": [["code", "img"]], "isTrigger": true,
-                          "hasFormSchema": true, "canAddInputPorts": true,
+                          "canAddInputPorts": true,
                           "showDebugPreview": true, "liveEndpoint": "web" },
             "display": { "kind": "media", "output": "out" },
-            "formFieldSpecs": [
-                { "fieldType": "text", "label": "Text",
-                  "render": { "component": "text_input", "source": "input", "multiple": true } }
-            ]
+            "portsFromConfig": { "field": "fields", "matchInput": "n", "specs": [
+                { "kind": "text", "label": "Text",
+                  "render": { "component": "text_input", "source": "input", "multiple": true },
+                  "fields": [
+                      "label",
+                      { "key": "options", "label": "Options", "required": true,
+                        "shape": "typed", "valueType": "List[String]" },
+                      { "key": "at_least", "label": "At least", "shape": "number" }
+                  ],
+                  "catchAll": true,
+                  "addsOutputs": [{ "nameTemplate": "{key}", "portType": "String" }] }
+            ] }
         }))
         .expect("fixture metadata loads");
         let v = serde_json::to_value(meta.resolved()).expect("serializes");
@@ -1752,8 +2296,8 @@ mod catalog_wire_tests {
         };
         assert_eq!(
             keys(&v),
-            ["color", "description", "display", "features", "formFieldSpecs", "icon",
-             "inputs", "label", "outputs", "requires_infra", "tags", "type"],
+            ["color", "description", "display", "features", "icon",
+             "inputs", "label", "outputs", "portsFromConfig", "requires_infra", "tags", "type"],
             "top-level catalog keys are the editor contract"
         );
         // Every resolved input ships the full editor surface, with the
@@ -1771,7 +2315,7 @@ mod catalog_wire_tests {
         assert_eq!(keys(&v["inputs"][5]["widget"]), ["accept", "kind", "type"]);
         assert_eq!(
             keys(&v["features"]),
-            ["canAddInputPorts", "hasFormSchema", "isTrigger", "liveEndpoint",
+            ["canAddInputPorts", "isTrigger", "liveEndpoint",
              "oneOfRequired", "showDebugPreview"],
             "feature keys are the camelCase forms the editor reads"
         );
@@ -1780,11 +2324,22 @@ mod catalog_wire_tests {
             ["kind", "output"],
             "the display declaration carries only its kind and the named side"
         );
-        assert_eq!(keys(&v["formFieldSpecs"][0]),
-            ["addsInputs", "addsOutputs", "fieldType", "label", "optionalConfig",
-             "render", "requiredConfig"]);
-        assert_eq!(keys(&v["formFieldSpecs"][0]["render"]),
+        assert_eq!(keys(&v["portsFromConfig"]), ["field", "matchInput", "specs"]);
+        assert_eq!(keys(&v["portsFromConfig"]["specs"][0]),
+            ["addsInputs", "addsOutputs", "catchAll", "fields", "keyField", "kind", "label",
+             "render"]);
+        assert_eq!(keys(&v["portsFromConfig"]["specs"][0]["render"]),
             ["component", "multiple", "source"]);
+        // Every entry field ships its RESOLVED widget, so the editor
+        // draws a control without deriving one from the shape.
+        assert_eq!(keys(&v["portsFromConfig"]["specs"][0]["fields"][0]),
+            ["key", "label", "required", "shape", "valueType", "widget"]);
+        // A field written as a name (`"label"`) reaches the editor as a
+        // whole declaration, drawn as a one-line box.
+        assert_eq!(v["portsFromConfig"]["specs"][0]["fields"][0]["key"], "label");
+        assert_eq!(v["portsFromConfig"]["specs"][0]["fields"][0]["widget"]["kind"], "text");
+        assert_eq!(v["portsFromConfig"]["specs"][0]["fields"][1]["key"], "options");
+        assert_eq!(v["portsFromConfig"]["specs"][0]["fields"][2]["widget"]["kind"], "number");
     }
 }
 
@@ -1846,6 +2401,142 @@ mod input_semantics_tests {
             m
         })
         .unwrap()
+    }
+
+    /// A node whose ports come from a config list: the list has to live
+    /// under a key the node DECLARES, because everything downstream (the
+    /// editor's control, validate's undeclared-key check) treats it as
+    /// an ordinary config input.
+    #[test]
+    fn ports_from_config_names_a_declared_input() {
+        let spec = || PortSpec {
+            kind: "case".into(),
+            key_field: "port".into(),
+            label: String::new(),
+            render: None,
+            fields: vec![],
+            catch_all: false,
+            adds_inputs: vec![],
+            adds_outputs: vec![PortTemplate::new("{key}", "Boolean")],
+        };
+
+        let mut undeclared = metadata_with(vec![]);
+        undeclared.ports_from_config =
+            Some(PortsFromConfig { field: "cases".into(), match_input: None, specs: vec![spec()] });
+        let e = undeclared.validate_semantics().unwrap_err();
+        assert!(e.contains("declare as an input"), "{e}");
+
+        let mut declared = metadata_with(vec![input(
+            "cases",
+            WeftType::List(Box::new(WeftType::JsonDict)),
+        )]);
+        declared.ports_from_config =
+            Some(PortsFromConfig { field: "cases".into(), match_input: None, specs: vec![spec()] });
+        declared.validate_semantics().expect("the list key is declared");
+    }
+
+    /// A kind's fields are held to a shape the compiler can check: only
+    /// a `typed` field names a type, and it must. An entry-list widget
+    /// must edit the very list the node's ports come from, or it would
+    /// draw a dropdown of nothing.
+    #[test]
+    fn ports_from_config_holds_a_kind_s_fields_and_its_editor_honest() {
+        let with_field = |field: serde_json::Value| {
+            let mut m = metadata_with(vec![input(
+                "cases",
+                WeftType::List(Box::new(WeftType::JsonDict)),
+            )]);
+            m.ports_from_config = Some(
+                serde_json::from_value(serde_json::json!({
+                    "field": "cases",
+                    "specs": [{
+                        "kind": "equals",
+                        "keyField": "port",
+                        "fields": [field],
+                        "addsOutputs": [{ "nameTemplate": "{key}", "portType": "Boolean" }]
+                    }]
+                }))
+                .expect("spec parses"),
+            );
+            m
+        };
+
+        let e = with_field(serde_json::json!({ "key": "v", "shape": "typed" }))
+            .validate_semantics()
+            .unwrap_err();
+        assert!(e.contains("must name a `valueType`"), "{e}");
+
+        let e = with_field(
+            serde_json::json!({ "key": "v", "shape": "number", "valueType": "Number" }),
+        )
+        .validate_semantics()
+        .unwrap_err();
+        assert!(e.contains("only a `typed` field takes"), "{e}");
+
+        // A shape measured against the matched input, with nothing
+        // saying what that input is.
+        let e = with_field(serde_json::json!({ "key": "v", "shape": "value" }))
+            .validate_semantics()
+            .unwrap_err();
+        assert!(e.contains("matchInput"), "{e}");
+
+        // A matchInput naming a port the node does not declare would
+        // resolve to nothing and silently disable every value check.
+        let mut phantom = with_field(
+            serde_json::json!({ "key": "v", "shape": "typed", "valueType": "Number" }),
+        );
+        phantom.ports_from_config.as_mut().expect("spec present").match_input =
+            Some("nope".into());
+        let e = phantom.validate_semantics().unwrap_err();
+        assert!(e.contains("matches entries against input"), "{e}");
+
+        // The editor widget has to sit on the list it edits.
+        let mut stray = metadata_with(vec![InputSpec {
+            widget: Some(Widget::EntryList),
+            ..input("elsewhere", WeftType::List(Box::new(WeftType::JsonDict)))
+        }]);
+        stray.ports_from_config = None;
+        let e = stray.validate_semantics().unwrap_err();
+        assert!(e.contains("portsFromConfig`.field` must name it") || e.contains("must name it"), "{e}");
+    }
+
+    /// Two specs claiming one kind would make an entry match both, and a
+    /// spec that adds no ports makes an entry that does nothing. Both are
+    /// authoring mistakes with no sensible reading.
+    #[test]
+    fn ports_from_config_refuses_ambiguous_or_empty_specs() {
+        let base = || {
+            metadata_with(vec![input("cases", WeftType::List(Box::new(WeftType::JsonDict)))])
+        };
+        let spec = |kind: &str, ports: Vec<PortTemplate>| PortSpec {
+            kind: kind.into(),
+            key_field: "port".into(),
+            label: String::new(),
+            render: None,
+            fields: vec![],
+            catch_all: false,
+            adds_inputs: vec![],
+            adds_outputs: ports,
+        };
+
+        let mut twice = base();
+        twice.ports_from_config = Some(PortsFromConfig {
+            field: "cases".into(),
+            match_input: None,
+            specs: vec![
+                spec("case", vec![PortTemplate::new("{key}", "Boolean")]),
+                spec("case", vec![PortTemplate::new("{key}", "String")]),
+            ],
+        });
+        assert!(twice.validate_semantics().unwrap_err().contains("two specs claim kind"));
+
+        let mut empty = base();
+        empty.ports_from_config = Some(PortsFromConfig {
+            field: "cases".into(),
+            match_input: None,
+            specs: vec![spec("case", vec![])],
+        });
+        assert!(empty.validate_semantics().unwrap_err().contains("adds no ports"));
     }
 
     /// A node that hands out a connection to a service it runs
@@ -1931,8 +2622,9 @@ mod input_semantics_tests {
             ("Image | Video", "file_drop"),
             ("Boolean", "checkbox"),
             ("Number", "number"),
-            ("String", "textarea"),
-            ("List[Image]", "textarea"),
+            ("String", "text"),
+            // A list of files is the picker too, holding several.
+            ("List[Image]", "file_drop"),
             ("List[List[String | Boolean]]", "textarea"),
             ("Dict[String, Number]", "textarea"),
             ("JsonDict", "textarea"),
@@ -1971,10 +2663,12 @@ mod input_semantics_tests {
                 depends_on: vec![],
                 free_text: false,
             },
-            Widget::FormBuilder,
+            Widget::EntryList,
+            Widget::TextList,
             Widget::FileDrop {
                 accept: None,
                 file_type: WeftType::primitive(WeftPrimitive::Image),
+                multiple: false,
             },
         ];
         for w in all {
@@ -2210,12 +2904,114 @@ mod input_semantics_tests {
         let meta = metadata_with(vec![input("prompt", WeftType::primitive(WeftPrimitive::String))]);
         let resolved = meta.resolved();
         assert_eq!(resolved.inputs[0].exposure, Some(Exposure::All));
-        assert_eq!(resolved.inputs[0].widget, Some(Widget::Textarea));
+        assert_eq!(resolved.inputs[0].widget, Some(Widget::Text));
         let again = resolved.resolved();
         assert_eq!(again.inputs[0].exposure, resolved.inputs[0].exposure);
         assert_eq!(again.inputs[0].widget, resolved.inputs[0].widget);
     }
 }
+
+
+// ── ports derived from a node's own config ──────────────────────────────
+
+use crate::project::{InputDefinition, PortDefinition};
+
+/// The (input, output) ports a node derives from a LIST in its own config (a
+/// form's `fields`, a switch's `cases`). Pure: reads each entry's `kind` and
+/// its port name, matches the spec, and resolves that spec's `adds_inputs` /
+/// `adds_outputs` templates. The enricher folds these into the node's known
+/// ports (see the call site).
+///
+/// Entries this node has no spec for are SKIPPED here rather than rejected:
+/// `validate` owns the diagnostics, so an unknown kind surfaces there with a
+/// span instead of as a missing port with no explanation.
+pub fn derive_config_ports(
+    config: &Value,
+    ports_from_config: &PortsFromConfig,
+) -> (Vec<InputDefinition>, Vec<PortDefinition>) {
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    let Some(entries) = config.get(&ports_from_config.field).and_then(|f| f.as_array()) else {
+        return (inputs, outputs);
+    };
+
+    for entry in entries {
+        let Some(obj) = entry.as_object() else { continue };
+        let Some(kind) = obj.get("kind").and_then(|v| v.as_str()) else { continue };
+        let Some(spec) = ports_from_config.spec_for(kind) else { continue };
+        let key = obj.get(&spec.key_field).and_then(|v| v.as_str()).unwrap_or_default();
+        if key.is_empty() {
+            continue;
+        }
+
+        for port in &spec.adds_inputs {
+            inputs.push(InputDefinition::from_wire_port(materialize_port(port, key, false)));
+        }
+        for port in &spec.adds_outputs {
+            outputs.push(materialize_port(port, key, true));
+        }
+    }
+    (inputs, outputs)
+}
+
+/// The metadata sentinel meaning "this port's own type variable": the
+/// materializer turns it into `T__{key}`, one variable per port, so
+/// sibling ports never unify by accident.
+// SYNC: AUTO_TYPE_VAR <-> packages/weft-graph/src/webview/lib/utils/port-specs.ts
+//       AUTO_TYPE_VAR_MARKER
+pub const AUTO_TYPE_VAR: &str = "T_Auto";
+
+/// Replace every `T_Auto` placeholder with a TypeVar scoped to the
+/// field key, recursing through every container arm: `List[T_Auto]`
+/// reads as "a list of anything, scoped to this field", so a nested
+/// placeholder scopes exactly like a top-level one.
+// SYNC: materialize_auto_type_vars <-> packages/weft-graph/src/webview/lib/utils/port-specs.ts materializeAutoTypeVars
+pub fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
+    match t {
+        WeftType::TypeVar(n) if n == AUTO_TYPE_VAR => WeftType::type_var(&format!("T__{key}")),
+        WeftType::List(inner) => WeftType::List(Box::new(materialize_auto_type_vars(inner, key))),
+        WeftType::Generator(inner) => {
+            WeftType::Generator(Box::new(materialize_auto_type_vars(inner, key)))
+        }
+        WeftType::Dict(k, v) => WeftType::Dict(
+            Box::new(materialize_auto_type_vars(k, key)),
+            Box::new(materialize_auto_type_vars(v, key)),
+        ),
+        WeftType::Union(members) => {
+            WeftType::Union(members.iter().map(|m| materialize_auto_type_vars(m, key)).collect())
+        }
+        WeftType::Record(fields) => WeftType::Record(
+            fields
+                .iter()
+                .map(|f| crate::weft_type::RecordField {
+                    name: f.name.clone(),
+                    ty: materialize_auto_type_vars(&f.ty, key),
+                    optional: f.optional,
+                })
+                .collect(),
+        ),
+        // No `Named` arm: a declared body is concrete by construction
+        // (the registry and the wire parser both refuse a type
+        // variable inside one), so there is never a `T_Auto` to
+        // materialize beneath an alias, and rebuilding the body here
+        // would be the door to two same-named types with different
+        // bodies.
+        other => other.clone(),
+    }
+}
+
+fn materialize_port(template: &PortTemplate, key: &str, is_output: bool) -> PortDefinition {
+    let name = template.resolve_name(key);
+    let port_type = materialize_auto_type_vars(&template.port_type, key);
+    PortDefinition {
+        name,
+        port_type,
+        required: !is_output,
+        description: None,
+        synthesized_from_carry: false,
+    }
+}
+
 
 #[cfg(test)]
 mod package_defaults_tests {
@@ -2223,8 +3019,8 @@ mod package_defaults_tests {
 
     const MEMBER: &str = r#"{ "type": "LlmInference", "label": "LLM",
         "description": "" }"#;
-    const DEFAULTS: &str = r#"{ "formFieldSpecs":
-        [{ "fieldType": "root_spec", "label": "Root spec", "render": { "component": "text" } }] }"#;
+    const DEFAULTS: &str = r#"{ "portsFromConfig": { "field": "fields", "specs":
+        [{ "kind": "root_spec", "label": "Root spec", "render": { "component": "text" } }] } }"#;
 
     /// The one guarantee finding-3 turns on: a package member's metadata is
     /// ONE document. The derive's runtime `parse_embedded(member, defaults)`
@@ -2241,18 +3037,21 @@ mod package_defaults_tests {
         merge_package_defaults(&mut value, &defaults).unwrap();
         let from_catalog: NodeMetadata = serde_json::from_value(value).unwrap();
 
-        let spec_types = |m: &NodeMetadata| {
-            m.form_field_specs.iter().map(|s| s.field_type.clone()).collect::<Vec<_>>()
+        let spec_kinds = |m: &NodeMetadata| {
+            m.ports_from_config
+                .as_ref()
+                .map(|p| p.specs.iter().map(|s| s.kind.clone()).collect::<Vec<_>>())
+                .unwrap_or_default()
         };
-        assert_eq!(spec_types(&from_derive), spec_types(&from_catalog));
+        assert_eq!(spec_kinds(&from_derive), spec_kinds(&from_catalog));
         assert_eq!(
-            spec_types(&from_derive),
+            spec_kinds(&from_derive),
             vec!["root_spec".to_string()],
             "the package-root defaults reach the merged metadata"
         );
         // A bare node (no defaults) parses its own file unchanged.
         let bare = NodeMetadata::parse_embedded(MEMBER, None, "test");
-        assert!(bare.form_field_specs.is_empty());
+        assert!(bare.ports_from_config.is_none());
     }
 
     /// The member's own key wins wholesale, disjoint keys survive, and an

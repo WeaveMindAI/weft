@@ -1364,7 +1364,7 @@ fn ops_refuse_an_identifier_that_would_inject_source() {
         EditOp::AddLoop { label: inject.into(), parent_group: None },
     ];
     for op in cases {
-        let err = apply_edits(src, None, "Untitled", &[op.clone()]).unwrap_err();
+        let err = apply_edits(src, None, "Untitled", std::slice::from_ref(&op)).unwrap_err();
         assert!(
             matches!(err, EditError::InvalidArgument(_)),
             "op {op:?} must be refused, got {err:?}"
@@ -2883,9 +2883,9 @@ fn per_widget_value_shapes_round_trip_through_source() {
         ("true", serde_json::json!(true)),                            // checkbox
         ("[\"a\", \"b\"]", serde_json::json!(["a", "b"])),           // multiselect
         (
-            "[{\"fieldType\": \"display\", \"key\": \"k\"}]",
-            serde_json::json!([{"fieldType": "display", "key": "k"}]),
-        ),                                                            // form_builder
+            "[{\"kind\": \"display\", \"key\": \"k\"}]",
+            serde_json::json!([{"kind": "display", "key": "k"}]),
+        ),                                                            // entry_list
         (
             "{\"id\": \"grant-1\", \"identity\": \"Q @ Acme\"}",
             serde_json::json!({"id": "grant-1", "identity": "Q @ Acme"}),
@@ -3229,3 +3229,92 @@ fn set_config_on_a_bodyless_decl_keeps_its_leading_newlines() {
 
 
 
+
+/// A container's interface port takes a value from the editor, written
+/// as a statement beside the container. `_should_flow` is the one key a
+/// container also reads inside its braces, so it keeps whichever form
+/// the author wrote.
+#[test]
+fn set_config_writes_a_container_port_value() {
+    let src = "g = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\n";
+
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "g".into(), key: "x".into(), value: "\"hi\"".into(), form: None,
+    }]);
+    assert!(out.contains("g.x = \"hi\""), "statement form beside the group: {out}");
+
+    // A second write finds the statement and rewrites it in place.
+    let out2 = apply(&out, vec![EditOp::SetConfig {
+        node: "g".into(), key: "x".into(), value: "\"bye\"".into(), form: None,
+    }]);
+    assert!(out2.contains("g.x = \"bye\""), "{out2}");
+    assert_eq!(out2.matches("g.x =").count(), 1, "one statement, not two: {out2}");
+
+    // `_should_flow` in the braces stays in the braces.
+    let braced = "g = Group(x: String) -> (y: String) {\n  _should_flow: false\n  self.y = self.x\n}\n";
+    let out3 = apply(braced, vec![EditOp::SetConfig {
+        node: "g".into(), key: "_should_flow".into(), value: "true".into(),
+        form: Some(crate::edit::ValueForm::Inline),
+    }]);
+    assert!(out3.contains("_should_flow: true"), "{out3}");
+}
+
+/// Only a DECLARED in-port may be written as `g.key = value`: anything
+/// else would emit source the compiler then rejects. A loop knob is
+/// refused with a pointer at its real home.
+#[test]
+fn set_config_refuses_a_key_that_is_not_a_container_port() {
+    let group = "g = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\n";
+    let err = apply_edits(group, None, "Untitled", &[EditOp::SetConfig {
+        node: "g".into(), key: "typo".into(), value: "\"v\"".into(), form: None,
+    }])
+    .unwrap_err();
+    assert!(
+        matches!(&err, EditError::InvalidArgument(m) if m.contains("not a port of the group")),
+        "{err:?}"
+    );
+
+    let lp = "l = Loop(x: String) -> (y: String) {\n  over: items\n  self.y = self.x\n}\n";
+    let err = apply_edits(lp, None, "Untitled", &[EditOp::SetConfig {
+        node: "l".into(), key: "over".into(), value: "\"v\"".into(), form: None,
+    }])
+    .unwrap_err();
+    assert!(
+        matches!(&err, EditError::InvalidArgument(m) if m.contains("SetLoopConfig")),
+        "loop knobs are named to their real home: {err:?}"
+    );
+}
+
+/// A loop's carry seed is a PORT even when the header never declares
+/// it: the compiler synthesizes the in-port from the `carry:` list, so
+/// the editor's write of the seed (`l.acc = 0`) must be accepted.
+#[test]
+fn set_config_accepts_a_synthesized_carry_seed() {
+    let src = "l = Loop(items: List[Number]) -> (acc: Number) {\n  over: [\"items\"]\n  carry: [\"acc\"]\n  self.acc = self.items\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "l".into(), key: "acc".into(), value: "0".into(), form: None,
+    }]);
+    assert!(out.contains("l.acc = 0"), "carry seed written as a statement: {out}");
+}
+
+/// The in-port list is read off the parsed tree, so a port TYPE
+/// carrying commas or brackets never splits the list wrong: a later
+/// port stays recognized, and a phantom name from inside a type is
+/// never accepted.
+#[test]
+fn set_config_reads_ports_from_the_tree_not_the_header_text() {
+    let src =
+        "g = Group(cfg: Dict[String, Number], items: String) -> (out: String) {\n  self.out = self.items\n}\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "g".into(), key: "items".into(), value: "\"v\"".into(), form: None,
+    }]);
+    assert!(out.contains("g.items = \"v\""), "{out}");
+    let err = apply_edits(src, None, "Untitled", &[EditOp::SetConfig {
+        node: "g".into(), key: "Number]".into(), value: "\"v\"".into(), form: None,
+    }])
+    .unwrap_err();
+    assert!(
+        matches!(&err, EditError::InvalidArgument(m) if m.contains("not a port of the group")),
+        "a fragment of a type is not a port: {err:?}"
+    );
+}

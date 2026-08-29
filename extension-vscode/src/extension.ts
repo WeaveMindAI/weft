@@ -15,6 +15,7 @@
 // talk to the center through shared callbacks.
 
 import * as vscode from 'vscode';
+import * as nodePath from 'node:path';
 import { spawn } from 'node:child_process';
 
 import { DispatcherClient } from './dispatcher';
@@ -22,7 +23,7 @@ import { GraphViewController } from './graphView';
 import { attachDiagnostics } from './diagnostics';
 import { ParseServer } from './parseServer';
 import { registerStreamingEditApi } from './streamingEdits';
-import { textTabsForPath } from './tabs';
+import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import { ActionBarStore } from './actionBarState';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
@@ -173,24 +174,50 @@ export function activate(context: vscode.ExtensionContext) {
     }, 500);
   }
 
-  /// Live drift detection: when the user edits the project source,
-  /// the worker / infra they activated could now be stale. Refetch
-  /// status 30s after the LAST parse so the action bar's source
-  /// drift / infra drift bits update without a manual Refresh.
-  /// Rapid typing keeps deferring the fetch (timer resets on every
-  /// new parse) so we only hit `weft status --json` once the user
-  /// actually pauses.
-  let parseRefreshTimer: NodeJS.Timeout | undefined;
-  function scheduleParseDrivenRefresh(): void {
-    if (parseRefreshTimer) clearTimeout(parseRefreshTimer);
-    parseRefreshTimer = setTimeout(() => {
-      parseRefreshTimer = undefined;
-      void refreshActionBarFromStatus();
-    }, 30_000);
+  /// Live drift detection: when the project source changes on disk,
+  /// the worker / infra the user activated could now be stale. `weft
+  /// status` hashes what is ON DISK, so the honest trigger is any
+  /// WRITE inside the pinned project, whoever made it: an editor
+  /// save, the graph view rewriting `main.weft` through
+  /// `workspace.fs.writeFile`, a layout write. A save listener missed
+  /// every non-editor write (VS Code drops an editor-less document
+  /// after a while, and the graph then writes via fs), so a
+  /// filesystem watcher on the pinned project owns this; a short
+  /// debounce folds a burst into one fetch. Build output churn
+  /// (`.weft/`, `target/`) is ignored: it moves no source hash.
+  let saveRefreshTimer: NodeJS.Timeout | undefined;
+  let driftWatcher: vscode.FileSystemWatcher | undefined;
+  function watchPinnedProjectForDrift(): void {
+    driftWatcher?.dispose();
+    driftWatcher = undefined;
+    const root = pinnedProject?.rootPath;
+    if (!root) return;
+    const ignored = ['.weft', 'target', 'node_modules', '.git'].map(
+      (d) => `${nodePath.sep}${d}${nodePath.sep}`,
+    );
+    const bump = (uri: vscode.Uri) => {
+      if (ignored.some((i) => uri.fsPath.includes(i))) return;
+      if (saveRefreshTimer) clearTimeout(saveRefreshTimer);
+      saveRefreshTimer = setTimeout(() => {
+        saveRefreshTimer = undefined;
+        void refreshActionBarFromStatus();
+      }, 1_000);
+    };
+    driftWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(root, '**'),
+    );
+    driftWatcher.onDidChange(bump);
+    driftWatcher.onDidCreate(bump);
+    driftWatcher.onDidDelete(bump);
   }
+  context.subscriptions.push({
+    dispose: () => {
+      driftWatcher?.dispose();
+      if (saveRefreshTimer) clearTimeout(saveRefreshTimer);
+    },
+  });
 
-  graphView.setRunHandler(() => runPinned());
-  graphView.setParseSuccessHandler(() => scheduleParseDrivenRefresh());
+  graphView.setRunHandler((targets) => runPinned(targets));
   graphView.setFollowTogglePinHandler(() => autoFollow.togglePin());
   graphView.setFollowCatchUpHandler(() => autoFollow.catchUpToLatest());
   graphView.setLifecycleStartHandler(() => autoFollow.pinAndFollow(undefined));
@@ -214,6 +241,7 @@ export function activate(context: vscode.ExtensionContext) {
     // pinned. The fresh status fetch below repopulates it.
     lastStatusSnapshot = undefined;
     pinnedProject = project;
+    watchPinnedProjectForDrift();
     executionsProvider.setPinnedProject(project);
     projectStream.setProject(project.id);
     autoFollow.setProject();
@@ -230,8 +258,10 @@ export function activate(context: vscode.ExtensionContext) {
   /// User clicked Run. Run is just a CLI verb like the others now;
   /// runPinned exists separately only so the keybinding (Ctrl+Enter)
   /// has a stable target name.
-  async function runPinned(): Promise<void> {
-    await runCliVerb('run', []);
+  /// `targets` narrows the run to those output nodes; empty runs every
+  /// output node, which is what the plain Run button does.
+  async function runPinned(targets: string[] = []): Promise<void> {
+    await runCliVerb('run', targets.flatMap((t) => ['--target', t]));
   }
 
   /// Spawn a CLI verb and pump its NDJSON event stream into the
@@ -610,10 +640,9 @@ export function activate(context: vscode.ExtensionContext) {
     });
   }
 
-  // Source-change drift refresh: the parse-success handler above
-  // (`graphView.setParseSuccessHandler`) covers every edit that
-  // produces a parse, including programmatic saves. A separate
-  // file-watcher would double-fire the same refresh.
+  // Source-change drift refresh: the save listener above covers
+  // every edit once it lands on disk, which is the only state
+  // `weft status` can see.
 
   /// Shell `weft --json <args>` in `cwd` and parse stdout as NDJSON,
   /// dispatching each event to `onEvent`. Stderr streams to the
@@ -931,7 +960,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('weft.runProject', (p?: ProjectNode | WeftProject) => {
       if (p) {
         const project = 'project' in p ? p.project : p;
-        return pinProject(project).then(runPinned);
+        return pinProject(project).then(() => runPinned());
       }
       return runPinned();
     }),
@@ -1028,6 +1057,14 @@ export function activate(context: vscode.ExtensionContext) {
       // deliberate "Source" view (the Source button), tracked by URI: that
       // editor is intentional code viewing, leave it entirely alone.
       if (ed.document.uri.fsPath === sourceViewPath) return;
+
+      // Reading a diff is reviewing, not editing: popping the graph over it
+      // would take away the comparison the reader opened. Wait a tick so
+      // the tab model reflects this focus change, then make sure the
+      // editor is still the active one.
+      await afterTabModelSettles();
+      if (vscode.window.activeTextEditor !== ed) return;
+      if (isReviewDoc(ed.document)) return;
 
       const docUri = ed.document.uri;
       const closeStrayTextTab = async () => {

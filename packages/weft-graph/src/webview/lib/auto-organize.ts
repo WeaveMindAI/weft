@@ -5,8 +5,10 @@
 
 import ELK from 'elkjs/lib/elk.bundled.js';
 import type { NodeInstance, Edge } from './types';
-import { isContainerNodeType, isLoopNodeType } from './types';
-import { LOOP_CONFIG_STRIP_BAR_PX, LOOP_CONFIG_STRIP_OPEN_PX } from './constants/loop-layout';
+import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, inputExposure } from './types';
+import { CONFIG_STRIP_BAR_PX, configStripOpenPx } from './constants/container-layout';
+import { LOOP_CONFIG_FIELDS } from './utils/input-field';
+import { SHOULD_FLOW_PORT } from '../../protocol';
 
 export interface AutoOrganizeResult {
 	positions: Map<string, { x: number; y: number }>;
@@ -134,12 +136,127 @@ export async function autoOrganize(
 		return node?.parentId || 'root';
 	}
 
+	// An edge whose target input is an `Access` port is plumbing: a
+	// credential hookup, not a step of the story. Plumbing does not bind
+	// two nodes into one component, so a side path that only shares an
+	// access node with the main flow lays out as its own row instead of
+	// being woven through the big one. (The wires still render; they are
+	// only ignored for component discovery.)
+	const plumbingEdgeIds = new Set<string>();
+	for (const e of projectEdges) {
+		const tgt = nodeById.get(e.target);
+		const input = tgt?.inputs?.find(i => i.name === e.targetHandle);
+		if (input && String(input.portType) === 'Access') plumbingEdgeIds.add(e.id);
+	}
+
+	// ---- Satellites ("moons") -----------------------------------------
+	// A leaf node with no incoming wires whose outputs all feed ONE
+	// same-scope consumer, and only through its hookup inputs (an `Access`
+	// port or a wire-exposure input like an LLM's `provider` / `params`),
+	// is an accessory of that consumer. Layered layout would slam it into
+	// the leftmost layer as a "source" and drag a wire across the whole
+	// canvas; instead it is kept out of ELK entirely and parked under its
+	// consumer afterwards, the way a person lays these out. A node feeding
+	// a plain DATA input (a Text heading a pipeline) is a story start and
+	// stays in the layering, as does a trigger.
+	const SAT_GAP = 30;
+	const incomingCount = new Map<string, number>();
+	const outEdges = new Map<string, Edge[]>();
+	for (const e of projectEdges) {
+		incomingCount.set(e.target, (incomingCount.get(e.target) ?? 0) + 1);
+		if (!outEdges.has(e.source)) outEdges.set(e.source, []);
+		outEdges.get(e.source)!.push(e);
+	}
+	/** Is this edge a hookup: does it land on an Access port or a
+	 *  wire-exposure input of its target? */
+	function isHookupEdge(e: Edge): boolean {
+		const input = nodeById.get(e.target)?.inputs?.find(i => i.name === e.targetHandle);
+		if (!input) return false;
+		return String(input.portType) === 'Access' || inputExposure(input) === 'wire';
+	}
+	/** Cached path split of one scope's children (plumbing-blind, the
+	 *  same split the banding uses). */
+	const scopeCompsCache = new Map<string, string[][]>();
+	function scopeComps(scopeId: string): string[][] {
+		let comps = scopeCompsCache.get(scopeId);
+		if (!comps) {
+			const ids = scopeId === 'root'
+				? new Set(topLevelNodes.map(nn => nn.id))
+				: new Set((childrenOf.get(scopeId) ?? []).map(nn => nn.id));
+			comps = findConnectedComponents(ids, scopeId);
+			scopeCompsCache.set(scopeId, comps);
+		}
+		return comps;
+	}
+	/** The consumer a moon parks with: the earliest consumer inside the
+	 *  path holding most of the moon's consumers. */
+	function pickMoonConsumer(n: NodeInstance, consumers: string[]): string {
+		if (consumers.length === 1) return consumers[0];
+		const comps = scopeComps(n.parentId ?? 'root');
+		const compOf = new Map<string, number>();
+		comps.forEach((comp, i) => comp.forEach(id => compOf.set(id, i)));
+		const votes = new Map<number, number>();
+		for (const c of consumers) {
+			const i = compOf.get(c);
+			if (i !== undefined) votes.set(i, (votes.get(i) ?? 0) + 1);
+		}
+		let best = -1, bestVotes = -1;
+		for (const [i, v] of votes) {
+			if (v > bestVotes) { best = i; bestVotes = v; }
+		}
+		// consumers is sourceRank-sorted, so the first hit in the winning
+		// path is the earliest one there; a vote tie keeps the earliest
+		// consumer overall (Map iteration saw its path first).
+		return consumers.find(c => compOf.get(c) === best) ?? consumers[0];
+	}
+
+	/** sat id -> consumer id */
+	const satelliteConsumer = new Map<string, string>();
+	/** consumer id -> sat ids, source order */
+	const satellitesByConsumer = new Map<string, string[]>();
+	for (const n of projectNodes) {
+		if (isContainerNodeType(n.nodeType) || n.nodeType === 'Annotation') continue;
+		if (n.features?.isTrigger) continue;
+		if ((incomingCount.get(n.id) ?? 0) > 0) continue;
+		const edges = outEdges.get(n.id);
+		if (!edges || edges.length === 0 || !edges.every(isHookupEdge)) continue;
+		// Several consumers (one access node, many users) still moon: it
+		// parks under one of them, and only the wires to the others stay
+		// long. Keeping such a node in the layering would thread its long
+		// wires through every layer as invisible spacers and push the real
+		// rows apart. It parks with the PATH that holds most of its
+		// consumers (the earliest consumer there), so a database shared by
+		// a main flow and a two-node maintenance branch sits with the
+		// branch, next to the bulk of its wires.
+		const consumers = [...new Set(edges.map(e => e.target))]
+			.filter(t => (nodeById.get(t)?.parentId ?? undefined) === (n.parentId ?? undefined))
+			.sort((a, b) => sourceRank(a) - sourceRank(b));
+		if (consumers.length === 0) continue;
+		const consumer = pickMoonConsumer(n, consumers);
+		const cNode = nodeById.get(consumer);
+		if (!cNode) continue;
+		satelliteConsumer.set(n.id, consumer);
+		if (!satellitesByConsumer.has(consumer)) satellitesByConsumer.set(consumer, []);
+		satellitesByConsumer.get(consumer)!.push(n.id);
+	}
+	for (const list of satellitesByConsumer.values()) {
+		list.sort((a, b) => sourceRank(a) - sourceRank(b));
+	}
 	// Build edges grouped by scope
 	const edgesByScope = new Map<string, any[]>();
 	function addEdgeToScope(scope: string, edge: any) {
 		if (!edgesByScope.has(scope)) edgesByScope.set(scope, []);
 		edgesByScope.get(scope)!.push(edge);
 	}
+
+	// Every port id some edge anchors on. ELK gets ONLY these: a node can
+	// declare far more inputs than it renders (config-only fields draw no
+	// handle), and its fallback port Ys assume one row per declared port,
+	// which lands phantom FIXED_POS anchors way below the node's real
+	// bottom. ELK then spaces neighbours and sizes groups around anchors
+	// that do not exist on screen (the inflated-group bug). A port no edge
+	// touches has no bearing on layout, so it is simply not declared.
+	const usedPortIds = new Set<string>();
 
 	let edgeIdx = 0;
 	for (const e of projectEdges) {
@@ -158,6 +275,8 @@ export async function autoOrganize(
 			sources: [`${e.source}__${srcDir}__${srcHandle}`],
 			targets: [`${e.target}__${tgtDir}__${tgtHandle}`],
 		};
+		usedPortIds.add(elkEdge.sources[0]);
+		usedPortIds.add(elkEdge.targets[0]);
 
 		// Determine scope: if both nodes are in the same scope, edge goes there.
 		// If one is a group and the handle is __inner, it's an internal edge of that group.
@@ -176,29 +295,43 @@ export async function autoOrganize(
 		}
 	}
 
-	const GROUP_TOP_PADDING = 80;   // header + port labels
-	const GROUP_SIDE_PADDING = 60;  // port labels on sides
-	const GROUP_BOTTOM_PADDING = 60; // extra breathing room below the body
+	// Builder groups need room for the header plus per-port label rows on
+	// both sides; simplified groups draw a slim header and bare dots, so the
+	// same padding would wrap a 96px square in a sea of empty box (the
+	// giant-group look). Sized to each view's real chrome.
+	const GROUP_TOP_PADDING = simplified ? 48 : 80;
+	const GROUP_SIDE_PADDING = simplified ? 28 : 60;
+	const GROUP_BOTTOM_PADDING = simplified ? 28 : 60;
 	const COLLAPSED_GROUP_WIDTH = 200;
 	const COLLAPSED_GROUP_HEIGHT = 80;
 
-	/** Extra vertical space the loop config strip (open or collapsed bar)
-	 *  occupies below the header. 0 for non-loops. Both ELK padding and
-	 *  side-port Y offsets add this so children never sit on the strip. */
-	function loopStripPx(nodeId: string): number {
-		// In simplified view the loop config strip is not drawn (GroupNode gates it
+	/** Extra vertical space the config strip (open or collapsed bar)
+	 *  occupies below a container's header. 0 when it draws none. Both ELK
+	 *  padding and side-port Y offsets add this so children never sit on
+	 *  the strip. */
+	function configStripPx(nodeId: string): number {
+		// In simplified view the config strip is not drawn (GroupNode gates it
 		// on !data.simplified), so it occupies zero vertical space. Reserving the
 		// open-strip height here would push the first child row down by ~220px with
 		// nothing to fill it: the phantom top gap above a simplified loop's body.
 		if (simplified) return 0;
 		const node = projectNodes.find(n => n.id === nodeId);
-		if (!node || !isLoopNodeType(node.nodeType)) return 0;
+		const literals = (node as { portLiterals?: Record<string, unknown> } | undefined)?.portLiterals;
+		if (!node || !containerHasConfigStrip(node.nodeType, literals)) return 0;
 		const configCollapsed = (node.config as Record<string, unknown> | undefined)?.configCollapsed === true;
-		return configCollapsed ? LOOP_CONFIG_STRIP_BAR_PX : LOOP_CONFIG_STRIP_OPEN_PX;
+		if (configCollapsed) return CONFIG_STRIP_BAR_PX;
+		// The open strip grows with its field list: one row per written
+		// port literal, plus the loop knob rows. Same derivation as
+		// GroupNode's stripFields, so the reserved space follows the
+		// rendered strip.
+		const fieldCount =
+			Object.keys(literals ?? {}).length +
+			(isLoopNodeType(node.nodeType) ? LOOP_CONFIG_FIELDS.length : 0);
+		return configStripOpenPx(fieldCount);
 	}
 
 	function paddingForGroup(groupId: string): string {
-		return `[top=${GROUP_TOP_PADDING + loopStripPx(groupId)},left=${GROUP_SIDE_PADDING},bottom=${GROUP_BOTTOM_PADDING},right=${GROUP_SIDE_PADDING}]`;
+		return `[top=${GROUP_TOP_PADDING + configStripPx(groupId)},left=${GROUP_SIDE_PADDING},bottom=${GROUP_BOTTOM_PADDING},right=${GROUP_SIDE_PADDING}]`;
 	}
 
 	// Port Y position constants (must match CSS in GroupNode.svelte and ProjectNode.svelte)
@@ -219,7 +352,7 @@ export async function autoOrganize(
 	/** Compute port Y position for expanded groups (side ports). Loop
 	 *  containers push side ports down by the config-strip height. */
 	function groupPortY(nodeId: string, portIndex: number): number {
-		return GROUP_PORT_START_Y + loopStripPx(nodeId) + portIndex * (GROUP_PORT_HEIGHT + GROUP_PORT_GAP) + GROUP_PORT_HEIGHT / 2;
+		return GROUP_PORT_START_Y + configStripPx(nodeId) + portIndex * (GROUP_PORT_HEIGHT + GROUP_PORT_GAP) + GROUP_PORT_HEIGHT / 2;
 	}
 
 	/** Get the actual measured port Y, falling back to computed position if DOM isn't available (e.g. during streaming). */
@@ -228,6 +361,63 @@ export async function autoOrganize(
 		if (measured !== undefined) return measured;
 		// Fallback: compute from constants (used during streaming when DOM isn't rendered)
 		return isGroup ? groupPortY(nodeId, portIndex) : nodePortY(portIndex);
+	}
+
+	/** The flow dock's Y on a node's header (the yellow triangle). */
+	const FLOW_PORT_Y = 16;
+
+	/** The ELK ports for one box: the implicit `_should_flow` dock (not in
+	 *  any declared `inputs`, but a wire into it is a real dependency edge;
+	 *  without it those wires get dropped and the gated chains come out
+	 *  sideways) plus every declared port an edge actually anchors on,
+	 *  inputs west, outputs east. Ports no edge touches are NOT declared,
+	 *  and every Y is clamped inside the box: a node can declare far more
+	 *  inputs than it renders, and the row-index fallback would otherwise
+	 *  put FIXED_POS anchors below the node's real bottom, which ELK then
+	 *  reserves space for (the inflated-group bug). */
+	function elkPorts(
+		nodeId: string,
+		inputs: string[],
+		outputs: string[],
+		width: number,
+		height: number,
+		isGroup: boolean,
+	) {
+		const clamp = (y: number) => Math.max(4, Math.min(y, height - 4));
+		const ports: any[] = [];
+		if (usedPortIds.has(`${nodeId}__in__${SHOULD_FLOW_PORT}`)) {
+			ports.push({
+				id: `${nodeId}__in__${SHOULD_FLOW_PORT}`,
+				x: 0,
+				y: clamp(portPositions?.get(nodeId)?.get(SHOULD_FLOW_PORT) ?? FLOW_PORT_Y),
+				width: 1, height: 1,
+				// Above every declared port (the dock sits on the header).
+				properties: { 'port.side': 'WEST', 'port.index': '-1' },
+			});
+		}
+		inputs.forEach((name, i) => {
+			const id = `${nodeId}__in__${name}`;
+			if (!usedPortIds.has(id)) return;
+			ports.push({
+				id,
+				x: 0,
+				y: clamp(getPortY(nodeId, name, isGroup, i)),
+				width: 1, height: 1,
+				properties: { 'port.side': 'WEST', 'port.index': String(i) },
+			});
+		});
+		outputs.forEach((name, i) => {
+			const id = `${nodeId}__out__${name}`;
+			if (!usedPortIds.has(id)) return;
+			ports.push({
+				id,
+				x: width - 1,
+				y: clamp(getPortY(nodeId, name, isGroup, i)),
+				width: 1, height: 1,
+				properties: { 'port.side': 'EAST', 'port.index': String(i) },
+			});
+		});
+		return ports;
 	}
 
 	// --- Shared ELK layout options ---
@@ -252,6 +442,20 @@ export async function autoOrganize(
 		'elk.layered.crossingMinimization.forceNodeModelOrder': 'true',
 		'elk.layered.nodePromotion.strategy': 'DUMMYNODE_PERCENTAGE',
 		'elk.separateConnectedComponents': 'true',
+		'elk.layered.compaction.connectedComponents': 'true',
+		'elk.spacing.componentComponent': '60',
+		// Wide-and-flat target for the component packing: flows read
+		// left-to-right, so a side path belongs below the main one, not
+		// squeezed beside it.
+		'elk.aspectRatio': '2.4',
+		// One-dimensional post-compaction closes the dead width that big
+		// boxes (expanded groups) tear open in their layer: nodes slide
+		// toward their edge partners after placement. QUADRATIC
+		// constraints on purpose: the default scanline constraint
+		// calculation throws "Invalid hitboxes" on hierarchical graphs
+		// (the moon clusters), quadratic handles them.
+		'elk.layered.compaction.postCompaction.strategy': 'EDGE_LENGTH',
+		'elk.layered.compaction.postCompaction.constraints': 'QUADRATIC',
 	};
 	const baseOptions = elkLayoutOptions;
 
@@ -273,6 +477,10 @@ export async function autoOrganize(
 
 		const portPeers = new Map<string, Set<string>>();
 		for (const e of projectEdges) {
+			// Plumbing (a wire into an Access port) does not bind two nodes
+			// into one component: a side path that only shares a credential
+			// source with the main flow is still its own path.
+			if (plumbingEdgeIds.has(e.id)) continue;
 			const src = resolveToScope(e.source);
 			const tgt = resolveToScope(e.target);
 			if (src && tgt && src !== tgt && nodeIds.has(src) && nodeIds.has(tgt)) {
@@ -320,177 +528,140 @@ export async function autoOrganize(
 			}
 			comps.push(comp);
 		}
-		return comps;
-	}
 
-	// --- Helper: arrange disconnected components side by side ---
-	function arrangeDisconnectedComponents(
-		comps: string[][],
-		padding: { top: number; left: number; bottom: number; right: number },
-	): { width: number; height: number } | null {
-		if (comps.length <= 1) return null;
-
-		const GAP = 80;
-		const compBBoxes: { minX: number; maxX: number; minY: number; maxY: number; ids: string[] }[] = [];
-		for (const comp of comps) {
-			let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+		// A component whose every member only SOURCES plumbing (an access
+		// node all of whose wires were ignored above) is not a path of its
+		// own; each member joins the component of its earliest consumer,
+		// so a plumbing-only cluster (a credential source and nothing
+		// else) is packed with the path that actually uses it instead of
+		// floating as its own island.
+		const compOf = new Map<string, number>();
+		comps.forEach((comp, i) => comp.forEach(id => compOf.set(id, i)));
+		const merged: string[][] = comps.map(() => []);
+		comps.forEach((comp, i) => {
+			const onlyPlumbs = comp.every(id => (adj.get(id)?.size ?? 0) === 0
+				&& projectEdges.some(e => plumbingEdgeIds.has(e.id) && resolveToScope(e.source) === id));
+			if (!onlyPlumbs) {
+				merged[i].push(...comp);
+				return;
+			}
 			for (const id of comp) {
-				const pos = positions.get(id);
-				if (!pos) continue;
-				const w = groupSizes.get(id)?.width ?? nodeSizes?.get(id)?.width ?? NODE_WIDTH;
-				const h = groupSizes.get(id)?.height ?? nodeSizes?.get(id)?.height ?? NODE_BASE_HEIGHT;
-				minX = Math.min(minX, pos.x);
-				maxX = Math.max(maxX, pos.x + w);
-				minY = Math.min(minY, pos.y);
-				maxY = Math.max(maxY, pos.y + h);
+				// This runs WHILE the satellite map is still being built
+				// (it is filled later, in the moon pass), so the vote is
+				// always the earliest consumer by rank.
+				const anchor = projectEdges
+					.filter(e => plumbingEdgeIds.has(e.id) && resolveToScope(e.source) === id)
+					.map(e => resolveToScope(e.target))
+					.filter((t): t is string => !!t && nodeIds.has(t) && !comp.includes(t))
+					.sort((a, b) => sourceRank(a) - sourceRank(b))[0];
+				const home = anchor !== undefined ? compOf.get(anchor) : undefined;
+				merged[home !== undefined && home !== i ? home : i].push(id);
 			}
-			compBBoxes.push({ minX, maxX, minY, maxY, ids: comp });
-		}
-		// Preserve the caller's ordering (connectivity-based for groups,
-		// X-position-based for root level)
-
-		let cursor = padding.left;
-		for (const comp of compBBoxes) {
-			if (comp.minX === Infinity) continue;
-			const shiftX = cursor - comp.minX;
-			const shiftY = padding.top - comp.minY;
-			for (const id of comp.ids) {
-				const pos = positions.get(id);
-				if (pos) positions.set(id, { x: pos.x + shiftX, y: pos.y + shiftY });
-			}
-			cursor += (comp.maxX - comp.minX) + GAP;
-		}
-
-		// Compute final bounding box
-		let totalMaxX = 0, totalMaxY = 0;
-		for (const comp of compBBoxes) {
-			for (const id of comp.ids) {
-				const pos = positions.get(id);
-				if (!pos) continue;
-				const w = groupSizes.get(id)?.width ?? nodeSizes?.get(id)?.width ?? NODE_WIDTH;
-				const h = groupSizes.get(id)?.height ?? nodeSizes?.get(id)?.height ?? NODE_BASE_HEIGHT;
-				totalMaxX = Math.max(totalMaxX, pos.x + w);
-				totalMaxY = Math.max(totalMaxY, pos.y + h);
-			}
-		}
-		return {
-			width: totalMaxX + padding.right,
-			height: totalMaxY + padding.bottom,
-		};
+		});
+		return merged.filter(c => c.length > 0);
 	}
 
 	// --- Build ELK node for a single scope (flat, no children for groups) ---
-	function buildElkLeafNode(node: NodeInstance): any {
+	/** THE sizer for a leaf's box: measured DOM size first, then config,
+	 *  then the row estimate. `buildElkLeafBase` builds its ELK node
+	 *  from this, so there is exactly one place a box size comes from. */
+	function leafSize(node: NodeInstance): { width: number; height: number } {
+		const override = nodeSizes?.get(node.id);
 		if (collapsedGroupIds.has(node.id)) {
-			const override = nodeSizes?.get(node.id);
-			const inputs = (node.inputs || []).map(p => p.name);
-			const outputs = (node.outputs || []).map(p => p.name);
-			const w = override?.width ?? COLLAPSED_GROUP_WIDTH;
-			return ({
-				id: node.id,
-				width: w,
+			return {
+				width: override?.width ?? COLLAPSED_GROUP_WIDTH,
 				height: override?.height ?? COLLAPSED_GROUP_HEIGHT,
-				ports: [
-					...inputs.map((name, i) => ({
-						id: `${node.id}__in__${name}`,
-						x: 0,
-						y: getPortY(node.id, name, false, i),
-						width: 1, height: 1,
-						properties: { 'port.side': 'WEST', 'port.index': String(i) },
-					})),
-					...outputs.map((name, i) => ({
-						id: `${node.id}__out__${name}`,
-						x: w - 1,
-						y: getPortY(node.id, name, false, i),
-						width: 1, height: 1,
-						properties: { 'port.side': 'EAST', 'port.index': String(i) },
-					})),
-				],
-				layoutOptions: { 'elk.portConstraints': 'FIXED_POS' },
-			});
+			};
 		}
-
-		if (groupIds.has(node.id)) {
-			// Groups are leaf nodes here, their children are laid out in a separate pass.
-			// Use the resolved size from groupSizes (set by bottom-up layout).
-			const inputs = (node.inputs || []).map(p => p.name);
-			const outputs = (node.outputs || []).map(p => p.name);
-			const size = groupSizes.get(node.id) ?? { width: 400, height: 300 };
-			return ({
-				id: node.id,
-				width: size.width,
-				height: size.height,
-				ports: [
-					...inputs.map((name, i) => ({
-						id: `${node.id}__in__${name}`,
-						x: 0,
-						y: getPortY(node.id, name, true, i),
-						width: 1, height: 1,
-						properties: { 'port.side': 'WEST', 'port.index': String(i) },
-					})),
-					...outputs.map((name, i) => ({
-						id: `${node.id}__out__${name}`,
-						x: size.width - 1,
-						y: getPortY(node.id, name, true, i),
-						width: 1, height: 1,
-						properties: { 'port.side': 'EAST', 'port.index': String(i) },
-					})),
-				],
-				layoutOptions: {
-					'elk.portConstraints': 'FIXED_POS',
-					'elk.nodeSize.constraints': 'MINIMUM_SIZE',
-					'elk.nodeSize.minimum': `(${size.width},${size.height})`,
-				},
-			});
-		}
-
 		if (annotationIds.has(node.id)) {
-			const size = groupSizes.get(node.id) ?? { width: ANNOTATION_TARGET_W, height: ANNOTATION_MIN_H };
+			return groupSizes.get(node.id) ?? { width: ANNOTATION_TARGET_W, height: ANNOTATION_MIN_H };
+		}
+		if (groupIds.has(node.id)) {
+			return groupSizes.get(node.id) ?? { width: 400, height: 300 };
+		}
+		const cfg = node.config as Record<string, unknown>;
+		const portCount = Math.max((node.inputs || []).length, (node.outputs || []).length, 1);
+		return {
+			width: override?.width ?? (cfg?.width as number | undefined) ?? NODE_WIDTH,
+			height: override?.height
+				?? (cfg?.height as number | undefined)
+				?? (NODE_BASE_HEIGHT + portCount * PORT_ROW_HEIGHT),
+		};
+	}
+
+	/** The node id a port id anchors on (`x__in__p` / `x__out__p` -> `x`). */
+	function portNode(portId: string): string {
+		return portId.split('__in__')[0].split('__out__')[0];
+	}
+
+	/** One ELK child for a scope: the node itself, or, when the node has
+	 *  moons, a real ELK subgraph holding the node and its moons with the
+	 *  hookup wires inside. ELK lays the cluster out itself (moons land
+	 *  in the layer left of their consumer, boxed tight) and the scope
+	 *  run places the whole box; nothing is positioned by hand. */
+	function buildElkUnit(node: NodeInstance, scopeEdges: any[]): any {
+		const base = buildElkLeafBase(node);
+		const sats = satellitesByConsumer.get(node.id);
+		if (!sats || sats.length === 0) return base;
+		// Move the moons' wires INTO the cluster: an edge whose source is
+		// one of this consumer's moons and whose target is the consumer
+		// belongs to the cluster's own layout, not the scope's.
+		const innerEdges: any[] = [];
+		for (let i = scopeEdges.length - 1; i >= 0; i--) {
+			const e = scopeEdges[i];
+			const src = portNode(e.sources[0]);
+			if (sats.includes(src) && portNode(e.targets[0]) === node.id) {
+				innerEdges.push(e);
+				scopeEdges.splice(i, 1);
+			}
+		}
+		return {
+			id: `__moons_${node.id}`,
+			layoutOptions: {
+				'elk.algorithm': 'layered',
+				'elk.direction': 'RIGHT',
+				'elk.padding': '[top=0,left=0,bottom=0,right=0]',
+				'elk.spacing.nodeNode': String(SAT_GAP),
+				'elk.layered.spacing.nodeNodeBetweenLayers': '40',
+			},
+			children: [base, ...sats.map(sid => buildElkLeafBase(nodeById.get(sid)!))],
+			edges: innerEdges,
+		};
+	}
+
+	function buildElkLeafBase(node: NodeInstance): any {
+		const { width, height } = leafSize(node);
+		if (annotationIds.has(node.id)) {
 			return ({
 				id: node.id,
-				width: size.width,
-				height: size.height,
+				width,
+				height,
 				layoutOptions: { 'elk.portConstraints': 'FREE' },
 			});
 		}
-
 		const inputs = (node.inputs || []).map(p => p.name);
 		const outputs = (node.outputs || []).map(p => p.name);
-		const portCount = Math.max(inputs.length, outputs.length, 1);
-		const override = nodeSizes?.get(node.id);
-		const cfg = node.config as Record<string, unknown>;
-		const configW = cfg?.width as number | undefined;
-		const configH = cfg?.height as number | undefined;
-		const width = override?.width ?? configW ?? NODE_WIDTH;
-		const height = override?.height ?? configH ?? (NODE_BASE_HEIGHT + portCount * PORT_ROW_HEIGHT);
-
+		if (groupIds.has(node.id) && !collapsedGroupIds.has(node.id)) {
+			// Groups are leaf nodes here, their children are laid out in a
+			// separate pass; the resolved size (from the bottom-up layout)
+			// is a floor ELK may grow.
+			return ({
+				id: node.id,
+				width,
+				height,
+				ports: elkPorts(node.id, inputs, outputs, width, height, true),
+				layoutOptions: {
+					'elk.portConstraints': 'FIXED_POS',
+					'elk.nodeSize.constraints': 'MINIMUM_SIZE',
+					'elk.nodeSize.minimum': `(${width},${height})`,
+				},
+			});
+		}
 		return ({
 			id: node.id,
 			width,
 			height,
-			ports: [
-				...inputs.map((name, i) => ({
-					id: `${node.id}__in__${name}`,
-					x: 0,
-					y: getPortY(node.id, name, false, i),
-					width: 1, height: 1,
-					properties: { 'port.side': 'WEST', 'port.index': String(i) },
-				})),
-				...outputs.map((name, i) => ({
-					id: `${node.id}__out__${name}`,
-					x: width - 1,
-					y: getPortY(node.id, name, false, i),
-					width: 1, height: 1,
-					properties: { 'port.side': 'EAST', 'port.index': String(i) },
-				})),
-				{
-					id: `${node.id}__out___raw`,
-					x: width - 1,
-					y: getPortY(node.id, '_raw', false, outputs.length),
-					width: 1, height: 1,
-					properties: { 'port.side': 'EAST', 'port.index': String(outputs.length) },
-				},
-			],
+			ports: elkPorts(node.id, inputs, outputs, width, height, false),
 			layoutOptions: { 'elk.portConstraints': 'FIXED_POS' },
 		});
 	}
@@ -501,16 +672,28 @@ export async function autoOrganize(
 	async function layoutScope(scopeId: string, children: NodeInstance[], padding: string) {
 		// Feed children in weft source order so ELK's model-order machinery can
 		// use it as a strong tiebreaker, keeping siblings left-to-right.
-		const orderedChildren = [...children].sort((a, b) => sourceRank(a.id) - sourceRank(b.id));
-		const elkChildren = orderedChildren.map(c => buildElkLeafNode(c));
+		// Satellites stay out: their consumer's box already reserves their
+		// room and the final pass parks them under it.
+		const orderedChildren = [...children]
+			.filter(c => !satelliteConsumer.has(c.id))
+			.sort((a, b) => sourceRank(a.id) - sourceRank(b.id));
 
-		// Collect all valid port IDs from children (and group ports if applicable)
+		// Collect all valid port IDs from children (and group ports if
+		// applicable), moons inside their clusters included.
+		const collectPorts = (child: any, into: Set<string>) => {
+			for (const port of (child.ports || [])) into.add(port.id);
+			for (const c of (child.children || [])) collectPorts(c, into);
+		};
+
+		// The scope's edges, filtered below to what this run can anchor.
+		// Built BEFORE the units: buildElkUnit MOVES a moon's hookup wires
+		// out of this list into its cluster.
+		const allScopeEdges = edgesByScope.get(scopeId) || [];
+		const scopeEdges = [...allScopeEdges];
+		const elkChildren = orderedChildren.map(c => buildElkUnit(c, scopeEdges));
+
 		const validPortIds = new Set<string>();
-		for (const child of elkChildren) {
-			for (const port of (child.ports || [])) {
-				validPortIds.add(port.id);
-			}
-		}
+		for (const child of elkChildren) collectPorts(child, validPortIds);
 
 		// Also include group's own ports (for edges from/to group interface)
 		if (groupIds.has(scopeId)) {
@@ -518,12 +701,19 @@ export async function autoOrganize(
 			if (scopeNode) {
 				for (const p of (scopeNode.inputs || [])) validPortIds.add(`${scopeId}__in__${p.name}`);
 				for (const p of (scopeNode.outputs || [])) validPortIds.add(`${scopeId}__out__${p.name}`);
+				validPortIds.add(`${scopeId}__in__${SHOULD_FLOW_PORT}`);
 			}
 		}
 
-		// Filter edges to only those whose source AND target ports exist in this layout
-		const allScopeEdges = edgesByScope.get(scopeId) || [];
-		const scopeEdges = allScopeEdges.filter((e: any) => {
+		// Only edges this run can anchor on both ends survive. A moon's
+		// leftover wires (to consumers other than the one it is boxed
+		// with) stay in: they are real dependencies, and layering needs
+		// them so a shared feeder's OTHER consumers land to its right.
+		// Withholding them left ELK blind to the link between two paths
+		// sharing one feeder (a database feeding both the main flow and a
+		// side path), and the unconstrained path could come out to the
+		// right of the feeder, drawing its wire backward.
+		const anchoredEdges = scopeEdges.filter((e: any) => {
 			const srcId = e.sources?.[0] as string;
 			const tgtId = e.targets?.[0] as string;
 			return validPortIds.has(srcId) && validPortIds.has(tgtId);
@@ -549,7 +739,9 @@ export async function autoOrganize(
 				id: `__wrapper_${scopeId}`,
 				layoutOptions: {
 					'elk.algorithm': 'layered',
-					'elk.hierarchyHandling': 'SEPARATE_CHILDREN',
+					// One layered problem across the hierarchy, so wires into a
+					// moon cluster's consumer still shape the outer layering.
+					'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
 				},
 				children: [{
 					id: scopeId,
@@ -562,24 +754,13 @@ export async function autoOrganize(
 						'elk.nodeSize.constraints': 'MINIMUM_SIZE',
 						'elk.nodeSize.minimum': `(${minW},${minH})`,
 					},
-					ports: [
-						...inputs.map((name, i) => ({
-							id: `${scopeId}__in__${name}`,
-							x: 0,
-							y: getPortY(scopeId, name, true, i),
-							width: 1, height: 1,
-							properties: { 'port.side': 'WEST', 'port.index': String(i) },
-						})),
-						...outputs.map((name, i) => ({
-							id: `${scopeId}__out__${name}`,
-							x: portRefW - 1,
-							y: getPortY(scopeId, name, true, i),
-							width: 1, height: 1,
-							properties: { 'port.side': 'EAST', 'port.index': String(i) },
-						})),
-					],
+					// `portRefW` as the width so the east ports sit at its edge;
+					// ELK grows the box and keeps FIXED_POS ports where placed.
+					// Height for the clamp: the group's own ports hug the header,
+					// so the min height bounds them fine.
+					ports: elkPorts(scopeId, inputs, outputs, portRefW, minH, true),
 					children: elkChildren,
-					edges: scopeEdges,
+					edges: anchoredEdges,
 				}],
 				edges: [],
 			};
@@ -591,12 +772,7 @@ export async function autoOrganize(
 				if (groupResult.width && groupResult.height) {
 					groupSizes.set(scopeId, { width: groupResult.width, height: groupResult.height });
 				}
-				for (const child of (groupResult.children || [])) {
-					positions.set(child.id, { x: child.x ?? 0, y: child.y ?? 0 });
-					if (groupIds.has(child.id) && child.width && child.height && !groupSizes.has(child.id)) {
-						groupSizes.set(child.id, { width: child.width, height: child.height });
-					}
-				}
+				harvestPositions(groupResult, 0, 0);
 			}
 			return result;
 		}
@@ -606,20 +782,33 @@ export async function autoOrganize(
 			id: scopeId,
 			layoutOptions: {
 				...baseOptions,
+				'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
 				'elk.padding': padding,
 			},
 			children: elkChildren,
-			edges: scopeEdges,
+			edges: anchoredEdges,
 		};
 
 		const result = await elk.layout(graph);
-		for (const child of (result.children || [])) {
-			positions.set(child.id, { x: child.x ?? 0, y: child.y ?? 0 });
-			if (groupIds.has(child.id) && child.width && child.height && !groupSizes.has(child.id)) {
-				groupSizes.set(child.id, { width: child.width, height: child.height });
-			}
-		}
+		harvestPositions(result, 0, 0);
 		return result;
+	}
+
+	/** Walk an ELK result depth-first, turning nested (cluster-relative)
+	 *  coordinates into scope coordinates. Cluster wrappers themselves are
+	 *  bookkeeping, not nodes, so only real ids land in `positions`. */
+	function harvestPositions(elkNode: any, ox: number, oy: number): void {
+		for (const child of (elkNode.children || [])) {
+			const x = ox + (child.x ?? 0);
+			const y = oy + (child.y ?? 0);
+			if (!String(child.id).startsWith('__moons_')) {
+				positions.set(child.id, { x, y });
+				if (groupIds.has(child.id) && child.width && child.height && !groupSizes.has(child.id)) {
+					groupSizes.set(child.id, { width: child.width, height: child.height });
+				}
+			}
+			harvestPositions(child, x, y);
+		}
 	}
 
 	// --- Bottom-up scope resolution ---
@@ -654,65 +843,18 @@ export async function autoOrganize(
 				if (children.length === 0) continue;
 
 				const padding = paddingForGroup(groupId);
-
-				// Find disconnected components first
-				const childIds = new Set(children.map(c => c.id));
-				const comps = findConnectedComponents(childIds, groupId);
-
-				// Lay out each component independently so ELK can't spread
-				// disconnected nodes across connected component's layers.
-				for (const comp of comps) {
-					const compChildren = children.filter(c => comp.includes(c.id));
-					await layoutScope(groupId, compChildren, padding);
-				}
-
-				// Sort components for arrangement:
-				// - Connected to group input ports → leftmost (score 0)
-				// - Connected to both → leftmost (score 0)
-				// - Not connected to any group port → middle (score 1)
-				// - Connected to group output ports only → rightmost (score 2)
-				if (comps.length > 1) {
-					const sortedComps = comps.map(comp => {
-						const compSet = new Set(comp);
-						let connectsToInput = false;
-						let connectsToOutput = false;
-						for (const e of projectEdges) {
-							if (e.source === groupId && compSet.has(e.target)) connectsToInput = true;
-							if (e.target === groupId && compSet.has(e.source)) connectsToOutput = true;
-						}
-						const score = connectsToInput ? 0 : connectsToOutput ? 2 : 1;
-						const minRank = Math.min(...comp.map(sourceRank));
-						return { comp, score, minRank };
-					});
-					// Score groups components by port role (input-connected first,
-					// output-connected last). Within the same score, weft source
-					// order wins so siblings stay left-to-right as the user wrote.
-					sortedComps.sort((a, b) => a.score - b.score || a.minRank - b.minRank);
-
-					const newSize = arrangeDisconnectedComponents(
-						sortedComps.map(c => c.comp),
-						{
-							top: GROUP_TOP_PADDING + loopStripPx(groupId),
-							left: GROUP_SIDE_PADDING,
-							bottom: GROUP_BOTTOM_PADDING,
-							right: GROUP_SIDE_PADDING,
-						},
-					);
-					if (newSize) {
-						groupSizes.set(groupId, newSize);
-					}
-				}
+				// One run: with the plumbing withheld from the edge set,
+				// ELK's own `separateConnectedComponents` splits and packs
+				// the group's independent pieces itself.
+				await layoutScope(groupId, children, padding);
 			}
 		}
 
-		// 3. Layout root scope (top-level nodes, groups now have final sizes)
+		// 3. Layout the root scope, groups now at their final sizes. One
+		// run here too: the paths (plumbing-blind components) are
+		// separated and packed by ELK, not by hand.
 		const rootPadding = `[top=${GROUP_PADDING},left=${GROUP_PADDING},bottom=${GROUP_PADDING},right=${GROUP_PADDING}]`;
 		await layoutScope('root', topLevelNodes, rootPadding);
-
-		// 4. Arrange disconnected components at root level
-		const topIds = new Set(topLevelNodes.map(n => n.id));
-		const comps = findConnectedComponents(topIds, 'root');
-		arrangeDisconnectedComponents(comps, { top: 0, left: 0, bottom: 0, right: 0 });
 	} catch (e) {
 		// ELK failing is a real bug (a malformed graph we fed it, a bad size, an
 		// unsupported option), not an expected outcome. Scattering nodes into a fixed

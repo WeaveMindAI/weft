@@ -68,6 +68,7 @@
     {
       "name": "comment",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "label": "Comment",
       "description": "A message posted alongside the file."

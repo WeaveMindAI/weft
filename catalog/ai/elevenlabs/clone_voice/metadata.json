@@ -35,6 +35,7 @@
     {
       "name": "description",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "description": "A note stored with the voice."
     },

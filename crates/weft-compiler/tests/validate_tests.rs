@@ -1160,7 +1160,7 @@ out.data = req.body
     );
     let d = validate(&project, &catalog());
     assert!(
-        !codes(&d).iter().any(|c| *c == "required-port-unmet"),
+        !codes(&d).contains(&"required-port-unmet"),
         "a defaulted required input needs no driver: {:?}",
         d
     );
@@ -1996,5 +1996,163 @@ out.data = a.value
         }),
         "expected the registry half of named-type-conflict, got {:?}",
         codes(&d)
+    );
+}
+
+/// A `Switch`'s cases are checked the way a type is: before anything
+/// runs. Each of these is a case that would otherwise be a branch that
+/// silently never fires, or one that swallows the branches after it.
+#[test]
+fn a_switch_holds_its_cases_to_what_they_claim() {
+    let switch_over = |cases: &str| {
+        let source = format!(
+            r#"
+words = Text {{ value: "an error happened" }}
+
+route = Switch {{
+  value: words.value
+  cases: {cases}
+}}
+
+out = Debug {{ data: route.taken }}
+"#
+        );
+        let project = parse_enrich(&source);
+        let diagnostics = validate(&project, &catalog());
+        codes(&diagnostics).iter().map(|c| c.to_string()).collect::<Vec<_>>()
+    };
+
+    // A test whose value the matched input could never hold.
+    assert!(switch_over(
+        r#"[{ "kind": "equals", "value": 42, "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#
+    )
+    .contains(&"config-entry-bad-value".to_string()));
+
+    // A comparison against something that is not a number: the branch
+    // could never be taken.
+    assert!(switch_over(
+        r#"[{ "kind": "gte", "value": 3, "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#
+    )
+    .contains(&"config-entry-bad-value".to_string()));
+
+    // A regular expression that does not compile.
+    assert!(switch_over(
+        r#"[{ "kind": "matches", "value": "[unclosed", "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#
+    )
+    .contains(&"config-entry-bad-value".to_string()));
+
+    // A case whose kind needs a value and does not carry one.
+    assert!(switch_over(
+        r#"[{ "kind": "equals", "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#
+    )
+    .contains(&"config-entry-missing-value".to_string()));
+
+    // A mistyped key on a case that does not take it.
+    let typo = switch_over(
+        r#"[{ "kind": "equals", "value": "err", "vlaue": "err", "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#,
+    );
+    assert!(typo.contains(&"unknown-config-entry-key".to_string()), "{typo:?}");
+
+    // A range needs both ends.
+    assert!(switch_over(
+        r#"[{ "kind": "between", "min": 1, "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#
+    )
+    .contains(&"config-entry-missing-value".to_string()));
+
+    // A catch-all with entries after it: everything below could never be
+    // reached.
+    assert!(switch_over(
+        r#"[{ "kind": "otherwise", "port": "taken" }, { "kind": "equals", "value": "err", "port": "rest" }]"#
+    )
+    .contains(&"catch-all-not-last".to_string()));
+
+    // Two catch-alls.
+    assert!(switch_over(
+        r#"[{ "kind": "otherwise", "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#
+    )
+    .contains(&"duplicate-catch-all".to_string()));
+
+    // A kind this node does not offer.
+    assert!(switch_over(
+        r#"[{ "kind": "text_input", "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#
+    )
+    .contains(&"unknown-config-entry-kind".to_string()));
+
+    // And the shape that is CORRECT stays clean: a test, then a
+    // catch-all last.
+    let clean = switch_over(
+        r#"[{ "kind": "contains", "value": "err", "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#,
+    );
+    assert!(
+        !clean.iter().any(|c| c.starts_with("config-entry") || c.starts_with("catch-all")
+            || c.starts_with("unknown-config-entry") || c == "duplicate-catch-all"),
+        "a well-formed switch has nothing to say: {clean:?}"
+    );
+}
+
+#[test]
+fn output_sink_is_exempt_from_orphan_outputs() {
+    // A node marked `_is_output: true` is a declared terminus: its output
+    // ports going nowhere is the point, not a mistake. A node with the
+    // same unconsumed outputs and no marker still gets the warning.
+    let project = parse_enrich(
+        r#"
+t = Text { value: "hi" }
+sink = Debug { _label: "sink" }
+sink.value = t.value
+loose = Cast(value: String) -> (value: String) {}
+loose.value = t.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let flagged: Vec<&str> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("orphan-outputs"))
+        .filter_map(|x| x.message.split('\'').nth(1))
+        .collect();
+    assert!(flagged.contains(&"loose"), "{d:?}");
+    assert!(!flagged.contains(&"t"), "t IS consumed: {d:?}");
+
+    // Same loose node, now marked as an output: warning gone.
+    let project = parse_enrich(
+        r#"
+t = Text { value: "hi" }
+sink = Debug { _label: "sink" }
+sink.value = t.value
+loose = Cast(value: String) -> (value: String) { _is_output: true }
+loose.value = t.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("orphan-outputs")),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn group_boundary_nodes_are_not_unknown_types() {
+    // Group lowering synthesizes Passthrough boundary nodes. They have no
+    // catalog entry by design; the lenient parse path must not paint them
+    // as unknown node types (the phantom line-0 warnings).
+    let (_, d) = weft_compiler::parse_only(
+        r#"
+g = Group(text: String) -> (out: String) {
+  inner = Cast(value: String) -> (value: String) {}
+  inner.value = self.text
+  self.out = inner.value
+}
+g.text = "hi"
+sink = Debug {}
+sink.value = g.out
+"#,
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        &catalog(),
+        None,
+    );
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("unknown-type")),
+        "{d:?}"
     );
 }

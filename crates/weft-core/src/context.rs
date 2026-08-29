@@ -686,6 +686,14 @@ pub enum BagSide {
 #[derive(Debug, Clone)]
 pub struct ValueBag {
     values: serde_json::Map<String, Value>,
+    /// The node's input names IN DECLARATION ORDER, which for a created
+    /// port is the order it was written in source. `values` is a sorted
+    /// map, so it cannot answer "which input came first"; a node whose
+    /// behaviour depends on that order (a join picking the first branch
+    /// that spoke) reads [`Self::in_order`]. `None` on wake and nested
+    /// bags, which have no port list behind them; reading order there
+    /// errors loud instead of iterating nothing.
+    order: Option<Vec<String>>,
     side: BagSide,
     /// Why [`Self::object`] cannot hand out the whole bag as one
     /// record: `None` everywhere except a wake bag whose firing
@@ -701,8 +709,9 @@ impl ValueBag {
     pub fn inputs(
         values: serde_json::Map<String, Value>,
         spec_names: std::collections::HashSet<String>,
+        order: Vec<String>,
     ) -> Self {
-        Self { values, side: BagSide::Inputs, no_record: None, spec_names }
+        Self { values, order: Some(order), side: BagSide::Inputs, no_record: None, spec_names }
     }
 
     /// The wake bag: the fire payload's top-level fields when the
@@ -717,7 +726,7 @@ impl ValueBag {
             None => Some("no wake payload was delivered for this firing".into()),
         };
         let values = payload.and_then(Value::as_object).cloned().unwrap_or_default();
-        Self { values, side: BagSide::Wake, no_record, spec_names: Default::default() }
+        Self { values, order: None, side: BagSide::Wake, no_record, spec_names: Default::default() }
     }
 
     /// The whole bag as one record. The inputs bag always has one; a
@@ -829,7 +838,7 @@ impl ValueBag {
                 )))
             }
         };
-        Ok(Self { values, side: self.side, no_record: None, spec_names: Default::default() })
+        Ok(Self { values, order: None, side: self.side, no_record: None, spec_names: Default::default() })
     }
 
     /// Iterate over every named value (name + raw value), the node's
@@ -853,6 +862,26 @@ impl ValueBag {
     /// uniform surface over all of them.
     pub fn custom(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.values.iter().filter(|(k, _)| !self.spec_names.contains(k.as_str()))
+    }
+
+    /// Every input the firing DELIVERED, in the node's port order (a
+    /// created port's order is where it was written in source). A port
+    /// that arrived closed, or that the node never declared, is absent:
+    /// the pair is the name and the value that came in.
+    ///
+    /// The one way to ask "which input came first", so a node that
+    /// answers by order (a join) and the author reading the file agree.
+    /// Errors on a wake or nested bag: those have no port list behind
+    /// them, so there is no order to read.
+    pub fn in_order(&self) -> WeftResult<impl Iterator<Item = (&String, &Value)>> {
+        match &self.order {
+            Some(order) => {
+                Ok(order.iter().filter_map(|name| self.values.get_key_value(name)))
+            }
+            None => Err(self.err(
+                "this bag has no port list behind it, so there is no order to read".to_string(),
+            )),
+        }
     }
 
     /// The complement of [`Self::custom`]: only the node TYPE's own
@@ -982,13 +1011,27 @@ pub fn node_input_bag(
         );
     }
 
+    // `_should_flow` is the LANGUAGE's port, not the node's: it decides
+    // whether this firing happens at all, which the engine has already
+    // acted on by the time a bag is built. Dropped AFTER the delivered /
+    // config / default layering above, so no layer can put it back, and
+    // a node's own data never carries it (an ExecPython would otherwise
+    // find a `_should_flow` variable it never declared).
+    delivered.remove(crate::exec::skip::SHOULD_FLOW_PORT);
+
     let spec_names = node
         .inputs
         .iter()
         .filter(|i| i.from_spec)
         .map(|i| i.name.clone())
         .collect();
-    Ok(ValueBag::inputs(delivered, spec_names))
+    let order = node
+        .inputs
+        .iter()
+        .map(|i| i.name.clone())
+        .filter(|name| name != crate::exec::skip::SHOULD_FLOW_PORT)
+        .collect();
+    Ok(ValueBag::inputs(delivered, spec_names, order))
 }
 
 /// A consumer input declaring `requiresScopes`/`requiresValues` stamps
@@ -1462,10 +1505,10 @@ impl StorageHandle {
                         "media.{}",
                         mime.rsplit('/').next().unwrap_or("bin")
                     );
-                    self.put(bytes, &mime, &filename, keep.clone()).await?
+                    self.put(bytes, &mime, &filename, keep).await?
                 }
                 MediaSlotContent::ExternalUrl(url) => {
-                    self.put_from_url(&url, None, keep.clone()).await?
+                    self.put_from_url(&url, None, keep).await?
                 }
             };
             replacements.insert(slot.to_string(), stored);
@@ -1820,7 +1863,51 @@ mod value_bag_tests {
     use serde_json::json;
 
     fn inputs_bag(values: serde_json::Value) -> ValueBag {
-        ValueBag::inputs(values.as_object().unwrap().clone(), Default::default())
+        let order = values.as_object().unwrap().keys().cloned().collect();
+        ValueBag::inputs(values.as_object().unwrap().clone(), Default::default(), order)
+    }
+
+    /// The bag walks its inputs in the order the node declares them,
+    /// which for a created port is the order it was written in source.
+    /// A port that delivered nothing is absent, so the first pair is
+    /// the first branch that actually spoke.
+    #[test]
+    fn in_order_follows_the_port_order() {
+        let bag = ValueBag::inputs(
+            json!({ "quick": "automatic", "checked": "reviewed" })
+                .as_object()
+                .unwrap()
+                .clone(),
+            Default::default(),
+            vec!["checked".into(), "quick".into()],
+        );
+        assert_eq!(
+            bag.in_order().unwrap().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["checked", "quick"],
+            "written order decides, not the map's own order",
+        );
+
+        // The cut branch is not in the bag at all, so the survivor leads
+        // even though it is written second.
+        let one_branch = ValueBag::inputs(
+            json!({ "quick": "automatic" }).as_object().unwrap().clone(),
+            Default::default(),
+            vec!["checked".into(), "quick".into()],
+        );
+        assert_eq!(
+            one_branch.in_order().unwrap().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["quick"],
+        );
+    }
+
+    /// Wake and nested bags carry no port list, so asking them for
+    /// order is a programming error and must say so rather than
+    /// iterate nothing.
+    #[test]
+    fn in_order_errors_on_a_bag_with_no_port_list() {
+        assert!(ValueBag::wake(None).in_order().is_err());
+        let bag = inputs_bag(json!({ "params": { "a": 1 } }));
+        assert!(bag.nested("params").unwrap().in_order().is_err());
     }
 
     /// `list` normalizes the one-or-many wire shapes: absent/null =
@@ -2007,7 +2094,7 @@ mod value_bag_tests {
     fn bag_resolves_and_stamps_errors() {
         let c = ctx(json!({"url": "http://x", "n": "not-a-number", "keep": true}));
         assert_eq!(c.inputs.get::<String>("url").unwrap(), "http://x");
-        assert_eq!(c.inputs.get::<bool>("keep").unwrap(), true);
+        assert!(c.inputs.get::<bool>("keep").unwrap());
         assert_eq!(c.inputs.opt::<String>("missing").unwrap(), None);
         assert_eq!(c.inputs.get_or("ttl_days", 30u64).unwrap(), 30);
         assert_eq!(c.inputs.get::<Value>("url").unwrap(), json!("http://x"));

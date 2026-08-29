@@ -609,7 +609,7 @@ impl LoopRuntime {
         let cap = inst.iter_cap;
         let next_index = inst.next_index();
         let launched = inst.launched.len() as u32;
-        let below_cap = cap.map_or(true, |c| launched < c);
+        let below_cap = cap.is_none_or(|c| launched < c);
         let ready = if parallel {
             below_cap
         } else {

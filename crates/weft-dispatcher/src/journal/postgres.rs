@@ -3,19 +3,18 @@
 //! durable state. Postgres is the source of truth, every dispatcher
 //! Pod is a stateless reader/writer.
 //!
-//! Schema migrations run idempotently on `connect`. They use
-//! `CREATE TABLE IF NOT EXISTS` so adding a Pod or restarting one
-//! is safe.
+//! Applies no schema of its own: the boot's `app::apply_core_schema`
+//! runs every group (this crate's [`GROUP`] included) in one pass.
 
 use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use weft_core::Color;
 
-use weft_journal::ExecEvent;
+use weft_journal::{decode_event, ExecEvent};
 use crate::journal::{
-    SignalToken, ColorLookup, ExecutionPage, ExecutionQuery, ExecutionSummary, Journal, LogEntry,
-    SignalRegistration,
+    SignalToken, ColorLookup, ExecutionOwner, ExecutionPage, ExecutionQuery, ExecutionSummary,
+    Journal, LogEntry, SignalRegistration,
 };
 
 pub struct PostgresJournal {
@@ -26,20 +25,27 @@ pub struct PostgresJournal {
 /// event JSON + its latest terminal event JSON, if any) into an
 /// `ExecutionSummary`. Shared by `list_executions` and `execution_summary` so
 /// the started-decode + terminal-status mapping lives in exactly one place.
-/// Returns `Ok(None)` when the started payload does not decode to an
-/// `ExecutionStarted` (a corrupt or non-started row that should be skipped).
+/// `Err` (naming the color and `weft clean`) for any unusable row: one
+/// that does not decode, or one whose kind column and payload disagree.
+/// The caller decides whether that fails the read or renders as a
+/// broken row.
 fn summary_from_payloads(
+    color: Color,
     started_payload: &str,
     terminal_payload: Option<String>,
-) -> anyhow::Result<Option<ExecutionSummary>> {
-    let Ok(started) = serde_json::from_str::<ExecEvent>(started_payload) else {
-        return Ok(None);
-    };
+) -> anyhow::Result<ExecutionSummary> {
+    let started = decode_event(color, started_payload).map_err(anyhow::Error::msg)?;
     let ExecEvent::ExecutionStarted {
         color, project_id, entry_node, at_unix, ..
     } = started
     else {
-        return Ok(None);
+        // The row was selected by kind = 'execution_started', so a
+        // decodable non-started payload means the kind column and the
+        // payload disagree: corrupted post-write, same as undecodable.
+        anyhow::bail!(
+            "exec_event row for color {color} is kind execution_started but decodes \
+             to a different event; `weft clean {color}` removes this color's rows"
+        );
     };
     // The terminal lookup only selects execution_{completed,failed,cancelled}
     // rows, so any other variant here means the journal row was corrupted
@@ -47,7 +53,7 @@ fn summary_from_payloads(
     // terminal execution as live.
     let (status, completed_at) = match terminal_payload {
         None => ("running".to_string(), None),
-        Some(p) => match serde_json::from_str::<ExecEvent>(&p)? {
+        Some(p) => match decode_event(color, &p).map_err(anyhow::Error::msg)? {
             ExecEvent::ExecutionCompleted { at_unix, .. } => ("completed".to_string(), Some(at_unix)),
             ExecEvent::ExecutionFailed { at_unix, .. } => ("failed".to_string(), Some(at_unix)),
             ExecEvent::ExecutionCancelled { at_unix, .. } => ("cancelled".to_string(), Some(at_unix)),
@@ -57,22 +63,50 @@ fn summary_from_payloads(
             ),
         },
     };
-    Ok(Some(ExecutionSummary {
+    Ok(ExecutionSummary {
         color,
         project_id,
         entry_node,
         status,
         started_at: at_unix,
         completed_at,
-    }))
+    })
+}
+
+/// Every payload for `color`, in write order, undecoded. Takes the
+/// executor so both the pool reads and the in-transaction cancel read
+/// share one query.
+async fn payload_rows<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    color: Color,
+) -> anyhow::Result<Vec<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
+    )
+    .bind(color.to_string())
+    .fetch_all(executor)
+    .await?;
+    Ok(rows.into_iter().map(|(p,)| p).collect())
+}
+
+/// Strictly decode every row: one undecodable row fails the whole read
+/// (a fold over a partial event list rebuilds a state that never
+/// existed).
+fn decode_all(color: Color, rows: Vec<String>) -> anyhow::Result<Vec<ExecEvent>> {
+    rows.into_iter()
+        .map(|payload| decode_event(color, &payload).map_err(anyhow::Error::msg))
+        .collect()
 }
 
 impl PostgresJournal {
-    /// Connect to Postgres at `database_url` (`postgres://user:pass@host:port/db`).
-    /// Creates the schema on first connect; idempotent. Retries
-    /// the initial connection for up to 60s so a Pod that boots
-    /// before Postgres is ready doesn't crash-loop.
-    pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+    /// A connected pool for `database_url`
+    /// (`postgres://user:pass@host:port/db`). Retries the initial
+    /// connection for up to 60s so a Pod that boots before Postgres is
+    /// ready doesn't crash-loop. Applies NO schema: the boot applies
+    /// every group in one pass ([`crate::app::apply_core_schema`]), so
+    /// every pending migration across every group runs in one global id
+    /// order rather than this crate's group jumping the queue.
+    pub async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let pool = loop {
             match PgPoolOptions::new()
@@ -93,20 +127,16 @@ impl PostgresJournal {
                 Err(e) => return Err(e.into()),
             }
         };
-        Self::from_pool(pool).await
+        Ok(pool)
     }
 
-    /// Wrap an EXISTING pool, creating the journal schema (idempotent).
-    /// The layer-3 db rig uses this with the per-test pool `#[sqlx::test]`
-    /// provisions; `connect` delegates here so production and the rig run
-    /// the same migration path.
-    pub async fn from_pool(pool: PgPool) -> anyhow::Result<Self> {
-        // Racing replicas serialize inside the guard itself: apply_groups
-        // runs under its own advisory lock, so no outer lock is layered
-        // here (an outer lock on the same pool would pin one connection
-        // while the guard opens a second, hanging a size-one pool).
-        weft_task_store::apply_groups(&pool, &[&GROUP]).await?;
-        Ok(Self { pool })
+    /// Wrap an EXISTING pool. Pure: the schema (this crate's [`GROUP`]
+    /// included) is applied once, before construction, by
+    /// [`crate::app::apply_core_schema`]; a second application here
+    /// would run this group's pending migrations ahead of every other
+    /// group's, breaking the one-global-id-order guarantee.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Expose the inner pool for sibling modules (lease manager,
@@ -116,8 +146,9 @@ impl PostgresJournal {
     }
 
     /// The color's first `ExecutionStarted` event, decoded. The ONE
-    /// fetch behind `execution_project` and
-    /// `execution_definition_hash`. A row whose JSON no longer
+    /// fetch behind `execution_definition_hash` (`execution_project`
+    /// and `execution_tenant` read the `execution_color` mirror
+    /// instead, so they survive a corrupt payload). A row whose JSON no longer
     /// decodes is a PERMANENT poison: returning `Err` would make
     /// pollers (the journal bridge's per-row processing) retry the
     /// same row forever, stalling the cursor fleet-wide. Log loud
@@ -241,8 +272,9 @@ impl PostgresJournal {
     }
 }
 
-/// The journal's schema, applied at journal connect (before every other
-/// group: the `worker_pod` group's fencing trigger attaches to `exec_event`).
+/// The journal's schema. First in `app::ALL_GROUPS` (the `worker_pod`
+/// group's fencing trigger attaches to `exec_event`); applied by the
+/// boot's one `apply_core_schema` pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "exec_event",
     tables: &["exec_event", "signal_token", "signal", "execution_color"],
@@ -439,6 +471,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_tenant ON execution_color(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_project ON execution_color(project_id)"#,
     ],
+    seed: &[],
 };
 
 #[async_trait]
@@ -459,27 +492,20 @@ impl Journal for PostgresJournal {
         self.record_with_seed(event, Some(dedup_key)).await
     }
 
-    async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
-        )
-        .bind(color.to_string())
-        .fetch_all(&self.pool)
-        .await?;
+    async fn events_log_lossy(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)> {
+        let rows = payload_rows(&self.pool, color).await?;
         let mut out = Vec::with_capacity(rows.len());
-        for (payload,) in rows {
-            match serde_json::from_str::<ExecEvent>(&payload) {
+        let mut bad = Vec::new();
+        for payload in rows {
+            match decode_event(color, &payload) {
                 Ok(ev) => out.push(ev),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_dispatcher::journal",
-                        color = %color, error = %e,
-                        "skip malformed event payload",
-                    );
-                }
+                Err(reason) => bad.push(reason),
             }
         }
-        Ok(out)
+        Ok((out, bad))
     }
 
     async fn start_execution(
@@ -542,27 +568,9 @@ impl Journal for PostgresJournal {
         // "cancel journaled" can never disagree. Per-node cancels land BEFORE
         // ExecutionCancelled (same ordering rule as the dispatcher's cancel
         // catch-up writer: a terminal-first partial write would make a retry
-        // skip the per-node rows forever). Malformed payloads are skipped with
-        // a warning, matching `events_log`.
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
-        )
-        .bind(color.to_string())
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut events = Vec::with_capacity(rows.len());
-        for (payload,) in rows {
-            match serde_json::from_str::<ExecEvent>(&payload) {
-                Ok(ev) => events.push(ev),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_dispatcher::journal",
-                        color = %color, error = %e,
-                        "skip malformed event payload",
-                    );
-                }
-            }
-        }
+        // skip the per-node rows forever). A payload that fails to decode
+        // fails the whole read, matching `events_log`.
+        let events = decode_all(color, payload_rows(&mut *tx, color).await?)?;
         let has_terminal = events.iter().any(|e| {
             matches!(
                 e,
@@ -659,31 +667,20 @@ impl Journal for PostgresJournal {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn execution_project(&self, color: Color) -> anyhow::Result<ColorLookup<String>> {
-        Ok(match self.execution_started(color).await? {
-            ColorLookup::Found(ExecEvent::ExecutionStarted { project_id, .. }) => {
-                ColorLookup::Found(project_id)
-            }
-            ColorLookup::Found(_) => ColorLookup::NotFound,
-            ColorLookup::NotFound => ColorLookup::NotFound,
-            ColorLookup::Corrupt => ColorLookup::Corrupt,
-        })
-    }
-
-    async fn execution_tenant(&self, color: Color) -> anyhow::Result<ColorLookup<String>> {
-        // Direct read of the `execution_color` row's tenant (stamped from
-        // `project.tenant_id` at start; `local` by default). Survives project
-        // deletion, so a terminate sweep resolves the right storage-key tenant
-        // either way.
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT tenant_id FROM execution_color WHERE color = $1")
+    async fn execution_owner(&self, color: Color) -> anyhow::Result<Option<ExecutionOwner>> {
+        // One read of the `execution_color` row, whose project and
+        // tenant were stamped together in the SAME transaction as
+        // `ExecutionStarted` (see `write_birth_in`). Never re-derived:
+        // not from the started payload (undecodable exactly when
+        // `weft clean` is the way out), and not from the project store
+        // (deletable, and an execution deliberately outlives its
+        // project).
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT project_id, tenant_id FROM execution_color WHERE color = $1")
                 .bind(color.to_string())
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(match row {
-            Some((tenant,)) => ColorLookup::Found(tenant),
-            None => ColorLookup::NotFound,
-        })
+        Ok(row.map(|(project_id, tenant)| ExecutionOwner { project_id, tenant }))
     }
 
     async fn execution_definition_hash(
@@ -779,8 +776,9 @@ impl Journal for PostgresJournal {
         .fetch_one(&self.pool)
         .await?;
 
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
-            "SELECT s.payload_json, t.payload_json \
+        let rows: Vec<(String, String, i64, String, Option<String>)> = sqlx::query_as(&format!(
+            "SELECT ec.color, ec.project_id, ec.started_at_unix, \
+                    s.payload_json, t.payload_json \
              FROM execution_color ec \
              JOIN LATERAL ( \
                  SELECT payload_json FROM exec_event \
@@ -806,9 +804,32 @@ impl Journal for PostgresJournal {
         .await?;
 
         let mut executions = Vec::with_capacity(rows.len());
-        for (started_payload, terminal_payload) in rows {
-            if let Some(summary) = summary_from_payloads(&started_payload, terminal_payload)? {
-                executions.push(summary);
+        for (color_text, project_id, started_at, started_payload, terminal_payload) in rows {
+            let color: Color = color_text.parse().map_err(|e| {
+                anyhow::anyhow!("execution_color row holds a non-uuid color '{color_text}': {e}")
+            })?;
+            // One corrupt row must not take the whole list down (the
+            // list is also the door to `weft clean`, the recovery for
+            // exactly this state), and it must not vanish either: the
+            // count includes it, so the page renders it as a broken
+            // row (inspectable via replay, deletable).
+            match summary_from_payloads(color, &started_payload, terminal_payload) {
+                Ok(summary) => executions.push(summary),
+                Err(e) => {
+                    tracing::error!(
+                        target: "weft_dispatcher::journal",
+                        %color, error = %e,
+                        "execution row does not decode; listed as corrupt"
+                    );
+                    executions.push(ExecutionSummary {
+                        color,
+                        project_id,
+                        entry_node: String::new(),
+                        status: "corrupt".to_string(),
+                        started_at: started_at as u64,
+                        completed_at: None,
+                    });
+                }
             }
         }
         Ok(ExecutionPage { executions, total: total.0.max(0) as u64 })
@@ -840,7 +861,7 @@ impl Journal for PostgresJournal {
         match row {
             None => Ok(None),
             Some((started_payload, terminal_payload)) => {
-                summary_from_payloads(&started_payload, terminal_payload)
+                summary_from_payloads(color, &started_payload, terminal_payload).map(Some)
             }
         }
     }

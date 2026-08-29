@@ -214,8 +214,7 @@ mod tests {
     /// spec, not in the kind's config blob).
     #[test]
     fn a_connectionless_subscription_is_refused() {
-        let mut kind = ProviderEvents::default();
-        kind.topic = "events".into();
+        let kind = ProviderEvents { topic: "events".into(), ..ProviderEvents::default() };
         let spec = to_spec(kind);
         assert!(spec.access.is_none());
         let err = validate_spec(&spec).unwrap_err();

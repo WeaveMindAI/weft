@@ -3,14 +3,20 @@
 //!
 //! Pipeline:
 //! 1. `project::load` reads the project manifest and the graph source.
-//! 2. `parser::parse_weft` turns the weft source into a graph AST.
-//! 3. `enrich::enrich` resolves TypeVars, dynamic ports, and form-
-//!    derived ports (ported from v1 in phase A2).
+//! 2. `weft_compiler::compile` lexes and parses the source into the
+//!    lossless CST, resolves `@file` / `@asset` / `@include`, then
+//!    flattens it: a group becomes two `Passthrough` boundary nodes and a
+//!    loop a `LoopIn` / `LoopOut` pair, so what comes out is one flat
+//!    `ProjectDefinition` of nodes and edges. (`compile_lenient` is the
+//!    same pipeline for the editor, collecting errors instead of
+//!    aborting.)
+//! 3. `enrich::enrich` resolves TypeVars, dynamic ports, and
+//!    config-derived ports.
 //! 4. `validate::validate` checks callback isolation, entry-point
 //!    detection, required-port coverage.
 //! 5. `codegen::emit` produces rust source files that link the graph +
 //!    every referenced node (all from the project's `nodes/`).
-//! 6. `build::invoke_cargo` runs cargo to produce the binary.
+//! 6. `build::build_project` runs cargo to produce the binary.
 
 pub mod project;
 pub mod source_name;
@@ -123,6 +129,13 @@ fn parse_only_inner(
         // (their ports come from the included file's Group header). Don't
         // flag them as unknown types.
         if node.include_path.is_some() {
+            continue;
+        }
+        // Compiler-synthesized boundary nodes (group/loop lowering) have no
+        // catalog entry by design; flagging them painted phantom line-0
+        // "unknown node type 'Passthrough'" warnings on every project with
+        // a group.
+        if enrich::is_lowering_builtin(&node.node_type) {
             continue;
         }
         if catalog.lookup(&node.node_type).is_none() {

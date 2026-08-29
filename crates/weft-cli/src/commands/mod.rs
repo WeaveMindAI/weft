@@ -19,7 +19,6 @@ pub mod rm;
 pub mod logs;
 pub mod daemon;
 pub mod infra;
-pub mod add;
 pub mod catalog;
 pub mod describe_nodes;
 pub mod parse;

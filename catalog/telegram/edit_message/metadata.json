@@ -32,6 +32,7 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "label": "New text"
     }

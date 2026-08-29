@@ -166,8 +166,12 @@ output.data = preprocessor.result
 
     let pt_in = result.nodes.iter().find(|n| n.id == "preprocessor__in").expect("input passthrough");
     assert_eq!(pt_in.node_type, "Passthrough");
-    assert_eq!(pt_in.inputs.len(), 1);
-    assert_eq!(pt_in.inputs[0].name, "raw");
+    // The group's own port, plus `_should_flow`: a group is guarded on
+    // its In boundary, so guarding it takes everything inside with it.
+    assert_eq!(
+        pt_in.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["raw", "_should_flow"]
+    );
 
     let pt_out = result.nodes.iter().find(|n| n.id == "preprocessor__out").expect("output passthrough");
     assert_eq!(pt_out.node_type, "Passthrough");
@@ -738,10 +742,10 @@ fn test_multiline_json_array_in_config() {
 review = HumanQuery {
   _label: "Test"
   fields: [{
-    "fieldType":"display",
+    "kind":"display",
     "key":"name"
   }, {
-    "fieldType":"text_input",
+    "kind":"text_input",
     "key":"notes"
   }]
 }
@@ -894,6 +898,105 @@ fn non_file_marker_value_is_loud() {
 }
 
 #[test]
+fn non_file_marker_inside_a_list_is_loud() {
+    // Marker-quoting inside a JSON value covers `@file`/`@asset` ONLY: a
+    // typo'd `@aset(...)` or a bare `@` inside a list must fail the JSON
+    // read loudly, never parse as the literal string of the marker text.
+    let bare = |v: &str| {
+        let src = format!("u = Text {{\n  value: {v}\n}}\n");
+        compile_lenient(&src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None).1
+    };
+    for v in ["[@aset(\"a.png\", Image)]", "[@]", "[@asset]", "[@file, @file(\"a.txt\")]"] {
+        let errs = bare(v);
+        assert!(!errs.is_empty(), "`{v}` must be loud, not a silent string");
+    }
+}
+
+#[test]
+fn a_scalar_loop_port_list_is_loud() {
+    // `carry: "acc"` is a shape mistake, never a silent empty list.
+    let src = "l = Loop(items: List[Number]) -> (acc: Number) {\n  over: [\"items\"]\n  carry: \"acc\"\n  self.acc = self.items\n}\n";
+    let (_, errs) =
+        compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    assert!(
+        errs.iter().any(|e| e.message.contains("must be a LIST")),
+        "a scalar carry names the shape mistake: {errs:?}"
+    );
+}
+
+#[test]
+fn nested_prose_starting_with_a_directive_word_is_plain_text() {
+    // "@file the report please" inside a list is user prose, not an
+    // attempted marker: only the parenthesized form states intent. A
+    // parenthesized-but-malformed nested marker stays loud.
+    let compile = |v: &str| {
+        let src = format!("u = Text {{\n  value: {v}\n}}\n");
+        compile_lenient(&src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None)
+    };
+    for v in [
+        "[\"@file the report please\"]",
+        "{\"msg\": \"@file\"}",
+        // A parenthetical inside the prose must not read as an
+        // argument list (a spaced paren never belongs to the marker).
+        "[\"@file the report (see appendix) please\"]",
+    ] {
+        let (_, errs) = compile(v);
+        assert!(errs.is_empty(), "`{v}` is prose, not a marker: {errs:?}");
+    }
+    let (_, errs) = compile("[\"@file(unquoted)\"]");
+    assert!(!errs.is_empty(), "a parenthesized malformed marker stays loud");
+    // An unclosed marker split across a multi-line list is a broken
+    // marker (it opened its paren), never prose that ships the literal
+    // text to the node at run time.
+    let src = "u = Text {\n  value: [\n    @asset(\"a.png\"\n  ]\n}\n";
+    let (_, errs) =
+        compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+    assert!(!errs.is_empty(), "an unclosed nested marker stays loud: {errs:?}");
+}
+
+#[test]
+fn a_malformed_include_is_loud() {
+    // A dropped include compiles to a project missing its nodes; that
+    // must never happen silently.
+    for src in ["lib = @include(\"a.weft\"\n", "lib = @include (\"a.weft\")\n"] {
+        let (_, errs) = compile_lenient(
+            src,
+            uuid::Uuid::new_v4(),
+            CompileFs::none(),
+            IncludeMode::Interface,
+            None,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("@include")),
+            "`{src}` names the include problem: {errs:?}"
+        );
+    }
+}
+
+#[test]
+fn non_ascii_inside_a_compound_value_survives_intact() {
+    // The marker-quoting scan walks a compound value character by
+    // character; a byte-wise walk would mojibake every non-ASCII string
+    // ("café" -> "cafÃ©") silently, baked into the shipped definition.
+    let src = "u = Text {\n  value: [\"café\", \"naïve ☕\", \"日本語\"]\n}\n";
+    let (project, errs) = compile_lenient(
+        src,
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        IncludeMode::Interface,
+        None,
+    );
+    assert!(errs.is_empty(), "clean parse expected: {errs:?}");
+    let node = project.nodes.iter().find(|n| n.id == "u").expect("node u");
+    let value = node.config.get("value").expect("value literal");
+    assert_eq!(
+        value,
+        &serde_json::json!(["café", "naïve ☕", "日本語"]),
+        "compound values must keep every character exactly as written"
+    );
+}
+
+#[test]
 fn malformed_json_value_is_loud() {
     // A `[`/`{`-leading value that isn't valid JSON used to be silently coerced
     // to a string (hiding `[a, b]`-style wiring typos). Now it fails loud, while
@@ -960,7 +1063,7 @@ g = Group(items: List[String]) -> (out: String) {
 "#;
     let (_, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(
-        errs.iter().any(|e| e.message.contains("groups do not take config fields")),
+        errs.iter().any(|e| e.message.contains("groups take no config fields")),
         "stray group config field must error loudly: {errs:?}"
     );
 }
@@ -2116,14 +2219,12 @@ fn literal_to_non_node_port_is_loud() {
     };
     // Literal to a group's own boundary output.
     assert_loud("g = Group() -> (out: String) {\n  self.out = \"lit\"\n}\n", CompileFs::none(), "self-boundary");
-    // Literal to an @include alias's input port (a group has no visual config).
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("comp.weft"),
         "Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\n").unwrap();
-    assert_loud("c = @include(\"comp.weft\")\nc.raw = \"hi\"\n", CompileFs::disk(dir.path()), "include-alias-port");
 
-    // BUT an inline node driving the include port is still valid (it's wiring,
-    // not a literal): a real node is synthesized and wired, no error.
+    // An inline node driving the include port is wiring, not a literal: a
+    // real node is synthesized and wired, no error.
     let (_p, errs) = compile_lenient(
         "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n",
         uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None,
@@ -2646,4 +2747,146 @@ fn include_with_internal_loop_lowers() {
     // Inner Loop boundary nodes scoped one level deeper.
     assert!(ids.contains(&("c.doit__in".into(), "LoopIn".into())), "loop in: {ids:?}");
     assert!(ids.contains(&("c.doit__out".into(), "LoopOut".into())), "loop out: {ids:?}");
+}
+
+/// `_should_flow` written inside a group's braces belongs to the group's IN
+/// boundary, in both forms: a literal lands on the boundary node's port
+/// literals, a wire becomes an ordinary edge into it.
+#[test]
+fn should_flow_in_a_group_body_lands_on_the_in_boundary() {
+    let source = r#"
+outer = Group(x: String) -> (y: String) {
+    _should_flow: false
+
+    step = Template { template: "{{x}}" }
+    step.value = self.x
+    self.y = step.output
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
+    let pt_in = result.nodes.iter().find(|n| n.id == "outer__in").expect("in boundary");
+    assert_eq!(
+        pt_in.port_literals.get("_should_flow"),
+        Some(&serde_json::Value::Bool(false)),
+        "the literal guards the whole subgraph from the boundary"
+    );
+}
+
+#[test]
+fn a_wired_should_flow_in_a_group_body_becomes_an_edge_into_the_in_boundary() {
+    let source = r#"
+check = Debug {}
+
+outer = Group(x: String) -> (y: String) {
+    _should_flow: check.data
+
+    step = Template { template: "{{x}}" }
+    step.value = self.x
+    self.y = step.output
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
+    let edge = result
+        .edges
+        .iter()
+        .find(|e| e.target_handle.as_deref() == Some("_should_flow"))
+        .expect("a wired guard is an ordinary edge");
+    assert_eq!(edge.target, "outer__in");
+    assert_eq!(edge.source, "check");
+}
+
+/// A Loop's braces already mix config and logic; `_should_flow` rides the
+/// same path and does not end up in the loop's config block.
+#[test]
+fn should_flow_in_a_loop_body_lands_on_the_in_boundary() {
+    let source = r#"
+each = Loop(items: List[String]) -> (out: List[String]) {
+    over: ["items"]
+    _should_flow: false
+
+    step = Template { template: "{{i}}" }
+    step.value = self.items
+    self.out = step.output
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
+    let pt_in = result.nodes.iter().find(|n| n.id == "each__in").expect("in boundary");
+    assert_eq!(pt_in.port_literals.get("_should_flow"), Some(&serde_json::Value::Bool(false)));
+    assert!(
+        pt_in.config.get("_should_flow").is_none(),
+        "the guard is a port, never a loop knob"
+    );
+}
+
+/// Every written form of `_should_flow`, in one place: braces or a
+/// statement, literal or wire, on a node or on a container.
+#[test]
+fn every_written_form_of_should_flow() {
+    let cases: [(&str, &str); 4] = [
+        ("node braces", "t = Text {\n  value: \"x\"\n  _should_flow: false\n}\nout = Debug {}\nout.data = t.value\n"),
+        ("node statement", "t = Text { value: \"x\" }\nt._should_flow = false\nout = Debug {}\nout.data = t.value\n"),
+        ("node statement wired", "c = Debug {}\nt = Text { value: \"x\" }\nt._should_flow = c.data\nout = Debug {}\nout.data = t.value\n"),
+        ("container from outside, wired", "c = Debug {}\ng = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\ng._should_flow = c.data\nout = Debug {}\nout.data = g.y\n"),
+    ];
+    for (name, src) in cases {
+        compile(src, uuid::Uuid::new_v4(), CompileFs::none())
+            .unwrap_or_else(|e| panic!("{name} must compile: {e:?}"));
+    }
+
+    // From outside, a literal on a container's port lands on its In
+    // boundary, the node those ports belong to.
+    let outside = "g = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\ng.x = \"hi\"\ng._should_flow = false\nout = Debug {}\nout.data = g.y\n";
+    let p = compile(outside, uuid::Uuid::new_v4(), CompileFs::none()).expect("outside literals compile");
+    let pt_in = p.nodes.iter().find(|n| n.id == "g__in").expect("in boundary");
+    assert_eq!(pt_in.port_literals.get("x"), Some(&serde_json::json!("hi")));
+    assert_eq!(pt_in.port_literals.get("_should_flow"), Some(&serde_json::json!(false)));
+
+    // A key naming no port on the container is loud.
+    let unknown = "g = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\ng.nope = \"hi\"\nout = Debug {}\nout.data = g.y\n";
+    let err = compile(unknown, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("unknown container port");
+    assert!(format!("{err:?}").contains("has no input port 'nope'"), "got {err:?}");
+}
+
+/// A nested container takes the same literals from its parent's body.
+#[test]
+fn a_literal_on_a_nested_container_port_lands_on_its_boundary() {
+    let source = r#"
+outer = Group(x: String) -> (y: String) {
+    inner = Group(v: String) -> (w: String) {
+        self.w = self.v
+    }
+    inner.v = "fixed"
+    inner._should_flow = false
+    self.y = inner.w
+}
+"#;
+    let p = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
+    let pt_in = p.nodes.iter().find(|n| n.id == "outer.inner__in").expect("in boundary");
+    assert_eq!(pt_in.port_literals.get("v"), Some(&serde_json::json!("fixed")));
+    assert_eq!(pt_in.port_literals.get("_should_flow"), Some(&serde_json::json!(false)));
+}
+
+/// An `@include` alias carries the included group's ports, so a value
+/// written on one lands on that group, the same as on a group written in
+/// this file. The alias has no ports of its own until the include
+/// resolves, so the value waits for it.
+#[test]
+fn a_literal_on_an_include_alias_port_lands_on_the_included_group() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("comp.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n  s = Text { value: \"x\" }\n  self.cleaned = s.value\n}\n").unwrap();
+    let src = "c = @include(\"comp.weft\")\nc.raw = \"hi\"\nout = Debug {}\nout.data = c.cleaned\n";
+
+    // Build path: the include is inlined, so the alias IS a group.
+    let p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("inlined include");
+    let pt_in = p.nodes.iter().find(|n| n.id == "c__in").expect("in boundary");
+    assert_eq!(pt_in.port_literals.get("raw"), Some(&serde_json::json!("hi")));
+
+    // Editor path: the include is one opaque node carrying the same ports,
+    // so the value is that node's own written value (enrich moves it onto
+    // the port afterwards, like any node's).
+    let (p2, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Interface, None);
+    assert!(errs.is_empty(), "{errs:?}");
+    let node = p2.nodes.iter().find(|n| n.id == "c").expect("opaque include node");
+    assert_eq!(node.config.get("raw"), Some(&serde_json::json!("hi")));
 }

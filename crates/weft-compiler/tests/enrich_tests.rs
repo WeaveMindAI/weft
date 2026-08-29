@@ -28,8 +28,11 @@ out.data = greeting.value
 
     let debug = project.nodes.iter().find(|n| n.id == "out").unwrap();
     assert_eq!(debug.node_type, "Debug");
-    assert_eq!(debug.inputs.len(), 1);
-    assert_eq!(debug.inputs[0].name, "data");
+    // Its own `data`, plus `_should_flow`, which every node carries.
+    assert_eq!(
+        debug.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["data", "_should_flow"]
+    );
 }
 
 #[test]
@@ -353,8 +356,8 @@ l1 = Loop(items: List[String]) -> (results: List[String | Null]) {
 
 #[test]
 fn human_trigger_derives_ports_from_minimal_fields() {
-    // The editor emits fields as `{ fieldType, key }` ONLY: render + config
-    // are inherited from the node's form_field_specs at enrich time, never
+    // The editor emits fields as `{ kind, key }` ONLY: render + config
+    // are inherited from the node's port specs at enrich time, never
     // duplicated into the source. This proves the minimal shape derives the
     // full set of ports (approve_reject -> {key}_approved/{key}_rejected
     // Booleans; text_input -> {key} String), so a lean source is not a lossy
@@ -363,8 +366,8 @@ fn human_trigger_derives_ports_from_minimal_fields() {
 
 human = HumanTrigger() {
   fields: [
-    { "fieldType": "text_input", "key": "answer" },
-    { "fieldType": "approve_reject", "key": "review" }
+    { "kind": "text_input", "key": "answer" },
+    { "kind": "approve_reject", "key": "review" }
   ]
 }
 out = Debug
@@ -398,7 +401,7 @@ fn human_trigger_accepts_a_matching_declared_port_header() {
     let source = r#"
 
 human = HumanTrigger() -> (test_approved: Boolean?, test_rejected: Boolean?) {
-  fields: [ { "fieldType": "approve_reject", "key": "test" } ]
+  fields: [ { "kind": "approve_reject", "key": "test" } ]
 }
 out = Debug
 
@@ -427,7 +430,7 @@ fn human_trigger_rejects_a_mismatched_declared_port() {
     let wrong_type = r#"
 
 human = HumanTrigger() -> (test_approved: String) {
-  fields: [ { "fieldType": "approve_reject", "key": "test" } ]
+  fields: [ { "kind": "approve_reject", "key": "test" } ]
 }
 out = Debug
 out.data = human.test_rejected
@@ -439,7 +442,7 @@ out.data = human.test_rejected
     let unknown_port = r#"
 
 human = HumanTrigger() -> (not_a_field: Boolean) {
-  fields: [ { "fieldType": "approve_reject", "key": "test" } ]
+  fields: [ { "kind": "approve_reject", "key": "test" } ]
 }
 out = Debug
 out.data = human.test_approved
@@ -481,4 +484,213 @@ out.data = q.rows
     );
     let q = project.nodes.iter().find(|n| n.id == "q").unwrap();
     assert!(q.published_service.is_none(), "a node that publishes nothing carries nothing");
+}
+
+/// A config key that names no declared port CREATES one, on a node type
+/// that accepts custom inputs. The ports come out in the order the keys
+/// were written, which is what a node that reads its inputs by order
+/// (`FirstInOrder`) depends on: config lands in a sorted map, so
+/// alphabetical order would silently reorder the branches.
+#[test]
+fn created_ports_follow_source_order() {
+    let source = r#"
+zulu = Text { value: "z" }
+alpha = Text { value: "a" }
+
+pick = FirstInOrder {
+  zebra: zulu.value
+  apple: alpha.value
+}
+out = Debug
+out.data = pick.value
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let pick = project.nodes.iter().find(|n| n.id == "pick").unwrap();
+    let created: Vec<&str> = pick
+        .inputs
+        .iter()
+        .filter(|p| p.name != "_should_flow")
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(created, vec!["zebra", "apple"], "written order, not alphabetical");
+    assert!(
+        pick.inputs.iter().all(|p| p.name == "_should_flow" || !p.required),
+        "FirstInOrder's created inputs are optional by nature: a cut branch must not skip it"
+    );
+}
+
+/// A created port takes the type of what feeds it: the wire's source
+/// port for a wire, the literal's own type for a literal. `FirstInOrder`
+/// is the exception that proves the rule for a JOIN: its metadata names
+/// ONE type variable for every created input, so two branches of
+/// different types fail to unify instead of meeting at an unresolved
+/// port.
+#[test]
+fn a_created_port_takes_the_type_of_what_feeds_it() {
+    let source = r#"
+words = Text { value: "hi" }
+
+step = ExecPython -> (out: String) {
+  code: "return {'out': text}"
+  text: words.value
+  limit: 3
+  flag: true
+}
+out = Debug
+out.data = step.out
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let step = project.nodes.iter().find(|n| n.id == "step").unwrap();
+    let port_type = |name: &str| {
+        step.inputs.iter().find(|p| p.name == name).map(|p| p.port_type.to_string()).unwrap()
+    };
+    assert_eq!(port_type("text"), "String", "a wired port takes its source's type");
+    assert_eq!(port_type("limit"), "Number", "a literal port takes the literal's type");
+    assert_eq!(port_type("flag"), "Boolean");
+}
+
+/// Two branches of different types meeting at a join is a type error,
+/// not an unresolved port: every created input on `FirstInOrder` shares
+/// the output's type variable.
+#[test]
+fn a_join_refuses_two_branches_of_different_types() {
+    let source = r#"
+words = Text { value: "hi" }
+counter = Range { to: 3 }
+
+pick = FirstInOrder {
+  first: words.value
+  second: counter.values
+}
+out = Debug
+out.data = pick.value
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich binds T to the first branch");
+    let diagnostics = weft_compiler::validate::validate(&project, &catalog());
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code.as_deref() == Some("type-mismatch")
+                && d.message.contains("pick.second")),
+        "the second branch cannot also be T, and the diagnostic names it: {diagnostics:?}"
+    );
+}
+
+/// `?` on a config key makes the port that key creates optional, and it
+/// is refused on a key that creates no port, where it would silently
+/// mean nothing.
+#[test]
+fn the_optional_marker_applies_to_created_ports_only() {
+    let source = r#"
+words = Text { value: "hi" }
+
+step = ExecPython -> (out: String) {
+  code: "return {'out': text}"
+  text?: words.value
+}
+out = Debug
+out.data = step.out
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let step = project.nodes.iter().find(|n| n.id == "step").unwrap();
+    let text = step.inputs.iter().find(|p| p.name == "text").unwrap();
+    assert!(!text.required, "`text?:` created an optional port");
+
+    let on_a_declared_key = r#"
+step = ExecPython -> (out: String) {
+  code?: "return {'out': 1}"
+}
+out = Debug
+out.data = step.out
+"#;
+    let mut project =
+        compile(on_a_declared_key, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    let err = enrich(&mut project, &catalog()).expect_err("`code` is a declared config input");
+    assert!(
+        format!("{err}").contains("not a port this node creates"),
+        "the marker is refused where it cannot apply: {err}"
+    );
+}
+
+/// `_should_flow: false` written straight into a node turns it off, in
+/// either form a literal can take. It has to reach `port_literals`,
+/// which is where the skip rule looks: left in `config` it would be a
+/// setting nothing reads.
+#[test]
+fn a_false_flow_literal_lands_where_the_skip_rule_reads_it() {
+    for source in [
+        r#"
+a = Text { value: "hi" }
+off = Debug {
+  data: a.value
+  _should_flow: false
+}
+"#,
+        r#"
+a = Text { value: "hi" }
+off = Debug
+off.data = a.value
+off._should_flow = false
+"#,
+    ] {
+        let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        enrich(&mut project, &catalog()).expect("enrich");
+        let off = project.nodes.iter().find(|n| n.id == "off").unwrap();
+        assert_eq!(
+            off.port_literals.get("_should_flow"),
+            Some(&serde_json::Value::Bool(false)),
+            "the literal drives the port, in either form"
+        );
+    }
+}
+
+/// Every node carries `_should_flow`, the port that decides whether it
+/// runs, and a group carries one on its In boundary so guarding a
+/// subgraph is the same one line.
+#[test]
+fn every_node_and_every_group_takes_the_flow_port() {
+    let source = r#"
+gate = Text { value: "true" }
+src = Text { value: "hi" }
+
+g = Group(x: String) -> (y: String) {
+  # guarded
+  echo = ExecPython(text: String) -> (out: String) {
+    code: "return {'out': text}"
+    text: self.x
+  }
+  self.y = echo.out
+}
+g.x = src.value
+g._should_flow = gate.value
+
+out = Debug { data: g.y }
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let has_flow = |id: &str| {
+        project
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap_or_else(|| panic!("node {id}"))
+            .inputs
+            .iter()
+            .any(|p| p.name == "_should_flow")
+    };
+    assert!(has_flow("out"), "a catalog node takes the flow port");
+    assert!(has_flow("g__in"), "a group takes it on its In boundary");
+    assert!(
+        !has_flow("g__out"),
+        "the Out boundary forwards what reached it; a group that did not run has nothing to forward"
+    );
+    assert!(
+        project.edges.iter().any(|e| e.target == "g__in"
+            && e.target_handle.as_deref() == Some("_should_flow")),
+        "the guard wire lands on the In boundary"
+    );
 }

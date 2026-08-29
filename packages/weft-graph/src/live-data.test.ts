@@ -38,14 +38,25 @@ describe('signalDisplayToLiveItems', () => {
     );
   });
 
-  it('renders auth mode (none vs api_key header)', () => {
-    const none = signalDisplayToLiveItems({ auth: { kind: 'none' } });
+  it('renders auth mode on a public entry (none vs api_key header)', () => {
+    const entry = { kind: 'public_entry', path: '/hook' };
+    const none = signalDisplayToLiveItems({ surface: entry, auth: { kind: 'none' } });
     expect(none).toContainEqual({ type: 'text', label: 'Auth', data: 'public (no key)' });
-    const keyed = signalDisplayToLiveItems({ auth: { kind: 'api_key', header_name: 'X-My-Key' } });
+    const keyed = signalDisplayToLiveItems({
+      surface: entry,
+      auth: { kind: 'api_key', header_name: 'X-My-Key' },
+    });
     expect(keyed).toContainEqual({ type: 'text', label: 'Auth header', data: 'X-My-Key' });
   });
 
-  it('emits nothing for an empty body', () => {
+  it('emits nothing without a public entry (internal/task-callback routing is not news)', () => {
     expect(signalDisplayToLiveItems({})).toEqual([]);
+    expect(signalDisplayToLiveItems({ auth: { kind: 'none' } })).toEqual([]);
+    expect(
+      signalDisplayToLiveItems({ surface: { kind: 'internal' }, auth: { kind: 'none' } }),
+    ).toEqual([]);
+    expect(
+      signalDisplayToLiveItems({ surface: { kind: 'task_callback' }, auth: { kind: 'api_key' } }),
+    ).toEqual([]);
   });
 });

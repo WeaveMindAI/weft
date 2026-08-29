@@ -2,8 +2,10 @@
     use weft_core::project::{Edge, NodeDefinition, Position, ProjectDefinition};
 
     fn mk_node(id: &str, is_trigger: bool, requires_infra: bool) -> NodeDefinition {
-        let mut features = weft_core::node::NodeFeatures::default();
-        features.is_trigger = is_trigger;
+        let features = weft_core::node::NodeFeatures {
+            is_trigger,
+            ..weft_core::node::NodeFeatures::default()
+        };
         NodeDefinition {
             id: id.to_string(),
             node_type: "Test".to_string(),
@@ -21,6 +23,7 @@
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),

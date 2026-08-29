@@ -1,6 +1,6 @@
 //! Post-compilation enrichment. Given a parsed ProjectDefinition and
 //! a NodeCatalog, populate each NodeDefinition's inputs/outputs/features
-//! from the catalog, materialize form-derived ports, merge
+//! from the catalog, materialize config-derived ports, merge
 //! weft-declared custom ports for nodes with
 //! canAddInputPorts/canAddOutputPorts, and validate that every
 //! referenced node type exists.
@@ -11,9 +11,8 @@
 //! `weft_compiler.rs`); enrich does not consult the catalog for them
 //! (it `continue`s past these node types).
 
-use serde_json::Value;
-
-use weft_core::node::{FormFieldPort, MetadataCatalog, Widget};
+use weft_core::exec::skip::SHOULD_FLOW_PORT;
+use weft_core::node::{derive_config_ports, materialize_auto_type_vars, MetadataCatalog, Widget, AUTO_TYPE_VAR};
 use weft_core::project::{InputDefinition, PortDefinition, ProjectDefinition, Span};
 use weft_core::weft_type::{Exposure, WeftType};
 
@@ -203,6 +202,14 @@ pub enum EnrichPolicy {
     Lenient,
 }
 
+/// Node-types written by the compiler's lowering passes (Passthrough by
+/// group-flatten, LoopIn/LoopOut by loop-lowering). They have no catalog
+/// entry by design: enrich fills their ports itself, and diagnostics must
+/// not flag them as unknown types.
+pub fn is_lowering_builtin(node_type: &str) -> bool {
+    matches!(node_type, "Passthrough" | "LoopIn" | "LoopOut")
+}
+
 pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) -> CompileResult<()> {
     enrich_with_policy(project, catalog, EnrichPolicy::Strict)
 }
@@ -242,6 +249,10 @@ pub fn enrich_collecting(
     // 2xN times.
     let mut reported_reserved: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Where each wire LANDS, per target node: the port it feeds and the
+    // source line it was written on. Read while the node loop holds
+    // `project.nodes` mutably, so it is collected up front.
+    let incoming_wires = incoming_wires_by_node(project);
 
     for node in project.nodes.iter_mut() {
         // Built-in boundary node-types. Their ports are written by the
@@ -251,7 +262,7 @@ pub fn enrich_collecting(
         // these built-in names is rejected loud as a corrupt catalog:
         // letting a catalog impl shadow the runtime built-in would
         // silently break group / loop boundaries.
-        if matches!(node.node_type.as_str(), "Passthrough" | "LoopIn" | "LoopOut") {
+        if is_lowering_builtin(&node.node_type) {
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
@@ -328,21 +339,54 @@ pub fn enrich_collecting(
             })
             .collect();
 
-        // A form-schema node's ports are DERIVED from its `fields` config. Fold
-        // them into the catalog port set BEFORE merging the source-declared
-        // ports, so they count as known ports: a header that re-declares a
-        // derived port (the graph editor never writes these, but a hand-authored
-        // `.weft` may) merges cleanly IF it matches by name + type, and a header
-        // port that does NOT match a derived (or catalog) port is the genuine
-        // "custom port on a node that forbids them" error. Declaring them is
-        // always OPTIONAL: omitting the header is the normal case.
+        // The ports of a node that derives them from its own config (a form's
+        // `fields`, a switch's `cases`). Fold them into the catalog port set
+        // BEFORE merging the source-declared ports, so they count as known
+        // ports: a header that re-declares a derived port (the graph editor
+        // never writes these, but a hand-authored `.weft` may) merges cleanly
+        // IF it matches by name + type, and a header port that does NOT match a
+        // derived (or catalog) port is the genuine "custom port on a node that
+        // forbids them" error. Declaring them is always OPTIONAL: omitting the
+        // header is the normal case.
         let mut catalog_inputs = catalog_inputs;
-        if meta.features.has_form_schema {
-            let (form_inputs, form_outputs) =
-                derive_form_ports(&node.config, &meta.form_field_specs);
-            catalog_inputs.extend(form_inputs);
-            catalog_outputs.extend(form_outputs);
+        if let Some(ports_from_config) = &meta.ports_from_config {
+            let (derived_inputs, derived_outputs) =
+                derive_config_ports(&node.config, ports_from_config);
+            catalog_inputs.extend(derived_inputs);
+            catalog_outputs.extend(derived_outputs);
         }
+
+        // `_should_flow` is on EVERY node: the port that says whether it
+        // runs at all. Unwired, its `true` default fills it and nothing
+        // changes; wired, a `false` or a closure skips the node. It sits
+        // with the catalog ports because the node type owns it, not the
+        // instance, and the node body never sees it (the input bag drops
+        // it: it is the language's decision, not the node's data).
+        catalog_inputs.push(InputDefinition {
+            name: SHOULD_FLOW_PORT.to_string(),
+            // Its OWN type variable, never the node's `T`: a join whose
+            // branches carry Strings must not also force its permission
+            // to be a String.
+            port_type: WeftType::type_var("T__should_flow"),
+            // Optional: unwired and unset, the node runs. The skip rule
+            // reads this port itself, so a closure on it does not need
+            // the required-input rule to bite.
+            required: false,
+            description: Some(
+                "Whether this node runs. A `false` value or a closed input skips it, \
+                 and everything downstream closes in turn."
+                    .to_string(),
+            ),
+            exposure: Exposure::All,
+            widget: None,
+            default: None,
+            label: None,
+            placeholder: None,
+            synthesized_from_carry: false,
+            from_spec: true,
+            requires_scopes: None,
+            requires_values: None,
+        });
 
         // An ACCESS NODE (metadata carries the `service` recipe):
         // stamp the service name onto its `access` widget, so the
@@ -374,6 +418,36 @@ pub fn enrich_collecting(
                         node.id, wp.name, node.node_type,
                     )});
                 }
+            }
+        }
+
+        // Ports this node's own config CREATES: a key that names no
+        // declared port, on a node type that accepts custom inputs. They
+        // join the source-declared ports, since that is exactly what they
+        // are: a port the author wrote, in the other form. On a node type
+        // that does NOT accept custom inputs nothing is created and
+        // validate reports the key (`undeclared-port-no-custom`), which
+        // knows how to say it with the key's own span.
+        let mut weft_inputs = weft_inputs;
+        if meta.features.can_add_input_ports {
+            weft_inputs.extend(created_input_ports(
+                node,
+                &catalog_inputs,
+                &weft_inputs,
+                &meta.features,
+                incoming_wires.get(node.id.as_str()).map(Vec::as_slice).unwrap_or(&[]),
+                &mut errors,
+            ));
+        }
+        // A `?` on a key that creates no port would silently mean nothing,
+        // so it is refused where it cannot apply.
+        for key in &node.optional_ports {
+            if !weft_inputs.iter().any(|p| p.name == *key) {
+                errors.push(EnrichError { span: node_span, message: format!(
+                    "node '{}': '{}?' marks a port optional, but '{}' is not a port this node \
+                     creates. Declare optionality on the port itself (`{}?: Type`) instead",
+                    node.id, key, key, key,
+                )});
             }
         }
 
@@ -677,100 +751,116 @@ fn replace_in_type(ty: &mut WeftType, var_name: &str, concrete: &WeftType) -> bo
     }
 }
 
-/// The (input, output) ports a form-schema node's `fields` config derives from
-/// its specs. Pure: reads each field's `fieldType` + `key`, matches the spec,
-/// and resolves its `adds_inputs` / `adds_outputs` templates. The enricher folds
-/// these into the node's known ports (see the call site).
-fn derive_form_ports(
-    config: &Value,
-    specs: &[weft_core::FormFieldSpec],
-) -> (Vec<InputDefinition>, Vec<PortDefinition>) {
-    let mut inputs = Vec::new();
-    let mut outputs = Vec::new();
-    let Some(fields) = config.get("fields").and_then(|f| f.as_array()) else {
-        return (inputs, outputs);
+/// One wire arriving at a node: which of its ports it feeds, and where
+/// the line that wrote it is. Enough to create the port the wire lands
+/// on when that port does not exist yet.
+struct IncomingWire {
+    target_port: String,
+    span: Span,
+}
+
+/// Every wire's landing point, keyed by target node id. Built once
+/// before the enrich loop, which holds the node list mutably.
+fn incoming_wires_by_node(
+    project: &ProjectDefinition,
+) -> std::collections::HashMap<String, Vec<IncomingWire>> {
+    let mut by_node: std::collections::HashMap<String, Vec<IncomingWire>> =
+        std::collections::HashMap::new();
+    for edge in &project.edges {
+        let Some(target_port) = &edge.target_handle else { continue };
+        by_node.entry(edge.target.clone()).or_default().push(IncomingWire {
+            target_port: target_port.clone(),
+            span: edge.span.unwrap_or_default(),
+        });
+    }
+    by_node
+}
+
+/// The input ports a node's own config CREATES: one per config key (or
+/// arriving wire) that names no declared port, on a node type that
+/// accepts custom inputs.
+///
+/// Ordered by SOURCE POSITION, because a node whose behaviour depends on
+/// the order of its inputs (`FirstInOrder`) reads them in the order they
+/// were written. Config lands in a sorted map, so map order is
+/// alphabetical and useless; the span of each field (or of the wire that
+/// feeds it) is the only record of what the author wrote first.
+///
+/// A wired port takes the `T_Auto` sentinel by default, which resolves
+/// against the edge like any other type variable, so the port ends up
+/// with the source port's type. A node type that wants every created
+/// input to share ONE type (a join) says so with `customInputType`.
+/// A port fed by a LITERAL has no edge to resolve against, so its type
+/// is inferred from the literal; a `null` literal infers nothing and is
+/// refused rather than guessed.
+fn created_input_ports(
+    node: &weft_core::project::NodeDefinition,
+    catalog_inputs: &[InputDefinition],
+    weft_inputs: &[InputDefinition],
+    features: &weft_core::NodeFeatures,
+    incoming: &[IncomingWire],
+    errors: &mut Vec<EnrichError>,
+) -> Vec<InputDefinition> {
+    let declared = |name: &str| {
+        catalog_inputs.iter().any(|p| p.name == name) || weft_inputs.iter().any(|p| p.name == name)
     };
 
-    for field in fields {
-        let Some(obj) = field.as_object() else { continue };
-        let field_type = obj
-            .get("fieldType")
-            .and_then(|v| v.as_str())
-            .or_else(|| obj.get("field_type").and_then(|v| v.as_str()))
-            .or_else(|| {
-                obj.get("field_type")
-                    .and_then(|v| v.get("kind"))
-                    .and_then(|v| v.as_str())
+    // (span, name, type) per created port, gathered from the two forms a
+    // config key can take, then ordered by where it was written.
+    let mut created: Vec<(Span, String, WeftType)> = Vec::new();
+    for wire in incoming {
+        if declared(&wire.target_port) {
+            continue;
+        }
+        let port_type = features
+            .custom_input_type
+            .clone()
+            .unwrap_or_else(|| WeftType::type_var(AUTO_TYPE_VAR));
+        created.push((wire.span, wire.target_port.clone(), port_type));
+    }
+    if let Some(config) = node.config.as_object() {
+        for (key, value) in config {
+            if weft_core::project::is_internal_config_key(key) || declared(key) {
+                continue;
+            }
+            let span = node.config_spans.get(key).map(|s| s.span).unwrap_or_default();
+            if value.is_null() {
+                errors.push(EnrichError { span, message: format!(
+                    "node '{}': config key '{}' creates a port, and `null` says nothing about \
+                     its type. Declare it (`{}: Type` in the signature) or give it a value",
+                    node.id, key, key,
+                )});
+                continue;
+            }
+            created.push((span, key.clone(), WeftType::infer(value)));
+        }
+    }
+    created.sort_by_key(|(span, _, _)| (span.start_line, span.start_column));
+    // One port per NAME, first written wins. Two lines can name the same
+    // port (a wire and a literal, or two wires): that is a real mistake,
+    // and validate names it (`duplicate-input-port` /
+    // `port-double-driven`). Creating the port twice on top of it would
+    // bury that message under a second one about the port list.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    created.retain(|(_, name, _)| seen.insert(name.clone()));
+
+    created
+        .into_iter()
+        .map(|(_, name, port_type)| {
+            let port_type = materialize_auto_type_vars(&port_type, &name);
+            // Required unless the node type says its created inputs are
+            // optional by nature, or this key carries the `?` marker.
+            let required =
+                !features.optional_custom_inputs && !node.optional_ports.contains(&name);
+            InputDefinition::from_wire_port(PortDefinition {
+                name,
+                port_type,
+                required,
+                description: None,
+                synthesized_from_carry: false,
             })
-            .unwrap_or_default();
-        let key = obj.get("key").and_then(|v| v.as_str()).unwrap_or_default();
-        if key.is_empty() || field_type.is_empty() {
-            continue;
-        }
-
-        let Some(spec) = specs.iter().find(|s| s.field_type == field_type) else {
-            continue;
-        };
-
-        for port in &spec.adds_inputs {
-            inputs.push(InputDefinition::from_wire_port(materialize_port(port, key, false)));
-        }
-        for port in &spec.adds_outputs {
-            outputs.push(materialize_port(port, key, true));
-        }
-    }
-    (inputs, outputs)
-}
-
-/// Replace every `T_Auto` placeholder with a TypeVar scoped to the
-/// field key, recursing through every container arm: `List[T_Auto]`
-/// reads as "a list of anything, scoped to this field", so a nested
-/// placeholder scopes exactly like a top-level one.
-/// SYNC: materialize_auto_type_vars <-> packages/weft-graph/src/webview/lib/utils/form-field-specs.ts materializeAutoTypeVars
-fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
-    match t {
-        WeftType::TypeVar(n) if n == "T_Auto" => WeftType::type_var(&format!("T__{key}")),
-        WeftType::List(inner) => WeftType::List(Box::new(materialize_auto_type_vars(inner, key))),
-        WeftType::Generator(inner) => {
-            WeftType::Generator(Box::new(materialize_auto_type_vars(inner, key)))
-        }
-        WeftType::Dict(k, v) => WeftType::Dict(
-            Box::new(materialize_auto_type_vars(k, key)),
-            Box::new(materialize_auto_type_vars(v, key)),
-        ),
-        WeftType::Union(members) => {
-            WeftType::Union(members.iter().map(|m| materialize_auto_type_vars(m, key)).collect())
-        }
-        WeftType::Record(fields) => WeftType::Record(
-            fields
-                .iter()
-                .map(|f| weft_core::weft_type::RecordField {
-                    name: f.name.clone(),
-                    ty: materialize_auto_type_vars(&f.ty, key),
-                    optional: f.optional,
-                })
-                .collect(),
-        ),
-        // No `Named` arm: a declared body is concrete by construction
-        // (the registry and the wire parser both refuse a type
-        // variable inside one), so there is never a `T_Auto` to
-        // materialize beneath an alias, and rebuilding the body here
-        // would be the door to two same-named types with different
-        // bodies.
-        other => other.clone(),
-    }
-}
-
-fn materialize_port(template: &FormFieldPort, key: &str, is_output: bool) -> PortDefinition {
-    let name = template.resolve_name(key);
-    let port_type = materialize_auto_type_vars(&template.port_type, key);
-    PortDefinition {
-        name,
-        port_type,
-        required: !is_output,
-        description: None,
-        synthesized_from_carry: false,
-    }
+        })
+        .collect()
 }
 
 #[cfg(test)]

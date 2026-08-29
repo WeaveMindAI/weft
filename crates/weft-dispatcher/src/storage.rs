@@ -398,6 +398,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             enqueued_at_unix BIGINT NOT NULL
         );
         "#],
+    seed: &[],
 };
 
 /// Enqueue a terminate sweep for `color`. Called by the journal bridge when it

@@ -33,6 +33,7 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "description": "The message text."
     },

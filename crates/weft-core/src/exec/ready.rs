@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
-use crate::exec::skip::check_should_skip;
+use crate::exec::skip::{check_should_skip, SkipReason};
 use crate::frames::LoopFrames;
 use crate::project::{EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
@@ -32,7 +32,9 @@ pub struct ReadyGroup {
     /// inspector can render closed ports distinctly from user-emitted
     /// nulls.
     pub closed_ports: Vec<String>,
-    pub should_skip: bool,
+    /// Set when this firing must NOT run its body, and why. `None`
+    /// means run it.
+    pub skip: Option<SkipReason>,
     pub pulse_ids: Vec<uuid::Uuid>,
     pub error: Option<String>,
 }
@@ -79,10 +81,19 @@ fn pulse_rank(p: &Pulse) -> u8 {
 }
 
 
+/// `dispatchable`, when set, is the only part of the graph this
+/// execution may dispatch (a setup phase's closure, or a manual run's
+/// subgraph). A node outside it is READY THE MOMENT ANY PULSE LANDS on
+/// it, as a skip: waiting for its full input set would park the pulse
+/// forever when one of its other parents is itself outside the set and
+/// never fires (an unkicked entry node feeding a side branch). (Named
+/// `dispatchable`, not `scope`: `NodeDefinition.scope` in this file is
+/// a node's group-nesting path, a different thing entirely.)
 pub fn find_ready_nodes(
     project: &ProjectDefinition,
     pulses: &PulseTable,
     edge_idx: &EdgeIndex,
+    dispatchable: Option<&HashSet<String>>,
 ) -> Vec<(String, ReadyGroup)> {
     let mut result = Vec::new();
 
@@ -94,6 +105,7 @@ pub fn find_ready_nodes(
         if pending_count == 0 {
             continue;
         }
+        let out_of_scope = dispatchable.is_some_and(|s| !s.contains(&node.id));
 
         let incoming = edge_idx.get_incoming(project, &node.id);
         let wired: HashSet<&str> = incoming
@@ -117,7 +129,7 @@ pub fn find_ready_nodes(
         }
 
         let groups = find_groups_for_node(
-            node, node_pulses, &required, &wired, &literal_filled, has_incoming,
+            node, node_pulses, &required, &wired, &literal_filled, has_incoming, out_of_scope,
         );
         for group in groups {
             result.push((node.id.clone(), group));
@@ -138,6 +150,7 @@ fn find_groups_for_node(
     wired: &HashSet<&str>,
     literal_filled: &HashSet<&str>,
     has_incoming: bool,
+    out_of_scope: bool,
 ) -> Vec<ReadyGroup> {
     let pending: Vec<&Pulse> = node_pulses
         .iter()
@@ -161,7 +174,10 @@ fn find_groups_for_node(
             group_pulses.iter().any(|p| p.target_port == *port_name)
         });
 
-        if has_incoming && !all_satisfied {
+        // An out-of-scope node never waits for its full input set: it
+        // will not run, so any pulse that lands is absorbed by a skip
+        // dispatch right away (see `find_ready_nodes`'s doc).
+        if has_incoming && !all_satisfied && !out_of_scope {
             continue;
         }
 
@@ -175,8 +191,19 @@ fn find_groups_for_node(
             .as_ref()
             .map(|gb| gb.role == GroupBoundaryRole::Out)
             .unwrap_or(false);
-        let should_skip = if is_out_boundary || !has_incoming {
-            false
+        // An entry node (no incoming edges) has nothing wired, so the
+        // closure rules cannot apply; but `_should_flow: false` in its
+        // braces still turns it off, so rule 0 runs on its own there.
+        let skip = if out_of_scope {
+            // Outside the part of the graph this execution runs: the
+            // most specific truth there is, whatever its inputs say.
+            Some(SkipReason::OutsideThisRun)
+        } else if is_out_boundary || !has_incoming {
+            // Pulses only ever ride edges, so a node with no incoming
+            // edges cannot form a group here; an entry node's
+            // `_should_flow` is decided where its kick is synthesized
+            // (the engine's kick path runs `check_flow_permission`).
+            None
         } else {
             check_should_skip(node, node_pulses, frames, *color, required, wired, literal_filled)
         };
@@ -208,7 +235,7 @@ fn find_groups_for_node(
             color: *color,
             input,
             closed_ports,
-            should_skip,
+            skip,
             pulse_ids,
             error: if type_errors.is_empty() { None } else { Some(type_errors.join("; ")) },
         });
@@ -488,6 +515,7 @@ mod tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: literals
                 .as_object()
                 .expect("literal fixture is an object")

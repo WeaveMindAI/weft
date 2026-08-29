@@ -231,6 +231,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             ON task(completed_at_unix)
             WHERE status IN ('complete', 'failed')"#,
     ],
+    seed: &[],
 };
 
 /// Insert a new task. Returns the minted id. Does NOT enforce dedup

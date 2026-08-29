@@ -446,7 +446,7 @@ impl std::fmt::Debug for NodeTest {
 /// one-emission-per-port rule).
 pub struct RunOutcome {
     /// The node body's own result. Tests that expect success `?` it
-    /// via [`Self::success`]; tests that expect a refusal match it.
+    /// via [`Self::ok`]; tests that expect a refusal match it.
     pub result: WeftResult<()>,
     /// Emitted output values by port.
     pub outputs: serde_json::Map<String, Value>,
@@ -629,6 +629,10 @@ struct FakeState {
     wake: Mutex<Option<Value>>,
     /// Every `register_signal` call: (spec, port snapshot).
     registered_signals: Mutex<Vec<(SignalSpec, Value)>>,
+    /// Every `await_signal` the node made, in order. What a node parks
+    /// ON is as much of its behaviour as what it emits (a form is the
+    /// thing a person reads), so a test can look at it.
+    awaited_signals: Mutex<Vec<SignalSpec>>,
     /// Stored values the fake's opened connections answer
     /// (`conn.value(name)`), keyed by service then value name.
     connection_values: Mutex<BTreeMap<String, BTreeMap<String, String>>>,
@@ -714,6 +718,7 @@ impl FakeState {
             signals: Mutex::new(VecDeque::new()),
             wake: Mutex::new(None),
             registered_signals: Mutex::new(Vec::new()),
+            awaited_signals: Mutex::new(Vec::new()),
             connection_values: Mutex::new(BTreeMap::new()),
             published: Mutex::new(std::collections::BTreeSet::new()),
             connection_permissions: Mutex::new(BTreeMap::new()),
@@ -1040,8 +1045,13 @@ impl FakeRig {
         let (bag, feeds) = manifest_input_bag(manifest, inputs)?;
         let wake = self.state.wake.lock().unwrap().take();
         // Declared overrides play the compiler's role for MustOverride
-        // ports; concrete metadata types stand as-is.
-        let mut outputs = declared_output_map(manifest);
+        // ports; concrete metadata types stand as-is. The output map is
+        // derived from the BAG (defaults applied), never the raw case
+        // inputs: the node reads the bag, so a `portsFromConfig` field
+        // with a manifest default must shape the outputs the same way
+        // it shapes the run.
+        let config = Value::Object(bag.object()?.clone());
+        let mut outputs = declared_output_map(manifest, &config);
         for (port, ty) in self.state.output_types.lock().unwrap().iter() {
             outputs.insert(port.clone(), ty.clone());
         }
@@ -1154,6 +1164,12 @@ impl FakeRig {
         self.state.registered_signals.lock().unwrap().clone()
     }
 
+    /// Every signal the node PARKED on, in order. A form node's park is
+    /// what a person ends up reading, so this is how a test looks at it.
+    pub fn awaited_signals(&self) -> Vec<SignalSpec> {
+        self.state.awaited_signals.lock().unwrap().clone()
+    }
+
     /// Every `ctx.log` line, in order.
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.state.logs.lock().unwrap().clone()
@@ -1228,7 +1244,21 @@ fn manifest_input_bag(
         );
     }
     let spec_names = manifest.inputs.iter().map(|i| i.name.clone()).collect();
-    Ok((ValueBag::inputs(delivered, spec_names), feeds))
+    // A rig run has no compiled node behind it, so the port order is the
+    // manifest's declaration order, then the case's extra inputs. A case
+    // hands its inputs as a JSON object, whose keys are sorted by the
+    // time they get here, so those extras are in NAME order and a rig
+    // case cannot express "written first". A node whose behaviour depends
+    // on the order its ports were WRITTEN in is proved where that order
+    // exists: the compiler orders created ports by source span, and
+    // `ValueBag::in_order` walks whatever order it was handed.
+    let mut order: Vec<String> = manifest.inputs.iter().map(|i| i.name.clone()).collect();
+    for name in delivered.keys() {
+        if !order.iter().any(|n| n == name) {
+            order.push(name.clone());
+        }
+    }
+    Ok((ValueBag::inputs(delivered, spec_names, order), feeds))
 }
 
 /// The generator-feed registrations one rig run installed. OWNS the
@@ -1246,12 +1276,24 @@ impl Drop for RegisteredFeeds {
     }
 }
 
-fn declared_output_map(manifest: &NodeMetadata) -> HashMap<String, WeftType> {
-    manifest
+/// Every output port a run may emit on: the manifest's own, plus the
+/// ones this node DERIVES from its config (a form's fields, a switch's
+/// cases). `config` is the case's inputs, which is where a rig run
+/// finds that config. Without the derived half, a node whose ports come
+/// from its config could never emit in a test.
+fn declared_output_map(manifest: &NodeMetadata, config: &Value) -> HashMap<String, WeftType> {
+    let mut declared: HashMap<String, WeftType> = manifest
         .outputs
         .iter()
         .map(|o| (o.name.clone(), o.port_type.clone()))
-        .collect()
+        .collect();
+    if let Some(ports_from_config) = &manifest.ports_from_config {
+        let (_, outputs) = crate::node::derive_config_ports(config, ports_from_config);
+        for port in outputs {
+            declared.insert(port.name, port.port_type);
+        }
+    }
+    declared
 }
 
 /// One ExecutionContext for a rig run: throwaway identities, the
@@ -1311,7 +1353,7 @@ impl Capture {
         // (generator ports accept repeats, but never past a close),
         // then the runtime output-type check, so a multi-fault
         // emission errors on the same gate here and there.
-        for (port, _) in &output.outputs {
+        for port in output.outputs.keys() {
             if !self.declared.contains_key(port) {
                 return Err(WeftError::NodeExecution(format!(
                     "the node emitted on undeclared output port '{port}'; declare it in \
@@ -1319,7 +1361,7 @@ impl Capture {
                 )));
             }
         }
-        for (port, _) in &output.outputs {
+        for port in output.outputs.keys() {
             let is_generator = self.declared[port].as_generator().is_some();
             if closed.iter().any(|p| p == port) {
                 return Err(WeftError::NodeExecution(if is_generator {
@@ -1413,7 +1455,7 @@ impl Capture {
     /// enforced in a node test: the harness consumes every yield
     /// instantly, so nothing is ever un-taken (see `pulse`).
     fn set_max_buffered_items(&self, port: &str, items: usize) -> WeftResult<()> {
-        if !self.declared.get(port).is_some_and(|t| t.as_generator().is_some()) {
+        if self.declared.get(port).is_none_or(|t| t.as_generator().is_none()) {
             return Err(WeftError::NodeExecution(format!(
                 "set_max_buffered_items on '{port}', which is not a Generator output of \
                  this node"
@@ -1543,13 +1585,18 @@ impl ContextHandle for TestHandle {
                 crate::context::stream_consumer_await_signal_error(NODE_UNDER_TEST_ID),
             ));
         }
-        self.state.signals.lock().unwrap().pop_front().ok_or_else(|| {
+        // Record the ATTEMPT before popping, so a test can see a park
+        // that found no queued payload (otherwise "parked on nothing"
+        // and "never awaited" would look the same).
+        self.state.awaited_signals.lock().unwrap().push(spec.clone());
+        let payload = self.state.signals.lock().unwrap().pop_front().ok_or_else(|| {
             WeftError::Config(format!(
                 "the node awaited a '{}' signal but the test declared no payload for it; \
                  queue one with rig.signal(json!(..)) before rig.run(..)",
                 spec.kind
             ))
-        })
+        })?;
+        Ok(payload)
     }
 
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
@@ -2213,9 +2260,19 @@ impl LiveRig {
             }
         };
         let has_generator_input = manifest.has_generator_input();
+        // From the BAG, not the raw case inputs, for the same reason as
+        // the fake rig: the node reads the defaulted bag, so the output
+        // map must be derived from it too.
+        let config = match bag.object() {
+            Ok(obj) => Value::Object(obj.clone()),
+            Err(e) => {
+                return RunOutcome { result: Err(e), outputs: Default::default(), closed_ports: Vec::new(), infra_spec: None }
+            }
+        };
+        let outputs_by_name = declared_output_map(manifest, &config);
         let inner = match (self.factory)(
             HandleRole::NodeUnderTest { node_type: &manifest.node_type },
-            declared_output_map(manifest),
+            outputs_by_name.clone(),
             has_generator_input,
         ) {
             Ok(handle) => handle,
@@ -2225,7 +2282,7 @@ impl LiveRig {
         };
         let handle = Arc::new(CapturingHandle {
             inner,
-            capture: Capture::new(declared_output_map(manifest)),
+            capture: Capture::new(outputs_by_name),
         });
         let ctx = test_context(manifest, bag, handle.clone());
         let result = node.run(ctx).await;

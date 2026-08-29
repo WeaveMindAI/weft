@@ -756,9 +756,7 @@ fn render_builder_base(manager: PackageManager) -> String {
             "    && rm -rf /var/lib/apt/lists/*\n",
         )
         .to_string(),
-        PackageManager::Apk => concat!(
-            "RUN apk add --no-cache ca-certificates curl build-base\n",
-        )
+        PackageManager::Apk => "RUN apk add --no-cache ca-certificates curl build-base\n"
         .to_string(),
         PackageManager::Yum => concat!(
             "RUN yum install -y ca-certificates curl gcc gcc-c++ make \\\n",
@@ -782,9 +780,7 @@ fn render_runtime_base(manager: PackageManager) -> String {
         )
         .to_string(),
         PackageManager::Apk => "RUN apk add --no-cache ca-certificates\n".to_string(),
-        PackageManager::Yum => concat!(
-            "RUN yum install -y ca-certificates \\\n    && yum clean all\n",
-        )
+        PackageManager::Yum => "RUN yum install -y ca-certificates \\\n    && yum clean all\n"
         .to_string(),
         PackageManager::Brew => String::new(),
     }

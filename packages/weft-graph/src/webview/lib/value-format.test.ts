@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatConfigValue, parseConfigToken, type WeftFileRefValue } from './value-format';
+import { fileRefsOf, formatConfigValue, parseConfigToken, type WeftFileRefValue } from './value-format';
 
 /** format then parse must recover the original value (the two are documented as
  *  exact inverses). */
@@ -87,5 +87,51 @@ describe('parseConfigToken rejects tokens formatConfigValue could not produce', 
 
   it('throws on a bare unquoted word', () => {
     expect(() => parseConfigToken('hello')).toThrow(/not a config value token/);
+  });
+});
+
+/** A port that holds SEVERAL files (an email's attachments, the media on an
+ *  LLM call). Its value is a list of refs, and its source is a list of
+ *  markers: one per file, in the order they were added. */
+describe('several files on one port', () => {
+  const ref = (path: string, type = 'Image'): WeftFileRefValue => ({
+    __weftFileRef: { path, type, marker: 'asset' },
+  });
+
+  it('writes one marker per file', () => {
+    expect(formatConfigValue([ref('assets/a.png'), ref('assets/b.png')])).toBe(
+      '[@asset("assets/a.png", Image), @asset("assets/b.png", Image)]',
+    );
+  });
+
+  it('round-trips the list', () => {
+    const files = [ref('assets/a.png'), ref('logo.svg'), ref('https://example.com/x.png')];
+    expect(parseConfigToken(formatConfigValue(files))).toEqual(files);
+  });
+
+  it('round-trips a type carrying a comma', () => {
+    const files = [ref('a.bin', 'Dict[String, Number]')];
+    expect(parseConfigToken(formatConfigValue(files))).toEqual(files);
+  });
+
+  it('leaves an ordinary list alone', () => {
+    expect(formatConfigValue(['a', 'b'])).toBe('["a","b"]');
+    expect(parseConfigToken('["a","b"]')).toEqual(['a', 'b']);
+  });
+
+  it('reads the files a written value names, in either shape', () => {
+    // The structural shape, what a file-backed config field carries.
+    expect(fileRefsOf(ref('a.png'))).toEqual([ref('a.png')]);
+    expect(fileRefsOf([ref('a.png'), ref('b.png')])).toEqual([ref('a.png'), ref('b.png')]);
+    // The written shape, what a port literal carries.
+    expect(fileRefsOf('@asset("a.png", Image)')).toEqual([ref('a.png')]);
+    expect(fileRefsOf(['@asset("a.png", Image)', '@asset("b.png", Image)'])).toEqual([
+      ref('a.png'),
+      ref('b.png'),
+    ]);
+    // Anything else names no files.
+    expect(fileRefsOf('hello')).toEqual([]);
+    expect(fileRefsOf(['hello'])).toEqual([]);
+    expect(fileRefsOf(null)).toEqual([]);
   });
 });

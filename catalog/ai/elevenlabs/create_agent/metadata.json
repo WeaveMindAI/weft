@@ -28,6 +28,7 @@
     {
       "name": "prompt",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "The agent's system prompt: who it is, what it does, how it talks. {{variables}} are filled per call.",
       "placeholder": "You are a friendly booking assistant for..."
@@ -35,6 +36,7 @@
     {
       "name": "firstMessage",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "description": "What the agent says first. Absent = it waits for the caller."
     },

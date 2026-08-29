@@ -2,7 +2,7 @@
 	/// Renders a list of FieldDefinition entries as inline form controls
 	/// against a `config` record. Handles the primitive field types:
 	/// text, textarea, select, multiselect, checkbox, number, password.
-	/// Exotic types (access, form_builder, code) are left to the
+	/// Exotic types (access, entry_list, code) are left to the
 	/// parent: pass a `customFieldKeys` set so the strip skips those
 	/// keys, and supply a `renderCustom` snippet that draws them inline
 	/// at the right position (the strip iterates the field list once,
@@ -30,6 +30,7 @@
 		readonlyKeys,
 		headerBadge,
 		onReadonlyEdit,
+		onClear,
 	}: {
 		fields: FieldDefinition[];
 		config: Record<string, unknown>;
@@ -47,7 +48,7 @@
 		/// (typically to data.onUpdate so the round-trip turns into
 		/// setConfig EditOps).
 		onUpdate: (key: string, value: unknown, portDriven?: boolean) => void;
-		/// Keys the parent renders itself (access / form_builder /
+		/// Keys the parent renders itself (access / entry_list /
 		/// code / file-backed). The strip skips them as primitives and
 		/// hands each to `renderCustom` instead.
 		customFieldKeys?: Set<string>;
@@ -79,6 +80,12 @@
 		/// readonly input swallows keystrokes silently). The parent decides
 		/// how to surface it (e.g. a throttled toast explaining why).
 		onReadonlyEdit?: (key: string) => void;
+		/// Remove a PORT-DRIVEN field's value from the source. A tick box
+		/// and a picker have no empty state, so the only way back to "the
+		/// source says nothing about this port" is the button this
+		/// enables; text controls clear themselves by being emptied and
+		/// never show it.
+		onClear?: (key: string) => void;
 	} = $props();
 
 	/// Keydown handler for readonly text controls: an editing keystroke
@@ -208,7 +215,19 @@
 				<label for={domId(field)} class="text-[10px] text-muted-foreground font-medium block">
 					{field.label}
 				</label>
-				{@render headerBadge?.(field)}
+				<div class="flex items-center gap-1">
+					{@render headerBadge?.(field)}
+					{#if onClear && field.portDriven && (field.type === 'checkbox' || field.type === 'select')
+						&& portValues && field.key in portValues && portValues[field.key] !== undefined && portValues[field.key] !== null}
+						<button
+							type="button"
+							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag bg-muted text-muted-foreground hover:text-destructive hover:bg-accent transition-colors"
+							title={`Remove ${field.key} from the source, leaving the port unset.`}
+							aria-label={`Remove ${field.key} from the source`}
+							onclick={(e) => { e.stopPropagation(); onClear(field.key); }}
+						><span aria-hidden="true">&times;</span></button>
+					{/if}
+				</div>
 			</div>
 
 			{#if field.type === 'textarea'}
@@ -274,6 +293,57 @@
 						</button>
 					{/each}
 				</div>
+			{:else if field.type === 'text_list'}
+				<!-- A list of short text values, added and removed one at a
+				     time: a select's options, the values a case matches.
+				     Each value is a row of the same box the text inputs
+				     use, so a list reads as one control rather than as
+				     loose text with crosses beside it. -->
+				{@const rawList = effectiveValue(field)}
+				{@const items = Array.isArray(rawList) ? (rawList as string[]) : []}
+				{#if rawList !== undefined && rawList !== null && !Array.isArray(rawList)}
+					<!-- The compiler types this key as a list, so a non-list can
+					     only come from a hand-edited source; half-drawing it
+					     (per-character rows) would hide the real problem. -->
+					<div class="text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1">
+						Expected a list; the source holds {JSON.stringify(rawList)}.
+					</div>
+				{/if}
+				<div class="space-y-1">
+					{#each items as item, i}
+						<div class="group flex items-center gap-1 text-xs bg-muted rounded pl-2 pr-1 py-1">
+							<span class="flex-1 truncate">{item}</span>
+							{#if !ro}
+								<button
+									type="button"
+									class="shrink-0 w-4 h-4 grid place-items-center rounded text-muted-foreground opacity-0 group-hover:opacity-100 hover:text-destructive hover:bg-background transition nodrag"
+									title="Remove"
+									aria-label="Remove {item}"
+									onclick={(e) => {
+										e.stopPropagation();
+										onUpdate(field.key, items.filter((_, at) => at !== i), field.portDriven);
+									}}
+								>&times;</button>
+							{/if}
+						</div>
+					{/each}
+					<input
+						id={domId(field)}
+						type="text"
+						readonly={ro}
+						class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
+						placeholder={field.placeholder ?? 'Add one, press Enter'}
+						onclick={(e) => e.stopPropagation()}
+						onkeydown={(e) => {
+							if (e.key !== 'Enter') return;
+							e.preventDefault();
+							const text = e.currentTarget.value.trim();
+							if (!text) return;
+							e.currentTarget.value = '';
+							onUpdate(field.key, [...items, text], field.portDriven);
+						}}
+					/>
+				</div>
 			{:else if field.type === 'checkbox'}
 				<label class="flex items-center gap-2 cursor-pointer">
 					<input
@@ -338,7 +408,7 @@
 					ondrop={() => readonlyPasteDrop(field.key, ro)}
 				/>
 			{:else}
-				<!-- code / access / form_builder MUST be in customFieldKeys
+				<!-- code / access / entry_list MUST be in customFieldKeys
 				     and rendered by the parent's renderCustom snippet.
 				     Reaching this branch means the parent forgot to claim
 				     this key; surface loud rather than silently rendering a

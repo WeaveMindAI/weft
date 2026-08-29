@@ -32,3 +32,6 @@ aws-smithy-types = { workspace = true }
 # warns on but doesn't prevent). Behind the feature so production
 # builds don't pull it.
 parking_lot = { workspace = true, optional = true }
+
+[lints]
+workspace = true

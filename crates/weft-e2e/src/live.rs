@@ -72,7 +72,7 @@ impl LiveWs {
     pub async fn send_json(&mut self, value: &Value) -> Result<()> {
         let text = serde_json::to_string(value).context("serialize ws message")?;
         self.stream
-            .send(Message::Text(text.into()))
+            .send(Message::Text(text))
             .await
             .context("ws send")
     }

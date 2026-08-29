@@ -28,6 +28,7 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "label": "Text"
     }

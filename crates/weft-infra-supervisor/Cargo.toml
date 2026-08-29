@@ -46,3 +46,6 @@ weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `test-util` enables tokio's paused virtual clock so the hung-action
 # timeout test fires deterministically without a real 5s wait.
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -269,9 +269,13 @@ export class ExecutionNode extends vscode.TreeItem {
       completed: '$(check)',
       failed: '$(error)',
       cancelled: '$(circle-slash)',
+      corrupt: '$(warning)',
     }[summary.status.toLowerCase()] ?? '$(circle-outline)';
     const started = new Date(summary.started_at * 1000).toLocaleString();
-    super(`${statusIcon} ${summary.entry_node} (${started})`, vscode.TreeItemCollapsibleState.None);
+    // A corrupt row has no entry node (its journal payload no longer
+    // decodes); it is listed so the user can see and delete it.
+    const name = summary.status === 'corrupt' ? '(corrupt journal)' : summary.entry_node;
+    super(`${statusIcon} ${name} (${started})`, vscode.TreeItemCollapsibleState.None);
     this.id = summary.color;
     this.description = `${summary.status}${pinned ? '' : '  ·  other project'}`;
     this.tooltip = new vscode.MarkdownString(
@@ -303,6 +307,8 @@ function statusThemeIcon(status: string): vscode.ThemeIcon {
       return new vscode.ThemeIcon('error', new vscode.ThemeColor('errorForeground'));
     case 'cancelled':
       return new vscode.ThemeIcon('circle-slash');
+    case 'corrupt':
+      return new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.orange'));
     default:
       return new vscode.ThemeIcon('circle-outline');
   }

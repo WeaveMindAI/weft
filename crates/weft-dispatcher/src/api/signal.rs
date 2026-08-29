@@ -643,7 +643,7 @@ pub(crate) async fn dispatch_listener_outcome(
                         state.journal.consume_suspension(&token_owned).await?;
                         Ok(StatusCode::OK)
                     }
-                    ProcessTarget::Entry { .. } => {
+                    ProcessTarget::Entry => {
                         // Every fire gets a STABLE fire id: a drain pop
                         // already carries one (the ParkedFire id, passed
                         // as the dedup nonce); a live fire mints a fresh
@@ -1549,6 +1549,8 @@ async fn prepare_live_execution(
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some(definition_hash.clone()),
         node_test: false,
+        // A live-trigger fire runs the whole graph, like any fire.
+        subgraph: None,
         at_unix: now,
     };
     let kick_events: Vec<weft_journal::ExecEvent> = kicks

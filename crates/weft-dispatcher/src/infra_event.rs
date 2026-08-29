@@ -48,6 +48,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_chrono ON infra_event(id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_project ON infra_event(project_id)"#,
     ],
+    seed: &[],
 };
 
 pub async fn insert(

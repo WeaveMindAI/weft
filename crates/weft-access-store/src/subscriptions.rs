@@ -359,7 +359,7 @@ fn row_to_subscription(
 /// internet cannot reach: states the need, the risk-accepting fix,
 /// and the door to the full explanation. The doc path is stable on
 /// purpose; the editor renders it as a link.
-// SYNC: no_public_url_error <-> docs/event-triggers.md (the section
+// SYNC: no_public_url_error <-> docs/src/connections/events.md (the section
 //       '"This trigger needs your weft to be reachable..."')
 pub fn no_public_url_error(service: &str) -> String {
     format!(
@@ -367,7 +367,8 @@ pub fn no_public_url_error(service: &str) -> String {
          your weft to be reachable from the internet, and it is not. If you accept \
          making its public trigger surface reachable, rerun `./setup.sh --public-url` \
          and re-activate; or use a connection that supports dialing out (your own \
-         provider app), where the service offers one. See docs/event-triggers.md"
+         provider app), where the service offers one. \
+         See https://weavemindai.github.io/weft/connections/events.html"
     )
 }
 

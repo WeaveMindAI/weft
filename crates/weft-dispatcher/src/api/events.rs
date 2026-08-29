@@ -50,28 +50,13 @@ pub async fn execution_stream(
     let target_color: uuid::Uuid = color
         .parse()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let project_id = match state
-        .journal
-        .execution_project(target_color)
+    // Resolve + tenant-gate in the ONE place that owns "who owns this
+    // execution": an unknown or cross-tenant color is 404 either way,
+    // and the project id rides back for the stream's attribution.
+    let project_id = crate::authenticator::authorize_execution(&*state.journal, &caller.0, target_color)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        crate::journal::ColorLookup::Found(p) => p,
-        crate::journal::ColorLookup::NotFound => return Err(StatusCode::NOT_FOUND),
-        // Corrupt journal row (logged loud at the decode site): a
-        // server-side defect, not a missing execution.
-        crate::journal::ColorLookup::Corrupt => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-    };
-    // Tenant gate on the resolved project (no second color lookup): a
-    // cross-tenant color reads as NOT_FOUND, same as an unknown one above.
-    {
-        let id = project_id
-            .parse::<uuid::Uuid>()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        authorize_project(&state, &caller.0, id)
-            .await
-            .map_err(|(s, _)| s)?;
-    }
+        .map_err(|(s, _)| s)?
+        .project_id;
 
     let target_color = Some(target_color);
     let rx = state.events.subscribe_project(&project_id).await;

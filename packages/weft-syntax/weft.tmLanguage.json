@@ -1,0 +1,186 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "$comment": "SYNC: weft highlighting <-> packages/weft-syntax/highlight-weft.js, crates/weft-compiler/src/cst/lexer.rs (the token rules), crates/weft-compiler/src/weft_compiler.rs RESERVED_CONFIG_KEYS + RESERVED_WORDS + RESERVED_TYPE_KEYWORDS, crates/weft-core/src/weft_type.rs (the type vocabulary), crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)",
+  "name": "Weft",
+  "scopeName": "source.weft",
+  "fileTypes": [
+    "weft"
+  ],
+  "patterns": [
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#heredoc"
+    },
+    {
+      "include": "#string"
+    },
+    {
+      "include": "#marker"
+    },
+    {
+      "include": "#reserved-key"
+    },
+    {
+      "include": "#config-key"
+    },
+    {
+      "include": "#endpoint"
+    },
+    {
+      "include": "#reserved-type"
+    },
+    {
+      "include": "#builtin-type"
+    },
+    {
+      "include": "#type"
+    },
+    {
+      "include": "#constant"
+    },
+    {
+      "include": "#number"
+    },
+    {
+      "include": "#operator"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.weft",
+      "match": "#.*$"
+    },
+    "heredoc": {
+      "name": "string.quoted.triple.weft",
+      "begin": "```",
+      "end": "(?<!\\\\)```",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.weft"
+        }
+      },
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.weft"
+        }
+      }
+    },
+    "string": {
+      "name": "string.quoted.double.weft",
+      "begin": "\"",
+      "end": "\"|(?=\\n)",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.begin.weft"
+        }
+      },
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.definition.string.end.weft"
+        }
+      },
+      "patterns": [
+        {
+          "name": "constant.character.escape.weft",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "marker": {
+      "match": "(@[A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.control.directive.weft"
+        }
+      }
+    },
+    "reserved-key": {
+      "match": "\\b(_label|_tags|_is_output|_should_flow)\\b(?=\\s*:)",
+      "captures": {
+        "1": {
+          "name": "keyword.other.reserved.weft"
+        }
+      }
+    },
+    "config-key": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_-]*)\\b(?=\\s*:)",
+      "captures": {
+        "1": {
+          "name": "variable.parameter.weft"
+        }
+      }
+    },
+    "endpoint": {
+      "match": "\\b(self)\\b(\\.)([A-Za-z_][A-Za-z0-9_-]*)|\\b([A-Za-z_][A-Za-z0-9_-]*)(\\.)([A-Za-z_][A-Za-z0-9_-]*)",
+      "captures": {
+        "1": {
+          "name": "variable.language.self.weft"
+        },
+        "2": {
+          "name": "punctuation.accessor.weft"
+        },
+        "3": {
+          "name": "variable.other.member.weft"
+        },
+        "4": {
+          "name": "variable.other.weft"
+        },
+        "5": {
+          "name": "punctuation.accessor.weft"
+        },
+        "6": {
+          "name": "variable.other.member.weft"
+        }
+      }
+    },
+    "reserved-type": {
+      "name": "keyword.control.weft",
+      "match": "\\b(Group|Loop|LoopIn|LoopOut|Passthrough)\\b"
+    },
+    "builtin-type": {
+      "name": "support.type.weft",
+      "match": "\\b(String|Number|Boolean|Null|Image|Video|Audio|Blob|Empty|Media|File|List|Dict|JsonDict|Bus|Access|Generator|MustOverride)\\b"
+    },
+    "type": {
+      "name": "entity.name.type.weft",
+      "match": "\\b([A-Z][A-Za-z0-9_]*)\\b"
+    },
+    "constant": {
+      "name": "constant.language.weft",
+      "match": "\\b(true|false|self)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.weft",
+      "match": "-?\\b[0-9]+(\\.[0-9]+)?\\b"
+    },
+    "operator": {
+      "name": "keyword.operator.weft",
+      "match": "->|=|\\?|\\|"
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.section.braces.weft",
+          "match": "[{}]"
+        },
+        {
+          "name": "punctuation.section.brackets.weft",
+          "match": "[\\[\\]]"
+        },
+        {
+          "name": "punctuation.section.parens.weft",
+          "match": "[()]"
+        },
+        {
+          "name": "punctuation.separator.weft",
+          "match": "[:,.]"
+        }
+      ]
+    }
+  }
+}

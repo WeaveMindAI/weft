@@ -11,11 +11,13 @@
 	import ActionBar from "./ActionBar.svelte";
 	import NodeTagsEditor from "./NodeTagsEditor.svelte";
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
+	import { isOutputNode, pruneTargets, runTargetFacts } from "../../run-targets";
 	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
 	import type { EditOp, TextEdit } from "../../../../protocol";
+	import { SHOULD_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
 	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
@@ -29,7 +31,7 @@
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "../../utils/trigger-subgraph";
-	import { nodeBodyFeedKind } from "../../utils/node-roles";
+	import { nodeBodyFeedKind, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 	let {
@@ -98,7 +100,9 @@
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		// Action-bar verb callbacks. The webview emits these; the
 		// host translates each into a CLI shell-out.
-		onRun?: () => void;
+		/// Targets are the output nodes the user aimed the run at, empty for
+		/// the ordinary run.
+		onRun?: (targets: string[]) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onActivate?: () => void;
@@ -256,9 +260,22 @@
 		const cfg = node.data.config as Record<string, unknown> | undefined;
 		const key = getLayoutKey(node);
 		const verb = layoutVerb;
+		let w = cfg?.width as number | undefined;
+		let h = cfg?.height as number | undefined;
+		// A persisted size is one fact (the layout format cannot hold half of
+		// one, and `updateLayoutEntry` throws on a half-set). Config CAN hold
+		// half: the group min-height auto-enforce writes a bare `{height}`,
+		// and a group whose layout never carried a size has no width to pair
+		// it with. Complete the fact from the rendered box, which is the size
+		// actually on screen.
+		if ((w === undefined) !== (h === undefined)) {
+			const rect = getNodeRect(node);
+			w ??= rect.width;
+			h ??= rect.height;
+		}
 		return (layout) => updateLayoutEntry(layout, key,
 			node.position.x, node.position.y,
-			cfg?.width as number | undefined, cfg?.height as number | undefined,
+			w, h,
 			cfg?.expanded as boolean | undefined ?? undefined,
 			cfg?.configCollapsed as boolean | undefined ?? undefined,
 			verb);
@@ -819,17 +836,19 @@
 			}
 			if ('inputs' in updates || 'outputs' in updates) {
 				const node = nodes.find(n => n.id === nodeId);
-				// A form-schema node's ports are DERIVED from its `fields` config
-				// (the enricher re-materializes them on every parse), so they must
-				// NEVER be written into the source signature. Emitting them makes the
-				// `.weft` declare `-> (test_approved: Boolean?, ...)` on a node type
-				// with `canAddOutputPorts: false`, which strict enrich (the build
-				// path) rejects as "custom output port on a node that does not
-				// support custom ports". The `fields` config, written by the config
-				// ops above, is the single source of truth; the ports round-trip
-				// through it, not through the header.
-				const isFormSchema = (node?.data?.features as { hasFormSchema?: boolean } | undefined)?.hasFormSchema === true;
-				if (node?.data && !isFormSchema) {
+				// The ports of a node that derives them from a config list (a
+				// form's `fields`, a switch's `cases`) are re-materialized by the
+				// enricher on every parse, so they must NEVER be written into the
+				// source signature. Emitting them makes the `.weft` declare
+				// `-> (test_approved: Boolean?, ...)` on a node type with
+				// `canAddOutputPorts: false`, which strict enrich (the build path)
+				// rejects as "custom output port on a node that does not support
+				// custom ports". That config list, written by the config ops above,
+				// is the single source of truth; the ports round-trip through it,
+				// not through the header.
+				const derivesPorts = (node?.data as { portsFromConfig?: unknown } | undefined)
+					?.portsFromConfig !== undefined;
+				if (node?.data && !derivesPorts) {
 					// Carry-synthesized ghost inputs are DERIVED from the loop's carry
 					// list (by the compiler on parse, by the projection on apply);
 					// writing one into the source signature would turn it into a real
@@ -1346,6 +1365,19 @@
 		value: {},
 	};
 
+	/// Output nodes the user aimed the run at, by node id. Empty is the
+	/// ordinary run: the dispatcher starts from every output node. This is
+	/// deliberately not surfaced anywhere except the right-click menu and the
+	/// glow on a targeted node, so it stays out of the way of somebody who
+	/// never wants it.
+	let runTargets = $state<Set<string>>(new Set());
+
+	function toggleRunTarget(nodeId: string): void {
+		const next = new Set(runTargets);
+		if (!next.delete(nodeId)) next.add(nodeId);
+		runTargets = next;
+	}
+
 	// Everything dynamic painted onto the projected graph, gathered in one
 	// place so there is ONE decoration pass (no per-source effects mutating
 	// `nodes` in place). `readOverlayCtx()` reads every reactive source, so
@@ -1364,6 +1396,11 @@
 		signalFeedByNode: typeof signalFeedByNode;
 		showInfraSubgraph: boolean;
 		showTriggerSubgraph: boolean;
+		/// Output nodes the run is aimed at. Read here rather than straight
+		/// from the state so setting a target repaints immediately: `decorate`
+		/// runs untracked, so a source it reads on its own never registers as
+		/// a dependency of the overlay effect.
+		runTargets: ReadonlySet<string>;
 		execPrefix: string;
 		projectNodes: import('../../types').NodeInstance[];
 	};
@@ -1401,6 +1438,7 @@
 			signalFeedByNode,
 			showInfraSubgraph,
 			showTriggerSubgraph,
+			runTargets,
 			// Touch execPrefix in the tracked region so a navigation that only
 			// changes the exec-id prefix re-decorates (decorate reads it via
 			// execKey). Untrack the projection: the STRUCTURAL effect already
@@ -1620,6 +1658,7 @@
 						...n,
 						data: {
 							...n.data,
+							runTarget: ctx.runTargets.has(n.id),
 							debugData,
 							executions,
 							executionCount: executions.length,
@@ -1750,6 +1789,53 @@
 	let selectedNodeId = $state<string | null>(null);
 
 	let contextMenu = $state<{ x: number; y: number; flowX: number; flowY: number; nodeId: string | null } | null>(null);
+
+	/// Targets the graph still holds. A targeted node the user then deleted,
+	/// or demoted out of being an output, is dropped here rather than sent to
+	/// a dispatcher that would refuse it.
+	const liveRunTargets = $derived([...pruneTargets(runTargets, nodes)]);
+	// And the STATE prunes itself too (the derived view above covers the
+	// same render tick): without this, deleting a targeted node and later
+	// re-creating one with the same id would bring it back already
+	// targeted, showing "Unset target" on a node the user never aimed at.
+	$effect(() => {
+		const pruned = pruneTargets(runTargets, nodes);
+		if (pruned.size !== runTargets.size) runTargets = new Set(pruned);
+	});
+
+	/// What the aimed run executes, read off the graph: whether its joined
+	/// subgraph touches any trigger (if not, the action bar offers Run
+	/// beside the trigger lifecycle), and which infra nodes it holds.
+	const runTargetFactsLive = $derived(
+		runTargetFacts(
+			liveRunTargets,
+			nodes.map((n) => ({
+				id: n.id,
+				isTrigger: nodeIsTrigger({
+					nodeType: (n.data?.nodeType as string) ?? '',
+					features: n.data?.features as { isTrigger?: boolean } | undefined,
+				}),
+				isInfra: nodeRequiresInfra({
+					nodeType: (n.data?.nodeType as string) ?? '',
+					requiresInfra: n.data?.requiresInfra as boolean | undefined,
+				}),
+			})),
+			edges,
+		),
+	);
+
+	/// The aimed run is ready infra-wise when every infra node in ITS
+	/// subgraph reports running. Infra elsewhere in the project has no
+	/// say: a targeted run never touches it.
+	const runTargetsInfraReady = $derived(
+		runTargetFactsLive.infraIds.every(
+			(id) => infraNodes?.find((inf) => inf.nodeId === id)?.status === 'running',
+		),
+	);
+
+	function runWithTargets(): void {
+		onRun?.(liveRunTargets);
+	}
 	// An OPEN node menu closes itself when its target can no longer fill it:
 	// the node vanished from the graph (deleted from the text tab in another
 	// column while the menu was open), or, in simplified view, its only menu
@@ -1991,7 +2077,7 @@
 		// Simplified view: the node renders only ONE input dot and ONE output dot,
 		// but the layout engine (shared with the builder view) looks up each REAL
 		// port by name. So alias every real input port name to the single in-dot's
-		// measured Y and every real output (plus `_raw`) to the out-dot's. The
+		// measured Y and every real output to the out-dot's. The
 		// engine then naturally collapses all of a node's ports onto its two dots,
 		// using the exact positions measured on screen. This keeps ONE layout path
 		// for both views: it always reads "the dots that actually exist".
@@ -2002,10 +2088,10 @@
 			const inputs = (node?.data.inputs as PortDefinition[] | undefined) ?? [];
 			const outputs = (node?.data.outputs as PortDefinition[] | undefined) ?? [];
 			if (inY !== undefined) for (const p of inputs) portYMap.set(p.name, inY);
-			if (outY !== undefined) {
-				for (const p of outputs) portYMap.set(p.name, outY);
-				portYMap.set('_raw', outY);
-			}
+			if (outY !== undefined) for (const p of outputs) portYMap.set(p.name, outY);
+			// Flow wires collapse onto the in dot too (no separate flow dock in
+			// simplified view), so the layout engine anchors them there as well.
+			if (inY !== undefined) portYMap.set(SHOULD_FLOW_PORT, inY);
 		}
 		return portYMap;
 	}
@@ -2246,7 +2332,7 @@
 				saveProject();
 				break;
 			case 'run':
-				onRun?.();
+				runWithTargets();
 				break;
 			case 'undo':
 				undo();
@@ -2333,8 +2419,8 @@
 	 *  input AND an output under the same name, e.g. a passthrough
 	 *  `value`/`value`; searching one list then the other would resolve
 	 *  the wrong side of that pair). Null when the port is not in the
-	 *  face's list (the implicit loop handles, `_raw`), which the type
-	 *  gate treats as "no opinion". */
+	 *  face's list (the implicit loop handles), which the type gate
+	 *  treats as "no opinion". */
 	function handlePortType(nodeId: string, handleId: string | null | undefined, side: 'source' | 'target'): string | null {
 		const node = nodes.find(n => n.id === nodeId);
 		if (!node) return null;
@@ -2862,11 +2948,9 @@
 		const draggedIds = new Set(draggedNodes.map(dn => dn.id));
 		transaction(() => {
 			const movedIds = new Set<string>();
-			// Simplified view is READ-ONLY for structure: a drag may REPOSITION but
-			// must not REPARENT. Re-scoping (dropping a node into a group) rewrites
-			// the .weft source, so it is suppressed here; only the position write
-			// below runs. (Builder view does both.)
-			const currentNode = simplified ? undefined : nodes.find(n => n.id === targetNode.id);
+			// Simplified view never reaches here: its layout is machine-owned, so
+			// node dragging is disabled outright (`nodesDraggable` on the canvas).
+			const currentNode = nodes.find(n => n.id === targetNode.id);
 			if (currentNode) {
 				if (applyNodeScopeChange(currentNode)) movedIds.add(currentNode.id);
 				if (currentNode.type === 'group' || currentNode.type === 'groupCollapsed') {
@@ -2904,9 +2988,8 @@
 		const draggedIds = new Set(selectedNodes.map(sn => sn.id));
 		transaction(() => {
 			const movedIds = new Set<string>();
-			// Simplified view is READ-ONLY for structure: reposition only, no reparent
-			// (see onNodeDragStop). The scope-change scan is skipped; positions persist.
-			for (const selectedNode of (simplified ? [] : selectedNodes)) {
+			// Simplified view never reaches here (dragging disabled, see onNodeDragStop).
+			for (const selectedNode of selectedNodes) {
 				const node = nodes.find(n => n.id === selectedNode.id);
 				if (!node) continue;
 				if (applyNodeScopeChange(node)) movedIds.add(node.id);
@@ -3386,6 +3469,7 @@
 				selectionOnDrag={false}
 				selectionMode={SelectionMode.Partial}
 				elementsSelectable={true}
+				nodesDraggable={!simplified}
 				panOnDrag={true}
 				panOnScroll
 				zoomOnScroll={false}
@@ -3454,7 +3538,8 @@
 		<ActionBar
 			state={actionBarState}
 			{drift}
-			{onRun}
+			onRun={runWithTargets}
+			runTargetCount={liveRunTargets.length}
 			{onStop}
 			{onDismissError}
 			{onActivate}
@@ -3472,6 +3557,8 @@
 			{onUpgradeInfra}
 			hasInfra={hasInfraInGraph}
 			hasTriggers={hasTriggersInGraph}
+			runTargetsAvoidTriggers={runTargetFactsLive.avoidsTriggers}
+			{runTargetsInfraReady}
 			onToggleInfraSubgraph={() => { showInfraSubgraph = !showInfraSubgraph; if (showInfraSubgraph) showTriggerSubgraph = false; }}
 			{showInfraSubgraph}
 			onToggleTriggerSubgraph={() => { showTriggerSubgraph = !showTriggerSubgraph; if (showTriggerSubgraph) showInfraSubgraph = false; }}
@@ -3528,6 +3615,16 @@
 							>
 								<span class="text-muted-foreground text-xs">#</span>
 								<span>Tags…</span>
+							</button>
+						{/if}
+						{#if isOutputNode(nodeToEdit.data?.config, nodeToEdit.data?.features)}
+							{@const isTarget = runTargets.has(targetNodeId)}
+							<button
+								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+								onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
+							>
+								<span class="text-muted-foreground text-xs">◎</span>
+								<span>{isTarget ? 'Unset target' : 'Set as target'}</span>
 							</button>
 						{/if}
 						{#if hasInfraActions}

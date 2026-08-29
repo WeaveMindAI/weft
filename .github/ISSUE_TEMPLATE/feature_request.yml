@@ -1,11 +1,11 @@
 name: Feature request
-description: Suggest a new capability, a language change, or an improvement to the dashboard.
+description: Suggest a new capability, a language change, or an improvement to the editor.
 labels: ["feature", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Before opening this, skim [DESIGN.md](https://github.com/WeaveMindAI/weft/blob/main/DESIGN.md) and the [roadmap](https://github.com/WeaveMindAI/weft/blob/main/ROADMAP.md). Weft is opinionated, and some kinds of changes will not land no matter how good the PR is. That is not a bad thing, it is just scope management.
+        Before opening this, skim [the design principles](https://weavemindai.github.io/weft/thinking/design-principles.html) and [the roadmap](https://weavemindai.github.io/weft/appendix/roadmap.html). Weft is opinionated, so some changes we will probably end up talking you out of, and that is a much nicer conversation to have in an issue than in review.
 
         If you want a new **node** (not a language change), use the "Node request" template instead.
 
@@ -35,14 +35,12 @@ body:
     id: design-fit
     attributes:
       label: How does this fit the design principles?
-      description: Point to the principle(s) in DESIGN.md that this supports or tensions with. If it breaks one, explain why the tradeoff is worth it.
+      description: Point to the principles this supports, or the one it pulls against. If it breaks one, tell us why the trade is worth it.
 
   - type: checkboxes
     id: checks
     attributes:
       label: Checks
       options:
-        - label: I have read DESIGN.md and ROADMAP.md.
-          required: true
         - label: I have searched existing issues for duplicates.
           required: true

@@ -10,8 +10,9 @@
 //! `$DATABASE_URL`, creates a random DB, drops it after). When
 //! `DATABASE_URL` is unset the macro skips the test, so a dev box without
 //! Postgres still builds. The schema is the REAL migration path in
-//! production order: journal first (`PostgresJournal::from_pool`), then
-//! `app::run_core_migrations` (exactly what a booting dispatcher runs).
+//! production order: `app::apply_core_schema` (one pass over every
+//! group), then the journal and store wrap the pool, exactly what a
+//! booting dispatcher runs.
 //!
 //! Gated behind the `db-tests` feature (off by default) so a plain
 //! `cargo test --workspace` needs no Postgres; run with
@@ -35,12 +36,10 @@ const TENANT: &str = "tenant-1";
 /// order. Returns the journal + the project store, the two handles the
 /// SQL under test goes through.
 async fn setup(pool: &PgPool) -> (PostgresJournal, weft_dispatcher::ProjectStore) {
-    let journal: PostgresJournal = PostgresJournal::from_pool(pool.clone())
-        .await
-        .expect("journal schema");
-    let projects = weft_dispatcher::app::run_core_migrations(pool)
-        .await
-        .expect("core migrations");
+    weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+    let journal = PostgresJournal::from_pool(pool.clone());
+    let projects: weft_dispatcher::ProjectStore =
+        std::sync::Arc::new(weft_dispatcher::PostgresProjectStore::new(pool.clone()));
     (journal, projects)
 }
 
@@ -372,6 +371,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
         node_test: false,
+        subgraph: None,
         at_unix: now,
     };
     let kick = weft_journal::ExecEvent::NodeKicked {
@@ -430,6 +430,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
         node_test: false,
+        subgraph: None,
         at_unix: now,
     };
     let task2 = weft_task_store::tasks::NewTask {

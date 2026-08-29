@@ -15,6 +15,7 @@
       "type": "String",
       "required": true,
       "exposure": "config",
+      "widget": { "kind": "code", "language": "python" },
       "label": "Python code"
     }
   ],

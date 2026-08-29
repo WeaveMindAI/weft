@@ -253,7 +253,7 @@ other field (`crates/weft-core/src/pulse.rs:82-98`). Three unrelated
 situations produce a byte-identical signal at the consumer:
 
 1. the producer FAILED (its body errored, so its ports closed),
-2. the producer deliberately declined to emit (a `Gate` whose `pass`
+2. the producer deliberately declined to emit (a node whose permission
    was false, an unselected branch),
 3. the producer was never going to run (a different trigger fired and
    this branch is dead, so its ports closed at Fire).
@@ -553,3 +553,206 @@ no-suspension-while-open rule keeps the gap honest until then.
 
 [Update Notice Warning] If we touch the BusCoordinator, implement
 Generator[T], or rework await_signal journaling, revisit this entry.
+
+## Rename color to exec
+Color was a concept I was experimenting with for mutliple execution in the same runtime but I changed my mind and never ended up changing the name.
+
+## Native branching and retries: should `if` / `else` / retry become language constructs?
+
+Branching is one rule: a closed port skips the node it lands on, which
+closes its outputs, which cascades. `_should_flow` is that rule with a
+handle on it (a node runs unless its permission says no), `Switch` picks
+which permission is granted, and `FirstInOrder` brings the branches back
+to one wire. Retries are a different story: whatever a node does about
+them, it does inside itself.
+
+That is enough to express branching, and it may not be the nicest way to
+write it. An author who wants "call this, and if it fails three times,
+take the other path" is writing node code for something that reads like
+control flow. The question is whether the language should grow a native
+`if` / `else` and a native retry, and if so what a retry means when the
+thing being retried is a subgraph rather than a call (what re-fires,
+what keeps its state, what the journal records, and what a person
+watching the graph sees while it happens).
+
+Two pieces of the old version of this question are now built, and what
+they taught is worth keeping:
+
+- Waiting for every wired port is not the problem it looks like. A
+  branch that was turned off does not keep anyone waiting: the node at
+  the head of it is skipped the moment its permission closes, and the
+  skip reaches the join in the same tick. A join stalls only while a
+  branch is genuinely still running, which is the honest answer anyway.
+- `FirstInOrder` picks by WRITTEN order, never by arrival, because a
+  race would replay differently from the run it recorded and the journal
+  is supposed to be the truth.
+
+What is still open is the RACE: two live branches, and the first answer
+wins. Nothing fires a node once per arriving value. The closest is a
+live channel (a stream or a bus), which delivers items to a node that is
+ALREADY running rather than firing it again. Whether ordinary ports
+should ever have a per-arrival mode is the question that decides whether
+a race is expressible without a bus.
+
+Decide before the release: a native form added later changes how every
+program is written, so it is cheaper to know now whether it is coming.
+
+## Inverting a decision: is there still a hole?
+
+`_should_flow` reads BOTH shapes of "no": a `false` value and a closure
+(nothing ever answered). So "run this when the other branch did not" is
+already writable: the node that decides emits an optional port that says
+nothing on success, and whatever reads that port runs only in the other
+case. The README's bigger example does exactly that with its `refusal`.
+
+What is still missing is the plain boolean flip. Holding a `true` and
+wanting to act on `false` means writing Python to invert it, since
+nothing in the catalog turns a boolean around. A `Not` node (boolean in,
+boolean out) would cover it and compose anywhere a boolean goes.
+
+Decide whether that node is worth adding, or whether "emit nothing on
+the branch you do not want" is the one way it should be said.
+
+## Executions steering each other by tag
+
+Two `ctx` functions, and the pair is what makes the feature.
+
+The first lets a node tag its own execution: one tag or several, added to
+whatever that execution already carries. Any node can call it, at any
+point.
+
+The second lets a node act on OTHER executions through those tags:
+"stop every execution carrying this tag, right now, including the ones
+parked waiting for a signal, and stop that waiting too."
+
+What it buys, in one shape everybody has hit: somebody fires three
+messages at an assistant in a row. Each message starts an execution
+whose first node tags it with the sender's id and whose second node
+waits ten seconds before answering. Each new execution begins by killing
+everything already carrying that id, so only the last message is
+answered, with all three in view. No queue, no debounce service, no
+state anywhere.
+
+The open parts: what a stopped execution looks like in the journal
+(cancelled by whom, on whose behalf), whether the caller may stop
+executions outside its own project (no), what happens to an execution
+that is mid-call in a node when the stop lands, and whether "stop"
+should have a sibling that only stops the waiting and lets the rest run
+on.
+
+**The same verb, one scope down.** Tags name nodes too (`_tags`), so the
+same idea points INSIDE one execution: "stop every node tagged `pathB`".
+Where it pays is a fork whose two branches race, one short and one long:
+the moment the short one wins, the long one is dead weight, and killing
+it saves the model calls and the compute it was about to spend rather
+than discarding its answer at the end. That is the difference between
+ignoring a branch and never paying for it.
+
+Whether that is the same function with a scope, or two functions, is
+part of the decision. What a killed branch leaves behind is the harder
+half: its nodes have to close their outputs so whatever was waiting on
+them skips cleanly rather than hanging, and a node that is mid-call when
+the kill lands is the same in-flight problem as above, one layer down.
+This one pairs with [fire-on-arrival](#fire-on-arrival-should-a-node-be-able-to-run-before-all-its-inputs-are-in),
+which is what makes the race expressible in the first place.
+
+Not doing it now. Writing it down because it turns a weft program from
+something that runs into something that can manage its own kind.
+
+## Nothing tests the editor: a rig that drives the real webview
+
+**Problem.** Every gesture in the graph is verified by a person looking
+at it. The webview's tests cover plain modules only (projection, the
+edit engine, layout, the protocol shapes): there is no jsdom, no
+component rendering, so nothing can click a button, open a form, drag a
+wire, or assert that a field is absent. The e2e rig cannot help: it
+drives the dispatcher over HTTP and never opens a browser. So the whole
+editor, which is most of what a user touches, has no test layer at all.
+
+What that costs, from one afternoon: a config field silently became a
+JSON text area instead of a list editor, a port dock offered a wire the
+compiler refuses, and an entry could be edited into a name a neighbour
+already owned. Each was found by eye.
+
+**What it has to test, and this is the point.** The gesture AND the
+source it produces. An edit in the graph rewrites the `.weft` file
+through the edit ops, so the assertion is a round trip: mount the real
+webview, act, read the source back, and check both what the file says
+and what the graph now shows. Half a rig that only asserts pixels would
+be worse than none.
+
+**Not only the graph.** The same harness is what would let us test the
+extension host: the action bar's states, the streaming AI edits landing
+in the open file, the sidebar's project and execution lists, the live
+panel, the graph reopening on the right file. Whatever shape it takes,
+it should be able to stand up an extension host as well as a webview.
+
+**Open questions.**
+- Which harness: jsdom plus a Svelte testing library (fast, runs in the
+  same vitest as everything else, but it is not a browser), a real
+  headless browser over the built bundle (honest, slower, new tooling),
+  or VS Code's own extension test runner (the only one that gives a
+  REAL extension host, and the heaviest).
+- The host bridge is a message channel, so a fake host is dumb and
+  hand-rolled, the same rule the other fakes follow. What it has to
+  answer: parse, validate, edit ops, file reads.
+- Where it lives: the renderer is `packages/weft-graph`, so its rig
+  belongs beside it; anything about the extension host belongs to
+  `extension-vscode`.
+- Whether it runs on every save or on the pre-release pass, which
+  decides how much it may cost.
+
+Not now: it is a real piece of infrastructure, not an afternoon.
+
+## Fire-on-arrival: should a node be able to run before all its inputs are in?
+
+**This entry is a decision to make, not a task to do.** Think it
+through, then decide whether it is worth building at all.
+
+Today a node fires once, when every wired port has arrived. A closed
+port counts as an arrival, which is what makes branching work, and it
+is also what makes this shape slow: a fork where one branch is three
+nodes and the other is thirty, both landing on the same node. The short
+branch's value is there in a second, and the node sits on it until the
+skip has walked all thirty nodes of the branch nobody took. It already
+holds everything it needs and it waits anyway.
+
+**The shape being considered.** A flag on a node: fire me every time one
+of my inputs is filled. Each firing sees the input bag AS IT STANDS, not
+just the value that arrived, so the body always has the whole picture.
+A first-to-arrive node then emits on its first firing and does nothing
+on the later ones. A node with five inputs that wants the sum of the
+first two waits through one firing, emits on the second, and ignores the
+rest.
+
+**What it drags in with it.** The body has to remember what it already
+did, across firings of the SAME execution, which weft gives a node no
+way to do. Something like a scratchpad on the ctx, scoped to this node
+in this execution, and the question of whether it lives in the worker's
+memory (lost the moment the execution suspends or the pod dies) or in
+the journal (durable, replayable, another thing on the write path).
+
+**The questions to answer before anything is built.**
+- Replay. Firing order becomes arrival order, and arrival order is a
+  race: the same program could pick a different branch on a replay than
+  it did on the original run. Either the journal records which firing
+  emitted and replay follows that record rather than the clock, or the
+  feature breaks the one property the whole system rests on.
+- What a firing IS in the journal. One node execution per firing, or one
+  execution that received several deliveries? The inspector, the metering,
+  and the replay all read that shape, and a node that ran four times and
+  emitted once has to be legible to a person looking at the graph.
+- Termination. The runtime still has to know when a node's inputs are
+  settled, so a node that never emitted can close its outputs and let the
+  skip cascade finish. Fire-on-arrival adds firings; it cannot remove
+  that.
+- Does a CLOSED arrival count as a fill? For the fork it must not (the
+  branch that lost has nothing to say), but "the first two that arrive"
+  needs the same answer stated deliberately rather than falling out.
+- Loops. A firing is per (color, frames), so this is per iteration; is
+  there any case where it should be otherwise?
+- Cost. A node that fired four times bills as what.
+
+It pairs with [tags stopping work](#executions-steering-each-other-by-tag):
+fire-on-arrival is what makes a race expressible, and cancelling the
+losing branch by tag is what stops it costing money.

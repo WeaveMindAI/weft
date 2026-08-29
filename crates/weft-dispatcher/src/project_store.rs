@@ -569,7 +569,7 @@ pub struct StoredProjectSummary {
 }
 
 impl PostgresProjectStore {
-    /// Plain wrap; the schema is the boot's job (`run_core_migrations`
+    /// Plain wrap; the schema is the boot's job (`apply_core_schema`
     /// applies [`GROUP`] with every other core group, so a stale
     /// `project` table fails the SAME boot error as its siblings).
     pub fn new(pool: PgPool) -> Self {
@@ -578,8 +578,10 @@ impl PostgresProjectStore {
 }
 
 /// The `project` + `project_definition` tables. The canonical CREATEs
-/// live here (edited in place, fresh DB on rebuild); the boot's
-/// `run_core_migrations` applies this group via the schema guard.
+/// live here, edited in place; an existing database is carried to them
+/// by a migration written with `./setup.sh --migration <name>` (the
+/// whole contract is `weft_task_store::schema_guard`'s header). The
+/// boot's `apply_core_schema` applies this group via the schema guard.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "project",
     tables: &["project", "project_definition"],
@@ -743,6 +745,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
         )"#,
     ],
+    seed: &[],
 };
 
 /// THE running-hash pointer advance: ONE atomic UPDATE of the trio of hashes
@@ -909,7 +912,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         // project with missing/half-written infra tags. Plain registration
         // passes `infra_image_tags = None`.
         advance_running_hashes(
-            &mut *tx,
+            &mut tx,
             id,
             binary_hash,
             definition_hash,
@@ -997,7 +1000,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         // `register_with_hashes`' transaction.
         let mut conn = self.pool.acquire().await?;
         advance_running_hashes(
-            &mut *conn,
+            &mut conn,
             id,
             binary_hash,
             definition_hash,
@@ -1722,7 +1725,7 @@ impl ProjectStoreOps for MockProjectStore {
                 .await
                 .get(&id)
                 .cloned()
-                .unwrap_or_else(|| ProjectLifecycle {
+                .unwrap_or(ProjectLifecycle {
                     status: ProjectStatus::Registered,
                     accepting_fires: true,
                     fires_visible_to_consumers: true,

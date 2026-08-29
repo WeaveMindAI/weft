@@ -4,10 +4,10 @@
 //! model names a rerank model (cohere/rerank-4-pro, ...).
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::json;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmRerankNode;
@@ -54,7 +54,12 @@ impl Node for LlmRerankNode {
         let mut ranked = Vec::new();
         let mut scores = Vec::new();
         for r in answer["results"].as_array().into_iter().flatten() {
-            let Some(idx) = r["index"].as_u64() else { continue };
+            let Some(idx) = r["index"].as_u64() else {
+                // Skipping would silently shrink the answer; a result
+                // with no index is a malformed reply, same as one past
+                // the list.
+                weft::node_bail!("the rerank answer has a result with no `index`");
+            };
             let Some(doc) = documents.get(idx as usize) else {
                 weft::node_bail!("the rerank answer names index {idx}, past the document list");
             };

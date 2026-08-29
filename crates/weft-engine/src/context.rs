@@ -1150,6 +1150,10 @@ impl JournalClient for PoisonOnWriteFailure {
         self.inner.events_for_color(color).await
     }
 
+    async fn raw_events_for_color(&self, color: Color) -> anyhow::Result<Vec<String>> {
+        self.inner.raw_events_for_color(color).await
+    }
+
     async fn has_terminal_event(&self, color: Color) -> anyhow::Result<bool> {
         self.inner.has_terminal_event(color).await
     }
@@ -1818,6 +1822,7 @@ pub async fn ship_node_skipped(
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     closed_ports: &[String],
+    reason: &weft_core::exec::skip::SkipReason,
     closures: Vec<weft_core::exec::PulseEmission>,
 ) {
     record_from_pod(
@@ -1827,6 +1832,7 @@ pub async fn ship_node_skipped(
             node_id: node_id.to_string(),
             frames: frames.clone(),
             closed_ports: closed_ports.to_vec(),
+            reason: Some(reason.clone()),
             closure_emissions: closures.into_iter().map(Into::into).collect(),
             at_unix: now_unix(),
         },
@@ -3045,7 +3051,7 @@ mod replay_tests {
             None,
             uuid::Uuid::nil(),
             weft_core::frames::LoopFrames::default(),
-            weft_core::context::ValueBag::inputs(Default::default(), Default::default()),
+            weft_core::context::ValueBag::inputs(Default::default(), Default::default(), Vec::new()),
             handle,
         )
     }
@@ -3701,7 +3707,7 @@ mod replay_tests {
     fn queries_report_protocol_and_none_without_caller() {
         // No caller wired: both queries false, caller() None.
         let bare = handle_with_sequence(vec![]);
-        assert!(!bare.caller_connection().is_some());
+        assert!(bare.caller_connection().is_none());
 
         // HTTP caller wired: protocol is Http.
         let http = handle_with_sequence(vec![]).with_caller_connection(Some(
@@ -3864,6 +3870,9 @@ mod bus_pump_tests {
             Ok(())
         }
         async fn events_for_color(&self, _color: Color) -> anyhow::Result<Vec<ExecEvent>> {
+            Ok(Vec::new())
+        }
+        async fn raw_events_for_color(&self, _color: Color) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
         async fn has_terminal_event(&self, _color: Color) -> anyhow::Result<bool> {

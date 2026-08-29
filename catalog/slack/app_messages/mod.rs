@@ -17,7 +17,6 @@
 //!   - `run`: fan the named event; `workspace` is which install.
 
 use async_trait::async_trait;
-use serde_json::Value;
 
 use weft::signal::{Predicate, ProviderEvents};
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};

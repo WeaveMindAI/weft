@@ -4,6 +4,9 @@
   "description": "Shared weft graph renderer + editor. Extracted from the VS Code extension so multiple hosts render the graph from one source. Each consumer provides its own host bridge (VS Code messaging, or the dispatcher HTTP API).",
   "type": "module",
   "private": true,
+  "scripts": {
+    "test": "vitest run"
+  },
   "exports": {
     ".": "./src/index.ts",
     "./protocol": "./src/protocol.ts",
@@ -14,7 +17,7 @@
   },
   "peerDependencies": {
     "@xyflow/svelte": "^1.5.0",
-    "elkjs": "^0.11.0",
+    "elkjs": "^0.12.0",
     "svelte": "^5.0.0"
   },
   "dependencies": {

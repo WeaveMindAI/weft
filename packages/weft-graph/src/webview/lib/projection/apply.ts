@@ -16,6 +16,7 @@
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
 import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure } from '../types';
 import type { EditOp, EditPortSig } from '../../../protocol';
+import { SHOULD_FLOW_PORT } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
 import type { FoldResult, PendingOp } from './types';
 
@@ -304,17 +305,21 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
     case 'setConfig':
     case 'removeConfig': {
       const node = resolveDecl(project, op.node);
-      if (isContainerNodeType(node.nodeType)) {
-        throw new Error(`SetConfig/RemoveConfig called on '${op.node}' which is a ${node.nodeType} decl, not a Node`);
-      }
       // Mirror the compiler's enrich normalization so the optimistic
       // projection matches the host's next parse: a value that DRIVES a
       // wireable input (braces on an `all`-exposure input, or an
       // explicit statement-form write on any input) homes in
       // `portLiterals`; everything else (config-exposure braces values
       // included) stays in `config`. One home per written form.
+      // A container has only the port home: its `config` is loop knobs,
+      // which ride their own ops.
       const input = node.inputs?.find((p) => p.name === op.key);
-      const portHomed = input !== undefined && (inputExposure(input) === 'all' || op.form === 'connection');
+      const isContainer = isContainerNodeType(node.nodeType);
+      if (isContainer && input === undefined && op.key !== SHOULD_FLOW_PORT) {
+        throw new Error(`'${op.node}' has no input port '${op.key}'`);
+      }
+      const portHomed = isContainer
+        || (input !== undefined && (inputExposure(input) === 'all' || op.form === 'connection'));
       if (portHomed) {
         const literals = (node.portLiterals ??= {});
         const spans = (node.portLiteralSpans ??= {});

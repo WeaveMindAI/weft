@@ -1,48 +1,53 @@
 <!--
-Thanks for sending a PR. Before opening it, please:
-1. Read CONTRIBUTING.md if you have not already.
-2. For medium or large changes, open an issue first and wait for a thumbs up.
-3. Make sure tests and lints pass locally.
+Thanks for sending this.
+
+For anything medium or large, an issue first saves you the afternoon where we
+change something underneath you. CONTRIBUTING.md has the rest.
 -->
 
 ## What and why
 
-<!-- One or two sentences: what does this change, and why. Not what lines, the why. -->
+<!-- One or two sentences. The diff says what changed, so say why. -->
 
 ## How
 
-<!-- Short technical description of the approach. Skip if obvious from the diff. -->
+<!-- The approach, briefly. Skip it if the diff is obvious. -->
 
 ## Linked issue
 
 <!-- Closes #123 / Refs #456 -->
 
-## Type of change
+## What kind of change
 
 - [ ] Bug fix
-- [ ] New feature
 - [ ] New node
-- [ ] Language change (parser, type system, executor)
-- [ ] Dashboard change
+- [ ] New service (an access recipe)
+- [ ] Language change: parser, type system, validator, codegen
+- [ ] Runtime change: engine, dispatcher, listener, supervisor, broker
+- [ ] The graph renderer
+- [ ] The VS Code extension
 - [ ] Docs
 - [ ] Refactor
 - [ ] Other:
 
 ## Checklist
 
-- [ ] `cargo build`, `cargo test`, and `cargo clippy` pass.
-- [ ] `pnpm -C dashboard check` passes (if frontend changed).
-- [ ] New code has tests. Bug fixes have a regression test.
-- [ ] No unrelated formatting churn.
-- [ ] No commented-out code.
-- [ ] No `TODO` or `FIXME` without a linked issue.
-- [ ] If this is a node, backend and frontend port names/types match, and I built a tiny project that uses it end to end.
-- [ ] If this is a language change, I opened an issue first and it was approved.
+- [ ] `cargo test` and `cargo clippy` pass.
+- [ ] If you touched the graph renderer, `pnpm -C packages/weft-graph test` passes.
+- [ ] If you touched the VS Code extension, `pnpm -C extension-vscode test` passes.
+- [ ] New code has tests, at [the right
+      layer](https://weavemindai.github.io/weft/running/architecture.html#testing-in-four-layers).
+- [ ] A bug fix has a regression test that fails before the fix.
+- [ ] Docs updated, if this changes behavior the docs describe.
+- [ ] If you changed SQL, the `db-tests` suites pass against a real Postgres.
+- [ ] A new node holds up against [the review
+      list](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#writing-a-node-for-the-standard-catalogue).
+- [ ] If you built this with an AI assistant, `/flow-4-review` and
+      `/flow-5-review-check` ran as a pair until a pair turned up nothing.
 
-## Screenshots / demo (if applicable)
+## Anything reviewers should look at twice
 
-<!-- Drop screenshots, a short video, or a link to a deployed preview. -->
-
-## Anything reviewers should pay extra attention to
-
-<!-- Tricky part, alternative you considered, tradeoff you are not sure about. Be honest, we will notice anyway. -->
+<!--
+The tricky part, an alternative you rejected, a tradeoff you are unsure about.
+Saying it here turns a review comment into a conversation you already started.
+-->

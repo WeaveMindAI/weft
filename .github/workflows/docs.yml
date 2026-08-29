@@ -1,0 +1,70 @@
+# Build the mdBook in docs/ and publish it to GitHub Pages.
+#
+# The book's source is plain markdown that also reads correctly on github.com,
+# so this workflow only adds search, navigation, and rendered mermaid. A broken
+# internal link fails the build rather than shipping: `create-missing` is off in
+# book.toml, so a SUMMARY entry with no file is an error here.
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time. A queued run supersedes a waiting one, but never
+# cancels a deploy already in flight.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the mdbook binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: mdbook-${{ runner.os }}-v1
+
+      - name: Install mdbook
+        run: |
+          set -euo pipefail
+          command -v mdbook          >/dev/null || cargo install mdbook --locked
+          command -v mdbook-mermaid  >/dev/null || cargo install mdbook-mermaid --locked
+
+      - name: Build
+        run: |
+          cd docs
+          mdbook-mermaid install .
+          mdbook build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    # Pull requests build the book to catch dead links, and stop there.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

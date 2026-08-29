@@ -28,6 +28,7 @@
     {
       "name": "description",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "The voice description (kept with the voice)."
     },

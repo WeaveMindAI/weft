@@ -38,6 +38,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             key TEXT PRIMARY KEY,
             last_id BIGINT NOT NULL
         )"#,
+    ],
+    seed: &[
         "INSERT INTO dispatcher_cursor (key, last_id) VALUES ('journal_bridge', 0) \
          ON CONFLICT (key) DO NOTHING",
     ],
@@ -155,7 +157,7 @@ async fn drain_new_rows(
                 cursor.blocked_on_xid = Some(inserted_xid);
                 cursor.blocked_ticks = 1;
             }
-            if cursor.blocked_ticks % STALL_BREADCRUMB_TICKS == 0 {
+            if cursor.blocked_ticks.is_multiple_of(STALL_BREADCRUMB_TICKS) {
                 tracing::warn!(
                     target: "weft_dispatcher::journal_bridge",
                     blocking_xid = inserted_xid,
@@ -226,13 +228,13 @@ async fn process_one_row(
     let Ok(color) = color_str.parse() else {
         return Ok(());
     };
-    // NotFound and Corrupt both soft-skip: the cursor must advance
-    // past a permanently-poisoned row (the decode site already
-    // logged loud) rather than stall the fleet.
-    let project_id = match state.journal.execution_project(color).await?.found() {
-        Some(p) => p,
-        None => return Ok(()),
+    // A missing row soft-skips: the cursor must advance past a row for
+    // a wiped execution rather than stall the fleet. Read ONCE here;
+    // the terminal arm below needs the tenant off the same row.
+    let Some(owner) = state.journal.execution_owner(color).await? else {
+        return Ok(());
     };
+    let project_id = owner.project_id.clone();
     // Terminal events drive signal-row cleanup + the
     // deactivate-drain CAS. Idempotent across pods: only the
     // first pod observing the terminal row removes the signal
@@ -250,17 +252,13 @@ async fn process_one_row(
             // The tenant comes from the execution's OWN journal row
             // (`execution_color.tenant_id`, frozen at start), NOT the mutable
             // project store: it is the tenant the run actually keyed its storage
-            // under, and it survives project deletion. A missing row soft-skips like
-            // `execution_project` above (a stale terminal event for a wiped execution
-            // must advance the cursor, never poison it).
-            if let Some(tenant) = state.journal.execution_tenant(color).await?.found() {
-                crate::storage::enqueue_sweep(
-                    &state.pg_pool,
-                    &tenant,
-                    &color.to_string(),
-                )
-                .await?;
-            }
+            // under, and it survives project deletion.
+            crate::storage::enqueue_sweep(
+                &state.pg_pool,
+                &owner.tenant,
+                &color.to_string(),
+            )
+            .await?;
         }
         // A suspension is the running -> suspended edge of the drain
         // condition: `running_count` excludes suspended colors (the
@@ -297,10 +295,10 @@ async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> a
 
     // If signal_remove_for_color found nothing (entry trigger or
     // already-cleaned execution), still try to find the project
-    // via execution_project so the drain-watcher fires.
+    // via the execution's own row so the drain-watcher fires.
     let project_id = match project_id {
         Some(p) => Some(p),
-        None => state.journal.execution_project(color).await?.found(),
+        None => state.journal.execution_owner(color).await?.map(|o| o.project_id),
     };
     if let Some(project_id) = project_id {
         try_finish_drain(state, &project_id, None).await?;
@@ -395,12 +393,13 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 project_id,
             }]
         }
-        ExecEvent::NodeSkipped { color, node_id, frames, closed_ports, .. } => {
+        ExecEvent::NodeSkipped { color, node_id, frames, closed_ports, reason, .. } => {
             vec![DispatcherEvent::NodeSkipped {
                 color: *color,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 closed_ports: closed_ports.clone(),
+                reason: reason.clone(),
                 project_id,
             }]
         }

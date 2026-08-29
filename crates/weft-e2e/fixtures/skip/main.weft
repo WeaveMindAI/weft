@@ -1,17 +1,19 @@
-# Null-propagation: a Gate whose `pass` is false closes its `value` output, so
-# the downstream Debug never runs (it is SKIPPED, not failed). ExecPython emits
-# both the literal value and the boolean gate signal inline.
+# Branching: a node whose `_should_flow` says no does not run, and the
+# nodes behind it close in turn. ExecPython emits both the value and the
+# permission inline, so the whole branch lives in one file.
 #
-# The rig asserts: the gate ran, but `out` was skipped (closed input), never
-# started. This is the core "branch off on null" behavior of the language.
+# The rig asserts: `blocked` was skipped (it was told not to run) and so
+# was `out` behind it, while the execution itself completed. This is the
+# core "one branch turns the other off" behavior of the language.
 
-source = ExecPython() -> (value: String, pass: Boolean) {
-  code: "return {'value': 'never-delivered', 'pass': False}"
+source = ExecPython() -> (value: String, allowed: Boolean) {
+  code: "return {'value': 'never-delivered', 'allowed': False}"
 }
 
-gate = Gate
-gate.value = source.value
-gate.pass = source.pass
+blocked = Cast -> (value: String) {
+  value: source.value
+  _should_flow: source.allowed
+}
 
 out = Debug
-out.data = gate.value
+out.data = blocked.value

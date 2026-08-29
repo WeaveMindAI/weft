@@ -164,6 +164,7 @@
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     node_test: false,
+                    subgraph: None,
                     at_unix: 0,
                 },
                 None,
@@ -325,7 +326,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            node_test: false, at_unix: 0,
+            node_test: false, subgraph: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: "waiter".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -590,7 +591,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            node_test: false, at_unix: 0,
+            node_test: false, subgraph: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: creator.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1090,7 +1091,7 @@
             journal.record_event(&ExecEvent::ExecutionStarted {
                 color, project_id: pid.clone(), entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            node_test: false, at_unix: 0,
+            node_test: false, subgraph: None, at_unix: 0,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
                 color, node_id: "payer".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1350,6 +1351,7 @@
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     node_test: false,
+                    subgraph: None,
                     at_unix: 0,
                 },
                 None,
@@ -2119,6 +2121,7 @@
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     node_test: false,
+                    subgraph: None,
                     at_unix: 0,
                 },
                 None,
@@ -2466,7 +2469,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
-            node_test: false, at_unix: 0,
+            node_test: false, subgraph: None, at_unix: 0,
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {

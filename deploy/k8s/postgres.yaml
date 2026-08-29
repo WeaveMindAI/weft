@@ -4,6 +4,51 @@
 # the broker reach Postgres directly (god mode + intra-namespace).
 # Tenant pods cannot reach this Service: NetworkPolicy in `weft-db`
 # denies their ingress.
+# The database's files live on the machine running the cluster, mounted into
+# the node at this path, rather than inside the node's own filesystem. A node
+# is a container and cannot change shape in place, so applying a change to the
+# cluster means building a new node; keeping the data out here is what makes
+# that cost nothing.
+# SYNC: hostPath <-> crates/weft-cli/src/commands/daemon.rs (NODE_POSTGRES_PATH)
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: weft-postgres-data
+  labels:
+    app: weft-postgres
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: [ReadWriteOnce]
+  # Kept when the claim goes, so deleting the namespace never deletes the
+  # bytes. A deleted claim does leave this volume `Released` with a stale
+  # claimRef uid; the pre-bound claimRef below plus the daemon clearing a
+  # Released ref is what lets a recreated claim rebind instead of hanging
+  # Pending forever.
+  persistentVolumeReclaimPolicy: Retain
+  # Pre-bind to the one claim that may ever use this volume, so nothing
+  # else can grab it and a fresh claim of this name binds immediately.
+  claimRef:
+    namespace: weft-db
+    name: weft-postgres-data
+  # Empty rather than absent: an empty class opts out of dynamic provisioning,
+  # so the claim below binds to THIS volume instead of having the default
+  # provisioner carve a fresh empty one inside the node.
+  storageClassName: ""
+  hostPath:
+    path: /var/weft-postgres
+    # This whole `hostPath` block sits inside spec.persistentVolumeSource,
+    # which Kubernetes FREEZES at creation: any edit here can never be
+    # applied to an existing volume (the apply is refused, and replacing
+    # the volume would take the database's binding with it), so whatever
+    # is written here is written forever. `DirectoryOrCreate` matches
+    # every volume already out there. The protection a stricter type
+    # once bought (fail rather than silently grow a fresh database in a
+    # node missing the host mount) lives in the daemon instead: a node
+    # without the mount is refused before any manifest applies
+    # (`ensure_cluster`'s mount probe).
+    type: DirectoryOrCreate
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -13,6 +58,8 @@ metadata:
     app: weft-postgres
 spec:
   accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: weft-postgres-data
   resources:
     requests:
       storage: 5Gi
@@ -41,7 +88,8 @@ metadata:
   labels:
     weft.dev/scope: local-dev-only
 type: Opaque
-# SYNC: local-dev PG credentials <-> crates/weft-e2e/src/platform.rs (PG_USER/PG_PASSWORD/PG_DBNAME)
+# SYNC: local-dev PG credentials <-> crates/weft-e2e/src/platform.rs (PG_USER/PG_PASSWORD/PG_DBNAME),
+#       setup.sh (WEFT_LIVE_DATABASE_URL), scripts/run-e2e.sh (WEFT_E2E_DATABASE_URL)
 data:
   POSTGRES_USER: d2VmdA==
   POSTGRES_PASSWORD: d2VmdC1sb2NhbC1kZXY=
@@ -92,7 +140,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:16-alpine
+          image: postgres:18-alpine
           ports:
             - containerPort: 5432
               name: postgres

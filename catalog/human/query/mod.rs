@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::form_helpers::{build_form, map_response_to_ports, parse_form_fields};
+use super::form_helpers::{build_form, form_specs, map_response_to_ports, parse_form_fields};
 
 #[derive(NodeManifest)]
 pub struct HumanQueryNode;
@@ -23,7 +23,7 @@ impl Node for HumanQueryNode {
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let raw_fields = parse_form_fields(ctx.inputs.object()?);
-        let specs = &self.manifest().form_field_specs;
+        let specs = form_specs(self.manifest())?;
 
         // Project the node's DATA inputs into a flat {key: value} map so
         // display / prefilled / source=input fields can lift them out by
@@ -38,6 +38,6 @@ impl Node for HumanQueryNode {
 
         let form = build_form(&ctx.inputs, specs, "human-query", &prefill)?;
         let submission = ctx.await_signal(form).await?;
-        ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)).await
+        ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)?).await
     }
 }

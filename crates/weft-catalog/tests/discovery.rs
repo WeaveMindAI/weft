@@ -236,14 +236,15 @@ fn lenient_collision_warns_and_keeps_first() {
     assert_eq!(claimers, 1, "only the winning package lists Dup");
 }
 
-/// Discovery must not follow symlinks anywhere in a node tree, so it
-/// agrees with the (no-follow) build-staging copy and source-hash
-/// walk. A symlinked package member discovered here but dropped by
-/// staging/hash would serve a stale worker image. Covers both the
-/// recursive descent and the package member-detection loop.
+/// Discovery follows symlinks anywhere in a node tree, so a project's
+/// `nodes/base_catalog` can be one symlink into a weft checkout's
+/// `catalog/` (this repo's `examples/` do exactly that). The staging
+/// copy, the pack, and the source-hash walk follow the same way, so
+/// what is discovered and what reaches the build context agree.
+/// Covers both the recursive descent and the package member loop.
 #[test]
 #[cfg(unix)]
-fn discovery_does_not_follow_symlinked_members() {
+fn discovery_follows_symlinked_members() {
     use std::os::unix::fs::symlink;
     let tmp = tempfile::tempdir().unwrap();
     let nodes = tmp.path().join("nodes");
@@ -253,34 +254,26 @@ fn discovery_does_not_follow_symlinked_members() {
     write_package_toml(&pkg, "pkg");
     write_node(&pkg.join("real"), "Real");
 
-    // A second real node elsewhere, symlinked INTO the package as a
-    // member. Following the link would register it as a pkg member.
-    let external = nodes.join("external");
+    // A node living OUTSIDE nodes/, symlinked into the package as a
+    // member.
+    let external = tmp.path().join("external");
     write_node(&external, "Linked");
     symlink(&external, pkg.join("linked")).unwrap();
 
     let cat = FsCatalog::discover(&nodes).unwrap();
     assert!(cat.entry("Real").is_some(), "real member discovered");
-    // `external` itself is a real bare node directly under nodes/, so
-    // `Linked` IS discovered via that path. What must NOT happen is the
-    // symlinked `pkg/linked` being walked as a pkg member: the pkg must
-    // own exactly its one real member.
-    let pkg_desc = cat.package_of("Real").expect("pkg");
-    assert_eq!(
-        pkg_desc.node_types,
-        vec!["Real".to_string()],
-        "package must not pick up a symlinked member",
-    );
+    assert!(cat.entry("Linked").is_some(), "symlinked member discovered");
+    let mut members = cat.package_of("Real").expect("pkg").node_types.clone();
+    members.sort();
+    assert_eq!(members, vec!["Linked".to_string(), "Real".to_string()]);
 }
 
-/// A unit defined by a SYMLINKED marker file must not be discovered:
-/// the no-follow staging copy and hash walk would drop the symlinked
-/// `metadata.json`, so a discovered-but-unstaged unit would serve a
-/// broken/stale worker image. Unit detection uses the same no-follow
-/// view as the walks, so the unit simply isn't detected (consistent).
+/// A unit defined by a SYMLINKED marker file is a real unit: the
+/// symlink-following staging copy and hash walk carry the target's
+/// bytes, so what is discovered is exactly what builds.
 #[test]
 #[cfg(unix)]
-fn symlinked_marker_does_not_define_a_unit() {
+fn symlinked_marker_defines_a_unit() {
     use std::os::unix::fs::symlink;
     let tmp = tempfile::tempdir().unwrap();
     let nodes = tmp.path().join("nodes");
@@ -298,75 +291,123 @@ fn symlinked_marker_does_not_define_a_unit() {
     symlink(&shared_meta, node.join("metadata.json")).unwrap();
 
     let cat = FsCatalog::discover(&nodes).unwrap();
+    assert!(cat.entry("Sneaky").is_some(), "symlink-marked node discovered");
+}
+
+/// A symlink cycle in a node tree fails loudly instead of walking
+/// forever.
+#[test]
+#[cfg(unix)]
+fn symlink_cycle_errors_loudly() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = tmp.path().join("nodes");
+    let a = nodes.join("a");
+    fs::create_dir_all(&a).unwrap();
+    symlink(&nodes, a.join("back")).unwrap();
+
+    let err = FsCatalog::discover(&nodes).expect_err("cycle must error");
     assert!(
-        cat.entry("Sneaky").is_none(),
-        "a node whose metadata.json is a symlink must not be discovered \
-         (staging/hash would drop the symlinked marker)",
+        err.to_string().contains("symlink cycle"),
+        "error names the cycle: {err}",
     );
 }
 
-/// A `formFieldSpecs` metadata value with a single spec whose `field_type`
+/// Two symlinks to the SAME shared directory are a DAG, not a cycle:
+/// the guard watches the descent chain, so reaching one directory
+/// twice by different paths walks fine. (The two copies then collide
+/// as duplicate node types, which is the honest error for that shape;
+/// here the shared target holds no node so discovery just succeeds.)
+#[test]
+#[cfg(unix)]
+fn two_symlinks_to_one_target_are_not_a_cycle() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let nodes = tmp.path().join("nodes");
+    fs::create_dir_all(&nodes).unwrap();
+    let shared = tmp.path().join("shared");
+    fs::create_dir_all(&shared).unwrap();
+    symlink(&shared, nodes.join("one")).unwrap();
+    symlink(&shared, nodes.join("two")).unwrap();
+
+    FsCatalog::discover(&nodes).expect("a DAG of symlinks walks clean");
+}
+
+/// A `portsFromConfig` metadata value with a single spec whose `kind`
 /// is `tag` (so a test can tell WHICH definition site won the merge).
 fn specs_json(tag: &str) -> String {
-    format!(r#"[{{ "field_type": "{tag}", "label": "{tag}", "render": {{ "component": "text" }} }}]"#)
+    format!(
+        r#"{{ "field": "fields", "specs": [{{ "kind": "{tag}", "label": "{tag}",
+              "render": {{ "component": "text" }},
+              "addsOutputs": [{{ "nameTemplate": "{{key}}", "portType": "String" }}] }}] }}"#
+    )
+}
+
+/// A node that declares the `fields` config input its ports come from,
+/// with `body` folded in (its own `portsFromConfig`, or nothing when the
+/// package root supplies it).
+fn write_derived_ports_node(dir: &Path, node_type: &str, body: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("metadata.json"),
+        format!(
+            r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "",
+                  "inputs": [{{ "name": "fields", "type": "List[JsonDict]",
+                               "exposure": "config" }}],
+                  "outputs": []{body} }}"#
+        ),
+    )
+    .unwrap();
+    fs::write(dir.join("mod.rs"), "// node impl\n").unwrap();
 }
 
 /// Package-level metadata defaults: a PARTIAL `metadata.json` at the package
 /// root is merged into every member key-by-key, the member's own key winning
 /// wholesale. Exercised on the two shared keys that exist today
-/// (`formFieldSpecs`, `provider`); the mechanism is key-agnostic.
+/// (`portsFromConfig`, `provider`); the mechanism is key-agnostic.
 #[test]
 fn package_metadata_defaults_merge_key_by_key_member_wins() {
     let tmp = tempfile::tempdir().unwrap();
     let nodes = tmp.path().join("nodes");
 
     // Package with root defaults and two members: one plain (inherits both
-    // keys), one that carries its own `formFieldSpecs` (overrides that key,
+    // keys), one that carries its own `portsFromConfig` (overrides that key,
     // still inherits `provider`).
     let pkg = nodes.join("pack");
     write_package_toml(&pkg, "pack");
     fs::write(
         pkg.join("metadata.json"),
-        format!(r#"{{ "formFieldSpecs": {} }}"#, specs_json("root_spec")),
+        format!(r#"{{ "portsFromConfig": {} }}"#, specs_json("root_spec")),
     )
     .unwrap();
-    write_node(&pkg.join("inherits"), "Inherits");
-    let overrides = pkg.join("overrides");
-    fs::create_dir_all(&overrides).unwrap();
-    fs::write(overrides.join("mod.rs"), "// impl\n").unwrap();
-    fs::write(
-        overrides.join("metadata.json"),
-        format!(
-            r#"{{ "type": "Overrides", "label": "o", "description": "",
-                  "formFieldSpecs": {} }}"#,
-            specs_json("member_spec")
-        ),
-    )
-    .unwrap();
+    write_derived_ports_node(&pkg.join("inherits"), "Inherits", "");
+    write_derived_ports_node(
+        &pkg.join("overrides"),
+        "Overrides",
+        &format!(r#", "portsFromConfig": {}"#, specs_json("member_spec")),
+    );
 
     // A bare node with its own key beside nothing: no defaults in play.
-    let bare = nodes.join("bare");
-    fs::create_dir_all(&bare).unwrap();
-    fs::write(bare.join("mod.rs"), "// impl\n").unwrap();
-    fs::write(
-        bare.join("metadata.json"),
-        format!(
-            r#"{{ "type": "Bare", "label": "b", "description": "",
-                  "formFieldSpecs": {} }}"#,
-            specs_json("bare_spec")
-        ),
-    )
-    .unwrap();
+    write_derived_ports_node(
+        &nodes.join("bare"),
+        "Bare",
+        &format!(r#", "portsFromConfig": {}"#, specs_json("bare_spec")),
+    );
 
     let cat = FsCatalog::discover(&nodes).unwrap();
 
-    let field_type = |t: &str| {
-        cat.entry(t).unwrap().metadata.form_field_specs.first().map(|s| s.field_type.clone())
+    let kind = |t: &str| {
+        cat.entry(t)
+            .unwrap()
+            .metadata
+            .ports_from_config
+            .as_ref()
+            .and_then(|p| p.specs.first())
+            .map(|s| s.kind.clone())
     };
-    assert_eq!(field_type("Inherits"), Some("root_spec".into()), "member inherits package defaults");
-    assert_eq!(field_type("Overrides"), Some("member_spec".into()), "member's own key wins wholesale");
-    assert_eq!(field_type("Bare"), Some("bare_spec".into()), "bare node reads its own metadata");
-
+    assert_eq!(kind("Inherits"), Some("root_spec".into()), "member inherits package defaults");
+    assert_eq!(kind("Overrides"), Some("member_spec".into()), "member's own key wins wholesale");
+    assert_eq!(kind("Bare"), Some("bare_spec".into()), "bare node reads its own metadata");
 }
 
 /// A package-level `metadata.json` that sets an IDENTITY key (`type`,

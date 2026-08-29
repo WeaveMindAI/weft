@@ -41,8 +41,31 @@
 #   (multiple combine)
 #
 # CLI knobs:
+#   --rebuild     force the daemon images to be rebuilt even when nothing
+#                 they are built from has changed. For when an image is
+#                 corrupt or hand-modified; a plain run already rebuilds
+#                 whatever actually moved.
+#   --rebuild-cluster  allow the daemon to delete and recreate the kind
+#                 cluster when its shape changed. Every project's own
+#                 database lives inside the node and is destroyed with it,
+#                 so this is never done without the flag.
 #   --debug       build CLI with the debug profile
 #   --prefix PATH install CLI binary into PATH/bin (default ~/.local)
+#
+# Changing a table:
+#   --migration NAME  Write the migration for whatever you changed in a
+#                     CREATE TABLE, then install as usual, which applies it.
+#                     Compares the schema your database has against the one
+#                     your code now declares and writes the difference. By
+#                     itself it writes a DRAFT: gitignored, yours alone, and
+#                     applied to your database like any other migration, so
+#                     nothing you have stored is lost while you are still
+#                     deciding the shape. Ask as often as you change the
+#                     table.
+#   --release         With --migration: collapse every draft into one
+#                     released migration, the one that goes in the PR, and
+#                     tell your database it is already in it. Nothing is
+#                     re-run and nothing is lost.
 #
 # Removal:
 #   --uninstall   Remove user-facing pieces but preserve work. Stops
@@ -61,15 +84,16 @@
 #                 every weft infra image, the object-store
 #                 container + data volume + seaweedfs image, the
 #                 BuildKit cache, the workspace target/ cargo
-#                 cache, ~/.local/share/weft (image-hash stamps,
-#                 port-forward state, etc), and every extension
+#                 cache, ~/.local/share/weft (THE DATABASE'S FILES
+#                 under postgres-data/, image-hash stamps,
+#                 port-forward state), and every extension
 #                 build artifact. The next install pays a full
 #                 cold-rebuild cost. Can combine with --uninstall.
 #
 #                 SHARED base images (commonly reused by other
 #                 docker projects on the host) are kept by default.
 #                 Add the matching flag to remove them too:
-#                   --postgres   remove postgres:16-alpine
+#                   --postgres   remove postgres:18-alpine
 #                   --kind       remove kindest/node images
 #                   --debian     remove debian:bookworm-slim
 #
@@ -241,6 +265,10 @@ profile="release"
 prefix="${HOME}/.local"
 do_uninstall=0
 do_purge=0
+write_migration=""
+do_release=0
+rebuild_flag=""
+rebuild_cluster_flag=""
 purge_debian=0
 purge_kind=0
 purge_postgres=0
@@ -351,11 +379,24 @@ while [[ $# -gt 0 ]]; do
     --opera)     targets_flip; target_opera=1 ;;
     --safari)    targets_flip; target_safari=1 ;;
 
+    --rebuild)   rebuild_flag="--rebuild" ;;
+    --rebuild-cluster) rebuild_cluster_flag="--rebuild-cluster" ;;
     --debug)     profile="dev" ;;
-    --prefix)    shift; prefix="$1" ;;
+    --prefix)
+      shift
+      [[ $# -gt 0 ]] || { fail "--prefix needs a path"; exit 1; }
+      prefix="$1" ;;
+    --migration)
+      shift
+      [[ $# -gt 0 ]] || { fail "--migration needs a name: ./setup.sh --migration add_owner"; exit 1; }
+      write_migration="$1" ;;
+    --release)   do_release=1 ;;
 
     -h|--help)
-      sed -n '2,85p' "$0" | sed 's/^# \{0,1\}//'
+      # The whole leading comment block, however long it grows: from
+      # line 2, print `#` lines with the marker stripped, stop at the
+      # first non-comment line.
+      awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"
       exit 0
       ;;
     *)
@@ -371,6 +412,77 @@ done
 # wrong one and rebuild stale source; print the tree up front so a wrong-tree
 # run is obvious before anything is built.
 hint "building from ${C_BOLD}${here}${C_RESET}"
+
+# ---- --migration: write the migration, then carry on installing -------
+#
+# Writing it needs a Postgres to build two schemas in and compare them, and the
+# one weft runs lives inside the cluster where nothing outside can reach it, so
+# this runs a throwaway container and takes it away again. Releasing also needs
+# to reach the real one, to swap its drafts for the released file, which it
+# does through a port-forward the way the tests do.
+if [[ $do_release -eq 1 && -z "${write_migration}" ]]; then
+  fail "--release only means something with --migration <name>: it collapses that run's drafts"
+  exit 1
+fi
+
+if [[ -n "${write_migration}" ]]; then
+  section "migration"
+  # shellcheck source=scripts/lib/throwaway-postgres.sh
+  . "${here}/scripts/lib/throwaway-postgres.sh"
+  # Chain onto the script's existing exit logger so a Ctrl-C mid-run
+  # leaves neither the container nor the port-forward behind.
+  pf_pid=""
+  migration_cleanup() {
+    [[ -n "${pf_pid}" ]] && { kill "${pf_pid}" 2>/dev/null || true; }
+    [[ -n "${THROWAWAY_PG_CONTAINER:-}" ]] \
+      && docker rm -f "${THROWAWAY_PG_CONTAINER}" >/dev/null 2>&1 || true
+  }
+  trap 'migration_cleanup; log_run_exit' EXIT
+  if ! start_throwaway_postgres weft-migration-scratch; then
+    fail "could not start a scratch postgres in docker"
+    exit 1
+  fi
+  export DATABASE_URL="$THROWAWAY_DATABASE_URL"
+
+  release_flag=""
+  if [[ $do_release -eq 1 ]]; then
+    release_flag="--release"
+    if ! kubectl get namespace weft-db >/dev/null 2>&1; then
+      fail "releasing has to reach the database you have been working against, and no cluster is up"
+      exit 1
+    fi
+    kubectl -n weft-db port-forward svc/weft-postgres 15433:5432 >/dev/null 2>&1 &
+    pf_pid=$!
+    # SYNC: local-dev PG credentials <-> deploy/k8s/postgres.yaml (WEFT_DATABASE_URL secret),
+    #       crates/weft-e2e/src/platform.rs (PG_USER/PG_PASSWORD/PG_DBNAME),
+    #       scripts/run-e2e.sh (WEFT_E2E_DATABASE_URL)
+    export WEFT_LIVE_DATABASE_URL="postgres://weft:weft-local-dev@127.0.0.1:15433/weft"
+    pf_up=0
+    for _ in $(seq 1 30); do
+      (exec 3<>/dev/tcp/127.0.0.1/15433) 2>/dev/null && { pf_up=1; break; }
+      sleep 1
+    done
+    if [[ $pf_up -ne 1 ]]; then
+      fail "the port-forward to weft-postgres (127.0.0.1:15433) never came up"
+      exit 1
+    fi
+  fi
+
+  # A failure in one crate leaves the other's release intact and this
+  # command re-runnable: the generator only deletes a crate's drafts
+  # after its released file is recorded on the live database, and a
+  # released crate answers "nothing changed" on the re-run.
+  for pkg in weft-dispatcher weft-broker; do
+    if ! cargo run -q -p "${pkg}" --features db-tests --example schema_migration \
+        -- "${write_migration}" ${release_flag}; then
+      fail "writing the migration failed in ${pkg}; fix the cause and re-run the same command"
+      exit 1
+    fi
+  done
+  migration_cleanup
+  trap log_run_exit EXIT
+  hint "carrying on with the install, which applies it"
+fi
 
 bin_dir="${prefix}/bin"
 weft_bin="${bin_dir}/weft"
@@ -523,8 +635,10 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     #    user chained --purge, those things are already gone.
     if [[ $do_purge -eq 0 ]]; then
       printf '\n%s%sWhat is preserved:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
-      printf "  %skind cluster%s %s'%s' (postgres, history, projects)%s\n" \
+      printf "  %skind cluster%s %s'%s' (the running pods)%s\n" \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${WEFT_CLUSTER_NAME:-weft-local}" "${C_RESET}"
+      printf '  %s~/.local/share/weft%s %s(the database: postgres, history, projects)%s\n' \
+        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sobject store%s %s(weft-object-store container + data volume)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sdocker images%s %s(dispatcher, listener, weft-worker-*)%s\n' \
@@ -596,8 +710,8 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
       # Shared base images, gated.
       if [[ $purge_postgres -eq 1 ]]; then
-        docker image rm -f postgres:16-alpine >/dev/null 2>&1 || true
-        ok "removed postgres:16-alpine ${C_DIM}(--postgres)${C_RESET}"
+        docker image rm -f postgres:18-alpine >/dev/null 2>&1 || true
+        ok "removed postgres:18-alpine ${C_DIM}(--postgres)${C_RESET}"
       fi
       if [[ $purge_kind -eq 1 ]]; then
         kind_ids="$(docker images kindest/node -q 2>/dev/null | sort -u)"
@@ -680,8 +794,8 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     # Shared-base hint footer.
     skipped_lines=()
     if [[ $purge_postgres -eq 0 ]]; then
-      if docker image inspect postgres:16-alpine >/dev/null 2>&1; then
-        skipped_lines+=("postgres:16-alpine|--postgres")
+      if docker image inspect postgres:18-alpine >/dev/null 2>&1; then
+        skipped_lines+=("postgres:18-alpine|--postgres")
       fi
     fi
     if [[ $purge_kind -eq 0 ]]; then
@@ -904,12 +1018,12 @@ if [[ $refresh_daemon -eq 1 ]]; then
     dispatcher_url="${WEFT_DISPATCHER_URL:-http://127.0.0.1:9999}"
     if curl --silent --max-time 2 "${dispatcher_url}/health" >/dev/null 2>&1; then
       hint "daemon running at ${C_DIM}${dispatcher_url}${C_RESET}; refreshing (no-op if nothing changed)"
-      spin_passthrough "weft daemon restart --rebuild" \
-        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon restart --rebuild ${public_url_flag}
+      spin_passthrough "weft daemon restart" \
+        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon restart ${rebuild_flag} ${rebuild_cluster_flag} ${public_url_flag}
     else
       hint "daemon not running; first install pulls images and creates the kind cluster (~2-3 min)"
-      spin_passthrough "weft daemon start --rebuild" \
-        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start --rebuild ${public_url_flag}
+      spin_passthrough "weft daemon start" \
+        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start ${rebuild_flag} ${rebuild_cluster_flag} ${public_url_flag}
     fi
   fi
 fi
@@ -924,7 +1038,7 @@ if [[ -r "${HOME}/.local/share/weft/public-url-enabled" \
 fi
 if [[ -n "${public_url}" && $is_default_install_pending -eq 0 ]]; then
   # Non-default installs print no summary block, so say it here.
-  hint "public trigger surface: ${C_BOLD}${public_url}${C_RESET}${C_DIM} (event pushes + signal fire links only)"
+  hint "public surface: ${C_BOLD}${public_url}${C_RESET}${C_DIM} (event pushes, signal fire links, file share links, OAuth callback)"
 fi
 
 # ---- VS Code extension -----------------------------------------------
@@ -978,6 +1092,9 @@ if [[ $build_vscode -eq 1 ]]; then
   # the extension's install. Created up-front (not inside the rebuild branch) so a
   # bare `pnpm run check:webview` resolves too. One symlink, no dep-list dup.
   ln -sfn ../../extension-vscode/node_modules ../packages/weft-graph/node_modules
+  # Same borrow for the grammars package: its only dependency is the
+  # highlight.js the extension already installs, for its own tests.
+  ln -sfn ../../extension-vscode/node_modules ../packages/weft-syntax/node_modules
 
   # Skip rebuild if nothing under src/ + config + package.json has
   # changed since the last successful build. We hash inputs and
@@ -994,12 +1111,21 @@ if [[ $build_vscode -eq 1 ]]; then
       # stale cached .vsix that installs old code.
       find src ../packages/weft-graph/src -type f \( -name '*.ts' -o -name '*.svelte' -o -name '*.css' \) -print0 \
         2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
+      # The package's own svelte config sits above `src` and is a build input
+      # too, since vite's root for the webview is inside the package.
+      sha256sum ../packages/weft-graph/svelte.config.mjs 2>/dev/null
       # package.json WITHOUT its version field: every build bumps the version
       # (so VS Code reinstalls), and that bump must not itself count as a source
       # change, or the skip would never hit and we'd rebuild on every run.
       node -e "const p=require('./package.json');delete p.version;process.stdout.write(JSON.stringify(p))" 2>/dev/null
       sha256sum pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs \
+        vite.markdown-preview.config.mjs markdown-preview/hljs-entry.js \
         tsconfig.json tsconfig.webview.json language-configuration.json 2>/dev/null
+      # The grammars ship from `../packages/weft-syntax` (symlinked into
+      # `syntaxes/` and `markdown-preview/`), so a colour change there has to
+      # produce a new .vsix.
+      find ../packages/weft-syntax -type f -print0 2>/dev/null \
+        | sort -z | xargs -0 sha256sum 2>/dev/null
     } | sha256sum | awk '{print $1}'
   )"
   prior_hash="$(cat "${hash_file}" 2>/dev/null || echo)"
@@ -1017,7 +1143,7 @@ if [[ $build_vscode -eq 1 ]]; then
     # version (touching its mtime), so it would always look "newer" than the
     # vsix and defeat the skip. The version-stripped content hash above already
     # catches any real package.json change.
-    newest_src="$(find src ../packages/weft-graph/src pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs tsconfig.json tsconfig.webview.json -type f -newer "${existing_vsix}" -print -quit 2>/dev/null)"
+    newest_src="$(find src ../packages/weft-graph/src ../packages/weft-graph/svelte.config.mjs ../packages/weft-syntax pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs vite.markdown-preview.config.mjs markdown-preview/hljs-entry.js tsconfig.json tsconfig.webview.json -type f -newer "${existing_vsix}" -print -quit 2>/dev/null)"
     [[ -z "${newest_src}" ]] && vsix_is_fresh="yes"
   fi
 
@@ -1039,6 +1165,7 @@ if [[ $build_vscode -eq 1 ]]; then
     spin "pnpm install" pnpm install --prefer-offline
     spin "tsc compile" pnpm run compile
     spin "vite bundle webview" pnpm run bundle:webview
+    spin "vite bundle markdown preview" pnpm run bundle:markdown-preview
     # New compiled output => bump the fingerprint version + repackage.
     prev_ver="${current_ver}"
     npm version patch --no-git-tag-version >/dev/null

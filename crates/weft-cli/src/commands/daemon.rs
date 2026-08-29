@@ -448,24 +448,24 @@ fn apiserver_clusterip(service_cidr: &str) -> std::result::Result<String, String
 }
 
 pub enum DaemonAction {
-    Start { rebuild: bool, public_url: Option<bool> },
+    Start { rebuild: bool, rebuild_cluster: bool, public_url: Option<bool> },
     Stop,
     Status,
-    Restart { rebuild: bool, public_url: Option<bool> },
+    Restart { rebuild: bool, rebuild_cluster: bool, public_url: Option<bool> },
     Logs { tail: usize, follow: bool },
 }
 
 pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
     match action {
-        DaemonAction::Start { rebuild, public_url } => {
+        DaemonAction::Start { rebuild, rebuild_cluster, public_url } => {
             set_public_url_choice(public_url)?;
-            start(&ctx, rebuild).await
+            start(&ctx, rebuild, rebuild_cluster).await
         }
         DaemonAction::Stop => stop().await,
         DaemonAction::Status => status(&ctx).await,
-        DaemonAction::Restart { rebuild, public_url } => {
+        DaemonAction::Restart { rebuild, rebuild_cluster, public_url } => {
             set_public_url_choice(public_url)?;
-            restart(&ctx, rebuild).await
+            restart(&ctx, rebuild, rebuild_cluster).await
         }
         DaemonAction::Logs { tail, follow } => logs(tail, follow).await,
     }
@@ -476,7 +476,7 @@ pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
 /// image changed. If neither image changed AND the daemon is
 /// already healthy, this is a true no-op: no pod restart, no
 /// port-forward rebuild.
-async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
+async fn restart(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     let cfg = cluster_config();
     require_binary("kubectl").await?;
     require_binary("docker").await?;
@@ -501,7 +501,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // not exist" against the absent cluster. Mirrors `start`'s ordering.
     if cfg.backend == ClusterBackend::Kind {
         require_binary("kind").await?;
-        ensure_cluster(cfg).await?;
+        ensure_cluster(cfg, rebuild_cluster).await?;
         ensure_object_store(cfg).await?;
         ensure_ingress_controller().await?;
         ensure_envoy_gateway().await?;
@@ -527,13 +527,25 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // mounted), so a change here rolls the broker below.
     let apps_changed = apply_access_apps_secret(cfg).await?;
 
+    // "Behind" per component = built this run, OR the built and rolled
+    // stamps disagree. The second half is what survives an ABORTED
+    // earlier restart: a run that built an image (stamping the build)
+    // and died before this rollout block would otherwise leave the pods
+    // on old content forever, with every later run reading "unchanged".
+    let dispatcher_behind =
+        dispatcher_built || images::pods_behind_image(&cfg.dispatcher_image);
+    let listener_behind = listener_built || images::pods_behind_image(&cfg.listener_image);
+    let broker_behind = broker_built || images::pods_behind_image(&cfg.broker_image);
+    let supervisor_behind =
+        supervisor_built || images::pods_behind_image(&cfg.supervisor_image);
+
     // The apps file mounts on the BROKER alone, so on its own it rolls
     // only the broker (below, after this block); everything else here
     // needs the dispatcher-first rollout order.
-    if dispatcher_built
-        || listener_built
-        || broker_built
-        || supervisor_built
+    if dispatcher_behind
+        || listener_behind
+        || broker_behind
+        || supervisor_behind
         || manifests_changed
         || sealing_key_changed
     {
@@ -568,6 +580,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
             anyhow::bail!("rollout restart failed");
         }
         wait_for_statefulset_ready("weft-dispatcher").await?;
+        images::mark_rolled(&cfg.dispatcher_image);
         kill_existing_port_forwards();
         start_port_forwards().await?;
         wait_for_http(&format!("http://127.0.0.1:{}/health", cfg.dispatcher_port)).await?;
@@ -583,24 +596,30 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         //     dispatcher created dynamically (same rationale as listeners).
         let db_namespace = cfg.db_namespace.to_string();
         let broker_rollout = async move {
-            if broker_built || sealing_key_changed || apps_changed {
-                let _ = kubectl(&[
+            if broker_behind || sealing_key_changed || apps_changed {
+                // Loud, never swallowed: a broker left on old bytes
+                // silently strips journal fields in transit.
+                let status = kubectl(&[
                     "-n", &db_namespace, "rollout", "restart", "deployment/weft-broker",
                 ])
                 .status()
-                .await;
+                .await?;
+                anyhow::ensure!(status.success(), "broker rollout restart failed");
+                images::mark_rolled(&cfg.broker_image);
             }
             Ok::<(), anyhow::Error>(())
         };
         let listener_rollout = async {
-            if listener_built {
+            if listener_behind {
                 roll_listener_deployments(cfg).await?;
+                images::mark_rolled(&cfg.listener_image);
             }
             Ok::<(), anyhow::Error>(())
         };
         let supervisor_rollout = async {
-            if supervisor_built {
+            if supervisor_behind {
                 roll_role_deployments("infra-supervisor", "infra-supervisor").await?;
+                images::mark_rolled(&cfg.supervisor_image);
             }
             Ok::<(), anyhow::Error>(())
         };
@@ -636,7 +655,7 @@ async fn restart(ctx: &Ctx, rebuild: bool) -> Result<()> {
         // leave the COMPLETE forward set working, so check EVERY desired forward
         // (not just the dispatcher's /health): the gateway, now programmed, is in
         // the desired set but has no live pid, so this re-establishes it.
-        let all_alive = all_forwards_alive(&cfg).await;
+        let all_alive = all_forwards_alive(cfg).await;
         if all_alive {
             println!("daemon already running with the latest images and manifests; nothing to do");
         } else {
@@ -712,11 +731,25 @@ async fn provision_images(cfg: &ClusterConfig, rebuild: bool) -> Result<BuiltIma
     };
     // Only the dispatcher stages `catalog/` (describe / compile
     // endpoints); the others must not rebuild on a catalog edit.
+    // SYNC: the crate names below <-> the `-p ... --bin ...` package list in
+    //       deploy/docker/system-images.Dockerfile
     let (dispatcher, listener, broker, supervisor, ()) = tokio::join!(
-        images::ensure_system_image(&cfg.dispatcher_image, "dispatcher", &["catalog"], rebuild),
-        images::ensure_system_image(&cfg.listener_image, "listener", &[], rebuild),
-        images::ensure_system_image(&cfg.broker_image, "broker", &[], rebuild),
-        images::ensure_system_image(&cfg.supervisor_image, "supervisor", &[], rebuild),
+        images::ensure_system_image(
+            &cfg.dispatcher_image,
+            "dispatcher",
+            "weft-dispatcher",
+            &["catalog"],
+            rebuild,
+        ),
+        images::ensure_system_image(&cfg.listener_image, "listener", "weft-listener", &[], rebuild),
+        images::ensure_system_image(&cfg.broker_image, "broker", "weft-broker", &[], rebuild),
+        images::ensure_system_image(
+            &cfg.supervisor_image,
+            "supervisor",
+            "weft-infra-supervisor",
+            &[],
+            rebuild,
+        ),
         worker_base_prewarm,
     );
     let mut failures: Vec<String> = Vec::new();
@@ -786,6 +819,7 @@ async fn apply_static_manifests(cfg: &ClusterConfig) -> Result<bool> {
     // rolling-apply list so RBAC drift (e.g. the supervisor's surface
     // growing) stays in sync.
     let template_vars = tunnel_then_template_vars(cfg, &manifests).await?;
+    prepare_postgres_apply(&manifests.join("postgres.yaml")).await?;
     for name in [
         "system-namespace.yaml",
         "db-namespace.yaml",
@@ -1120,7 +1154,8 @@ async fn reconcile_public_tunnel(manifests: &std::path::Path) -> Result<Option<S
             "  NOTE: this free-tunnel address changes whenever the tunnel reconnects, \
              and everything registered against it (a provider's event push URL, an \
              OAuth redirect) rots until re-registered. For a stable address, set \
-             WEFT_PUBLIC_TUNNEL_TOKEN + WEFT_PUBLIC_TUNNEL_HOSTNAME (docs/stable-public-address.md)."
+             WEFT_PUBLIC_TUNNEL_TOKEN + WEFT_PUBLIC_TUNNEL_HOSTNAME \
+             (https://weavemindai.github.io/weft/connections/public-address.html)."
         );
     }
     Ok(Some(url))
@@ -1178,9 +1213,7 @@ async fn wait_for_quick_tunnel_url() -> Result<String> {
         // and the startup banner's old address can still sit earlier
         // in the log. Only the newest one answers.
         if let Some(url) = text
-            .split_whitespace()
-            .filter(|w| w.starts_with("https://") && w.contains(".trycloudflare.com"))
-            .last()
+            .split_whitespace().rfind(|w| w.starts_with("https://") && w.contains(".trycloudflare.com"))
         {
             return Ok(url.trim_end_matches('/').to_string());
         }
@@ -1306,13 +1339,13 @@ fn pf_log_file(name: &str) -> PathBuf {
     data_dir().join(format!("port-forward-{name}.log"))
 }
 
-async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
+async fn start(ctx: &Ctx, rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     let cfg = cluster_config();
     require_binary("kubectl").await?;
     require_binary("docker").await?;
     if cfg.backend == ClusterBackend::Kind {
         require_binary("kind").await?;
-        ensure_cluster(cfg).await?;
+        ensure_cluster(cfg, rebuild_cluster).await?;
         // The object store is a HOST docker container the cluster reaches OUT to
         // (the local stand-in for a real S3 provider). Bring it up before anything
         // that needs a bucket.
@@ -1352,6 +1385,7 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     // pod in the control-plane namespace (placed lazily on first write),
     // and a project gets its own namespace only at first infra apply.
     // Register creates no namespace.
+    prepare_postgres_apply(&manifests.join("postgres.yaml")).await?;
     kubectl_apply_file(&manifests.join("postgres.yaml")).await?;
     wait_for_deployment_ready_in_ns("weft-postgres", &cfg.db_namespace).await?;
     // broker + dispatcher carry cluster-specific placeholders (the
@@ -1378,6 +1412,17 @@ async fn start(ctx: &Ctx, rebuild: bool) -> Result<()> {
     kubectl_apply_templated(&manifests.join("gateway.yaml"), &template_vars).await?;
 
     wait_for_statefulset_ready("weft-dispatcher").await?;
+    // Fresh pods were just created from the currently built images, so
+    // the rolled stamps match the build stamps from here (see
+    // `images::pods_behind_image` for why the two are separate).
+    for tag in [
+        &cfg.dispatcher_image,
+        &cfg.listener_image,
+        &cfg.broker_image,
+        &cfg.supervisor_image,
+    ] {
+        images::mark_rolled(tag);
+    }
     // Kill any stale forwards from a previous daemon before
     // re-establishing, so a restarted daemon doesn't leak processes
     // or bind-conflict on the local ports.
@@ -1449,7 +1494,7 @@ async fn all_forwards_alive(cfg: &ClusterConfig) -> bool {
 
 async fn status(ctx: &Ctx) -> Result<()> {
     let cfg = cluster_config();
-    let pf_alive = all_forwards_alive(&cfg).await;
+    let pf_alive = all_forwards_alive(cfg).await;
     match ctx.client().get_json("/projects").await {
         Ok(v) => {
             let n = v.as_array().map(|a| a.len()).unwrap_or(0);
@@ -1499,10 +1544,177 @@ async fn logs(tail: usize, follow: bool) -> Result<()> {
 
 // ----- Cluster + ingress bootstrap ----------------------------------
 
-async fn ensure_cluster(cfg: &ClusterConfig) -> Result<()> {
+/// Where the database's files live: a directory on this machine, mounted into
+/// the cluster's node.
+///
+/// A kind node is a container, so everything stored inside it dies with the
+/// cluster, and the cluster has to be rebuilt whenever its own shape changes
+/// (a port mapping, a node image), which Docker cannot do in place. Keeping
+/// the database's bytes out here is what makes that rebuild cost nothing:
+/// the new node mounts the same directory and every project and execution is
+/// still there.
+pub fn postgres_data_dir() -> PathBuf {
+    data_dir().join("postgres-data")
+}
+
+/// The path the node sees it at. Named in the PersistentVolume the local
+/// Postgres manifest declares.
+// SYNC: NODE_POSTGRES_PATH <-> deploy/k8s/postgres.yaml (the PersistentVolume's
+//       hostPath)
+const NODE_POSTGRES_PATH: &str = "/var/weft-postgres";
+
+/// The cluster's shape. Fingerprinted, so a change here rebuilds the node
+/// rather than being silently ignored on every machine that already has one.
+fn kind_cluster_config() -> String {
+    let host_dir = postgres_data_dir();
+    format!(
+        r#"kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+    extraMounts:
+      - hostPath: {}
+        containerPath: {NODE_POSTGRES_PATH}
+"#,
+        host_dir.display()
+    )
+}
+
+/// Whether the running kind node carries the postgres host mount. The
+/// stamp is an optimization over this probe: when the stamp is missing,
+/// the node itself is the evidence of whether it has the shape the code
+/// below depends on.
+async fn node_has_postgres_mount(cluster: &str) -> Result<bool> {
+    let out = Command::new("docker")
+        .args([
+            "inspect",
+            &format!("{cluster}-control-plane"),
+            "--format",
+            "{{range .Mounts}}{{.Destination}}\n{{end}}",
+        ])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "docker inspect of the kind node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == NODE_POSTGRES_PATH))
+}
+
+/// What a node rebuild does to the databases, stated from the ground
+/// truth: the system database survives only if its files are already on
+/// the host. On the first rebuild onto host-mounted storage they are
+/// not, and saying otherwise would promise survival that does not happen.
+fn rebuild_data_notice() -> String {
+    let host_db = postgres_data_dir();
+    if host_database_exists() {
+        format!(
+            "Rebuilding it keeps the system database (its files live in {}), \
+             but DESTROYS every project's own database (their volumes live \
+             inside the node).",
+            host_db.display()
+        )
+    } else {
+        "Rebuilding it DESTROYS the system database (projects, journal, \
+         execution history) and every project's own database: they all \
+         live inside the current node, and nothing is on the host yet."
+            .to_string()
+    }
+}
+
+/// Whether the third-party bundle this cluster holds is the one the code now
+/// asks for. Answers true on a cluster that has one but was never stamped,
+/// which is any cluster built before the stamp existed.
+fn install_is_stale(name: &str, want: &str) -> bool {
+    let path = data_dir().join(format!("installed-{name}.txt"));
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).as_deref() != Some(want)
+}
+
+/// Record what was just installed, after it succeeded.
+fn record_install(name: &str, want: &str) -> Result<()> {
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(data_dir().join(format!("installed-{name}.txt")), want)?;
+    Ok(())
+}
+
+/// Where the fingerprint of the config the current node was built from is
+/// kept.
+fn kind_config_stamp() -> PathBuf {
+    data_dir().join("kind-cluster-config.sha256")
+}
+
+
+async fn ensure_cluster(cfg: &ClusterConfig, rebuild_cluster: bool) -> Result<()> {
+    let config = kind_cluster_config();
+    // The kind binary's version is part of the node's identity: the Kubernetes
+    // version a node runs comes from kind's default node image, so a different
+    // kind builds a different cluster even from identical config. Without this
+    // an upgraded kind would give a fresh machine one Kubernetes and leave
+    // every existing machine on another.
+    let kind_version = Command::new("kind").arg("version").output().await?;
+    let want = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(config.as_bytes());
+        h.update(&kind_version.stdout);
+        format!("{:x}", h.finalize())
+    };
+
     let out = Command::new("kind").args(["get", "clusters"]).output().await?;
     let list = String::from_utf8_lossy(&out.stdout);
-    if list.lines().any(|n| n == cfg.cluster_name) {
+    let exists = list.lines().any(|n| n == cfg.cluster_name);
+
+    // A node is a container, so its shape (port mappings, mounts, image)
+    // cannot change in place: the only way to apply a change is to build
+    // a new node. The SYSTEM database survives that (its files live on
+    // the host, mounted back in), but every project's own database (a
+    // PostgresDatabase infra node's volume) lives inside the node and
+    // dies with it, so rebuilding is never a silent side effect.
+    if exists {
+        let have = std::fs::read_to_string(kind_config_stamp()).ok();
+        let have = have.as_deref().map(str::trim);
+        // No stamp is not evidence either way: it is a cluster from
+        // before the stamp existed, or a wiped data dir. The node
+        // itself settles it: one built with the postgres host mount is
+        // adoptable as current; one without it predates the mount and
+        // must be rebuilt like any other shape change.
+        let adoptable =
+            have.is_none() && node_has_postgres_mount(&cfg.cluster_name).await?;
+        if adoptable {
+            std::fs::create_dir_all(data_dir())?;
+            std::fs::write(kind_config_stamp(), &want)?;
+        } else if have != Some(want.as_str()) {
+            if !rebuild_cluster {
+                anyhow::bail!(
+                    "the cluster's shape changed (kind config or kind version), and \
+                     a node cannot change in place.\n\
+                     {}\n\
+                     Run `weft daemon start --rebuild-cluster` to rebuild it.",
+                    rebuild_data_notice()
+                );
+            }
+            println!("rebuilding the kind node. {}", rebuild_data_notice());
+            let status = Command::new("kind")
+                .args(["delete", "cluster", "--name", &cfg.cluster_name])
+                .status()
+                .await?;
+            anyhow::ensure!(status.success(), "kind delete cluster failed with {status}");
+            return create_cluster(cfg, &config, &want).await;
+        }
         // The kind cluster exists, but the kubeconfig CONTEXT can be absent even so:
         // a reset/rotated kubeconfig, a different `$KUBECONFIG`, or a prior partial
         // run leaves the node running with no `kind-<name>` context. Everything
@@ -1521,28 +1733,16 @@ async fn ensure_cluster(cfg: &ClusterConfig) -> Result<()> {
         }
         return Ok(());
     }
-    println!(
-        "creating kind cluster '{}' (first run)",
-        cfg.cluster_name,
-    );
-    let config = r#"kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-nodes:
-  - role: control-plane
-    kubeadmConfigPatches:
-      - |
-        kind: InitConfiguration
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-labels: "ingress-ready=true"
-    extraPortMappings:
-      - containerPort: 80
-        hostPort: 80
-        protocol: TCP
-      - containerPort: 443
-        hostPort: 443
-        protocol: TCP
-"#;
+    println!("creating kind cluster '{}' (first run)", cfg.cluster_name);
+    create_cluster(cfg, &config, &want).await
+}
+
+/// Build the node from `config` and record the fingerprint it was built from.
+async fn create_cluster(cfg: &ClusterConfig, config: &str, fingerprint: &str) -> Result<()> {
+    // The config bind-mounts this directory into the node, and kind
+    // refuses a mount whose source does not exist. This is the one
+    // moment the directory has to be there.
+    std::fs::create_dir_all(postgres_data_dir())?;
     let tmp = tempfile::NamedTempFile::new()?;
     std::fs::write(tmp.path(), config)?;
     let status = Command::new("kind")
@@ -1553,6 +1753,10 @@ nodes:
     if !status.success() {
         anyhow::bail!("kind create cluster failed with {status}");
     }
+    // Stamped only after the node is up: a failed create must not leave a
+    // fingerprint claiming this shape is live.
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(kind_config_stamp(), fingerprint)?;
     Ok(())
 }
 
@@ -1714,13 +1918,34 @@ fn is_private_ipv4(ip: std::net::Ipv4Addr) -> bool {
     ip.is_private() || ip.is_link_local() || cgnat
 }
 
-/// Bring up the object store as a HOST docker container (SeaweedFS's S3 gateway).
-/// The cluster reaches OUT to it over S3: the store is never inside
-/// the cluster. Idempotent: a running container is left alone, a stopped one is
-/// started, else it is created. `-s3.externalUrl` is deliberately UNSET so the
-/// gateway validates each presigned request against its own incoming Host header
-/// (v3.80 behavior), letting the SAME instance accept URLs signed for the host
-/// gateway IP (pods) AND for 127.0.0.1 (the browser).
+/// One shell script in a throwaway `alpine:3` container with `dir`
+/// mounted at `mount_spec` (a container path, optionally `:ro`). The
+/// ONE way this file reaches for a root-owned or postgres-owned path
+/// the host user cannot touch; pinned to the same image everywhere
+/// (setup.sh's purge uses alpine:3 too), so a machine that has it
+/// never pulls again.
+async fn run_in_alpine(
+    dir: &std::path::Path,
+    mount_spec: &str,
+    script: &str,
+) -> Result<std::process::Output> {
+    // A colon in the host path would read as an extra -v field and
+    // docker would refuse with an unrelated message; name the real
+    // problem instead.
+    let host = dir.display().to_string();
+    anyhow::ensure!(
+        !host.contains(':'),
+        "cannot docker-mount {host}: docker's -v syntax cannot carry a path \
+         containing ':' (move the weft data directory to a colon-free path)"
+    );
+    Ok(Command::new("docker")
+        .args(["run", "--rm", "-v"])
+        .arg(format!("{host}:{mount_spec}"))
+        .args(["alpine:3", "sh", "-c", script])
+        .output()
+        .await?)
+}
+
 /// Remove the Docker-created root-owned `s3.config.json` directory and
 /// chown the config dir back to the invoking user, with docker's own
 /// (root) privileges. Only called after a plain remove failed.
@@ -1731,30 +1956,54 @@ async fn heal_root_owned_config_dir(cfg_dir: &std::path::Path) -> Result<()> {
         Ok::<String, anyhow::Error>(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
     let (uid, gid) = (id_of("-u").await?, id_of("-g").await?);
-    let status = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-v",
-            &format!("{}:/heal", cfg_dir.display()),
-            "alpine:3",
-            "sh",
-            "-c",
-            &format!("rm -rf /heal/s3.config.json && chown {uid}:{gid} /heal"),
-        ])
-        .status()
-        .await?;
-    anyhow::ensure!(status.success(), "the docker-run cleanup exited with {status}");
+    let out = run_in_alpine(
+        cfg_dir,
+        "/heal",
+        &format!("rm -rf /heal/s3.config.json && chown {uid}:{gid} /heal"),
+    )
+    .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "the docker-run cleanup exited with {}: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     Ok(())
 }
 
+/// Bring up the object store as a HOST docker container (SeaweedFS's S3 gateway).
+/// The cluster reaches OUT to it over S3: the store is never inside
+/// the cluster. Idempotent: a running container is left alone, a stopped one is
+/// started, else it is created. `-s3.externalUrl` is deliberately UNSET so the
+/// gateway validates each presigned request against its own incoming Host header
+/// (v3.80 behavior), letting the SAME instance accept URLs signed for the host
+/// gateway IP (pods) AND for 127.0.0.1 (the browser).
 async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
+    // What the container would be run with today. A container cannot change
+    // its ports, mounts or image in place, so when this text moves the
+    // container is rebuilt. Its data volume is named and is not touched, so
+    // rebuilding costs nothing but the restart.
+    let want = object_store_run_args(cfg).join(" ");
+    let stamp = data_dir().join("object-store-run.sha256");
+    let want_hash = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(want.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+    let stale = std::fs::read_to_string(&stamp).ok().map(|s| s.trim().to_string())
+        != Some(want_hash.clone());
+
     let running = Command::new("docker")
         .args(["ps", "-q", "-f", &format!("name=^{OBJECT_STORE_CONTAINER}$")])
         .output()
         .await?;
     if running.status.success() && !running.stdout.is_empty() {
-        return Ok(());
+        if !stale {
+            return Ok(());
+        }
+        println!("the object store's settings changed; rebuilding its container");
+        let _ = Command::new("docker").args(["rm", "-f", OBJECT_STORE_CONTAINER]).status().await;
     }
     // The s3 identities file the container bind-mounts. Ensure it exists AS A
     // FILE before any `docker start/run`: a start whose bind-mount source is
@@ -1797,7 +2046,7 @@ async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
         .args(["ps", "-aq", "-f", &format!("name=^{OBJECT_STORE_CONTAINER}$")])
         .output()
         .await?;
-    if exists.status.success() && !exists.stdout.is_empty() {
+    if !stale && exists.status.success() && !exists.stdout.is_empty() {
         let status =
             Command::new("docker").args(["start", OBJECT_STORE_CONTAINER]).status().await?;
         if !status.success() {
@@ -1805,57 +2054,74 @@ async fn ensure_object_store(cfg: &ClusterConfig) -> Result<()> {
         }
         return Ok(());
     }
-    println!("starting object store container '{OBJECT_STORE_CONTAINER}' on port {}", cfg.seaweed_port);
-    let port_map = format!("{}:8333", cfg.seaweed_port);
-    let mount = format!("{}:/etc/seaweedfs/s3.config.json:ro", cfg_path.display());
-    let status = Command::new("docker")
-        .args([
-            "run",
-            "-d",
-            "--name",
-            OBJECT_STORE_CONTAINER,
-            "--restart",
-            "unless-stopped",
-            "-p",
-            &port_map,
-            "-v",
-            &format!("{OBJECT_STORE_CONTAINER}-data:/data"),
-            "-v",
-            &mount,
-            "chrislusf/seaweedfs:3.80",
-            "server",
-            "-dir=/data",
-            "-s3",
-            "-s3.port=8333",
-            "-s3.config=/etc/seaweedfs/s3.config.json",
-            "-master.volumeSizeLimitMB=1024",
-        ])
-        .status()
-        .await?;
+    if exists.status.success() && !exists.stdout.is_empty() {
+        let _ = Command::new("docker").args(["rm", "-f", OBJECT_STORE_CONTAINER]).status().await;
+    }
+    println!(
+        "starting object store container '{OBJECT_STORE_CONTAINER}' on port {}",
+        cfg.seaweed_port
+    );
+    let status = Command::new("docker").args(object_store_run_args(cfg)).status().await?;
     if !status.success() {
         anyhow::bail!("docker run {OBJECT_STORE_CONTAINER} failed with {status}");
     }
+    std::fs::create_dir_all(data_dir())?;
+    std::fs::write(&stamp, &want_hash)?;
     Ok(())
 }
 
+/// Everything `docker run` is given for the object store. One place, so the
+/// fingerprint that decides whether to rebuild covers exactly what was run.
+fn object_store_run_args(cfg: &ClusterConfig) -> Vec<String> {
+    let cfg_path = data_dir().join("object-store").join("s3.config.json");
+    [
+        "run",
+        "-d",
+        "--name",
+        OBJECT_STORE_CONTAINER,
+        "--restart",
+        "unless-stopped",
+        "-p",
+        &format!("{}:8333", cfg.seaweed_port),
+        "-v",
+        &format!("{OBJECT_STORE_CONTAINER}-data:/data"),
+        "-v",
+        &format!("{}:/etc/seaweedfs/s3.config.json:ro", cfg_path.display()),
+        "chrislusf/seaweedfs:3.80",
+        "server",
+        "-dir=/data",
+        "-s3",
+        "-s3.port=8333",
+        "-s3.config=/etc/seaweedfs/s3.config.json",
+        "-master.volumeSizeLimitMB=1024",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The ingress controller's bundle. Changing this re-applies it on every
+/// machine, which is why it is a constant rather than a literal at the call
+/// site.
+const INGRESS_MANIFEST: &str = "https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml";
+
 async fn ensure_ingress_controller() -> Result<()> {
-    let out = kubectl(&["get", "namespace", "ingress-nginx", "-o", "name"])
+    let installed = kubectl(&["get", "namespace", "ingress-nginx", "-o", "name"])
         .output()
         .await?;
-    if out.status.success() && !out.stdout.is_empty() {
+    let present = installed.status.success() && !installed.stdout.is_empty();
+    // Present is not the same as current. The stamp says WHICH bundle this
+    // cluster was given, so changing the bundle re-applies it here instead of
+    // only reaching machines that have never installed one.
+    if present && !install_is_stale("ingress", INGRESS_MANIFEST) {
         return Ok(());
     }
     println!("installing nginx-ingress controller");
-    let status = kubectl(&[
-        "apply",
-        "-f",
-        "https://kind.sigs.k8s.io/examples/ingress/deploy-ingress-nginx.yaml",
-    ])
-    .status()
-    .await?;
+    let status = kubectl(&["apply", "-f", INGRESS_MANIFEST]).status().await?;
     if !status.success() {
         anyhow::bail!("ingress install failed with {status}");
     }
+    record_install("ingress", INGRESS_MANIFEST)?;
     // `kubectl wait --for=condition=ready pod --selector=...` errors
     // immediately if zero pods exist at the moment of the call.
     // Right after `kubectl apply`, the Deployment is created but the
@@ -1890,7 +2156,11 @@ async fn ensure_envoy_gateway() -> Result<()> {
     let out = kubectl(&["get", "namespace", "envoy-gateway-system", "-o", "name"])
         .output()
         .await?;
-    if !(out.status.success() && !out.stdout.is_empty()) {
+    let present = out.status.success() && !out.stdout.is_empty();
+    // A bumped version has to reach clusters that already have the old one, so
+    // the check is on the version installed rather than on the namespace
+    // existing. Server-side apply is the upstream upgrade path.
+    if !present || install_is_stale("envoy-gateway", ENVOY_GATEWAY_VERSION) {
         println!("installing Envoy Gateway controller ({ENVOY_GATEWAY_VERSION})");
         let url = format!(
             "https://github.com/envoyproxy/gateway/releases/download/{ENVOY_GATEWAY_VERSION}/install.yaml"
@@ -1899,6 +2169,7 @@ async fn ensure_envoy_gateway() -> Result<()> {
         if !status.success() {
             anyhow::bail!("Envoy Gateway install failed with {status}");
         }
+        record_install("envoy-gateway", ENVOY_GATEWAY_VERSION)?;
     }
     // Wait for the controller before applying our Gateway/Backend CRs
     // (a CR applied before the CRDs register would 404).
@@ -2388,9 +2659,197 @@ async fn kubectl_apply_changed(path: &Path, vars: &[(&str, String)]) -> Result<b
     Ok(manifest_apply_changed_by_stamp(path, &manifest))
 }
 
+/// Everything that must hold before `postgres.yaml` can be applied.
+/// Lives next to nothing but the apply itself so no apply path can
+/// forget it: both the fresh-start path and the rolling-restart path
+/// call this immediately before applying the manifest.
+async fn prepare_postgres_apply(manifest: &Path) -> Result<()> {
+    guard_postgres_data_major(manifest).await?;
+    rebind_released_postgres_volume().await
+}
+
+/// The data directory now outlives the node, which makes the Postgres
+/// major version a data-format contract: a newer major refuses to start
+/// on an older major's files, and the pod would just CrashLoop. Refuse
+/// the apply up front when the bytes on the host disagree with the
+/// manifest's image, naming both ways out.
+async fn guard_postgres_data_major(manifest: &Path) -> Result<()> {
+    let data = postgres_data_dir();
+    // Postgres owns pgdata (uid 70, mode 0700), so the host user cannot
+    // read PG_VERSION directly; a throwaway container can. Only reached
+    // when the directory exists, so a fresh machine pays nothing.
+    if !host_database_exists() {
+        return Ok(()); // no database on the host yet: any major is fine
+    }
+    // `__ABSENT__` separates "PG_VERSION is not there" (a half-born
+    // database: Postgres died mid-initdb) from "docker could not run"
+    // (offline pull, daemon down), which must not block the start over
+    // a healthy database NOR silently wave a broken one through.
+    let out = run_in_alpine(
+        &data,
+        "/d:ro",
+        "if [ -f /d/pgdata/PG_VERSION ]; then cat /d/pgdata/PG_VERSION; else echo __ABSENT__; fi",
+    )
+    .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "docker could not read {}/pgdata to check the Postgres major version \
+         before applying (is the docker daemon up, and the alpine:3 image \
+         reachable?): {}",
+        data.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let on_disk = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    anyhow::ensure!(
+        on_disk != "__ABSENT__",
+        "{data}/pgdata exists but holds no PG_VERSION: Postgres died before \
+         finishing initdb, and nothing in it is recoverable. The directory is \
+         owned by the container's postgres user, so remove it the same way:\n  \
+         docker run --rm -v {data}:/d alpine:3 sh -c 'rm -rf /d/pgdata'\n\
+         then start again to initialize a fresh database.",
+        data = data.display()
+    );
+    let wanted = postgres_major_in_manifest(
+        &std::fs::read_to_string(manifest)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", manifest.display()))?,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} names no `image: ...postgres:<major>...` line to check the \
+             on-host data directory against",
+            manifest.display()
+        )
+    })?;
+    anyhow::ensure!(
+        wanted == on_disk,
+        "the database files in {data} were written by Postgres {on_disk}, and the \
+         manifest asks for Postgres {wanted}, which refuses to start on them.\n\
+         Either upgrade the data directory with pg_upgrade, or start from an \
+         empty database by removing it (it is owned by the container's \
+         postgres user, so remove it the same way):\n  \
+         docker run --rm -v {data}:/d alpine:3 sh -c 'rm -rf /d/pgdata'",
+        data = data.display()
+    );
+    Ok(())
+}
+
+/// Whether the system database's files exist on the host. `is_dir` on
+/// the pgdata directory itself, never a file inside it: Postgres owns
+/// pgdata as uid 70 mode 0700, so the host user can see the directory
+/// but cannot read into it.
+fn host_database_exists() -> bool {
+    postgres_data_dir().join("pgdata").is_dir()
+}
+
+/// The major version of the postgres image a manifest runs, whatever
+/// the YAML spelling (a list item, quotes, a registry prefix). The
+/// image NAME must be exactly `postgres` (`acme/mypostgres:14` is not
+/// it), and a manifest running postgres containers on two DIFFERENT
+/// majors (a pg_upgrade initContainer) is refused as ambiguous rather
+/// than guessed at. Pure, so the parse is pinned by tests.
+fn postgres_major_in_manifest(text: &str) -> Option<String> {
+    let mut majors = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches("- "))
+        .filter_map(|l| l.strip_prefix("image:"))
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\''))
+        .filter_map(|img| {
+            let (name, tag) = img.rsplit_once(':')?;
+            let bare = name.rsplit('/').next().unwrap_or(name);
+            (bare == "postgres").then_some(tag)
+        })
+        .filter_map(|tag| {
+            let major: String = tag.chars().take_while(|c| c.is_ascii_digit()).collect();
+            (!major.is_empty()).then_some(major)
+        });
+    let first = majors.next()?;
+    for other in majors {
+        if other != first {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+/// If the postgres PersistentVolume is `Released` (its claim was
+/// deleted; the data survived under reclaim policy Retain), clear the
+/// stale claimRef uid so the recreated claim can rebind. A missing
+/// volume (first run) is a no-op.
+async fn rebind_released_postgres_volume() -> Result<()> {
+    // `--ignore-not-found` exits 0 with EMPTY output for a missing
+    // volume (the apply below creates it), so absence never has to be
+    // told apart from a real failure (API server down, a wrong kube
+    // context) by string-matching stderr; every real failure bails.
+    let out = kubectl(&[
+        "get", "pv", "weft-postgres-data", "--ignore-not-found", "-o",
+        "jsonpath={.status.phase}",
+    ])
+    .output()
+    .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "checking the postgres volume's phase failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    if out.stdout.is_empty() {
+        return Ok(()); // no volume yet
+    }
+    if String::from_utf8_lossy(&out.stdout).trim() == "Released" {
+        println!("postgres volume is Released; clearing its stale claim so the new claim rebinds");
+        // A merge patch, not a JSON patch: `remove` fails the whole
+        // patch when a path is absent, and a released volume does not
+        // always carry both fields. Nulling them is a no-op for a
+        // missing one.
+        let status = kubectl(&[
+            "patch", "pv", "weft-postgres-data", "--type=merge", "-p",
+            r#"{"spec":{"claimRef":{"uid":null,"resourceVersion":null}}}"#,
+        ])
+        .status()
+        .await?;
+        anyhow::ensure!(status.success(), "clearing the postgres volume's stale claimRef failed");
+    }
+    Ok(())
+}
+
 /// Pipe a manifest to `kubectl apply -f -`. `what` names the manifest in
 /// errors (a file path, or a description for generated manifests).
+///
+/// Applied DOCUMENT BY DOCUMENT: a multi-doc file applied whole would
+/// make an immutable-field refusal anywhere in it a decision about the
+/// whole bundle, and the replace/refuse choice below is per object.
 async fn kubectl_apply_stdin(manifest: &str, what: &str) -> Result<()> {
+    for doc in split_yaml_documents(manifest) {
+        kubectl_apply_one_document(doc, what).await?;
+    }
+    Ok(())
+}
+
+/// The documents of a (possibly multi-doc) YAML text, `---` separators
+/// removed, empty documents dropped.
+fn split_yaml_documents(manifest: &str) -> Vec<&str> {
+    let mut docs = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    for line in manifest.split_inclusive('\n') {
+        if line.trim_end() == "---" {
+            docs.push(&manifest[start..at]);
+            start = at + line.len();
+        }
+        at += line.len();
+    }
+    docs.push(&manifest[start..]);
+    docs.retain(|d| !d.trim().is_empty());
+    docs
+}
+
+/// The `kind:` of one YAML document, read from its top-level line.
+fn yaml_document_kind(doc: &str) -> Option<&str> {
+    doc.lines()
+        .find_map(|l| l.strip_prefix("kind:"))
+        .map(str::trim)
+}
+
+async fn kubectl_apply_one_document(manifest: &str, what: &str) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut child = kubectl(&["apply", "-f", "-"])
         .stdin(std::process::Stdio::piped())
@@ -2408,10 +2867,64 @@ async fn kubectl_apply_stdin(manifest: &str, what: &str) -> Result<()> {
     let out = child.wait_with_output().await?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        // Some fields cannot be updated in place (a Service's clusterIP, a
+        // Job's template, a selector). Kubernetes refuses the update rather
+        // than doing it, so the only way to land the change is to replace the
+        // object. `--force` is the same apply with a delete-and-recreate for
+        // exactly the object that refused, which is why it is reached for
+        // here and nowhere else.
+        // The refusal wording varies by resource ("field is immutable",
+        // "spec is immutable after creation", "may not be changed"), so
+        // match the shared fragment.
+        if stderr.contains("is immutable") || stderr.contains("may not be changed") {
+            // Replacing means deleting first, so it is refused for the two
+            // kinds that stand between the cluster and the database's files.
+            // A claim recreated behind Postgres's back comes up bound to
+            // nothing, and the operator would be left with a running cluster
+            // pointed at an empty disk.
+            let kind = yaml_document_kind(manifest).unwrap_or("");
+            if kind == "PersistentVolume" || kind == "PersistentVolumeClaim" {
+                anyhow::bail!(
+                    "{what}: a field on a volume or a claim cannot be updated in place, \
+                     and replacing it would take the database's binding with it. Change \
+                     it by hand, or move the data first: {stderr}"
+                );
+            }
+            println!("{what}: a field there cannot be updated in place; replacing the object");
+            return kubectl_apply_replacing(manifest, what).await;
+        }
         anyhow::bail!("kubectl apply ({what}) failed: {stderr}");
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     print!("{stdout}");
+    Ok(())
+}
+
+/// The same apply, allowed to delete and recreate whatever refused to change.
+///
+/// Only ever reached from the immutable-field path above: a plain apply is
+/// tried first every time, so nothing is deleted that could have been updated.
+async fn kubectl_apply_replacing(manifest: &str, what: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = kubectl(&["apply", "--force", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn kubectl apply --force: {e}"))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(manifest.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write manifest to kubectl stdin: {e}"))?;
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("kubectl apply --force ({what}) failed: {stderr}");
+    }
+    print!("{}", String::from_utf8_lossy(&out.stdout));
     Ok(())
 }
 
@@ -2569,8 +3082,50 @@ fn signal_term(pid: i32) -> Result<()> {
 mod tests {
     use super::{
         apiserver_clusterip, canonical_tunnel_hostname, check_cidr, configured_dns_ip,
-        endpoint_host, EndpointHost,
+        endpoint_host, split_yaml_documents, yaml_document_kind, EndpointHost,
     };
+
+    #[test]
+    fn yaml_documents_split_on_bare_separators_only() {
+        // Leading and trailing separators, an empty document between
+        // two separators, and CRLF endings all collapse away.
+        let docs = split_yaml_documents("---\nkind: A\n---\r\n---\nkind: B\n---\n");
+        assert_eq!(docs.iter().map(|d| d.trim()).collect::<Vec<_>>(), ["kind: A", "kind: B"]);
+        // A `---` that is not alone on its line is content, not a
+        // separator (a string value, a heredoc marker).
+        let docs = split_yaml_documents("kind: A\ndata: \"--- not a split\"\n");
+        assert_eq!(docs.len(), 1);
+        // No separator at all: the whole text is one document.
+        assert_eq!(split_yaml_documents("kind: A\n"), ["kind: A\n"]);
+    }
+
+    #[test]
+    fn postgres_major_survives_yaml_spellings() {
+        use super::postgres_major_in_manifest as major;
+        assert_eq!(major("          image: postgres:18-alpine"), Some("18".into()));
+        assert_eq!(major("- image: postgres:16"), Some("16".into()));
+        assert_eq!(major("  image: \"postgres:15-alpine\""), Some("15".into()));
+        assert_eq!(major("image: registry.example.com/library/postgres:14"), Some("14".into()));
+        // A non-postgres image line never answers, and the image NAME
+        // must be exactly `postgres`.
+        assert_eq!(major("image: redis:7"), None);
+        assert_eq!(major("image: postgres:latest"), None);
+        assert_eq!(major("image: acme/mypostgres:14"), None);
+        // Two postgres containers on different majors (a pg_upgrade
+        // initContainer) are ambiguous, never guessed at; the same
+        // major twice is fine.
+        assert_eq!(major("image: postgres:16\nimage: postgres:18"), None);
+        assert_eq!(major("image: postgres:18\nimage: postgres:18-alpine"), Some("18".into()));
+    }
+
+    #[test]
+    fn yaml_document_kind_reads_only_the_top_level_line() {
+        assert_eq!(yaml_document_kind("apiVersion: v1\nkind: PersistentVolume\n"), Some("PersistentVolume"));
+        // An indented `kind:` is a nested field (a kubeadm patch, a
+        // pod template), never the document's own kind.
+        assert_eq!(yaml_document_kind("data:\n  kind: InitConfiguration\n"), None);
+        assert_eq!(yaml_document_kind(""), None);
+    }
 
     #[test]
     fn tunnel_hostname_accepts_only_a_bare_https_host() {

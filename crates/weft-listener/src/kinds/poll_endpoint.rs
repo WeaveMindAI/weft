@@ -319,6 +319,10 @@ fn poll_url(
     Ok(format!("{url}{sep}{}={value}", cp.name))
 }
 
+/// What one poll advanced by: the new items as `(cursor, item)` pairs in
+/// ascending cursor order, and the state to store for the next poll.
+type DeltaAdvance = (Vec<(Value, Value)>, Option<Value>);
+
 /// The pure delta step. Returns the NEW items past `state` as
 /// `(payload, state_after)` pairs, each `state_after` being the durable
 /// state that acknowledges exactly that item and everything before it
@@ -351,7 +355,7 @@ fn delta_advance(
     delta: &weft_core::signal::PollDelta,
     response: &Value,
     state: Option<&Value>,
-) -> anyhow::Result<(Vec<(Value, Value)>, Option<Value>)> {
+) -> anyhow::Result<DeltaAdvance> {
     let items = if delta.items.is_empty() {
         response
     } else {
@@ -417,7 +421,7 @@ fn delta_advance(
                 // first page persists NOTHING (stay unprimed): there
                 // is no cursor to pin, and a persisted cursor-less
                 // state would read as primed-but-unreadable forever.
-                let max = keyed.iter().map(|(k, _)| k.clone()).max_by(|a, b| cursor_cmp(a, b));
+                let max = keyed.iter().map(|(k, _)| k.clone()).max_by(cursor_cmp);
                 let idle = max.map(|m| serde_json::json!({ "cursor": m }));
                 return Ok((Vec::new(), idle));
             };
@@ -481,7 +485,7 @@ fn set_advance(
         // Priming: remember the page in its own (recency) order.
         let mut seen: Vec<String> = Vec::with_capacity(current_ids.len());
         for id in current_ids {
-            if !seen.iter().any(|s| *s == id) {
+            if !seen.contains(&id) {
                 seen.push(id);
             }
         }

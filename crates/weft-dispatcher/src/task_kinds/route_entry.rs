@@ -100,6 +100,8 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some(candidate_hash.clone()),
                     node_test: false,
+                    // A trigger-fired execution runs the whole graph.
+                    subgraph: None,
                     at_unix: now,
                 },
                 &format!("route_entry:{}:start", payload.fire_id),

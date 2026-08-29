@@ -156,12 +156,18 @@ enum Reserved {
 
 type StoreResult<T> = Result<T, RuntimeStoreError>;
 
+/// One ACTIVE `runtime_file` row as `query_active_meta` selects it:
+/// (mime_type, filename, size_bytes, keep, expires_at_unix,
+/// keep_ttl_secs, created_at_unix).
+type StoredFileRow = (String, String, i64, bool, Option<i64>, Option<i64>, i64);
+
 /// The runtime-file plane's schema. The broker owns it (it is the only
 /// reader/writer) and applies this group at its own boot via
 /// `weft_task_store::schema_guard::apply_groups` (which serializes concurrent
-/// boots behind the shared schema advisory lock). Per the no-migration-cruft
-/// rule the canonical CREATE lives here and is edited in place (fresh DB on
-/// rebuild).
+/// boots behind the shared schema advisory lock). The canonical CREATE
+/// lives here, edited in place; an existing database is carried to it by
+/// a migration written with `./setup.sh --migration <name>` (the whole
+/// contract is `weft_task_store::schema_guard`'s header).
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "runtime_file",
     tables: &["runtime_file", "runtime_file_part", "public_file_link"],
@@ -262,6 +268,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         );
         "#,
     ],
+    seed: &[],
 };
 
 /// A clock seam so the expiry math is testable without wall-clock. The broker
@@ -1403,7 +1410,7 @@ impl RuntimeStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         key: &str,
     ) -> Result<Option<PendingUpload>> {
-        Ok(sqlx::query_as::<_, PendingUpload>(
+        sqlx::query_as::<_, PendingUpload>(
             "SELECT tenant_id, mime_type, filename, keep, keep_ttl_secs, created_at_unix, \
              upload_id, part_size, declared_size \
              FROM runtime_file WHERE key = $1 AND status = 'pending'",
@@ -1411,7 +1418,7 @@ impl RuntimeStore {
         .bind(key)
         .fetch_optional(&mut **tx)
         .await
-        .context("read pending upload row")?)
+        .context("read pending upload row")
     }
 
     /// Read a key's ACTIVE row inside an open transaction (the complete-upload
@@ -1422,7 +1429,7 @@ impl RuntimeStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         key: &str,
     ) -> StoreResult<Option<StoredFileMeta>> {
-        let row: Option<(String, String, i64, bool, Option<i64>, Option<i64>, i64)> =
+        let row: Option<StoredFileRow> =
             sqlx::query_as(
                 "SELECT mime_type, filename, size_bytes, keep, expires_at_unix, keep_ttl_secs, \
                  created_at_unix FROM runtime_file WHERE key = $1 AND status = 'active'",
@@ -1452,14 +1459,14 @@ impl RuntimeStore {
     /// Access does NOT bump a kept file's expiry here (a metadata peek is not an
     /// access); the byte `get`/`download_url` bumps it.
     async fn row(&self, key: &str) -> Result<Option<FileRow>> {
-        Ok(sqlx::query_as::<_, FileRow>(
+        sqlx::query_as::<_, FileRow>(
             "SELECT key, mime_type, filename, size_bytes, keep, expires_at_unix, keep_ttl_secs, created_at_unix \
              FROM runtime_file WHERE key = $1 AND status = 'active'",
         )
         .bind(key)
         .fetch_optional(&self.pool)
         .await
-        .context("runtime row")?)
+        .context("runtime row")
     }
 
     /// Metadata only (no access bump). The caller has already passed the wall.
@@ -1549,14 +1556,14 @@ impl RuntimeStore {
     /// too; the bucket never keeps state whose row a sweep removed.
     async fn keys_under(&self, prefix: &str) -> Result<Vec<SweepEntry>> {
         let pattern = like_prefix(prefix);
-        Ok(sqlx::query_as::<_, SweepEntry>(
+        sqlx::query_as::<_, SweepEntry>(
             "SELECT key, (keep AND status = 'active') AS kept_active, status, upload_id \
              FROM runtime_file WHERE key LIKE $1 ESCAPE '\\'",
         )
         .bind(&pattern)
         .fetch_all(&self.pool)
         .await
-        .context("runtime keys_under")?)
+        .context("runtime keys_under")
     }
 
     /// Steps 2+3 of a fenced reap (the caller has already flipped the row to
@@ -1650,7 +1657,7 @@ impl RuntimeStore {
         parsed: &ParsedKey,
         ttl_secs: Option<u64>,
     ) -> StoreResult<String> {
-        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).min(MAX_PRESIGN_TTL_SECS).max(1);
+        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).clamp(1, MAX_PRESIGN_TTL_SECS);
         let (meta, fetch_url) =
             self.presign_get(parsed, PresignAudience::Internal, Some(ttl)).await?;
         let token = uuid::Uuid::new_v4().simple().to_string();
@@ -1748,7 +1755,7 @@ impl RuntimeStore {
             .map_err(RuntimeStoreError::Other)?
             .ok_or_else(|| RuntimeStoreError::NotFound(key.clone()))?;
         self.bump_expiry(&row).await.map_err(RuntimeStoreError::Other)?;
-        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).min(MAX_PRESIGN_TTL_SECS).max(1);
+        let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).clamp(1, MAX_PRESIGN_TTL_SECS);
         let url = self
             .bucket
             .presign_get(&object_key(&key), audience, ttl)

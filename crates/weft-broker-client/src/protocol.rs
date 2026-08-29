@@ -293,9 +293,14 @@ pub struct JournalFetchRequest {
     pub color: String,
 }
 
+/// RAW payload strings, exactly as journaled, never re-encoded typed
+/// events: the broker only ferries these rows, and a typed hop would
+/// silently STRIP any field its own build predates (a stale broker
+/// once erased `ExecutionStarted.subgraph` this way, and the worker
+/// ran an aimed run unbounded). The consumer decodes, loudly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalFetchResponse {
-    pub events: Vec<ExecEvent>,
+    pub payloads: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

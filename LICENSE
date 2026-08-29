@@ -24,3 +24,25 @@ FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---
+
+## What this means in practice
+
+This section is a plain-English summary. It is not part of the licence and
+carries no legal weight. Where the two disagree, the text above is what counts,
+and if the difference matters to you, ask a lawyer rather than us.
+
+**You can**: use it, read it, change it, build products on it, run it inside
+your company, ship it inside something you sell, and fork it. Commercially,
+without asking and without paying.
+
+**You cannot**: take weft and offer it back to other people as a hosted service
+whose main value is weft itself. Running weft to power your own product is
+fine. Running weft *as* the product, for third parties, is the one thing
+clause 2 is about.
+
+**You must**: keep the copyright notice and the licence text with any copy or
+substantial portion you distribute.
+
+Unsure which side of the line you are on? Email contact@weavemind.ai and ask.

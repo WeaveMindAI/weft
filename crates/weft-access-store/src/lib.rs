@@ -371,6 +371,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             ON signal_subscription (signal_token);
         "#,
     ],
+    seed: &[],
 };
 
 /// Parse a grant row's spec snapshot back into the typed recipe. A

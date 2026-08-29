@@ -1,0 +1,4 @@
+# `matches` is a regular-expression test, checked at compile time by the
+# validator and evaluated here.
+[dependencies]
+regex = "1"

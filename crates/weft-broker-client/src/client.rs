@@ -215,11 +215,27 @@ impl JournalClient for BrokerJournalClient {
     }
 
     async fn events_for_color(&self, color: Color) -> Result<Vec<ExecEvent>> {
+        let payloads = self.raw_events_for_color(color).await?;
+        let mut out = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            // The broker ferried raw bytes; THIS side decodes, so a
+            // field the broker's build does not know can never be
+            // silently stripped in transit, and an undecodable row
+            // fails the resume fold loudly (same contract as the
+            // direct-postgres client).
+            out.push(
+                weft_journal::decode_event(color, &payload).map_err(anyhow::Error::msg)?,
+            );
+        }
+        Ok(out)
+    }
+
+    async fn raw_events_for_color(&self, color: Color) -> Result<Vec<String>> {
         let req = JournalFetchRequest {
             color: color.to_string(),
         };
         let resp: JournalFetchResponse = self.http.post("/v1/journal/fetch", &req).await?;
-        Ok(resp.events)
+        Ok(resp.payloads)
     }
 
     async fn has_terminal_event(&self, color: Color) -> Result<bool> {

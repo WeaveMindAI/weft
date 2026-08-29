@@ -496,7 +496,7 @@ impl BrokerSupervisorOps for FakeBroker {
         Ok(inner
             .infra_nodes
             .iter()
-            .filter_map(|((p, _), n)| (p == project_id).then(|| n.clone()))
+            .filter(|&((p, _), _n)| p == project_id).map(|((_p, _), n)| n.clone())
             .collect())
     }
 

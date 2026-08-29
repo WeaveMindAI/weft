@@ -10,12 +10,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RunningPolicy {
     /// Cancel running execs immediately, then proceed.
     Cancel,
     /// Wait until running_count reaches 0, then proceed. New fires are
     /// gated per the project's lifecycle axes (set by the
     /// trigger-deactivate / park step).
+    #[default]
     Wait,
 }
 
@@ -40,11 +42,6 @@ impl RunningPolicy {
     pub const VARIANTS: &'static [Self] = &[Self::Cancel, Self::Wait];
 }
 
-impl Default for RunningPolicy {
-    fn default() -> Self {
-        Self::Wait
-    }
-}
 
 impl std::fmt::Display for RunningPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

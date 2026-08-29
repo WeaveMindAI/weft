@@ -100,8 +100,11 @@ pub async fn journal_fetch(
         .color
         .parse()
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad color: {e}")))?;
-    let events = state.journal.events_for_color(color).await.map_err(internal)?;
-    Ok(Json(JournalFetchResponse { events }))
+    // RAW rows, never decode-and-re-encode: the broker only ferries
+    // these, and a typed hop would silently strip any event field this
+    // build predates. The worker decodes them, loudly.
+    let payloads = state.journal.raw_events_for_color(color).await.map_err(internal)?;
+    Ok(Json(JournalFetchResponse { payloads }))
 }
 
 pub async fn journal_has_terminal(

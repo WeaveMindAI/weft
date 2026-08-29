@@ -1,5 +1,5 @@
 [dependencies]
-minillmlib = "0.5.8"
+minillmlib = "0.5.10"
 # The project defines its OWN provider meter in this node's mod.rs; the
 # ProviderMeter trait's method signatures name these two crates (a follow-up
 # HTTP client, and anyhow errors), so a node that ships a meter pulls them in.

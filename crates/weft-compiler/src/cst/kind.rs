@@ -16,6 +16,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 #[allow(non_camel_case_types)]
+// `__LAST` is not the non_exhaustive idiom: it is the numeric BOUND the
+// `from_u16` range check compares against, which `#[non_exhaustive]`
+// cannot provide.
+#[allow(clippy::manual_non_exhaustive)]
 pub enum SyntaxKind {
     // ── tokens (leaves; carry text) ────────────────────────────────────────
     // trivia: whitespace + comments, kept in the tree so round-trip is exact.

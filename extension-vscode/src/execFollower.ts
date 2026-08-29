@@ -25,6 +25,7 @@ import type {
   LoopIteration,
   LoopTerminationReason,
   NodeExecEvent,
+  SkipReason,
 } from '../../packages/weft-graph/src/protocol';
 
 // SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
@@ -36,7 +37,7 @@ export type DispatcherEvent =
   | { kind: 'node_cancelled'; color: string; node: string; frames: LoopIteration[]; reason: string; project_id: string }
   | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; project_id: string }
   | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; project_id: string }
-  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; project_id: string }
+  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; reason: SkipReason; project_id: string }
   | { kind: 'port_type_mismatch'; color: string; node: string; frames: LoopIteration[]; port: string; expected: string; actual: string; project_id: string }
   | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown }
   | { kind: 'execution_failed'; color: string; project_id: string; error: string }
@@ -128,21 +129,14 @@ export class ExecutionFollower implements vscode.Disposable {
     private readonly post: PostFn,
   ) {}
 
-  /** Start following a fresh execution (live from the first event).
-   *  The webview gets an execReset up front so any old colors / pulses
-   *  drop. */
-  follow(color: string): void {
-    this.start(color, false);
-  }
-
   /** Hydrate a past execution by replaying every journaled event up
    *  front, then keep following so a still-running execution stays
    *  live. Called when the user clicks an execution in the sidebar. */
   async replay(color: string): Promise<void> {
-    await this.start(color, true);
+    await this.start(color);
   }
 
-  /** Single follow path for both live and replay. Subscribe-FIRST,
+  /** The one follow path. Subscribe-FIRST,
    *  buffering live events, THEN run the replay GET, THEN drain the
    *  buffer. This closes the gap where an event that fired between
    *  "replay GET returned" and "subscribe attached" was dropped
@@ -151,14 +145,14 @@ export class ExecutionFollower implements vscode.Disposable {
    *  (nodeId, framesKey) and updated in place (idempotent), and bus +
    *  loop logs are deduped at append time in App.svelte (bus by
    *  (busId, offset); loop by (groupId, kind, parentFrames, index)). */
-  private async start(color: string, doReplay: boolean): Promise<void> {
+  private async start(color: string): Promise<void> {
     this.stop();
     this.currentColor = color;
     this.post({ kind: 'execReset' });
 
-    // Buffer live events until the replay (if any) has been applied,
+    // Buffer live events until the replay has been applied,
     // so live events never overtake their historical context.
-    let buffering = doReplay;
+    let buffering = true;
     const buffer: DispatcherEvent[] = [];
     const onData = (data: string) => {
       let event: DispatcherEvent;
@@ -191,7 +185,7 @@ export class ExecutionFollower implements vscode.Disposable {
       },
     );
 
-    if (doReplay) {
+    {
       try {
         const events = await this.client.get<DispatcherEvent[]>(`/executions/${color}/replay`);
         // A follow switch may have landed while the GET was in flight.
@@ -310,6 +304,7 @@ export class ExecutionFollower implements vscode.Disposable {
           state: 'skipped',
           frames: e.frames,
           closedPorts: e.closed_ports,
+          skipReason: e.reason,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;

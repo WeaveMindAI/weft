@@ -276,3 +276,11 @@ describe('the one layout writer (parse-modify-serialize)', () => {
 		expect(parseLayoutCode(removed, SIMPLIFIED_LAYOUT_VERB).b).toEqual({ x: 4, y: 4 });
 	});
 });
+
+describe('updateLayoutEntry size invariant', () => {
+	it('refuses a half-set size loudly (a size is one fact)', () => {
+		expect(() => updateLayoutEntry('a @layout 0 0', 'a', 0, 0, undefined, 348)).toThrow(
+			'set or cleared together',
+		);
+	});
+});

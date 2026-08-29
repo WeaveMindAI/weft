@@ -34,6 +34,7 @@
     {
       "name": "body",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "label": "Body"
     },

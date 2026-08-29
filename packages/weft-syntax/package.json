@@ -1,0 +1,21 @@
+{
+  "name": "@weft/syntax",
+  "version": "0.1.0",
+  "description": "Weft syntax highlighting: one TextMate grammar for editors, one highlight.js language for the book. No dependencies, so any host can take it.",
+  "private": true,
+  "files": [
+    "weft.tmLanguage.json",
+    "highlight-weft.js",
+    "weft-markdown-injection.json"
+  ],
+  "main": "highlight-weft.js",
+  "exports": {
+    ".": "./highlight-weft.js",
+    "./tmlanguage": "./weft.tmLanguage.json",
+    "./highlight": "./highlight-weft.js",
+    "./markdown-injection": "./weft-markdown-injection.json"
+  },
+  "scripts": {
+    "test": "vitest run"
+  }
+}

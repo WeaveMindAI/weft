@@ -39,15 +39,33 @@ macro_rules! define_primitives {
                 }
             }
 
-            pub fn from_str(s: &str) -> Option<Self> {
+            /// The primitive `s` names, or `None` for any other word.
+            /// Not `FromStr` (that trait answers with an error type;
+            /// here absence is an ordinary answer, not a failure).
+            pub fn from_name(s: &str) -> Option<Self> {
                 match s {
                     $(stringify!($variant) => Some(WeftPrimitive::$variant)),+,
                     _ => None,
                 }
             }
+
+            /// Every primitive name, in declaration order. Lets a caller
+            /// that has to KNOW the whole set (the syntax-highlighting
+            /// vocabulary test) enumerate it instead of restating it.
+            pub const ALL_NAMES: &'static [&'static str] = &[$(stringify!($variant)),+];
         }
     };
 }
+
+/// The type names that are not primitives but still mean something to
+/// the type language: the two containers, the opaque dict, the two
+/// wired-only handles, and the two declaration markers. A node author
+/// cannot name a type after any of them.
+// SYNC: the type vocabulary (this list + define_primitives! below) <->
+// packages/weft-syntax/weft.tmLanguage.json, packages/weft-syntax/highlight-weft.js,
+// crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
+pub const CONTAINER_AND_SPECIAL_TYPES: &[&str] =
+    &["List", "Dict", "JsonDict", "Bus", "Access", "Generator", "MustOverride"];
 
 define_primitives!(
     String,
@@ -141,12 +159,9 @@ impl FileKind {
     /// Identify the kind of a marker object by which sentinel key it
     /// carries. None if the object carries no stored-file marker.
     pub fn from_marker_obj(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
-        for kind in [FileKind::Image, FileKind::Video, FileKind::Audio, FileKind::Blob] {
-            if obj.contains_key(kind.marker_key()) {
-                return Some(kind);
-            }
-        }
-        None
+        [FileKind::Image, FileKind::Video, FileKind::Audio, FileKind::Blob]
+            .into_iter()
+            .find(|&kind| obj.contains_key(kind.marker_key()))
     }
 }
 
@@ -409,11 +424,8 @@ impl TypeRegistry {
                         letters, digits, and underscores"
                 .into());
         }
-        let reserved = WeftPrimitive::from_str(name).is_some()
-            || matches!(
-                name,
-                "List" | "Dict" | "JsonDict" | "Bus" | "Access" | "Generator" | "MustOverride"
-            )
+        let reserved = WeftPrimitive::from_name(name).is_some()
+            || CONTAINER_AND_SPECIAL_TYPES.contains(&name)
             || WeftType::UNION_ALIASES.iter().any(|(alias, _)| *alias == name)
             || is_type_var_name(name);
         if reserved {
@@ -489,8 +501,17 @@ pub struct RecordField {
     pub optional: bool,
 }
 
+/// What a file control offers for a port: the file type it picks (and
+/// writes into `@asset(..., <Type>)`), and whether the port holds
+/// several files rather than one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileControl {
+    pub file_type: WeftType,
+    pub multiple: bool,
+}
+
 /// Recursive port type system.
-#[derive(Debug, Clone, Eq)]
+#[derive(Debug, Clone, Eq, Default)]
 pub enum WeftType {
     /// Scalar: String, Number, Boolean, Image, Video, Audio, Blob
     Primitive(WeftPrimitive),
@@ -549,6 +570,7 @@ pub enum WeftType {
     TypeVar(std::string::String),
     /// Node cannot determine the type. User/AI must override in Weft code.
     /// Remaining MustOverride at compile time = error.
+    #[default]
     MustOverride,
 }
 
@@ -664,6 +686,12 @@ impl WeftType {
             ],
         ),
     ];
+
+    /// The name of every union alias (`Media`, `File`), for a caller
+    /// that needs the whole set rather than one lookup.
+    pub fn union_alias_names() -> impl Iterator<Item = &'static str> {
+        Self::UNION_ALIASES.iter().map(|(name, _)| *name)
+    }
 
     /// Resolve a NAMED union alias to its concrete union type, the ONE
     /// place a union name expands. `Media`/`File` are language-builtin
@@ -912,6 +940,43 @@ impl WeftType {
             WeftType::Named { body, .. } => body.is_file_valued(),
             _ => false,
         }
+    }
+
+    /// What a file control would offer for this type, when one makes
+    /// sense: the file type it picks and writes, and whether it may hold
+    /// several. `Image` is one image; `List[Audio]` is several audio
+    /// files; `Media | List[Media]` (an attachment port that takes one or
+    /// many) is several too. None for a union mixing files with anything
+    /// else, where a picker would take the other half away.
+    pub fn file_control(&self) -> Option<FileControl> {
+        if self.is_file_valued() {
+            return Some(FileControl { file_type: self.clone(), multiple: false });
+        }
+        if let WeftType::List(inner) = self {
+            if inner.is_file_valued() {
+                return Some(FileControl { file_type: (**inner).clone(), multiple: true });
+            }
+        }
+        let WeftType::Union(members) = self else {
+            return None;
+        };
+        let mut files: Vec<WeftType> = Vec::new();
+        let mut multiple = false;
+        for member in members {
+            match member {
+                // A nullable file (`Image | Null`) still wants the
+                // picker: Null narrows what may be LEFT EMPTY, not what
+                // the control picks.
+                WeftType::Primitive(WeftPrimitive::Null) => continue,
+                m if m.is_file_valued() => files.push(m.clone()),
+                WeftType::List(inner) if inner.is_file_valued() => {
+                    multiple = true;
+                    files.push((**inner).clone());
+                }
+                _ => return None,
+            }
+        }
+        (!files.is_empty()).then(|| FileControl { file_type: WeftType::union(files), multiple })
     }
 
     /// True if the type includes Null as a valid value (null is legitimate
@@ -1269,8 +1334,8 @@ impl WeftType {
                 },
                 // Exactly 1/0; any other number is ambiguous, refused.
                 Value::Number(n) => match n.as_f64() {
-                    Some(x) if x == 1.0 => Ok(Value::Bool(true)),
-                    Some(x) if x == 0.0 => Ok(Value::Bool(false)),
+                    Some(1.0) => Ok(Value::Bool(true)),
+                    Some(0.0) => Ok(Value::Bool(false)),
                     _ => Err(format!("{n} is not a boolean (only 1/0 cast)")),
                 },
                 _ => Err(format!("no cast from {} into Boolean", Self::infer(value))),
@@ -1969,7 +2034,7 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
         }
     } else {
         // Try primitive first
-        if let Some(p) = WeftPrimitive::from_str(s) {
+        if let Some(p) = WeftPrimitive::from_name(s) {
             return Some(WeftType::Primitive(p));
         }
         // Type variable: T, T1, T2, ... (starts with uppercase T, optionally followed by digits)
@@ -1990,7 +2055,7 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
 /// Type variable names users can write: T, T1, T2, ..., T99.
 ///
 /// Also accepted (catalog-internal only, not user-facing):
-///   - `T_Auto`: sentinel emitted by catalog helpers like `FormFieldPort::any`
+///   - `T_Auto`: sentinel emitted by catalog helpers like `PortTemplate::any`
 ///     to request a per-port-instance TypeVar. Replaced with `T__{key}` at
 ///     enrichment time.
 ///   - `T__scope` (e.g. `T__hook`): materialized form of a `T_Auto` marker,
@@ -1999,7 +2064,8 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
 ///
 /// The internal forms exist so catalog authors can express "this port accepts
 /// anything, independently from sibling ports" without forcing the same rule
-/// on nodes that genuinely want shared `T` semantics (Gate, future Zip, etc.).
+/// on nodes that genuinely want shared `T` semantics (FirstInOrder, future
+/// Zip, etc.).
 fn is_type_var_name(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -2062,12 +2128,6 @@ fn find_top_level(s: &str, delimiter: char) -> Option<usize> {
         }
     }
     None
-}
-
-impl Default for WeftType {
-    fn default() -> Self {
-        WeftType::MustOverride
-    }
 }
 
 impl WeftType {

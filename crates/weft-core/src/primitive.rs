@@ -275,8 +275,9 @@ pub struct JournalCorruption {
     pub reason: String,
 }
 
-/// Closed enum over the fold sites that can reject a row. Adding a
-/// new fold branch that can fail forces adding a variant here; that
+/// Closed enum over the places a journal row can be rejected: every
+/// fold branch that can fail, plus the row that does not decode at
+/// all. Adding a new rejecting site forces adding a variant here; that
 /// is the point. Serialised as the variant name on the wire so the
 /// inspector renders a stable label.
 // SYNC: CorruptionSite <-> packages/weft-graph/src/protocol.ts CorruptionSite
@@ -319,6 +320,10 @@ pub enum CorruptionSite {
     /// `ExecEvent::NodeCancelled` fold path (`push_pulse` on a carried
     /// closure emission).
     NodeCancelled,
+    /// A journal row whose JSON no longer decodes to any `ExecEvent`
+    /// at all (the display read surfaces it; state-rebuilding reads
+    /// refuse the whole log instead).
+    UndecodableRow,
 }
 
 /// One entry in the per-(node, frames) replay sequence rebuilt by

@@ -78,6 +78,27 @@ impl<T> NodeErrExt<T> for Option<T> {
     }
 }
 
+#[cfg(feature = "runtime")]
+impl From<crate::caller::CallerError> for WeftError {
+    /// A caller-connection failure surfaces as a node failure (fails
+    /// loud, visible in the UI), EXCEPT a disconnect under the
+    /// `cancel-on-disconnect` policy, which IS a cancellation of this
+    /// execution and maps to `Cancelled` so the engine's existing
+    /// cancel short-circuit handles it uniformly. The connection layer
+    /// fires the per-execution cancel flag independently; this mapping
+    /// only governs how the awaiting node's `?` propagates.
+    fn from(e: crate::caller::CallerError) -> Self {
+        use crate::caller::CallerError;
+        match e {
+            // A disconnect always means the run is being cancelled (the
+            // keep-running policy is a silent `Ok(())`, never this error), so
+            // it maps cleanly to `Cancelled` with no action to disambiguate.
+            CallerError::Disconnected => WeftError::Cancelled,
+            other => WeftError::NodeExecution(other.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod node_err_tests {
     use super::*;
@@ -111,26 +132,5 @@ mod node_err_tests {
 
         let e = None::<u32>.node_err("no messageId on a media message").unwrap_err();
         assert!(matches!(&e, WeftError::NodeExecution(m) if m == "no messageId on a media message"), "{e}");
-    }
-}
-
-#[cfg(feature = "runtime")]
-impl From<crate::caller::CallerError> for WeftError {
-    /// A caller-connection failure surfaces as a node failure (fails
-    /// loud, visible in the UI), EXCEPT a disconnect under the
-    /// `cancel-on-disconnect` policy, which IS a cancellation of this
-    /// execution and maps to `Cancelled` so the engine's existing
-    /// cancel short-circuit handles it uniformly. The connection layer
-    /// fires the per-execution cancel flag independently; this mapping
-    /// only governs how the awaiting node's `?` propagates.
-    fn from(e: crate::caller::CallerError) -> Self {
-        use crate::caller::CallerError;
-        match e {
-            // A disconnect always means the run is being cancelled (the
-            // keep-running policy is a silent `Ok(())`, never this error), so
-            // it maps cleanly to `Cancelled` with no action to disambiguate.
-            CallerError::Disconnected => WeftError::Cancelled,
-            other => WeftError::NodeExecution(other.to_string()),
-        }
     }
 }

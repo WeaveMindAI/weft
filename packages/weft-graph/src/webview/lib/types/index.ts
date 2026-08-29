@@ -391,6 +391,7 @@ export interface FieldDefinition {
 	description?: string;
 	accept?: string; // For file_drop fields: narrows the type-derived HTML-accept filter
 	fileType?: string; // For file_drop fields: the declared weft file type (Image/Audio/.../File)
+	multiple?: boolean; // For file_drop fields: the port holds several files, so the control keeps a list
 	language?: string; // For code fields: the CodeMirror syntax ("python", "javascript", ...)
 	min?: number; // For number fields: minimum allowed value (clamped on blur)
 	max?: number; // For number fields: maximum allowed value (clamped on blur)
@@ -427,6 +428,8 @@ export interface NodeExecution {
 	/// as "(closed)" so a user-emitted null is not visually confused
 	/// with a structural close.
 	closedPorts?: string[];
+	/// Why this firing did not run, on a skipped one.
+	skipReason?: import('../../../protocol').SkipReason;
 	output?: unknown;
 	costUsd: number;
 	/// At least one of this firing's cost records could not be resolved
@@ -554,7 +557,9 @@ export interface NodeTemplate {
 	/** The node's declared inline per-firing display (a media player,
 	 *  a file card) and which port it shows. */
 	display?: import('../../../protocol').DisplaySpecWire;
-	formFieldSpecs?: import('../utils/form-field-specs').FormFieldSpec[];
+	/** Which config key this node's ports come from, and the entry
+	 *  kinds it accepts. Undefined for a node whose ports are fixed. */
+	portsFromConfig?: import('../../../protocol').PortsFromConfigWire;
 	/** The service recipe, present ONLY on a personal access node;
 	 *  drives the connect flow's forms and scope menu. */
 	service?: import('../../../protocol').AccessSpecWire;
@@ -691,6 +696,18 @@ export function containerKindOf(nodeType: unknown): 'Group' | 'Loop' | null {
  *  collapse/expand. The renderer picks distinct visuals per kind. */
 export function isContainerNodeType(nodeType: unknown): boolean {
 	return containerKindOf(nodeType) !== null;
+}
+
+/** True iff an expanded container draws its config strip: a loop always
+ *  (its knobs live there), and any container carrying values written on
+ *  its interface ports. Both the renderer and the layout engine ask
+ *  this, so the strip and the space reserved for it cannot disagree. */
+export function containerHasConfigStrip(
+	nodeType: unknown,
+	portLiterals: Record<string, unknown> | undefined,
+): boolean {
+	if (!isContainerNodeType(nodeType)) return false;
+	return isLoopNodeType(nodeType) || Object.keys(portLiterals ?? {}).length > 0;
 }
 
 /** True iff a node is a Loop container (used by renderer + visual

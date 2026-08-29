@@ -82,6 +82,7 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "label": "Text",
       "description": "The message text. With blocks present, this is the notification fallback text."

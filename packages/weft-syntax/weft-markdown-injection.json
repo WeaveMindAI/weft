@@ -1,0 +1,25 @@
+{
+  "$comment": "Colours a ```weft fence inside a markdown file. Same shape as VS Code's own markdown-math fence injection.",
+  "scopeName": "markdown.weft.codeblock",
+  "fileTypes": [],
+  "injectionSelector": "L:markup.fenced_code.block.markdown",
+  "patterns": [
+    { "include": "#weft-code-block" }
+  ],
+  "repository": {
+    "weft-code-block": {
+      "begin": "(?<=[`~])weft(\\s+[^`~]*)?$",
+      "end": "(^|\\G)(?=\\s*[`~]{3,}\\s*$)",
+      "patterns": [
+        {
+          "begin": "(^|\\G)(\\s*)(.*)",
+          "while": "(^|\\G)(?!\\s*([`~]{3,})\\s*$)",
+          "contentName": "meta.embedded.block.weft",
+          "patterns": [
+            { "include": "source.weft" }
+          ]
+        }
+      ]
+    }
+  }
+}

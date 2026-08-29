@@ -33,6 +33,7 @@
     {
       "name": "content",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "label": "Content"
     }

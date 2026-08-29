@@ -170,26 +170,8 @@ impl<'a> Lexer<'a> {
         self.emit(SyntaxKind::ERROR, ch_len);
     }
 
-    /// Length of an `@marker` token: the `@name` plus a balanced `(...)` if one
-    /// immediately follows. A marker is SINGLE-LINE: its parens must close on the
-    /// same line. If they don't, the scan stops at the newline, leaving the
-    /// marker unclosed so the parser flags it loudly (rather than stealing a
-    /// later line's `)`, which would mask the error and corrupt structure).
     fn marker_len(&self, rest: &'a str) -> usize {
-        let bytes = rest.as_bytes();
-        // consume @ + name chars
-        let mut i = 1;
-        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'(' {
-            // Balanced parens, but never crossing a line break (`\n` OR a lone
-            // `\r`), so a CR-terminated marker line can't swallow the next line.
-            let end = i + line_end(&rest[i..]);
-            let bal = self.balanced_len(&rest[i..end], b'(', b')');
-            return i + bal;
-        }
-        i
+        marker_len(rest)
     }
 
     /// Length of a ```...``` heredoc: opening fence, body, closing fence. If no
@@ -210,6 +192,31 @@ impl<'a> Lexer<'a> {
     fn balanced_len(&self, rest: &'a str, open: u8, close: u8) -> usize {
         balanced_span(rest, open, close).unwrap_or(rest.len())
     }
+}
+
+/// Length of an `@marker` token starting at `rest[0] == '@'`: the
+/// `@name` plus a balanced `(...)` if one immediately follows. A marker
+/// is SINGLE-LINE: its parens must close on the same line. If they
+/// don't, the scan stops at the newline, leaving the marker unclosed so
+/// the parser flags it loudly (rather than stealing a later line's `)`,
+/// which would mask the error and corrupt structure). The ONE token
+/// boundary for markers: the lexer and `quote_markers`' raw-JSON walk
+/// both use it (`cst::marker` then CLASSIFIES within the bounded text).
+pub(crate) fn marker_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    // consume @ + name chars
+    let mut i = 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'(' {
+        // Balanced parens, but never crossing a line break (`\n` OR a lone
+        // `\r`), so a CR-terminated marker line can't swallow the next line.
+        let end = i + line_end(&rest[i..]);
+        let bal = balanced_span(&rest[i..end], b'(', b')').unwrap_or(end - i);
+        return i + bal;
+    }
+    i
 }
 
 /// The length of a balanced `open`/`close` span starting at `rest[0] == open`,

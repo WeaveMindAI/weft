@@ -7,7 +7,7 @@
 start = HumanTrigger {
   title: "Kick off"
   fields: [{
-    "fieldType": "approve_reject",
+    "kind": "approve_reject",
     "key": "go"
   }]
 }

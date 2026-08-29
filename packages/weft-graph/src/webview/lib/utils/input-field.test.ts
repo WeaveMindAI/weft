@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { fieldForInput, clampToRange } from './input-field';
+import { fieldForInput, clampToRange, inputRendersField, nextPortLiterals, shouldFlowField } from './input-field';
+import { SHOULD_FLOW_PORT } from '../../../protocol';
 import { inputExposure } from '../types';
 import type { PortDefinition } from '../types';
 
@@ -103,5 +104,69 @@ describe('clampToRange', () => {
 		expect(clampToRange(1.5, 0, 2)).toBe(1.5);
 		expect(clampToRange(99, undefined, undefined)).toBe(99);
 		expect(clampToRange(-5, 0, undefined)).toBe(0);
+	});
+});
+
+/** `_should_flow` is the language's own port: it is answered by a wire
+ *  and docks in the node's corner, so it must not sit in the body among
+ *  the node's settings. A value written into the source is the one case
+ *  it has to show, because otherwise there is no way to see or undo it. */
+describe('inputRendersField', () => {
+	const input = (over: Partial<PortDefinition>): PortDefinition => ({
+		name: 'x',
+		portType: 'String',
+		required: false,
+		exposure: 'all',
+		widget: { kind: 'textarea' },
+		...over,
+	});
+	const flow = input({ name: SHOULD_FLOW_PORT, portType: 'T__should_flow' });
+
+	it('hides _should_flow when nothing wrote a value for it', () => {
+		expect(inputRendersField(flow, { wired: false, hasWrittenValue: false })).toBe(false);
+	});
+
+	it('shows _should_flow when the source wrote one', () => {
+		expect(inputRendersField(flow, { wired: false, hasWrittenValue: true })).toBe(true);
+	});
+
+	it('hides _should_flow driven by a wire, written value or not', () => {
+		expect(inputRendersField(flow, { wired: true, hasWrittenValue: false })).toBe(false);
+		expect(inputRendersField(flow, { wired: true, hasWrittenValue: true })).toBe(false);
+	});
+
+	it('keeps the ordinary rules for every other input', () => {
+		expect(inputRendersField(input({}), { wired: false, hasWrittenValue: false })).toBe(true);
+		expect(inputRendersField(input({}), { wired: true, hasWrittenValue: false })).toBe(false);
+		expect(
+			inputRendersField(input({ exposure: 'wire' }), { wired: false, hasWrittenValue: true }),
+		).toBe(false);
+		expect(
+			inputRendersField(input({ synthesizedFromCarry: true }), { wired: false, hasWrittenValue: false }),
+		).toBe(false);
+	});
+
+	it('draws the same control for a node and a container', () => {
+		expect(shouldFlowField('node').type).toBe('checkbox');
+		expect(shouldFlowField('node').portDriven).toBe(true);
+		expect(shouldFlowField('container').description).toContain('inside it');
+	});
+});
+
+/** One emptiness rule for the port-literal writer: null, undefined,
+ *  '' and [] all DELETE the key (a multiselect deselect-all and a
+ *  text_list with its last row removed must clear the literal, not
+ *  strand a phantom [] in the source), and any other value lands. */
+describe('nextPortLiterals', () => {
+	it('deletes the key on every empty shape', () => {
+		for (const empty of [null, undefined, '', []]) {
+			expect(nextPortLiterals({ tags: ['a'] }, 'tags', empty)).toEqual({});
+		}
+	});
+
+	it('stores any non-empty value and leaves other keys alone', () => {
+		expect(nextPortLiterals({ other: 1 }, 'tags', ['a'])).toEqual({ other: 1, tags: ['a'] });
+		expect(nextPortLiterals({}, 'flag', false)).toEqual({ flag: false });
+		expect(nextPortLiterals({}, 'n', 0)).toEqual({ n: 0 });
 	});
 });

@@ -18,3 +18,6 @@ serde_json = { workspace = true }
 # author-facing alias), `weft_core` inside the workspace. This resolves
 # the right one from the invoking crate's Cargo.toml.
 proc-macro-crate = "3"
+
+[lints]
+workspace = true

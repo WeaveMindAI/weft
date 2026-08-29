@@ -1,205 +1,290 @@
+<div align="center">
+
+<img src="docs/src/img/logo.png" alt="Weft" width="120" />
+
 # Weft
 
-**A programming language where an LLM call, a human approval, a database, and a WhatsApp line are the same kind of thing: typed nodes a compiler can check. An AI writes it, you read it as a graph, and it runs as a native Rust binary.**
+**A programming language and framework for AI orchestration.**
 
-```bash
-git clone https://github.com/WeaveMindAI/weft.git && cd weft && ./setup.sh
-```
+*As flexible as an agent, as reliable as code.*
 
-Why can't any compiler see the parts of your system that matter most, the LLM calls, the human review steps, the API glue?
+[Try it](#try-it) · [The book](https://weavemindai.github.io/weft/) · [Discord](https://discord.com/invite/FGwNu6mDkU) · [Blog](https://weavemind.ai/blog/future-of-programming)
 
-Why does "wait for a person to approve this" take a webhook, a queue, and a state machine instead of one line?
+</div>
 
-Why did your AI assistant just write ten thousand lines of Python that neither of you can hold in your head?
+---
 
-Every language you can use today was designed before programs had intelligence inside them. Weft is designed after. LLMs, humans, APIs, databases, and infrastructure are its primitives, the way numbers and operators are primitives elsewhere. The compiler reads the whole system, checks every connection and every type, and transpiles it to Rust: a native binary, not a graph crawling through an interpreter.
+## Why weft?
 
-Here's a real one. A support ticket comes in by email, an LLM triages it, and anything it flags as critical waits for a human before it gets escalated:
+Weft is a high-level language and a low-level Rust framework made to effortlessly create complex and reliable orchestrations of AIs, humans and tools:
 
-````weft
-mailbox = EmailAccess
+- **Readable.** The language describes how components interact, not what happens inside them, so a whole system fits in a few lines of code that are extremely fast to produce and hard to get wrong. The internal representation of the program is natively a graph, so even a non developer can follow what is happening and fully interact with it through a GUI.
+- **Compiled.** The compiler proves things about your orchestration before it runs: today it proves the whole graph is wired soundly and will execute properly at runtime; it will grow toward compiler flags that pin down what the system is allowed to do at runtime. The final step is Rust transpilation, so you also get Rust's memory safety, and high-speed performance for free.
+- **Alive.** Execution is not one pass through a graph. Parts can stay up, wait for answers, and keep talking to each other while the rest of the program carries on.
+- **Durable.** A program can put itself in hibernation and wait for any kind of signal at virtually 0 computational cost, then resume from exactly where it stopped. Every run is written down as it happens, so you can open any of them and see what happened, or is happening, interactively through the graph.
+- **Infrastructure included.** Write `pg = PostgresDatabase` and the program gets a Postgres of its own. The node says which container it needs; the runtime starts that container with a disk that survives restarts, and the rest of the program reaches it through one output, `pg.access`. The WhatsApp bridge in the program below is an infrastructure node too: it puts its login QR code in the graph view, so you connect the bot by scanning it. Anything that runs in a container can be an infrastructure node; if you want to write your own, go and read [infrastructure nodes](https://weavemindai.github.io/weft/nodes/infrastructure.html).
+- **Dynamic vocabulary.** A node is two files and a few dozen lines of Rust, because weft has already taken on every piece of plumbing you would have to do manually. It is opinionated on purpose: there is one way a file is stored and one way a credential is held, and you get every parameter but never the mechanism, so each piece is hardened once instead of half-written again in every node. That makes a node cost a fraction of the tokens it would in another framework, and come out with far less to go wrong. Where weft's job stops and yours begins is written down in [the commandments of plumbing](https://weavemindai.github.io/weft/thinking/plumbing.html).
 
-ticket = ReceiveEmail
-ticket.account = mailbox.access
+## Your first weft program
 
-llm = OpenRouterProvider { model: "openai/gpt-4.1-nano" }
+```weft
+whatsapp = BaileyBridge
 
-triage = LlmParams {
-  systemPrompt: "Classify this support ticket. Reply with JSON: {severity, summary}."
+ask = BaileyReceive { endpointUrl: whatsapp.endpointUrl }
+
+draft = LlmInference -> (answer: String, sensitivity: String) {
+  parseJson: true
+  prompt: ask.content
+  provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider
+  params: LlmParams { systemPrompt: @file("prompts/support.md"), temperature: 0.75 }.params
 }
 
-classify = LlmInference -> (response: String) {}
-classify.prompt = ticket.body
-classify.provider = llm.provider
-classify.params = triage.params
+# Exactly one of these two says yes, the other stays quiet
+route = Switch {
+  value: draft.sensitivity
+  cases: [
+    { "kind": "equals", "value": "high", "port": "needsAPerson" },
+    { "kind": "otherwise", "port": "goAhead" }
+  ]
+}
 
 review = HumanQuery {
-  title: "Escalate this ticket?"
-  fields: [{ "fieldType": "approve_reject", "key": "escalate" }]
+  _should_flow: route.needsAPerson
+  title: "Send this answer?"
+  fields: [
+    { "kind": "display", "key": "from" },
+    { "kind": "display", "key": "question" },
+    { "kind": "display", "key": "answer" },
+    { "kind": "approve_reject", "key": "send" }
+  ]
+  from: ask.pushName
+  question: ask.content
+  answer: draft.answer
 }
 
-escalate = Gate(pass: Boolean, value: String) -> (value: String?) {}
-escalate.pass = review.escalate_approved
-escalate.value = classify.response
+allowed = FirstInOrder {
+  approved: review.send_approved
+  automatic: route.goAhead
+}
 
-alert = Debug
-alert.data = escalate.value
-````
-
-Read it top to bottom: ticket in, LLM classifies, a human approves the escalation, the gate only lets approved tickets through to the alert. Every edge and every type was checked before a single node ran. The human pause is one node (`HumanQuery`): the program can wait minutes or days for that approval and resume exactly where it left off. Open the same file in the editor and it's a graph you click through and watch execute live.
-
-<!-- CAPTURE: hero image or short GIF right here: the support-ticket example
-     above, shown side by side as code and as its rendered graph in VS Code,
-     ideally mid-execution with one node lit. This is the front door's one
-     visual; it carries the "code for the AI, graph for you" claim. -->
-
-> **Building in public, early days.** The language, the type system, and the durable executor are the stable core. The node catalog is small and opinionated on purpose. Breaking changes will happen while the shape settles, and they'll come with migration notes. Treat this as a foundation to build on, not a finished product.
-
-## Two layers, one cheap seam
-
-Most tools pick a side. Zapier lets you *compose* pre-built blocks but you can't make new ones. A library lets you *make* primitives but composing them is just more raw code, with all the plumbing back. Weft is built so the seam between those two worlds is cheap to cross, and that seam is what makes it different from everything else.
-
-**The lower layer is vocabulary.** Someone wraps a capability (an LLM call, a Postgres store, a WhatsApp bridge, a NeRF, a niche model, a custom agent) into a *node*: a typed, self-contained building block with clean input and output ports. Hard tech that was painful to use becomes a drop-in. The node carries its own dependencies and infrastructure, so when someone else imports it, it just works.
-
-**The upper layer is composition.** You snap that vocabulary into programs. If the node you need already exists, you use it or import someone else's. If it doesn't, you write one in a few minutes, and now it's vocabulary forever. The catalog compounds: every node added pulls in more builders, who add more nodes. Build a word once and every sentence after that gets to use it.
-
-## Built to be written by AI, not learned by humans
-
-People hear "new language" and flinch: nobody wants to learn another syntax. But you don't learn Weft. **It's designed from the ground up to be written by AI and read by you as a graph.**
-
-What makes the syntax AI-friendly is that it is *strict*. Strong typing, top-down construction, and connection-completeness form a cage around the model: the compiler won't let it wire a String into a Number, leave a required input dangling, or send unfiltered user input straight into an LLM. The AI builds *inside* a structure that's guaranteed sound, instead of improvising the whole thing and hoping. That's the difference between an agent and orchestration: your trust goes to the architecture, which the compiler checked, rather than to the model's good behavior.
-
-The payoff shows up in build time. In our testing, an AI builds the equivalent system in Weft about **20x faster** than writing it in Python with a coding agent (a customer-feedback triage pipeline went from ~1 hour to ~3 minutes), and the result is a graph you can read, edit, and watch execute live.
-
-## How you actually build with it
-
-You grow the system against a real example instead of writing it from a spec. Take one input that matters to you, build the first step, run it, click the node, and look at the value that actually came out. When that step produces what you want, grow the next one. When the whole chain works end to end, feed it a second example and fix whichever steps break, while the earlier examples keep passing. A few examples in, new inputs just work, and at no point were you guessing: every decision was made looking at a real value on a real run.
-
-We call this way of working **Sequential Diffusion Programming**: the program sharpens pass after pass, the way an image sharpens out of noise, and each pass is anchored to a concrete case. It only became viable now, because an AI pass over a Weft program is fast and cheap enough that refining beats up-front design. The graph view exists for exactly this loop, and when something breaks in production later, the same motion works in reverse: the journal keeps every execution, so you open the failed run, descend the folded groups to the step whose value went wrong, and iterate on that step with the failing case as your new example.
-
-## What the compiler buys you
-
-Because the whole orchestration is legible (not buried in glue code), the machine can do things no framework can:
-
-- **Guarantees before it runs.** The compiler reads the entire architecture. It can flag user input reaching a model with no filter, an output hitting a destructive action with no human review, and it's the place to enforce things like compliance or jailbreak protection, before a single node fires.
-- **Reliable systems from unpredictable parts.** LLMs are unpredictable by nature. You choose how tightly each one is contained, from "acts freely, fast to prototype" to "output bounded and checked." Prototype loose, then lock down the parts that need to be reliable, without losing the intelligence where it matters.
-- **Everything is mockable.** Any node or group can be swapped for "pretend it returns this." Test one step, benchmark it, compare two prompts in isolation. The mock is type-checked against the real ports, so it can't silently drift.
-- **First-class humans.** Pause mid-program, send a form to a person, wait three days, resume exactly where you left off. All of that is one node, with no webhooks or polling loops to hand-roll around it.
-- **Durable by default.** Programs survive crashes and restarts. "Wait three days for an approval" is the same code as "wait three seconds for an API response."
-- **The full power of Kubernetes without operating it.** Kubernetes already won at coordinating real infrastructure (pods, networking, storage, health, lifecycle). The only thing wrong with it is that wielding it means YAML, operators, and an ops priesthood. Weft puts a tiny typed DSL in front of all that power: a database, a WhatsApp bridge, a headless browser is just a node you drop on the graph and wire up. Hit start and the platform provisions the real pod, waits for it to be healthy, and hands the rest of your program a URL. The same code runs on a local cluster on your laptop and on real Kubernetes in any cloud, with no separate "prod" setup to maintain. The defaults are sane without being a ceiling: an expert can always drop down to the actual cluster config and tighten it, because every node's full vocabulary stays reachable.
-- **Recursively foldable.** Any group of nodes collapses into a single node with a typed interface. A 100-node system still reads as 5 blocks at the top level.
-- **Compiles to native code.** Weft transpiles to Rust, so you get memory safety and real performance, not a slow interpreted graph (the Zapier-clone failure mode) that buckles at scale. The graph is how you read and edit it; the thing that runs is a compiled binary.
-
-## Quick start
-
-You need [Docker](https://docs.docker.com/get-docker/) (for Postgres) and [Rust](https://rustup.rs/). On macOS, `brew install bash` (the script needs Bash 4+).
-
-```bash
-git clone https://github.com/WeaveMindAI/weft.git
-cd weft
-./setup.sh
+reply = BaileySend {
+  _is_output: true
+  _should_flow: allowed.value
+  endpointUrl: whatsapp.endpointUrl
+  to: ask.chatId
+  message: draft.answer
+}
 ```
 
-That one script builds and links three binaries into `~/.local/bin`:
+[Watch the demo](docs/src/img/readme_demo.mp4)
 
-- `weft` (the CLI)
-- `weft-dispatcher` (the local runtime daemon)
-- `weft-runner` (the worker, launched by the dispatcher)
+This is a complete runnable program: a support bot on WhatsApp. A customer messages in, a model writes an answer and rates how sensitive the question was, and if the question is sensitive the programs waits for a person to approve the answer before sending it.
 
-It also builds and installs the VS Code extension, which is where the graph editor and live execution view live. If `~/.local/bin` isn't on your `PATH`, the script prints the exact line to add.
+It is about forty lines, so let me walk you through it:
 
-The script also leaves the local runtime daemon up and running, so you can go
-straight to your first project:
+The first line is the WhatsApp integration. **It is only one line** because `BaileyBridge` is an infrastructure node: it ships with its own container and handle it's own infrastructure. When you open the graph view, you only have to scan the QR code with your phone that owns the whatsapp account, and the bot is connected. There is nothing else to set up. You can check the source code of the BailyBridge in the [`catalog/`](catalog/bailey/bridge/) if you want to see how it works.
+
+Then `ask` is a trigger that waits for a message to come in. When a message is detected, it start an executions with the message payload. Then `draft` call and LLM and draft a reply. `parseJson: true` means that the prompt asks for a JSON reply and it extract the payload into two typed outputs: the answer, and the sensitivity rating. The system prompt lives in its own file, and the model is whatever OpenRouter is serving, here `z-ai/glm-5.3`.
+
+After that there is a `Switch`. It looks at `draft.sensitivity` and opens exactly one of its two ports: `needsAPerson` if the rating is `"high"`, `goAhead` otherwise. `review` reads that port through `_should_flow`, so the person is only asked when the answer was sensitive; if not, the review node is skipped.
+
+When the `review` fires, the execution pause, and ask for a human to review the answer through the integrated [Weft browser extension](extension-browser/). **While they decide, nothing is running.** The process that runs the program exit, and the execution is a row in a table. When the human reply, a fresh worker rebuilds the state and picks up from that exact line. **Whether the wait is three seconds or three weeks, there is no compute spent** (other than the infra running in the background, but for a program with no infra there is nothing running)
+
+If the user refuse, this fires true on "send_rejected" and close the other "send_approved" which propagate through the rest of the program and stop the execution. If the user approve, the "send_approved" is set to True and the other is closed. ("send_rejected" and "send_approved" are auto infered ports from the field of kind "approve_reject")
+
+Then `FirstInOrder` takes whichever input arrived first in the config order, `review.send_approved` or `route.goAhead`, and ouput it as ".value", and `reply` uses it as its own `_should_flow`. So either the LLM decided it wasn't highly sensitive and it skiped direclty to this node and then sent the reply, or the human approved the reply and it gets sent through the same path.
+
+The whole thing is a runnable project in [`examples/`](examples/whatsapp-support-bot/). There are other more complex example next to it.
+
+## Try it
+
+Weft runs your programs in a Kubernetes cluster, and that cluster is local:
+`setup.sh` builds it on your machine with `kind`. You will need Rust, Docker,
+kubectl, kind, Node 20 or newer, and pnpm, and if anything is missing the
+script names all of it before it starts. If you rebuild later, only what
+changed is redone; the first build compiles the whole Rust workspace and builds
+the images, so it might take a bit of time.
 
 ```bash
-weft new hello         # scaffold a project
-cd hello
-weft run               # compile, register, fire an execution, stream live events
+git clone https://github.com/WeaveMindAI/weft.git && cd weft
+./setup.sh                               # the runtime, the CLI, the VS Code ext
+weft new hello && cd hello && weft run   # scaffold, compile, fire an execution
 ```
 
-Open the project folder in VS Code to see the graph, click nodes, and watch execution flow through in real time. The full walkthrough (webhooks, human-in-the-loop, infrastructure nodes) is in [docs/getting-started.md](./docs/getting-started.md).
+If `weft` is not found, `setup.sh` printed the `export PATH=...` line to add to
+your shell rc: run it and try again.
 
-### API keys and connections
+If a VS Code window was open while `./setup.sh` ran, it installed the editor
+extension into it; otherwise it printed a `code --install-extension` command to
+run from a VS Code terminal. Either way, open the `hello` folder in VS Code and
+you get your program as a graph, lighting up node by node as it runs, with a
+"Source" button that puts the text back beside it. If it went into a window you
+already had open, run CTRL+Shift+P `Developer: Reload Window` once first.
 
-Nodes that call a third party (an LLM provider, email, Slack) take a **connection**, picked on the node in the editor. Your key never enters the graph or the source file; the node's config stores only a handle to the stored connection. Two ways to connect:
+When a program hits a "HumanQuery" or a "HumanTrigger", the question turns up in the
+weft browser extension, which the default install does not build. If you want
+it, `./setup.sh --browser --no-sign --no-bump` builds it: `--no-sign` skips the
+Firefox add-on signing you do not need locally, and `--no-bump` leaves the
+extension's version number alone. For how to load it into your browser and
+point it at your runtime, go and read
+[the browser extension](https://weavemindai.github.io/weft/running/browser-extension.html).
 
-- **Your own key**: paste it once in the editor's connection flow for that service.
-- **One click on this weft's own key**: add an `api_key` entry for the service in the shared-credentials file (`access-apps.json`) and the editor offers it as a ready-made connection.
+If you only want part of it built, or you want to uninstall the whole thing, go
+and read
+[the install page](https://weavemindai.github.io/weft/start/install.html)
+for the flags. For what a weft runtime is actually made of (four tiers plus a
+broker), and why a crash mid-execution loses nothing, go and read
+[how the runtime is built](https://weavemindai.github.io/weft/running/architecture.html).
 
-Copy `access-apps.example.json` to `access-apps.json` and fill in the services you want to offer that way. All optional: a node whose connection is missing fails loudly at run time, never silently.
+## Nobody is supposed to learn this
+
+No serious developer writes code by hand any more.
+
+It became the slow way to get from an idea to a system that works, and the
+people who noticed first are shipping while everyone else is still defending
+the craft.
+
+What replaces it is a person with real field experience, an AI that writes the
+code, and a medium between them that **both sides can trust and understand**.
+
+Field experience: having walked into the walls yourself, many times, across
+enough real cases to know which ones matter. A model has read about the walls.
+The other half of what you bring is taste: knowing which of five working
+designs is the one to keep. Weft is built so those two can be all you bring.
+
+Today the medium between the two is Python, and neither side trusts it. The
+human cannot read ten thousand lines to check the model's work. The model has
+no structure holding it to anything, so it improvises and you find out later.
+
+Weft is aiming at that medium. You are not meant to sit down and learn it the
+way you learned Python: it is written by AI and read by you, as a graph you
+**watch run**. When you do write some yourself, for a node or a tricky step,
+you are writing your own logic and nothing around it.
+
+A model writing weft cannot invent a control flow nobody checked: control flow
+is wires, and you have already seen the compiler go over them.
+
+If you want to hand a piece of the work to an agent or another person, the same
+strictness is what makes that safe. You can give out a job as small as "turn a
+raw email into a normalised ticket, here are its input and output types",
+because a group is a typed contract. Check it against the types on its boundary
+and merge it, without anyone re-reading the whole program.
+
+## The best way to use Weft
+
+Vibe coding is one-shot generation. You describe the thing, a model produces
+it, and you hope. If you want more than a demo, build against a real example.
+
+Take one input that actually matters to you and build the first step, then run
+it and click the node to see the value that came out. When that step does what
+you want, add the next one and run again. Once the chain works end to end, feed
+in a second real example and fix whichever steps break while the earlier ones
+keep coming out right. After a few examples the only steps that still break are
+usually the ones parsing messy input.
+
+We call it
+[Sequential Diffusion Programming](https://weavemindai.github.io/weft/thinking/sdp.html):
+the program sharpens pass after pass, the way an image sharpens out of noise.
+
+When something breaks in production six months later, you run the same loop
+again with the failing case as your example. Every execution was recorded step
+by step, with the value on every wire. Weft calls that the journal, and for how
+to read one, go and read
+[the journal](https://weavemindai.github.io/weft/running/the-journal.html). You
+open the run that failed, descend the folded groups to the step whose value
+went wrong, and iterate there.
+
+## Building blocks, and programs made of them
+
+Most tools hands you blocks somebody else built and a wall
+the moment you need one they did not imagine. A library lets you build your own
+and then leaves you wiring them together in raw code.
+
+In weft you write the node you were missing and use it on the next line.
+
+**The lower layer is where the vocabulary comes from.** Someone wraps a
+capability into a node: an LLM call, a Postgres store, a WhatsApp bridge, a
+long-lived agent. Something that was painful to stand up becomes a line in a
+file, and it works the same way for the next person who drops that folder into
+their project.
+
+**The upper layer is where you snap that vocabulary together**, and you can
+drop the Python you already have straight into it. `ExecPython` runs it as a
+node: `py = ExecPython(x: Number) -> (result: String) { code: "..." }`. Each
+input arrives as a variable named after its port, and the dict your code
+returns goes out keyed by port name.
+
+A node is a folder with a `metadata.json` saying what goes in and out and a
+`mod.rs` doing the work. If it needs a crate, name it in a `deps.toml`, and if
+you want it to have its own tests, drop a `tests.rs` in the same folder. For
+the walkthrough, go and read
+[what a node is](https://weavemindai.github.io/weft/nodes/what-a-node-is.html).
+
+## Models are not required
+
+The program above uses a model, because that is what everyone is building right
+now. Nothing in weft needs one.
+
+If your slow step is a person or an API, weft sees the same thing it sees in a
+model call: a node with typed ports that takes a while to answer.
+
+## Where things stand
+
+Weft's own development runs every day on the language, the type system, the
+compiler, the executor that survives restarts, the journal, the node framework
+and the login system. They change rarely now.
+
+The catalog is small on purpose: it exists to prove the language can express
+things, and it grows wherever somebody needs it to. To see what is in it today,
+go and look in
+[`catalog/`](catalog/).
+
+Breaking changes will happen while the shape settles. Each one comes with its
+migration notes.
+
+For the pushback we get most often and what we think about it, go and read
+[Things people say to me](https://weavemindai.github.io/weft/thinking/objections.html).
 
 ## Repo layout
 
 ```
 weft/
-├── catalog/            # The node catalog (source of truth for every built-in node)
-│   ├── ai/             #   LLM providers, params + inference; speech-to-text
-│   ├── basic/          #   Text, Debug, Python execution
-│   ├── email/          #   Email receive/send
-│   ├── http/           #   HTTP request
-│   ├── human/          #   Human Query, Human Trigger (forms, approvals)
-│   ├── live/           #   HTTP endpoints, websockets
-│   ├── logic/          #   Gate (conditional routing)
-│   ├── triggers/       #   Cron
-│   ├── bailey/         #   WhatsApp bridge + send/receive
-│   └── ...             #   Slack, GitHub, Google, storage, Telegram
+├── catalog/            every built-in node, and the best place to read before writing your own
+│   ├── ai/             LLM providers and inference, speech, image and video, documents
+│   ├── basic/          Text, Debug, Python execution, Cast, Range
+│   ├── human/          forms and approvals
+│   ├── live/           HTTP endpoints, websockets
+│   ├── logic/          Switch, FirstInOrder
+│   └── ...             Slack, Google, Notion, Airtable, email, S3, storage, Postgres,
+│                       Telegram, WhatsApp (`bailey/`), HTTP, RSS, web, triggers
 ├── crates/
-│   ├── weft-core/      #   Type system, pulse model, the Node trait
-│   ├── weft-compiler/  #   Lex, parse (lossless CST), enrich, validate, codegen
-│   ├── weft-engine/    #   The execution loop (durable, resumable)
-│   ├── weft-dispatcher/#   Routing + lifecycle, coordinates through Postgres
-│   ├── weft-listener/  #   Wake events (timers, webhooks, forms)
-│   └── ...             #   journal, catalog, broker, infra, CLI
-├── extension-vscode/   # The editor: graph view + live execution
-├── extension-browser/  # Browser extension for human-in-the-loop tasks
-├── docs/               # Getting started, authoring nodes, use cases
-└── setup.sh            # Build + install everything
+│   ├── weft-core/       the type system, how values travel between nodes
+│   ├── weft-compiler/   lex, parse, enrich, validate, codegen
+│   ├── weft-engine/     the execution loop: durable, resumable
+│   ├── weft-dispatcher/ routing and lifecycle, coordinated through Postgres
+│   ├── weft-listener/   wake events: timers, forms, feeds, provider events
+│   └── ...              journal, task store, catalog, broker, infra, CLI
+├── packages/
+│   └── weft-graph/      the graph renderer and editor the VS Code extension embeds
+├── extension-vscode/   the editor: graph view and live execution
+├── extension-browser/  where people answer the tasks programs send them
+├── docs/               the book
+├── deploy/             the container images, the cluster manifests, the public page
+├── scripts/            the test runners and the worktree helper
+└── setup.sh            build and install everything
 ```
 
-### How a node works
+## Contributing
 
-Every node is a folder in `catalog/` with:
-
-- `mod.rs`: the Rust implementation (the `Node` trait: declare metadata, implement `execute`).
-- `metadata.json`: ports, config fields, and UI hints, as data.
-- `deps.toml` (optional): the cargo crates and system packages this node needs.
-
-The compiler discovers nodes by walking the catalog. Adding one is a folder with two files. The full guide is in [docs/authoring-nodes.md](./docs/authoring-nodes.md).
-
-## The common objections
-
-**"Isn't this just Python with some libraries?"** A library is more code on top of a language that still can't see your system. Weft is a coordination language, so the orchestration itself is something the compiler can read and prove sound. The syntax is also shaped to be token-efficient, written and reasoned about by AI.
-
-**"Do I have to rebuild my stack?"** No. Weft coordinates your existing stack and drops down to real code wherever you need it. It can even expose itself as an API. You adopt it incrementally.
-
-**"Nobody adopts new languages."** What kills a new language is the cost of getting people to learn it. Nobody has to learn Weft. The AI writes it, you read it as a graph.
-
-**"Why now?"** Software is being rebuilt around AI, and people are still gluing these systems together with primitive tooling. The language is always the foundation of what gets built on top of it. The window to set that foundation is open now.
-
-**"Why should I bet my stack on something this young?"** Because the foundation is deliberately small. Weft stands on two technologies that aren't going anywhere: Rust (the runtime it compiles to) and Kubernetes (how it provisions and runs infrastructure). Everything else, we keep the dependency surface as thin as we can, so there's little to rot. And because Kubernetes is the substrate, the runtime isn't welded to one cloud: the same manifests run on a local cluster or any provider's Kubernetes, so porting is a config change, not a rewrite.
-
-## Where to go next
-
-- **Build something.** [docs/getting-started.md](./docs/getting-started.md).
-- **Author a node.** [docs/authoring-nodes.md](./docs/authoring-nodes.md).
-- **See what it's for.** [docs/target-use-cases.md](./docs/target-use-cases.md).
-- **Contribute.** [CONTRIBUTING.md](./CONTRIBUTING.md).
-- **Join in, share a project, argue with me.** [Discord](https://discord.com/invite/FGwNu6mDkU).
-
-Read the longer story: [The Future of Programming (and Why I'm Building a New Language)](https://weavemind.ai/blog/future-of-programming).
-
-## Star history
-
-<a href="https://www.star-history.com/?repos=WeaveMindAI%2Fweft&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=WeaveMindAI/weft&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=WeaveMindAI/weft&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=WeaveMindAI/weft&type=date&legend=top-left" />
- </picture>
-</a>
+If you want to send a patch, or you are wondering how we review them, go and
+read [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-[O'Saasy License](./LICENSE). MIT with a SaaS restriction: use, modify, and self-host freely, but you can't offer it as a competing hosted service. See [osaasy.dev](https://osaasy.dev/).
+[O'Saasy](LICENSE): do what you like, including selling your programs, as long
+as you keep the notice and do not run it as a competing hosted service.
 
-Copyright © 2026 Quentin Feuillade--Montixi.
+---
+
+<sub>Weft is built by [Weavemind](https://weavemind.ai). Come and find us on
+[Discord](https://discord.com/invite/FGwNu6mDkU).</sub>

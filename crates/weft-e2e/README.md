@@ -20,40 +20,57 @@ Need a subset or a flag? Add it to `run-e2e.sh`. Do NOT hand-write a `cargo test
 invocation. First run is slow (cluster bring-up + per-fixture worker-image
 compiles); that is expected, never shortcut it.
 
-## When the cluster looks wrong, fix the SETUP/SOURCE, not the cluster (HARD REQUIREMENT)
+## Credentials, and what the runner provides for you
 
-This is not advice, it is the protocol, and it is NOT optional. Time is NOT a
-reason to deviate: a clean purge + reinstall + full e2e run is slow (cluster
-bring-up, per-fixture worker-image compiles, serial scenarios), and that is
-expected and fine. Always take the slow, reproducible path over a fast hand-patch,
-so every fix is reproducible from source (a fresh machine or CI gets the same
-working system).
+Everything a local machine can serve, the runner provisions itself and tears
+down when the suite passes: the store's Postgres (a port-forward of the
+cluster's own), and an S3 endpoint (the daemon's SeaweedFS container). You set
+nothing for those.
 
-The cluster is owned by `setup.sh` + the daemon. Your ONLY cluster operations:
+What is left is the genuinely external services, which come from the
+environment. The runner reads the repo-root `.env`, which is gitignored, and
+anything you already exported wins over what it would provision.
+
+They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
+
+| Service | Variables |
+|---|---|
+| Slack | `WEFT_E2E_SLACK_BOT_TOKEN`, `_APP_TOKEN`, `_SIGNING_SECRET`, `_CLIENT_ID`, `_CHANNEL_ID` |
+| Google | `WEFT_E2E_GOOGLE_CLIENT_ID`, `_CLIENT_SECRET`, `_REFRESH_TOKEN` |
+| Telegram | `WEFT_E2E_TELEGRAM_TOKEN`, `_CHAT_ID` |
+| Email | `WEFT_E2E_EMAIL_USER`, `_PASSWORD`, `_IMAP_HOST`, `_IMAP_PORT`, `_SMTP_HOST`, `_SMTP_PORT` |
+| ElevenLabs | `WEFT_E2E_ELEVENLABS_API_KEY` |
+
+A test whose variables are absent **skips** rather than fails, through
+`env_or_skip` / `env_group_or_skip`, so a partial `.env` still gets you a
+useful run. Which also means a green suite does not prove the skipped ones
+work: check the output for what skipped before you trust it.
+
+This is a different mechanism from the node self-tests, which read
+`WEFT_NODE_TEST_*` and can also use a connection you signed into in the editor.
+Theirs is documented in [Testing a node](https://weavemindai.github.io/weft/nodes/testing.html#giving-the-live-tier-what-it-needs).
+
+## When the cluster looks wrong, fix the source (HARD REQUIREMENT)
+
+The rule and its whole list of never-dos live in
+[CONTRIBUTING](../../CONTRIBUTING.md#working-on-the-cluster), because it holds
+for every part of this repo, not just this suite.
+
+The one thing worth repeating here: time is never a reason to deviate. A
+reinstall and a full e2e run is slow (per-fixture worker image compiles, serial
+scenarios), and that is expected. Take the slow reproducible path, so a fresh
+machine and CI end up with the same working system you have.
 
 ```bash
-./setup.sh --uninstall --purge   # full teardown (cluster + Postgres volume)
-./setup.sh                       # fresh install / bring to current code (idempotent)
+./setup.sh                       # bring the cluster to the current code
 ```
 
-- **Never `kubectl apply/delete/edit/scale/rollout`, never `DROP`/`ALTER` the
-  live DB, never hand-roll a port-forward.** Those patch the running cluster, not
-  the source, so the fix evaporates on the next install and the bug ships.
-- **A test failure or wrong cluster state is a bug in the code, a manifest,
-  `setup.sh`, or the test toolkit. Fix it THERE**, then validate with purge +
-  reinstall + re-run. A blocked pod -> the manifest; a missing column -> the
-  `CREATE TABLE` + a purge; a wedged cluster -> a clean reinstall.
-- **If a plain `./setup.sh` does NOT pick up your change, that is a `setup.sh`
-  change-detection bug** (per-image stamp / migration). Fix the script so a fresh
-  run produces the right state on its own, and keep re-running it until it does.
-  Never patch the cluster to compensate, and never patch a test to tolerate the
-  wrong state, if the test needs a capability the toolkit lacks, extend the
-  toolkit (see "Add a test").
+`--uninstall --purge` exists for a genuine clean slate and takes every project,
+execution and stored credential on the machine with it. It is not the way to
+apply a change.
 
-**DB schema changes REQUIRE a purge.** The Postgres volume is durable across
-`setup.sh` runs and tables use `CREATE TABLE IF NOT EXISTS`, so a column change is
-silently skipped without `--purge`. After touching any `CREATE TABLE` / migration:
-`./setup.sh --uninstall --purge` then `./setup.sh`.
+If a test needs a capability the toolkit lacks, extend the toolkit (see "Add a
+test"). Never patch a test to tolerate the wrong state.
 
 ## Add a test
 
@@ -79,8 +96,8 @@ it) + a `main.weft`; a custom node goes under `fixtures/<name>/nodes/<node>/`. F
 a runtime value baked into the graph, put a `__E2E_TOKEN__` placeholder in
 `main.weft` and call `project.substitute_in_main(...)` before building.
 
-To write the `.weft` graph itself, see the language guide: `../../docs/weft-lang-
-guide.md` (and `../../docs/authoring-nodes.md` for custom nodes). Get the project
+To write the `.weft` graph itself, see the language reference under
+`../../docs/src/language/` (and `../../docs/src/nodes/` for custom nodes). Get the project
 right there; a malformed `main.weft` fails at build, not as a test assertion.
 
 **If a test needs something the toolkit doesn't have, extend the toolkit

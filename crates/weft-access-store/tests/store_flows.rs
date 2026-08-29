@@ -1209,7 +1209,7 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool
     .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("--public-url"), "{msg}");
-    assert!(msg.contains("docs/event-triggers.md"), "{msg}");
+    assert!(msg.contains("connections/events.html"), "{msg}");
     assert!(
         fake.calls.lock().unwrap().iter().all(|c| !c.starts_with("/watch/")),
         "no provider channel was opened"

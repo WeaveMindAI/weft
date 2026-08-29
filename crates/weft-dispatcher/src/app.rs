@@ -34,48 +34,53 @@ use crate::DispatcherState;
 /// without depending on the platform crate directly.
 pub use weft_platform_traits::object_store_from_env;
 
-/// Run the core dispatcher schema migrations against `pool`. Every table the
-/// dispatcher itself owns is created here, in dependency order.
-/// Serialization across racing replicas is the guard's own job:
-/// `apply_groups` runs everything in one transaction under its advisory lock.
-pub async fn run_core_migrations(pool: &sqlx::PgPool) -> anyhow::Result<crate::ProjectStore> {
-    // One guarded pass over every core group, in dependency order. The
-    // journal's `exec_event` group ran earlier, at journal connect; the
-    // `worker_pod` group's fencing triggers attach to `exec_event` and
-    // `task`, so it must stay AFTER the journal connect and after
-    // `tasks::GROUP`: a reset of either table drops the attached trigger,
-    // and this ordering is what recreates it in the same boot (matching
-    // stamps re-run their DDL). The `dispatcher_cursor` table group
-    // precedes the `infra_event_bridge_cursor` seed that writes into it.
-    // The guard refuses to run any group whose stamped fingerprint no
-    // longer matches its DDL, naming the tables to drop.
-    weft_task_store::apply_groups(
-        pool,
-        &[
-            &crate::listener::GROUP,
-            &crate::supervisor_pool::GROUP,
-            &weft_task_store::tasks::GROUP,
-            &weft_task_store::worker_pod::GROUP,
-            &weft_access_store::GROUP,
-            &crate::infra_node::GROUP,
-            &crate::infra_event::GROUP,
-            &crate::infra_lifecycle_command::GROUP,
-            &crate::journal_bridge::GROUP,
-            &crate::infra_event_bridge::GROUP,
-            // The durable terminate-sweep queue (no FK; the dispatcher owns
-            // it and the reaper drains it by asking the broker to sweep a
-            // terminated color's files).
-            &crate::storage::GROUP,
-            // In the one list with everything else, so a mismatch
-            // anywhere surfaces in ONE error naming every stale group
-            // together.
-            &crate::project_store::GROUP,
-        ],
-    )
-    .await
-    .context("apply core schema groups")?;
-    Ok(std::sync::Arc::new(crate::PostgresProjectStore::new(pool.clone())))
+/// Apply every schema group the dispatcher owns against `pool`, the ONE
+/// schema entry point per process: one guarded pass over [`ALL_GROUPS`]
+/// in dependency order, so every pending migration across every group
+/// runs in one global id order (the same order the agreement test
+/// replays). Serialization across racing replicas is the guard's own
+/// job: `apply_groups` runs everything in one transaction under its
+/// advisory lock. Runs BEFORE the journal or any store is constructed;
+/// none of them applies schema on its own.
+pub async fn apply_core_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    // Dependency order: the `worker_pod` group's fencing triggers attach
+    // to `exec_event` and `task`, so it sits after the journal group and
+    // `tasks::GROUP` (a reset of either table drops the attached
+    // trigger, and this ordering recreates it in the same boot). The
+    // `dispatcher_cursor` table group precedes the
+    // `infra_event_bridge_cursor` seed that writes into it. The guard
+    // refuses to run any group whose stamped fingerprint no longer
+    // matches its DDL, naming the tables to drop.
+    weft_task_store::apply_groups(pool, ALL_GROUPS)
+        .await
+        .context("apply core schema groups")
 }
+
+/// Every schema group the dispatcher owns, in dependency order, journal
+/// first. One list answers "what is the dispatcher's schema": the boot
+/// applies it whole, the migration generator writes its origins from it,
+/// and the agreement test builds from it.
+pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
+    &crate::journal::postgres::GROUP,
+    &crate::listener::GROUP,
+    &crate::supervisor_pool::GROUP,
+    &weft_task_store::tasks::GROUP,
+    &weft_task_store::worker_pod::GROUP,
+    &weft_access_store::GROUP,
+    &crate::infra_node::GROUP,
+    &crate::infra_event::GROUP,
+    &crate::infra_lifecycle_command::GROUP,
+    &crate::journal_bridge::GROUP,
+    &crate::infra_event_bridge::GROUP,
+    // The durable terminate-sweep queue (no FK; the dispatcher owns
+    // it and the reaper drains it by asking the broker to sweep a
+    // terminated color's files).
+    &crate::storage::GROUP,
+    // In the one list with everything else, so a mismatch
+    // anywhere surfaces in ONE error naming every stale group
+    // together.
+    &crate::project_store::GROUP,
+];
 
 /// The construction-time policies threaded into `build_state`: who a request
 /// authenticates as, which tenant owns a project, where a worker lands, whether
@@ -133,10 +138,13 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
 
     let database_url = std::env::var("WEFT_DATABASE_URL")
         .context("WEFT_DATABASE_URL is required (postgres://user:pass@host:port/db)")?;
-    let journal = PostgresJournal::connect(&database_url)
+    let pool = PostgresJournal::connect_pool(&database_url)
         .await
-        .with_context(|| format!("connect journal at {database_url}"))?;
-    let projects = run_core_migrations(journal.pool()).await?;
+        .with_context(|| format!("connect postgres at {database_url}"))?;
+    apply_core_schema(&pool).await?;
+    let journal = PostgresJournal::from_pool(pool.clone());
+    let projects: crate::ProjectStore =
+        std::sync::Arc::new(crate::PostgresProjectStore::new(pool));
 
     // Broker URL: every tenant pod (listener / worker / infra) talks to the
     // broker instead of touching Postgres. Required in-cluster; subprocess dev

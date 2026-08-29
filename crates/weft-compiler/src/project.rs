@@ -282,18 +282,35 @@ pub fn seed_catalog_into_upload(
     seed_base_catalog(tmp.path())?;
 
     let mut folder = std::collections::BTreeMap::new();
-    read_folder_into_map(tmp.path(), tmp.path(), &mut folder)?;
+    read_folder_into_map(tmp.path(), tmp.path(), &mut folder, &mut Default::default())?;
     Ok(folder)
 }
 
 /// Recursively read every regular file under `dir` into `out` keyed by its path
-/// relative to `root` (`/`-separated), skipping `NODE_TREE_EXCLUDE` names and never
-/// following symlinks, so the packed map matches what the build reads.
+/// relative to `root` (`/`-separated), skipping `NODE_TREE_EXCLUDE` names and
+/// following symlinks (their target bytes are packed, so a symlinked
+/// `nodes/base_catalog` uploads as real files), so the packed map matches what
+/// the build reads. A symlink cycle fails loudly via the descent chain.
 #[cfg(feature = "build")]
 fn read_folder_into_map(
     root: &Path,
     dir: &Path,
     out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    chain: &mut Vec<PathBuf>,
+) -> CompileResult<()> {
+    let canon = weft_catalog::guard_node_tree_cycle(dir, chain).map_err(CompileError::Io)?;
+    chain.push(canon);
+    let result = read_folder_entries_into_map(root, dir, out, chain);
+    chain.pop();
+    result
+}
+
+#[cfg(feature = "build")]
+fn read_folder_entries_into_map(
+    root: &Path,
+    dir: &Path,
+    out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    chain: &mut Vec<PathBuf>,
 ) -> CompileResult<()> {
     for entry in std::fs::read_dir(dir).map_err(CompileError::Io)? {
         let entry = entry.map_err(CompileError::Io)?;
@@ -302,13 +319,10 @@ fn read_folder_into_map(
             continue;
         }
         let path = entry.path();
-        let ft = entry.file_type().map_err(CompileError::Io)?;
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            read_folder_into_map(root, &path, out)?;
-        } else if ft.is_file() {
+        let kind = weft_catalog::node_tree_entry_kind(&path).map_err(CompileError::Io)?;
+        if kind == weft_catalog::NodeTreeEntryKind::Dir {
+            read_folder_into_map(root, &path, out, chain)?;
+        } else {
             let rel = path
                 .strip_prefix(root)
                 .expect("walked path is under root")
@@ -344,7 +358,7 @@ mod find_tests {
         // A malformed weft.toml -> Err (loud), NOT Ok(None).
         let bad = tempfile::tempdir().unwrap();
         std::fs::write(bad.path().join("weft.toml"), "this is = = not valid toml [[[\n").unwrap();
-        assert!(matches!(Project::find(bad.path()), Err(_)), "malformed manifest fails loud, not silent no-project");
+        assert!(Project::find(bad.path()).is_err(), "malformed manifest fails loud, not silent no-project");
 
         // An unresolvable start path -> Ok(None) (an unsaved buffer is no-project,
         // not an error).

@@ -434,7 +434,7 @@ mod tests {
         // A two-byte varint: low 7 bits 0 with the continue bit, then
         // 1 in the next group = 128.
         let mut long = vec![0x30, 0x80, 0x01];
-        long.extend(std::iter::repeat(0u8).take(127));
+        long.extend(std::iter::repeat_n(0u8, 127));
         assert_eq!(f.split(&long).unwrap(), None, "127 of 128 payload bytes arrived");
         long.push(0);
         assert_eq!(f.split(&long).unwrap().unwrap().1, 3 + 128);

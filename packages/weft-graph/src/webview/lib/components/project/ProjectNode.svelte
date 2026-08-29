@@ -9,16 +9,16 @@
 	import CodeEditor from "../CodeEditor.svelte";
 	import { toast } from "svelte-sonner";
 	import CopyButton from "../ui/CopyButton.svelte";
-	import { buildSpecMap, deriveInputsFromFields, deriveOutputsFromFields, isValidFieldKey, type FormFieldDef, type FormFieldSpec } from '../../utils/form-field-specs';
+	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, entryPortCollisions, entryPortName, isValidFieldKey, type PortEntryDef, type PortSpec } from '../../utils/port-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "../../utils/status";
 	import type { ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
-	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink } from '@lucide/svelte';
+	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink, Pencil } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { createPortContextMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
-	import { fieldForInput } from "../../utils/input-field";
+	import { fieldForInput, fieldForSpecField, inputRendersField, nextPortLiterals, shouldFlowField } from "../../utils/input-field";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
@@ -27,8 +27,9 @@
 	import RemoteSelectField from './RemoteSelectField.svelte';
 	import { grantsForService, grantsGeneration } from './grants-cache.svelte';
 	import FilePreview from './FilePreview.svelte';
+	import FlowDock from './FlowDock.svelte';
 	import type { FileValueWire } from "../../../../protocol";
-	import { parseFileValue, typeReferencesFile } from "../../../../protocol";
+	import { parseFileValue, typeReferencesFile, SHOULD_FLOW_PORT } from "../../../../protocol";
 
 	const edgesState = useEdges();
 	const nodesState = useNodes();
@@ -41,6 +42,10 @@
 			/// one in/out dot), no ports/config/body. Execution overlays
 			/// (status glyph, inspector, glow) are kept.
 			simplified?: boolean;
+			/// The user aimed the run at this output node (right-click, "Set as
+			/// target"). Renders as a breathing ring in the node's own colour,
+			/// which is the only place the feature shows on the canvas.
+			runTarget?: boolean;
 			config: Record<string, unknown>;
 			/// Body-set PORT values + their written forms, the two-home
 			/// twin of `config` (see NodeInstance.portLiterals).
@@ -140,8 +145,8 @@
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
 
-	const nodeFormFieldSpecs: FormFieldSpec[] = $derived(typeConfig.formFieldSpecs ?? []);
-	const nodeFormSpecMap: Record<string, FormFieldSpec> = $derived(buildSpecMap(nodeFormFieldSpecs));
+	const entryKinds: PortSpec[] = $derived(typeConfig.portsFromConfig?.specs ?? []);
+	const entryKindByName: Record<string, PortSpec> = $derived(buildSpecMap(entryKinds));
 
 	/** Input ports that have an incoming edge, so their field is hidden
 	 *  (the edge is the value's source of truth). */
@@ -183,10 +188,14 @@
 		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
 		const result: FieldDefinition[] = [];
 		for (const input of inputList) {
-			if (input.synthesizedFromCarry) continue; // carry ghost: not editable
-			if (inputExposure(input) === 'wire') continue; // wires only, never a field
-			if (wiredInputPorts.has(input.name)) continue; // edge wins, no field
-			result.push(fieldForInput(input));
+			const rendered = inputRendersField(input, {
+				wired: wiredInputPorts.has(input.name),
+				hasWrittenValue: portLiterals[input.name] !== undefined,
+			});
+			if (!rendered) continue;
+			result.push(
+				input.name === SHOULD_FLOW_PORT ? shouldFlowField('node') : fieldForInput(input),
+			);
 		}
 		return result;
 	});
@@ -209,30 +218,10 @@
 	}
 
 
-	// Recursively remove _raw keys from objects
-	function stripRawKeys(value: unknown): unknown {
-		if (value === null || value === undefined) return value;
-		if (Array.isArray(value)) {
-			return value.map(stripRawKeys);
-		}
-		if (typeof value === 'object') {
-			const obj = value as Record<string, unknown>;
-			const result: Record<string, unknown> = {};
-			for (const [key, val] of Object.entries(obj)) {
-				if (key !== '_raw') {
-					result[key] = stripRawKeys(val);
-				}
-			}
-			return result;
-		}
-		return value;
-	}
-
-	// Get clean debug data as JSON string (exclude _raw recursively)
+	/// The debug preview's text: the node's latest output, as JSON.
 	const debugDataJson = $derived.by(() => {
 		if (data.debugData === undefined || data.debugData === null) return null;
-		const cleaned = stripRawKeys(data.debugData);
-		return JSON.stringify(cleaned, null, 2);
+		return JSON.stringify(data.debugData, null, 2);
 	});
 
 	// The node's declared inline file display (`features.display`):
@@ -269,7 +258,12 @@
 	// flags, so a part can never render without growing the card, or be counted
 	// without rendering. Add a new live-display kind = add a flag here and a branch
 	// in `liveDisplay`, and `hasLiveDisplay` picks it up for free.
-	const showBodyFeed = $derived(!!data.bodyFeed && (data.bodyFeed.state === 'error' || data.bodyFeed.items.length > 0));
+	const showBodyFeed = $derived(
+		!!data.bodyFeed &&
+			(data.bodyFeed.state === 'error' ||
+				data.bodyFeed.state === 'absent' ||
+				(data.bodyFeed.state === 'ok' && data.bodyFeed.items.length > 0)),
+	);
 	const showDebugDisplay = $derived(!!(typeConfig.features?.showDebugPreview && debugDataJson));
 	const showFileDisplay = $derived(!!(typeConfig.display && displayedFileValue));
 	// Simplified view: a node with any live-display part (an infra/trigger feed, a
@@ -322,7 +316,7 @@
 			);
 			data.onUpdate?.({ inputs: newInputs });
 		} else {
-			const newOutputs = baseOutputs.map((p: PortDefinition) =>
+			const newOutputs = outputs.map((p: PortDefinition) =>
 				p.name === portName ? { ...p, portType: newType } : { ...p }
 			);
 			data.onUpdate?.({ outputs: newOutputs });
@@ -336,7 +330,7 @@
 			);
 			data.onUpdate?.({ inputs: newInputs });
 		} else {
-			const newOutputs = baseOutputs.map((p: PortDefinition) =>
+			const newOutputs = outputs.map((p: PortDefinition) =>
 				p.name === portName ? { ...p, required: !p.required } : { ...p }
 			);
 			data.onUpdate?.({ outputs: newOutputs });
@@ -349,7 +343,7 @@
 		const { portName, side, x, y } = portContextMenu;
 		const port = side === 'input'
 			? inputs.find((p) => p.name === portName)
-			: baseOutputs.find((p) => p.name === portName);
+			: outputs.find((p) => p.name === portName);
 		if (!port) return;
 
 		const defaultPorts = side === 'input' ? typeConfig.defaultInputs : typeConfig.defaultOutputs;
@@ -410,10 +404,10 @@
 	 *  design-time setting the graph never wires, so it gets a field in
 	 *  the body but no handle on the edge rail. `inputs` stays the
 	 *  COMPLETE list (edits round-trip the full set). */
-	const wireableInputs = $derived(inputs.filter((p: PortDefinition) => inputExposure(p) !== 'config'));
-	const baseOutputs = $derived(data.outputs || typeConfig.defaultOutputs);
-	// _raw port is rendered separately as a square in the top-right corner
-	const outputs = $derived(baseOutputs);
+	const wireableInputs = $derived(inputs.filter(
+		(p: PortDefinition) => inputExposure(p) !== 'config' && p.name !== SHOULD_FLOW_PORT
+	));
+	const outputs = $derived(data.outputs || typeConfig.defaultOutputs);
 
 	// Dynamic min resize height: header + ports + fixed buffer for at least one config line
 	// Accent bar (2) + header row (32) + content padding (16) + label (24) + ports gap (8) + port rows + buffer (100)
@@ -432,9 +426,21 @@
 		new Set(oneOfRequiredGroups.flat())
 	);
 	const canAddPorts = $derived(canAddInputPorts || canAddOutputPorts);
-	// Check if _raw output is connected (any edge from this node's _raw handle)
-	const rawConnected = $derived(
-		edgesState.current.some((e: Edge) => e.source === id && e.sourceHandle === '_raw')
+	// `_should_flow` decides whether the node runs at all, so it docks in
+	// the top-left corner as a square instead of sitting in the port rail
+	// among the node's own inputs. Filled means something answers it: a
+	// wire, or a literal written straight into the braces.
+	const flowConnected = $derived(
+		edgesState.current.some((e: Edge) => e.target === id && e.targetHandle === SHOULD_FLOW_PORT)
+			|| data.portLiterals?.[SHOULD_FLOW_PORT] !== undefined
+	);
+	// Simplified view draws a dot only when an edge attaches to it (the live
+	// edges there are the merged __simp_* ones, flow wires included).
+	const simplifiedInConnected = $derived(
+		edgesState.current.some((e: Edge) => e.target === id && e.targetHandle === SIMPLIFIED_IN_HANDLE)
+	);
+	const simplifiedOutConnected = $derived(
+		edgesState.current.some((e: Edge) => e.source === id && e.sourceHandle === SIMPLIFIED_OUT_HANDLE)
 	);
 	
 
@@ -506,10 +512,10 @@
 
 	/// Field keys this node renders itself rather than delegating to the
 	/// shared FieldStrip primitive renderer: only the exotic types (code,
-	/// form_builder). File-backed primitives render through
+	/// entry_list). File-backed primitives render through
 	/// FieldStrip via its displayValueOf / readonlyKeys / headerBadge
 	/// capabilities.
-	const EXOTIC_FIELD_TYPES = new Set(['code', 'access', 'remote_select', 'form_builder', 'file_drop']);
+	const EXOTIC_FIELD_TYPES = new Set(['code', 'access', 'remote_select', 'entry_list', 'file_drop']);
 	const customFieldKeys = $derived.by(() => {
 		const keys = new Set<string>();
 		for (const field of displayedFields) {
@@ -569,7 +575,7 @@
 		data.onUpdate?.({ config: { ...data.config, [key]: flipped } });
 	}
 
-	function updateConfig(key: string, value: string | string[] | number | boolean | FormFieldDef[] | Record<string, unknown> | WeftFileRefValue | null) {
+	function updateConfig(key: string, value: string | string[] | number | boolean | PortEntryDef[] | Record<string, unknown> | WeftFileRefValue | WeftFileRefValue[] | null) {
 		// File-backed field: the edit goes to the referenced file, never to the
 		// weft source. The `@file(...)` marker in config (and source) is left
 		// untouched; only the file's content changes.
@@ -606,12 +612,12 @@
 			// resolved content), so serializing the whole config re-emits the
 			// marker. No special handling needed for sibling file-backed fields.
 			const newConfig = { ...data.config, [key]: value };
-			if (typeConfig.features?.hasFormSchema && key === 'fields') {
-				const fields = value as FormFieldDef[];
+			if (typeConfig.portsFromConfig && key === typeConfig.portsFromConfig.field) {
+				const fields = value as PortEntryDef[];
 				data.onUpdate({
 					config: newConfig,
-					inputs: deriveInputsFromFields(fields, nodeFormSpecMap),
-					outputs: deriveOutputsFromFields(fields, nodeFormSpecMap),
+					inputs: deriveInputsFromEntries(fields, entryKindByName),
+					outputs: deriveOutputsFromEntries(fields, entryKindByName),
 				});
 			} else {
 				data.onUpdate({ config: newConfig });
@@ -634,11 +640,7 @@
 	 *  store a phantom "" literal. */
 	function updatePortLiteral(key: string, value: unknown) {
 		if (!data.onUpdate) return;
-		const cleared = value === null || value === undefined || value === '';
-		const next = { ...portLiterals } as Record<string, unknown>;
-		if (cleared) delete next[key];
-		else next[key] = value;
-		data.onUpdate({ portLiterals: next });
+		data.onUpdate({ portLiterals: nextPortLiterals(portLiterals, key, value) });
 	}
 
 	/** Route a field edit. FILE-BACKING WINS over the value's home, and
@@ -922,77 +924,150 @@
 		return fieldEditor.display(field.key, storeStr);
 	}
 
-	let addingFormField = $state(false);
-	let newFormField = $state<FormFieldDef>({ fieldType: 'display', key: '', config: {} });
-	let newOptionText = $state('');
-	/** Set when the user clicks Add with an empty key so the key input
-	 *  renders in an error state (red border + message) instead of
-	 *  silently no-op'ing. Cleared on any keystroke in the key input. */
-	let newFormFieldKeyError = $state(false);
+	let addingEntry = $state(false);
+	/// The entry being built, in its final shape: `kind`, the port name
+	/// under the spec's own key field, and whatever that kind asked for,
+	/// all at the top level.
+	let newEntry = $state<PortEntryDef>({ kind: '' });
+	/** Set when the user clicks Add with an empty or unusable name so the
+	 *  name input renders in an error state (red border + message)
+	 *  instead of silently no-op'ing. Cleared on any keystroke. */
+	let newEntryKeyError = $state(false);
 
-	function getFormFields(): FormFieldDef[] {
-		return ((data.config as Record<string, unknown>)?.fields as FormFieldDef[]) ?? [];
+	/// Entries open for editing, keyed by the port name they had when the
+	/// pen was clicked. That key is the row's identity: port names are
+	/// unique across the list, so removing another row (or reordering)
+	/// never sends an edit to the wrong entry. Several can be open at
+	/// once, each with its own draft and its own error flag.
+	let editDrafts = $state<Record<string, PortEntryDef>>({});
+	let editKeyErrors = $state<Record<string, boolean>>({});
+
+	function startEditingEntry(entry: PortEntryDef, key: string) {
+		editDrafts = { ...editDrafts, [key]: { ...entry } };
+		editKeyErrors = { ...editKeyErrors, [key]: false };
 	}
 
-	function updateFormFields(fields: FormFieldDef[]) {
-		updateConfig('fields', fields);
+	function cancelEditingEntry(key: string) {
+		const { [key]: _drop, ...rest } = editDrafts;
+		editDrafts = rest;
+		const { [key]: _dropErr, ...restErrors } = editKeyErrors;
+		editKeyErrors = restErrors;
 	}
 
-	function removeFormField(index: number) {
-		const fields = getFormFields().filter((_, i) => i !== index);
-		updateFormFields(fields);
+	function setEditDraft(key: string, draft: PortEntryDef) {
+		editDrafts = { ...editDrafts, [key]: draft };
 	}
 
-	function addFormField() {
-		const f = newFormField;
-		const key = f.key?.trim() ?? '';
-		if (!key || !isValidFieldKey(key)) {
-			newFormFieldKeyError = true;
-			return;
+	/// Switch a draft's kind, keeping only the port name: the values
+	/// belonged to the kind that asked for them.
+	function draftWithKind(draft: PortEntryDef, kind: string): PortEntryDef {
+		const from = entryKindByName[draft.kind] ?? entryKinds[0];
+		const to = entryKindByName[kind];
+		const name = from ? entryPortName(draft, from) : '';
+		return { kind, ...(to && name ? { [to.keyField]: name } : {}) };
+	}
+
+	const newEntrySpec = $derived(entryKindByName[newEntry.kind] ?? entryKinds[0]);
+
+	/// The config key holding the entry list, which the node's own
+	/// metadata names (`fields` for a form, `cases` for a switch).
+	const entryListKey = $derived(typeConfig.portsFromConfig?.field ?? '');
+
+	function getEntries(): PortEntryDef[] {
+		return ((data.config as Record<string, unknown>)?.[entryListKey] as PortEntryDef[]) ?? [];
+	}
+
+	function removeEntry(index: number) {
+		updateConfig(entryListKey, getEntries().filter((_, i) => i !== index));
+	}
+
+	function startAddingEntry() {
+		newEntry = { kind: entryKinds[0]?.kind ?? '' };
+		newEntryKeyError = false;
+		addingEntry = true;
+	}
+
+	/// Write a draft into the entry list, as a new entry (`replacing`
+	/// null) or over the one at `replacing`. The one place an entry is
+	/// checked, so the add form and every open edit form refuse the same
+	/// things: an unusable port name, a missing required value, and a
+	/// port name another entry already took. Returns whether it landed;
+	/// the caller closes its form on true.
+	function commitEntry(draft: PortEntryDef, replacing: number | null): boolean {
+		const spec = entryKindByName[draft.kind] ?? entryKinds[0];
+		if (!spec) return false;
+		const name = entryPortName(draft, spec).trim();
+		if (!name || !isValidFieldKey(name)) {
+			return false; // the caller lights up its own name input
 		}
-		// Emit the MINIMAL field: type + key (+ user-set config). `render` and
-		// an empty `config` are inherited from the node's form_field_specs at
-		// parse/runtime, so writing them here would just duplicate the spec's
-		// defaults into the source. Only carry `config` when the user actually
-		// set something (e.g. select `options`).
-		const field: FormFieldDef = { fieldType: f.fieldType, key };
-		if (f.config && Object.keys(f.config).length > 0) field.config = f.config;
+		// Emptied counts as missing: a required text field the user typed
+		// into and then cleared leaves '', and an entry with an empty
+		// required value is as incomplete as one with none.
+		const missing = (spec.fields ?? []).filter((f) => {
+			if (!f.required) return false;
+			const v = draft[f.key];
+			return v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0);
+		});
+		if (missing.length > 0) {
+			toast.error(`A "${spec.label}" needs ${missing.map((f) => f.label).join(', ')}.`);
+			return false;
+		}
+		const entry: PortEntryDef = { ...draft, kind: spec.kind, [spec.keyField]: name };
 
-		// Compute port names the new field would generate
-		const newInputNames = deriveInputsFromFields([field], nodeFormSpecMap).map(p => p.name);
-		const newOutputNames = deriveOutputsFromFields([field], nodeFormSpecMap).map(p => p.name);
-		const newPortNames = new Set([...newInputNames, ...newOutputNames]);
-
-		// Compute all existing port names from current fields
-		const existingFields = getFormFields();
-		const existingInputNames = deriveInputsFromFields(existingFields, nodeFormSpecMap).map(p => p.name);
-		const existingOutputNames = deriveOutputsFromFields(existingFields, nodeFormSpecMap).map(p => p.name);
-		const existingPortNames = new Set([...existingInputNames, ...existingOutputNames]);
-
-		const collisions = [...newPortNames].filter(n => existingPortNames.has(n));
+		// The ports this entry would add, against the ones already there.
+		// An edit measures against every OTHER entry, so keeping a name
+		// is not a conflict with itself.
+		const existing = getEntries();
+		const others = replacing === null ? existing : existing.filter((_, i) => i !== replacing);
+		const collisions = entryPortCollisions(entry, others, entryKindByName);
 		if (collisions.length > 0) {
-			toast.error(`Port name conflict: "${collisions.join('", "')}" already exists. Choose a different key.`);
-			return;
+			toast.error(`Port name conflict: "${collisions.join('", "')}" already exists. Choose a different name.`);
+			return false;
 		}
 
-		updateFormFields([...existingFields, field]);
-		newFormField = { fieldType: 'display', key: '', config: {} };
-		newOptionText = '';
-		newFormFieldKeyError = false;
-		addingFormField = false;
+		updateConfig(
+			entryListKey,
+			replacing === null
+				? [...existing, entry]
+				: existing.map((e, i) => (i === replacing ? entry : e)),
+		);
+		return true;
 	}
 
-	function addOption() {
-		const opt = newOptionText.trim();
-		if (!opt) return;
-		const options = [...((newFormField.config?.options as string[]) ?? []), opt];
-		newFormField = { ...newFormField, config: { ...newFormField.config, options } };
-		newOptionText = '';
+	function addEntry() {
+		if (!commitEntry(newEntry, null)) {
+			const spec = newEntrySpec;
+			const name = spec ? entryPortName(newEntry, spec).trim() : '';
+			newEntryKeyError = !name || !isValidFieldKey(name);
+			return;
+		}
+		addingEntry = false;
+		newEntryKeyError = false;
 	}
 
-	function removeOption(i: number) {
-		const options = ((newFormField.config?.options as string[]) ?? []).filter((_, idx) => idx !== i);
-		newFormField = { ...newFormField, config: { ...newFormField.config, options } };
+	/// Save one open edit. `key` is the port name the row had when the
+	/// pen was clicked; the row it points at may have been removed while
+	/// the form was open, and that says so rather than writing over a
+	/// neighbour.
+	function saveEditingEntry(key: string) {
+		const draft = editDrafts[key];
+		if (!draft) return;
+		const index = getEntries().findIndex((e) => {
+			const spec = entryKindByName[e.kind];
+			return spec ? entryPortName(e, spec) === key : false;
+		});
+		if (index === -1) {
+			toast.error(`"${key}" is no longer in the list, so there is nothing to save it over.`);
+			cancelEditingEntry(key);
+			return;
+		}
+		if (!commitEntry(draft, index)) {
+			const spec = entryKindByName[draft.kind] ?? entryKinds[0];
+			const name = spec ? entryPortName(draft, spec).trim() : '';
+			editKeyErrors = { ...editKeyErrors, [key]: !name || !isValidFieldKey(name) };
+			return;
+		}
+		cancelEditingEntry(key);
 	}
 
 	function addInputPort() {
@@ -1024,12 +1099,7 @@
 	function addOutputPort() {
 		const name = newOutputName.trim();
 		if (!name) return;
-		// Check for duplicate name (_raw is reserved for the raw output dock)
-		if (name === '_raw') {
-			toast.error(`"_raw" is a reserved port name`);
-			return;
-		}
-		if (baseOutputs.some((p: PortDefinition) => p.name === name)) {
+		if (outputs.some((p: PortDefinition) => p.name === name)) {
 			toast.error(`Output port "${name}" already exists`);
 			return;
 		}
@@ -1038,8 +1108,7 @@
 			portType: 'MustOverride',
 			required: false,
 		};
-		// Use baseOutputs (not outputs which includes _raw)
-		const newOutputs = [...baseOutputs, newPort];
+		const newOutputs = [...outputs, newPort];
 		if (data.onUpdate) {
 			data.onUpdate({ outputs: newOutputs });
 		}
@@ -1055,7 +1124,7 @@
 	}
 
 	function removeOutputPort(portName: string) {
-		const newOutputs = baseOutputs.filter((p: PortDefinition) => p.name !== portName);
+		const newOutputs = outputs.filter((p: PortDefinition) => p.name !== portName);
 		if (data.onUpdate) {
 			data.onUpdate({ outputs: newOutputs });
 		}
@@ -1115,6 +1184,67 @@
      preview) rendered the SAME way in the full body and the simplified card,
      so the two never drift. `actionBtn` is its helper. Defined at the top
      level so both render branches can call it. -->
+{#snippet entryForm(
+	draft: PortEntryDef,
+	keyError: boolean,
+	idPrefix: string,
+	commitLabel: string,
+	onDraft: (next: PortEntryDef) => void,
+	onCancel: () => void,
+	onCommit: () => void,
+)}
+	{@const spec = entryKindByName[draft.kind] ?? entryKinds[0]}
+	{@const fields = (spec?.fields ?? []).map(fieldForSpecField)}
+	<div class="rounded border border-border bg-background p-2 space-y-2">
+		<div class="space-y-1">
+			<span class="text-[10px] text-muted-foreground font-medium block">Kind</span>
+			<select
+				class="w-full text-xs bg-muted px-2 py-1.5 rounded border-none outline-none"
+				value={draft.kind}
+				onchange={(e) => onDraft(draftWithKind(draft, e.currentTarget.value))}
+			>
+				{#each entryKinds as option}
+					<option value={option.kind}>{option.label}</option>
+				{/each}
+			</select>
+		</div>
+		<div class="space-y-1">
+			<label for={`${idPrefix}-name`} class="text-[10px] text-muted-foreground font-medium block">
+				Name {#if spec}<span class="font-normal">(becomes the port name)</span>{/if}
+			</label>
+			<input
+				id={`${idPrefix}-name`}
+				type="text"
+				class="w-full text-xs bg-muted px-2 py-1.5 rounded outline-none font-mono {keyError ? 'ring-1 ring-destructive' : 'border-none'}"
+				placeholder={spec ? spec.keyField : 'name'}
+				value={spec ? entryPortName(draft, spec) : ''}
+				oninput={(e) => { if (spec) onDraft({ ...draft, [spec.keyField]: e.currentTarget.value }); }}
+			/>
+			{#if keyError}
+				<p class="text-[10px] text-destructive">Letters, digits and underscores only, starting with a letter or an underscore.</p>
+			{/if}
+		</div>
+		{#if fields.length > 0}
+			<FieldStrip
+				{fields}
+				config={draft as Record<string, unknown>}
+				idPrefix={idPrefix}
+				onUpdate={(key, value) => onDraft({ ...draft, [key]: value })}
+			/>
+		{/if}
+		<div class="flex gap-1 pt-0.5">
+			<button
+				class="flex-1 text-[10px] py-1 rounded text-muted-foreground hover:bg-muted transition-colors"
+				onclick={(e) => { e.stopPropagation(); onCancel(); }}
+			>Cancel</button>
+			<button
+				class="flex-1 text-[10px] py-1 rounded bg-primary text-primary-foreground hover:opacity-90 transition-opacity"
+				onclick={(e) => { e.stopPropagation(); onCommit(); }}
+			>{commitLabel}</button>
+		</div>
+	</div>
+{/snippet}
+
 {#snippet actionBtn(item: LiveDataItem)}
 	{#if item.action}
 		<button
@@ -1141,6 +1271,10 @@
 			<div class="flex items-start gap-1.5 text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-2 py-1.5">
 				<span class="font-medium shrink-0">Error</span>
 				<span class="break-all">{data.bodyFeed.error}</span>
+			</div>
+		{:else if data.bodyFeed.state === 'absent'}
+			<div class="text-[10px] text-muted-foreground bg-zinc-50 border border-zinc-200 rounded px-2 py-1.5">
+				Not running. Start it from the action bar.
 			</div>
 		{:else if data.bodyFeed.items.length > 0}
 			<div class="space-y-2">
@@ -1223,6 +1357,13 @@
 	{/if}
 {/snippet}
 
+<!-- Flow dock: `_should_flow` decides whether this node runs at all, so it
+     sits apart from the node's own inputs, as a square in the top-left
+     corner. Filled means something answers it. -->
+{#snippet flowDock()}
+	<FlowDock top={18} subject="node" connected={flowConnected} />
+{/snippet}
+
 {#if data.simplified}
 	<!-- Simplified view. A bare node is a square: icon, type, editable label, one
 	     in/out dot. A node with LIVE DISPLAY content (infra feed, debug preview,
@@ -1231,16 +1372,23 @@
 	     kept; ports/config are not shown; structure is not editable, but the
 	     LABEL can still be renamed by double-click. -->
 	{@const Icon = typeConfig.icon}
-	<Handle
-		type="target"
-		position={Position.Left}
-		id={SIMPLIFIED_IN_HANDLE}
-		style="top: 50%; z-index: 5; {simplifiedDotStyle(typeConfig.color)}"
-	/>
+	<!-- A dot only exists when something attaches to it: structure is not
+	     editable here, so an unwired dot would be pure decoration. Flow
+	     wires collapse onto the in dot too (the edge builder maps them
+	     there), so a flow-gated node still shows its in dot; the builder
+	     view's separate flow dock is not drawn. -->
+	{#if simplifiedInConnected}
+		<Handle
+			type="target"
+			position={Position.Left}
+			id={SIMPLIFIED_IN_HANDLE}
+			style="top: 50%; z-index: 5; {simplifiedDotStyle(typeConfig.color)}"
+		/>
+	{/if}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		bind:this={nodeElement}
-		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''}"
+		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
 		style="
 			width: 100%;
 			height: 100%;
@@ -1255,6 +1403,7 @@
 			border: 1px solid {selected ? typeConfig.color : 'rgba(0, 0, 0, 0.08)'};
 			box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05){selected ? `, 0 0 0 1px ${typeConfig.color}20` : ''};
 			backdrop-filter: blur(8px);
+			--run-target-color: {typeConfig.color};
 		"
 	>
 		<!-- Status glyph (top-right) + inspector (magnifier), same as full view -->
@@ -1301,12 +1450,14 @@
 			</div>
 		{/if}
 	</div>
-	<Handle
-		type="source"
-		position={Position.Right}
-		id={SIMPLIFIED_OUT_HANDLE}
-		style="top: 50%; z-index: 5; {simplifiedDotStyle(typeConfig.color)}"
-	/>
+	{#if simplifiedOutConnected}
+		<Handle
+			type="source"
+			position={Position.Right}
+			id={SIMPLIFIED_OUT_HANDLE}
+			style="top: 50%; z-index: 5; {simplifiedDotStyle(typeConfig.color)}"
+		/>
+	{/if}
 {:else}
 
 <!-- Node Resizer - only visible when selected AND expanded -->
@@ -1327,8 +1478,9 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	bind:this={nodeElement}
-	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''}"
+	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
 	style="
+		--run-target-color: {typeConfig.color};
 		width: 100%;
 		height: 100%;
 		display: flex;
@@ -1615,7 +1767,7 @@
 				     FieldStrip, including file-backed ones (displayValueOf
 				     supplies the resolved content, readonlyKeys locks unready
 				     fields, headerBadge shows the path chip). The exotic kinds
-				     (code / form_builder) are claimed via
+				     (code / entry_list) are claimed via
 				     customFieldKeys and drawn inline by the renderCustom
 				     snippet below, in the same authored order. -->
 				<FieldStrip
@@ -1632,6 +1784,7 @@
 					{headerBadge}
 					{renderCustom}
 					onReadonlyEdit={explainReadonlyField}
+					onClear={(key) => updatePortLiteral(key, null)}
 				/>
 
 				{#snippet headerBadge(field: FieldDefinition)}
@@ -1657,6 +1810,8 @@
 							disabled={!hasValue}
 							onclick={(e) => { e.stopPropagation(); if (hasValue) togglePortValueForm(field.key); }}
 						><span aria-hidden="true">{form === 'inline' ? '{ }' : '='}</span></button>
+						<!-- The clear (×) button for checkbox/select port fields
+						     is FieldStrip's own, via onClear. -->
 					{:else if fileRefOf(field.key)}
 						{@const ref = fileRefOf(field.key)}
 						<!-- The chip doubles as the marker toggle: @file (editable,
@@ -1761,77 +1916,73 @@
 								value={declaredValue(field)}
 								accept={field.accept}
 								fileType={field.fileType}
+								multiple={field.multiple ?? false}
 								onUpdate={(ref) => updateFieldValue(field.key, ref, field.portDriven)}
 							/>
-						{:else if field.type === "form_builder"}
+						{:else if field.type === "entry_list"}
+							<!-- The list a node's ports come from: one row per
+							     entry, and an add row that asks whatever the
+							     chosen kind declares it needs. Nothing here
+							     knows any kind by name. The pen opens that same
+							     form over the row it belongs to, filled in, and
+							     several rows can be open at once. -->
 							<div class="nodrag nopan space-y-1.5" onclick={(e) => e.stopPropagation()}>
-								{#each getFormFields() as f, i}
-									<div class="flex items-center gap-1.5 bg-zinc-50 border border-zinc-200 rounded px-2 py-1 text-[10px]">
-										<span class="text-zinc-400 font-mono shrink-0 truncate" title={f.fieldType}>{nodeFormSpecMap[f.fieldType]?.label ?? f.fieldType}</span>
-										<span class="flex-1 text-zinc-700 font-mono truncate">{f.key}</span>
-										<button
-											class="ml-1 text-zinc-400 hover:text-red-500 transition-colors leading-none"
-											onclick={(e) => { e.stopPropagation(); removeFormField(i); }}
-											title="Remove field"
-										>×</button>
-									</div>
-								{/each}
-								{#if addingFormField}
-									<div class="border border-zinc-200 rounded p-2 space-y-1.5 bg-white">
-										<select
-											class="w-full text-[10px] bg-zinc-50 px-1.5 py-1 rounded border border-zinc-200 outline-none"
-											bind:value={newFormField.fieldType}
-										>
-											{#each nodeFormFieldSpecs as spec}
-												<option value={spec.fieldType}>{spec.label}</option>
-											{/each}
-										</select>
-										<input
-											type="text"
-											class="w-full text-[10px] bg-zinc-50 px-1.5 py-1 rounded border outline-none font-mono {newFormFieldKeyError ? 'border-red-400' : 'border-zinc-200'}"
-											placeholder="key (shown to reviewer + port name)"
-											bind:value={newFormField.key}
-											oninput={() => { newFormFieldKeyError = false; }}
-										/>
-										{#if newFormFieldKeyError}
-											<p class="text-[10px] text-red-500 -mt-0.5">Key must be a letter/underscore followed by letters, digits, or underscores (it becomes a port name)</p>
-										{/if}
-										{#if nodeFormSpecMap[newFormField.fieldType ?? 'display']?.requiredConfig.includes('options')}
-											<div class="space-y-1">
-												{#each ((newFormField.config?.options as string[]) ?? []) as opt, i}
-													<div class="flex items-center gap-1">
-														<span class="flex-1 text-[10px] text-zinc-600 truncate">{opt}</span>
-														<button class="text-zinc-400 hover:text-red-500 text-xs" onclick={(e) => { e.stopPropagation(); removeOption(i); }}>×</button>
-													</div>
-												{/each}
-												<div class="flex gap-1">
-													<input
-														type="text"
-														class="flex-1 text-[10px] bg-zinc-50 px-1.5 py-1 rounded border border-zinc-200 outline-none"
-														placeholder="Add option..."
-														bind:value={newOptionText}
-														onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addOption(); } }}
-													/>
-													<button class="text-[10px] px-2 py-1 bg-zinc-100 hover:bg-zinc-200 rounded" onclick={(e) => { e.stopPropagation(); addOption(); }}>+</button>
-												</div>
+								{#each getEntries() as entry, i}
+									{@const spec = entryKindByName[entry.kind]}
+									{@const rowKey = spec ? entryPortName(entry, spec) : ''}
+									<!-- An entry whose kind the catalog no longer knows has
+									     no form to open, so it stays a plain row you can
+									     only remove. -->
+									{#if rowKey && editDrafts[rowKey]}
+										{@render entryForm(
+											editDrafts[rowKey],
+											editKeyErrors[rowKey] ?? false,
+											`${id}-edit-${rowKey}`,
+											'Edit',
+											(draft) => setEditDraft(rowKey, draft),
+											() => cancelEditingEntry(rowKey),
+											() => saveEditingEntry(rowKey),
+										)}
+									{:else}
+										<div class="group flex items-center gap-2 bg-muted rounded pl-2 pr-1 py-1 text-xs">
+											<span class="flex-1 font-mono truncate">{rowKey}</span>
+											<span class="shrink-0 text-[10px] text-muted-foreground truncate" title={entry.kind}>{spec?.label ?? entry.kind}</span>
+											<div class="shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+												{#if spec && rowKey}
+													<button
+														class="w-4 h-4 grid place-items-center rounded text-muted-foreground hover:text-foreground hover:bg-background transition"
+														onclick={(e) => { e.stopPropagation(); startEditingEntry(entry, rowKey); }}
+														title="Edit"
+														aria-label="Edit {rowKey}"
+													>
+														<Pencil size={10} />
+													</button>
+												{/if}
+												<button
+													class="w-4 h-4 grid place-items-center rounded text-muted-foreground hover:text-destructive hover:bg-background transition"
+													onclick={(e) => { e.stopPropagation(); removeEntry(i); }}
+													title="Remove"
+													aria-label="Remove {rowKey}"
+												>&times;</button>
 											</div>
-										{/if}
-										<div class="flex gap-1 pt-0.5">
-											<button
-												class="flex-1 text-[10px] py-1 bg-zinc-100 hover:bg-zinc-200 rounded transition-colors"
-												onclick={(e) => { e.stopPropagation(); addingFormField = false; newFormField = { fieldType: 'display', key: '', config: {} }; newOptionText = ''; newFormFieldKeyError = false; }}
-											>Cancel</button>
-											<button
-												class="flex-1 text-[10px] py-1 bg-zinc-800 hover:bg-zinc-700 text-white rounded transition-colors"
-												onclick={(e) => { e.stopPropagation(); addFormField(); }}
-											>Add</button>
 										</div>
-									</div>
+									{/if}
+								{/each}
+								{#if addingEntry}
+									{@render entryForm(
+										newEntry,
+										newEntryKeyError,
+										`${id}-new-entry`,
+										'Add',
+										(draft) => { newEntry = draft; newEntryKeyError = false; },
+										() => { addingEntry = false; newEntryKeyError = false; },
+										() => addEntry(),
+									)}
 								{:else}
 									<button
-										class="w-full text-[10px] py-1 border border-dashed border-zinc-300 hover:border-zinc-400 text-zinc-400 hover:text-zinc-600 rounded transition-colors"
-										onclick={(e) => { e.stopPropagation(); addingFormField = true; newFormFieldKeyError = false; }}
-									>+ Add field</button>
+										class="w-full text-[10px] py-1 rounded border border-dashed border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+										onclick={(e) => { e.stopPropagation(); startAddingEntry(); }}
+									>+ Add</button>
 								{/if}
 							</div>
 						{:else}
@@ -1915,30 +2066,8 @@
 	</div>
 </div>
 
-<!-- Raw output dock: Square handle in top-right corner for full output access -->
-<Handle
-	type="source"
-	position={Position.Right}
-	id="_raw"
-	style="top: 18px; background: none; border: none; width: 10px; height: 10px;"
->
-	<svg 
-		width="10" 
-		height="10" 
-		viewBox="0 0 10 10" 
-		style="pointer-events: none; position: absolute; left: 0; top: 0;"
-	>
-		<rect 
-			x="1" 
-			y="1" 
-			width="8" 
-			height="8" 
-			fill={rawConnected ? '#18181b' : 'white'}
-			stroke="#18181b"
-			stroke-width="1.5"
-		/>
-	</svg>
-</Handle>
+{@render flowDock()}
+
 {/if}
 
 <!-- Port context menu is rendered via $effect on document.body to avoid CSS transform issues -->
@@ -2016,6 +2145,42 @@
 		border-top-color: #f59e0b;
 		border-radius: 50%;
 		animation: debug-spin 0.8s linear infinite;
+	}
+
+	/* An output node the user aimed the run at. A ring in the node's own
+	   colour that breathes, so a targeted node is obvious on a busy canvas
+	   without adding anything permanent to every output node. `!important`
+	   because the inline box-shadow on the card would otherwise win. */
+	:global(.node-run-target) {
+		box-shadow:
+			0 1px 3px rgba(0, 0, 0, 0.08),
+			0 4px 12px rgba(0, 0, 0, 0.05),
+			0 0 0 3px var(--run-target-color) !important;
+		animation: run-target-breathe 2.4s ease-in-out infinite;
+	}
+
+	@keyframes run-target-breathe {
+		0%, 100% {
+			box-shadow:
+				0 1px 3px rgba(0, 0, 0, 0.08),
+				0 4px 12px rgba(0, 0, 0, 0.05),
+				0 0 0 3px var(--run-target-color),
+				0 0 6px 1px var(--run-target-color);
+		}
+		50% {
+			box-shadow:
+				0 1px 3px rgba(0, 0, 0, 0.08),
+				0 4px 12px rgba(0, 0, 0, 0.05),
+				0 0 0 3px var(--run-target-color),
+				0 0 18px 5px var(--run-target-color);
+		}
+	}
+
+	/* Somebody who set reduce-motion still gets the ring, without the pulse. */
+	@media (prefers-reduced-motion: reduce) {
+		:global(.node-run-target) {
+			animation: none;
+		}
 	}
 
 	@keyframes debug-spin {

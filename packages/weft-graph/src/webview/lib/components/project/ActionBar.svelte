@@ -9,11 +9,13 @@
 		CliPhase,
 	} from '../../../../protocol';
 	import ErrorDetailsModal from './ErrorDetailsModal.svelte';
+	import { runLabel } from '../../run-targets';
 
 	let {
 		state: barState,
 		drift,
 		onRun,
+		runTargetCount,
 		onActivate,
 		onCancelActivate,
 		onCancelBuild,
@@ -36,6 +38,8 @@
 		nodeCount = 1,
 		hasInfra = false,
 		hasTriggers = false,
+		runTargetsAvoidTriggers = false,
+		runTargetsInfraReady = true,
 	}: {
 		// Single source of truth. The host's ActionBarStore pushes
 		// every transition; this component is a pure renderer.
@@ -50,6 +54,9 @@
 		// when the user clicks. The host decides scope (infra vs
 		// trigger) based on graph contents at the time of the click.
 		onRun?: () => void;
+		/// How many output nodes the run is aimed at. Zero is the ordinary
+		/// run, and the button says so plainly.
+		runTargetCount?: number;
 		onActivate?: () => void;
 		// Mid-activate: cancel TriggerSetup, wipe partial signals,
 		// flip back to Inactive.
@@ -97,6 +104,14 @@
 		// (don't show Infra section if no infra nodes exist).
 		hasInfra?: boolean;
 		hasTriggers?: boolean;
+		/// True when the aimed run's upstream walk reaches no trigger, so
+		/// Run is offered even while the trigger lifecycle is visible.
+		runTargetsAvoidTriggers?: boolean;
+		/// True when every infra node inside the aimed run's subgraph
+		/// reports running (vacuously true with no targets or no infra
+		/// there). Gates the aimed run the way the whole-graph rollup
+		/// gates the ordinary one.
+		runTargetsInfraReady?: boolean;
 	} = $props();
 
 	// ─── Convenience accessors (all backend-side facts) ──────────
@@ -349,17 +364,24 @@
 		// slot is hidden. Whenever the trigger slot is visible
 		// (source has triggers, or backend still has them active /
 		// deactivating / preserved), the trigger lifecycle is the
-		// right entry point and Run would conflict.
-		if (triggerSlotVisible) {
+		// right entry point and Run would conflict. The exception is
+		// an aimed run that walks through no trigger (a hand-fired
+		// maintenance branch): that run is an ordinary one-shot, so
+		// the button comes back beside the trigger lifecycle.
+		if (triggerSlotVisible && !runTargetsAvoidTriggers) {
 			return { kind: 'absent' };
 		}
-		// Source-derived gate: if the graph has infra nodes, Run is
-		// only legal once every infra node is Running. This is
-		// defense-in-depth on top of the dispatcher's own
-		// `available_actions` check: the dispatcher gate fails when
-		// the project is unregistered (status fetch errors out), so
-		// we re-derive from the parsed graph + last-known rollup.
-		const infraReady = !hasInfra || backend.infraRollup === 'running';
+		// Source-derived gate: Run is only legal once the infra it
+		// would touch is Running. An aimed run consults only ITS
+		// subgraph's infra nodes (per-node status); the ordinary run
+		// touches everything, so the whole-graph rollup gates it. This
+		// is defense-in-depth on top of the dispatcher's own scoped
+		// pre-flight: the dispatcher gate fails when the project is
+		// unregistered (status fetch errors out), so we re-derive from
+		// the parsed graph + last-known per-node/rollup state.
+		const infraReady = (runTargetCount ?? 0) > 0
+			? runTargetsInfraReady
+			: !hasInfra || backend.infraRollup === 'running';
 		return {
 			kind: 'run',
 			enabled:
@@ -686,7 +708,7 @@
 			disabled={!slot.enabled}
 		>
 			<Play class="w-3.5 h-3.5" />
-			<span class={labelCss}>Run Project</span>
+			<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
 		</button>
 	{/if}
 {/snippet}

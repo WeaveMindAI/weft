@@ -66,6 +66,18 @@ data:
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
       }
+      # The token-authenticated enumeration surface: a client holding a
+      # signal token lists the signals it can see, clears them, and
+      # checks the token still works. `weft token mint` hands out an
+      # address under THIS host, so the surface it names has to be
+      # reachable here. The token rides the Authorization header and is
+      # the credential, same trust shape as the fire doors above.
+      location /signal-token/ {
+        proxy_pass $dispatcher;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+      }
       # The public file relay: minted expiring media links an external
       # consumer (a model provider) fetches. The unguessable token in
       # the path is the credential; the route answers 404 for anything

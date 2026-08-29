@@ -1,0 +1,31 @@
+# Aimed runs: one source fans out into two output branches plus a
+# side-effect leaf that feeds no output.
+#
+#   source -> left  -> out_left    (an output branch)
+#   source -> right -> out_right   (a sibling output branch)
+#   source -> side                 (a leaf, not an output)
+#
+# The rig runs this twice. Untargeted, everything runs: pulses go
+# wherever the wiring takes them, side leaf included. Aimed at
+# `out_left`, only the target's upstream closure runs: `right` sits on
+# the boundary (an in-scope producer feeds it directly), so it journals
+# exactly ONE skip whose reason is `outside_this_run`, while `out_right`
+# gets nothing at all (no cascade is manufactured past the boundary).
+
+source = Text { value: "fan out" }
+
+left = Cast -> (value: String) {
+  value: source.value
+}
+out_left = Debug
+out_left.data = left.value
+
+right = Cast -> (value: String) {
+  value: source.value
+}
+out_right = Debug
+out_right.data = right.value
+
+side = Cast -> (value: String) {
+  value: source.value
+}

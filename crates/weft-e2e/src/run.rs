@@ -49,6 +49,26 @@ pub async fn run_and_settle(project: &mut Project) -> Result<SettledRun> {
     SettledRun::observe(project.dispatcher(), color).await
 }
 
+/// Fire an AIMED run (`weft run --target <node>` per target) and wait
+/// for it to settle. The dispatcher journals the targets' upstream
+/// closure as the run's boundary; everything a pulse reaches outside it
+/// skips with reason `outside_this_run`.
+pub async fn run_targeted_and_settle(
+    project: &mut Project,
+    targets: &[&str],
+) -> Result<SettledRun> {
+    let mut args = vec!["run", "--json"];
+    for t in targets {
+        args.push("--target");
+        args.push(t);
+    }
+    let stdout = project.weft(&args).await?;
+    project.mark_registered();
+    let color =
+        parse_color(&stdout).context("parse color from `weft run --target --json` output")?;
+    SettledRun::observe(project.dispatcher(), color).await
+}
+
 /// Extract the execution color from `weft run --json` NDJSON. The CLI emits a
 /// `dispatcher_call_done` event whose `detail` carries `{ color, project_id }`
 /// (see crates/weft-cli/src/commands/run.rs). We scan for the first event that

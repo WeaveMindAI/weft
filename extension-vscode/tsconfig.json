@@ -28,5 +28,8 @@
     "../packages/weft-graph/src/status.ts",
     "../packages/weft-graph/src/live-data.ts"
   ],
-  "exclude": ["node_modules", ".vscode-test", "src/webview/**"]
+  // Tests are not part of the shipped build, and their vitest imports need a
+  // newer `moduleResolution` than the extension host compiles under. vitest
+  // runs and type-checks them itself.
+  "exclude": ["node_modules", ".vscode-test", "src/webview/**", "src/**/*.test.ts"]
 }

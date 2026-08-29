@@ -19,6 +19,7 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "What the sound should be.",
       "placeholder": "Heavy rain on a tin roof"

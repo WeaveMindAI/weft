@@ -78,7 +78,7 @@ fn usd_per_hour(query: &str) -> f64 {
     rate
 }
 
-fn query_param<'a>(query: &'a str, name: &str) -> Option<String> {
+fn query_param(query: &str, name: &str) -> Option<String> {
     url::form_urlencoded::parse(query.as_bytes())
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.into_owned())

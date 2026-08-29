@@ -50,7 +50,10 @@
 //!   running infrastructure. Drives the upgrade prompt. Scoped to
 //!   the infra closure (every `requires_infra` node + every node
 //!   upstream of one). Inputs:
-//!     - graph definition: `main.weft`, `weft.toml`.
+//!     - graph definition: the closure's slice of the canonical
+//!       `ProjectDefinition` (its nodes' configs + the edges among
+//!       them, same non-semantic strips as the definition hash), plus
+//!       `weft.toml`. An edit outside the closure does not move it.
 //!     - per closure-node: full source dir (host-side `mod.rs`,
 //!       `metadata.json`, `deps.toml`, shared package files,
 //!       `images/` dir if present).
@@ -113,16 +116,17 @@ pub type SourceHash = String;
 /// could legitimately use the same key names):
 /// - top level: `createdAt` / `updatedAt` (stamped `Utc::now()` on
 ///   every compile; hashing them would flip the hash per build).
-/// - per node: `span` / `headerSpan` / `configSpans` (source text
-///   coordinates: comments or formatting shift them without changing
-///   the runtime graph) and `position` (canvas layout from a drag).
+/// - per node: `span` / `headerSpan` / `configSpans` / `portLiteralSpans`
+///   (source text coordinates: comments or formatting shift them without
+///   changing the runtime graph) and `position` (canvas layout from a drag).
 /// - per node: `fileRefs` (records that a config field came from
 ///   `@file("path", Type)`; the RESOLVED value already lives in `config`,
 ///   which IS hashed, so the path here is editor-routing metadata: renaming
 ///   the file with identical content must not flip the hash) and
 ///   `includePath` (an interface-parse-only pointer to an `@include`d file;
 ///   the file's PATH is non-semantic, its expanded topology is what runs).
-/// - per edge: `span`. Per group: `span` / `headerSpan`.
+/// - per edge: `span`. Per group: `span` / `headerSpan` /
+///   `portLiteralSpans`.
 ///
 /// `publishedService` IS hashed, and it is the one enriched field that
 /// carries ANOTHER node's metadata (the recipe a publishing node hands
@@ -152,9 +156,9 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
     obj.remove("id");
     obj.remove("createdAt");
     obj.remove("updatedAt");
-    strip_keys(obj.get_mut("nodes"), &["span", "headerSpan", "configSpans", "position", "fileRefs", "includePath"]);
-    strip_keys(obj.get_mut("edges"), &["span"]);
-    strip_keys(obj.get_mut("groups"), &["span", "headerSpan"]);
+    strip_keys(obj.get_mut("nodes"), NODE_HASH_STRIPS);
+    strip_keys(obj.get_mut("edges"), EDGE_HASH_STRIPS);
+    strip_keys(obj.get_mut("groups"), GROUP_HASH_STRIPS);
     let json = serde_json::to_vec(&value)
         .map_err(|e| anyhow::anyhow!("re-serialize ProjectDefinition: {e}"))?;
     hasher.update(&json);
@@ -189,6 +193,14 @@ pub fn compute_source_hash(files: &[(String, String)]) -> SourceHash {
     }
     hex(&hasher.finalize())
 }
+
+/// The non-semantic keys stripped before hashing, shared by
+/// [`compute_definition_hash`] and the infra slice hasher so the two
+/// digests can never disagree on what "semantic" means.
+const NODE_HASH_STRIPS: &[&str] =
+    &["span", "headerSpan", "configSpans", "portLiteralSpans", "position", "fileRefs", "includePath"];
+const EDGE_HASH_STRIPS: &[&str] = &["span"];
+const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans"];
 
 /// Remove `keys` from every object in a JSON array. Top level of
 /// each element only: deliberately does NOT recurse into `config`.
@@ -234,7 +246,7 @@ mod fs_hashes {
     use weft_catalog::{is_node_tree_excluded, FsCatalog};
     use weft_core::project::ProjectDefinition;
 
-    use super::{hex, SourceHash};
+    use super::{hex, strip_keys, SourceHash};
     use crate::project::Project;
 
     /// Dockerfile (relative to the weft root) that builds the shared
@@ -490,15 +502,20 @@ mod fs_hashes {
         catalog: &FsCatalog,
     ) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-infra-v1\n");
+        hasher.update(b"weft-infra-v2\n");
 
-        // Graph definition: which nodes are infra, what config they have,
-        // what edges they receive. A user edit to main.weft can flip a
-        // node into / out of the infra closure or rewire an upstream.
-        hash_path(&mut hasher, "main.weft", &project_root.join("main.weft"))?;
-        hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
-
+        // Graph definition, scoped to the infra closure: which nodes are
+        // infra, what config they carry, and the wires among them. An edit
+        // can flip a node into / out of the closure or rewire an upstream,
+        // and the closure slice sees all of that. NOT the raw main.weft:
+        // hashing the whole file lit the Upgrade button for every edit to
+        // the rest of the graph (an LLM prompt tweak has no bearing on the
+        // running bridge pod). Same canonical form as the definition hash:
+        // spans / positions / file-ref paths stripped, nodes and edges
+        // sorted, so a comment or a canvas drag cannot flip it either.
         let closure = closure_with_upstream(project, |n| n.requires_infra);
+        hash_definition_slice(&mut hasher, project, &closure)?;
+        hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
 
         // Hash each package root that owns a closure node (mod.rs /
         // metadata.json / deps.toml of every node in the package, plus
@@ -549,37 +566,96 @@ mod fs_hashes {
 
     /// Recursive directory walk that returns every regular file under
     /// `root`, skipping the shared node-tree exclude set
-    /// (`weft_catalog::NODE_TREE_EXCLUDE`) and never following symlinks.
+    /// (`weft_catalog::NODE_TREE_EXCLUDE`). Symlinked directories are
+    /// followed (a cycle fails loudly via the descent chain), so a
+    /// linked shared catalog is hashed at every path it appears at,
+    /// matching what the stage copy materializes.
     /// This is the hash side of the one node-tree walk policy: it must
     /// see exactly the bytes the build stages, or a missed/extra file
     /// silently de/over-syncs the worker-image hash. Order is not stable;
     /// callers that need deterministic order sort the returned vec.
     pub fn walk_dir(root: &Path) -> Result<Vec<PathBuf>> {
+        walk_dir_skipping(root, &[])
+    }
+
+    /// [`walk_dir`], with whole top-level directories of `root` left
+    /// out. For an input whose consumer reads only part of a directory
+    /// (the system images compile a crate's binaries, so its `tests/`
+    /// has no bearing on what comes out).
+    pub fn walk_dir_skipping(root: &Path, skip_top_level: &[&str]) -> Result<Vec<PathBuf>> {
         let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir)
+        let mut chain = Vec::new();
+        walk_into(root, skip_top_level, &mut out, &mut chain)?;
+        Ok(out)
+    }
+
+    // Symlinks are followed (a symlinked `nodes/base_catalog` has to
+    // hash as the bytes it resolves to, the same view the staging copy
+    // and the pack take); the descent chain turns a symlink cycle into
+    // a loud error instead of an infinite walk.
+    fn walk_into(
+        dir: &Path,
+        skip_top_level: &[&str],
+        out: &mut Vec<PathBuf>,
+        chain: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        let canon = weft_catalog::guard_node_tree_cycle(dir, chain)
+            .with_context(|| format!("walk {}", dir.display()))?;
+        chain.push(canon);
+        let at_top = chain.len() == 1;
+        let result = (|| {
+            for entry in std::fs::read_dir(dir)
                 .with_context(|| format!("read_dir {}", dir.display()))?
             {
                 let entry = entry?;
-                if is_node_tree_excluded(&entry.file_name().to_string_lossy()) {
-                    continue;
-                }
-                // `file_type()` does not follow symlinks: a loop under
-                // user-authored `nodes/` must not send the walk infinite.
-                let ft = entry.file_type()?;
-                if ft.is_symlink() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_node_tree_excluded(&name)
+                    || (at_top && skip_top_level.contains(&name.as_str()))
+                {
                     continue;
                 }
                 let path = entry.path();
-                if ft.is_dir() {
-                    stack.push(path);
-                } else if ft.is_file() {
-                    out.push(path);
+                match weft_catalog::node_tree_entry_kind(&path)
+                    .with_context(|| format!("stat {}", path.display()))?
+                {
+                    weft_catalog::NodeTreeEntryKind::Dir => {
+                        walk_into(&path, skip_top_level, out, chain)?
+                    }
+                    weft_catalog::NodeTreeEntryKind::File => out.push(path),
                 }
             }
+            Ok(())
+        })();
+        chain.pop();
+        result
+    }
+
+    /// [`hash_path`], with whole top-level directories of `path` left out.
+    ///
+    /// For an input whose consumer reads only part of a directory. The system
+    /// images compile a crate's binaries, so its `tests/` has no bearing on
+    /// what comes out; hashing it anyway would rebuild four images every time
+    /// somebody edits a test.
+    pub fn hash_path_skipping(
+        hasher: &mut Sha256,
+        label: &str,
+        path: &Path,
+        skip: &[&str],
+    ) -> Result<()> {
+        if !path.exists() {
+            // Hash the absence so a future appearance invalidates.
+            hasher.update(b"missing:");
+            hasher.update(label.as_bytes());
+            hasher.update(b"\n");
+            return Ok(());
         }
-        Ok(out)
+        if path.is_file() {
+            hash_file(hasher, label, path)
+        } else if path.is_dir() {
+            hash_dir(hasher, label, path, skip)
+        } else {
+            Ok(())
+        }
     }
 
     /// Path-into-hasher: file → label + content; dir → label + recursive
@@ -591,20 +667,7 @@ mod fs_hashes {
     /// share the exact same framing rules (no
     /// two-different-hash-functions-for-the-same-job drift).
     pub fn hash_path(hasher: &mut Sha256, label: &str, path: &Path) -> Result<()> {
-        if !path.exists() {
-            // Hash the absence so a future appearance invalidates.
-            hasher.update(b"missing:");
-            hasher.update(label.as_bytes());
-            hasher.update(b"\n");
-            return Ok(());
-        }
-        if path.is_file() {
-            hash_file(hasher, label, path)
-        } else if path.is_dir() {
-            hash_dir(hasher, label, path)
-        } else {
-            Ok(())
-        }
+        hash_path_skipping(hasher, label, path, &[])
     }
 
     fn hash_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<()> {
@@ -618,11 +681,11 @@ mod fs_hashes {
         Ok(())
     }
 
-    fn hash_dir(hasher: &mut Sha256, label: &str, dir: &Path) -> Result<()> {
+    fn hash_dir(hasher: &mut Sha256, label: &str, dir: &Path, skip: &[&str]) -> Result<()> {
         hasher.update(b"dir:");
         hasher.update(label.as_bytes());
         hasher.update(b"\n");
-        let mut entries = walk_dir(dir)?;
+        let mut entries = walk_dir_skipping(dir, skip)?;
         entries.sort();
         for entry in entries {
             let rel = entry
@@ -633,13 +696,51 @@ mod fs_hashes {
             hasher.update(b"path:");
             hasher.update(rel.as_bytes());
             hasher.update(b"\n");
-            // `walk_dir` yields regular files only (symlinks + dirs excluded), so
-            // read unconditionally; a non-file here would fail loud via `read`.
+            // `walk_dir` yields files only (dirs recursed, symlinks resolved), so
+            // read unconditionally; a non-file here fails loud via `read`.
             let bytes = std::fs::read(&entry)
                 .with_context(|| format!("read {} for hashing", entry.display()))?;
             hasher.update(&bytes);
             hasher.update(b"\n");
         }
+        Ok(())
+    }
+
+    /// Fold the closure's slice of the definition into the hasher: the
+    /// closure's nodes and the edges between them, in the definition
+    /// hash's canonical form (same non-semantic strips, see
+    /// [`compute_definition_hash`]), sorted by id so source order and
+    /// unrelated graph edits cannot move the digest.
+    fn hash_definition_slice(
+        hasher: &mut Sha256,
+        project: &ProjectDefinition,
+        closure: &HashSet<String>,
+    ) -> Result<()> {
+        let mut nodes: Vec<serde_json::Value> = project
+            .nodes
+            .iter()
+            .filter(|n| closure.contains(&n.id))
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("serialize infra-closure node: {e}"))?;
+        nodes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        let mut edges: Vec<serde_json::Value> = project
+            .edges
+            .iter()
+            .filter(|e| closure.contains(&e.source) && closure.contains(&e.target))
+            .map(serde_json::to_value)
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("serialize infra-closure edge: {e}"))?;
+        edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        let mut slice = serde_json::json!({ "nodes": nodes, "edges": edges });
+        strip_keys(slice.get_mut("nodes"), super::NODE_HASH_STRIPS);
+        strip_keys(slice.get_mut("edges"), super::EDGE_HASH_STRIPS);
+        hasher.update(b"definition-slice:");
+        hasher.update(
+            &serde_json::to_vec(&slice)
+                .map_err(|e| anyhow::anyhow!("serialize infra-closure slice: {e}"))?,
+        );
+        hasher.update(b"\n");
         Ok(())
     }
 
@@ -668,14 +769,104 @@ mod fs_hashes {
                 continue;
             }
             for edge in &project.edges {
-                if edge.target == id && by_id.contains_key(edge.source.as_str()) {
-                    if !closure.contains(&edge.source) {
+                if edge.target == id && by_id.contains_key(edge.source.as_str())
+                    && !closure.contains(&edge.source) {
                         frontier.push(edge.source.clone());
                     }
-                }
             }
         }
         closure
+    }
+
+    #[cfg(test)]
+    mod infra_slice_tests {
+        use super::*;
+
+        /// Three-node project: `a -> b` where `b` is infra, plus an
+        /// unrelated `x`. Closure = {a, b}. The caller varies one
+        /// node's config to probe what moves the slice digest.
+        fn project(a_cfg: &str, b_cfg: &str, x_cfg: &str, b_x: f64) -> ProjectDefinition {
+            let node = |id: &str, cfg: &str, infra: bool, x: f64| {
+                serde_json::json!({
+                    "id": id, "nodeType": "T", "label": null,
+                    "config": {"v": cfg},
+                    "position": {"x": x, "y": 0.0},
+                    "inputs": [], "outputs": [], "features": {},
+                    "scope": [], "groupBoundary": null,
+                    "requiresInfra": infra, "images": [],
+                })
+            };
+            serde_json::from_value(serde_json::json!({
+                "id": "00000000-0000-0000-0000-000000000000",
+                "nodes": [
+                    node("a", a_cfg, false, 0.0),
+                    node("b", b_cfg, true, b_x),
+                    node("x", x_cfg, false, 0.0),
+                ],
+                "edges": [{
+                    "id": "a.out->b.in", "source": "a", "target": "b",
+                    "sourceHandle": "out", "targetHandle": "in",
+                }],
+                "groups": [],
+                "createdAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+            }))
+            .expect("test ProjectDefinition")
+        }
+
+        fn slice_digest(p: &ProjectDefinition) -> String {
+            let closure = closure_with_upstream(p, |n| n.requires_infra);
+            let mut hasher = Sha256::new();
+            hash_definition_slice(&mut hasher, p, &closure).unwrap();
+            hex(&hasher.finalize())
+        }
+
+        #[test]
+        fn a_config_edit_outside_the_closure_does_not_move_the_hash() {
+            assert_eq!(
+                slice_digest(&project("a1", "b1", "x1", 0.0)),
+                slice_digest(&project("a1", "b1", "CHANGED", 0.0)),
+            );
+        }
+
+        #[test]
+        fn a_closure_config_edit_moves_the_hash() {
+            let base = slice_digest(&project("a1", "b1", "x1", 0.0));
+            assert_ne!(base, slice_digest(&project("CHANGED", "b1", "x1", 0.0)));
+            assert_ne!(base, slice_digest(&project("a1", "CHANGED", "x1", 0.0)));
+        }
+
+        #[test]
+        fn a_canvas_drag_does_not_move_the_hash() {
+            assert_eq!(
+                slice_digest(&project("a1", "b1", "x1", 0.0)),
+                slice_digest(&project("a1", "b1", "x1", 500.0)),
+            );
+        }
+
+        /// A literal's SPAN is a source-text coordinate: a comment
+        /// added above the node shifts it without changing the graph,
+        /// and the Upgrade button must not light up for that.
+        #[test]
+        fn a_shifted_port_literal_span_does_not_move_the_hash() {
+            let mut with_span = project("a1", "b1", "x1", 0.0);
+            with_span.nodes[1].port_literals.insert("v".into(), serde_json::json!("lit"));
+            let mut shifted = with_span.clone();
+            use weft_core::project::{ConfigFieldSpan, Span};
+            let span_at = |line| ConfigFieldSpan::inline(Span {
+                start_line: line,
+                start_column: 3,
+                end_line: line,
+                end_column: 9,
+            });
+            with_span.nodes[1].port_literal_spans.insert("v".into(), span_at(2));
+            shifted.nodes[1].port_literal_spans.insert("v".into(), span_at(7));
+            assert_eq!(slice_digest(&with_span), slice_digest(&shifted));
+            assert_eq!(
+                super::super::compute_definition_hash(&with_span).unwrap(),
+                super::super::compute_definition_hash(&shifted).unwrap(),
+            );
+        }
     }
 
     /// Load + enrich a project to a `ProjectDefinition` AND return the

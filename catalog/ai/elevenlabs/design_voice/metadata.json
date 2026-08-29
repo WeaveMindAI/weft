@@ -26,6 +26,7 @@
     {
       "name": "description",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "What the voice should sound like.",
       "placeholder": "A calm, deep male narrator with a slight British accent"
@@ -33,6 +34,7 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "description": "The preview line to speak. Absent = a fitting line is generated."
     },

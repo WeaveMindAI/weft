@@ -544,6 +544,9 @@ mod tests {
 
     /// A WS server that records the handshake and echoes every text
     /// frame back prefixed with "echo:". Serves ONE connection.
+    // The handshake callback's Err type is tungstenite's own
+    // (a whole HTTP Response); its size is the library's contract.
+    #[allow(clippy::result_large_err)]
     async fn spawn_echo_ws() -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -570,7 +573,7 @@ mod tests {
             while let Some(Ok(msg)) = ws.next().await {
                 if let Message::Text(t) = msg {
                     seen_srv.lock().unwrap().push(format!("frame={t}"));
-                    ws.send(Message::Text(format!("echo:{t}").into())).await.unwrap();
+                    ws.send(Message::Text(format!("echo:{t}"))).await.unwrap();
                 }
             }
         });

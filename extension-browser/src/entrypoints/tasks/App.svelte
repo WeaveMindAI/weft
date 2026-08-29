@@ -383,7 +383,7 @@
                   {@const r = field.render}
                   {#if r?.component === 'readonly'}
                     <div class="field">
-                      <p class="field-key">{(field.config?.label as string) || field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}</p>
                       {#if isComplex(field.value)}
                         <pre class="readonly-pre">{fmt(field.value)}</pre>
                       {:else}
@@ -393,9 +393,9 @@
                   {:else if r?.component === 'image'}
                     {@const imgSrc = typeof field.value === 'string' ? field.value : ((field.value as Record<string, unknown>)?.url as string | undefined)}
                     <div class="field">
-                      <p class="field-key">{(field.config?.label as string) ?? field.key}</p>
+                      <p class="field-key">{field.label || field.key}</p>
                       {#if imgSrc}
-                        <img src={imgSrc} alt={(field.config?.label as string) ?? field.key} class="field-image" />
+                        <img src={imgSrc} alt={field.label || field.key} class="field-image" />
                       {:else}
                         <p class="field-empty">(no image)</p>
                       {/if}
@@ -403,7 +403,7 @@
                   {:else if r?.component === 'buttons'}
                     {@const decision = buttonDecisions[field.key]}
                     <div class="field">
-                      <p class="field-key">{(field.config?.label as string) || field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}</p>
                       <div class="btn-row">
                         <button
                           class="decision-btn {decision === false ? 'reject-active' : 'reject-idle'}"
@@ -420,7 +420,7 @@
                     {#if r.multiple}
                       {@const selected = (formValues[field.key] as string[]) ?? []}
                       <div class="field">
-                        <p class="field-key">{(field.config?.label as string) || field.label || field.key}</p>
+                        <p class="field-key">{field.label || field.key}</p>
                         <div class="chip-row">
                           {#each options as option}
                             <button
@@ -433,7 +433,7 @@
                       </div>
                     {:else}
                       <div class="field">
-                        <p class="field-key">{(field.config?.label as string) || field.label || field.key}</p>
+                        <p class="field-key">{field.label || field.key}</p>
                         <div class="chip-row">
                           {#each options as option}
                             <button
@@ -447,21 +447,22 @@
                     {/if}
                   {:else if r?.component === 'text'}
                     <div class="field">
-                      <p class="field-key">{(field.config?.label as string) || field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}</p>
                       <input
                         type="text"
                         class="text-input"
-                        placeholder={field.key}
+                        placeholder={(field.config?.placeholder as string) ?? ''}
                         value={(formValues[field.key] as string) ?? ''}
                         oninput={(e) => { formValues = { ...formValues, [field.key]: e.currentTarget.value }; }}
                       />
                     </div>
                   {:else if r?.component === 'textarea'}
                     <div class="field">
-                      <p class="field-key">{(field.config?.label as string) || field.label || field.key}</p>
+                      <p class="field-key">{field.label || field.key}</p>
                       <textarea
                         class="text-input"
                         rows={r.prefilled ? 6 : 3}
+                        placeholder={(field.config?.placeholder as string) ?? ''}
                         value={(formValues[field.key] as string) ?? ''}
                         oninput={(e) => { formValues = { ...formValues, [field.key]: e.currentTarget.value }; }}
                       ></textarea>

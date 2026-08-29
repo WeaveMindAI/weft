@@ -351,12 +351,21 @@ pub async fn remove(
 }
 
 #[derive(Debug, Deserialize)]
+// A field this struct no longer has (an old client's `entry_node`) is a
+// loud 422, never a silently different run than the caller asked for.
+#[serde(deny_unknown_fields)]
 pub struct RunRequest {
-    /// Optional override: which node to start from. Defaults to the
-    /// first entry-primitive-bearing node in the project. If none,
-    /// falls back to the first top-level node.
+    /// Run only what these nodes need: the upstream walk starts from
+    /// them instead of from every output node. Empty means every
+    /// output node, which is the ordinary run.
+    ///
+    /// Each one must BE an output node. The walk would work from any
+    /// node, but a target that is not an output is a worse thing to
+    /// offer: the graph only lets you select outputs, and a user who
+    /// aimed a run at a middle node would get a run whose result
+    /// nothing collects. Refused with the fix named instead.
     #[serde(default)]
-    pub entry_node: Option<String>,
+    pub targets: Vec<String>,
     /// Initial payload for the entry node's first pulse.
     #[serde(default)]
     pub payload: Value,
@@ -435,9 +444,8 @@ pub(crate) async fn coherent_definition(
 /// Manual-run semantics (see docs/v2-design.md 3.0): collect every
 /// node with `is_output: true`, compute the union of their upstream
 /// subgraphs, find the roots, kick each root with a null-valued pulse.
-/// If `body.entry_node` is set, that node's roots are used as a
-/// single-entry override instead (used for debugging a specific
-/// subgraph).
+/// `body.targets` narrows that to the upstream subgraph of the named
+/// output nodes.
 pub async fn run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -454,12 +462,61 @@ pub async fn run(
     let (definition_hash, project) = coherent_definition(&state, id).await?;
     let project_id = id.to_string();
 
-    // Pre-flight: every `requires_infra` node must be Running. The
-    // node body's `ctx.endpoint(...)` deep in execute() would
-    // fail with a confusing "endpoint not available" otherwise.
-    // Match the activate / reactivate pre-flight semantics so the
-    // user sees the same actionable error from any entry point.
-    let missing = missing_infra_nodes(&state, &project_id, &project).await?;
+    // Pick targets: the requested ones, else every output node.
+    let targets: Vec<String> = if body.targets.is_empty() {
+        project
+            .nodes
+            .iter()
+            .filter(|n| n.is_output())
+            .map(|n| n.id.clone())
+            .collect()
+    } else {
+        for target in &body.targets {
+            // Caller-supplied strings, bounded before they echo back.
+            let shown = weft_core::truncate_user_string(target, 256);
+            match project.nodes.iter().find(|n| &n.id == target) {
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("no node '{shown}' in this project"),
+                    ));
+                }
+                Some(n) if !n.is_output() => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "'{shown}' is not an output node, so a run aimed at it would \
+                             produce something nothing collects. Make it one by setting \
+                             `_is_output: true` in its config, then target it."
+                        ),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        body.targets.clone()
+    };
+    if targets.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "project has no outputs; add a Debug node or mark one with is_output: true".into(),
+        ));
+    }
+
+    let subgraph = RunSubgraph::of(&project, &targets);
+
+    // Pre-flight, scoped to what THIS run executes: every
+    // `requires_infra` node inside the subgraph must be Running (the
+    // node body's `ctx.endpoint(...)` deep in execute() would fail
+    // with a confusing "endpoint not available" otherwise). Infra
+    // outside the subgraph never runs here, so it does not gate: a
+    // maintenance branch with no infra fires whether or not the rest
+    // of the project's infra is up.
+    // Only an AIMED run is bounded (see the journal note below); an
+    // untargeted run gates infra for the whole graph, because pulses
+    // will flow wherever the wiring takes them.
+    let bound = if body.targets.is_empty() { None } else { Some(&subgraph.nodes) };
+    let missing = missing_infra_nodes(&state, &project_id, &project, bound).await?;
     if !missing.is_empty() {
         return Err((
             StatusCode::PRECONDITION_REQUIRED,
@@ -470,25 +527,7 @@ pub async fn run(
         ));
     }
 
-    // Pick targets: explicit override -> upstream of that one node.
-    // Otherwise every `is_output` node in the project.
-    let targets: Vec<String> = match &body.entry_node {
-        Some(n) => vec![n.clone()],
-        None => project
-            .nodes
-            .iter()
-            .filter(|n| n.is_output())
-            .map(|n| n.id.clone())
-            .collect(),
-    };
-    if targets.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "project has no outputs; add a Debug node or mark one with is_output: true".into(),
-        ));
-    }
-
-    let kicks = compute_root_kicks(&project, &targets, &body.payload);
+    let kicks = subgraph.root_kicks(&project, &body.payload, None);
     if kicks.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -525,6 +564,16 @@ pub async fn run(
         &entry_node_for_journal,
         &kicks,
         &definition_hash,
+        // Only an AIMED run (non-empty targets) journals a boundary:
+        // the user narrowed the graph, so the engine holds the run
+        // (resumes included) to that set and skips everything outside
+        // it as OutsideThisRun. An untargeted run journals None and
+        // behaves like a trigger fire: its kicks come from the output
+        // closure's roots, and pulses then run whatever they reach,
+        // downstream fan-out included (a side-effect leaf that feeds
+        // no output still runs). The subgraph would be WRONG for it:
+        // an upstream closure excludes exactly that fan-out.
+        bound,
     )
     .await?;
 
@@ -542,46 +591,89 @@ pub async fn run(
     Ok(Json(RunResponse { color: color.to_string() }))
 }
 
-/// Compute the kicks for a manual run. Walks upstream from each
-/// target (stopping at triggers, which act as terminators exactly as
-/// at fire time), collects the subgraph nodes, picks the ones with no
-/// incoming edge inside the subgraph as roots, and returns one `Kick`
-/// per root.
-///
-/// A manual run has no firing trigger: every trigger in the subgraph
-/// is kicked payload-less, which the engine turns into "close all its
-/// output ports" so trigger-fed branches prune via the skip cascade
-/// and the run exercises the trigger-free paths.
-///
-/// `payload` lands on every non-trigger kicked root. Manual runs
-/// typically pass `Value::Null` (no wake payload, just "kick alive");
-/// per-target mocks may pass a real payload to kick specific roots.
-fn compute_root_kicks(
-    project: &ProjectDefinition,
-    targets: &[String],
-    payload: &Value,
-) -> Vec<Kick> {
-    let edge_idx = EdgeIndex::build(project);
-    let triggers: HashSet<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.features.is_trigger)
-        .map(|n| n.id.clone())
-        .collect();
-    let in_subgraph = upstream_closure_stop_at(project, &edge_idx, targets, &triggers);
-    roots_of_with_forced(project, &edge_idx, &in_subgraph, &triggers)
-        .into_iter()
-        .map(|id| Kick {
-            payload: if payload.is_null() || triggers.contains(&id) {
-                None
-            } else {
-                Some(payload.clone())
-            },
-            node_id: id,
-            firing: false,
-            port_snapshot: None,
-        })
-        .collect()
+/// The subgraph one execution runs: the upstream closure of its
+/// targets with triggers as terminators, next to the edge index and
+/// trigger set every consumer of it needs. Built once per request;
+/// manual runs and trigger fires both go through it, so "what runs"
+/// and "what gets kicked" can never disagree.
+// SYNC: RunSubgraph::of <-> packages/weft-graph/src/webview/lib/run-targets.ts runTargetFacts
+struct RunSubgraph {
+    edge_idx: EdgeIndex,
+    triggers: HashSet<String>,
+    /// Every node the execution dispatches; journaled as its scope.
+    nodes: HashSet<String>,
+}
+
+impl RunSubgraph {
+    /// The edge index and trigger set alone, for a caller (the fire
+    /// path) that has to pick its targets before it can aim.
+    fn graph_base(project: &ProjectDefinition) -> (EdgeIndex, HashSet<String>) {
+        let edge_idx = EdgeIndex::build(project);
+        let triggers = project
+            .nodes
+            .iter()
+            .filter(|n| n.features.is_trigger)
+            .map(|n| n.id.clone())
+            .collect();
+        (edge_idx, triggers)
+    }
+
+    fn aimed(
+        project: &ProjectDefinition,
+        edge_idx: EdgeIndex,
+        triggers: HashSet<String>,
+        targets: &[String],
+    ) -> Self {
+        let nodes = upstream_closure_stop_at(project, &edge_idx, targets, &triggers);
+        Self { edge_idx, triggers, nodes }
+    }
+
+    fn of(project: &ProjectDefinition, targets: &[String]) -> Self {
+        let (edge_idx, triggers) = Self::graph_base(project);
+        Self::aimed(project, edge_idx, triggers, targets)
+    }
+
+    /// One `Kick` per root of the subgraph (a node with no in-subgraph
+    /// parent; triggers are always roots, they were terminators).
+    ///
+    /// `firing = Some((trigger, snapshot))` is fire time: only that
+    /// trigger carries the payload (its wake body) and the snapshot.
+    ///
+    /// `firing = None` is a manual run: there is no firing trigger, so
+    /// every trigger in the subgraph is kicked payload-less, which the
+    /// engine turns into "close all its output ports" so trigger-fed
+    /// branches prune via the skip cascade. A non-null `payload` lands
+    /// on every non-trigger root (per-target mocks); plain manual runs
+    /// pass `Value::Null` ("kick alive").
+    fn root_kicks(
+        &self,
+        project: &ProjectDefinition,
+        payload: &Value,
+        firing: Option<(&str, Option<&Value>)>,
+    ) -> Vec<Kick> {
+        roots_of_with_forced(project, &self.edge_idx, &self.nodes, &self.triggers)
+            .into_iter()
+            .map(|id| match firing {
+                Some((firing_id, snapshot)) if id == firing_id => Kick {
+                    node_id: id,
+                    firing: true,
+                    payload: Some(payload.clone()),
+                    port_snapshot: snapshot.cloned(),
+                },
+                Some(_) => Kick { node_id: id, firing: false, payload: None, port_snapshot: None },
+                None => Kick {
+                    payload: if payload.is_null() || self.triggers.contains(&id) {
+                        None
+                    } else {
+                        Some(payload.clone())
+                    },
+                    node_id: id,
+                    firing: false,
+                    port_snapshot: None,
+                },
+            })
+            .collect()
+    }
 }
 
 /// For each `requires_infra` node in the project, list the
@@ -735,6 +827,11 @@ async fn start_queued_execution(
     entry_node: &str,
     kicks: &[Kick],
     definition_hash: &str,
+    // A manual run's computed subgraph, journaled so the engine skips
+    // everything outside it and a resume rebuilds the same boundary.
+    // `None` for the setup phases (they compute their scope engine-side)
+    // and for anything that runs the whole graph.
+    subgraph: Option<&HashSet<String>>,
 ) -> Result<(), (StatusCode, String)> {
     let now = crate::lease::now_unix() as u64;
     let tenant = state
@@ -761,6 +858,12 @@ async fn start_queued_execution(
         phase,
         definition_hash: Some(definition_hash.to_string()),
         node_test: false,
+        subgraph: subgraph.map(|s| {
+            // Sorted so the journaled row is deterministic.
+            let mut v: Vec<String> = s.iter().cloned().collect();
+            v.sort();
+            v
+        }),
         at_unix: now,
     };
     let kick_events: Vec<weft_journal::ExecEvent> = kicks
@@ -787,13 +890,23 @@ async fn start_queued_execution(
 /// `activate`, and `reactivate` all consult it (a Stopped/Failed/Flaky/missing node
 /// is not-running), then each formats its own precondition message, so there is one
 /// definition of "is the infra up" and no drift between the entry points.
+///
+/// `within` narrows the check to the named nodes: a targeted run only touches
+/// its own upstream subgraph, so infra outside it has no bearing on that run
+/// and must not gate it. `None` checks the whole project (activate does).
 async fn missing_infra_nodes(
     state: &DispatcherState,
     project_id: &str,
     project: &ProjectDefinition,
+    within: Option<&HashSet<String>>,
 ) -> Result<Vec<String>, (StatusCode, String)> {
     let mut missing: Vec<String> = Vec::new();
-    for node in project.nodes.iter().filter(|n| n.requires_infra) {
+    for node in project
+        .nodes
+        .iter()
+        .filter(|n| n.requires_infra)
+        .filter(|n| within.is_none_or(|set| set.contains(&n.id)))
+    {
         let row = crate::infra_node::get(&state.pg_pool, project_id, &node.id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
@@ -842,6 +955,7 @@ pub async fn start_infra_setup(
         &kicks[0].node_id,
         &kicks,
         &definition_hash,
+        None,
     )
     .await?;
     Ok(Some(InfraSetupRun { color, events, project_id }))
@@ -973,17 +1087,9 @@ pub fn compute_trigger_kicks(
     payload: &Value,
     port_snapshot: Option<&Value>,
 ) -> Vec<Kick> {
-    let edge_idx = EdgeIndex::build(project);
-
-    // Set of trigger nodes (`features.is_trigger`). All trigger
-    // nodes register signals during TriggerSetup; this is the set
-    // we route fires to.
-    let triggers: HashSet<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.features.is_trigger)
-        .map(|n| n.id.clone())
-        .collect();
+    // All trigger nodes register signals during TriggerSetup; that set
+    // is what fires route to.
+    let (edge_idx, triggers) = RunSubgraph::graph_base(project);
     if !triggers.contains(firing_node_id) {
         return Vec::new();
     }
@@ -1003,30 +1109,10 @@ pub fn compute_trigger_kicks(
     // Upstream closure from those outputs, stopping at triggers
     // (include the trigger but do not walk through its incoming
     // edges). The fired trigger is in this set by construction: every
-    // target was picked from its downstream closure.
-    let in_subgraph = upstream_closure_stop_at(project, &edge_idx, &targets, &triggers);
-
-    // Roots of the subgraph. Triggers are always roots (they were
-    // terminators); nodes in the subgraph with no in-subgraph
-    // parent are roots too.
-    roots_of_with_forced(project, &edge_idx, &in_subgraph, &triggers)
-        .into_iter()
-        .map(|id| {
-            // Only the firing trigger carries the wake payload and the
-            // snapshot. Other roots get `None`: non-firing triggers
-            // close, plain roots are "kick alive" entries.
-            if id == firing_node_id {
-                Kick {
-                    node_id: id,
-                    firing: true,
-                    payload: Some(payload.clone()),
-                    port_snapshot: port_snapshot.cloned(),
-                }
-            } else {
-                Kick { node_id: id, firing: false, payload: None, port_snapshot: None }
-            }
-        })
-        .collect()
+    // target was picked from its downstream closure. Only the firing
+    // trigger's kick carries the wake payload and the snapshot.
+    RunSubgraph::aimed(project, edge_idx, triggers, &targets)
+        .root_kicks(project, payload, Some((firing_node_id, port_snapshot)))
 }
 
 /// BFS downstream from `start` through outgoing edges, returning
@@ -2273,7 +2359,7 @@ pub async fn activate_inner(
     // Stopped / Failed / Flaky node is just as bad as a missing one
     // from TriggerSetup's POV (the worker will try `endpoint_url`
     // and the broker will return None).
-    let missing = missing_infra_nodes(&state, &project_id, &project).await?;
+    let missing = missing_infra_nodes(state, &project_id, &project, None).await?;
     if !missing.is_empty() {
         return Err((
             StatusCode::PRECONDITION_REQUIRED,
@@ -2362,7 +2448,7 @@ pub async fn activate_inner(
     // block with ONE rollback site below. A future step added here
     // can't forget the un-stick.
     let setup = activate_trigger_setup_window(
-        &state, id, &project_id, choice, &project,
+        state, id, &project_id, choice, &project,
         &running_definition_hash,
     )
     .await;
@@ -2375,9 +2461,9 @@ pub async fn activate_inner(
         // Both are idempotent and safe if a concurrent cancel/success
         // already moved us out of Activating (the inner CAS no-ops).
         let rb = match rollback {
-            ActivateRollback::UnstickOnly => unstick_activating(&state, id).await.map(|_| ()),
+            ActivateRollback::UnstickOnly => unstick_activating(state, id).await.map(|_| ()),
             ActivateRollback::WipeSignals { ts_color } => {
-                wipe_activating_state(&state, id, &project_id, ts_color).await
+                wipe_activating_state(state, id, &project_id, ts_color).await
             }
         };
         if let Err((rb_status, rb_msg)) = rb {
@@ -2402,11 +2488,11 @@ pub async fn activate_inner(
     // Resume vs Entry vs Drop based on what the listener returns,
     // exactly like a live fire. Runs after the Active CAS so the
     // gate relays instead of re-queueing.
-    drain_parked_fires(&state, &project_id)
+    drain_parked_fires(state, &project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("drain_parked_fires: {e}")))?;
 
-    let urls = collect_listener_urls(&state, &project_id).await.map_err(|e| {
+    let urls = collect_listener_urls(state, &project_id).await.map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, format!("collect_listener_urls: {e}"))
     })?;
     for url in &urls {
@@ -3073,7 +3159,7 @@ pub async fn resync(
     // 2. Reactivate precondition: every requires_infra node must be
     //    running. If not, leave the project deactivated and surface
     //    a clear error. The user starts infra and clicks Activate.
-    let missing = missing_infra_nodes(&state, &project_id, &project).await?;
+    let missing = missing_infra_nodes(&state, &project_id, &project, None).await?;
     if !missing.is_empty() {
         return Err((
             StatusCode::PRECONDITION_REQUIRED,
@@ -3860,6 +3946,7 @@ async fn run_trigger_setup(
         &kicks[0].node_id,
         &kicks,
         definition_hash,
+        None,
     )
     .await
     .map_err(|(status, msg)| (status, msg, None))?;
@@ -4126,8 +4213,8 @@ mod trigger_kick_tests {
 mod infra_kick_and_dep_tests {
     use super::*;
 
-    /// (id, is_trigger, requires_infra)
-    fn project(nodes: &[(&str, bool, bool)], edges: &[(&str, &str)]) -> ProjectDefinition {
+    /// (id, is_trigger, requires_infra). Shared with `run_subgraph_tests`.
+    pub(super) fn project(nodes: &[(&str, bool, bool)], edges: &[(&str, &str)]) -> ProjectDefinition {
         let n_json: Vec<serde_json::Value> = nodes
             .iter()
             .map(|(id, is_trigger, requires_infra)| {
@@ -4316,6 +4403,81 @@ mod infra_kick_and_dep_tests {
         // includes both text AND infra. Deps should include infra.
         let deps = compute_trigger_deps(&p);
         assert_eq!(deps, vec![("infra".to_string(), "trigger".to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod run_subgraph_tests {
+    use super::infra_kick_and_dep_tests::project;
+    use super::*;
+
+    /// Diamond: src feeds two branches, only one is aimed at. The
+    /// other branch's exclusive nodes stay out of the subgraph, so
+    /// they are neither infra-gated nor dispatched.
+    #[test]
+    fn aiming_at_one_output_excludes_the_other_branch() {
+        let p = project(
+            &[
+                ("src", false, false),
+                ("a", false, false),
+                ("out1", false, false),
+                ("b", false, false),
+                ("out2", false, false),
+            ],
+            &[("src", "a"), ("a", "out1"), ("src", "b"), ("b", "out2")],
+        );
+        let sub = RunSubgraph::of(&p, &["out1".to_string()]);
+        let mut nodes: Vec<&str> = sub.nodes.iter().map(|s| s.as_str()).collect();
+        nodes.sort();
+        assert_eq!(nodes, vec!["a", "out1", "src"]);
+    }
+
+    /// A trigger in the walk is a terminator: included (it gets kicked
+    /// payload-less so its branch prunes), but its own upstream is not.
+    #[test]
+    fn a_trigger_terminates_the_upstream_walk_and_kicks_bare() {
+        let p = project(
+            &[
+                ("setup", false, false),
+                ("trig", true, false),
+                ("mid", false, false),
+                ("out", false, false),
+            ],
+            &[("setup", "trig"), ("trig", "mid"), ("mid", "out")],
+        );
+        let sub = RunSubgraph::of(&p, &["out".to_string()]);
+        assert!(sub.nodes.contains("trig"));
+        assert!(!sub.nodes.contains("setup"), "the trigger's own upstream stays out");
+
+        let kicks = sub.root_kicks(&p, &serde_json::json!({ "mock": 1 }), None);
+        let trig = kicks.iter().find(|k| k.node_id == "trig").expect("trigger is a root");
+        assert!(trig.payload.is_none(), "a manual run kicks triggers payload-less");
+        assert!(!trig.firing);
+    }
+
+    /// Fire time: only the firing trigger carries the wake payload
+    /// and the snapshot; every other root is a bare kick.
+    #[test]
+    fn only_the_firing_trigger_carries_the_payload() {
+        let p = project(
+            &[
+                ("trig", true, false),
+                ("other", true, false),
+                ("out", false, false),
+            ],
+            &[("trig", "out"), ("other", "out")],
+        );
+        let sub = RunSubgraph::of(&p, &["out".to_string()]);
+        let payload = serde_json::json!({ "msg": "hi" });
+        let snapshot = serde_json::json!({ "port": "v" });
+        let kicks = sub.root_kicks(&p, &payload, Some(("trig", Some(&snapshot))));
+        let trig = kicks.iter().find(|k| k.node_id == "trig").unwrap();
+        assert!(trig.firing);
+        assert_eq!(trig.payload.as_ref(), Some(&payload));
+        assert_eq!(trig.port_snapshot.as_ref(), Some(&snapshot));
+        let other = kicks.iter().find(|k| k.node_id == "other").unwrap();
+        assert!(!other.firing);
+        assert!(other.payload.is_none() && other.port_snapshot.is_none());
     }
 }
 

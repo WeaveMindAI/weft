@@ -19,6 +19,7 @@
     {
       "name": "prompt",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "What the image should show."
     },

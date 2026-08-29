@@ -48,7 +48,21 @@ dashboard-v1/static/projects
 # AI agent scratch
 .claude/agents/prompt-engineering.md
 # The agent memory index is private working notes, not part of the public repo.
-.claude/MEMORY.md
 CODE_QUALITY_TRIAGE.md
 packages/weft-graph/node_modules
 .weft-base-context.lock
+
+# Draft migrations: local to the machine that wrote them, collapsed into a
+# released migration by `./setup.sh --migration <name> --release`.
+crates/weft-task-store/migrations/*/drafts/
+
+# mdbook build output (docs/book.toml build-dir).
+docs/book/
+
+# Bundled highlight.js for the markdown preview (built by
+# `pnpm run bundle:markdown-preview`).
+extension-vscode/markdown-preview/hljs.js
+packages/weft-syntax/node_modules
+
+# Example projects generate build state when opened; never commit it.
+examples/*/.weft/

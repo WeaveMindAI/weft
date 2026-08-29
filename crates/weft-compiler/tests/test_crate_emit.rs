@@ -247,6 +247,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         span: None,
         header_span: None,
         config_spans: Default::default(),
+        optional_ports: Default::default(),
         port_literals: Default::default(),
         port_literal_spans: Default::default(),
         file_refs: Default::default(),

@@ -417,6 +417,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_infra_owner_pod
              ON infra_owner(supervisor_pod)"#,
     ],
+    seed: &[],
 };
 
 // =============================================================

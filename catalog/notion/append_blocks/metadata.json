@@ -37,6 +37,7 @@
     {
       "name": "content",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "description": "Plain text to append: one paragraph per line."
     },

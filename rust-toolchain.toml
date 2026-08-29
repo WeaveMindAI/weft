@@ -12,3 +12,7 @@
 [toolchain]
 channel = "1.94.0"
 profile = "minimal"
+# On top of the minimal profile: clippy for the CI gate and local lint
+# runs, rustfmt for formatting. Installed for THIS pinned toolchain;
+# without this line CI's clippy step would have no clippy to run.
+components = ["clippy", "rustfmt"]

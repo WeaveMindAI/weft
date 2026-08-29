@@ -488,7 +488,7 @@ impl CallObservation for OpenRouterObservation {
                 Err(_) => {
                     // Truncated at the cap: the front of the body (id,
                     // model) is still recoverable from the valid prefix.
-                    if let Some(front) = std::str::from_utf8(&buffer[..buffer.len().min(4096)]).ok()
+                    if let Ok(front) = std::str::from_utf8(&buffer[..buffer.len().min(4096)])
                     {
                         let (id, model) = (&mut self.id, &mut self.model);
                         if id.is_none() {

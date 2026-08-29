@@ -34,9 +34,9 @@ pub fn hash_spec(
     let tags_json = serde_json::to_string(image_tags)?;
     let mut hasher = Sha256::new();
     hasher.update(b"weft-infra-typed-v1\n");
-    hasher.update(&(spec_json.len() as u64).to_le_bytes());
+    hasher.update((spec_json.len() as u64).to_le_bytes());
     hasher.update(spec_json.as_bytes());
-    hasher.update(&(tags_json.len() as u64).to_le_bytes());
+    hasher.update((tags_json.len() as u64).to_le_bytes());
     hasher.update(tags_json.as_bytes());
     Ok(hex(&hasher.finalize()))
 }

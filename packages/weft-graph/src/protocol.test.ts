@@ -85,20 +85,39 @@ describe('catalog wire fixture', () => {
 				  requiresScopes: ['s.read'], requiresValues: ['host'] },
 				{ name: 'sheet', type: 'String', exposure: 'config',
 				  widget: { kind: 'remote_select', access: 'grant',
-				            sources: [{ kind: 'granted', from: 'sheets' }], depends_on: ['pick'] } },
+				            sources: [{ kind: 'granted', from: 'sheets', label: 'label', value: 'id' }], depends_on: ['pick'] } },
 				{ name: 'img', type: 'Image', exposure: 'all',
 				  widget: { kind: 'file_drop', type: 'Image', accept: 'image/png' } },
 			],
 			outputs: [{ name: 'out', type: 'String' }],
 			features: { oneOfRequired: [['code', 'img']], isTrigger: true,
-			            hasFormSchema: true, canAddInputPorts: true,
+			            canAddInputPorts: true,
 			            showDebugPreview: true, liveEndpoint: 'web' },
 			display: { kind: 'media', output: 'out' },
-			formFieldSpecs: [
-				{ fieldType: 'text', label: 'Text',
-				  render: { component: 'text_input', source: 'input', multiple: true },
-				  requiredConfig: [], optionalConfig: [], addsInputs: [], addsOutputs: [] },
-			],
+			portsFromConfig: {
+				field: 'fields',
+				matchInput: 'n',
+				specs: [
+					{ kind: 'text', keyField: 'key', label: 'Text',
+					  render: { component: 'text_input', source: 'input', multiple: true },
+					  // A metadata author may write a field as a bare name
+					  // (`"label"`); the resolved metadata expands it into
+					  // the whole declaration before the editor sees it.
+					  fields: [
+						{ key: 'label', label: 'Label', required: false,
+						  shape: 'typed', valueType: 'String',
+						  widget: { kind: 'text' } },
+						{ key: 'options', label: 'Options', required: true,
+						  shape: 'typed', valueType: 'List[String]',
+						  widget: { kind: 'text_list' } },
+						{ key: 'at_least', label: 'At least', shape: 'number',
+						  widget: { kind: 'number' } },
+					  ],
+					  catchAll: true,
+					  addsInputs: [],
+					  addsOutputs: [{ nameTemplate: '{key}', portType: 'String' }] },
+				],
+			},
 		};
 		expect(fixture.type).toBe('Fixture');
 	});
@@ -109,7 +128,7 @@ describe('catalog wire fixture', () => {
 		const label = (w: Widget): string => {
 			switch (w.kind) {
 				case 'text': case 'textarea': case 'checkbox': case 'password':
-				case 'form_builder': case 'code': case 'number': case 'select':
+				case 'entry_list': case 'text_list': case 'code': case 'number': case 'select':
 				case 'multiselect': case 'access': case 'remote_select': case 'file_drop':
 					return w.kind;
 				default: {

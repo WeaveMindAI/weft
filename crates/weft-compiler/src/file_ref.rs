@@ -36,8 +36,9 @@ use crate::weft_compiler::CompileError;
 pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
     let trimmed = raw.trim();
     // Exactly the `@file` / `@asset` directive (not `@filesystem`); the marker
-    // module is the single home for directive/arg extraction and tolerates a
-    // space before `(`.
+    // module is the single home for directive/arg extraction, and its arg
+    // list must directly abut the name (a spaced paren, or text after the
+    // close, is prose, never a marker).
     let marker = match crate::cst::marker::directive(trimmed) {
         "file" => FileMarker::File,
         "asset" => FileMarker::Asset,
@@ -47,8 +48,27 @@ pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
         FileMarker::File => "@file",
         FileMarker::Asset => "@asset",
     };
-    let Some(inner) = crate::cst::marker::args_raw(trimmed) else {
-        return Some(Err(format!("{name} must be followed by (\"path\")")));
+    // Each malformation gets its own actionable message (mirroring
+    // @require_one_of's split); the shape comes from the one balanced
+    // scan, never re-derived by string search (a `)` inside a quoted
+    // path once made "unclosed" read as "trailing text").
+    let inner = match crate::cst::marker::args(trimmed) {
+        crate::cst::marker::MarkerArgs::Args(body) => body,
+        crate::cst::marker::MarkerArgs::NoList => {
+            return Some(Err(format!(
+                "{name} must be followed by (\"path\") directly after the name \
+                 (no space before `(`)"
+            )));
+        }
+        crate::cst::marker::MarkerArgs::Unclosed => {
+            return Some(Err(format!("{name} is missing its closing parenthesis")));
+        }
+        crate::cst::marker::MarkerArgs::TrailingText => {
+            return Some(Err(format!(
+                "{name}(...) must be the whole value: text after the closing \
+                 parenthesis would be silently replaced by the file's contents"
+            )));
+        }
     };
 
     // Split into the quoted path and an optional type, on the first
@@ -140,12 +160,40 @@ pub fn is_runtime_key_ref(file_ref: &FileRef) -> bool {
     weft_core::storage::key::is_scope_key(&file_ref.path)
 }
 
-/// Collect every MEDIA ref whose source is a RUNTIME STORAGE KEY (see
-/// [`is_runtime_key_ref`]), deduplicated. The build driver resolves each
-/// through the storage listing into the same `path -> value` map the sync's
-/// file refs use, so [`apply_asset_resolutions`] treats both identically.
-pub fn collect_runtime_key_refs(
+/// Every string a node's written values hold, however deep. A marker is a
+/// value, so it sits at the top (`file: @asset(...)`) or inside a list
+/// (`attachments: [@asset(...), @asset(...)]`), and every pass that reads
+/// or rewrites markers walks the same way.
+fn each_string(value: &serde_json::Value, visit: &mut impl FnMut(&str)) {
+    match value {
+        serde_json::Value::String(s) => visit(s),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| each_string(v, visit)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| each_string(v, visit)),
+        _ => {}
+    }
+}
+
+/// The same walk, for a pass that REPLACES a marker with what it resolved
+/// to (a stored-file value). Visits every leaf, string or not, so the
+/// caller decides what to do with it.
+fn each_value_mut(value: &mut serde_json::Value, visit: &mut impl FnMut(&mut serde_json::Value)) {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(|v| each_value_mut(v, visit))
+        }
+        serde_json::Value::Object(map) => {
+            map.values_mut().for_each(|v| each_value_mut(v, visit))
+        }
+        leaf => visit(leaf),
+    }
+}
+
+/// The one walk behind both public collectors: every `@asset` ref in
+/// every node's config and port literals, deduplicated by path (first
+/// declared type wins), filtered by `keep`.
+fn collect_refs(
     project: &weft_core::project::ProjectDefinition,
+    keep: impl Fn(&FileRef) -> bool,
 ) -> Vec<FileRef> {
     let mut seen = std::collections::BTreeSet::new();
     let mut refs = Vec::new();
@@ -158,17 +206,28 @@ pub fn collect_runtime_key_refs(
             .flatten()
             .chain(node.port_literals.values())
         {
-            let Some(raw) = value.as_str() else { continue };
-            let Some(Ok(file_ref)) = parse_marker(raw) else { continue };
-            if is_asset_ref(&file_ref)
-                && is_runtime_key_ref(&file_ref)
-                && seen.insert(file_ref.path.clone())
-            {
-                refs.push(file_ref);
-            }
+            each_string(value, &mut |raw| {
+                let Some(Ok(file_ref)) = parse_marker(raw) else { return };
+                if is_asset_ref(&file_ref)
+                    && keep(&file_ref)
+                    && seen.insert(file_ref.path.clone())
+                {
+                    refs.push(file_ref);
+                }
+            });
         }
     }
     refs
+}
+
+/// Collect every MEDIA ref whose source is a RUNTIME STORAGE KEY (see
+/// [`is_runtime_key_ref`]), deduplicated. The build driver resolves each
+/// through the storage listing into the same `path -> value` map the sync's
+/// file refs use, so [`apply_asset_resolutions`] treats both identically.
+pub fn collect_runtime_key_refs(
+    project: &weft_core::project::ProjectDefinition,
+) -> Vec<FileRef> {
+    collect_refs(project, is_runtime_key_ref)
 }
 
 /// Resolve runtime-key refs (from [`collect_runtime_key_refs`]) against a
@@ -297,37 +356,55 @@ pub(crate) fn resolve_node_file_refs(
     errors: &mut Vec<CompileError>,
 ) {
     for (key, value) in config.iter_mut() {
-        let raw = match value.as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let marker = match parse_marker(raw) {
-            Some(m) => m,
-            None => continue, // ordinary value, leave it
-        };
         // The culprit is the field that carries the marker; fall back to the
         // node's declaration span only if the field span is missing.
         let span = config_spans.get(key).map(|s| s.span).unwrap_or(node_span);
-        let file_ref = match marker {
-            Ok(fr) => fr,
-            Err(msg) => {
-                errors.push(CompileError::at(span, msg));
-                continue;
+        // A marker sits at the top of a field (`systemPrompt: @file(...)`)
+        // or inside a list (`attachments: [@asset(...), @asset(...)]`), and
+        // every one of them resolves. Only a field that is ONE marker is
+        // recorded as file-backed: that record drives editing the file
+        // through the field, which is a thing you do to one file.
+        let single = value.as_str().is_some();
+        each_value_mut(value, &mut |leaf| {
+            let Some(raw) = leaf.as_str() else { return };
+            let Some(marker) = parse_marker(raw) else { return }; // ordinary value
+            let file_ref = match marker {
+                Ok(fr) => fr,
+                Err(msg) => {
+                    // A NESTED string that merely starts with the
+                    // directive word and never OPENS an argument list
+                    // ("@file the report please" inside a prompt array)
+                    // is user prose: the abutting paren is what states
+                    // intent. A string that DID open one is always an
+                    // attempted marker, however malformed (an unclosed
+                    // paren split across lines, trailing text), and
+                    // stays loud; so does a field that IS the string.
+                    if !single && !crate::cst::marker::has_abutting_args(raw.trim()) {
+                        return;
+                    }
+                    errors.push(CompileError::at(span, msg));
+                    return;
+                }
+            };
+            match resolve(&file_ref, fs) {
+                Ok(Resolved::Value(resolved)) => {
+                    *leaf = resolved;
+                    if single {
+                        file_refs.insert(key.clone(), file_ref);
+                    }
+                }
+                // A deferred media ref (editor/lenient parse): the raw
+                // `@file` string stays in config for the UI to render, and
+                // the ref is recorded so the field is known to be
+                // file-backed.
+                Ok(Resolved::Deferred) => {
+                    if single {
+                        file_refs.insert(key.clone(), file_ref);
+                    }
+                }
+                Err(msg) => errors.push(CompileError::at(span, msg)),
             }
-        };
-        match resolve(&file_ref, fs) {
-            Ok(Resolved::Value(resolved)) => {
-                *value = resolved;
-                file_refs.insert(key.clone(), file_ref);
-            }
-            // A deferred media ref (editor/lenient parse): the raw `@file`
-            // string stays in config for the UI to render, and the ref is
-            // recorded so the field is known to be file-backed.
-            Ok(Resolved::Deferred) => {
-                file_refs.insert(key.clone(), file_ref);
-            }
-            Err(msg) => errors.push(CompileError::at(span, msg)),
-        }
+        });
     }
 }
 
@@ -380,11 +457,11 @@ pub fn apply_asset_resolutions(
     for node in &mut project.nodes {
         if let Some(config) = node.config.as_object_mut() {
             for value in config.values_mut() {
-                resolve_value(value, map, &mut missing);
+                each_value_mut(value, &mut |leaf| resolve_value(leaf, map, &mut missing));
             }
         }
         for value in node.port_literals.values_mut() {
-            resolve_value(value, map, &mut missing);
+            each_value_mut(value, &mut |leaf| resolve_value(leaf, map, &mut missing));
         }
     }
     if missing.is_empty() {
@@ -400,29 +477,7 @@ pub fn apply_asset_resolutions(
 /// `@asset` strings in config). Deduplicated by path, first declared type
 /// wins (the type only picks the marker kind; the bytes are the identity).
 pub fn collect_asset_refs(project: &weft_core::project::ProjectDefinition) -> Vec<FileRef> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut refs = Vec::new();
-    for node in &project.nodes {
-        for value in node
-            .config
-            .as_object()
-            .map(|o| o.values())
-            .into_iter()
-            .flatten()
-            .chain(node.port_literals.values())
-        {
-            let Some(raw) = value.as_str() else { continue };
-            let Some(Ok(file_ref)) = parse_marker(raw) else { continue };
-            if is_asset_ref(&file_ref)
-                && !is_url_ref(&file_ref)
-                && !is_runtime_key_ref(&file_ref)
-                && seen.insert(file_ref.path.clone())
-            {
-                refs.push(file_ref);
-            }
-        }
-    }
-    refs
+    collect_refs(project, |r| !is_url_ref(r) && !is_runtime_key_ref(r))
 }
 
 #[cfg(test)]

@@ -3,10 +3,10 @@
 //! shape an LLM step consumes directly.
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
 mod tests;

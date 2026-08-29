@@ -12,8 +12,8 @@ use weft_core::Color;
 
 use weft_journal::ExecEvent;
 use crate::journal::{
-    SignalToken, ColorLookup, ExecutionPage, ExecutionQuery, ExecutionSummary, Journal, LogEntry,
-    SignalRegistration,
+    SignalToken, ColorLookup, ExecutionOwner, ExecutionPage, ExecutionQuery, ExecutionSummary,
+    Journal, LogEntry, SignalRegistration,
 };
 
 #[derive(Default)]
@@ -295,8 +295,12 @@ impl Journal for MockJournal {
         Ok(weft_task_store::tasks::SetupFailureOutcome::NoWorkerWillRun)
     }
 
-    async fn events_log(&self, color: Color) -> anyhow::Result<Vec<ExecEvent>> {
-        Ok(self
+    async fn events_log_lossy(
+        &self,
+        color: Color,
+    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)> {
+        // In-memory events are typed, so nothing can fail to decode.
+        let events = self
             .inner
             .lock()
             .unwrap()
@@ -304,7 +308,8 @@ impl Journal for MockJournal {
             .iter()
             .filter(|e| e.color() == color)
             .cloned()
-            .collect())
+            .collect();
+        Ok((events, Vec::new()))
     }
 
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool> {
@@ -360,36 +365,15 @@ impl Journal for MockJournal {
         Ok(removed)
     }
 
-    async fn execution_project(&self, color: Color) -> anyhow::Result<ColorLookup<String>> {
-        // The mock stores typed events, so a row can never be
-        // corrupt; only Found / NotFound occur here.
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .events
-            .iter()
-            .find_map(|e| match e {
-                ExecEvent::ExecutionStarted { color: c, project_id, .. } if *c == color => {
-                    Some(project_id.clone())
-                }
-                _ => None,
-            })
-            .map_or(ColorLookup::NotFound, ColorLookup::Found))
-    }
-
-    async fn execution_tenant(&self, color: Color) -> anyhow::Result<ColorLookup<String>> {
-        // Read the tenant off the `execution_colors` mirror (the same
-        // `(project_id, tenant_id)` denormalization Postgres keeps), so it
-        // resolves even after the execution's project mapping is gone.
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .execution_colors
-            .get(&color)
-            .map(|r| r.tenant_id.clone())
-            .map_or(ColorLookup::NotFound, ColorLookup::Found))
+    async fn execution_owner(&self, color: Color) -> anyhow::Result<Option<ExecutionOwner>> {
+        // Read off the `execution_colors` mirror, exactly like
+        // Postgres: ownership must resolve when the started event is
+        // unusable AND when the project row is gone, or `weft clean`
+        // could never authorize the rows that need it most.
+        Ok(self.inner.lock().unwrap().execution_colors.get(&color).map(|r| ExecutionOwner {
+            project_id: r.project_id.clone(),
+            tenant: r.tenant_id.clone(),
+        }))
     }
 
     async fn execution_definition_hash(
@@ -780,6 +764,7 @@ mod tests {
             phase: weft_core::context::Phase::Fire,
             definition_hash: None,
             node_test: true,
+            subgraph: None,
             at_unix: 0,
         })
         .await
@@ -796,6 +781,7 @@ mod tests {
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
             node_test: false,
+            subgraph: None,
             at_unix: 0,
         }
     }
@@ -833,21 +819,19 @@ mod tests {
     /// lets the terminate sweep key storage by the run's own tenant WITHOUT the
     /// project store, so a since-deleted project's terminal event still resolves.
     #[tokio::test]
-    async fn execution_tenant_reads_the_seeded_tenant() {
+    async fn execution_owner_reads_the_seeded_row() {
         let j = MockJournal::new();
         let color = weft_core::Color::new_v4();
         j.set_project_tenant("p", "tenant-x");
         j.record_event(&started(color, "p")).await.unwrap();
 
-        assert_eq!(
-            j.execution_tenant(color).await.unwrap().found().as_deref(),
-            Some("tenant-x"),
-        );
+        let owner = j.execution_owner(color).await.unwrap().expect("owner");
+        // Both fields come off the mirror in one read, so neither can
+        // resolve while the other does not.
+        assert_eq!(owner.tenant, "tenant-x");
+        assert_eq!(owner.project_id, "p");
         // A color that never started has no execution_color row.
-        assert!(matches!(
-            j.execution_tenant(weft_core::Color::new_v4()).await.unwrap(),
-            ColorLookup::NotFound
-        ));
+        assert!(j.execution_owner(weft_core::Color::new_v4()).await.unwrap().is_none());
     }
 
     fn started_at(color: weft_core::Color, project_id: &str, at_unix: u64) -> ExecEvent {
@@ -858,6 +842,7 @@ mod tests {
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
             node_test: false,
+            subgraph: None,
             at_unix,
         }
     }

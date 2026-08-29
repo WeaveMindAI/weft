@@ -28,6 +28,9 @@ if (HISTORY_SYNC_ON_DEMAND === undefined) {
 /**
  * Creates and manages the Baileys WhatsApp connection.
  *
+ * Returns as soon as the handle is built, with the connection still
+ * being dialled. Read `getState().status` for where it has got to.
+ *
  * State machine:
  *   disconnected -> qr_pending -> connecting -> connected
  *                                             -> disconnected (on close)
@@ -292,7 +295,21 @@ export async function createBridge(authDir, webhookManager, messageStore) {
     return proto.Message.create({ conversation: '' });
   }
 
-  await connect();
+  // Dial WhatsApp in the background rather than making the caller wait
+  // for it. A connect can sit unfinished for a long time (an unpaired
+  // bridge waits for somebody to scan its QR code), and `/live` is what
+  // SHOWS that QR code, so the HTTP surface has to be up first.
+  //
+  // Anything thrown before the socket's first `connection.update` ends
+  // the process. The reconnect machinery hangs off those events, so a
+  // failure that precedes them has nothing left to retry it, and a
+  // bridge that answers `/live` forever while never dialling again is
+  // worse than a pod restart.
+  state.status = 'connecting';
+  connect().catch((err) => {
+    console.error('[bridge] initial connect failed:', err.message);
+    process.exit(1);
+  });
 
   return {
     getState() {

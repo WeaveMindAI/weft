@@ -160,6 +160,10 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     },
     position: { x: 0, y: 0 },
     parentId,
+    // A container's interface-port literals reach the view the same way a
+    // node's do, so everything downstream reads one place for both.
+    portLiterals: g.portLiterals,
+    portLiteralSpans: g.portLiteralSpans,
     inputs: g.inPorts.map(toV1Port),
     outputs: g.outPorts.map(toV1Port),
     features: {

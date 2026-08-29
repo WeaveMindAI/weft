@@ -5,30 +5,56 @@
 use super::Ctx;
 use crate::commands::daemon::ClusterBackend;
 
+/// One page of the dispatcher's execution listing. The body is
+/// `{"executions": [...], "total": N}`; anything else is a broken
+/// contract and fails loudly rather than reading as "no executions".
+async fn executions_page(
+    client: &crate::client::DispatcherClient,
+    limit: u32,
+    offset: u64,
+    project: Option<&str>,
+) -> anyhow::Result<(Vec<serde_json::Value>, u64)> {
+    let filter = project.map(|p| format!("&project_id={p}")).unwrap_or_default();
+    let resp: serde_json::Value = client
+        .get_json(&format!("/executions?limit={limit}&offset={offset}{filter}"))
+        .await?;
+    let rows = resp
+        .get("executions")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!("/executions returned no `executions` array: {resp}")
+        })?;
+    let total = resp
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("/executions returned no `total`: {resp}"))?;
+    Ok((rows, total))
+}
+
 pub async fn list(ctx: Ctx, limit: u32) -> anyhow::Result<()> {
     let client = ctx.client();
-    let resp: serde_json::Value = client
-        .get_json(&format!("/executions?limit={limit}"))
-        .await?;
-    let Some(arr) = resp.as_array() else {
-        println!("(no executions)");
-        return Ok(());
-    };
+    let (arr, total) = executions_page(&client, limit, 0, None).await?;
     if arr.is_empty() {
         println!("(no executions)");
         return Ok(());
     }
     println!(
-        "{:<38} {:<38} {:<12} {:<20} {}",
-        "color", "project_id", "status", "started_at", "entry_node"
+        "{:<38} {:<38} {:<12} {:<20} entry_node",
+        "color", "project_id", "status", "started_at"
     );
-    for row in arr {
+    for row in &arr {
         let color = row.get("color").and_then(|v| v.as_str()).unwrap_or("?");
         let project = row.get("project_id").and_then(|v| v.as_str()).unwrap_or("?");
         let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
         let entry = row.get("entry_node").and_then(|v| v.as_str()).unwrap_or("?");
         println!("{color:<38} {project:<38} {status:<12} {started:<20} {entry}");
+    }
+    // The server clamps the page size, so a big --limit can come back
+    // short; say so rather than letting the page read as the total.
+    if (arr.len() as u64) < total {
+        println!("showing {} of {total} (raise --limit or page with the API)", arr.len());
     }
     Ok(())
 }
@@ -69,10 +95,11 @@ pub async fn events(ctx: Ctx, color: String) -> anyhow::Result<()> {
 pub async fn clean(
     ctx: Ctx,
     color: Option<String>,
-    keep_days: u32,
+    keep_days: Option<u32>,
     all: bool,
     images: bool,
     build_cache: bool,
+    project: Option<String>,
 ) -> anyhow::Result<()> {
     if images || build_cache {
         if images {
@@ -86,37 +113,79 @@ pub async fn clean(
 
     let client = ctx.client();
     if let Some(c) = color {
+        anyhow::ensure!(
+            project.is_none(),
+            "a color names ONE execution, so --project cannot narrow it further: \
+             drop one of them"
+        );
         client.delete(&format!("/executions/{c}")).await?;
         println!("deleted {c}");
         return Ok(());
     }
 
-    // Bulk clean: list then delete those older than keep_days (or
-    // all, if --all).
-    let resp: serde_json::Value = client.get_json("/executions?limit=10000").await?;
-    let arr = resp.as_array().cloned().unwrap_or_default();
+    // Bulk clean: page through the listing and delete what the cutoff
+    // selects. Deleting shifts the pages, so every pass re-reads from
+    // offset 0 and stops when a pass deletes nothing (rows it chose to
+    // keep are all that remain).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock past UNIX_EPOCH")
         .as_secs();
-    let cutoff = if all {
-        u64::MAX
-    } else {
-        now.saturating_sub(keep_days as u64 * 24 * 3600)
+    // One predicate: `None` = take them all, `Some(c)` = take what
+    // started before c. Naming a SUBJECT means you mean all of it (a
+    // color deletes outright; a project takes its whole history), so
+    // the 30-day default guards only the sweep that names nothing.
+    // `--keep-days` still narrows any of them when asked for.
+    let days = match (keep_days, all, project.is_some()) {
+        (Some(d), _, _) => Some(d),
+        (None, true, _) => None,  // --all: no cutoff, as before
+        (None, false, true) => None,  // a named project: all of its runs
+        (None, false, false) => Some(30),  // the unnamed sweep's guard
     };
+    let cutoff = days.map(|d| now.saturating_sub(d as u64 * 24 * 3600));
     let mut count = 0usize;
-    for row in arr {
-        let Some(color) = row.get("color").and_then(|v| v.as_str()) else { continue };
-        let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
-        if all || started < cutoff {
-            client.delete(&format!("/executions/{color}")).await?;
-            count += 1;
+    loop {
+        let mut offset = 0u64;
+        let mut deleted_this_pass = 0usize;
+        loop {
+            let (rows, total) =
+                executions_page(&client, 200, offset, project.as_deref()).await?;
+            if rows.is_empty() {
+                break;
+            }
+            let fetched = rows.len() as u64;
+            for row in rows {
+                let Some(color) = row.get("color").and_then(|v| v.as_str()) else { continue };
+                let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
+                if cutoff.is_none_or(|c| started < c) {
+                    // A failed delete must not hide how far the sweep
+                    // got: what is already gone stays gone.
+                    if let Err(e) = client.delete(&format!("/executions/{color}")).await {
+                        anyhow::bail!(
+                            "deleted {count} executions, then deleting {color} failed: {e}. \
+                             Re-run to continue the sweep."
+                        );
+                    }
+                    count += 1;
+                    deleted_this_pass += 1;
+                }
+            }
+            offset += fetched;
+            if offset >= total {
+                break;
+            }
+        }
+        if deleted_this_pass == 0 {
+            break;
         }
     }
-    if all {
-        println!("deleted {count} executions (all)");
-    } else {
-        println!("deleted {count} executions older than {keep_days}d");
+    let scope = match &project {
+        Some(p) => format!(" of project {p}"),
+        None => String::new(),
+    };
+    match days {
+        Some(d) => println!("deleted {count} executions{scope} older than {d}d"),
+        None => println!("deleted {count} executions{scope} (all)"),
     }
     Ok(())
 }

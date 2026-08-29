@@ -47,3 +47,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 uuid = { workspace = true }
 weft-core = { workspace = true, features = ["test-helpers"] }
 futures = { workspace = true }
+
+[lints]
+workspace = true

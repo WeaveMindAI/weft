@@ -23,7 +23,7 @@ pub async fn cancel(
     let color: Color = color_str
         .parse()
         .map_err(|e: uuid::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    authorize_execution(&state, &caller.0, color).await?;
+    authorize_execution(&*state.journal, &caller.0, color).await?;
     cancel_color(&state, color).await.map_err(|e| {
         tracing::error!(target: "weft_dispatcher::cancel", color = %color, error = %e, "cancel_color failed");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -88,24 +88,14 @@ pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Resu
         .unregister_many(&state.pg_pool, &removed)
         .await;
 
-    let project_id = match state.journal.execution_project(color).await? {
-        crate::journal::ColorLookup::Found(p) => p,
-        crate::journal::ColorLookup::NotFound => {
-            tracing::warn!(
-                target: "weft_dispatcher::cancel",
-                color = %color,
-                "no project_id for color; nothing to do"
-            );
-            return Ok(());
-        }
-        crate::journal::ColorLookup::Corrupt => {
-            tracing::warn!(
-                target: "weft_dispatcher::cancel",
-                color = %color,
-                "journal row for color is corrupt; cannot resolve project; nothing to do"
-            );
-            return Ok(());
-        }
+    let Some(project_id) = state.journal.execution_owner(color).await?.map(|o| o.project_id)
+    else {
+        tracing::warn!(
+            target: "weft_dispatcher::cancel",
+            color = %color,
+            "no project_id for color; nothing to do"
+        );
+        return Ok(());
     };
 
     // 2. Always enqueue cancel_execution. If a worker is alive AND
@@ -323,7 +313,7 @@ pub async fn get(
     Path(color_str): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_execution(&state, &caller.0, color)
+    authorize_execution(&*state.journal, &caller.0, color)
         .await
         .map_err(|(s, _)| s)?;
     // Direct point-lookup by color (authorization above already proved the
@@ -361,7 +351,7 @@ pub async fn list_logs(
     Path(color_str): Path<String>,
 ) -> Result<Json<Vec<LogLineOut>>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_execution(&state, &caller.0, color)
+    authorize_execution(&*state.journal, &caller.0, color)
         .await
         .map_err(|(s, _)| s)?;
     let entries = state
@@ -403,42 +393,28 @@ pub async fn replay(
     Path(color_str): Path<String>,
 ) -> Result<Json<Vec<DispatcherEvent>>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    // `execution_project` errors propagate as 500. An unknown color
-    // is also fatal here: replaying events for a color we can't
-    // attribute to a project would emit them on the empty-string
-    // project bucket, which no SSE subscriber listens to. Surface
-    // NotFound as 404; a corrupt journal row (already logged loud at
-    // the decode site) is a server-side defect, so 500.
-    let project_id = match state
-        .journal
-        .execution_project(color)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        crate::journal::ColorLookup::Found(p) => p,
-        crate::journal::ColorLookup::NotFound => return Err(StatusCode::NOT_FOUND),
-        crate::journal::ColorLookup::Corrupt => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-    };
-    // Tenant gate: the resolved project must belong to the caller. Reuse the
-    // project gate on the already-resolved id (no second color lookup); a
-    // cross-tenant color reads as NOT_FOUND, same as an unknown one above.
-    {
-        let id = project_id
-            .parse::<uuid::Uuid>()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        authorize_project(&state, &caller.0, id)
-            .await
-            .map_err(|(s, _)| s)?;
-    }
+    // Resolve + tenant-gate in the ONE place that owns "who owns this
+    // execution": a lookup failure is 500, an unknown or cross-tenant
+    // color is 404, and the resolved project rides back for the
+    // replay's event attribution.
+    let project_id =
+        authorize_execution(&*state.journal, &caller.0, color).await.map_err(|(s, _)| s)?.project_id;
     // Use the full ExecEvent log so bus events ride along with node
     // lifecycle events. The same `to_dispatcher_events` mapper the
     // live `journal_bridge` uses runs over the log; replay and live
     // share the projection so they can't drift.
-    let raw_events = state
-        .journal
-        .events_log(color)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Lossy read: the inspector renders what exists, and every row
+    // that no longer decodes lands below as its own JournalCorruption
+    // entry, naming `weft clean`, instead of taking the response down.
+    let (raw_events, undecodable) =
+        state.journal.events_log_lossy(color).await.map_err(|e| {
+            tracing::error!(
+                target: "weft_dispatcher::api",
+                %color, error = %e,
+                "replay: reading the journal failed"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     // Fold once for corruption detection. The fold is otherwise
     // unused here (the replay sends raw ExecEvent projections, not
     // snapshot state), but it's cheap relative to the network round-
@@ -458,6 +434,14 @@ pub async fn replay(
             project_id: project_id.clone(),
             site: c.site,
             reason: c.reason,
+        });
+    }
+    for reason in undecodable {
+        out.push(DispatcherEvent::JournalCorruption {
+            color,
+            project_id: project_id.clone(),
+            site: weft_core::primitive::CorruptionSite::UndecodableRow,
+            reason,
         });
     }
     Ok(Json(out))
@@ -537,39 +521,28 @@ pub async fn delete_execution(
     Path(color_str): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_execution(&state, &caller.0, color)
-        .await
-        .map_err(|(s, _)| s)?;
+    // The gate already read the owning row; keep it rather than asking
+    // again. Its tenant is the one the storage prefix was WRITTEN
+    // under, so the wipe below addresses the same bytes the run
+    // created even for a project that has since been removed (asking
+    // the project store for the tenant would fail exactly there).
+    let owner = authorize_execution(&*state.journal, &caller.0, color).await.map_err(|(s, _)| s)?;
     // Wipe the execution's storage folder (kept survivors included:
     // `weft clean <color>` IS the explicit removal verb for them)
-    // BEFORE the journal rows go, while the color->project mapping
-    // still exists. A spent color's storage address dies with its
-    // journal history.
-    if let Ok(Some(project_id)) = state.journal.execution_project(color).await.map(|p| p.found())
-    {
-        let tenant = state
-            .tenant_router
-            .tenant_for_project(&project_id)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    target: "weft_dispatcher::storage",
-                    %color, error = %e,
-                    "could not resolve tenant to wipe execution storage; aborting clean so a retry can"
-                );
-                StatusCode::SERVICE_UNAVAILABLE
-            })?;
-        crate::storage::wipe_prefix(&state, &format!("{}/exec/{color}/", tenant.as_str()))
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    target: "weft_dispatcher::storage",
-                    %color, error = %e,
-                    "could not wipe execution storage; aborting clean so a retry can"
-                );
-                StatusCode::SERVICE_UNAVAILABLE
-            })?;
-    }
+    // BEFORE the journal rows go, while the color's row still exists.
+    // A spent color's storage address dies with its journal history;
+    // every failure below aborts so a retry can still wipe, never
+    // orphaning the prefix.
+    crate::storage::wipe_prefix(&state, &format!("{}/exec/{color}/", owner.tenant))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "weft_dispatcher::storage",
+                %color, error = %e,
+                "could not wipe execution storage; aborting clean so a retry can"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
     state
         .journal
         .delete_execution(color)

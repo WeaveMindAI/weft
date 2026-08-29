@@ -97,3 +97,6 @@ runtime = [
 # `caller::FakeCallerConnection`) so downstream crates can wire them into
 # layer-3 tests. Off by default; consumers enable it in `[dev-dependencies]`.
 test-helpers = []
+
+[lints]
+workspace = true

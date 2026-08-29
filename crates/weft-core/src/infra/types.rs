@@ -373,7 +373,7 @@ impl Container {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Image {
-    /// Pull from an external registry. e.g. `"postgres:16"`,
+    /// Pull from an external registry. e.g. `"postgres:18"`,
     /// `"ghcr.io/huggingface/tgi@sha256:..."`.
     Upstream { reference: String },
 

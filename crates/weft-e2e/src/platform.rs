@@ -51,7 +51,8 @@ const PG_LOCAL_PORT: u16 = 55432;
 /// (`postgres://weft:weft-local-dev@weft-postgres.weft-db:5432/weft`); they are
 /// not secret in any meaningful sense (local kind only) and exist only so the
 /// platform layer can reach behind the API. NOT used by any shipped code.
-/// SYNC: PG_USER/PG_PASSWORD/PG_DBNAME <-> deploy/k8s/postgres.yaml (WEFT_DATABASE_URL secret)
+/// SYNC: PG_USER/PG_PASSWORD/PG_DBNAME <-> deploy/k8s/postgres.yaml (WEFT_DATABASE_URL secret),
+///       setup.sh (WEFT_LIVE_DATABASE_URL), scripts/run-e2e.sh (WEFT_E2E_DATABASE_URL)
 const PG_USER: &str = "weft";
 const PG_PASSWORD: &str = "weft-local-dev";
 const PG_DBNAME: &str = "weft";

@@ -120,7 +120,9 @@ pub struct ApiKeyEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SharedCredential {
-    OauthApp(RegisteredApp),
+    // Boxed: a RegisteredApp is an order of magnitude bigger than an
+    // ApiKeyEntry, and these live in per-service Vecs.
+    OauthApp(Box<RegisteredApp>),
     ApiKey(ApiKeyEntry),
 }
 
@@ -269,7 +271,7 @@ impl FileAppProvider {
         if raw.trim().is_empty() {
             return Ok(BTreeMap::new());
         }
-        let named: BTreeMap<String, serde_json::Value> = serde_json::from_str(&raw)
+        let named: BTreeMap<String, serde_json::Value> = serde_json::from_str(raw)
             .with_context(|| format!("parse access apps file {}", path.display()))?;
         let mut services = BTreeMap::new();
         for (service, value) in named {
@@ -353,7 +355,7 @@ impl AppProvider for FileAppProvider {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|c| match c {
-                SharedCredential::OauthApp(app) => Some(app),
+                SharedCredential::OauthApp(app) => Some(*app),
                 SharedCredential::ApiKey(_) => None,
             })
             .collect())

@@ -4,7 +4,10 @@
 /// field components consume. The editor never derives a widget from a
 /// type: that rule lives in Rust (`Widget::default_for_type`).
 import type { FieldDefinition, PortDefinition } from '../types';
+import type { Widget } from '../../../protocol';
+import type { SpecField } from './port-specs';
 import { inputExposure } from '../types';
+import { SHOULD_FLOW_PORT } from '../../../protocol';
 
 /// The render field for one input. `portDriven` follows the exposure: a
 /// wireable input's literal lives in `portLiterals` (the port home), a
@@ -12,19 +15,66 @@ import { inputExposure } from '../types';
 /// A locally-added port that has not round-tripped yet has no widget;
 /// it renders as a textarea until the parse stamps the real one.
 export function fieldForInput(input: PortDefinition): FieldDefinition {
-	const w = input.widget ?? { kind: 'textarea' };
-	const field: FieldDefinition = {
-		key: input.name,
-		label: input.label ?? input.name,
-		type: w.kind,
-		portDriven: inputExposure(input) !== 'config',
-	};
+	const field = fieldFromWidget(
+		input.name,
+		input.label ?? input.name,
+		input.widget ?? { kind: 'textarea' },
+	);
+	field.portDriven = inputExposure(input) !== 'config';
 	if (input.placeholder !== undefined) field.placeholder = input.placeholder;
 	if (input.default !== undefined) field.defaultValue = input.default;
 	if (input.description !== undefined) field.description = input.description;
-	// Per-variant payloads: the Widget union narrows on `kind`, so a
-	// variant's required payload (a select's options, a remote_select's
-	// sources) cannot be silently absent.
+	return field;
+}
+
+/// The field for `_should_flow`, the port that decides whether a node
+/// runs. Every node has it, and it is answered by a wire, so it gets no
+/// field of its own: the corner dock on the node is where it lives. The
+/// one exception is a value written straight into the source, which has
+/// to be visible to be changed or removed, and this is that field. One
+/// definition, so a node and a container show the same control.
+export function shouldFlowField(subject: 'node' | 'container'): FieldDefinition {
+	return {
+		key: SHOULD_FLOW_PORT,
+		label: SHOULD_FLOW_PORT,
+		type: 'checkbox',
+		portDriven: true,
+		description: `Whether this ${subject} runs. Off skips it, and everything ${subject === 'container' ? 'inside it ' : ''}downstream closes in turn.`,
+	};
+}
+
+/// Does this input get a field in the body? A `wire`-exposure input
+/// never does, a wired one never does (the edge is the value), and
+/// `_should_flow` only does when the source wrote a value for it.
+export function inputRendersField(
+	input: PortDefinition,
+	opts: { wired: boolean; hasWrittenValue: boolean },
+): boolean {
+	if (input.synthesizedFromCarry) return false; // carry ghost: not editable
+	if (inputExposure(input) === 'wire') return false;
+	if (opts.wired) return false;
+	if (input.name === SHOULD_FLOW_PORT) return opts.hasWrittenValue;
+	return true;
+}
+
+/// The render field for one value a config entry kind asks for (a
+/// select's options, a case's value). The SAME widget flattening an
+/// input goes through, so a node inventing a kind gets a real control
+/// without anything here learning the key.
+export function fieldForSpecField(spec: SpecField): FieldDefinition {
+	const field = fieldFromWidget(spec.key, spec.label || spec.key, spec.widget);
+	// An entry's values live in the entry object, never in a port
+	// literal: the entry list itself is the one value being edited.
+	field.portDriven = false;
+	return field;
+}
+
+/// Flatten one resolved widget into the render shape the field
+/// components consume. The per-variant payloads (a select's options, a
+/// number's range) come from the widget itself, so the union narrows on
+/// `kind` and a variant's required payload cannot be silently absent.
+function fieldFromWidget(key: string, label: string, w: Widget): FieldDefinition {
+	const field: FieldDefinition = { key, label, type: w.kind };
 	switch (w.kind) {
 		case 'select':
 		case 'multiselect':
@@ -50,12 +100,14 @@ export function fieldForInput(input: PortDefinition): FieldDefinition {
 		case 'file_drop':
 			if (w.accept) field.accept = w.accept;
 			field.fileType = w.type;
+			if (w.multiple) field.multiple = true;
 			break;
 		case 'text':
 		case 'textarea':
 		case 'checkbox':
 		case 'password':
-		case 'form_builder':
+		case 'text_list':
+		case 'entry_list':
 			break;
 	}
 	return field;
@@ -86,6 +138,30 @@ export const LOOP_CONFIG_FIELDS: FieldDefinition[] = [
 		description: 'Zip iter inputs to the shortest length. Off = crash loud on mismatch.',
 	},
 ];
+
+/// The next portLiterals map after one field write, pure. THE rule for
+/// what "cleared" means (null, undefined, the empty string a text
+/// control leaves behind, or the empty array a multiselect/text_list
+/// leaves behind): a cleared key is DELETED, so the source goes back to
+/// saying nothing about the port, and no control can ever store a
+/// phantom "" or [] literal. The same emptiness rule commitEntry
+/// applies to entry values. Both hosts of a port strip (ProjectNode,
+/// GroupNode) route their writes through this so they cannot disagree.
+export function nextPortLiterals(
+	literals: Record<string, unknown>,
+	key: string,
+	value: unknown,
+): Record<string, unknown> {
+	const next = { ...literals };
+	const cleared =
+		value === null ||
+		value === undefined ||
+		value === '' ||
+		(Array.isArray(value) && value.length === 0);
+	if (cleared) delete next[key];
+	else next[key] = value;
+	return next;
+}
 
 /// Clamp a number to a field's declared min/max. The widget's range is
 /// a contract (the compiler rejects out-of-range literals), so every

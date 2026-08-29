@@ -462,29 +462,6 @@ fn public_link_route(bucket_internet: bool, internet_base: Option<&str>) -> Publ
     }
 }
 
-#[cfg(test)]
-mod public_link_route_tests {
-    use super::{public_link_route, PublicLinkRoute};
-
-    #[test]
-    fn route_follows_the_configured_facts() {
-        // Internet-declared bucket wins outright (even with a base up:
-        // the direct URL is the no-hop path).
-        assert_eq!(public_link_route(true, None), PublicLinkRoute::DirectPresign);
-        assert_eq!(
-            public_link_route(true, Some("https://x.example")),
-            PublicLinkRoute::DirectPresign
-        );
-        // Private bucket + internet base: relay under the base.
-        assert_eq!(
-            public_link_route(false, Some("https://x.example")),
-            PublicLinkRoute::Relay("https://x.example")
-        );
-        // Neither: no public link, callers inline.
-        assert_eq!(public_link_route(false, None), PublicLinkRoute::Unsupported);
-    }
-}
-
 /// Parse the key through the wall's grammar and confirm the caller may touch
 /// it. Every key-addressed worker verb goes through here (so "a key reaching
 /// the store passed the wall" holds by construction).
@@ -814,4 +791,27 @@ async fn admin_sweep_exec(
     let store = store(&state)?;
     let (swept, lingering) = store.sweep_exec(&req.tenant, &req.color).await.map_err(map_anyhow)?;
     Ok(Json(SweepExecResponse { swept, lingering }))
+}
+
+#[cfg(test)]
+mod public_link_route_tests {
+    use super::{public_link_route, PublicLinkRoute};
+
+    #[test]
+    fn route_follows_the_configured_facts() {
+        // Internet-declared bucket wins outright (even with a base up:
+        // the direct URL is the no-hop path).
+        assert_eq!(public_link_route(true, None), PublicLinkRoute::DirectPresign);
+        assert_eq!(
+            public_link_route(true, Some("https://x.example")),
+            PublicLinkRoute::DirectPresign
+        );
+        // Private bucket + internet base: relay under the base.
+        assert_eq!(
+            public_link_route(false, Some("https://x.example")),
+            PublicLinkRoute::Relay("https://x.example")
+        );
+        // Neither: no public link, callers inline.
+        assert_eq!(public_link_route(false, None), PublicLinkRoute::Unsupported);
+    }
 }

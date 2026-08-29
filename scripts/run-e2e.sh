@@ -58,6 +58,9 @@ if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
   kubectl -n weft-db port-forward svc/weft-postgres 15433:5432 >/dev/null 2>&1 &
   PF_PID=$!
   CLEANUP+=("kill $PF_PID 2>/dev/null || true")
+  # SYNC: local-dev PG credentials <-> deploy/k8s/postgres.yaml (WEFT_DATABASE_URL secret),
+  #       crates/weft-e2e/src/platform.rs (PG_USER/PG_PASSWORD/PG_DBNAME),
+  #       setup.sh (WEFT_LIVE_DATABASE_URL)
   export WEFT_E2E_DATABASE_URL="postgres://weft:weft-local-dev@127.0.0.1:15433/weft"
   for _ in $(seq 1 30); do
     (exec 3<>/dev/tcp/127.0.0.1/15433) 2>/dev/null && break

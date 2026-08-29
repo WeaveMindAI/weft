@@ -31,6 +31,35 @@
     }
     pub(super) use test_manifest;
 
+    /// Lookup-by-type catalog over a plain list, the shape every suite
+    /// that hands its own node set to `drive` needs.
+    pub(super) struct VecCatalog {
+        nodes: Vec<(&'static str, &'static dyn weft_core::Node)>,
+    }
+    impl weft_core::NodeCatalog for VecCatalog {
+        fn lookup(&self, node_type: &str) -> Option<&'static dyn weft_core::Node> {
+            self.nodes.iter().find(|(t, _)| *t == node_type).map(|(_, n)| *n)
+        }
+        fn all(&self) -> Vec<&'static str> {
+            self.nodes.iter().map(|(t, _)| *t).collect()
+        }
+    }
+
+    pub(super) fn catalog(
+        nodes: Vec<(&'static str, Box<dyn weft_core::Node>)>,
+    ) -> Arc<dyn weft_core::NodeCatalog> {
+        // `Box::leak` is DELIBERATE: the catalog contract wants
+        // `&'static dyn Node`, and each test (each stress-run) builds
+        // its own node set, so the leak is bounded by the suite's test
+        // count and lives only for the test process.
+        Arc::new(VecCatalog {
+            nodes: nodes
+                .into_iter()
+                .map(|(t, n)| (t, Box::leak(n) as &'static dyn weft_core::Node))
+                .collect(),
+        })
+    }
+
     /// In-memory recording journal: stores every event and replays them
     /// for the boot fold. Unlike the Noop journals in `replay_tests`,
     /// this actually drives a live execution.
@@ -52,6 +81,14 @@
                 .iter()
                 .filter(|e| e.color() == color)
                 .cloned()
+                .collect())
+        }
+        async fn raw_events_for_color(&self, color: Color) -> anyhow::Result<Vec<String>> {
+            Ok(self
+                .events_for_color(color)
+                .await?
+                .iter()
+                .map(|e| serde_json::to_string(e).expect("serialize ExecEvent"))
                 .collect())
         }
         async fn has_terminal_event(&self, color: Color) -> anyhow::Result<bool> {
@@ -109,4 +146,105 @@
             // fetch path is never invoked here. Bail loud if it is.
             anyhow::bail!("NoopProject::fetch_definition not implemented in execution_driver tests")
         }
+    }
+
+    /// Seed + drive one execution: ExecutionStarted(Fire) + a kick per
+    /// entry node, then `run_one_execution`. Returns the outcome and
+    /// every journaled event.
+    pub(super) async fn drive(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        kicks: &[&str],
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        drive_with_cancel(project, catalog, kicks, CancellationFlag::new_arc()).await
+    }
+
+    /// `drive` with a caller-owned cancellation flag, for the tests
+    /// that trip it mid-stream. Every run is bounded by a generous
+    /// failsafe deadline, a rig-level safety net: a regression into a
+    /// hang must FAIL the test by name, never wedge the whole
+    /// `cargo test` process.
+    pub(super) async fn drive_with_cancel(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        kicks: &[&str],
+        cancellation: Arc<CancellationFlag>,
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        drive_scoped(project, catalog, kicks, None, cancellation).await
+    }
+
+    /// `drive` with a journaled run subgraph, the shape a manual run
+    /// aimed at targets produces: only the named nodes dispatch, and
+    /// everything else skips with `OutsideThisRun`.
+    pub(super) async fn drive_scoped(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        kicks: &[&str],
+        subgraph: Option<&[&str]>,
+        cancellation: Arc<CancellationFlag>,
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        let color = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        journal
+            .record_event(
+                &ExecEvent::ExecutionStarted {
+                    color,
+                    project_id: project.id.to_string(),
+                    entry_node: kicks[0].to_string(),
+                    phase: weft_core::context::Phase::Fire,
+                    definition_hash: Some("test-hash".into()),
+                    node_test: false,
+                    subgraph: subgraph.map(|s| s.iter().map(|n| n.to_string()).collect()),
+                    at_unix: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        for kick in kicks {
+            journal
+                .record_event(
+                    &ExecEvent::NodeKicked {
+                        color,
+                        node_id: kick.to_string(),
+                        firing: false,
+                        payload: None,
+                        port_snapshot: None,
+                        at_unix: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let clients = EngineClients {
+            journal: journal.clone(),
+            tasks: Arc::new(NoopTasks),
+            infra: Arc::new(NoopInfra),
+            infra_state: Arc::new(NoopInfraState),
+            project: Arc::new(NoopProject),
+            clock: Arc::new(weft_platform_traits::clock::SystemClock),
+            storage: crate::storage::FakeWorkerStorage::new(),
+            access_broker: crate::context::FakeAccessBroker::new(),
+            pending_costs: crate::metering::PendingCostRecords::new(),
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_one_execution(
+                Arc::new(project),
+                catalog,
+                color,
+                clients,
+                "pod-test".into(),
+                "tenant-test".into(),
+                "ns-test".into(),
+                cancellation,
+                None,
+            ),
+        )
+        .await
+        .expect("the drive hung: a loud-failure contract regressed into a hang")
+        .expect("run_one_execution ok");
+        let events = journal.events.lock().unwrap().clone();
+        (outcome, events)
     }

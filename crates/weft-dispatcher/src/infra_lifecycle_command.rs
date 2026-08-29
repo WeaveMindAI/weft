@@ -113,6 +113,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
               ON infra_lifecycle_command(project_id, node_id)
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
     ],
+    seed: &[],
 };
 
 /// Enqueue a Stop or Terminate command. Returns its id; the

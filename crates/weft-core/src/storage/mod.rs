@@ -171,11 +171,12 @@ pub async fn collect_stream(mut stream: ByteStream) -> std::io::Result<bytes::By
 /// Which key-prefix wall a storage handle operates inside. One box
 /// per tenant; the scope picks the prefix, the caller's verified
 /// identity picks the values inside it (its own color / project).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageScope {
     /// `exec/<color>/`: walled to a single run, swept on terminate
     /// unless kept. The default.
+    #[default]
     Execution,
     /// `project/<project_id>/`: outlives runs, shared across the
     /// project's executions, wiped by `weft clean` / `weft rm`.
@@ -192,11 +193,6 @@ pub enum StorageScope {
     Asset,
 }
 
-impl Default for StorageScope {
-    fn default() -> Self {
-        Self::Execution
-    }
-}
 
 /// Lifetime of a KEPT execution-scoped file. Every access bumps the
 /// expiry back to now + TTL, so actively-used survivors never

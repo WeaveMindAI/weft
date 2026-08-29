@@ -79,7 +79,7 @@ pub fn plan_memory_scaledown(pods: &[PoolPodLoad], threshold: f64) -> Option<Str
             .map(|p| (threshold - p.mem_pressure).max(0.0))
             .sum();
         if target.mem_pressure <= survivor_headroom
-            && best.as_ref().map_or(true, |b| target.mem_pressure < b.mem_pressure)
+            && best.as_ref().is_none_or(|b| target.mem_pressure < b.mem_pressure)
         {
             best = Some(target);
         }

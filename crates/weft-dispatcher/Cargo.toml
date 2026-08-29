@@ -64,7 +64,7 @@ test-helpers = []
 # (the StoragePool placement/reservation/reap logic lives in SQL). OFF by
 # default so a plain `cargo test --workspace` needs no Postgres; CI runs
 # `cargo test -p weft-dispatcher --features db-tests` with a Postgres up.
-db-tests = []
+db-tests = ["weft-task-store/db-tests"]
 
 [dev-dependencies]
 weft-listener = { path = "../weft-listener" }
@@ -73,3 +73,10 @@ weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `#[sqlx::test]` (macros + migrate) provisions a fresh isolated DB per test.
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono", "macros", "migrate"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[example]]
+name = "schema_migration"
+required-features = ["db-tests"]
+
+[lints]
+workspace = true

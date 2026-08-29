@@ -264,6 +264,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
                   AND NEW.kind IN ('execute', 'resume'))
             EXECUTE FUNCTION weft_bind_color_owner()"#,
     ],
+    seed: &[],
 };
 
 /// Appoint `pod_name` as the driver of `color`. Ownership normally

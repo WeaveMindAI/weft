@@ -1,7 +1,7 @@
 {
   "type": "HumanTrigger",
   "label": "Human Trigger",
-  "description": "Start an execution when a human submits a form. Form fields determine the output ports via form_field_specs.",
+  "description": "Start an execution when a human submits a form. Form fields determine the output ports.",
   "tags": [
     "human",
     "form",
@@ -25,6 +25,7 @@
     {
       "name": "description",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "exposure": "config",
       "label": "Description",
       "description": "Description shown under the title."
@@ -35,17 +36,16 @@
       "required": true,
       "exposure": "config",
       "widget": {
-        "kind": "form_builder"
+        "kind": "entry_list"
       },
       "label": "Form fields",
-      "description": "Each field contributes an output port per its fieldType (see form_field_specs)."
+      "description": "Each field contributes an output port per its kind (see the node's portsFromConfig)."
     }
   ],
   "outputs": [],
   "requires_infra": false,
   "features": {
-    "isTrigger": true,
-    "hasFormSchema": true
+    "isTrigger": true
   },
   "validate": [
     {

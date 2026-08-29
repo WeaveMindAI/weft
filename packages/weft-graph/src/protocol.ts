@@ -164,7 +164,7 @@ export type WeftType =
  *
  *  These internal forms exist so catalog authors can express "this port
  *  accepts anything, independently from sibling ports" without forcing the
- *  same rule on nodes that want shared `T` semantics (Gate, etc.). */
+ *  same rule on nodes that want shared `T` semantics (FirstInOrder, etc.). */
 function isTypeVarName(s: string): boolean {
   if (!s) return false;
   if (s === 'T_Auto') return true;
@@ -477,16 +477,20 @@ export interface DisplaySpecWire {
 
 // SYNC: NodeFeaturesWire <-> crates/weft-core/src/node.rs NodeFeatures
 // This mirrors ONLY the features the editor reads. Backend-only
-// features (cast ports, output defaults, hidden filtering, ...) stay
-// out: an unread field in a wire type advertises UI behavior that does
-// not exist. The wire may still carry them (JS ignores unknown keys).
+// features (cast ports, hidden filtering, ...) stay out: an unread
+// field in a wire type advertises UI behavior that does not exist.
+// The wire may still carry them (JS ignores unknown keys).
 export interface NodeFeaturesWire {
   oneOfRequired?: string[][];
   canAddInputPorts?: boolean;
   canAddOutputPorts?: boolean;
-  hasFormSchema?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
+  /// This node type's firing is the deliverable, so a run started from
+  /// the outputs reaches it. The editor reads it to know which nodes a
+  /// run can be aimed at; a project overrides it per instance with
+  /// `_is_output` in the node's config.
+  isOutputDefault?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
   /// so the panel doesn't show a broken eye.
@@ -565,6 +569,13 @@ export interface GroupDefinition {
   /// line of the group (text without the `# `).
   // SYNC: GroupDefinition <-> crates/weft-core/src/project.rs GroupDefinition
   description?: string | null;
+  /// Literals written on the container's interface ports: `g.x = "hi"` from
+  /// outside, or `_should_flow: false` in the braces. A wired value is an
+  /// ordinary edge and never appears here.
+  portLiterals?: Record<string, unknown>;
+  /// Where each `portLiterals` entry was written, and in which form, so an
+  /// edit rewrites the value where it already lives.
+  portLiteralSpans?: Record<string, ConfigFieldSpan>;
 }
 
 export interface ProjectDefinition {
@@ -677,12 +688,16 @@ export type Widget =
       /// fetched list is suggestions, not a closed set).
       free_text?: boolean;
     }
-  | { kind: 'form_builder' }
+  /// Build the list of config entries a node's ports come from.
+  | { kind: 'entry_list' }
+  /// A list of short text values, added and removed one at a time.
+  | { kind: 'text_list' }
   /// Editor file picker. `type` is the declared weft file type
   /// (Image/Audio/Video/Blob/File); `accept` optionally narrows the
-  /// derived filter.
+  /// derived filter; `multiple` means the port holds several files, so
+  /// the control keeps a list and writes one marker per file.
   // SYNC: Widget.type <-> crates/weft-core/src/node.rs Widget::FileDrop file_type
-  | { kind: 'file_drop'; accept?: string | null; type: string };
+  | { kind: 'file_drop'; accept?: string | null; type: string; multiple?: boolean };
 
 // One declared INPUT of a node type, as authored in metadata.json and
 // RESOLVED by the CLI before it ships (exposure + widget always filled
@@ -735,12 +750,13 @@ export interface CatalogEntry {
    *  file card) and which port it shows. */
   // SYNC: display <-> crates/weft-core/src/node.rs NodeMetadata.display
   display?: DisplaySpecWire;
-  /** Form-field vocabulary for nodes whose `features.hasFormSchema`
-   *  is true. Empty/undefined for everything else. A metadata key,
-   *  declared once in the package root's partial `metadata.json` and
-   *  inherited by every member, so the form_builder editor can drive
-   *  the field-type dropdown without a separate fetch. */
-  formFieldSpecs?: FormFieldSpecWire[];
+  /** Which config key this node's ports come from, and the entry kinds
+   *  that key accepts. Undefined for a node whose ports are fixed. A
+   *  metadata key, declared once in the package root's partial
+   *  `metadata.json` and inherited by every member, so the
+   *  entry-list editor can drive the kind dropdown without a
+   *  separate fetch. */
+  portsFromConfig?: PortsFromConfigWire;
   /** The service recipe, present ONLY on an access node. Drives the
    *  connection picker (doors, permission catalogue, own page). */
   // SYNC: AccessSpecWire <-> crates/weft-core/src/access/spec.rs AccessSpec
@@ -905,24 +921,65 @@ export interface FormFieldRenderWire {
   prefilled?: boolean;
 }
 
-/** Port template emitted by a field type. */
-export interface FormFieldPortWire {
+/** Port template one entry kind adds. */
+// SYNC: PortTemplateWire <-> crates/weft-core/src/node.rs PortTemplate
+export interface PortTemplateWire {
   nameTemplate: string;
   portType: string;
 }
 
-/** Wire shape of one `FormFieldSpec` (camelCase). The webview narrows
- *  this further via its own `FormFieldSpec` interface in
- *  `lib/utils/form-field-specs`. */
-// SYNC: FormFieldSpecWire <-> crates/weft-core/src/node.rs FormFieldSpec
-export interface FormFieldSpecWire {
-  fieldType: string;
+/** Wire shape of one `PortSpec` (camelCase): how one kind of config
+ *  entry contributes ports. The webview narrows this further via its
+ *  own `PortSpec` interface in `lib/utils/port-specs`. */
+/** What a [kind] asks the author to fill in, and what that value has to
+ *  be: a plain weft type, or a shape measured against the input the
+ *  entries are matched on. */
+// SYNC: SpecFieldWire <-> crates/weft-core/src/node.rs SpecField, SpecShape
+export type SpecFieldWire = {
+  /** The entry key this value lives under (`options`, `value`, `min`). */
+  key: string;
   label: string;
-  render: FormFieldRenderWire;
-  requiredConfig: string[];
-  optionalConfig: string[];
-  addsInputs: FormFieldPortWire[];
-  addsOutputs: FormFieldPortWire[];
+  /** An entry of this kind is incomplete without it. */
+  required?: boolean;
+  /** The control the editor draws, always filled by the time it ships. */
+  widget: Widget;
+} & (
+  | { shape: 'typed'; valueType: string }
+  | { shape: 'value' }
+  | { shape: 'valueList' }
+  | { shape: 'number' }
+  | { shape: 'element' }
+  | { shape: 'regex' }
+);
+
+// SYNC: PortSpecWire <-> crates/weft-core/src/node.rs PortSpec
+export interface PortSpecWire {
+  kind: string;
+  /** The entry key holding the port name (`key` for a form field,
+   *  `port` for a switch case). */
+  keyField: string;
+  label: string;
+  /** Absent for a kind nothing renders (a switch case). */
+  render?: FormFieldRenderWire;
+  /** What this kind asks the author to fill in. A metadata author may
+   *  write an entry as a bare name (`"placeholder"`); by the time it
+   *  reaches the editor it is always the whole declaration. */
+  fields?: SpecFieldWire[];
+  /** This kind takes anything, so it is the branch reached when no
+   *  earlier entry matched. At most one per list, and it goes last. */
+  catchAll?: boolean;
+  addsInputs: PortTemplateWire[];
+  addsOutputs: PortTemplateWire[];
+}
+
+/** Where a node's ports come from when they come from its own config. */
+// SYNC: PortsFromConfigWire <-> crates/weft-core/src/node.rs PortsFromConfig
+// This mirrors only what the editor reads; the wire also carries
+// `matchInput` (the compiler's value-check anchor), which no UI path
+// consumes and so stays out, same rule as NodeFeaturesWire.
+export interface PortsFromConfigWire {
+  field: string;
+  specs: PortSpecWire[];
 }
 
 export interface ParseResponse {
@@ -938,6 +995,24 @@ export interface ParseResponse {
 /// (`pending` / `suspended` / `accumulating`) the dispatcher never
 /// emitted; they painted states the engine could not produce and
 /// `suspended` doubled-up with the real `waiting_for_input` event.
+/// Why a firing did not run. A DECISION (the author's `_should_flow` said no)
+/// reads differently from a CONSEQUENCE (an input it needed never arrived), so
+/// the journal carries which one it was.
+// SYNC: SkipReason <-> crates/weft-core/src/exec/skip.rs SkipReason
+export type SkipReason =
+  | { kind: 'did_not_flow' }
+  | { kind: 'flow_closed' }
+  | { kind: 'required_input_closed'; port: string }
+  | { kind: 'every_input_closed' }
+  | { kind: 'one_of_group_closed'; ports: string[] }
+  | { kind: 'outside_this_run' };
+
+/// The port every node carries, deciding whether it runs at all.
+// SYNC: SHOULD_FLOW_PORT <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
+// docs/src/language/syntax.md (reserved keys),
+// packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README)
+export const SHOULD_FLOW_PORT = '_should_flow';
+
 export type NodeExecutionStatus =
   | 'running'
   | 'waiting_for_input'
@@ -991,6 +1066,10 @@ export interface NodeExecEvent {
   /// events; other state transitions don't carry the per-port closed
   /// info because it's the same set the firing started with.
   closedPorts?: string[];
+  /// Why the firing did not run, on a `skipped` event. The inspector
+  /// tells a DECISION (`did_not_flow`) from a CONSEQUENCE (an input it
+  /// needed closed) with it.
+  skipReason?: SkipReason;
   output?: unknown;
 }
 
@@ -1139,7 +1218,8 @@ export type CorruptionSite =
   | 'NodeSkipped'
   | 'NodeCancelled'
   | 'PulsesConsumed'
-  | 'LoopStreamEnded';
+  | 'LoopStreamEnded'
+  | 'UndecodableRow';
 
 /// One item rendered in a node's body panel. Two distinct feeds
 /// produce items: infra `/live` (infra-pod telemetry) and signal
@@ -1180,6 +1260,10 @@ export interface LiveDataItem {
 /// the backend, the user sees the error verbatim.
 export type NodeFeedState =
   | { state: 'ok'; items: LiveDataItem[] }
+  // The feed's SOURCE does not exist yet (infra not provisioned, the
+  // signal not registered): a resting state with its own affordance,
+  // distinct from a healthy-but-empty list AND from a failure.
+  | { state: 'absent' }
   | { state: 'error'; error: string };
 
 // ─── Messages: extension host -> webview ────────────────────────────────
@@ -1634,10 +1718,11 @@ export type HostMessage =
   /// dispatcher route's JSON response on success; `error` the failure
   /// reason. Summaries only: no stored value ever rides this channel.
   | { kind: 'accessResult'; requestId: number; result?: unknown; error?: string }
-  /// Reply to `pickAsset`: `path` is the token path the field writes into its
-  /// `@asset("<path>", <Type>)` ref (a path in place locally, `assets/<name>`
-  /// for stored bytes), absent on cancel; `error` on failure.
-  | { kind: 'assetPicked'; requestId: number; path?: string; error?: string }
+  /// Reply to `pickAsset`: `paths` are the token paths the field writes
+  /// into its `@asset("<path>", <Type>)` refs (a path in place locally,
+  /// `assets/<name>` for stored bytes). Empty means the user cancelled;
+  /// a single-file field takes the first. `error` on failure.
+  | { kind: 'assetPicked'; requestId: number; paths?: string[]; error?: string }
   /// Reply to `listRuntimeFiles`: the project's STORED runtime files (its
   /// `project/` + `asset/` storage scopes), keys tenant-less (the short
   /// address a picked ref writes into source). `error` is the failure
@@ -1709,7 +1794,12 @@ export type WebviewMessage =
   /// file's graph in the panel.
   | { kind: 'navigateBack' }
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string }
-  | { kind: 'runProject' }
+  /// Run the project. `targets` narrows the run to those output nodes'
+  /// upstream subgraphs; absent or empty runs every output node, which
+  /// is the ordinary case. Only output nodes may appear here: the
+  /// dispatcher refuses anything else, so the graph must not offer a
+  /// middle node as a target.
+  | { kind: 'runProject'; targets?: string[] }
   | { kind: 'infraStart' }
   /// Project-level infra Stop / Terminate. `deactivation` is set iff
   /// the project is Active: the shared picker (in the webview) chose
@@ -1839,7 +1929,11 @@ export type WebviewMessage =
       kind: 'pickAsset';
       requestId: number;
       accept?: string;
-      dropped?: { name: string; bytesBase64: string };
+      /// The field takes several files, so the host's dialog lets the
+      /// user choose several at once.
+      multiple?: boolean;
+      /// Files dropped onto the field, in drop order, as base64 bytes.
+      dropped?: { name: string; bytesBase64: string }[];
     }
   /// The file-picker modal asks for the project's STORED runtime files
   /// (reply: `runtimeFiles`): what the storage plane holds for this project,

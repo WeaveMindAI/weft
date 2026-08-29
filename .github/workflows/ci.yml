@@ -1,0 +1,89 @@
+# The checks CONTRIBUTING asks you to run locally, run again on every PR.
+#
+# Deliberately NOT here: the end-to-end suite (needs a real cluster, driven by
+# scripts/run-e2e.sh) and the live node-test tier (spends real money). Both are
+# run by hand before a release.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain input: the action reads rust-toolchain.toml, which
+      # is the single source of truth for the version AND the components
+      # (clippy for the gate below).
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+
+      # No compile-time query macros anywhere, so the workspace suite needs no
+      # database. The tests that do want one are behind the `db-tests` feature.
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The examples are the first thing a new user copies, and nothing
+      # else compiles them. The script tolerates only the
+      # connect-a-credential diagnostics a fresh checkout produces.
+      - run: scripts/validate-examples.sh
+
+  db:
+    name: cargo test --features db-tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports: ["5432:5432"]
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+      - uses: Swatinem/rust-cache@v2
+      # The same script developers run locally, pointed at the service
+      # container, so the crate list lives in exactly one place.
+      - run: scripts/run-db-tests.sh
+
+  editor:
+    name: graph + editor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The pnpm version comes from extension-vscode/package.json's
+      # `packageManager` field (there is no root package.json).
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: extension-vscode/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: extension-vscode/pnpm-lock.yaml
+      - run: pnpm -C extension-vscode install --frozen-lockfile
+      # weft-graph has no install of its own: it borrows the extension's,
+      # the same way setup.sh wires it locally.
+      - run: ln -sfn ../../extension-vscode/node_modules packages/weft-graph/node_modules
+      - run: ln -sfn ../../extension-vscode/node_modules packages/weft-syntax/node_modules
+      - run: pnpm -C packages/weft-graph test
+      - run: pnpm -C packages/weft-syntax test
+      - run: pnpm -C extension-vscode test
+      - run: pnpm -C extension-vscode run compile

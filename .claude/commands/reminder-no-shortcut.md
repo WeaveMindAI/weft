@@ -1,1 +1,0 @@
-Remember, it doesn't matter how non trivial or time consuming the proper thing is, take as long as you need no shortcut.

@@ -169,6 +169,7 @@
                     phase,
                     definition_hash: Some("test-hash".into()),
                     node_test: false,
+                    subgraph: None,
                     at_unix: 0,
                 },
                 None,
@@ -240,6 +241,69 @@
         .await;
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
         assert_eq!(*calls.lock().unwrap(), vec!["src:run", "trig:setup_trigger"]);
+    }
+
+    /// A setup phase leaves the business graph UNTOUCHED in the
+    /// journal: everything downstream of the trigger is outside the
+    /// setup's dispatch bound, and an activation must not paint it
+    /// "skipped" (the pulses the trigger's unmentioned-port sweep sends
+    /// there are absorbed silently).
+    #[tokio::test]
+    async fn trigger_setup_journals_nothing_for_the_downstream_graph() {
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "name": "phase-routing-test",
+            "description": null,
+            "nodes": [
+                {
+                    "id": "src", "nodeType": "Src", "label": null,
+                    "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [], "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "trig", "nodeType": "Trig", "label": null,
+                    "config": null, "position": { "x": 1.0, "y": 0.0 },
+                    "inputs": [{ "name": "value", "portType": "String", "required": true }],
+                    "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                    "features": { "isTrigger": true }, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "d1", "nodeType": "Src", "label": null,
+                    "config": null, "position": { "x": 2.0, "y": 0.0 },
+                    "inputs": [{ "name": "value", "portType": "String", "required": true }],
+                    "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                    "features": {}, "scope": [], "groupBoundary": null,
+                    "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                { "id": "e1", "source": "src", "target": "trig", "sourceHandle": "value", "targetHandle": "value" },
+                { "id": "e2", "source": "trig", "target": "d1", "sourceHandle": "value", "targetHandle": "value" }
+            ],
+            "groups": []
+        }))
+        .expect("downstream project");
+        let (_calls, outcome, journal) = run_routing_case(
+            project,
+            weft_core::context::Phase::TriggerSetup,
+            &["src"],
+        )
+        .await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        let events = journal.events.lock().unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, ExecEvent::NodeSkipped { .. })),
+            "a setup phase journals no skip rows: {events:?}"
+        );
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, ExecEvent::NodeStarted { node_id, .. } if node_id == "d1")
+            ),
+            "the downstream node never appears: {events:?}"
+        );
     }
 
     /// Fire: the kicked trigger runs its normal body exactly once;
@@ -382,6 +446,7 @@
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
                     node_test: false,
+                    subgraph: None,
                     at_unix: 0,
                 },
                 None,

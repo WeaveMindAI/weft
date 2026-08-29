@@ -948,13 +948,45 @@ fn set_config(
     form: Option<super::ValueForm>,
 ) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
-    // NODE-only (inline nodes included), same kind-honesty discipline
-    // as rename/move/ports: loop config rides `SetLoopConfig` /
-    // `RemoveLoopConfig` (groups take no config at all). Silently
-    // accepting a container here would fork one operation across two
-    // op families.
-    if !matches!(decl, Decl::Node(_) | Decl::InlineNode(_)) {
+    // A container takes values on its INTERFACE PORTS, which is what this
+    // op writes. Its loop knobs are a different home and ride
+    // `SetLoopConfig` / `RemoveLoopConfig`. An include alias has neither.
+    if let Decl::Include(_) = &decl {
         return Err(kind_mismatch("SetConfig/RemoveConfig", node_id, "Node", &decl));
+    }
+    if matches!(decl, Decl::Group(_) | Decl::Loop(_)) {
+        // Inside the braces, the only key a container reads is
+        // `_should_flow`: an ordinary key there is a loop knob or an
+        // error, never a port value. Every other port is written as a
+        // `g.key = value` statement.
+        if key != weft_core::exec::skip::SHOULD_FLOW_PORT {
+            // Only a DECLARED in-port may be written as `g.key = value`:
+            // anything else would emit source the compiler then rejects.
+            // Loop knobs (`over`, `parallel`, ...) are not ports and ride
+            // `SetLoopConfig`; refuse them here with a pointer. Checked
+            // BEFORE the braces-form refusal, so a typo'd key is named a
+            // non-port rather than "one of its ports".
+            if !header_in_port_names(&decl).iter().any(|p| p == key) {
+                return Err(EditError::InvalidArgument(match &decl {
+                    Decl::Loop(_) => format!(
+                        "'{key}' is not a port of the loop '{node_id}'; loop knobs ride \
+                         SetLoopConfig"
+                    ),
+                    _ => format!("'{key}' is not a port of the group '{node_id}'"),
+                }));
+            }
+            if form == Some(super::ValueForm::Inline) {
+                return Err(EditError::InvalidArgument(format!(
+                    "'{node_id}' is a container: '{key}' is one of its ports, written `{node_id}.{key} = ...`, and has no braces form"
+                )));
+            }
+            return match (find_connection_origin_field(view, &decl, key), value) {
+                (Some(conn), Some(v)) => replace_connection_rhs(&conn, v),
+                (Some(conn), None) => { detach_with_leading_ws(&conn); Ok(()) }
+                (None, Some(v)) => insert_connection_value(view, node_id, key, v),
+                (None, None) => Ok(()),
+            };
+        }
     }
     // An inline node lives INSIDE a value: its fields are only ever the
     // braces form (no `host__key.field = ...` statement can exist, the
@@ -2300,7 +2332,7 @@ fn rebuild_decl(decl: &Decl, new_header: &str) -> Result<(), EditError> {
         leading_ws(decl.syntax()).map(|t| t.text().to_string()).unwrap_or_default()
     };
     let rebuilt = match decl.body() {
-        Some(body) => format!("{lead}{} {}", new_header.trim(), body.syntax().to_string()),
+        Some(body) => format!("{lead}{} {}", new_header.trim(), body.syntax()),
         None => format!("{lead}{}", new_header.trim()),
     };
     splice_decl(decl, &rebuilt)
@@ -2327,10 +2359,59 @@ fn splice_decl(decl: &Decl, text: &str) -> Result<(), EditError> {
     Ok(())
 }
 
-/// Split a header string into (`id = Type`, rest-with-sig). The head ends at the
-/// first `(` or `->`.
+/// The container's IN-port names as the COMPILER sees them: the
+/// header's own `PORT_SIG_IN` port declarations (read off the parsed
+/// tree, never re-parsed from header text, which mis-splits on the
+/// commas and parentheses a port TYPE may carry), plus, for a loop, the
+/// carry inputs the compiler synthesizes (a `carry:` name matching an
+/// out port becomes an in port even when the header never wrote it).
+// SYNC: carry input synthesis <-> crates/weft-compiler/src/weft_compiler.rs
+//       (lower_group's carry loop), packages/weft-graph/src/webview/lib/
+//       projection/apply.ts syncLoopCarryInputs
+fn header_in_port_names(decl: &Decl) -> Vec<String> {
+    use crate::cst::SyntaxKind as K;
+    let header = match decl {
+        Decl::Group(g) => g.header().map(|h| h.syntax().clone()),
+        Decl::Loop(l) => l.header().map(|h| h.syntax().clone()),
+        _ => None,
+    };
+    let Some(header) = header else { return Vec::new() };
+    let mut ins: Vec<String> = Vec::new();
+    let mut outs: Vec<String> = Vec::new();
+    for sig in header.children() {
+        let bucket = match sig.kind() {
+            K::PORT_SIG_IN => &mut ins,
+            K::PORT_SIG_OUT => &mut outs,
+            _ => continue,
+        };
+        for el in sig.children() {
+            if el.kind() != K::PORT_DECL {
+                continue;
+            }
+            let text = el.to_string();
+            let text = text.trim().trim_end_matches(',').trim();
+            if let Ok(port) = crate::weft_compiler::try_parse_port_decl(text) {
+                bucket.push(port.name);
+            }
+        }
+    }
+    for carry in read_carry_list(decl) {
+        if outs.contains(&carry) && !ins.contains(&carry) {
+            ins.push(carry);
+        }
+    }
+    ins
+}
+
+/// Split a header string into (`id = Type`, rest-with-sig). The head
+/// ends at whichever of the first `(` or the first `->` comes first (a
+/// signature can open with `->` when there are no in-ports).
 fn split_header_head(header: &str) -> (String, String) {
-    let cut = header.find('(').or_else(|| header.find("->")).unwrap_or(header.len());
+    let cut = [header.find('('), header.find("->")]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(header.len());
     (header[..cut].to_string(), header[cut..].to_string())
 }
 

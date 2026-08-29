@@ -128,7 +128,7 @@ pub use infra::{
 };
 pub use frames::{LoopFrames, LoopIteration};
 pub use node::{
-    Condition, FormFieldPort, FormFieldSpec, InputSpec, MetadataCatalog,
+    Condition, InputSpec, MetadataCatalog, PortSpec, PortsFromConfig, PortTemplate,
     NodeFeatures, NodeManifest, NodeMetadata, NodeOutput, OutputSpec, RuleDiagnostic, RuleSeverity,
     Widget,
     ValidationLevel, ValidationRule,

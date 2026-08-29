@@ -207,11 +207,13 @@ impl<'a> Parser<'a> {
 
         match op {
             K::COLON => {
-                // `key: value` config field: LHS is exactly one IDENT.
-                if lhs.len() == 1 && lhs[0].1 == K::IDENT {
-                    LineShape::Field
-                } else {
-                    LineShape::Unknown
+                // `key: value` config field: LHS is one IDENT, optionally
+                // followed by the `?` that marks a port this field CREATES as
+                // optional (`answer?: draft.text`).
+                match lhs.len() {
+                    1 if lhs[0].1 == K::IDENT => LineShape::Field,
+                    2 if lhs[0].1 == K::IDENT && lhs[1].1 == K::QUESTION => LineShape::Field,
+                    _ => LineShape::Unknown,
                 }
             }
             K::EQ => match lhs.len() {
@@ -550,6 +552,13 @@ impl<'a> Parser<'a> {
         self.builder.start_node(wrapper.into());
         self.bump_significant(); // key IDENT
         self.bump_trivia_inline();
+        // `key?:` marks the port this field creates as optional. The token
+        // rides inside the CONFIG_FIELD node so the tree round-trips and the
+        // lowering can see it.
+        if self.cur() == Some(SyntaxKind::QUESTION) {
+            self.bump();
+            self.bump_trivia_inline();
+        }
         if self.cur() == Some(SyntaxKind::COLON) {
             self.bump();
         }

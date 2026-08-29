@@ -1,0 +1,8 @@
+[package]
+name = "whatsapp_support_bot"
+id = "f972a87f-ac1f-4256-9d66-527623834807"
+version = "0.1.0"
+
+[dispatcher]
+
+[build.worker]

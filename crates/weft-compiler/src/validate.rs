@@ -9,10 +9,12 @@
 use weft_core::node::{
     Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
 };
+use weft_core::exec::skip::SHOULD_FLOW_PORT;
 use weft_core::project::{NodeDefinition, Span};
 use weft_core::weft_type::WeftType;
 use weft_core::ProjectDefinition;
 
+use crate::weft_compiler::read_loop_port_list_vetted;
 use crate::{Diagnostic, Severity};
 
 /// Which validation rules to run. `Structural` checks only editor-
@@ -62,6 +64,7 @@ fn validate_scoped(
     check_port_resolution(project, &mut d);
     check_type_compat(project, &mut d);
     check_port_coverage(project, catalog, &mut d);
+    check_config_derived_ports(project, catalog, &mut d);
     check_loop_config(project, &mut d);
     check_double_driven_ports(project, &mut d);
     check_warnings(project, &mut d);
@@ -862,8 +865,8 @@ fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>
         let Some(tgt) = by_id.get(edge.target.as_str()) else {
             continue;
         };
-        if matches!(src.node_type.as_str(), "Passthrough" | "LoopIn" | "LoopOut")
-            || matches!(tgt.node_type.as_str(), "Passthrough" | "LoopIn" | "LoopOut")
+        if crate::enrich::is_lowering_builtin(&src.node_type)
+            || crate::enrich::is_lowering_builtin(&tgt.node_type)
         {
             continue;
         }
@@ -976,7 +979,7 @@ fn did_you_mean<'a>(input: &str, candidates: &[&'a str]) -> Option<&'a str> {
     let mut best: Option<(usize, &str)> = None;
     for c in candidates {
         let d = levenshtein(input, c);
-        if d <= 2 && best.map_or(true, |(bd, _)| d < bd) {
+        if d <= 2 && best.is_none_or(|(bd, _)| d < bd) {
             best = Some((d, c));
         }
     }
@@ -1372,38 +1375,35 @@ fn check_port_coverage(
                     .map(|s| s.span)
                     .unwrap_or(span)
             };
-            match &input.widget {
-                // literal-out-of-range: a number widget's min/max bound
-                // the literal at compile time (the editor clamps on
-                // blur; this is the backstop for hand-written source).
-                Some(weft_core::node::Widget::Number { min, max, .. }) => {
-                    // Range-check the CAST value so a stringified number
-                    // in an un-enriched graph is bounded consistently
-                    // with the type check. An uncastable value is not
-                    // silently passed: config-type-mismatch reports it.
-                    let cast_num = literal_value
-                        .and_then(|v| input.port_type.cast_value(v).ok())
-                        .and_then(|v| v.as_f64());
-                    if let Some(n) = cast_num {
-                        if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
-                            push(
-                                d,
-                                literal_span(),
-                                Severity::Error,
-                                "literal-out-of-range",
-                                format!(
-                                    "input '{}.{}': {} is outside the allowed range [{}, {}]",
-                                    node.id,
-                                    input.name,
-                                    n,
-                                    min.map_or("-inf".into(), |m| m.to_string()),
-                                    max.map_or("inf".into(), |m| m.to_string()),
-                                ),
-                            );
-                        }
+            // literal-out-of-range: a number widget's min/max bound
+            // the literal at compile time (the editor clamps on
+            // blur; this is the backstop for hand-written source).
+            if let Some(weft_core::node::Widget::Number { min, max, .. }) = &input.widget {
+                // Range-check the CAST value so a stringified number
+                // in an un-enriched graph is bounded consistently
+                // with the type check. An uncastable value is not
+                // silently passed: config-type-mismatch reports it.
+                let cast_num = literal_value
+                    .and_then(|v| input.port_type.cast_value(v).ok())
+                    .and_then(|v| v.as_f64());
+                if let Some(n) = cast_num {
+                    if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+                        push(
+                            d,
+                            literal_span(),
+                            Severity::Error,
+                            "literal-out-of-range",
+                            format!(
+                                "input '{}.{}': {} is outside the allowed range [{}, {}]",
+                                node.id,
+                                input.name,
+                                n,
+                                min.map_or("-inf".into(), |m| m.to_string()),
+                                max.map_or("inf".into(), |m| m.to_string()),
+                            ),
+                        );
                     }
                 }
-                _ => {}
             }
         }
 
@@ -1439,20 +1439,22 @@ fn check_port_coverage(
         // undeclared-port-no-custom: if the node can't accept custom
         // inputs (features.can_add_input_ports == false), every
         // config key must name a declared input or output (literal-
-        // emitter nodes like Text drive their output via config). The
-        // unified namespace means node.inputs already covers what used
-        // to be "fields". LoopIn/LoopOut carry the loop config (`over`,
-        // `parallel`, ...) in their config blob; check_loop_config
-        // validates those keys exhaustively against its own known-keys
-        // list, so exactly those two types are exempt here (matched by
-        // node_type, the same key check_loop_config selects on, so the
-        // two checks partition the space with no gap).
+        // emitter nodes like Text drive their output via config). A
+        // node that derives ports from a config list holds that list
+        // under a key it DECLARES as a config input (the catalog load
+        // refuses `portsFromConfig` naming an undeclared input), so it
+        // needs no exemption here. LoopIn/LoopOut carry the loop config
+        // (`over`, `parallel`, ...) in their config blob;
+        // check_loop_config validates those keys exhaustively against
+        // its own known-keys list, so exactly those two types are
+        // exempt here (matched by node_type, the same key
+        // check_loop_config selects on, so the two checks partition the
+        // space with no gap).
         // An unknown node type (a lenient-parse placeholder in the
         // editor; a hard enrich error in a strict compile) has no
         // declared inputs at all, so every config key would
         // false-positive here.
         if !node.features.can_add_input_ports
-            && !node.features.has_form_schema
             && !matches!(node.node_type.as_str(), "LoopIn" | "LoopOut")
             && catalog.lookup(&node.node_type).is_some()
         {
@@ -1465,9 +1467,8 @@ fn check_port_coverage(
                 // Compiler/editor plumbing keys (`_`-reserved,
                 // `parentId`) are validated by the parser / merged at
                 // flatten time and never need to match a declared
-                // input. `fields` is the layout-side form-schema blob
-                // co-resident in the same config.
-                if weft_core::project::is_internal_config_key(key) || key == "fields" {
+                // input.
+                if weft_core::project::is_internal_config_key(key) {
                     continue;
                 }
                 if known_inputs.contains(key.as_str())
@@ -1488,38 +1489,29 @@ fn check_port_coverage(
             }
         }
 
-        // form-field-conflict: form fields materialize as ports. If
-        // a form field's key clashes with an already-declared port,
-        // the generated port would collide.
-        //
-        // Form-derived ports already live in `node.inputs` /
-        // `node.outputs` after enrich. Duplicate-detection runs PER
-        // SIDE: a single field can't materialize twice in `inputs`
-        // (or twice in `outputs`), but a node legitimately can have
-        // an input AND an output sharing a name (e.g. a passthrough
-        // `value`/`value`). Crossing the chain would false-positive
-        // every passthrough that happens to declare a form schema.
-        if node.features.has_form_schema {
-            let sides: [Vec<&str>; 2] = [
-                node.inputs.iter().map(|p| p.name.as_str()).collect(),
-                node.outputs.iter().map(|p| p.name.as_str()).collect(),
-            ];
-            for names in sides {
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
-                for name in names {
-                    if !seen.insert(name) {
-                        push(
-                            d,
-                            span,
-                            Severity::Error,
-                            "form-field-conflict",
-                            format!(
-                                "form field key '{}' duplicates a port of the same direction on '{}'",
-                                name, node.id
-                            ),
-                        );
-                    }
+        // duplicate-port: two ports of the same name on the same side.
+        // Config-derived ports (a form's fields, a switch's cases) are
+        // where this comes from in practice, since a catalog's own port
+        // list is checked at load and the source-vs-catalog merge is
+        // by name. Detection runs PER SIDE: a node legitimately has an
+        // input AND an output sharing a name (a passthrough's
+        // `value`/`value`), so crossing the two would false-positive
+        // every one of them.
+        let sides: [Vec<&str>; 2] = [
+            node.inputs.iter().map(|p| p.name.as_str()).collect(),
+            node.outputs.iter().map(|p| p.name.as_str()).collect(),
+        ];
+        for names in sides {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for name in names {
+                if !seen.insert(name) {
+                    push(
+                        d,
+                        span,
+                        Severity::Error,
+                        "duplicate-port",
+                        format!("node '{}' has two ports named '{}' on one side", node.id, name),
+                    );
                 }
             }
         }
@@ -1529,6 +1521,312 @@ fn check_port_coverage(
     // parse time: a `node.port = "literal"` line is lowered to a config
     // field on the node (not an edge), which the port checks reject when
     // the target port is output-only. No extra check needed at validate.
+}
+
+/// The entries a node derives its ports from (a form's `fields`, a
+/// switch's `cases`) have to say what they claim to say, or the ports
+/// they were supposed to make just are not there and every wire to them
+/// reads as a typo.
+///
+/// Rules, all about one entry list:
+///  - the value under the key is a LIST of objects.
+///  - every entry names a `kind` this node offers.
+///  - every entry names its port, under the key its spec asks for.
+///  - every entry carries only keys its spec declares, so a mistyped
+///    test (`euqals`) fails here instead of quietly becoming a case
+///    that matches everything.
+///  - every test carries the shape it declares: a value the matched
+///    input could hold, a list of them, a number, or a regular
+///    expression that compiles.
+///  - a CATCH-ALL entry (one carrying no test at all) is unique and
+///    last, since the entries are matched in order and anything after it
+///    could never be reached.
+fn check_config_derived_ports(
+    project: &ProjectDefinition,
+    catalog: &dyn MetadataCatalog,
+    d: &mut Vec<Diagnostic>,
+) {
+    for node in &project.nodes {
+        let Some(meta) = catalog.lookup(&node.node_type) else { continue };
+        let Some(ports_from_config) = &meta.ports_from_config else { continue };
+        let span = node.header_span_or_default();
+        let key_span = node
+            .config_spans
+            .get(&ports_from_config.field)
+            .map(|s| s.span)
+            .unwrap_or(span);
+        let Some(raw) = node.config.get(&ports_from_config.field) else { continue };
+        let Some(entries) = raw.as_array() else {
+            push(
+                d,
+                key_span,
+                Severity::Error,
+                "config-ports-not-a-list",
+                format!(
+                    "node '{}': '{}' holds the list this node's ports come from, so it must be \
+                     a list",
+                    node.id, ports_from_config.field
+                ),
+            );
+            continue;
+        };
+
+        let kinds: Vec<&str> = ports_from_config.specs.iter().map(|s| s.kind.as_str()).collect();
+        let mut catch_all_at: Option<usize> = None;
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(obj) = entry.as_object() else {
+                push(
+                    d,
+                    key_span,
+                    Severity::Error,
+                    "config-entry-not-an-object",
+                    format!(
+                        "node '{}': entry {} of '{}' is not an object",
+                        node.id,
+                        index + 1,
+                        ports_from_config.field
+                    ),
+                );
+                continue;
+            };
+            let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or_default();
+            let Some(spec) = ports_from_config.spec_for(kind) else {
+                push(
+                    d,
+                    key_span,
+                    Severity::Error,
+                    "unknown-config-entry-kind",
+                    format!(
+                        "node '{}': entry {} of '{}' has kind '{}', which {} does not offer \
+                         (it takes: {})",
+                        node.id,
+                        index + 1,
+                        ports_from_config.field,
+                        kind,
+                        node.node_type,
+                        kinds.join(", ")
+                    ),
+                );
+                continue;
+            };
+            let port_name = obj.get(&spec.key_field).and_then(|v| v.as_str()).unwrap_or_default();
+            if port_name.is_empty() {
+                push(
+                    d,
+                    key_span,
+                    Severity::Error,
+                    "config-entry-without-a-port",
+                    format!(
+                        "node '{}': entry {} of '{}' needs a '{}' naming the port it adds",
+                        node.id,
+                        index + 1,
+                        ports_from_config.field,
+                        spec.key_field
+                    ),
+                );
+                continue;
+            }
+            // Every key an entry may carry, so anything else is a
+            // mistyped one.
+            let mut allowed: Vec<&str> = vec!["kind", spec.key_field.as_str()];
+            allowed.extend(spec.fields.iter().map(|f| f.key.as_str()));
+            let unknown: Vec<&String> =
+                obj.keys().filter(|key| !allowed.contains(&key.as_str())).collect();
+            for key in &unknown {
+                push(
+                    d,
+                    key_span,
+                    Severity::Error,
+                    "unknown-config-entry-key",
+                    format!(
+                        "node '{}': entry {} of '{}' carries '{}', which a '{}' entry does \
+                         not take (it takes: {})",
+                        node.id,
+                        index + 1,
+                        ports_from_config.field,
+                        key,
+                        spec.kind,
+                        allowed.join(", ")
+                    ),
+                );
+            }
+            // What the entries are matched against, when they compete.
+            // Its type is what holds a test to a value it could see.
+            let matched_type = ports_from_config
+                .match_input
+                .as_ref()
+                .and_then(|name| node.inputs.iter().find(|p| p.name == *name))
+                .map(|p| p.port_type.clone());
+            for field in &spec.fields {
+                match obj.get(field.key.as_str()) {
+                    Some(value) => {
+                        if let Some(problem) =
+                            spec_field_problem(field, value, matched_type.as_ref())
+                        {
+                            push(
+                                d,
+                                key_span,
+                                Severity::Error,
+                                "config-entry-bad-value",
+                                format!(
+                                    "node '{}': entry {} of '{}' sets `{}`, and {}",
+                                    node.id,
+                                    index + 1,
+                                    ports_from_config.field,
+                                    field.key,
+                                    problem
+                                ),
+                            );
+                        }
+                    }
+                    None if field.required => push(
+                        d,
+                        key_span,
+                        Severity::Error,
+                        "config-entry-missing-value",
+                        format!(
+                            "node '{}': entry {} of '{}' is a '{}', which needs a '{}'",
+                            node.id,
+                            index + 1,
+                            ports_from_config.field,
+                            spec.kind,
+                            field.key
+                        ),
+                    ),
+                    None => {}
+                }
+            }
+            // A kind that takes anything is the branch reached when no
+            // earlier entry matched, so a second one can never fire.
+            if spec.catch_all {
+                match catch_all_at {
+                    Some(first) => push(
+                        d,
+                        key_span,
+                        Severity::Error,
+                        "duplicate-catch-all",
+                        format!(
+                            "node '{}': entries {} and {} of '{}' both match anything; the \
+                             second can never be reached",
+                            node.id,
+                            first + 1,
+                            index + 1,
+                            ports_from_config.field
+                        ),
+                    ),
+                    None => catch_all_at = Some(index),
+                }
+            }
+        }
+        if let Some(at) = catch_all_at {
+            if at + 1 != entries.len() {
+                push(
+                    d,
+                    key_span,
+                    Severity::Error,
+                    "catch-all-not-last",
+                    format!(
+                        "node '{}': entry {} of '{}' matches anything, so the {} after it can \
+                         never be reached. Write it last",
+                        node.id,
+                        at + 1,
+                        ports_from_config.field,
+                        entries.len() - at - 1
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// What is wrong with one value a kind asked for, or `None` when it
+/// fits. Reads only the SHAPE the spec declares, so the compiler holds
+/// it honest without knowing what any node means by the key.
+fn spec_field_problem(
+    field: &weft_core::node::SpecField,
+    value: &serde_json::Value,
+    matched_type: Option<&WeftType>,
+) -> Option<String> {
+    use weft_core::node::SpecShape;
+    // Every shape below `Typed` measures the value against the input
+    // named by `matchInput`. Manifest validation guarantees that input
+    // exists whenever a spec declares such a field, so a missing type
+    // here is a broken manifest; report it rather than skipping the
+    // check silently.
+    fn matched(matched_type: Option<&WeftType>) -> Result<&WeftType, String> {
+        matched_type.ok_or_else(|| {
+            "its spec matches entries against an input this node does not declare \
+             (broken node metadata: `matchInput` names no input)"
+                .to_string()
+        })
+    }
+    match field.shape {
+        SpecShape::Typed => {
+            let declared = field.value_type.as_ref()?;
+            (!declared.accepts_runtime_value(value))
+                .then(|| format!("{value} is not a {declared}"))
+        }
+        SpecShape::Value => {
+            let ty = match matched(matched_type) {
+                Ok(t) => t,
+                Err(p) => return Some(p),
+            };
+            (!ty.accepts_runtime_value(value))
+                .then(|| format!("{value} is not a {ty}, which is what it is matched against"))
+        }
+        SpecShape::ValueList => {
+            let Some(items) = value.as_array() else {
+                return Some(format!("{value} is not a list of values to match against"));
+            };
+            let ty = match matched(matched_type) {
+                Ok(t) => t,
+                Err(p) => return Some(p),
+            };
+            items.iter().find(|item| !ty.accepts_runtime_value(item)).map(|item| {
+                format!("{item} is not a {ty}, which is what it is matched against")
+            })
+        }
+        SpecShape::Number => {
+            if !value.is_number() {
+                return Some(format!("{value} is not a number, so there is nothing to compare"));
+            }
+            // Comparing a number against something that never holds one
+            // is a branch that can never be taken.
+            let ty = match matched(matched_type) {
+                Ok(t) => t,
+                Err(p) => return Some(p),
+            };
+            (!ty.is_unresolved() && !ty.accepts_runtime_value(&serde_json::json!(0)))
+                .then(|| format!("what it matches against is a {ty}, never a number"))
+        }
+        SpecShape::Element => {
+            let ty = match matched(matched_type) {
+                Ok(t) => t,
+                Err(p) => return Some(p),
+            };
+            if ty.is_unresolved() {
+                return None;
+            }
+            match ty.structural() {
+                WeftType::List(item) => (!item.accepts_runtime_value(value))
+                    .then(|| format!("{value} is not a {item}, so no {ty} could hold it")),
+                WeftType::Primitive(weft_core::weft_type::WeftPrimitive::String) => value
+                    .as_str()
+                    .is_none()
+                    .then(|| format!("{value} is not text, so no text could contain it")),
+                other => Some(format!(
+                    "there is nothing to look inside: what it matches against is a {other}, \
+                     not a list or text"
+                )),
+            }
+        }
+        SpecShape::Regex => match value.as_str() {
+            None => Some(format!("{value} is not a regular expression")),
+            Some(pattern) => regex::Regex::new(pattern)
+                .err()
+                .map(|e| format!("{value} is not a regular expression that compiles: {e}")),
+        },
+    }
 }
 
 // ─── group 5: loop config validation ─────────────────────────────────────────
@@ -1580,8 +1878,8 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             in_node
                 .config_spans
                 .get(key)
-                .map(|cs| cs.span.clone())
-                .unwrap_or_else(|| span.clone())
+                .map(|cs| cs.span)
+                .unwrap_or_else(|| span)
         };
 
         // Unknown config keys are rejected loudly: a typo'd knob
@@ -1645,23 +1943,28 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             }
         }
 
-        // Non-string entries in over / carry are already rejected at
-        // lowering time (`read_loop_port_list` pushes a CompileError);
-        // here we just read the post-lowering values, which validate
-        // can trust are strings.
-        let read_port_list = |key: &str| -> Vec<String> {
-            cfg.get(key).and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                .unwrap_or_default()
+        // A malformed over/carry (a scalar value, or non-string
+        // entries) is already rejected at lowering time
+        // (`read_loop_port_list` pushes [loop-config-malformed]);
+        // validate must not pile a second diagnostic
+        // (parallel-without-over, unbounded, ...) onto the same
+        // mistake. `lists_ok` gates exactly the rules that READ
+        // over/carry; everything else (reserved names, parallel-with-
+        // done, type checks) still reports in the same compile.
+        let well_formed_list = |key: &str| {
+            cfg.get(key).is_none_or(|v| {
+                v.as_array().is_some_and(|arr| arr.iter().all(|e| e.is_string()))
+            })
         };
-        let over: Vec<String> = read_port_list("over");
-        let carry: Vec<String> = read_port_list("carry");
+        let lists_ok = well_formed_list("over") && well_formed_list("carry");
+        let over: Vec<String> = read_loop_port_list_vetted(cfg.as_object(), "over");
+        let carry: Vec<String> = read_loop_port_list_vetted(cfg.as_object(), "carry");
 
-        if parallel && !carry.is_empty() {
+        if lists_ok && parallel && !carry.is_empty() {
             push(d, span_for("carry"), Severity::Error, "parallel-with-carry",
                 format!("loop '{gid}': parallel: true forbids carry ports (carry implies sequential)"));
         }
-        if parallel && over.is_empty() {
+        if lists_ok && parallel && over.is_empty() {
             push(d, span_for("parallel"), Severity::Error, "parallel-without-over",
                 format!("loop '{gid}': parallel: true requires a non-empty 'over' list"));
         }
@@ -1690,7 +1993,7 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // `self.done` write (no vote to stop) is provably infinite.
         // Reject at compile time. A loop that has ANY of the three is
         // the user's own program: trusted, unbounded by the runtime.
-        if !parallel && over.is_empty() && cfg.get("max_iters").is_none() && !done_wired {
+        if lists_ok && !parallel && over.is_empty() && cfg.get("max_iters").is_none() && !done_wired {
             push(d, span, Severity::Error, "loop-unbounded-no-termination",
                 format!(
                     "loop '{gid}': sequential loop declares no 'over', no 'max_iters', and \
@@ -1700,10 +2003,12 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         }
 
         let carry_set: HashSet<&String> = carry.iter().collect();
-        for p in &over {
-            if carry_set.contains(p) {
-                push(d, span_for("over"), Severity::Error, "over-and-carry-overlap",
-                    format!("loop '{gid}': port '{p}' listed in both 'over' and 'carry'"));
+        if lists_ok {
+            for p in &over {
+                if carry_set.contains(p) {
+                    push(d, span_for("over"), Severity::Error, "over-and-carry-overlap",
+                        format!("loop '{gid}': port '{p}' listed in both 'over' and 'carry'"));
+                }
             }
         }
 
@@ -1723,9 +2028,11 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 
         // Gather outputs must be declared `List[T | Null]`. The
         // reserved name `done` already errored above; flagging its
-        // nullability too would double-report one mistake.
+        // nullability too would double-report one mistake. Which
+        // outputs are carries is read off the carry list, so a
+        // malformed one skips this rule (`lists_ok`).
         for port in &out_node.outputs {
-            if carry_set.contains(&port.name) || port.name == "done" {
+            if !lists_ok || carry_set.contains(&port.name) || port.name == "done" {
                 continue;
             }
             if !is_list_of_nullable(&port.port_type) {
@@ -1869,8 +2176,13 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         let span = node.header_span_or_default();
 
         // orphan-outputs: only flag when the node has outputs at all.
-        // Nodes like Debug (no outputs) are terminal and exempt.
-        if !node.outputs.is_empty() && !source_nodes.contains(node.id.as_str()) {
+        // Nodes like Debug (no outputs) are terminal and exempt, and so is
+        // any node marked as an output (`_is_output: true`): it is a
+        // declared terminus, its unconsumed ports are the point.
+        if !node.outputs.is_empty()
+            && !node.is_output()
+            && !source_nodes.contains(node.id.as_str())
+        {
             push(
                 d,
                 span,
@@ -1890,11 +2202,21 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // sinks); we don't flag them.
         // Only WIREABLE inputs count: a `config`-exposure input is a
         // design-time setting, not upstream data, so it neither makes
-        // the node "have inputs" nor satisfies the warning.
-        let wireable: Vec<_> = node.inputs.iter().filter(|p| p.exposure.wireable()).collect();
+        // the node "have inputs" nor satisfies the warning. Nor does
+        // `_should_flow`, which every node carries: it is permission,
+        // not the data the warning is about.
+        let wireable: Vec<_> = node
+            .inputs
+            .iter()
+            .filter(|p| p.exposure.wireable() && p.name != SHOULD_FLOW_PORT)
+            .collect();
+        // A node whose created inputs are optional BY NATURE (a join,
+        // which exists to run on whichever branch survived) is the one
+        // shape this warning's advice is wrong for.
         if !wireable.is_empty()
             && !node.outputs.is_empty()
             && wireable.iter().all(|p| !p.required)
+            && !node.features.optional_custom_inputs
             && node.features.one_of_required.is_empty()
         {
             push(
@@ -1976,7 +2298,7 @@ fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic
             Span::default(),
             Severity::Error,
             "no-output-node",
-            "project has no output node (Debug, or any node with `is_output: true`). \
+            "project has no output node (Debug, or any node with `_is_output: true`). \
              The run will have nothing to produce.",
         );
         return;

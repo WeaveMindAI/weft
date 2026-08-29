@@ -39,6 +39,16 @@
         async fn events_for_color(&self, _color: Color) -> anyhow::Result<Vec<ExecEvent>> {
             Ok(self.events.lock().unwrap().clone())
         }
+        async fn raw_events_for_color(&self, color: Color) -> anyhow::Result<Vec<String>> {
+            // Typed events, serialized the way the real journal stores
+            // them, so a ferry-shaped consumer sees the same bytes.
+            Ok(self
+                .events_for_color(color)
+                .await?
+                .iter()
+                .map(|e| serde_json::to_string(e).expect("serialize ExecEvent"))
+                .collect())
+        }
         async fn has_terminal_event(&self, _color: Color) -> anyhow::Result<bool> {
             Ok(false)
         }
@@ -126,6 +136,7 @@
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
@@ -175,6 +186,7 @@
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
@@ -212,6 +224,7 @@
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
@@ -241,6 +254,7 @@
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
@@ -309,7 +323,7 @@
             color: uuid::Uuid::nil(),
             input: outer_input,
             closed_ports: Vec::new(),
-            should_skip: false,
+            skip: None,
             pulse_ids: Vec::new(),
             error: None,
         };
@@ -343,7 +357,7 @@
             color: uuid::Uuid::nil(),
             input: writes,
             closed_ports,
-            should_skip: false,
+            skip: None,
             pulse_ids: Vec::new(),
             error: None,
         };
@@ -932,6 +946,7 @@
             features: Default::default(), requires_infra: false, images: vec![],
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
             file_refs: Default::default(), include_path: None,
         };
@@ -954,6 +969,7 @@
             features: Default::default(), requires_infra: false, images: vec![],
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
             file_refs: Default::default(), include_path: None,
         };
@@ -972,6 +988,7 @@
             features: Default::default(), requires_infra: false, images: vec![],
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
             file_refs: Default::default(), include_path: None,
         };
@@ -986,6 +1003,7 @@
             outputs: vec![], features: Default::default(), requires_infra: false, images: vec![],
             published_service: None,
             span: None, header_span: None, config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
             file_refs: Default::default(), include_path: None,
         };
@@ -1029,8 +1047,8 @@
         ).await;
 
         // After LoopIn: iteration 0's body bucket has `items=a`, `acc=""`.
-        fn iter_ports<'a>(
-            pulses: &'a PulseTable, body_id: &str, idx: u32,
+        fn iter_ports(
+            pulses: &PulseTable, body_id: &str, idx: u32,
         ) -> std::collections::HashMap<String, serde_json::Value> {
             pulses.get(body_id)
                 .map(|b| b.iter()

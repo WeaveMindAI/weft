@@ -9,6 +9,8 @@ repository.workspace = true
 # Gates the Layer-3 DB tests that need a real Postgres via `#[sqlx::test]`
 # + $DATABASE_URL. OFF by default so `cargo test --workspace` is green on
 # any machine without Postgres.
+# Gates this crate's own Postgres-backed tests; nothing here uses the
+# task-store's migration-generator APIs, so no feature propagation.
 db-tests = []
 
 [dependencies]
@@ -46,3 +48,6 @@ weft-core = { workspace = true }
 # The layer-3 tests' fake provider is a tiny in-process HTTP server.
 axum = { workspace = true }
 anyhow = { workspace = true }
+
+[lints]
+workspace = true

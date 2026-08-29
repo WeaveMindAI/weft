@@ -1,283 +1,310 @@
-# Contributing to Weft
+# Contributing
 
-Thanks for considering it. Weft is early, opinionated, and moves fast. Every external eye on it makes the language better. This document covers setup, repo layout, and the rules for sending code.
+Thank you for considering lending a hand!
 
-If anything here is wrong, unclear, or out of date, that is a bug. Open an issue.
+It is early days here, so things move fast and plenty is still up for grabs. If
+you think a something in the codebase is wrong, it might well be, so please come and tell us on
+[Discord](https://discord.com/invite/FGwNu6mDkU).
 
-> **Architecture note.** This document still describes the v1 architecture (Restate orchestrator, `dev.sh`, `backend.rs` + `frontend.ts` per node). The v2 architecture (kubernetes-native, single-binary dispatcher, VS Code extension as the UI, `mod.rs` + `metadata.json` per node) is in flight. See `docs/authoring-nodes.md` for the current shape. A CONTRIBUTING rewrite is on the punch list.
+And if you are not sure whether something is wanted, come ask us: 
+Discord for a quick question, an issue for something that we should keep track of. 
 
----
+Everything about how weft *works* is in
+[the book](https://weavemindai.github.io/weft/). This file is about
+working on the codebase.
 
-## Before you start
+## Set up
 
-The design principles are the filter every pull request runs through: if a change fights one of them, it gets reshaped or dropped. The node design rules below capture the load-bearing ones; a full design document is being rewritten.
+Go check [Install](https://weavemindai.github.io/weft/start/install.html).
 
-Check the [roadmap](./ROADMAP.md) and open issues. Someone might already be working on what you want to build. Ask in [Discord](https://discord.com/invite/FGwNu6mDkU) before starting a large change.
+If you want two branches open at once, `scripts/add-worktree.sh <branch>`
+branches off the one you are on into `../weft-trees/`, in a folder named after
+the branch with any slashes flattened to dashes. It gets its own `target/`, so
+the two builds shouldn't fight. Your `.env`, `.env.extension` and
+`access-apps.json` are symlinked in, so both trees have the same ones. Run
+`./setup.sh` inside it before you use it.
 
-For small changes, just open a PR. Typos, doc fixes, obvious bugs, missing error messages. No discussion needed.
-
-For medium or large changes, open an issue first. Describe what you want to build and why. Wait for a thumbs up. This protects your time. No one enjoys closing a 500-line PR because the approach does not fit.
-
----
-
-## Getting set up
-
-### Prerequisites
-
-- [Docker](https://docs.docker.com/get-docker/) for PostgreSQL.
-- [Node.js](https://nodejs.org/) 18+.
-- macOS only: `brew install bash` (Bash 4+ required).
-
-Rust, Restate, and pnpm are installed automatically on first run.
-
-### Clone and run
+## Tests
 
 ```bash
-git clone https://github.com/WeaveMindAI/weft.git
-cd weft
-cp .env.example .env
-# Edit .env to add your API keys (OpenRouter, Tavily, etc.)
-
-# Terminal 1: backend
-./dev.sh server
-
-# Terminal 2: dashboard
-./dev.sh dashboard
+cargo test                        # the workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+pnpm -C packages/weft-graph test  # the graph renderer
+pnpm -C extension-vscode test     # the VS Code extension
 ```
 
-Open http://localhost:5173. If anything crashes or refuses to start, that is a bug and we want to hear about it.
+CI runs all four of those, plus the Postgres ones further down. The two pnpm
+suites share the VS Code extension's install, so `./setup.sh` (or at least `./setup.sh --vscode`) has to
+have run at least once before they work.
 
-### Useful commands
+If you are not sure which layer your test belongs at, go check
+[the testing pyramid](https://weavemindai.github.io/weft/running/architecture.html#testing-in-four-layers).
+
+Three more suites have their own runners:
 
 ```bash
-./dev.sh server       # Backend only
-./dev.sh dashboard    # Frontend only
-./dev.sh all          # Both, server in background
-./dev.sh extension    # Build the browser extension
-
-./cleanup.sh          # Stop everything and reset state
-./cleanup.sh --no-db  # Keep the database
-
-cargo build           # Compile all Rust crates
-cargo test            # Run the Rust test suite (no DB needed, .sqlx is committed)
-cargo clippy          # Lint
-pnpm -C dashboard check  # Svelte type check
+scripts/run-db-tests.sh [crate]         # the tests that need a real Postgres
+scripts/run-node-tests.sh [package]     # node tests, over everything in catalog/
+scripts/run-e2e.sh [name]               # the end-to-end suite
 ```
 
----
+The node and end-to-end ones stop at the first failure, the end-to-end one test
+by test and the node one package by package. Both take `--from <name>` to pick
+up where they stopped. The node one takes `--parallel` when you want every
+package at once, or `--parallel N` for batches of N.
 
-## Repo layout
+The database one has its own section further down.
 
+If you changed something all the nodes depend on, such as a ctx function or
+the code generator, run the node test script: it works in a
+scratch project built from this checkout. For how to write node tests, go
+and read
+[Testing a node](https://weavemindai.github.io/weft/nodes/testing.html).
+
+By default `run-node-tests.sh` runs the basic and fake tiers, which need
+nothing set up and is free.
+If you want to test with real services `--tier live` runs the nodes against 
+real accounts and **spends real money**, so it remembers what passed and skips 
+a package until you change it (you can force a rerun with `--retest` or by wiping
+the cache in `.live-pass-cache` in `target/node-tests`).
+
+The live tier needs a real connection per service. If you signed into one in any editor, 
+it is picked up by itself; Otherwise, for pasted keys, the runner reads
+`WEFT_NODE_TEST_*` from this repo's root `.env`. For the full list of
+variables, and the three ways to hand a test an account, go and read
+[Giving the live tier what it needs](https://weavemindai.github.io/weft/nodes/testing.html#giving-the-live-tier-what-it-needs).
+
+When an end-to-end test fails, its project and any pods it made are left in
+the cluster on purpose so you can debug what happened.
+
+If you are setting up the end-to-end suite, the only variables you have to set
+are for the outside services. They are `WEFT_E2E_*`, and they are listed in
+[`crates/weft-e2e/README.md`](crates/weft-e2e/README.md#credentials-and-what-the-runner-provides-for-you).
+
+A test that fails intermittently is a bug, so put anything timing-sensitive
+through `stress_test!`
+(`crates/weft-core/src/test_support.rs`). You need `futures` as a
+dev-dependency in the crate you call it from. For why we treat it that way, and
+the fixes that look tempting and make it worse, go check
+[Flakes are bugs](https://weavemindai.github.io/weft/running/architecture.html#flakes-are-bugs).
+
+## Writing a node for the standard catalogue
+
+If you want a first contribution, this is a good one. A node is a folder with
+two files in it. You can go and read [the guide](https://weavemindai.github.io/weft/nodes/what-a-node-is.html) 
+for how to write one. If it talks to a service weft has never logged into before,
+it needs an access node beside it holding the login, which is
+[Declaring a service](https://weavemindai.github.io/weft/connections/writing-a-service.html).
+
+A few things we look for in review:
+
+- **The node do one thing**: The test is what somebody reading the graph
+  should be able to see. A loop, a retry or a multi-step process they would
+  want to watch or resume belongs in the graph rather than hidden inside your
+  node, and a node that does two different things depending on what got wired
+  in is usually two nodes. We do accept bunch of complex use case in Rust: a browser agent node
+  managing its own browser session, an infra node setting itself up. If doing
+  it in Rust hides nothing and is clearly simpler, nobody is going to fight you
+  over it.
+- **Do not write plumbing**: If you find yourself handling
+  a credential, keeping a subscription alive, or anything that feels tedious,
+  that is usually weft missing something. Build it yourself and send a PR, 
+  or open an issue asking for it. For where that line falls today, go check
+  [the commandments of plumbing](https://weavemindai.github.io/weft/thinking/plumbing.html).
+- **Never ask for a secret in config**: anything in config is stored in
+  the clear and shows up in the inspector. Secrets come from
+  [a connection](https://weavemindai.github.io/weft/connections/using-a-connection.html).
+- **Make it user friendly to use** You can go read
+  [which widget when](https://weavemindai.github.io/weft/nodes/metadata.html#widget).
+- **Decide `isOutputDefault`** rather than letting it default. There is no safe
+  answer, and you can go and read   for the fields, and
+  [what your node shows in the graph](https://weavemindai.github.io/weft/nodes/showing-things-in-the-graph.html)
+  for what it can put on its own body. [how to choose](https://weavemindai.github.io/weft/nodes/metadata.html#isoutputdefault).
+- **Ship a `fake` test**, in a `tests.rs` beside your `mod.rs`. And if it talks
+  to a provider, a `live` one on the cheapest path that still exercises the real
+  thing.
+
+## Adding a provider
+
+A provider is a service whose prices weft knows. For that you need to code a
+**meter**: A wrapper around a client call, that works out what a call cost from the bytes that went out
+and came back.
+
+If weft cannot price a service yet and you want every project to get it, open a
+PR putting its meter in `crates/weft-providers/src/providers/`. For the trait,
+and what a meter has to do before we accept it, go and read
+[Measuring what a call costs](https://weavemindai.github.io/weft/connections/meters.html).
+
+## Code style
+
+**No legacy, no compatibility shims.** weft is pre-1.0, so for now do not worry
+too much about backwards compatibility. Delete dead code.
+
+**Check for an existing concept before adding one.** If two structs have
+overlapping fields under different names, they are one concept split in two.
+
+**Fix root causes.** A fix at the source beats a workaround downstream, however
+much smaller the workaround looks.
+
+**Same-language duplicates get merged.** The `// SYNC:` marker is only for a
+concept a language boundary forces you to write twice.
+
+For why the code is shaped this way, including the no-fallbacks rule, naming by
+contract, and the prose header every file opens with, go and read
+[Design principles](https://weavemindai.github.io/weft/thinking/design-principles.html).
+
+**No em dashes**, in code and comments as much as in prose. You can go check
+[why we hunt em dashes](https://weavemindai.github.io/weft/thinking/em-dashes.html).
+
+## Working on the database 
+
+Change any table, then:
+
+```bash
+./setup.sh --migration add_owner
 ```
-weft/
-├── catalog/                # Node definitions (source of truth, see below)
-├── crates/
-│   ├── weft-core/          # Type system, compiler, executor, Restate objects
-│   ├── weft-nodes/         # Node trait, registry, node runner binary
-│   ├── weft-api/           # REST API (triggers, files, infra, usage)
-│   └── weft-orchestrator/  # Restate services and Axum project executor
-├── dashboard/              # Web UI (SvelteKit + Svelte 5)
-├── extension/              # Browser extension (WXT)
-├── scripts/                # Dev helpers (catalog-link, etc.)
-├── ROADMAP.md              # What's coming
-└── dev.sh                  # Development entry point
+
+The name for the migration file name. Docker has to be running, because the difference with the existing db is worked out in a throwaway Postgres. Then it installs as usual, and applies it. Change the table again and ask again, as often as you like.
+
+What it writes each time is a **draft**: gitignored and yours alone, and your
+database runs it like any other migration. When the shape has settled, collapse
+the drafts into the one migration that goes in the PR:
+
+```bash
+./setup.sh --migration add_owner --release
 ```
 
-The `catalog/` directory is the source of truth for every node. `scripts/catalog-link.sh` (run by `dev.sh`) symlinks it into the Rust crate and the dashboard. Do not duplicate node files. Always edit the originals in `catalog/`.
+Releasing also needs your cluster up, since it has to reach the database you
+have been developing against.
 
----
+That collapses every draft into one released migration per table group and
+tells your database they are already in it, so nothing re-runs. Forget the step
+and the `schema_agreement` test fails.
 
-## How to add a node
+Never edit a released migration by hand unless you really know what you are doing. Ideally ask for another one instead.
 
-A node is one folder under `catalog/<category>/<node_name>/` with two files.
+### Running the SQL tests
 
-**`backend.rs`** is the Rust implementation.
+If you changed SQL, run the tests that exercise it against a real Postgres
+before opening the PR:
 
-```rust
-//! Greeting Node - says hi.
-
-use async_trait::async_trait;
-use crate::node::{Node, NodeMetadata, NodeFeatures, PortDef, ExecutionContext, FieldDef};
-use crate::{NodeResult, register_node};
-
-#[derive(Default)]
-pub struct GreetingNode;
-
-#[async_trait]
-impl Node for GreetingNode {
-    fn node_type(&self) -> &'static str {
-        "Greeting"
-    }
-
-    fn metadata(&self) -> NodeMetadata {
-        NodeMetadata {
-            label: "Greeting",
-            inputs: vec![
-                PortDef::new("name", "String", false),
-            ],
-            outputs: vec![
-                PortDef::new("message", "String", false),
-            ],
-            features: NodeFeatures { ..Default::default() },
-            fields: vec![],
-        }
-    }
-
-    async fn execute(&self, ctx: ExecutionContext) -> NodeResult {
-        let name = ctx.inputs.get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("stranger");
-        NodeResult::completed(serde_json::json!({
-            "message": format!("Hi, {}!", name)
-        }))
-    }
-}
-
-register_node!(GreetingNode);
+```bash
+scripts/run-db-tests.sh                    # every crate that has them
+scripts/run-db-tests.sh weft-broker        # just one
 ```
 
-**`frontend.ts`** is the dashboard UI definition.
+It starts a throwaway Postgres in Docker, runs the four crates whose tests need
+one, and takes the container away afterwards. Point it at a server of your own
+by setting `DATABASE_URL`, which is what CI does. Not the one your weft runs
+on, though: these tests create and drop databases on whatever server they are
+given.
 
-```typescript
-import type { NodeTemplate } from '$lib/types';
-import { Hand } from '@lucide/svelte';
+The one whose output to read is `schema_agreement`, in the dispatcher and
+broker runs. It builds one database from the `CREATE TABLE`s and another by
+replaying the released migrations, then names whatever differs.
 
-export const GreetingNode: NodeTemplate = {
-  type: 'Greeting',
-  label: 'Greeting',
-  description: 'Generates a greeting for a name.',
-  isBase: false,
-  icon: Hand,
-  color: '#6b7280',
-  category: 'Utility',
-  tags: ['greeting', 'hello', 'text'],
-  fields: [],
-  defaultInputs: [
-    { name: 'name', portType: 'String', required: true, description: 'Person to greet' },
-  ],
-  defaultOutputs: [
-    { name: 'message', portType: 'String', required: false, description: 'Greeting message' },
-  ],
-  features: {},
-};
-```
+These tests are behind the `db-tests` feature, off by default, so a plain
+`cargo test` never builds them.
 
-The `inventory` crate auto-discovers the new node at startup. The dashboard picks up the new template on the next reload.
+## Working on the cluster
 
-### Checklist before you open the PR
+If the cluster looks wrong, the bug is in the code, a manifest, `setup.sh`, or
+the test toolkit. So never `kubectl apply/delete/edit/scale`, never `DROP` or
+`ALTER` the live database, and never hand-roll a port-forward (again unless you really know what you are doing but know you are risking your local cluster).
 
-- [ ] The backend and frontend port names and types match exactly.
-- [ ] Every input and output has a clear one-line description.
-- [ ] The node has a sensible icon and category.
-- [ ] If the node needs credentials, it uses an existing `*Config` node or you added a new `*Config` alongside it.
-- [ ] You added the node to `catalog-tree.json` if it applies.
-- [ ] You built a small project that uses the node end to end from the dashboard.
-- [ ] `cargo test`, `cargo clippy`, and `pnpm -C dashboard check` all pass.
+Fix the source instead, then check with a plain `./setup.sh`. If that does not
+pick your change up, that is a change-detection bug in the script: fix the
+script until a fresh run gets there on its own.
 
-### Node design rules
+As a last resort, you can `./setup.sh --uninstall --purge` and `./setup.sh` to fully reinstall but know that it will wipe your listeners, infra, and running workers. Before you submit a PR you must install the the previous verison of weft that you are mergin into, and make sure that running your ./setup.sh correclty upgrade the version without any issues.
 
-Do not skip them.
+## Documentation
 
-- **No special cases.** If your node needs a new capability, propose it as a general language feature first. Do not bolt it into a single node.
-- **Typed end to end.** Every port has a concrete type. No `Any`. No untyped dicts except `JsonDict` for genuinely opaque JSON.
-- **One thing per node.** If your node does five different things based on config flags, it is five nodes.
-- **Surface errors loudly.** Nodes either work or fail with a clear message. No silent fallbacks, no guessed defaults for values the user was supposed to provide.
+The book is in [`docs/src/`](docs/src/) and builds with mdBook. For the build
+command and the house style, go and read [`docs/README.md`](docs/README.md).
 
----
+## Working with an AI assistant
 
-## The compiler and the language
+Most of this repo is built with one. If you do,
+everything our own assistant works from is in `.claude/`: the rules in
+`.claude/CLAUDE.md`, the project's own facts in `.claude/MEMORY.md`, the code
+reviewer we hand review work to in `.claude/agents/`, and the five flow
+commands below in `.claude/commands/`.
 
-Core language work lives in `crates/weft-core/`. This covers the parser, type system, edge resolution, groups, and parallel processing. It is the most opinionated part of the codebase. Before you touch it:
+Open `.claude/CLAUDE.md` and find-and-replace `[FIRST_NAME]` with your name: it
+appears 35 times, because the file talks to you by name throughout.
 
-1. Read the relevant page in the [language reference](https://weavemind.ai/docs).
-2. Open an issue describing the change.
-3. Wait for a thumbs up.
+If you use something other than Claude Code, hand your assistant
+`.claude/CLAUDE.md` and `.claude/MEMORY.md` as context. A few passages name
+Claude Code's own tools (the Edit tool, `AskUserQuestion`), which yours will
+not recognise; the rest is plain instruction. The flow commands below are
+Claude Code slash commands, so typing them will do nothing, but the files
+behind them in `.claude/commands/` are prose you can paste in, minus the odd
+reference to a Claude Code agent.
 
-Changes to the compiler affect every project written in Weft. A small improvement to the type checker can silently break a user's production pipeline. We are not paranoid, we are careful.
+If you are building a feature, this is our usual workflow. We recommend you use this as this is very effective to write production ready code:
 
-Tests live alongside the code in `crates/weft-core/src/tests/`. Any change to parsing or type resolution needs a test. Any bug fix needs a test that fails before the fix and passes after.
+1. **`/flow-1-init`** first, the assistant catch up to the current state of the codebase.
+2. **Then babble.** Say what you want, and go back and forth with your AI assistant
+  until you both agree on a shape, try to go deep in the details.
+3. **`/flow-2-plan`** writes that shape into a file under `~/.claude/plans/`.
+4. **Read the plan, and ask what it is still unclear about.** Go round again
+   until it says what you meant.
+5. I usually run a compaction here
+6. **`/flow-3-implement`** builds the whole thing in one session (I usually switch to strongest model I can here, e.g. Fable)
+7. I usually run a compaction here and stage the changes
+8. **`/flow-4-review`, then `/flow-5-review-check`**, as a pair, and repeat
+   the pair until flow-4 turns up nothing.
+   `/flow-5-review-check` exists to red-team the fixes `/flow-4-review` just
+   made, this is where bugs often comes from.
 
----
+A small feature is usually done after one pair; a big one takes several.
 
-## Infrastructure nodes
+From step six on it mostly runs itself. Step back in when a review hits a fork. Usually you will see them at the end of the review flows, make sure to read the last message before going to the next flow.
 
-A regular node is code that runs during execution. An infrastructure node provisions a real Kubernetes workload on Start and tears it down on Stop. Databases, message bridges, browser pools, and vector stores all fit this pattern: anything stateful that needs to outlive a single execution.
+## Pull requests
 
-> **This section is being rewritten for the v2 architecture.** The old `sidecars/` + `InfrastructureSpec` + `SIDECAR_IMAGE_REGISTRY` model is GONE. In v2 an infra node lives in `nodes/<name>/` (`mod.rs` + `metadata.json`), declares `requires_infra: true`, and returns an `InfraSpec` from `provision`; its container image is built from an `images/<name>/` dir into `weft-infra-<name>:<content_hash>`, and a pooled supervisor reconciles it (apply / health self-heal / stop / terminate). See [docs/authoring-nodes.md](docs/authoring-nodes.md) for the current, accurate shape. Do NOT follow the v1 sidecar walkthrough that used to live here; it described an interface that no longer exists.
+The checklist is in
+[the PR template](.github/PULL_REQUEST_TEMPLATE.md). Try to keep on PR to one feature.
 
----
+## How we disagree
 
-## The dashboard
+When we disagree here, we don't hold back.
 
-`dashboard/` is a SvelteKit + Svelte 5 app. It covers the graph view, the code view, and the AI builder UI.
+Say what you actually think is going on, even when you suspect you are missing
+something. Holding back because you assume somebody already thought of it is
+what makes us miss important flaws.
 
-- Use Svelte 5 runes (`$state`, `$derived`, `$effect`). No legacy reactive statements.
-- Types come from `$lib/types`. Do not duplicate interfaces.
-- The parser lives in `$lib/parser`. Long term, parsing is moving into Rust (see [ROADMAP.md](./ROADMAP.md)). Until then, keep the frontend parser and the backend parser in lockstep.
+Four rules:
 
----
+**Attack the idea as hard as you like, never the person.** Ideas, decisions,
+code, situations: hit any of them with everything you have. Swear if you want
+to, it moves people in a way that swallowing what you think and handing over a
+half-baked pleasantry does not. "This is fucking stupid" is fine if you then
+say why. "You are fucking stupid" is not, ever.
 
-## Commit, branch, PR
+**Nobody bails out, however long it takes.** An argument ends when each of you
+can understand where the other is coming from and what the crux was. You do not have
+to agree, but "let us just move on" is not an ending.
 
-- **Branch naming.** `fix/short-description`, `feat/short-description`, `docs/short-description`. One branch per logical change.
-- **Commit messages.** Short summary on line 1, blank line, body explaining the why. Imperative mood ("fix parser crash on empty groups", not "fixed").
-- **One thing per PR.** A refactor and a feature in the same PR is two PRs.
-- **Link the issue.** `Closes #123` in the PR body if applicable.
-- **No AI-generated slop.** If an AI wrote your PR, read it yourself first. We will notice if there are issues, and it wastes everyone's time.
+**Listen for real.** Both of you ask about the parts you do not understand,
+instead of defending your own position while you wait for your turn to talk.
 
-### PR checklist
+**Heat is for people who know each other.** A blunt argument works between
+people who know the other one cares about them. Somebody who turned up last week has none
+of that yet, so be much more careful and patient with them.
 
-- [ ] Code compiles and all tests pass locally.
-- [ ] New code has tests.
-- [ ] Public functions and types have one-line docs where useful. Do not write essays.
-- [ ] No unrelated formatting churn.
-- [ ] No commented-out code.
-- [ ] No `TODO` or `FIXME` without a linked issue.
+## Where to talk
 
----
+- **[Discord](https://discord.com/invite/FGwNu6mDkU)** for questions. It is the
+  fastest way to reach us.
+- **[GitHub Discussions](https://github.com/WeaveMindAI/weft/discussions)** for
+  longer proposals and design arguments.
+- **[GitHub Issues](https://github.com/WeaveMindAI/weft/issues)** for bugs and
+  concrete requests.
+- **contact@weavemind.ai** for anything private, and for
+  [security](SECURITY.md), which never goes in a public issue.
 
-## What not to do
+There is also a [code of conduct](CODE_OF_CONDUCT.md).
 
-- Do not add a new primitive type to the language without discussion.
-- Do not add a quick fix that bypasses the type checker.
-- Do not add libraries for things we can do in 20 lines.
-- Do not add silent fallbacks. Fail loud.
-
----
-
-## Getting help
-
-- **Discord.** [Join here](https://discord.com/invite/FGwNu6mDkU). Fastest for questions.
-- **GitHub Discussions.** For longer-form proposals and design conversations.
-- **GitHub Issues.** For bugs and concrete feature requests.
-- **Email.** contact@weavemind.ai.
-
----
-
-## Ground rules
-
-Weft runs on constructive confrontation. A 30-minute argument that ends in alignment beats three weeks of polite avoidance that ends in a shipped disaster. This project is not a "nice" culture, it is a respectful one. That distinction matters.
-
-**What is welcome:**
-
-- Strong disagreement with a design, a decision, a PR, a commit, a pattern, or a blocker. With real heat behind it if that is how you feel.
-- Calling out a bug, a broken approach, or a regression bluntly. Swear words at a problem are fine if they are scoped and in service of fixing something.
-- Pushing back on a maintainer when you think they are wrong. Including Quentin. Especially Quentin.
-- Arguing until both sides understand each other. The goal of an argument is not "someone wins", it is "we both leave knowing more".
-
-**What is not welcome:**
-
-- Anger or insults aimed at a person. Attacks on someone's character, intelligence, background, or identity. Hard no, zero tolerance.
-- Sarcasm or condescension in code review. Say what you mean directly.
-- "You are lazy", "you clearly did not read", "this is amateur work". Those describe a person. Replace them with "this PR misses X", "this approach breaks Y", "this does not match the convention in Z". Same point, aimed at the work.
-- Piling on. One maintainer's pushback is enough. If you see a contributor getting dogpiled, step in.
-
-After an argument, does everyone involved understand the problem better, or does one side just feel worse? If the first, we are doing it right. If the second, somebody crossed a line and we will step in.
-
-A design argument between people who have worked together for a year can run hot. A first-time contributor's PR review should stay warm. Same respect, different temperature, because the trust is different. If you are new, you will find us friendly and careful. If you stick around, you will find us blunt and fast. Both are intentional.
-
-We follow the [Contributor Covenant](./CODE_OF_CONDUCT.md) as the floor. The rules above describe what heat is welcome above that floor. If someone is making the project worse to be around, email contact@weavemind.ai.
-
----
-
-Thanks for contributing. The project is better because you showed up.
+If you build something with weft, come show us in Discord!

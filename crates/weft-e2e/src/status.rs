@@ -71,7 +71,7 @@ impl ProjectStatus {
 
     /// Whether `verb` is currently offered.
     pub fn offers(&self, verb: &str) -> bool {
-        self.available_actions().iter().any(|v| *v == verb)
+        self.available_actions().contains(&verb)
     }
 
     /// Assert the offered verbs are EXACTLY `expected` (order-insensitive).

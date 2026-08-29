@@ -20,6 +20,7 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "The text to speak."
     },

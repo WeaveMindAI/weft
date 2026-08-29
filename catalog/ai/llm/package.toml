@@ -15,6 +15,6 @@ name = "llm"
 # cost bookkeeping of their own.
 [dependencies]
 async-trait = "0.1"
-minillmlib = "0.5.8"
+minillmlib = "0.5.10"
 serde_json = "1"
 tokio = "1"

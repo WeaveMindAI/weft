@@ -114,6 +114,19 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    # Infra node pods, in every project namespace: the dispatcher
+    # reads their declared endpoints (`/live` for the editor, health
+    # for status). Their own namespace's `infra-policy` already names
+    # the dispatcher as an allowed source; this is the matching egress
+    # side. No port list: an endpoint's port is whatever the node
+    # declared, so the pod selector is the whole constraint.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              weft.dev/role: project
+          podSelector:
+            matchLabels:
+              weft.dev/role: infra
     # Sibling dispatcher pods (headless-Service peer traffic).
     - to:
         - podSelector:

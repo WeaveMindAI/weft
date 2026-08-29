@@ -16,6 +16,7 @@
     {
       "name": "prompt",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone)."
     },

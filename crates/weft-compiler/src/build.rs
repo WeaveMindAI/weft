@@ -90,7 +90,7 @@ pub fn build_project(
     let dockerfile_summary = worker_image::emit(
         &project.manifest.build.worker,
         project_root,
-        &catalog,
+        catalog,
         &referenced_nodes,
         &binary_name,
         builder_base_tag,
@@ -114,7 +114,7 @@ pub fn build_project(
         &crate_root,
         &weft_root,
         &dockerfile_path,
-        &catalog,
+        catalog,
         &referenced_nodes,
         stage_weft,
     )?;
@@ -364,8 +364,10 @@ pub fn worker_crate_entries(crate_dir: &Path) -> CompileResult<Vec<(String, Path
         if name == "tests" || weft_catalog::is_node_tree_excluded(&name) {
             continue;
         }
-        // Symlinks are skipped everywhere in the slice (stager and hasher
-        // both), matching the deeper walks.
+        // Symlinks are skipped in the workspace-crate slice, by the
+        // stager and the hasher alike (this enumerator is both), so
+        // staged and hashed bytes stay equal. Unlike a user's node
+        // tree, weft's own crates never legitimately hold one.
         if entry.file_type().map_err(CompileError::Io)?.is_symlink() {
             continue;
         }
@@ -570,6 +572,32 @@ fn target_cache_key(weft_root: &Path) -> CompileResult<String> {
 /// container, so cargo only rebuilds the package whose node source
 /// genuinely changed (plus the worker relink).
 pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> CompileResult<()> {
+    copy_dir_filtered_inner(src, dst, exclude, &mut Default::default())
+}
+
+/// Symlinks are followed and their TARGET bytes copied (`fs::copy`
+/// reads through the link), so a symlinked `nodes/base_catalog` stages
+/// as real files inside the build context; a cycle fails loudly via
+/// the descent chain.
+fn copy_dir_filtered_inner(
+    src: &Path,
+    dst: &Path,
+    exclude: &[&str],
+    chain: &mut Vec<PathBuf>,
+) -> CompileResult<()> {
+    let canon = weft_catalog::guard_node_tree_cycle(src, chain).map_err(CompileError::Io)?;
+    chain.push(canon);
+    let result = copy_dir_filtered_entries(src, dst, exclude, chain);
+    chain.pop();
+    result
+}
+
+fn copy_dir_filtered_entries(
+    src: &Path,
+    dst: &Path,
+    exclude: &[&str],
+    chain: &mut Vec<PathBuf>,
+) -> CompileResult<()> {
     std::fs::create_dir_all(dst).map_err(CompileError::Io)?;
     for entry in std::fs::read_dir(src).map_err(CompileError::Io)? {
         let entry = entry.map_err(CompileError::Io)?;
@@ -578,14 +606,11 @@ pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Com
         if exclude.iter().any(|e| *e == name_str) {
             continue;
         }
-        let ft = entry.file_type().map_err(CompileError::Io)?;
         let from = entry.path();
         let to = dst.join(&name);
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            copy_dir_filtered(&from, &to, exclude)?;
+        let kind = weft_catalog::node_tree_entry_kind(&from).map_err(CompileError::Io)?;
+        if kind == weft_catalog::NodeTreeEntryKind::Dir {
+            copy_dir_filtered_inner(&from, &to, exclude, chain)?;
         } else {
             std::fs::copy(&from, &to).map_err(CompileError::Io)?;
             mirror_mtime(&from, &to);

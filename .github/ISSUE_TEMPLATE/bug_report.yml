@@ -1,11 +1,11 @@
 name: Bug report
-description: Something in Weft is broken or behaves unexpectedly.
+description: Something in weft is broken or behaves unexpectedly.
 labels: ["bug", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a bug. The more specific you are, the faster we can fix it.
+        Thanks for reporting a bug.
         If this is a security issue, do NOT file it here. Email contact@weavemind.ai instead.
 
   - type: textarea
@@ -29,7 +29,7 @@ body:
     id: repro
     attributes:
       label: Steps to reproduce
-      description: Minimal steps so we can see the bug on our side. A tiny Weft project that triggers it is ideal.
+      description: Minimal steps so we can see the bug on our side. A tiny weft project that triggers it is ideal.
       placeholder: |
         1. Create a new project with these two nodes...
         2. Wire X to Y...
@@ -42,14 +42,14 @@ body:
     id: weft-code
     attributes:
       label: Weft code (if applicable)
-      description: Paste the minimal Weft project that reproduces the bug.
+      description: Paste the minimal weft project that reproduces the bug.
       render: weft
 
   - type: textarea
     id: logs
     attributes:
       label: Logs or error messages
-      description: Relevant output from the dashboard, the backend, or the browser console.
+      description: Relevant output from `weft daemon logs`, `weft events <color>`, or the editor's console.
       render: shell
 
   - type: input

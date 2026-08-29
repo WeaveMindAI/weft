@@ -46,12 +46,14 @@
     {
       "name": "text",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "label": "Text body"
     },
     {
       "name": "html",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "label": "HTML body",
       "description": "Text and/or HTML; both together send a proper alternative pair."

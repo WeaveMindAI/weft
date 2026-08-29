@@ -25,6 +25,7 @@
     {
       "name": "description",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "exposure": "config",
       "label": "Description",
       "placeholder": "Get the current weather for a city",

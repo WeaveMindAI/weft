@@ -245,7 +245,7 @@ impl Body {
     /// The direct child declarations of this body (nodes + groups + includes),
     /// in source order.
     pub fn decls(&self) -> impl Iterator<Item = Decl> + '_ {
-        self.0.children().filter_map(|n| Decl::cast(n))
+        self.0.children().filter_map(Decl::cast)
     }
     /// The closing `}` token, the splice anchor for inserting a child.
     pub fn close_brace(&self) -> Option<SyntaxToken> {
@@ -311,7 +311,7 @@ pub fn connection_is_config_origin(conn: &SyntaxNode, target_local: Option<&str>
     // Target must be a real node (not `self`) with a non-empty port.
     match (&t_id, &t_port) {
         (Some(id), Some(_)) if id != "self" => {
-            target_local.map_or(true, |l| id == l) && port.map_or(true, |k| t_port.as_deref() == Some(k))
+            target_local.is_none_or(|l| id == l) && port.is_none_or(|k| t_port.as_deref() == Some(k))
         }
         _ => false,
     }
@@ -430,7 +430,7 @@ impl<'a> FileView<'a> {
             let refs = conn
                 .children()
                 .filter(|n| n.kind() == SyntaxKind::ENDPOINT)
-                .filter_map(|ep| Endpoint::cast(ep))
+                .filter_map(Endpoint::cast)
                 .any(|ep| endpoint_resolves_to(&ep, scope, &all_ids).as_deref() == Some(target_scoped.as_str()));
             if refs {
                 out.push(conn.clone());

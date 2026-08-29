@@ -45,9 +45,9 @@ export type ActionableEventHandler = (ev: DispatcherEvent) => void;
 export class AutoFollowController {
   private mode: FollowMode = 'latest';
   private color: string | undefined;
-  private pendingCount = 0;
-  // Execs that started while we were pinned; newest last so we
-  // can pop the most-recent when the user catches up.
+  // Execs that started while we were pinned; newest last so we can
+  // pop the most-recent when the user catches up. The pending COUNT
+  // shown in the banner is derived from it, never stored twice.
   private pendingQueue: string[] = [];
 
   constructor(
@@ -66,7 +66,6 @@ export class AutoFollowController {
   setProject(): void {
     this.mode = 'latest';
     this.color = undefined;
-    this.pendingCount = 0;
     this.pendingQueue = [];
     this.follower.stop();
     this.emitStatus();
@@ -88,7 +87,6 @@ export class AutoFollowController {
   clearFollow(): void {
     this.mode = 'latest';
     this.color = undefined;
-    this.pendingCount = 0;
     this.pendingQueue = [];
     this.follower.stop();
     this.emitStatus();
@@ -102,7 +100,6 @@ export class AutoFollowController {
   pinAndFollow(color: string | undefined): void {
     console.log(`[weft/autoFollow] pinAndFollow(${color}): mode=${this.mode} color=${this.color}`);
     this.mode = 'latest';
-    this.pendingCount = 0;
     this.pendingQueue = [];
     if (color) {
       // Race window: the dispatcher's /run response arrives on the
@@ -133,7 +130,6 @@ export class AutoFollowController {
   pinToExecution(color: string): void {
     this.mode = 'pinned';
     this.color = color;
-    this.pendingCount = 0;
     this.pendingQueue = [];
     void this.follower.replay(color);
     this.emitStatus();
@@ -157,7 +153,6 @@ export class AutoFollowController {
   catchUpToLatest(): void {
     const newest = this.pendingQueue[this.pendingQueue.length - 1];
     this.mode = 'latest';
-    this.pendingCount = 0;
     this.pendingQueue = [];
     if (newest) {
       this.color = newest;
@@ -181,10 +176,8 @@ export class AutoFollowController {
       this.color = runningColor;
       void this.follower.replay(runningColor);
       this.emitStatus();
-    } else if (!this.pendingQueue.includes(runningColor)) {
-      this.pendingQueue.push(runningColor);
-      this.pendingCount += 1;
-      this.emitStatus();
+    } else {
+      this.queuePending(runningColor);
     }
   }
 
@@ -239,10 +232,17 @@ export class AutoFollowController {
       void this.follower.replay(ev.color);
       this.emitStatus();
     } else {
-      this.pendingQueue.push(ev.color);
-      this.pendingCount += 1;
-      this.emitStatus();
+      this.queuePending(ev.color);
     }
+  }
+
+  /** The ONE way a color joins the pending queue: deduplicated, so a
+   *  reconnect resync and the backlog's own execution_started for the
+   *  same run never count twice. */
+  private queuePending(color: string): void {
+    if (this.pendingQueue.includes(color)) return;
+    this.pendingQueue.push(color);
+    this.emitStatus();
   }
 
   /** Post the current follow status to the webview. Public because a
@@ -252,7 +252,7 @@ export class AutoFollowController {
     const status: FollowStatus = {
       mode: this.mode,
       color: this.color,
-      pendingCount: this.pendingCount,
+      pendingCount: this.pendingQueue.length,
     };
     this.post({ kind: 'followStatus', status });
   }

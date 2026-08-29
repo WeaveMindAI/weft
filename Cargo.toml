@@ -22,6 +22,18 @@ members = [
     "crates/weft-e2e",
 ]
 
+[workspace.lints.clippy]
+# CI runs clippy with -D warnings, so what is allowed is POLICY and it
+# lives here, once. Doc comments in this workspace are long-form prose;
+# clippy's list-indentation opinions fight that style constantly and
+# carry no bug signal. The workspace's orchestration entry points and
+# store/client traits deliberately take their full context as named
+# parameters rather than a grab-bag struct, so the argument-count lint
+# is also policy, not drift.
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+too_many_arguments = "allow"
+
 [workspace.package]
 version = "0.2.0"
 edition = "2021"

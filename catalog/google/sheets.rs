@@ -167,7 +167,7 @@ pub fn row_to_cells(row: &Value, headers: Option<&[String]>) -> WeftResult<Vec<V
 
 // This file is a package-level SHARED helper, not a node, so its unit
 // tests stay an ordinary `#[cfg(test)]` block (node self-tests in a
-// `tests.rs` belong to nodes; see weft/docs/node-tests.md).
+// `tests.rs` belong to nodes; see docs/src/nodes/testing.md).
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -84,6 +84,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_project   ON infra_node(project_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_namespace ON infra_node(namespace)"#,
     ],
+    seed: &[],
 };
 
 /// Upsert a row in `infra_node`. Used by the apply task's status
@@ -250,57 +251,6 @@ pub async fn endpoint_url(
         .and_then(|val| val.as_str().map(|s| s.to_string())))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_round_trips() {
-        for s in [
-            InfraNodeStatus::Provisioning,
-            InfraNodeStatus::Running,
-            InfraNodeStatus::Stopped,
-            InfraNodeStatus::Flaky,
-            InfraNodeStatus::Failed,
-            InfraNodeStatus::Stopping,
-            InfraNodeStatus::Terminating,
-        ] {
-            assert_eq!(InfraNodeStatus::parse(s.as_str()), Some(s));
-        }
-    }
-
-    #[test]
-    fn status_parse_unknown_returns_none() {
-        assert_eq!(InfraNodeStatus::parse("garbage"), None);
-        assert_eq!(InfraNodeStatus::parse(""), None);
-        // Casing matters; status strings are lowercase on the wire.
-        assert_eq!(InfraNodeStatus::parse("Running"), None);
-    }
-
-    #[test]
-    fn status_as_str_is_lowercase_snake() {
-        // The supervisor + apply executor write these directly into
-        // the row; the parse() round-trip above already proves them,
-        // but pin exact wire bytes too so a casual rename doesn't
-        // silently break the SSE protocol.
-        assert_eq!(InfraNodeStatus::Provisioning.as_str(), "provisioning");
-        assert_eq!(InfraNodeStatus::Running.as_str(), "running");
-        assert_eq!(InfraNodeStatus::Stopped.as_str(), "stopped");
-        assert_eq!(InfraNodeStatus::Flaky.as_str(), "flaky");
-        assert_eq!(InfraNodeStatus::Failed.as_str(), "failed");
-        assert_eq!(InfraNodeStatus::Stopping.as_str(), "stopping");
-        assert_eq!(InfraNodeStatus::Terminating.as_str(), "terminating");
-    }
-
-    #[test]
-    fn failure_stage_as_str() {
-        assert_eq!(FailureStage::Provision.as_str(), "provision");
-        assert_eq!(FailureStage::Apply.as_str(), "apply");
-        assert_eq!(FailureStage::Run.as_str(), "run");
-        assert_eq!(FailureStage::ApplyLifecycle.as_str(), "apply_lifecycle");
-    }
-}
-
 /// Decode one `infra_node` row. Every NOT-NULL column is required;
 /// every nullable column is `Option<T>` and surfaces as such. A
 /// decode failure on ANY column is schema drift (or a wrong-typed
@@ -370,4 +320,55 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         preserve_pvcs,
         units,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_round_trips() {
+        for s in [
+            InfraNodeStatus::Provisioning,
+            InfraNodeStatus::Running,
+            InfraNodeStatus::Stopped,
+            InfraNodeStatus::Flaky,
+            InfraNodeStatus::Failed,
+            InfraNodeStatus::Stopping,
+            InfraNodeStatus::Terminating,
+        ] {
+            assert_eq!(InfraNodeStatus::parse(s.as_str()), Some(s));
+        }
+    }
+
+    #[test]
+    fn status_parse_unknown_returns_none() {
+        assert_eq!(InfraNodeStatus::parse("garbage"), None);
+        assert_eq!(InfraNodeStatus::parse(""), None);
+        // Casing matters; status strings are lowercase on the wire.
+        assert_eq!(InfraNodeStatus::parse("Running"), None);
+    }
+
+    #[test]
+    fn status_as_str_is_lowercase_snake() {
+        // The supervisor + apply executor write these directly into
+        // the row; the parse() round-trip above already proves them,
+        // but pin exact wire bytes too so a casual rename doesn't
+        // silently break the SSE protocol.
+        assert_eq!(InfraNodeStatus::Provisioning.as_str(), "provisioning");
+        assert_eq!(InfraNodeStatus::Running.as_str(), "running");
+        assert_eq!(InfraNodeStatus::Stopped.as_str(), "stopped");
+        assert_eq!(InfraNodeStatus::Flaky.as_str(), "flaky");
+        assert_eq!(InfraNodeStatus::Failed.as_str(), "failed");
+        assert_eq!(InfraNodeStatus::Stopping.as_str(), "stopping");
+        assert_eq!(InfraNodeStatus::Terminating.as_str(), "terminating");
+    }
+
+    #[test]
+    fn failure_stage_as_str() {
+        assert_eq!(FailureStage::Provision.as_str(), "provision");
+        assert_eq!(FailureStage::Apply.as_str(), "apply");
+        assert_eq!(FailureStage::Run.as_str(), "run");
+        assert_eq!(FailureStage::ApplyLifecycle.as_str(), "apply_lifecycle");
+    }
 }

@@ -1,0 +1,1 @@
+../../packages/weft-syntax/highlight-weft.js

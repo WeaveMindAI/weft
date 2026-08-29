@@ -24,6 +24,7 @@
     {
       "name": "message",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true
     }
   ],

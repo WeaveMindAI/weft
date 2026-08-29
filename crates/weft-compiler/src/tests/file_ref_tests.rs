@@ -43,10 +43,16 @@ fn asset_marker_parses_with_the_same_grammar() {
 }
 
 #[test]
-fn marker_tolerates_space_before_paren() {
-    // `@file ("x")` (space before paren) is recognized, same as @include.
-    let fr = parse_marker("@file (\"p.txt\")").unwrap().unwrap();
-    assert_eq!(fr.path, "p.txt");
+fn marker_refuses_a_spaced_paren_loudly() {
+    // `@file ("x")` (space before paren) is NOT a marker argument list:
+    // tolerating it once made prose like `@file ("notes.txt") is what I
+    // want` read a file off disk and swallow the sentence. At the top
+    // of a field it is a malformed marker and fails loud, so the fix
+    // (delete the space) is one keystroke away.
+    assert!(matches!(parse_marker("@file (\"p.txt\")"), Some(Err(_))));
+    // Trailing text after the closing paren is prose, never a marker
+    // whose surroundings get silently replaced by the file's contents.
+    assert!(matches!(parse_marker("@file(\"p.txt\") please"), Some(Err(_))));
 }
 
 #[test]
@@ -362,3 +368,98 @@ fn resolve_failed_cast_errors() {
     let fr = text_ref("n.txt", WeftType::Primitive(WeftPrimitive::Number));
     assert!(resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).is_err());
 }
+
+/// A node whose written value is a LIST of markers: an attachments port
+/// taking several files. Every pass that reads or rewrites markers has to
+/// see the ones inside the list, not just a marker standing alone.
+mod markers_in_a_list {
+    use serde_json::json;
+    use weft_core::project::{NodeDefinition, ProjectDefinition};
+
+    fn project_with(literal: serde_json::Value) -> ProjectDefinition {
+        let mut node: NodeDefinition = serde_json::from_value(json!({
+            "id": "send", "nodeType": "GmailSend", "label": null,
+            "position": { "x": 0, "y": 0 }, "inputs": [], "outputs": []
+        }))
+        .unwrap();
+        node.port_literals.insert("attachments".to_string(), literal);
+        let base: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000001", "nodes": [], "edges": []
+        }))
+        .unwrap();
+        ProjectDefinition { nodes: vec![node], ..base }
+    }
+
+    #[test]
+    fn every_ref_in_the_list_is_collected() {
+        let project = project_with(json!([
+            "@asset(\"assets/a.png\", Image)",
+            "@asset(\"assets/b.png\", Image)"
+        ]));
+        let paths: Vec<String> =
+            crate::file_ref::collect_asset_refs(&project).into_iter().map(|r| r.path).collect();
+        assert_eq!(paths, ["assets/a.png", "assets/b.png"]);
+    }
+
+    #[test]
+    fn every_ref_in_the_list_is_resolved() {
+        let mut project = project_with(json!([
+            "@asset(\"assets/a.png\", Image)",
+            "@asset(\"assets/b.png\", Image)"
+        ]));
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("assets/a.png".to_string(), json!({ "resolved": "a" }));
+        map.insert("assets/b.png".to_string(), json!({ "resolved": "b" }));
+        crate::file_ref::apply_asset_resolutions(&mut project, &map).expect("both resolve");
+        assert_eq!(
+            project.nodes[0].port_literals["attachments"],
+            json!([{ "resolved": "a" }, { "resolved": "b" }])
+        );
+    }
+
+    /// One missing file in a list is named, exactly as a lone marker is,
+    /// rather than the list silently keeping its raw text.
+    #[test]
+    fn a_missing_file_in_the_list_is_named() {
+        let mut project = project_with(json!([
+            "@asset(\"assets/a.png\", Image)",
+            "@asset(\"assets/gone.png\", Image)"
+        ]));
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("assets/a.png".to_string(), json!({ "resolved": "a" }));
+        let errs = crate::file_ref::apply_asset_resolutions(&mut project, &map).unwrap_err();
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("gone.png"), "got: {}", errs[0]);
+    }
+}
+
+/// A `@file` inside a list resolves like one standing alone: its content
+/// replaces it. Nothing may leave a raw marker in a value the runtime
+/// would then receive as text.
+#[test]
+fn a_file_marker_inside_a_list_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "first").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "second").unwrap();
+    let mut config = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+        serde_json::json!({ "stop": ["@file(\"a.txt\")", "@file(\"b.txt\")"] }),
+    )
+    .unwrap();
+    let mut refs = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    crate::file_ref::resolve_node_file_refs(
+        &mut config,
+        &Default::default(),
+        &mut refs,
+        weft_core::project::Span::default(),
+        &crate::file_reader::CompileFs::disk(dir.path()),
+        &mut errors,
+    );
+    assert!(errors.is_empty(), "got: {errors:?}");
+    assert_eq!(config["stop"], serde_json::json!(["first", "second"]));
+    assert!(
+        refs.is_empty(),
+        "a list is not one file-backed field, so nothing is editable through it"
+    );
+}
+

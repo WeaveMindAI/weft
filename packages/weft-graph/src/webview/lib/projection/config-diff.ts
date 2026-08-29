@@ -101,6 +101,9 @@ export function diffPortLiteralOps(
   spans: Record<string, ConfigFieldSpan>,
   inputs: PortDefinition[],
 ): EditOp[] {
+  // Only reached for a value not yet in source, which is a NODE's fields:
+  // a container's strip lists the values its source already spells out, so
+  // every key it can emit carries a span with the form the author wrote.
   const defaultForm = (key: string): 'inline' | 'connection' => {
     const input = inputs.find((p) => p.name === key);
     return input !== undefined && inputExposure(input) !== 'all' ? 'connection' : 'inline';

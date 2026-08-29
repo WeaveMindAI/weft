@@ -66,3 +66,6 @@ weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `start_paused` for the bounded-drain test: the paused clock fires the
 # drain window the instant the silent peer yields no progress.
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

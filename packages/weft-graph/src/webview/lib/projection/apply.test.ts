@@ -87,9 +87,18 @@ describe('applyOpsToProject: config and label', () => {
     expect('text' in p.nodes.find((n) => n.id === 'text_1')!.config).toBe(false);
   });
 
-  it('setConfig on a container is a kind mismatch', () => {
+  it('setConfig on a container port it does not have is loud', () => {
     expect(() => applyOpsToProject(fixture(), ops({ op: 'setConfig', node: 'G', key: 'k', value: '1' }), catalog))
-      .toThrow(/not a Node/);
+      .toThrow(/has no input port 'k'/);
+  });
+
+  it("setConfig on a container's `_should_flow` homes in its port literals", () => {
+    const p = applyOpsToProject(
+      fixture(),
+      ops({ op: 'setConfig', node: 'G', key: '_should_flow', value: 'false' }),
+      catalog,
+    );
+    expect(p.nodes.find((n) => n.id === 'G')!.portLiterals).toEqual({ _should_flow: false });
   });
 
   it('setLabel sets and clears a node label', () => {

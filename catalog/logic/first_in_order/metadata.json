@@ -1,0 +1,29 @@
+{
+  "type": "FirstInOrder",
+  "label": "First in order",
+  "description": "Take whichever branch spoke, in the order the inputs are written: the first input that carried a value is the one emitted, and nothing is emitted when they all stayed quiet. Its inputs are the ones you wire onto it, so `checked: review.answer` above `quick: draft.answer` prefers the checked one whenever both arrive.",
+  "tags": [
+    "flow",
+    "join",
+    "merge",
+    "branch",
+    "first"
+  ],
+  "icon": "Merge",
+  "color": "#6366f1",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "value",
+      "type": "T",
+      "required": false,
+      "description": "The first input that spoke, in written order. Closed when none did."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true,
+    "optionalCustomInputs": true,
+    "customInputType": "T"
+  },
+  "requires_infra": false
+}

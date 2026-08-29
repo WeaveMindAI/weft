@@ -910,132 +910,6 @@ fn parse_id(raw: &str) -> Result<uuid::Uuid, (StatusCode, String)> {
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn sync_request_defaults() {
-        let r: SyncRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(r.binary_hash.is_none());
-        assert!(r.definition_hash.is_none());
-        assert!(r.infra_hash.is_none());
-        assert!(r.image_hashes.is_empty());
-        assert!(r.trigger_deactivation.is_none());
-        assert!(r.running_policy.is_none());
-    }
-
-    #[test]
-    fn sync_request_running_policy_round_trips() {
-        let r: SyncRequest =
-            serde_json::from_value(json!({ "runningPolicy": "cancel" })).unwrap();
-        assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
-        // ONE wire spelling: snake_case is an unknown field.
-        let r: SyncRequest =
-            serde_json::from_value(json!({ "running_policy": "cancel" })).unwrap();
-        assert_eq!(r.running_policy, None);
-    }
-
-    #[test]
-    fn sync_request_parses_camelcase_only() {
-        let camel: SyncRequest = serde_json::from_value(json!({
-            "binaryHash": "abc",
-            "definitionHash": "def0",
-            "infraHash": "def",
-            "imageHashes": { "node1": { "bridge": "x:1" } },
-            "triggerDeactivation": {
-                "mode": "park",
-                "graceMinutes": 30,
-                "runningPolicy": "wait",
-            },
-        }))
-        .unwrap();
-        assert_eq!(camel.binary_hash.as_deref(), Some("abc"));
-        assert_eq!(camel.definition_hash.as_deref(), Some("def0"));
-        let td = camel.trigger_deactivation.expect("trigger_deactivation present");
-        assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
-        assert_eq!(td.grace_minutes, 30);
-        assert_eq!(td.running_policy, RunningPolicy::Wait);
-
-        // ONE wire spelling: snake_case keys are unknown fields, not
-        // a tolerated second dialect. (`SyncRequest`'s fields are all
-        // defaulted, so unknown top-level keys are silently ignored
-        // by serde; the load-bearing check is that the snake key does
-        // NOT populate the field.)
-        let snake: SyncRequest = serde_json::from_value(json!({
-            "binary_hash": "abc",
-        }))
-        .unwrap();
-        assert_eq!(snake.binary_hash, None, "snake_case must not populate the field");
-        // A required inner field spelled snake_case fails the parse
-        // outright (`runningPolicy` has no default).
-        let bad_inner: Result<SyncRequest, _> = serde_json::from_value(json!({
-            "triggerDeactivation": {
-                "mode": "wipe",
-                "running_policy": "cancel",
-            },
-        }));
-        assert!(bad_inner.is_err(), "snake_case runningPolicy must not parse");
-    }
-
-    #[test]
-    fn stop_request_defaults() {
-        let r: StopRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(r.trigger_deactivation.is_none());
-    }
-
-    #[test]
-    fn stop_request_carries_trigger_deactivation() {
-        let r: StopRequest = serde_json::from_value(json!({
-            "triggerDeactivation": {
-                "mode": "park",
-                "runningPolicy": "wait",
-            }
-        }))
-        .unwrap();
-        let td = r.trigger_deactivation.expect("present");
-        assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
-        assert_eq!(td.running_policy, RunningPolicy::Wait);
-    }
-
-    #[test]
-    fn per_node_request_defaults() {
-        let r: PerNodeRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(r.running_policy.is_none());
-    }
-
-    #[test]
-    fn per_node_request_running_policy_round_trips() {
-        let r: PerNodeRequest =
-            serde_json::from_value(json!({"runningPolicy": "cancel"})).unwrap();
-        assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
-        // ONE wire spelling: a snake_case key is an unknown field and
-        // must not populate the (defaulted) field.
-        let r: PerNodeRequest =
-            serde_json::from_value(json!({"running_policy": "wait"})).unwrap();
-        assert_eq!(r.running_policy, None, "snake_case must not populate the field");
-    }
-
-    #[test]
-    fn image_hashes_nested_shape() {
-        // Per-(node_id, image_name) map. Verify the wire shape
-        // deserializes via the documented `imageHashes` key.
-        let r: SyncRequest = serde_json::from_value(json!({
-            "imageHashes": {
-                "tgi": { "bridge": "weft-infra-bridge:abc123", "engine": "weft-infra-engine:def456" },
-                "whatsapp": { "bridge": "weft-infra-bridge:111" }
-            }
-        }))
-        .unwrap();
-        assert_eq!(r.image_hashes.len(), 2);
-        assert_eq!(
-            r.image_hashes.get("tgi").unwrap().get("bridge").unwrap(),
-            "weft-infra-bridge:abc123"
-        );
-    }
-}
-
 /// Project deletion entry point. Called by `weft rm`.
 ///
 /// Issues a project-wide `Terminate` lifecycle command and waits for
@@ -1603,4 +1477,130 @@ pub async fn delete_project(
             )
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn sync_request_defaults() {
+        let r: SyncRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(r.binary_hash.is_none());
+        assert!(r.definition_hash.is_none());
+        assert!(r.infra_hash.is_none());
+        assert!(r.image_hashes.is_empty());
+        assert!(r.trigger_deactivation.is_none());
+        assert!(r.running_policy.is_none());
+    }
+
+    #[test]
+    fn sync_request_running_policy_round_trips() {
+        let r: SyncRequest =
+            serde_json::from_value(json!({ "runningPolicy": "cancel" })).unwrap();
+        assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
+        // ONE wire spelling: snake_case is an unknown field.
+        let r: SyncRequest =
+            serde_json::from_value(json!({ "running_policy": "cancel" })).unwrap();
+        assert_eq!(r.running_policy, None);
+    }
+
+    #[test]
+    fn sync_request_parses_camelcase_only() {
+        let camel: SyncRequest = serde_json::from_value(json!({
+            "binaryHash": "abc",
+            "definitionHash": "def0",
+            "infraHash": "def",
+            "imageHashes": { "node1": { "bridge": "x:1" } },
+            "triggerDeactivation": {
+                "mode": "park",
+                "graceMinutes": 30,
+                "runningPolicy": "wait",
+            },
+        }))
+        .unwrap();
+        assert_eq!(camel.binary_hash.as_deref(), Some("abc"));
+        assert_eq!(camel.definition_hash.as_deref(), Some("def0"));
+        let td = camel.trigger_deactivation.expect("trigger_deactivation present");
+        assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
+        assert_eq!(td.grace_minutes, 30);
+        assert_eq!(td.running_policy, RunningPolicy::Wait);
+
+        // ONE wire spelling: snake_case keys are unknown fields, not
+        // a tolerated second dialect. (`SyncRequest`'s fields are all
+        // defaulted, so unknown top-level keys are silently ignored
+        // by serde; the load-bearing check is that the snake key does
+        // NOT populate the field.)
+        let snake: SyncRequest = serde_json::from_value(json!({
+            "binary_hash": "abc",
+        }))
+        .unwrap();
+        assert_eq!(snake.binary_hash, None, "snake_case must not populate the field");
+        // A required inner field spelled snake_case fails the parse
+        // outright (`runningPolicy` has no default).
+        let bad_inner: Result<SyncRequest, _> = serde_json::from_value(json!({
+            "triggerDeactivation": {
+                "mode": "wipe",
+                "running_policy": "cancel",
+            },
+        }));
+        assert!(bad_inner.is_err(), "snake_case runningPolicy must not parse");
+    }
+
+    #[test]
+    fn stop_request_defaults() {
+        let r: StopRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(r.trigger_deactivation.is_none());
+    }
+
+    #[test]
+    fn stop_request_carries_trigger_deactivation() {
+        let r: StopRequest = serde_json::from_value(json!({
+            "triggerDeactivation": {
+                "mode": "park",
+                "runningPolicy": "wait",
+            }
+        }))
+        .unwrap();
+        let td = r.trigger_deactivation.expect("present");
+        assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
+        assert_eq!(td.running_policy, RunningPolicy::Wait);
+    }
+
+    #[test]
+    fn per_node_request_defaults() {
+        let r: PerNodeRequest = serde_json::from_value(json!({})).unwrap();
+        assert!(r.running_policy.is_none());
+    }
+
+    #[test]
+    fn per_node_request_running_policy_round_trips() {
+        let r: PerNodeRequest =
+            serde_json::from_value(json!({"runningPolicy": "cancel"})).unwrap();
+        assert_eq!(r.running_policy, Some(RunningPolicy::Cancel));
+        // ONE wire spelling: a snake_case key is an unknown field and
+        // must not populate the (defaulted) field.
+        let r: PerNodeRequest =
+            serde_json::from_value(json!({"running_policy": "wait"})).unwrap();
+        assert_eq!(r.running_policy, None, "snake_case must not populate the field");
+    }
+
+    #[test]
+    fn image_hashes_nested_shape() {
+        // Per-(node_id, image_name) map. Verify the wire shape
+        // deserializes via the documented `imageHashes` key.
+        let r: SyncRequest = serde_json::from_value(json!({
+            "imageHashes": {
+                "tgi": { "bridge": "weft-infra-bridge:abc123", "engine": "weft-infra-engine:def456" },
+                "whatsapp": { "bridge": "weft-infra-bridge:111" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(r.image_hashes.len(), 2);
+        assert_eq!(
+            r.image_hashes.get("tgi").unwrap().get("bridge").unwrap(),
+            "weft-infra-bridge:abc123"
+        );
+    }
 }

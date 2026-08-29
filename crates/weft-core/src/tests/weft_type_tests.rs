@@ -516,7 +516,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   fn runtime_check_primitives() {
       assert!(check(&WeftType::primitive(WeftPrimitive::String), &serde_json::json!("hello")));
       assert!(!check(&WeftType::primitive(WeftPrimitive::String), &serde_json::json!(42)));
-      assert!(check(&WeftType::primitive(WeftPrimitive::Number), &serde_json::json!(3.14)));
+      assert!(check(&WeftType::primitive(WeftPrimitive::Number), &serde_json::json!(2.75)));
       assert!(!check(&WeftType::primitive(WeftPrimitive::Number), &serde_json::json!("nope")));
       assert!(check(&WeftType::primitive(WeftPrimitive::Boolean), &serde_json::json!(true)));
       assert!(!check(&WeftType::primitive(WeftPrimitive::Boolean), &serde_json::json!("true")));
@@ -1384,7 +1384,7 @@ fn file_url(mime: &str) -> serde_json::Value {
   #[test]
   fn cast_number() {
       assert_eq!(ty("Number").cast_text("42"), Ok(serde_json::json!(42.0)));
-      assert_eq!(ty("Number").cast_text("  3.14  "), Ok(serde_json::json!(3.14)));
+      assert_eq!(ty("Number").cast_text("  2.75  "), Ok(serde_json::json!(2.75)));
       assert_eq!(ty("Number").cast_text("-7"), Ok(serde_json::json!(-7.0)));
       assert!(ty("Number").cast_text("hello").is_err());
       assert!(ty("Number").cast_text("").is_err());
@@ -1937,7 +1937,7 @@ fn installed_registry_is_idempotent_for_identical_content_only() {
     // `install` is process-global; this test only checks the content
     // rule through fresh threads' current() view being scope-driven.
     let reg = test_registry();
-    let seen = reg.clone().scoped(|| TypeRegistry::current());
+    let seen = reg.clone().scoped(TypeRegistry::current);
     assert_eq!(*seen, *reg);
     // Outside the scope, bare names are gone again (builtin only).
     assert!(WeftType::parse("ChatMessage").is_none());
@@ -2073,4 +2073,16 @@ fn the_wire_named_form_refuses_a_typevar_body_but_stays_registry_independent() {
             "an old stored wire string keeps parsing after the declaration changed"
         );
     });
+}
+
+/// A nullable file union keeps its picker: `Image | Null` is a file
+/// port the user may leave empty, not a JSON textarea. A union mixing
+/// files with real non-file data still gets none (a picker would take
+/// the other half away).
+#[test]
+fn a_nullable_file_union_still_offers_the_file_picker() {
+    let nullable = WeftType::parse("Image | Null").expect("parses");
+    let control = nullable.file_control().expect("nullable file keeps its picker");
+    assert!(!control.multiple);
+    assert!(WeftType::parse("Image | String").expect("parses").file_control().is_none());
 }

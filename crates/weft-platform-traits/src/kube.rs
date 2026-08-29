@@ -236,7 +236,7 @@ pub use kubectl::KubectlClient;
 /// on PATH. Returns `Arc<dyn KubeClient>` so call sites bind to the
 /// trait, not the struct.
 pub async fn in_cluster() -> Result<Arc<dyn KubeClient>> {
-    Ok(KubectlClient::in_cluster().await?)
+    KubectlClient::in_cluster().await
 }
 
 // ---------- fake ----------

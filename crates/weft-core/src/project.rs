@@ -97,6 +97,18 @@ pub struct GroupDefinition {
     /// body line of the group body (text without the `# `).
     #[serde(default)]
     pub description: Option<String>,
+    /// Literals written on this container's interface ports: `g.x = "hi"`
+    /// from outside, or `_should_flow: false` in the braces. A wired value
+    /// is an ordinary edge and never appears here.
+    // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts GroupDefinition.portLiterals
+    #[serde(default, rename = "portLiterals")]
+    pub port_literals: std::collections::BTreeMap<String, Value>,
+    /// Where each `port_literals` entry was written, and in which form
+    /// (a braces field or a `g.x = ...` statement), so an edit rewrites
+    /// the value where it already lives.
+    // SYNC: port_literal_spans <-> packages/weft-graph/src/protocol.ts GroupDefinition.portLiteralSpans
+    #[serde(default, rename = "portLiteralSpans")]
+    pub port_literal_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
 }
 
 /// Graph-level instance of a node.
@@ -243,6 +255,14 @@ pub struct NodeDefinition {
     // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts NodeDefinition.portLiterals
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiterals")]
     pub port_literals: std::collections::BTreeMap<String, Value>,
+    /// Config keys the source marked `?` (`answer?: draft.text`), which
+    /// makes the input port that key CREATES optional: a closure on it
+    /// no longer skips the node. Only meaningful on a node type that
+    /// accepts created ports; enrich rejects the marker anywhere else,
+    /// where it would silently mean nothing.
+    // SYNC: optional_ports <-> packages/weft-graph/src/protocol.ts NodeDefinition.optionalPorts
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty", rename = "optionalPorts")]
+    pub optional_ports: std::collections::BTreeSet<String>,
     /// Source ranges + written form for `port_literals` entries, keyed
     /// by input name (the twin of `config_spans` for the other home).
     /// The `origin` is the form the value is WRITTEN in (`Connection` =
@@ -326,6 +346,7 @@ impl NodeDefinition {
     /// when computing the run subgraph (see docs/v2-design.md section
     /// 3.0). Flipping this bit changes what the runtime considers a
     /// "production target" of a run.
+    // SYNC: is_output <-> packages/weft-graph/src/webview/lib/run-targets.ts isOutputNode
     pub fn is_output(&self) -> bool {
         if let Some(v) = self.config.get("_is_output").and_then(|v| v.as_bool()) {
             return v;
@@ -692,6 +713,7 @@ mod project_wire_tests {
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
@@ -711,6 +733,8 @@ mod project_wire_tests {
             span: None,
             header_span: None,
             description: None,
+            port_literals: [("_should_flow".to_string(), Value::Bool(false))].into(),
+            port_literal_spans: Default::default(),
         };
         let edge = Edge {
             id: "e1".into(),
@@ -729,6 +753,7 @@ mod project_wire_tests {
             updated_at: Utc::now(),
         };
         let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["groups"][0]["portLiterals"]["_should_flow"], false, "portLiterals key: {v}");
         // The renamed keys the TS side depends on:
         assert!(v["nodes"][0].get("nodeType").is_some(), "nodeType key: {v}");
         assert!(v["nodes"][0]["inputs"][0].get("portType").is_some(), "portType key: {v}");
@@ -780,6 +805,7 @@ mod project_wire_tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),

@@ -1,0 +1,8 @@
+[package]
+name = "telegram_image_bot"
+id = "2c65676f-ac18-496c-8e61-2d4a170d2f00"
+version = "0.1.0"
+
+[dispatcher]
+
+[build.worker]

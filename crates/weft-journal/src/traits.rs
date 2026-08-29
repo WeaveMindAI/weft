@@ -32,6 +32,17 @@ pub trait JournalClient: Send + Sync {
     /// boot fold and re-fold-after-stall.
     async fn events_for_color(&self, color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>>;
 
+    /// The same rows as RAW payload strings, undecoded. For a FERRY (the
+    /// broker's journal-fetch handler): a hop that decoded into its own
+    /// `ExecEvent` and re-encoded would silently strip any field its
+    /// build predates, so a row that only passes through must pass
+    /// through byte-faithful. Consumers of the rows decode them
+    /// themselves, loudly.
+    async fn raw_events_for_color(
+        &self,
+        color: weft_core::Color,
+    ) -> anyhow::Result<Vec<String>>;
+
     /// True iff a terminal event already exists for `color`. Used
     /// by the worker before writing its own terminal so the
     /// dispatcher's cancel path doesn't bridge double.
@@ -56,6 +67,13 @@ impl JournalClient for NoopJournal {
     }
 
     async fn events_for_color(&self, _color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn raw_events_for_color(
+        &self,
+        _color: weft_core::Color,
+    ) -> anyhow::Result<Vec<String>> {
         Ok(Vec::new())
     }
 
@@ -89,30 +107,31 @@ impl JournalClient for PostgresJournalClient {
     }
 
     async fn events_for_color(&self, color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>> {
-        use sqlx::Row;
-        let rows = sqlx::query(
+        let payloads = self.raw_events_for_color(color).await?;
+        let mut out = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            // This read feeds the engine's resume fold, which rebuilds
+            // the execution's state. A fold over a partial event list
+            // rebuilds a state that never existed (skips un-happen,
+            // closures never cascade), so a row that no longer decodes
+            // fails the read outright: the execution fails loudly and
+            // `weft clean` removes it, instead of resuming wrong.
+            out.push(crate::decode_event(color, &payload).map_err(anyhow::Error::msg)?);
+        }
+        Ok(out)
+    }
+
+    async fn raw_events_for_color(
+        &self,
+        color: weft_core::Color,
+    ) -> anyhow::Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
         )
         .bind(color.to_string())
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let payload: String = row.try_get("payload_json")?;
-            // One malformed row must NOT brick the engine's boot
-            // fold: that would lock every execution sharing this
-            // color out of resuming forever. Log loud and skip.
-            // Matches the dispatcher's `events_log` behavior.
-            match serde_json::from_str::<ExecEvent>(&payload) {
-                Ok(ev) => out.push(ev),
-                Err(e) => tracing::error!(
-                    target: "weft_journal::traits",
-                    %color, error = %e,
-                    "skip malformed event payload during fold"
-                ),
-            }
-        }
-        Ok(out)
+        Ok(rows.into_iter().map(|(p,)| p).collect())
     }
 
     async fn has_terminal_event(&self, color: weft_core::Color) -> anyhow::Result<bool> {

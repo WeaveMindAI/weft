@@ -16,7 +16,7 @@
 //!   deps. The package root can also hold shared Rust files (`.rs`)
 //!   accessible to every member via `use super::<name>;`, plus an
 //!   optional PARTIAL `metadata.json` of defaults (shared keys like
-//!   `provider` or `formFieldSpecs`) every member inherits key-by-key;
+//!   `provider` or `portsFromConfig`) every member inherits key-by-key;
 //!   a member's own key, when present, wins.
 //!
 //! Units can sit at any depth under `nodes/`: directly under it or ten
@@ -46,9 +46,11 @@ use weft_core::node::{MetadataCatalog, NodeMetadata};
 /// on exactly which bytes constitute a node. Diverging here is how a
 /// stale worker image gets served (hash misses a file the build
 /// copies) or a build context bloats (copies a cache the worker never
-/// compiles). Symlinks are also never followed by any node-tree walk
-/// (a loop under user-authored `nodes/` is a real input); that rule
-/// lives at each walk site since it's a traversal mechanic, not a name.
+/// compiles). Symlinks are FOLLOWED by every node-tree walk through
+/// `node_tree_entry_kind` (so a project's `nodes/base_catalog` can be
+/// a symlink into a weft checkout's `catalog/`, e.g. this repo's own
+/// `examples/`); the recursive walks refuse symlink cycles through
+/// `guard_node_tree_cycle` (a descent-chain check) and fail loudly.
 pub const NODE_TREE_EXCLUDE: &[&str] = &["target", "node_modules", ".git", ".weft"];
 
 /// True if `name` is an excluded node-tree directory. Convenience over
@@ -56,6 +58,55 @@ pub const NODE_TREE_EXCLUDE: &[&str] = &["target", "node_modules", ".git", ".wef
 /// `OsStr`/`Cow<str>` entry name.
 pub fn is_node_tree_excluded(name: &str) -> bool {
     NODE_TREE_EXCLUDE.contains(&name)
+}
+
+/// What one node-tree entry is, symlinks resolved: a symlinked
+/// directory walks as a directory, a symlinked file reads as a file.
+/// The shared traversal mechanic of every node-tree walk (discovery,
+/// the pack into the source map, the staging copy, the source-hash
+/// walk), so they agree on exactly which bytes constitute a node. A
+/// broken symlink is a loud error (its target is part of the node's
+/// source and it is missing).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NodeTreeEntryKind {
+    Dir,
+    File,
+}
+
+pub fn node_tree_entry_kind(path: &Path) -> std::io::Result<NodeTreeEntryKind> {
+    // `fs::metadata` follows symlinks; a dangling one errors NotFound
+    // here, which is the loud failure we want (the tree names bytes
+    // that do not exist).
+    let meta = fs::metadata(path)?;
+    if meta.is_dir() {
+        Ok(NodeTreeEntryKind::Dir)
+    } else {
+        Ok(NodeTreeEntryKind::File)
+    }
+}
+
+/// Canonicalize `dir` and refuse when it already sits on the current
+/// DESCENT CHAIN (the canonical directories from the walk's root down
+/// to here): that is a symlink cycle, and walking on would never end.
+/// Two different paths reaching the same directory (two symlinks to
+/// one shared catalog) are fine: only re-entering a directory the walk
+/// is currently INSIDE loops. A link to an ancestor of the walk root
+/// (`nodes/x -> /home`) is caught the same way, because the walk
+/// re-reaches a chain member the moment it descends back into itself.
+///
+/// Returns the canonical path; the caller pushes it onto its chain
+/// before descending and pops it after.
+pub fn guard_node_tree_cycle(dir: &Path, chain: &[PathBuf]) -> std::io::Result<PathBuf> {
+    let canon = fs::canonicalize(dir)?;
+    if chain.contains(&canon) {
+        return Err(std::io::Error::other(format!(
+            "symlink cycle in node tree: {} resolves to {}, a directory this walk is \
+             already inside",
+            dir.display(),
+            canon.display()
+        )));
+    }
+    Ok(canon)
 }
 
 /// True if `s` is a plain Rust identifier (`[A-Za-z_][A-Za-z0-9_]*`).
@@ -178,7 +229,12 @@ impl FsCatalog {
                 None => { /* Lenient fallback: builtin only, warned. */ }
             }
             let registry = cat.type_registry.clone();
-            let mut ctx = DiscoverCtx { policy, cat: &mut cat };
+            let mut ctx = DiscoverCtx {
+                policy,
+                cat: &mut cat,
+                chain: Default::default(),
+                done: Default::default(),
+            };
             registry.scoped(|| visit_dir(root, &mut ctx))?;
         }
         Ok(cat)
@@ -517,6 +573,15 @@ struct PackageSection {
 struct DiscoverCtx<'a> {
     policy: DiscoverPolicy,
     cat: &'a mut FsCatalog,
+    /// Canonical dirs of the CURRENT descent chain; re-entering one is
+    /// a symlink cycle and fails loudly (see `guard_node_tree_cycle`).
+    chain: Vec<PathBuf>,
+    /// Canonical dirs already fully processed. A folder reachable by
+    /// two paths (two symlinks to one shared catalog) registers once
+    /// and is skipped on every later arrival; without this, a chain of
+    /// doubled links walks a shared subtree once per path, which grows
+    /// as 2^depth.
+    done: std::collections::HashSet<PathBuf>,
 }
 
 impl DiscoverCtx<'_> {
@@ -597,8 +662,8 @@ impl DiscoverCtx<'_> {
 /// project's [`weft_core::weft_type::TypeRegistry`]. This walk is
 /// deliberately simpler than unit discovery: type declarations are
 /// global, so it reads the `types` key of EVERY `metadata.json` in the
-/// tree (member and package-root alike, same no-follow/exclusion policy
-/// via `read_node_dir`) with no unit semantics. Malformed JSON is left
+/// tree (member and package-root alike, same symlink-following and
+/// exclusion policy via `read_node_dir`) with no unit semantics. Malformed JSON is left
 /// for the main discovery pass to report (it owns metadata errors);
 /// only the declarations themselves fail here. Under `Lenient` a
 /// registry build failure becomes a warning and `None` (builtin-only),
@@ -633,9 +698,39 @@ fn harvest_type_declarations(
     dir: &Path,
     out: &mut Vec<(String, String, String)>,
 ) -> Result<(), CatalogError> {
+    let mut chain = Vec::new();
+    let mut done = std::collections::HashSet::new();
+    harvest_type_declarations_inner(dir, out, &mut chain, &mut done)
+}
+
+fn harvest_type_declarations_inner(
+    dir: &Path,
+    out: &mut Vec<(String, String, String)>,
+    chain: &mut Vec<PathBuf>,
+    done: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), CatalogError> {
+    let canon = guard_node_tree_cycle(dir, chain)
+        .map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
+    // Same dedupe as discovery: a folder reachable by two symlink paths
+    // yields its declarations once.
+    if !done.insert(canon.clone()) {
+        return Ok(());
+    }
+    chain.push(canon);
+    let result = harvest_type_declarations_entries(dir, out, chain, done);
+    chain.pop();
+    result
+}
+
+fn harvest_type_declarations_entries(
+    dir: &Path,
+    out: &mut Vec<(String, String, String)>,
+    chain: &mut Vec<PathBuf>,
+    done: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), CatalogError> {
     for entry in read_node_dir(dir)? {
         match entry {
-            NodeDirEntry::Dir(path) => harvest_type_declarations(&path, out)?,
+            NodeDirEntry::Dir(path) => harvest_type_declarations_inner(&path, out, chain, done)?,
             NodeDirEntry::File(path) => {
                 if path.file_name().and_then(|n| n.to_str()) != Some("metadata.json") {
                     continue;
@@ -698,11 +793,12 @@ impl NodeDirEntry {
 }
 
 /// Read a directory's immediate children under the node-tree policy:
-/// never follow symlinks, skip `NODE_TREE_EXCLUDE` names. The single
-/// traversal mechanic for discovery; `visit_dir` recurses its dirs and
-/// `register_package` matches members/shared files against the same
-/// entries, so the two can't diverge on what a node tree contains (the
-/// de-sync that serves a stale image or bloats the build context).
+/// follow symlinks (see `node_tree_entry_kind` for the loop guard),
+/// skip `NODE_TREE_EXCLUDE` names. The single traversal mechanic for
+/// discovery; `visit_dir` recurses its dirs and `register_package`
+/// matches members/shared files against the same entries, so the two
+/// can't diverge on what a node tree contains (the de-sync that serves
+/// a stale image or bloats the build context).
 fn read_node_dir(dir: &Path) -> Result<Vec<NodeDirEntry>, CatalogError> {
     let read = fs::read_dir(dir).map_err(|e| CatalogError::Io {
         path: dir.to_path_buf(),
@@ -717,21 +813,12 @@ fn read_node_dir(dir: &Path) -> Result<Vec<NodeDirEntry>, CatalogError> {
         if is_node_tree_excluded(&child.file_name().to_string_lossy()) {
             continue;
         }
-        // `file_type()` does not follow symlinks: a loop under
-        // user-authored `nodes/` must never send the walk infinite,
-        // and a symlinked member must not be discovered-then-dropped
-        // by the (no-follow) staging copy and hash walk.
-        let ft = child.file_type().map_err(|e| CatalogError::Io {
+        match node_tree_entry_kind(&child.path()).map_err(|error| CatalogError::Io {
             path: child.path(),
-            error: e,
-        })?;
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            out.push(NodeDirEntry::Dir(child.path()));
-        } else if ft.is_file() {
-            out.push(NodeDirEntry::File(child.path()));
+            error,
+        })? {
+            NodeTreeEntryKind::Dir => out.push(NodeDirEntry::Dir(child.path())),
+            NodeTreeEntryKind::File => out.push(NodeDirEntry::File(child.path())),
         }
     }
     // Sorted, because `fs::read_dir` order is the filesystem's, not
@@ -745,12 +832,11 @@ fn read_node_dir(dir: &Path) -> Result<Vec<NodeDirEntry>, CatalogError> {
     Ok(out)
 }
 
-/// True if the entries contain a real (non-symlink) file named `name`.
-/// Unit detection goes through this rather than re-`stat`ing with
-/// `Path::is_file` (which follows symlinks): detection must see the
-/// SAME no-follow view the tree walk and staging copy see, or a unit
-/// defined by a symlinked `metadata.json` / `package.toml` would be
-/// discovered yet have its manifest dropped from the build context.
+/// True if the entries contain a file named `name` (symlinks resolved,
+/// like every node-tree walk). Unit detection goes through this rather
+/// than re-`stat`ing with `Path::is_file`: detection must see the
+/// SAME symlink-following view the tree walk and staging copy see, so
+/// what is discovered and what reaches the build context agree.
 fn has_node_file(entries: &[NodeDirEntry], name: &str) -> bool {
     entries.iter().any(|e| {
         matches!(e, NodeDirEntry::File(p)
@@ -759,6 +845,13 @@ fn has_node_file(entries: &[NodeDirEntry], name: &str) -> bool {
 }
 
 fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), CatalogError> {
+    let canon = guard_node_tree_cycle(dir, &ctx.chain)
+        .map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
+    // A folder already fully processed (reached again through a second
+    // symlink path) registers nothing twice and is not re-walked.
+    if !ctx.done.insert(canon.clone()) {
+        return Ok(());
+    }
     let entries = read_node_dir(dir)?;
     if has_node_file(&entries, "package.toml") {
         return register_package(dir, &dir.join("package.toml"), entries, ctx);
@@ -766,6 +859,16 @@ fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), CatalogError> 
     if has_node_file(&entries, "metadata.json") {
         return register_bare_node(dir, ctx);
     }
+    ctx.chain.push(canon);
+    let result = visit_dir_children(entries, ctx);
+    ctx.chain.pop();
+    result
+}
+
+fn visit_dir_children(
+    entries: Vec<NodeDirEntry>,
+    ctx: &mut DiscoverCtx<'_>,
+) -> Result<(), CatalogError> {
     for entry in entries {
         if let NodeDirEntry::Dir(path) = entry {
             visit_dir(&path, ctx)?;
@@ -849,14 +952,12 @@ fn register_package(
     // at the package root. Every member inherits its top-level keys unless
     // the member's own `metadata.json` carries the key (key-by-key, member
     // wins; see `load_node_entry`). One place for whatever a package's nodes
-    // share (`provider`, `formFieldSpecs`, future keys), instead of one
+    // share (`provider`, `portsFromConfig`, future keys), instead of one
     // sidecar file per feature. `type` is a node's identity and can never be
     // shared, so its presence here is an error, not a default.
-    // Presence is decided by the SAME no-follow view the walk, staging, and
-    // hash use (`has_node_file`), never a re-`stat` that follows symlinks: a
-    // symlinked package-root metadata.json is dropped from the build context,
-    // so seeing it here would split the catalog's view from the compiled
-    // node's (whose derive reads the staged, no-follow tree).
+    // Presence is decided by the SAME `read_node_dir` view the walk,
+    // staging, and hash use (`has_node_file`), so the catalog's view and
+    // the compiled node's (whose derive reads the staged tree) agree.
     let package_defaults = if has_node_file(&entries, "metadata.json") {
         match load_package_defaults(dir) {
             Ok(d) => d,
@@ -866,8 +967,8 @@ fn register_package(
         None
     };
 
-    // Auto-detect members: every immediate subdir whose own no-follow
-    // view contains a `metadata.json`. Shared `.rs` files live at the
+    // Auto-detect members: every immediate subdir whose own
+    // `read_node_dir` view contains a `metadata.json`. Shared `.rs` files live at the
     // package root. All of this is the `read_node_dir` view (the
     // package's `entries` plus each member's), so a package's tree is
     // seen identically by discovery, staging, and hashing.
@@ -930,10 +1031,9 @@ fn register_package(
 }
 
 /// Load a package root's partial `metadata.json` (the defaults its members
-/// inherit key-by-key). The CALLER decides the file exists, from the no-follow
-/// view it already holds (`has_node_file`), so this never re-`stat`s the path
-/// (a follow-symlink check here would see a file the staging copy and the hash
-/// walk both drop). A file that is not a JSON object, or that carries an
+/// inherit key-by-key). The CALLER decides the file exists, from the
+/// `read_node_dir` view it already holds (`has_node_file`), so this never
+/// re-`stat`s the path. A file that is not a JSON object, or that carries an
 /// identity key, is an error: silently ignoring it would make every member
 /// quietly miss its inherited keys.
 fn load_package_defaults(
@@ -1162,8 +1262,11 @@ mod package_tests {
         let cat = FsCatalog::discover(&stdlib_root()).unwrap();
         let q = cat.entry("HumanQuery").expect("HumanQuery missing");
         let t = cat.entry("HumanTrigger").expect("HumanTrigger missing");
-        assert!(!q.metadata.form_field_specs.is_empty(), "HumanQuery specs empty");
-        assert!(!t.metadata.form_field_specs.is_empty(), "HumanTrigger specs empty");
+        let specs = |e: &CatalogEntry| {
+            e.metadata.ports_from_config.as_ref().map(|p| p.specs.len()).unwrap_or(0)
+        };
+        assert!(specs(q) > 0, "HumanQuery specs empty");
+        assert!(specs(t) > 0, "HumanTrigger specs empty");
         assert_eq!(q.package_key, t.package_key, "both nodes should share package_key");
         let pkg = cat.package_of("HumanQuery").expect("pkg_of missing");
         assert_eq!(pkg.name, "human");

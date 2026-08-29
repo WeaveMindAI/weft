@@ -1,0 +1,40 @@
+[book]
+title = "The Weft Book"
+description = "The language, the node framework, and the runtime."
+authors = ["Quentin Feuillade--Montixi"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "ayu"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/WeaveMindAI/weft"
+edit-url-template = "https://github.com/WeaveMindAI/weft/edit/main/docs/{path}"
+site-url = "/weft/"
+no-section-label = false
+additional-css = ["theme/weft.css"]
+additional-js = ["theme/highlight-weft.js"]
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 2
+
+[output.html.playground]
+runnable = false
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html.print]
+enable = true

@@ -1708,9 +1708,7 @@ impl BusCursor {
     /// poison-recovering (see `BusInner::lock_log`) so a panicking
     /// filter fails only its own node, not every bus participant.
     pub async fn next(&mut self) -> Option<BusEntry> {
-        let Some(inner) = self.inner.upgrade() else {
-            return None;
-        };
+        let inner = self.inner.upgrade()?;
         // One destructure splits the borrows: the closure takes the
         // cursor position and filter, the wait keeps the node identity.
         let Self { next_offset, filter, node, .. } = self;
@@ -1776,7 +1774,7 @@ impl BusCursor {
                     None
                 };
                 let entry_for_filter: &BusEntry = resolved_entry.as_ref().unwrap_or(entry);
-                let allow = filter.as_ref().map_or(true, |f| f(entry_for_filter));
+                let allow = filter.as_ref().is_none_or(|f| f(entry_for_filter));
                 if !allow {
                     idx += 1;
                     continue;

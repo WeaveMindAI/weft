@@ -26,18 +26,15 @@
     //! sensitive tests run through `stress_test!`.
 
     use super::*;
-    use super::engine_test_rig::{
-        test_manifest, MemJournal, NoopInfra, NoopInfraState, NoopProject, NoopTasks,
-    };
+    use super::engine_test_rig::{drive, drive_with_cancel, test_manifest};
     use std::sync::Mutex as StdMutex;
     use async_trait::async_trait;
     use serde_json::json;
     use weft_core::error::WeftResult;
     use weft_core::generator::Generator;
     use weft_core::node::{Node, NodeOutput};
-    use weft_core::{ExecutionContext, NodeCatalog, ProjectDefinition};
+    use weft_core::{ExecutionContext, ProjectDefinition};
     use weft_journal::ExecEvent;
-    use crate::context::EngineClients;
 
     type Log = Arc<StdMutex<Vec<String>>>;
 
@@ -105,6 +102,10 @@
                     log(&self.log, "taker quit early");
                     return Ok(());
                 }
+                // Logged BEFORE the await, on the consumer's own task:
+                // the race-free observation point the lock-step test
+                // orders producer sends against.
+                log(&self.log, format!("pulling {taken}"));
                 match stream.next().await {
                     Ok(Some(v)) => {
                         log(&self.log, format!("took {v}"));
@@ -123,30 +124,7 @@
         }
     }
 
-    struct StreamCatalog {
-        nodes: Vec<(&'static str, &'static dyn Node)>,
-    }
-    impl NodeCatalog for StreamCatalog {
-        fn lookup(&self, node_type: &str) -> Option<&'static dyn Node> {
-            self.nodes.iter().find(|(t, _)| *t == node_type).map(|(_, n)| *n)
-        }
-        fn all(&self) -> Vec<&'static str> {
-            self.nodes.iter().map(|(t, _)| *t).collect()
-        }
-    }
-
-    fn catalog(nodes: Vec<(&'static str, Box<dyn Node>)>) -> Arc<dyn NodeCatalog> {
-        // `Box::leak` is DELIBERATE: the catalog contract wants
-        // `&'static dyn Node`, and each test (each stress-run) builds
-        // its own node set, so the leak is bounded by the suite's test
-        // count and lives only for the test process.
-        Arc::new(StreamCatalog {
-            nodes: nodes
-                .into_iter()
-                .map(|(t, n)| (t, Box::leak(n) as &'static dyn Node))
-                .collect(),
-        })
-    }
+    use super::engine_test_rig::catalog;
 
     /// producer.out (Generator[Number]) -> consumer.in (Generator[Number]).
     fn stream_project() -> ProjectDefinition {
@@ -176,93 +154,6 @@
             "groups": []
         }))
         .expect("stream project")
-    }
-
-    /// Seed + drive one execution: ExecutionStarted(Fire) + a kick per
-    /// entry node, then `run_one_execution`. Returns the outcome and
-    /// every journaled event.
-    async fn run(
-        project: ProjectDefinition,
-        catalog: Arc<dyn NodeCatalog>,
-        kicks: &[&str],
-    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
-        run_with_cancel(project, catalog, kicks, CancellationFlag::new_arc()).await
-    }
-
-    /// `run` with a caller-owned cancellation flag, for the tests that
-    /// trip it mid-stream. Every run is bounded by a generous failsafe
-    /// deadline: the suite's whole subject is "loud failure instead of
-    /// hang", so a regression into a hang must FAIL the test by name,
-    /// never wedge the whole `cargo test` process.
-    async fn run_with_cancel(
-        project: ProjectDefinition,
-        catalog: Arc<dyn NodeCatalog>,
-        kicks: &[&str],
-        cancellation: Arc<CancellationFlag>,
-    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
-        let color = uuid::Uuid::new_v4();
-        let journal = Arc::new(MemJournal::default());
-        journal
-            .record_event(
-                &ExecEvent::ExecutionStarted {
-                    color,
-                    project_id: project.id.to_string(),
-                    entry_node: kicks[0].to_string(),
-                    phase: weft_core::context::Phase::Fire,
-                    definition_hash: Some("test-hash".into()),
-                    node_test: false,
-                    at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        for kick in kicks {
-            journal
-                .record_event(
-                    &ExecEvent::NodeKicked {
-                        color,
-                        node_id: kick.to_string(),
-                        firing: false,
-                        payload: None,
-                        port_snapshot: None,
-                        at_unix: 0,
-                    },
-                    None,
-                )
-                .await
-                .unwrap();
-        }
-        let clients = EngineClients {
-            journal: journal.clone(),
-            tasks: Arc::new(NoopTasks),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-        };
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            run_one_execution(
-                Arc::new(project),
-                catalog,
-                color,
-                clients,
-                "pod-test".into(),
-                "tenant-test".into(),
-                "ns-test".into(),
-                cancellation,
-                None,
-            ),
-        )
-        .await
-        .expect("the drive hung: a loud-failure contract regressed into a hang")
-        .expect("run_one_execution ok");
-        let events = journal.events.lock().unwrap().clone();
-        (outcome, events)
     }
 
     /// How many times a node was DISPATCHED fresh (NodeStarted rows).
@@ -300,7 +191,7 @@
                 ("Yielder", Box::new(Yielder { count: 5, delivered: false, fail_after: None, log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(
                 matches!(outcome, ExecutionOutcome::Completed { .. }),
                 "stream run completes, got {outcome:?}"
@@ -341,16 +232,27 @@
                 ("Yielder", Box::new(Yielder { count: 4, delivered: true, fail_after: None, log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
-            let (outcome, _) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, _) = drive(stream_project(), cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
+            // Lock-step is pinned as "pulling i" BEFORE "sent i":
+            // `yield i` may only return once pull i is underway, and
+            // "pulling i" is written on the consumer's own task BEFORE
+            // it awaits, so the ordering is race-free by causality.
+            // ("took i" before "sent i" is NOT assertable: the feed
+            // pops the item and releases the producer inside the pull,
+            // before the consumer's post-await log line runs.) A
+            // non-delivered producer fails immediately (every send
+            // logged before the first pull), and a one-slot-buffer
+            // regression fails deterministically (sent 0 lands before
+            // the consumer is even dispatched).
             for i in 0..4 {
                 let sent = log_index(&entries, &format!("sent {i}"))
                     .unwrap_or_else(|| panic!("'sent {i}' missing from {entries:?}"));
-                let took = log_index(&entries, &format!("took {i}"))
-                    .unwrap_or_else(|| panic!("'took {i}' missing from {entries:?}"));
+                let pulling = log_index(&entries, &format!("pulling {i}"))
+                    .unwrap_or_else(|| panic!("'pulling {i}' missing from {entries:?}"));
                 assert!(
-                    took < sent,
+                    pulling < sent,
                     "a delivered yield returns only after its pull: item {i} \
                      (log: {entries:?})"
                 );
@@ -376,7 +278,7 @@
                 ("Yielder", Box::new(Yielder { count: 0, delivered: false, fail_after: None, log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
             assert!(
                 !node_skipped(&events, "consumer"),
@@ -407,7 +309,7 @@
                 ("Yielder", Box::new(Yielder { count: 5, delivered: false, fail_after: Some(2), log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
             let consumer_err = node_failed_error(&events, "consumer")
                 .expect("the consumer fails on the poisoned end");
@@ -435,7 +337,7 @@
                 ("Yielder", Box::new(Yielder { count: 5, delivered: true, fail_after: None, log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: Some(1), log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
             let producer_err = node_failed_error(&events, "producer")
                 .expect("the delivery-waiting producer fails");
@@ -461,7 +363,7 @@
                 ("Yielder", Box::new(Yielder { count: 5, delivered: false, fail_after: None, log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: Some(1), log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(
                 matches!(outcome, ExecutionOutcome::Completed { .. }),
                 "a take-1-of-5 consumer is a legal pattern for plain yields, got {outcome:?}"
@@ -586,7 +488,7 @@
             ("Yielder", Box::new(Yielder { count: 1, delivered: false, fail_after: None, log: log.clone() })),
             ("Taker", Box::new(AwaitingTaker)),
         ]);
-        let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+        let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
         assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
         let err = node_failed_error(&events, "consumer").expect("the consumer fails");
         assert!(
@@ -624,7 +526,7 @@
                 ("Second", Box::new(Second { log: log.clone(), first_started })),
                 ("Joint", Box::new(Joint { log: log.clone(), fail: false })),
             ]);
-            let (outcome, events) = run(join_project(), cat, &["first", "second"]).await;
+            let (outcome, events) = drive(join_project(), cat, &["first", "second"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             let before = log_index(&entries, "first before").expect("first ran");
@@ -658,7 +560,7 @@
                 ("Second", Box::new(Second { log: log.clone(), first_started })),
                 ("Joint", Box::new(Joint { log: log.clone(), fail: true })),
             ]);
-            let (outcome, events) = run(join_project(), cat, &["first", "second"]).await;
+            let (outcome, events) = drive(join_project(), cat, &["first", "second"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             assert!(
@@ -698,12 +600,13 @@
                 ("Second", Box::new(SecondCloses)),
                 ("Joint", Box::new(Joint { log: log.clone(), fail: false })),
             ]);
-            let (outcome, events) = run(join_project(), cat, &["first", "second"]).await;
+            let (outcome, events) = drive(join_project(), cat, &["first", "second"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
             let first_err =
                 node_failed_error(&events, "first").expect("the waiting producer fails");
             assert!(
-                first_err.contains("the consumer 'joint' skipped (a required input closed)"),
+                first_err
+                    .contains("the consumer 'joint' skipped (the required input 'y' closed)"),
                 "the error names the skip that killed the delivery: {first_err}"
             );
             assert!(node_skipped(&events, "joint"), "joint skipped on the closed required y");
@@ -780,7 +683,7 @@
         async fn body() {
             let log: Log = Arc::new(StdMutex::new(Vec::new()));
             let cat = catalog(vec![("PingPong", Box::new(PingPong { log: log.clone() }))]);
-            let (outcome, events) = run(cycle_project(), cat, &["ping"]).await;
+            let (outcome, events) = drive(cycle_project(), cat, &["ping"]).await;
             assert!(
                 matches!(outcome, ExecutionOutcome::Failed { .. }),
                 "a deadlocked run fails loudly, got {outcome:?}"
@@ -861,7 +764,7 @@
             ("Yielder", Box::new(flooder)),
             ("Taker", Box::new(GatedTaker { release, log: log.clone() })),
         ]);
-        run(stream_project(), cat, &["producer"]).await
+        drive(stream_project(), cat, &["producer"]).await
     }
 
     fn assert_overrun_failed(
@@ -967,7 +870,7 @@
                 ),
                 ("Taker", Box::new(GatedTaker { release, log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             let err = assert_overrun_failed(&outcome, &events, 2);
             assert!(err.contains("3 un-taken"), "the 3 pre-cap items buffered fine: {err}");
             let entries = log.lock().unwrap().clone();
@@ -1101,7 +1004,7 @@
             ("Doubler", Box::new(Doubler)),
             ("Sink", Box::new(Sink { log: log.clone() })),
         ]);
-        let (outcome, events) = run(stream_loop_project(parallel), cat, &["producer"]).await;
+        let (outcome, events) = drive(stream_loop_project(parallel), cat, &["producer"]).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
         let entries = log.lock().unwrap().clone();
         let sink = entries.iter().find(|e| e.starts_with("sink")).expect("sink ran");
@@ -1168,7 +1071,7 @@
                 ("Doubler", Box::new(Doubler)),
                 ("Sink", Box::new(Sink { log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_loop_project(false), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_loop_project(false), cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             assert!(
@@ -1204,7 +1107,7 @@
                 }))
                 .unwrap(),
             );
-            let (outcome, events) = run(project, cat, &["producer"]).await;
+            let (outcome, events) = drive(project, cat, &["producer"]).await;
             // The loop terminated cleanly after one iteration; the
             // producer parked on a delivery the dead loop can never
             // take, which is a loud failure, so the run overall fails.
@@ -1246,7 +1149,7 @@
             ]);
             let mut project = stream_project();
             project.edges.clear();
-            let (outcome, _) = run(project, cat, &["producer"]).await;
+            let (outcome, _) = drive(project, cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             for i in 0..3 {
@@ -1282,7 +1185,7 @@
                 ("Yielder", Box::new(WrongTyped { log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
             let producer_err = node_failed_error(&events, "producer").expect("producer failed");
             assert!(producer_err.contains("does not accept"), "{producer_err}");
@@ -1331,7 +1234,7 @@
                 ("Yielder", Box::new(Yielder { count: 1, delivered: true, fail_after: None, log: log.clone() })),
                 ("Taker", Box::new(StringTaker { log: log.clone() })),
             ]);
-            let (outcome, events) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             assert!(
@@ -1418,7 +1321,7 @@
                 ("YielderB", Box::new(Yielder { count: 2, delivered: true, fail_after: None, log: log.clone() })),
                 ("TwoTaker", Box::new(TwoTaker { log: log.clone() })),
             ]);
-            let (outcome, events) = run(two_stream_project(), cat, &["pa", "pb"]).await;
+            let (outcome, events) = drive(two_stream_project(), cat, &["pa", "pb"]).await;
             assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             assert!(
@@ -1462,7 +1365,7 @@
                 ("Yielder", Box::new(BusyYielder { log: log.clone() })),
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
-            let (outcome, _) = run(stream_project(), cat, &["producer"]).await;
+            let (outcome, _) = drive(stream_project(), cat, &["producer"]).await;
             assert!(
                 matches!(outcome, ExecutionOutcome::Completed { .. }),
                 "a live producer must never be torn down by the stuck-check, got {outcome:?}"
@@ -1511,7 +1414,7 @@
                 ("Taker", Box::new(CancellingTaker { flag: flag.clone(), log: log.clone() })),
             ]);
             let (outcome, _) =
-                run_with_cancel(stream_project(), cat, &["producer"], flag).await;
+                drive_with_cancel(stream_project(), cat, &["producer"], flag).await;
             assert!(
                 matches!(outcome, ExecutionOutcome::Cancelled),
                 "a mid-stream cancel resolves the run as Cancelled, got {outcome:?}"
@@ -1581,7 +1484,7 @@
                 ("BusWaiter", Box::new(BusWaiter)),
                 ("PullerFromWaiter", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
-            let (outcome, events) = run(bus_stream_project(), cat, &["waiter"]).await;
+            let (outcome, events) = drive(bus_stream_project(), cat, &["waiter"]).await;
             assert!(
                 matches!(outcome, ExecutionOutcome::Failed { .. }),
                 "the mixed bus+stream deadlock must resolve loudly, got {outcome:?}"

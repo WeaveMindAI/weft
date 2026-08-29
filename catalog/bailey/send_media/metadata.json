@@ -29,6 +29,7 @@
     {
       "name": "caption",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false
     }
   ],

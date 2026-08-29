@@ -50,7 +50,7 @@ use weft_core::ProjectDefinition;
 use crate::error::{CompileError, CompileResult};
 
 /// Emit the full cargo crate. Writes every file listed in the module
-/// docstring. Returns the crate root (passed to `invoke_cargo`).
+/// docstring. Returns the crate root (`build::build_project` compiles it).
 pub fn emit(
     project: &ProjectDefinition,
     project_root: &Path,
@@ -1508,6 +1508,7 @@ mod tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),

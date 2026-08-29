@@ -26,6 +26,7 @@
     {
       "name": "prompt",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "What happens in the video."
     },

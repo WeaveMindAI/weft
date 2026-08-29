@@ -43,6 +43,73 @@ export function emptyToUnset(value: string): string | null {
   return value === '' ? null : value;
 }
 
+/** Split a list body on its TOP-LEVEL commas, so a comma inside a
+ *  marker's type (`Dict[String, Number]`) or inside a quoted path does not
+ *  cut an element in half. */
+function splitTopLevel(inner: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let inString = false;
+  let start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (inString) {
+      if (ch === '\\') i++;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth--;
+    else if (ch === ',' && depth === 0) {
+      parts.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(inner.slice(start));
+  return parts;
+}
+
+/** One `@file` / `@asset` marker in its source form. Shared by the single
+ *  value and by every element of a list of them. */
+function formatFileRef(value: WeftFileRefValue): string {
+  const { path, type, marker } = value.__weftFileRef;
+  const p = quoteString(path);
+  const directive = marker === 'asset' ? '@asset' : '@file';
+  return type === 'String' ? `${directive}(${p})` : `${directive}(${p}, ${type})`;
+}
+
+/** The file ref a `@file(...)` / `@asset(...)` token names, or null when
+ *  the text is not one. A port's written value arrives as this text (the
+ *  parse leaves a marker as its own source), so the control reads its
+ *  current files through here. */
+export function fileRefFromToken(token: string): WeftFileRefValue | null {
+  // The path group accepts escaped chars so a `"` inside the path round-trips.
+  const m = token.match(/^@(file|asset)\("((?:[^"\\]|\\.)*)"(?:,\s*([A-Za-z][A-Za-z0-9_[\],| ]*))?\)$/);
+  if (!m) return null;
+  return {
+    __weftFileRef: {
+      path: unquoteString(m[2]),
+      type: m[3] ?? 'String',
+      marker: m[1] as 'file' | 'asset',
+    },
+  };
+}
+
+/** Every file a written value names: one for a lone marker, several for a
+ *  list of them, none for anything else. Accepts both the structural ref
+ *  shape (what the host bridge hands back for a file-backed field) and the
+ *  raw marker text (what a port literal carries). */
+export function fileRefsOf(value: unknown): WeftFileRefValue[] {
+  const one = (v: unknown): WeftFileRefValue | null =>
+    isFileRefValue(v) ? v : typeof v === 'string' ? fileRefFromToken(v) : null;
+  const single = one(value);
+  if (single) return [single];
+  if (!Array.isArray(value)) return [];
+  const refs = value.map(one);
+  return refs.every((r): r is WeftFileRefValue => r !== null) ? refs : [];
+}
+
 /** Format a config value as a `.weft` source token. Single-line scalars become
  *  quoted strings / literals; objects and arrays become pretty-printed JSON;
  *  multi-line strings become triple-backtick heredocs; a `@file` marker becomes
@@ -56,10 +123,12 @@ export function formatConfigValue(value: unknown): string {
     throw new Error('config value is unset; emit a removeConfig, not a token');
   }
   if (isFileRefValue(value)) {
-    const { path, type, marker } = value.__weftFileRef;
-    const p = quoteString(path);
-    const directive = marker === 'asset' ? '@asset' : '@file';
-    return type === 'String' ? `${directive}(${p})` : `${directive}(${p}, ${type})`;
+    return formatFileRef(value);
+  }
+  // A port that holds several files: one marker per file, in order. A
+  // marker is a value, so the list is written like any other list.
+  if (Array.isArray(value) && value.length > 0 && value.every(isFileRefValue)) {
+    return `[${value.map(formatFileRef).join(', ')}]`;
   }
   if (typeof value === 'string') {
     if (value.includes('\n')) {
@@ -107,16 +176,16 @@ const JSON_COMPACT_MAX_CHARS = 60;
  *  could not have produced (the projection drops the op loudly).
  *  SYNC: parseConfigToken <-> crates/weft-compiler/src/edit/ops.rs format_string (it inverts what format_string emits), crates/weft-compiler/src/weft_compiler.rs unescape_heredoc, crates/weft-compiler/src/cst/lexer.rs heredoc_span */
 export function parseConfigToken(token: string): unknown {
-  // The path group accepts escaped chars so a `"` inside the path round-trips.
-  const fileRef = token.match(/^@(file|asset)\("((?:[^"\\]|\\.)*)"(?:,\s*([A-Za-z][A-Za-z0-9_[\],| ]*))?\)$/);
-  if (fileRef) {
-    return {
-      __weftFileRef: {
-        path: unquoteString(fileRef[2]),
-        type: fileRef[3] ?? 'String',
-        marker: fileRef[1] as 'file' | 'asset',
-      },
-    } satisfies WeftFileRefValue;
+  const fileRef = fileRefFromToken(token);
+  if (fileRef) return fileRef;
+  // A list of markers: what a port holding several files writes.
+  if (token.startsWith('[') && token.includes('@')) {
+    const inner = token.slice(1, -1).trim();
+    const parts = inner ? splitTopLevel(inner) : [];
+    const refs = parts.map((part) => fileRefFromToken(part.trim()));
+    if (refs.length > 0 && refs.every((r): r is WeftFileRefValue => r !== null)) {
+      return refs;
+    }
   }
   if (token.startsWith('```')) {
     // Require a real closing fence: an unterminated heredoc is not a token

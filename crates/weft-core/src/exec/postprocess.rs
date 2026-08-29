@@ -409,7 +409,7 @@ mod fan_in_tests {
 
     #[test]
     fn same_value_fan_in_dedups_silently() {
-        let outgoing = vec![edge("out", "consumer", "in")];
+        let outgoing = [edge("out", "consumer", "in")];
         let outgoing_refs: Vec<&Edge> = outgoing.iter().collect();
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
@@ -430,7 +430,7 @@ mod fan_in_tests {
 
     #[test]
     fn data_and_existing_closure_coexist_and_data_wins_at_resolve_time() {
-        let outgoing = vec![edge("out", "consumer", "in")];
+        let outgoing = [edge("out", "consumer", "in")];
         let outgoing_refs: Vec<&Edge> = outgoing.iter().collect();
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
@@ -459,7 +459,7 @@ mod fan_in_tests {
 
     #[test]
     fn closure_skips_when_data_already_pending() {
-        let outgoing = vec![edge("out", "consumer", "in")];
+        let outgoing = [edge("out", "consumer", "in")];
         let outgoing_refs: Vec<&Edge> = outgoing.iter().collect();
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
@@ -521,6 +521,7 @@ mod fan_in_tests {
             span: None,
             header_span: None,
             config_spans: Default::default(),
+            optional_ports: Default::default(),
             port_literals: Default::default(),
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
@@ -655,7 +656,7 @@ mod fan_in_tests {
 
     #[test]
     fn closure_dedups_against_closure() {
-        let outgoing = vec![edge("out", "consumer", "in")];
+        let outgoing = [edge("out", "consumer", "in")];
         let outgoing_refs: Vec<&Edge> = outgoing.iter().collect();
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();

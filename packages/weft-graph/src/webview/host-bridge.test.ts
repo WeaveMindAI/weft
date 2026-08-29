@@ -80,4 +80,30 @@ describe('translateProject', () => {
     expect(labels.get('outer')).toBe('outer');
     expect(labels.get('outer.inner')).toBe('inner');
   });
+
+  it("carries a group's `_should_flow` literal across as a port literal", () => {
+    const host = {
+      id: 'p1',
+      nodes: [],
+      edges: [],
+      groups: [
+        {
+          id: 'off', kind: 'group' as const, label: null,
+          inPorts: [], outPorts: [], oneOfRequired: [],
+          parentGroupId: null, childGroupIds: [], nodeIds: [],
+          portLiterals: { _should_flow: false },
+        },
+        {
+          id: 'on', kind: 'group' as const, label: null,
+          inPorts: [], outPorts: [], oneOfRequired: [],
+          parentGroupId: null, childGroupIds: [], nodeIds: [],
+        },
+      ],
+    } as unknown as HostProject;
+
+    const v1 = translateProject(host, 'src', '');
+    const byId = new Map(v1.nodes.map((n) => [n.id, n]));
+    expect(byId.get('off')?.portLiterals).toEqual({ _should_flow: false });
+    expect(byId.get('on')?.portLiterals).toBeUndefined();
+  });
 });

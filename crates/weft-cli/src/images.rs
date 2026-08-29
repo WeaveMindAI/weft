@@ -72,38 +72,34 @@ pub async fn ensure_worker_builder_base() -> Result<String> {
 /// stage selected with `docker build --target <stage>`.
 const SYSTEM_IMAGES_DOCKERFILE: &str = "system-images.Dockerfile";
 
-/// The four system binaries the unified Dockerfile compiles. Seeds the
-/// crate-closure the staleness stamps hash: an edit to a crate NONE of the
-/// four link (weft-e2e, weft-cli) must not rebuild + re-roll the system pods.
-// SYNC: SYSTEM_IMAGE_BINARIES <-> deploy/docker/system-images.Dockerfile (the
-//       `cargo build -p ... --bin ...` line)
-const SYSTEM_IMAGE_BINARIES: &[&str] = &[
-    "weft-dispatcher",
-    "weft-listener",
-    "weft-broker",
-    "weft-infra-supervisor",
-];
 
 /// Build (if stale) a system image: the `target` stage of
-/// `deploy/docker/system-images.Dockerfile`. The input set is the four system
-/// binaries' crate closure + the workspace manifests + toolchain pin, plus
-/// that Dockerfile, plus `extra_input_rels` (paths relative to the weft root
-/// the image additionally stages: the dispatcher bundles `catalog/` for its
+/// `deploy/docker/system-images.Dockerfile`. The input set is `binary_crate`'s
+/// own crate closure + the workspace manifests + toolchain pin, plus that
+/// Dockerfile, plus `extra_input_rels` (paths relative to the weft root the
+/// image additionally stages: the dispatcher bundles `catalog/` for its
 /// describe / compile endpoints, the others stage nothing extra, so a
 /// catalog-only edit doesn't invalidate them).
+///
+/// A crate none of the four link (weft-e2e, weft-cli) moves nothing, and a
+/// crate only one of them links moves only that one.
 /// Returns `true` if a rebuild actually happened, `false` on a cache hit.
 pub async fn ensure_system_image(
     tag: &str,
     target: &str,
+    binary_crate: &str,
     extra_input_rels: &[&str],
     rebuild: bool,
 ) -> Result<bool> {
     let root = weft_compiler::build::resolve_weft_root()
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let dockerfile = root.join("deploy/docker").join(SYSTEM_IMAGES_DOCKERFILE);
-    let seeds: Vec<String> = SYSTEM_IMAGE_BINARIES.iter().map(|s| s.to_string()).collect();
-    let closure = weft_compiler::codegen::workspace_crate_closure(&root, &seeds)
-        .map_err(|e| anyhow::anyhow!("system-image crate closure: {e}"))?;
+    // This image's own binary and what it links, so a change confined to one
+    // service rebuilds and rolls that service alone. A shared crate is in
+    // every closure, so it still moves all four.
+    let closure =
+        weft_compiler::codegen::workspace_crate_closure(&root, &[binary_crate.to_string()])
+            .map_err(|e| anyhow::anyhow!("system-image crate closure: {e}"))?;
     let mut inputs: Vec<(String, PathBuf)> = closure
         .iter()
         .map(|name| (format!("crates/{name}"), root.join("crates").join(name)))
@@ -202,6 +198,48 @@ fn stamp_path_for(tag: &str) -> PathBuf {
     base.join(format!("{safe_tag}.hash"))
 }
 
+/// Per-tag stamp of the image content the running pods were last
+/// ROLLED onto. Built and rolled are separate milestones on purpose: a
+/// run can build an image (writing its build stamp) and then abort
+/// before the rollout, and the next run must still know the pods are
+/// behind. That exact gap once left a stale broker silently stripping
+/// journal fields for a day.
+fn rolled_stamp_path(tag: &str) -> PathBuf {
+    stamp_path_for(tag).with_extension("rolled")
+}
+
+/// True when the running pods may hold OLDER content than the built
+/// image: the build stamp and the rolled stamp disagree, or either is
+/// unknown (rolling an already-current pod is a cheap restart; running
+/// a stale one is a silent wire-contract break).
+pub fn pods_behind_image(tag: &str) -> bool {
+    let built = std::fs::read_to_string(stamp_path_for(tag)).ok();
+    let rolled = std::fs::read_to_string(rolled_stamp_path(tag)).ok();
+    match (built, rolled) {
+        (Some(b), Some(r)) => b.trim() != r.trim(),
+        _ => true,
+    }
+}
+
+/// Record that the pods were just rolled onto (or freshly created
+/// from) the currently built image content. Failure to write only
+/// costs a redundant roll next restart, so it warns rather than fails.
+pub fn mark_rolled(tag: &str) {
+    let Ok(built) = std::fs::read_to_string(stamp_path_for(tag)) else {
+        return; // no build stamp to certify against; stay "behind"
+    };
+    if let Err(e) = std::fs::write(rolled_stamp_path(tag), built) {
+        eprintln!(
+            "warning: could not write rolled stamp for {tag} ({e}); \
+             the next restart will roll it again"
+        );
+    }
+}
+
+/// Directories inside a crate that the image build never compiles, so a change
+/// in one must not roll four images and the pods running them.
+const NOT_IN_THE_BINARY: &[&str] = &["tests", "benches", "examples"];
+
 /// Hash every regular file under each labeled input path. Shares
 /// framing rules with the project source-hash function
 /// (`hash::hash_path`) so the two hashers can't drift; both use
@@ -212,7 +250,7 @@ fn hash_inputs(inputs: &[(String, PathBuf)]) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for (label, path) in inputs {
-        weft_compiler::hash::hash_path(&mut hasher, label, path)?;
+        weft_compiler::hash::hash_path_skipping(&mut hasher, label, path, NOT_IN_THE_BINARY)?;
     }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(16);
@@ -401,31 +439,42 @@ async fn kind_node_has_tag(cluster: &str, tag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::SYSTEM_IMAGE_BINARIES;
-
-    /// The system-image stamp closure must EXCLUDE the crates none of the four
-    /// binaries link (weft-e2e, weft-cli): otherwise every e2e / CLI edit
-    /// rebuilds + re-rolls all four system pods for nothing (the exact
-    /// slowdown the closure scoping removed), and INCLUDE the binaries
-    /// themselves plus the shared brain they all pull (weft-compiler via the
-    /// dispatcher).
+    /// Each system image's stamp closure covers its own binary and what that
+    /// binary links, and nothing else. Two properties matter. A crate none of
+    /// them link (weft-e2e, weft-cli) must gate no image, or every CLI edit
+    /// rebuilds and re-rolls four pods for nothing. And a service's own crate
+    /// must gate only its own image, so a dispatcher change does not roll the
+    /// listener, the broker and the supervisor with it.
     #[test]
-    fn system_stamp_closure_skips_non_system_crates() {
+    fn each_system_image_hashes_its_own_binary_and_its_links() {
         let root = weft_compiler::build::resolve_weft_root().expect("resolve weft root");
-        let seeds: Vec<String> = SYSTEM_IMAGE_BINARIES.iter().map(|s| s.to_string()).collect();
-        let closure = weft_compiler::codegen::workspace_crate_closure(&root, &seeds)
-            .expect("compute system closure");
+        let closure_of = |seed: &str| {
+            weft_compiler::codegen::workspace_crate_closure(&root, &[seed.to_string()])
+                .expect("compute system closure")
+        };
+
+        let dispatcher = closure_of("weft-dispatcher");
         for absent in ["weft-e2e", "weft-cli"] {
             assert!(
-                !closure.contains(&absent.to_string()),
-                "{absent} must not gate system-image staleness; closure: {closure:?}"
+                !dispatcher.contains(&absent.to_string()),
+                "{absent} must not gate an image; closure: {dispatcher:?}"
             );
         }
-        for present in ["weft-dispatcher", "weft-listener", "weft-broker",
-                        "weft-infra-supervisor", "weft-compiler", "weft-core"] {
+        // The shared brain every service pulls, so a change there does move
+        // all four.
+        for present in ["weft-dispatcher", "weft-compiler", "weft-core"] {
             assert!(
-                closure.contains(&present.to_string()),
-                "{present} missing from the system closure; closure: {closure:?}"
+                dispatcher.contains(&present.to_string()),
+                "{present} missing from the dispatcher closure; closure: {dispatcher:?}"
+            );
+        }
+
+        for other in ["weft-listener", "weft-broker", "weft-infra-supervisor"] {
+            let closure = closure_of(other);
+            assert!(closure.contains(&other.to_string()), "{other} misses itself");
+            assert!(
+                !closure.contains(&"weft-dispatcher".to_string()),
+                "a dispatcher-only change must not roll {other}; closure: {closure:?}"
             );
         }
     }

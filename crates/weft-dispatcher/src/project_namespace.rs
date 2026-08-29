@@ -127,7 +127,7 @@ fn short_label(s: &str, max: usize) -> String {
         out.pop();
     }
     if out.is_empty() {
-        out.push_str("x");
+        out.push('x');
     }
     out
 }

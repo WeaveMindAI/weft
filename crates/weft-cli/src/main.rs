@@ -105,6 +105,12 @@ enum Cmd {
     Run {
         #[arg(long)]
         detach: bool,
+        /// Run only what this output node needs (repeatable). A run
+        /// normally starts from every output node and walks upstream;
+        /// this narrows that set, so a project's other branches stay
+        /// untouched. A node that is not an output is refused.
+        #[arg(long, value_name = "node-id")]
+        target: Vec<String>,
     },
     /// Subscribe to the dispatcher's SSE stream for a project.
     Follow { project: String },
@@ -220,8 +226,6 @@ enum Cmd {
         #[command(subcommand)]
         action: InfraAction,
     },
-    /// Add an external node package (git-backed).
-    Add { source: String },
     /// Print the per-project catalog as JSON (for editor / tooling
     /// introspection).
     DescribeNodes {
@@ -307,17 +311,30 @@ enum Cmd {
     ///   --build-cache     docker buildkit cache prune
     ///   --all             with the journal subject: nuke every execution
     ///                     with --images: every project's images
+    ///   --project <id>    that project's runs, all of them. They
+    ///                     outlive the project, so this is how the
+    ///                     history of a project you already removed is
+    ///                     erased.
     #[command(verbatim_doc_comment)]
     Clean {
         /// Single execution UUID to delete. Mutually exclusive with --images / --build-cache.
         #[arg(value_name = "color")]
         color: Option<String>,
-        /// Bulk-delete journal cutoff in days.
-        #[arg(long, default_value_t = 30)]
-        keep_days: u32,
+        /// Age cutoff in days for a sweep that names no subject
+        /// (default 30). Naming a subject means you mean all of it, so
+        /// this only applies to `--project` when you ask for it.
+        #[arg(long, value_name = "days")]
+        keep_days: Option<u32>,
         /// Wipe ALL executions (with no other flags) OR span every project (with --images).
         #[arg(long, default_value_t = false)]
         all: bool,
+        /// This project's executions. A project's runs outlive it
+        /// (removing a project leaves its history in the journal), so
+        /// this is how a removed project's history is erased. Takes
+        /// all of them, like naming one execution does; add
+        /// --keep-days to spare the recent ones.
+        #[arg(long, value_name = "project-id")]
+        project: Option<String>,
         /// Reclaim dangling worker images. Cwd-scoped unless --all.
         #[arg(long, default_value_t = false)]
         images: bool,
@@ -524,6 +541,14 @@ enum DaemonAction {
         /// Force-rebuild the dispatcher and listener images.
         #[arg(long)]
         rebuild: bool,
+        /// Allow rebuilding the kind NODE when its shape changed (a
+        /// config or kind-version change). The system database survives
+        /// (its files live on the host); every project's own database
+        /// (a PostgresDatabase infra node's volume) lives inside the
+        /// node and is destroyed with it. Without this flag a shape
+        /// change refuses and explains.
+        #[arg(long)]
+        rebuild_cluster: bool,
         /// Expose the PUBLIC TRIGGER SURFACE (/events/..., /signal/...)
         /// to the internet through an outbound tunnel + filtering
         /// proxy, so providers can deliver event pushes to this local
@@ -544,6 +569,9 @@ enum DaemonAction {
     Restart {
         #[arg(long)]
         rebuild: bool,
+        /// See `daemon start --rebuild-cluster`.
+        #[arg(long)]
+        rebuild_cluster: bool,
         /// See `daemon start --public-url`.
         #[arg(long, overrides_with = "no_public_url")]
         public_url: bool,
@@ -613,17 +641,19 @@ fn public_url_choice(on: bool, off: bool) -> Option<bool> {
 impl From<DaemonAction> for commands::daemon::DaemonAction {
     fn from(value: DaemonAction) -> Self {
         match value {
-            DaemonAction::Start { rebuild, public_url, no_public_url } => {
+            DaemonAction::Start { rebuild, rebuild_cluster, public_url, no_public_url } => {
                 commands::daemon::DaemonAction::Start {
                     rebuild,
+                    rebuild_cluster,
                     public_url: public_url_choice(public_url, no_public_url),
                 }
             }
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
             DaemonAction::Status => commands::daemon::DaemonAction::Status,
-            DaemonAction::Restart { rebuild, public_url, no_public_url } => {
+            DaemonAction::Restart { rebuild, rebuild_cluster, public_url, no_public_url } => {
                 commands::daemon::DaemonAction::Restart {
                     rebuild,
+                    rebuild_cluster,
                     public_url: public_url_choice(public_url, no_public_url),
                 }
             }
@@ -678,7 +708,7 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { detach } => commands::run::run(ctx, detach).await,
+        Cmd::Run { detach, target } => commands::run::run(ctx, detach, target).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,
         Cmd::Activate { project, reactivate_choice } => {
@@ -731,7 +761,6 @@ async fn main() -> anyhow::Result<()> {
             let (verb, opts) = action.split();
             commands::infra::run(ctx, verb, opts).await
         }
-        Cmd::Add { source } => commands::add::run(ctx, source).await,
         Cmd::DescribeNodes { stdlib } => commands::describe_nodes::run(ctx, stdlib).await,
         Cmd::Parse { file } => commands::parse::parse(file).await,
         Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
@@ -754,8 +783,11 @@ async fn main() -> anyhow::Result<()> {
             FilesAction::Rm { target, yes } => commands::files::rm(ctx, target, yes).await,
             FilesAction::Usage => commands::files::usage(ctx).await,
         },
-        Cmd::Clean { color, keep_days, all, images, build_cache } => {
-            commands::executions::clean(ctx, color, keep_days, all, images, build_cache).await
+        Cmd::Clean { color, keep_days, all, images, build_cache, project } => {
+            commands::executions::clean(
+                ctx, color, keep_days, all, images, build_cache, project,
+            )
+            .await
         }
     }
 }

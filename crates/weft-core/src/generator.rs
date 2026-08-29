@@ -511,7 +511,7 @@ mod tests {
     /// one). The registration self-heals via the Weak registry when a
     /// test does not unregister.
     fn handle(f: &Arc<GeneratorFeed>) -> Generator<i64> {
-        let id = register_feed(&f);
+        let id = register_feed(f);
         serde_json::from_value(generator_marker(id)).expect("live handle")
     }
 

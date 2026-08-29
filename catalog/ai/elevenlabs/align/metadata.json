@@ -26,6 +26,7 @@
     {
       "name": "transcript",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": true,
       "description": "The text actually spoken in the recording."
     }

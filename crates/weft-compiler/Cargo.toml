@@ -56,3 +56,6 @@ build = ["weft-core/runtime", "dep:filetime", "dep:weft-catalog", "dep:tempfile"
 [dev-dependencies]
 uuid = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

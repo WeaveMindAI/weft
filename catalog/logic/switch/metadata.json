@@ -1,0 +1,246 @@
+{
+  "type": "Switch",
+  "label": "Switch",
+  "description": "Pick a branch by testing a value: each case names an output port and the test the value has to pass, and exactly one of them emits true while the rest close. Wire the port a case names into the `_should_flow` of whatever that branch runs. A case's kind IS its test: `equals`, `in`, `contains`, `matches` (a regular expression), `gt` / `gte` / `lt` / `lte`, `between` for a range, and `otherwise` for everything the cases above did not catch, which goes last.",
+  "tags": [
+    "flow",
+    "switch",
+    "route",
+    "branch",
+    "match"
+  ],
+  "icon": "GitBranch",
+  "color": "#6366f1",
+  "inputs": [
+    {
+      "name": "value",
+      "type": "T",
+      "required": true,
+      "description": "The value the cases match against."
+    },
+    {
+      "name": "cases",
+      "type": "List[JsonDict]",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "entry_list"
+      },
+      "label": "Cases",
+      "description": "One entry per branch: `{ \"kind\": \"equals\", \"value\": \"high\", \"port\": \"urgent\" }`, or any other test kind in place of `equals`. The `otherwise` kind catches everything else and goes last."
+    }
+  ],
+  "outputs": [],
+  "portsFromConfig": {
+    "field": "cases",
+    "matchInput": "value",
+    "specs": [
+      {
+        "kind": "equals",
+        "keyField": "port",
+        "label": "is exactly this value",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Value",
+            "shape": "value",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "in",
+        "keyField": "port",
+        "label": "is one of these values",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Values",
+            "shape": "valueList",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "contains",
+        "keyField": "port",
+        "label": "a list holding this item, or text holding this text",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Item",
+            "shape": "element",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "matches",
+        "keyField": "port",
+        "label": "text matching this regular expression",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Regular expression",
+            "shape": "regex",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "gt",
+        "keyField": "port",
+        "label": "greater than",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Value",
+            "shape": "number",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "gte",
+        "keyField": "port",
+        "label": "greater than or equal to",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Value",
+            "shape": "number",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "lt",
+        "keyField": "port",
+        "label": "less than",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Value",
+            "shape": "number",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "lte",
+        "keyField": "port",
+        "label": "less than or equal to",
+        "fields": [
+          {
+            "key": "value",
+            "label": "Value",
+            "shape": "number",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "between",
+        "keyField": "port",
+        "label": "between these two numbers, ends included",
+        "fields": [
+          {
+            "key": "min",
+            "label": "Lowest",
+            "shape": "number",
+            "required": true
+          },
+          {
+            "key": "max",
+            "label": "Highest",
+            "shape": "number",
+            "required": true
+          }
+        ],
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      },
+      {
+        "kind": "otherwise",
+        "keyField": "port",
+        "label": "anything the cases above did not catch",
+        "catchAll": true,
+        "addsOutputs": [
+          {
+            "nameTemplate": "{key}",
+            "portType": "Boolean"
+          }
+        ]
+      }
+    ]
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "cases"
+        }
+      },
+      "then": {
+        "message": "Switch '{id}' has no cases, so it would derive no ports and emit nothing; add at least one case.",
+        "level": "structural",
+        "field": "cases"
+      }
+    }
+  ],
+  "requires_infra": false
+}

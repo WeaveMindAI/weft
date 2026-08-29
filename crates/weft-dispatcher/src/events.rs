@@ -51,7 +51,13 @@ pub enum DispatcherEvent {
     NodeCancelled { color: Color, node: String, frames: LoopFrames, reason: String, project_id: String },
     NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, project_id: String },
     NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, project_id: String },
-    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, project_id: String },
+    /// `reason` says WHY: the author's `_should_flow` said no, or an
+    /// input the node needed never arrived. A decision and a consequence
+    /// look identical on the graph without it.
+    /// `None` only for a journal row written before the field existed
+    /// (the UI renders "reason not recorded"); every live writer sends
+    /// `Some`.
+    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, project_id: String },
     /// A node emitted a value whose type is incompatible with the
     /// declared (possibly narrowed) type of `port`. The engine refused
     /// the value and closed the port (downstream sees null); the node did

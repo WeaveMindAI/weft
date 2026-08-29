@@ -5,7 +5,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        Missing a node? Tell us what you need. Most of the time, "there is no node for X" turns into a new entry in the catalog within a day or two.
+        Tell us what you need and we will look at building it.
+
+        You can also just build it yourself, and it is a good first contribution: a node is a folder with two files, and there is [a guide for writing them](https://weavemindai.github.io/weft/nodes/what-a-node-is.html). A node in your own project's `nodes/` works today and answers to nobody, so you are never blocked waiting on us.
 
         Before filing, check the [node catalog](https://github.com/WeaveMindAI/weft/tree/main/catalog). A close enough existing node is usually better than a new one.
 
@@ -29,7 +31,7 @@ body:
     id: inputs-outputs
     attributes:
       label: Inputs and outputs
-      description: List the input ports and output ports you would expect, with types. Use Weft syntax.
+      description: List the input ports and output ports you would expect, with types. Use weft syntax.
       placeholder: |
         inputs:
           - amount: Number (required)

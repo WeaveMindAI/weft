@@ -1,7 +1,7 @@
 {
   "type": "HumanQuery",
   "label": "Human",
-  "description": "Pause execution and wait for a human to submit a form. Uses the await_form language primitive. Form fields determine the visible inputs/outputs via form_field_specs.",
+  "description": "Pause execution and wait for a human to submit a form. Uses the await_form language primitive. Form fields determine the visible inputs/outputs.",
   "tags": [
     "human",
     "form",
@@ -26,6 +26,7 @@
     {
       "name": "description",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "exposure": "config",
       "label": "Description",
       "placeholder": "What you want the reviewer to do.",
@@ -37,17 +38,14 @@
       "required": true,
       "exposure": "config",
       "widget": {
-        "kind": "form_builder"
+        "kind": "entry_list"
       },
       "label": "Form fields",
-      "description": "Each field contributes inputs/outputs per its fieldType (see form_field_specs)."
+      "description": "Each field contributes inputs/outputs per its kind (see the node's portsFromConfig)."
     }
   ],
   "outputs": [],
   "requires_infra": false,
-  "features": {
-    "hasFormSchema": true
-  },
   "validate": [
     {
       "when": {

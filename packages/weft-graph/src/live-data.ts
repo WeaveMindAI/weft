@@ -44,14 +44,21 @@ export function isLiveDataItem(v: unknown): v is LiveDataItem {
 export function signalDisplayToLiveItems(body: Record<string, unknown>): LiveDataItem[] {
   const items: LiveDataItem[] = [];
   const surface = body.surface as Record<string, unknown> | undefined;
-  if (surface && surface.kind === 'public_entry') {
-    const path = typeof surface.path === 'string' ? surface.path : '';
-    items.push({
-      type: 'text',
-      label: 'Path',
-      data: path === '' ? '/' : `/${path.replace(/^\//, '')}`,
-    });
+  if (!surface || surface.kind !== 'public_entry') {
+    // Only a public entry has anything worth a body panel: a URL an
+    // outside caller hits, and the auth that gates it. Task-callback
+    // and internal signals (timers, provider pushes, bridge webhooks)
+    // carry `auth: none` in their routing too, but there is no caller
+    // choosing a key, so "public (no key)" would be noise. No items:
+    // the renderer hides the panel entirely.
+    return items;
   }
+  const path = typeof surface.path === 'string' ? surface.path : '';
+  items.push({
+    type: 'text',
+    label: 'Path',
+    data: path === '' ? '/' : `/${path.replace(/^\//, '')}`,
+  });
   const auth = body.auth as Record<string, unknown> | undefined;
   if (auth && auth.kind === 'api_key') {
     const header = typeof auth.header_name === 'string' ? auth.header_name : 'X-Api-Key';

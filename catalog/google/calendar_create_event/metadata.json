@@ -46,6 +46,7 @@
     {
       "name": "description",
       "type": "String",
+      "widget": { "kind": "textarea" },
       "required": false,
       "label": "Description"
     },

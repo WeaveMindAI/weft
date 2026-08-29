@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::form_helpers::{build_form, map_response_to_ports, parse_form_fields};
+use super::form_helpers::{build_form, form_specs, map_response_to_ports, parse_form_fields};
 
 #[derive(NodeManifest)]
 pub struct HumanTriggerNode;
@@ -28,7 +28,7 @@ impl Node for HumanTriggerNode {
     }
 
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let specs = &self.manifest().form_field_specs;
+        let specs = form_specs(self.manifest())?;
         // Triggers have no upstream input ports at setup time; an
         // empty prefill means no value is projected into prefilled /
         // display fields.
@@ -43,8 +43,8 @@ impl Node for HumanTriggerNode {
         // would silently fire a fake "all fields empty" submission (for
         // an approve/reject field, a synthesized `rejected: true` pulse).
         let submission = ctx.wake.record()?;
-        let specs = &self.manifest().form_field_specs;
+        let specs = form_specs(self.manifest())?;
         let raw_fields = parse_form_fields(ctx.inputs.object()?);
-        ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)).await
+        ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)?).await
     }
 }

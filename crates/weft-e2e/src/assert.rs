@@ -239,6 +239,52 @@ impl SettledRun {
         Ok(self)
     }
 
+    /// Assert a node was skipped EXACTLY ONCE, with the given reason
+    /// (`did_not_flow`, `required_input_closed`, `outside_this_run`,
+    /// ...). The count matters as much as the reason: a firing location
+    /// terminates once, and a duplicated lifecycle pair is a bug this
+    /// assertion must surface, never read past.
+    pub fn assert_skip_reason(&self, node: &str, reason_kind: &str) -> Result<&Self> {
+        let reasons: Vec<String> = self
+            .replay
+            .by_kind("node_skipped")
+            .filter(|e| e.is_node(node))
+            .map(|e| {
+                e.field("reason")
+                    .and_then(|r| r.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<no reason>")
+                    .to_string()
+            })
+            .collect();
+        if reasons.len() != 1 {
+            bail!(
+                "expected exactly one node_skipped for '{node}', got {} (reasons: {reasons:?})",
+                reasons.len()
+            );
+        }
+        if reasons[0] != reason_kind {
+            bail!("node '{node}' skipped with reason '{}', expected '{reason_kind}'", reasons[0]);
+        }
+        if self.node_completed(node) {
+            bail!("node '{node}' was skipped AND completed; expected a skip with no output");
+        }
+        Ok(self)
+    }
+
+    /// Assert the replay holds NO events at all for `node`: it was never
+    /// kicked, started, skipped, or closed. The shape of a node BEYOND
+    /// an aimed run's boundary: nothing manufactures pulses past the
+    /// first out-of-scope node, so deeper nodes stay blank rather than
+    /// painting the whole graph "skipped".
+    pub fn assert_untouched(&self, node: &str) -> Result<&Self> {
+        let kinds: Vec<&str> = self.replay.for_node(node).map(|e| e.kind()).collect();
+        if !kinds.is_empty() {
+            bail!("expected node '{node}' to have no events at all, got: {kinds:?}");
+        }
+        Ok(self)
+    }
+
     /// Assert a node RAN to completion at least once. The counterpart of
     /// [`Self::assert_skipped`]: a branch behind an optional output port
     /// (toolCalls, a fan port) is silently SKIPPED when the port never

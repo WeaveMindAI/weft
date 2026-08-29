@@ -57,7 +57,7 @@ pub async fn ok_or_bail(
 /// so the request would silently address a DIFFERENT object.
 // This file is a package-level SHARED helper, not a node, so its unit
 // tests stay an ordinary `#[cfg(test)]` block (node self-tests in a
-// `tests.rs` belong to nodes; see weft/docs/node-tests.md).
+// `tests.rs` belong to nodes; see docs/src/nodes/testing.md).
 #[cfg(test)]
 mod url_tests {
     use super::*;

@@ -510,6 +510,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             leased_until_unix BIGINT NOT NULL,
             grace_until_unix  BIGINT NOT NULL
         )"#],
+    seed: &[],
 };
 
 // =============================================================
@@ -547,7 +548,7 @@ impl ListenerPool {
         let Some((Some(pod_name),)) = row else {
             return Ok(None);
         };
-        Ok(self.pod_handle(&pod_name, pg_pool).await?)
+        self.pod_handle(&pod_name, pg_pool).await
     }
 
     /// The admin handle for a named live pod, or None if its registry
@@ -898,7 +899,7 @@ impl ListenerPool {
             match load_report(&pod.handle()).await {
                 Ok(load) if !load.saturated => {
                     let signals = load.signals;
-                    if best.as_ref().map_or(true, |(b, _)| signals < *b) {
+                    if best.as_ref().is_none_or(|(b, _)| signals < *b) {
                         best = Some((signals, pod));
                     }
                 }
@@ -1065,7 +1066,7 @@ impl ListenerPool {
         .bind(project_id)
         .fetch_optional(pg_pool)
         .await?;
-        Ok(row.map_or(false, |(n,)| n > 0))
+        Ok(row.is_some_and(|(n,)| n > 0))
     }
 
     /// Renew the lease on every listener pod this dispatcher owns. The

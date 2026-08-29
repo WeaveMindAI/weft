@@ -39,6 +39,15 @@ export interface FieldEditor {
 export function createFieldEditor(debounceMs: number = DEFAULT_DEBOUNCE_MS): FieldEditor {
 	let _activeKey: string | null = $state(null);
 	let _activeValue: string = $state('');
+	// The value as last WRITTEN (at focus time, or by the latest
+	// debounced/flushed save): a blur whose value matches it must not
+	// emit a write (a click into a field and out again would otherwise
+	// WRITE the rendered value back, and for a port literal an empty
+	// rendering writes a delete). Tracked against the last save, not
+	// the focus snapshot: the debounce saves DURING the focus, so
+	// typing, autosaving, then deleting back to the focus value must
+	// still write on blur or the file keeps the autosaved text.
+	let _savedValue: string = '';
 	let _timer: ReturnType<typeof setTimeout> | null = null;
 	let _pendingSaveFn: ((value: string) => void) | null = null;
 
@@ -58,24 +67,42 @@ export function createFieldEditor(debounceMs: number = DEFAULT_DEBOUNCE_MS): Fie
 		clearTimer();
 		_activeKey = key;
 		_activeValue = currentValue;
+		_savedValue = currentValue;
+	}
+
+	/// THE one write path: every save (debounce fire, blur, flush)
+	/// goes through here, so the "no write when the value matches the
+	/// last write" guard cannot be forgotten at one of them (it was,
+	/// twice).
+	function commit(saveFn: (value: string) => void) {
+		if (_activeValue === _savedValue) return;
+		saveFn(_activeValue);
+		_savedValue = _activeValue;
 	}
 
 	function input(value: string, key: string, saveFn: (value: string) => void) {
+		// Typing into a field that was never focused has no baseline to
+		// diff against; a silent drop here would throw the user's text
+		// away, so refuse loudly (every control pairs onfocus with
+		// oninput; this is the tripwire for one that forgets).
+		if (_activeKey !== key) {
+			throw new Error(
+				`field editor: input() for '${key}' without focus() (active: ${_activeKey})`,
+			);
+		}
 		_activeValue = value;
 		_pendingSaveFn = saveFn;
 		clearTimer();
 		_timer = setTimeout(() => {
-			if (_activeKey === key) {
-				saveFn(_activeValue);
-				_pendingSaveFn = null;
-			}
+			commit(saveFn);
+			_pendingSaveFn = null;
 		}, debounceMs);
 	}
 
 	function blur(key: string, saveFn: (value: string) => void) {
 		clearTimer();
 		if (_activeKey === key) {
-			saveFn(_activeValue);
+			commit(saveFn);
 			_pendingSaveFn = null;
 			_activeKey = null;
 			_activeValue = '';
@@ -85,7 +112,7 @@ export function createFieldEditor(debounceMs: number = DEFAULT_DEBOUNCE_MS): Fie
 	function flush() {
 		if (_activeKey !== null && _pendingSaveFn !== null) {
 			clearTimer();
-			_pendingSaveFn(_activeValue);
+			commit(_pendingSaveFn);
 			_pendingSaveFn = null;
 		}
 	}

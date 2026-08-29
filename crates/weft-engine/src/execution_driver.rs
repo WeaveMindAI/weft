@@ -128,7 +128,7 @@ pub async fn run_one_execution(
     caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
 ) -> anyhow::Result<ExecutionOutcome> {
     let project = &*project;
-    let edge_idx = EdgeIndex::build(&project);
+    let edge_idx = EdgeIndex::build(project);
     let mut pulses: PulseTable = Default::default();
     let mut executions: NodeExecutionTable = Default::default();
     // Kicked roots (entry points of the active execution: firing
@@ -183,7 +183,7 @@ pub async fn run_one_execution(
     // before the worker boots." If we sat through the full wait
     // and the journal is STILL empty, that contract is broken: bail
     // loudly instead of silently proceeding with phase=Fire (which
-    // would bypass phase_scope for what might have been a
+    // would bypass the setup-phase dispatch bound for what might have been a
     // TriggerSetup execution).
     if events.is_empty() {
         anyhow::bail!(
@@ -194,23 +194,29 @@ pub async fn run_one_execution(
     // Phase derives from the ExecutionStarted event we now have. No
     // unwrap_or fallback: if events is non-empty but contains no
     // ExecutionStarted, the journal is malformed and we fail loud.
-    let phase = events
+    let (phase, run_subgraph) = events
         .iter()
         .find_map(|e| match e {
-            weft_journal::ExecEvent::ExecutionStarted { phase, .. } => Some(*phase),
+            weft_journal::ExecEvent::ExecutionStarted { phase, subgraph, .. } => {
+                Some((*phase, subgraph.clone()))
+            }
             _ => None,
         })
         .ok_or_else(|| anyhow::anyhow!(
             "color {color} has journal events but no ExecutionStarted; \
              journal is malformed"
         ))?;
+    // A manual run journaled the subgraph it set out to execute;
+    // resumes rebuild the same boundary from the same row.
+    let run_subgraph: Option<std::collections::HashSet<String>> =
+        run_subgraph.map(|v| v.into_iter().collect());
     let snap = weft_journal::fold_to_snapshot(color, &events);
-    let mut loop_runtime = rehydrate_loop_runtime(&project, &snap.loop_instances)
+    let mut loop_runtime = rehydrate_loop_runtime(project, &snap.loop_instances)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let doomed =
-        apply_snapshot(&project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences);
+        apply_snapshot(project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences);
     fail_unresumable_stream_consumers(
-        doomed, color, &project, &edge_idx, &mut pulses, &mut executions,
+        doomed, color, project, &edge_idx, &mut pulses, &mut executions,
         journal.as_ref(), &pod_name,
     )
     .await;
@@ -274,7 +280,7 @@ pub async fn run_one_execution(
     let mut outcome;
     loop {
         outcome = drive(
-            &project,
+            project,
             &edge_idx,
             catalog.as_ref(),
             &exec_id,
@@ -294,6 +300,7 @@ pub async fn run_one_execution(
             std::mem::take(&mut awaited_sequences),
             &mut loop_runtime,
             phase,
+            run_subgraph.as_ref(),
             event_count_before,
         )
         .await?;
@@ -380,13 +387,13 @@ pub async fn run_one_execution(
         }
         event_count_before = fresh.len();
         let snap = weft_journal::fold_to_snapshot(color, &fresh);
-        loop_runtime = rehydrate_loop_runtime(&project, &snap.loop_instances)
+        loop_runtime = rehydrate_loop_runtime(project, &snap.loop_instances)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let doomed = apply_snapshot(
-            &project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
+            project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
         );
         fail_unresumable_stream_consumers(
-            doomed, color, &project, &edge_idx, &mut pulses, &mut executions,
+            doomed, color, project, &edge_idx, &mut pulses, &mut executions,
             journal.as_ref(), &pod_name,
         )
         .await;
@@ -745,7 +752,7 @@ async fn fail_unresumable_stream_consumers(
         );
         handle_node_failure(
             &loc.node_id, &std::collections::HashSet::new(), color, &loc.frames, &err,
-            project, edge_idx, pulses, executions, journal, pod_name, None,
+            project, edge_idx, pulses, executions, journal, pod_name,
         )
         .await;
     }
@@ -829,6 +836,9 @@ async fn drive(
     mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     phase: weft_core::context::Phase,
+    // A manual run's journaled subgraph: in Phase::Fire, only these
+    // nodes dispatch and everything else skips. None = whole graph.
+    run_subgraph: Option<&std::collections::HashSet<String>>,
     // Number of journal events the caller already folded into the
     // snapshot it handed us. The bus-held resume poll compares against
     // this to detect newly-landed rows without a redundant re-fetch.
@@ -874,17 +884,19 @@ async fn drive(
     // kill me" and exits.
     let mut waiting: HashMap<String, FiringLocation> = HashMap::new();
 
-    // Phase-scoped subgraph. In TriggerSetup we only want the
-    // triggers (features.is_trigger) and their upstream closure to
-    // execute; in InfraSetup we only want infra nodes
-    // (requires_infra) and their upstream closure. Any node outside
-    // the set is auto-skipped when a pulse lands on it, otherwise
-    // downstream nodes block forever waiting for inputs that the
-    // setup phase never produces.
+    // The set of nodes this execution may dispatch. In TriggerSetup
+    // only the triggers (features.is_trigger) and their upstream
+    // closure run; in InfraSetup only infra nodes (requires_infra) and
+    // theirs. A node outside the set skips the moment a pulse lands on
+    // it, otherwise downstream nodes would block forever on inputs the
+    // setup phase never produces (the ready pass owns that decision;
+    // the dispatch loop decides whether the skip is journaled or
+    // silent).
     //
-    // None (no scoping) is used for Phase::Fire (normal execution
-    // graph reaches everything via pulses).
-    let phase_scope: Option<std::collections::HashSet<String>> =
+    // Phase::Fire is bounded for every manual run (the dispatcher
+    // journaled the computed subgraph); a trigger-fired execution
+    // carries none and reaches everything via pulses.
+    let dispatchable: Option<std::collections::HashSet<String>> =
         match phase {
             weft_core::context::Phase::TriggerSetup => {
                 Some(compute_trigger_setup_scope(project, edge_idx))
@@ -892,13 +904,13 @@ async fn drive(
             weft_core::context::Phase::InfraSetup => {
                 Some(compute_infra_setup_scope(project, edge_idx))
             }
-            weft_core::context::Phase::Fire => None,
+            weft_core::context::Phase::Fire => run_subgraph.cloned(),
         };
-    if let Some(scope) = phase_scope.as_ref() {
-        // Boot-time prune: the drive's StreamRuntime is fresh, so no
-        // delivery gate can be tracking these yet.
-        let _ = drop_out_of_scope_pulses(pulses, scope);
-    }
+    // A pulse landing on a node outside the scope is NOT pruned: the
+    // readiness pass turns it into a real NodeSkipped (reason: outside
+    // this run), whose cascade closes its downstream. Silent deletion
+    // was how out-of-scope nodes vanished from the inspector with no
+    // row at all.
 
     // Rehydrate sweep: a resumed stream-driven loop whose durable
     // `stream_end` is already recorded has no close pulse left (it was
@@ -910,7 +922,7 @@ async fn drive(
     // later through the normal stream_push / LoopOut chain.
     settle_rehydrated_stream_ends(
         project, edge_idx, pulses, executions, journal, pod_name, color,
-        phase_scope.as_ref(), loop_runtime, &mut stream_rt,
+        loop_runtime, &mut stream_rt,
     )
     .await;
 
@@ -987,7 +999,6 @@ async fn drive(
                 pulses,
                 journal,
                 pod_name,
-                phase_scope.as_ref(),
                 loop_runtime,
                 &mut stream_rt,
             )
@@ -1030,7 +1041,7 @@ async fn drive(
         // exactly like any first pulse does.
         let acted = route_stream_pulses(
             color, project, edge_idx, pulses, executions, journal, pod_name,
-            phase_scope.as_ref(), &mut stream_rt, loop_runtime, &mut emitted_ports,
+            &mut stream_rt, loop_runtime, &mut emitted_ports,
         )
         .await;
         if acted > 0 {
@@ -1042,7 +1053,7 @@ async fn drive(
             idled_since_progress = false;
         }
 
-        let mut ready = find_ready_nodes(project, pulses, edge_idx);
+        let mut ready = find_ready_nodes(project, pulses, edge_idx, dispatchable.as_ref());
         // HOLD pulses that arrive at a node already PARKED on an
         // unresolved suspension. A WaitingForInput record is waiting for
         // its token to RESOLVE (a signal), not for input pulses; a fresh
@@ -1129,12 +1140,24 @@ async fn drive(
                 // bag and the node failed with
                 // `missing input on port: <name>` despite the source
                 // setting the value.
-                let input = match project.nodes.iter().find(|n| n.id == *node_id) {
-                    Some(def) => weft_core::exec::ready::build_kicked_input(
-                        def,
-                        info.port_snapshot.as_ref(),
+                // A kicked entry node still answers to `_should_flow`:
+                // a `false` literal in its braces (no pulses exist on a
+                // kick, so only the literal branch can fire) turns it
+                // off, same as any other node.
+                let (input, skip) = match project.nodes.iter().find(|n| n.id == *node_id) {
+                    Some(def) => (
+                        weft_core::exec::ready::build_kicked_input(
+                            def,
+                            info.port_snapshot.as_ref(),
+                        ),
+                        weft_core::exec::skip::check_flow_permission(
+                            def,
+                            &[],
+                            &Vec::new(),
+                            color,
+                        ),
                     ),
-                    None => Value::Object(serde_json::Map::new()),
+                    None => (Value::Object(serde_json::Map::new()), None),
                 };
                 ready.push((
                     node_id.clone(),
@@ -1143,7 +1166,7 @@ async fn drive(
                         color,
                         input,
                         closed_ports: Vec::new(),
-                        should_skip: false,
+                        skip,
                         pulse_ids: Vec::new(),
                         error: None,
                     },
@@ -1187,14 +1210,49 @@ async fn drive(
                      project definition; corrupt compiled project shape"
                 ));
             };
-            // TriggerSetup scoping: if this node isn't in the
-            // trigger-upstream closure, skip it. The pulses that got
-            // it into `ready` still need to be absorbed, and
-            // downstream should still see null pulses so cascading
-            // skips terminate cleanly.
-            if let Some(scope) = phase_scope.as_ref() {
-                if !scope.contains(&node_id) {
-                    group.should_skip = true;
+            // Scope is decided inside `find_ready_nodes` (an
+            // out-of-scope node arrives here already carrying its skip
+            // reason and forms a group on ANY pulse). Two cases absorb
+            // SILENTLY, journaling nothing:
+            //  - a location already terminally skipped: scope is a
+            //    per-run constant, so once skipped, a later pulse batch
+            //    (a second parent closing a tick later) must not open a
+            //    second lifecycle pair;
+            //  - a setup phase: its scope is engine plumbing the user
+            //    never chose, so an activation must not paint the
+            //    business graph "skipped".
+            // Both settle any delivery gate through the same
+            // skip-absorb path a journaled skip uses.
+            if matches!(
+                group.skip,
+                Some(weft_core::exec::skip::SkipReason::OutsideThisRun)
+            ) {
+                let already_skipped = executions.get(&node_id).is_some_and(|v| {
+                    v.iter().any(|e| {
+                        e.color == group.color
+                            && e.frames == group.frames
+                            && e.status.is_terminal()
+                    })
+                });
+                let setup_phase = !matches!(phase, weft_core::context::Phase::Fire);
+                if already_skipped || setup_phase {
+                    if let Some(bucket) = pulses.get_mut(&node_id) {
+                        for p in bucket.iter_mut() {
+                            if group.pulse_ids.contains(&p.id)
+                                && p.status == weft_core::pulse::PulseStatus::Pending
+                            {
+                                p.absorb();
+                            }
+                        }
+                    }
+                    let msg = format!(
+                        "the consumer '{node_id}' skipped (it is outside the part of \
+                         the graph this execution runs), so the awaited delivery can \
+                         never happen"
+                    );
+                    stream_rt
+                        .on_pulses_absorbed(&group.pulse_ids, AbsorbKind::Skipped { reason: &msg });
+                    continue;
                 }
             }
             // Absorb input pulses for this dispatch, EXCEPT pulses on
@@ -1211,7 +1269,7 @@ async fn drive(
                 .collect();
             let mut deferred: std::collections::HashSet<uuid::Uuid> =
                 std::collections::HashSet::new();
-            if !group.should_skip && !generator_ports.is_empty() {
+            if group.skip.is_none() && !generator_ports.is_empty() {
                 if let Some(bucket) = pulses.get(&node_id) {
                     for p in bucket.iter() {
                         if group.pulse_ids.contains(&p.id)
@@ -1239,18 +1297,15 @@ async fn drive(
             // producer resumes); a skip dispatch consumes them with no
             // delivery ever possible, so its waiting producers fail
             // loudly instead of hanging.
-            let skip_reason = format!(
-                "the consumer '{node_id}' skipped (a required input closed), so the \
-                 awaited delivery can never happen"
-            );
-            stream_rt.on_pulses_absorbed(
-                &absorbed_now,
-                if group.should_skip {
-                    AbsorbKind::Skipped { reason: &skip_reason }
-                } else {
-                    AbsorbKind::Taken
-                },
-            );
+            if let Some(reason) = &group.skip {
+                let msg = format!(
+                    "the consumer '{node_id}' skipped ({reason}), so the awaited \
+                     delivery can never happen"
+                );
+                stream_rt.on_pulses_absorbed(&absorbed_now, AbsorbKind::Skipped { reason: &msg });
+            } else {
+                stream_rt.on_pulses_absorbed(&absorbed_now, AbsorbKind::Taken);
+            }
 
             // Resume detection: if a non-terminal exec already
             // exists at this (node, frames), this dispatch continues
@@ -1374,11 +1429,10 @@ async fn drive(
                 resume_token_value.as_ref(), is_resume,
             ).await;
 
-            if group.should_skip {
+            if let Some(reason) = &group.skip {
                 handle_node_skip(
-                    &node_id, group.color, &group.frames, &group.closed_ports,
+                    &node_id, group.color, &group.frames, &group.closed_ports, reason,
                     project, edge_idx, pulses, executions, journal, pod_name,
-                    phase_scope.as_ref(),
                 )
                 .await;
                 continue;
@@ -1392,7 +1446,6 @@ async fn drive(
                 handle_node_failure(
                     &node_id, &mentioned, group.color, &group.frames, err,
                     project, edge_idx, pulses, executions, journal, pod_name,
-                    phase_scope.as_ref(),
                 )
                 .await;
                 continue;
@@ -1425,9 +1478,9 @@ async fn drive(
                         // the terminal marker (push_pulse dedup makes a
                         // replayed row idempotent).
                         let mut all_emissions = emissions;
-                        all_emissions.extend(build_unmentioned_closures_and_prune(
+                        all_emissions.extend(build_unmentioned_closures(
                             &node_id, &mentioned, color, &group.frames,
-                            project, edge_idx, pulses, phase_scope.as_ref(), None,
+                            project, edge_idx, pulses, None,
                         ));
                         mark_completed(executions, &node_id, color, &group.frames);
                         ship_node_completed(journal, pod_name, color, &node_id, &group.frames, &forwarded, all_emissions).await;
@@ -1437,7 +1490,6 @@ async fn drive(
                         handle_node_failure(
                             &node_id, &mentioned, color, &group.frames, &e.to_string(),
                             project, edge_idx, pulses, executions, journal, pod_name,
-                            phase_scope.as_ref(),
                         ).await;
                     }
                 }
@@ -1477,7 +1529,7 @@ async fn drive(
                         handle_loop_boundary_failure(
                             node_def, color, &group.frames, &err,
                             project, edge_idx, pulses, executions, journal, pod_name,
-                            phase_scope.as_ref(), loop_runtime,
+                            loop_runtime,
                         )
                         .await;
                     }
@@ -1493,7 +1545,6 @@ async fn drive(
                     handle_node_failure(
                         &node_id, &mentioned, group.color, &group.frames, &err,
                         project, edge_idx, pulses, executions, journal, pod_name,
-                        phase_scope.as_ref(),
                     )
                     .await;
                     continue;
@@ -1561,7 +1612,7 @@ async fn drive(
                     handle_node_failure(
                         &node_id, &std::collections::HashSet::new(), group.color,
                         &group.frames, &err, project, edge_idx, pulses, executions,
-                        journal, pod_name, phase_scope.as_ref(),
+                        journal, pod_name,
                     )
                     .await;
                     continue;
@@ -1596,7 +1647,6 @@ async fn drive(
                     handle_node_failure(
                         &node_id, &mentioned, group.color, &group.frames, &err,
                         project, edge_idx, pulses, executions, journal, pod_name,
-                        phase_scope.as_ref(),
                     )
                     .await;
                     continue;
@@ -1832,7 +1882,6 @@ async fn drive(
             pod_name,
             &mut waiting,
             &mut emitted_ports,
-            phase_scope.as_ref(),
             &mut stream_rt,
             /* is_cancel = */ false,
         )
@@ -1931,10 +1980,23 @@ async fn drive(
         // and anything enqueued before a task parked is already
         // visible to `is_empty()`, so "provable AND empty" is sound;
         // checking emptiness first would not be.
+        // The idle pass is reached by YIELDING, never by waiting for a
+        // notification: the deadlock's last liveness wake can be
+        // consumed by an iteration that also drained a message (which
+        // resets `idled_since_progress`), and after that nothing ever
+        // notifies again, since every park already happened. The extra
+        // pass exists only so a freshly-dispatched batch is not judged
+        // before the runtime has touched it at all; CORRECTNESS rests
+        // on `deadlock_provable` being exact at the check instant (see
+        // its comment), not on any scheduling the yield provides.
+        if !idled_since_progress {
+            idled_since_progress = true;
+            tokio::task::yield_now().await;
+            continue;
+        }
         let in_flight_firings: std::collections::HashSet<FiringLocation> =
             task_firings.values().cloned().collect();
-        if idled_since_progress
-            && waiting_count(executions) == 0
+        if waiting_count(executions) == 0
             && waits.deadlock_provable(&in_flight_firings)
             && task_rx.is_empty()
         {
@@ -2130,7 +2192,7 @@ async fn drive(
                 if let Some(msg) = task_msg {
                     apply_one_task_msg(
                         msg, color, project, edge_idx, pulses, executions, journal, pod_name,
-                        &mut waiting, &mut emitted_ports, phase_scope.as_ref(),
+                        &mut waiting, &mut emitted_ports,
                         &mut stream_rt,
                         /* is_cancel = */ false,
                     )
@@ -2159,7 +2221,6 @@ async fn drive(
                     pulses,
                     journal,
                     pod_name,
-                    phase_scope.as_ref(),
                     loop_runtime,
                     &mut stream_rt,
                 )
@@ -2173,22 +2234,12 @@ async fn drive(
     }
 }
 
-/// Tear down a terminated firing downstream: emit CLOSURE markers
-/// on every output port the firing did NOT mention, ship those
-/// mutations, then prune out-of-scope pulses. The SHARED tail of
-/// every node-down path (success-with-unmentioned-ports, failure,
-/// skip). The prune is here, not at the call sites, so a new
-/// node-down path can't forget it (during a setup phase
-/// `close_unmentioned_downstream` can emit onto out-of-scope nodes,
-/// which would otherwise be dispatched, auto-skipped, and churn the
-/// loop).
-///
 /// A closure is structural: it tells the consumer "this port is dead
-/// at this frame stack". A user-emitted null is data; these are different
-/// signals and the consumer-side `skip` distinguishes them.
-#[allow(clippy::too_many_arguments)]
+/// at this frame stack". A user-emitted null is data; these are
+/// different signals and the consumer-side `skip` distinguishes them.
+///
 /// Build (and apply to `pulses`) the CLOSURE pulses on every output port
-/// the firing did NOT mention, then prune out-of-scope pulses. RETURNS
+/// the firing did NOT mention. RETURNS
 /// the emissions so the caller folds them into its terminal row
 /// (NodeCompleted / NodeFailed / NodeSkipped) so the marker and the
 /// closures it implies are ONE atomic write: a crash between two separate
@@ -2196,7 +2247,7 @@ async fn drive(
 /// firing nor skipping (refold Stuck). Every terminal-shipping path uses
 /// this; the standalone shipping wrapper below exists only for the
 /// cancel-cleanup walk, which has no terminal row to carry them.
-fn build_unmentioned_closures_and_prune(
+fn build_unmentioned_closures(
     node_id: &str,
     mentioned: &std::collections::HashSet<String>,
     color: weft_core::Color,
@@ -2204,7 +2255,6 @@ fn build_unmentioned_closures_and_prune(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     // The firing's error on a FAILURE path: rides generator ports'
     // closures as a failed stream end (the consumer's pull gets the
     // error). None on every non-failure termination.
@@ -2237,13 +2287,6 @@ fn build_unmentioned_closures_and_prune(
              will neither fire nor skip"
         );
     }
-    if let Some(scope) = phase_scope {
-        // Gate-free by construction: any gate-tracked pulse that was
-        // out of scope was pruned (and its gate settled) by the
-        // emission apply that created it; what remains here are the
-        // sweep's own closures and non-delivery pulses.
-        let _ = drop_out_of_scope_pulses(pulses, scope);
-    }
     emissions
 }
 
@@ -2252,7 +2295,7 @@ fn build_unmentioned_closures_and_prune(
 /// suppresses the per-node terminal row (the dispatcher's NodeCancelled
 /// is the status truth), so there is no terminal row to carry them.
 /// Every other path folds the closures into its terminal event instead.
-async fn close_unmentioned_downstream_and_prune(
+async fn close_unmentioned_downstream_and_ship(
     node_id: &str,
     mentioned: &std::collections::HashSet<String>,
     color: weft_core::Color,
@@ -2262,11 +2305,9 @@ async fn close_unmentioned_downstream_and_prune(
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
 ) {
-    let emissions = build_unmentioned_closures_and_prune(
-        node_id, mentioned, color, frames, project, edge_idx, pulses, phase_scope, None,
-    );
+    let emissions =
+        build_unmentioned_closures(node_id, mentioned, color, frames, project, edge_idx, pulses, None);
     crate::context::ship_pulse_emissions(journal, pod_name, emissions).await;
 }
 
@@ -3160,7 +3201,6 @@ async fn handle_loop_boundary_failure(
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
 ) {
     use weft_core::primitive::{LoopInstanceKey, LoopTerminationReason};
@@ -3185,7 +3225,7 @@ async fn handle_loop_boundary_failure(
         let mentioned = std::collections::HashSet::new();
         handle_node_failure(
             &node_def.id, &mentioned, color, frames, err,
-            project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
+            project, edge_idx, pulses, executions, journal, pod_name,
         )
         .await;
         return;
@@ -3251,7 +3291,7 @@ async fn handle_loop_boundary_failure(
     let mentioned = std::collections::HashSet::new();
     handle_node_failure_inner(
         &node_def.id, &mentioned, color, frames, err,
-        project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
+        project, edge_idx, pulses, executions, journal, pod_name,
         /* ship_node_terminal = */ true, nodefailed_closures,
     )
     .await;
@@ -3277,11 +3317,10 @@ async fn handle_node_failure(
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
 ) {
     handle_node_failure_inner(
         node_id, mentioned, color, frames, err, project, edge_idx, pulses, executions,
-        journal, pod_name, phase_scope, /* ship_node_terminal = */ true, Vec::new(),
+        journal, pod_name, /* ship_node_terminal = */ true, Vec::new(),
     )
     .await;
 }
@@ -3309,11 +3348,10 @@ async fn handle_node_failure_cancel_path(
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
 ) {
     handle_node_failure_inner(
         node_id, mentioned, color, frames, err, project, edge_idx, pulses, executions,
-        journal, pod_name, phase_scope, /* ship_node_terminal = */ false, Vec::new(),
+        journal, pod_name, /* ship_node_terminal = */ false, Vec::new(),
     )
     .await;
 }
@@ -3331,7 +3369,6 @@ async fn handle_node_failure_inner(
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     ship_node_terminal: bool,
     // Closures the CALLER already built (and applied to `pulses`) for a
     // terminal row whose ONLY carrier is this NodeFailed: the no-instance
@@ -3342,13 +3379,13 @@ async fn handle_node_failure_inner(
     extra_closures: Vec<weft_core::exec::PulseEmission>,
 ) {
     mark_failed(executions, node_id, color, frames, err);
-    // Build the closures FIRST (mutates RAM pulses, prunes), then ship
+    // Build the closures FIRST (mutates RAM pulses), then ship
     // them INSIDE the NodeFailed row so the terminal marker and its
     // closures are one atomic write. A crash between two separate writes
     // would lose the closures, leaving downstream consumers neither
     // firing nor skipping (the execution refolds Stuck).
-    let mut closures = build_unmentioned_closures_and_prune(
-        node_id, mentioned, color, frames, project, edge_idx, pulses, phase_scope, Some(err),
+    let mut closures = build_unmentioned_closures(
+        node_id, mentioned, color, frames, project, edge_idx, pulses, Some(err),
     );
     closures.extend(extra_closures);
     if ship_node_terminal {
@@ -3361,8 +3398,8 @@ async fn handle_node_failure_inner(
 }
 
 /// Skip a firing (a scope/condition decided it shouldn't run):
-/// mark Skipped, ship `NodeSkipped`, null+prune downstream. Same
-/// downstream teardown as a failure (the prune in particular), just a
+/// mark Skipped, ship `NodeSkipped`, close downstream. Same
+/// downstream teardown as a failure, just a
 /// different lifecycle event.
 #[allow(clippy::too_many_arguments)]
 async fn handle_node_skip(
@@ -3370,15 +3407,28 @@ async fn handle_node_skip(
     color: weft_core::Color,
     frames: &weft_core::frames::LoopFrames,
     closed_ports: &[String],
+    reason: &weft_core::exec::skip::SkipReason,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
 ) {
     mark_skipped(executions, node_id, color, frames);
+    // An out-of-scope skip carries NO closures: everything downstream
+    // of an out-of-scope node is itself outside the scope (scopes are
+    // upstream closures), so a cascade would only manufacture pulses
+    // for nodes that are absorbed anyway; each out-of-scope node
+    // adjacent to the in-scope region gets its own skip row from the
+    // pulses in-scope producers send it directly.
+    if matches!(reason, weft_core::exec::skip::SkipReason::OutsideThisRun) {
+        ship_node_skipped(
+            journal, pod_name, color, node_id, frames, closed_ports, reason, Vec::new(),
+        )
+        .await;
+        return;
+    }
     // A skipped LOOP In-boundary needs its own teardown: the generic
     // sweep below deliberately no-ops for loop boundary nodes
     // (per-iteration firings must not auto-close the outward ports),
@@ -3404,12 +3454,7 @@ async fn handle_node_skip(
         let closures = build_loop_outward_closures(
             project, edge_idx, pulses, color, &group_id, frames,
         );
-        ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, closures).await;
-        if let Some(scope) = phase_scope {
-            // Gate-free by construction (see the sweep site in
-            // `build_unmentioned_closures_and_prune`'s caller).
-            let _ = drop_out_of_scope_pulses(pulses, scope);
-        }
+        ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, reason, closures).await;
         return;
     }
     // A skipped node's body never runs, so it never emitted on ANY
@@ -3418,10 +3463,10 @@ async fn handle_node_skip(
     // closures FIRST, then ship them INSIDE the NodeSkipped row (atomic
     // marker+closures, same reason as the failure path).
     let mentioned = std::collections::HashSet::new();
-    let closures = build_unmentioned_closures_and_prune(
-        node_id, &mentioned, color, frames, project, edge_idx, pulses, phase_scope, None,
+    let closures = build_unmentioned_closures(
+        node_id, &mentioned, color, frames, project, edge_idx, pulses, None,
     );
-    ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, closures).await;
+    ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, reason, closures).await;
 }
 
 /// Gives a firing's runtime-granted provider accesses back on every exit
@@ -3495,7 +3540,6 @@ async fn cancel_cleanup(
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
@@ -3523,7 +3567,7 @@ async fn cancel_cleanup(
     //    firing's closures would be lost and downstream never learn).
     let late_terminated = drain_task_msgs_for_cancel(
         task_rx, color, project, edge_idx, pulses, executions, journal, pod_name,
-        waiting, emitted_ports, phase_scope, stream_rt,
+        waiting, emitted_ports, stream_rt,
     )
     .await;
     // Every delivery wait dies with its task (the abort above): fail
@@ -3550,9 +3594,9 @@ async fn cancel_cleanup(
     firings.extend(late_terminated);
     for loc in firings {
         let mentioned = emitted_ports.remove(&loc).unwrap_or_default();
-        close_unmentioned_downstream_and_prune(
+        close_unmentioned_downstream_and_ship(
             &loc.node_id, &mentioned, color, &loc.frames, project, edge_idx, pulses, journal,
-            pod_name, phase_scope,
+            pod_name,
         )
         .await;
     }
@@ -3666,7 +3710,6 @@ async fn route_stream_pulses(
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
@@ -3818,7 +3861,6 @@ async fn route_stream_pulses(
                         handle_node_failure(
                             &loc.node_id, &mentioned, color, &loc.frames, &err,
                             project, edge_idx, pulses, executions, journal, pod_name,
-                            phase_scope,
                         )
                         .await;
                     }
@@ -3856,7 +3898,7 @@ async fn route_stream_pulses(
                                  engine bug",
                                 key.group_id
                             ),
-                            phase_scope, loop_runtime, stream_rt,
+                            loop_runtime, stream_rt,
                         )
                         .await;
                         continue;
@@ -3890,7 +3932,7 @@ async fn route_stream_pulses(
                         {
                             fail_loop_from_stream(
                                 project, edge_idx, pulses, executions, journal, pod_name,
-                                color, &key, &loop_in, &e, phase_scope, loop_runtime,
+                                color, &key, &loop_in, &e, loop_runtime,
                                 stream_rt,
                             )
                             .await;
@@ -3912,14 +3954,14 @@ async fn route_stream_pulses(
                                  loop '{}'",
                                 key.group_id
                             ),
-                            phase_scope, loop_runtime, stream_rt,
+                            loop_runtime, stream_rt,
                         )
                         .await;
                     }
                     Err(e) => {
                         fail_loop_from_stream(
                             project, edge_idx, pulses, executions, journal, pod_name,
-                            color, &key, &loop_in, &e, phase_scope, loop_runtime, stream_rt,
+                            color, &key, &loop_in, &e, loop_runtime, stream_rt,
                         )
                         .await;
                     }
@@ -3957,7 +3999,7 @@ async fn route_stream_pulses(
                 if loop_runtime.get(&key).is_some_and(|inst| inst.terminated.is_none()) {
                     apply_loop_stream_close(
                         project, edge_idx, pulses, executions, journal, pod_name, color,
-                        &key, &loop_in, end, phase_scope, loop_runtime, stream_rt,
+                        &key, &loop_in, end, loop_runtime, stream_rt,
                     )
                     .await;
                 }
@@ -4200,14 +4242,13 @@ async fn apply_loop_stream_close(
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
     end: StreamEnd,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
     let advance = loop_runtime.stream_close(key, end);
     apply_loop_stream_advance(
         advance, project, edge_idx, pulses, executions, journal, pod_name, color, key,
-        loop_in_id, phase_scope, loop_runtime, stream_rt,
+        loop_in_id, loop_runtime, stream_rt,
     )
     .await;
 }
@@ -4233,7 +4274,6 @@ async fn settle_rehydrated_stream_ends(
     journal: &dyn JournalClient,
     pod_name: &str,
     color: Color,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
@@ -4258,7 +4298,7 @@ async fn settle_rehydrated_stream_ends(
         let advance = loop_runtime.settle_stream_end(&key);
         apply_loop_stream_advance(
             advance, project, edge_idx, pulses, executions, journal, pod_name, color, &key,
-            &loop_in_id, phase_scope, loop_runtime, stream_rt,
+            &loop_in_id, loop_runtime, stream_rt,
         )
         .await;
     }
@@ -4278,7 +4318,6 @@ async fn apply_loop_stream_advance(
     color: Color,
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
@@ -4293,7 +4332,7 @@ async fn apply_loop_stream_advance(
             {
                 fail_loop_from_stream(
                     project, edge_idx, pulses, executions, journal, pod_name, color, key,
-                    loop_in_id, &e, phase_scope, loop_runtime, stream_rt,
+                    loop_in_id, &e, loop_runtime, stream_rt,
                 )
                 .await;
                 return;
@@ -4307,7 +4346,7 @@ async fn apply_loop_stream_advance(
         Err(e) => {
             fail_loop_from_stream(
                 project, edge_idx, pulses, executions, journal, pod_name, color, key,
-                loop_in_id, &e, phase_scope, loop_runtime, stream_rt,
+                loop_in_id, &e, loop_runtime, stream_rt,
             )
             .await;
         }
@@ -4329,7 +4368,6 @@ async fn fail_loop_from_stream(
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
     err: &str,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
@@ -4343,7 +4381,7 @@ async fn fail_loop_from_stream(
     };
     handle_loop_boundary_failure(
         node_def, color, &key.parent_frames, err, project, edge_idx, pulses, executions,
-        journal, pod_name, phase_scope, loop_runtime,
+        journal, pod_name, loop_runtime,
     )
     .await;
     drop_loop_stream_leftovers(
@@ -4466,7 +4504,6 @@ async fn apply_one_emission(
     journal: &dyn JournalClient,
     pod_name: &str,
     emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
 ) {
@@ -4505,13 +4542,13 @@ async fn apply_one_emission(
                 if is_cancel {
                     handle_node_failure_cancel_path(
                         &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err,
-                        project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
+                        project, edge_idx, pulses, executions, journal, pod_name,
                     )
                     .await;
                 } else {
                     handle_node_failure(
                         &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err,
-                        project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
+                        project, edge_idx, pulses, executions, journal, pod_name,
                     )
                     .await;
                 }
@@ -4605,7 +4642,6 @@ async fn apply_one_emission(
                             executions,
                             journal,
                             pod_name,
-                            phase_scope,
                         )
                         .await;
                     } else {
@@ -4621,7 +4657,6 @@ async fn apply_one_emission(
                             executions,
                             journal,
                             pod_name,
-                            phase_scope,
                         )
                         .await;
                     }
@@ -4649,13 +4684,13 @@ async fn apply_one_emission(
                 if is_cancel {
                     handle_node_failure_cancel_path(
                         &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err.to_string(),
-                        project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
+                        project, edge_idx, pulses, executions, journal, pod_name,
                     )
                     .await;
                 } else {
                     handle_node_failure(
                         &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err.to_string(),
-                        project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
+                        project, edge_idx, pulses, executions, journal, pod_name,
                     )
                     .await;
                 }
@@ -4687,19 +4722,10 @@ async fn apply_one_emission(
     }
 
     crate::context::ship_pulse_emissions(journal, pod_name, emissions).await;
-    if let Some(scope) = phase_scope {
-        let dropped = drop_out_of_scope_pulses(pulses, scope);
-        // The gate registered above may track pulses this prune just
-        // removed (a producer yielding toward a node outside the
-        // phase's scope); an untold gate would park it forever.
-        stream_rt.on_pulses_absorbed(
-            &dropped,
-            AbsorbKind::Skipped {
-                reason: "the consumer is outside this phase's scope, so the awaited \
-                         delivery can never happen",
-            },
-        );
-    }
+    // A pulse toward a node outside the scope stays in the table: the
+    // readiness pass dispatches that node as a skip (reason: outside
+    // this run), which absorbs the pulse and settles any delivery gate
+    // tracking it through the ordinary skip-absorb path.
 }
 
 /// Drain the task channel in FIFO order, applying each `Emission`
@@ -4722,7 +4748,6 @@ async fn apply_task_msgs(
     pod_name: &str,
     waiting: &mut HashMap<String, FiringLocation>,
     emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
 ) -> bool {
@@ -4731,7 +4756,7 @@ async fn apply_task_msgs(
         any = true;
         apply_one_task_msg(
             msg, color, project, edge_idx, pulses, executions, journal, pod_name,
-            waiting, emitted_ports, phase_scope, stream_rt, is_cancel,
+            waiting, emitted_ports, stream_rt, is_cancel,
         )
         .await;
     }
@@ -4753,7 +4778,6 @@ async fn apply_one_task_msg(
     pod_name: &str,
     waiting: &mut HashMap<String, FiringLocation>,
     emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
 ) {
@@ -4761,7 +4785,7 @@ async fn apply_one_task_msg(
         TaskMsg::Emission(emit) => {
             apply_one_emission(
                 emit, color, project, edge_idx, pulses, executions, journal, pod_name,
-                emitted_ports, phase_scope, stream_rt, is_cancel,
+                emitted_ports, stream_rt, is_cancel,
             )
             .await;
         }
@@ -4804,9 +4828,9 @@ async fn apply_one_task_msg(
                 // Build the unmentioned-port closures FIRST, then carry
                 // them INSIDE the NodeCompleted row (atomic marker+
                 // closures, same reason as the failure/skip paths).
-                let closures = build_unmentioned_closures_and_prune(
+                let closures = build_unmentioned_closures(
                     &loc.node_id, &mentioned, tcolor, &loc.frames,
-                    project, edge_idx, pulses, phase_scope, None,
+                    project, edge_idx, pulses, None,
                 );
                 ship_node_completed(
                     journal, pod_name, tcolor, &loc.node_id, &loc.frames, &output, closures,
@@ -4826,7 +4850,7 @@ async fn apply_one_task_msg(
                 let mentioned = emitted_ports.remove(&loc).unwrap_or_default();
                 handle_node_failure(
                     &loc.node_id, &mentioned, tcolor, &loc.frames, &err,
-                    project, edge_idx, pulses, executions, journal, pod_name, phase_scope,
+                    project, edge_idx, pulses, executions, journal, pod_name,
                 )
                 .await;
             }
@@ -4872,7 +4896,6 @@ async fn drain_task_msgs_for_cancel(
     pod_name: &str,
     waiting: &mut HashMap<String, FiringLocation>,
     emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
-    phase_scope: Option<&std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
 ) -> Vec<FiringLocation> {
     let mut late_terminated: Vec<FiringLocation> = Vec::new();
@@ -4884,7 +4907,7 @@ async fn drain_task_msgs_for_cancel(
             TaskMsg::Emission(emit) => {
                 apply_one_emission(
                     emit, color, project, edge_idx, pulses, executions, journal, pod_name,
-                    emitted_ports, phase_scope, stream_rt, /* is_cancel = */ true,
+                    emitted_ports, stream_rt, /* is_cancel = */ true,
                 )
                 .await;
             }
@@ -5082,36 +5105,6 @@ fn mark_skipped(
     }
 }
 
-
-/// Remove every pending pulse whose target is not in `scope`.
-/// Called after each successful node completion to prevent
-/// out-of-scope downstream nodes from wedging TriggerSetup.
-///
-/// Returns the removed pulse ids, and the result MUST be routed to
-/// `StreamRuntime::on_pulses_absorbed` wherever a delivery gate can be
-/// tracking one of them (a removed pulse can never absorb, so an
-/// untold gate would park its producer forever). The emission-apply
-/// call site is the one place a freshly-armed gate's pulses can be out
-/// of scope; the closure-sweep sites run after that same apply already
-/// pruned them, so their removals are provably gate-free.
-#[must_use = "route the removed ids to StreamRuntime::on_pulses_absorbed where gates can exist"]
-fn drop_out_of_scope_pulses(
-    pulses: &mut PulseTable,
-    scope: &std::collections::HashSet<String>,
-) -> Vec<uuid::Uuid> {
-    let out_of_scope: Vec<String> = pulses
-        .keys()
-        .filter(|k| !scope.contains(*k))
-        .cloned()
-        .collect();
-    let mut removed = Vec::new();
-    for key in out_of_scope {
-        if let Some(bucket) = pulses.remove(&key) {
-            removed.extend(bucket.iter().map(|p| p.id));
-        }
-    }
-    removed
-}
 
 /// Which `Node` trait method a dispatch invokes. The engine picks it
 /// from the phase plus the manifest, so a node never inspects the
@@ -5406,6 +5399,13 @@ mod phase_routing_tests;
 #[cfg(test)]
 #[path = "execution_driver_tests/bus_comm.rs"]
 mod bus_comm_tests;
+
+// Layer 3: branching through the real loop. `_should_flow` decides
+// whether a node runs, the skip carries WHY, and the cascade reaches
+// everything behind it.
+#[cfg(test)]
+#[path = "execution_driver_tests/branching.rs"]
+mod branching_tests;
 
 // Layer 3: Generator streams + delivery-waiting emissions through the
 // real loop. See the module doc for the contracts pinned there.

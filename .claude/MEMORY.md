@@ -1,0 +1,21 @@
+# Project Memory: weft
+Durable rules for this repo. Each entry = one or two tight lines. General rules (em dashes, git push, no fallbacks, decision framework) live in `.claude/CLAUDE.md`. Add new entries inline as `##`. Keep this small.
+
+## Schema: canonical CREATE TABLE plus generated migrations
+Every table is written down twice and both are kept. The canonical `CREATE TABLE` lives in Rust on a `SchemaGroup` next to its code (edit in place; builds a fresh database). One SQL file per change under `crates/weft-task-store/migrations/<group>/` carries an existing database forward; each database records what it ran in `weft_migration`, so any old database reaches today and two branches converge whichever way they merge. The crate's build script walks that directory, so a file being there IS its registration: nothing lists it, no Rust changes, and it travels with the crate into every build context. NEVER hand-write a migration and NEVER edit a released one (the boot refuses it, checksummed). The flow: change the DDL, `./setup.sh --migration <name>` (writes a gitignored DRAFT under `drafts/`, applies it, keeps your data; repeat as often as you change the table), then `./setup.sh --migration <name> --release` to collapse every draft into ONE released file and record it as already applied on your database. Each group also has a frozen `origin.sql` (its DDL at ship time, written automatically); the `schema_agreement` test replays origin+released (drafts excluded, so an unreleased draft fails CI) and compares against the canonical build. Changing the DDL with no migration fails the boot printing reset SQL. Prefer additive changes; drop a column in a later release than the one that stopped reading it.
+[Update Notice Warning] If we touch `crates/weft-task-store/src/schema_guard.rs`, revisit this entry.
+
+## Runtime tiers: Listener / Dispatcher / Worker
+Four tiers, one role each. **Listener:** relays wake events to dispatcher; pooled + tenant-agnostic; never decides/spawns/touches journal. **Supervisor:** pooled + tenant-agnostic; exclusive `infra_owner` lease per project so one supervisor runs kubectl per project. **Dispatcher:** pure routing + lifecycle + placement; persists to Postgres; never executes node logic. **Worker:** runs the compiled project binary, one Pod per project pool, multiplexes executions, idle-shuts-down. Listener is the kind-aware processor (kinds live in `crates/weft-listener/src/kinds/`); dispatcher is pure transport and acts on a kind-agnostic `ProcessAction`. New signal kinds = listener code only; never a dispatcher-side kind branch.
+
+## Dispatcher coordination through the DB
+Dispatcher Pods are stateless coordination-wise: Postgres is the single source of truth, Pod RAM is just optimization. Ownership = DB leases (any Pod claims an expired one). Reconnect to a sibling Pod must rebuild from DB (no state across the gap). Before adding an in-RAM mutex/dashmap/counter on `DispatcherState`, ask "what if a sibling Pod handles the next request?": if that means stale reads/lost updates, it belongs in Postgres. N replicas is the target; single-Pod is the degenerate case.
+
+## Language vs node separation
+The language is generic: compiler/dispatcher/engine/shared infra never contain node-specific knowledge (no hardcoded field names, no `if node is X`). Nodes do no plumbing: a node's code only does its own logic; translating it into language concepts (triggers, URLs, suspensions, sidecar manifests) is the language's job. When a node needs something the language lacks, build the general mechanism first, then have the node use it through the ctx.
+
+## Color = one execution
+`Color` (`weft_core::Color = Uuid`) IS one execution: minted at `ExecutionStarted`, spent on terminate; a re-run is a NEW color. "Per color" always means per-execution. No retry-across-colors, no per-color attempt cap (a give-up-after-N concept would be per-PROJECT, out of scope).
+
+## Don't timeout user-facing long operations
+Real workflows (LLM pipelines, infra builds, human-in-the-loop, executions) can run hours/days. No deadlines on user-controlled waits (build/deploy/infra/execution/drain/user node code); make stuck-state legible (periodic breadcrumb + a documented recovery like Ctrl+C / `weft stop`). Deadlines only on internal service-to-service waits the user can't control.

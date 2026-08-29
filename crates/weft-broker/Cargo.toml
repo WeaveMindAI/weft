@@ -51,7 +51,7 @@ bytes = { workspace = true }
 # Layer-3 contract tests of the runtime-file plane against a real Postgres.
 # Gated like the other db-backed test suites so a plain `cargo test` stays
 # pure-function fast; CI / local-with-PG runs `--features db-tests`.
-db-tests = []
+db-tests = ["weft-task-store/db-tests"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
@@ -68,3 +68,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "mi
 # broker itself never links the dispatcher crate. The test needs the real
 # writer to populate the table before exercising the reader, hence this dep.
 weft-dispatcher = { path = "../weft-dispatcher" }
+
+[[example]]
+name = "schema_migration"
+required-features = ["db-tests"]
+
+[lints]
+workspace = true

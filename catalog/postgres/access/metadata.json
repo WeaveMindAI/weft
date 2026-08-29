@@ -74,5 +74,21 @@
         }
       ]
     }
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": {
+          "kind": "config_nonempty",
+          "field": "account"
+        }
+      },
+      "then": {
+        "message": "PostgresAccess '{id}' has no connected database; connect one on the node.",
+        "level": "runtime",
+        "field": "account"
+      }
+    }
+  ]
 }

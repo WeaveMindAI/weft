@@ -83,7 +83,7 @@
 		onOpenInclude?: (path: string, alias: string) => void;
 		execPrefix?: string;
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
-		onRun?: () => void;
+		onRun?: (targets: string[]) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onActivate?: () => void;

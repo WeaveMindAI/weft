@@ -114,16 +114,14 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         // `signal_insert`. Token reuse for entry rows keeps the
         // registration stable across reactivates; resume rows always
         // mint fresh.
-        let project_id = match state.journal.execution_project(color).await? {
-            crate::journal::ColorLookup::Found(p) => p,
-            crate::journal::ColorLookup::NotFound => {
-                anyhow::bail!("no project for color {color}")
-            }
-            crate::journal::ColorLookup::Corrupt => anyhow::bail!(
-                "journal row for color {color} is corrupt; see dispatcher logs"
-            ),
+        let Some(owner) = state.journal.execution_owner(color).await? else {
+            anyhow::bail!("no execution row for color {color}")
         };
-        let tenant = state.tenant_router.tenant_for_project(&project_id).await?;
+        let project_id = owner.project_id;
+        // The tenant stamped on the execution, not one re-derived from
+        // the project store: same answer while the project lives, and
+        // still an answer once it does not.
+        let tenant = owner.tenant;
 
         // The reused entry token's previously-persisted kind_state, when
         // the row already exists (reactivate). Handed to the kind's
