@@ -4,6 +4,11 @@
   "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, AI streaming edits.",
   "version": "0.2.237",
   "publisher": "weavemind",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WeaveMindAI/weft"
+  },
   "packageManager": "pnpm@10.32.1",
   "engines": {
     "vscode": "^1.90.0"

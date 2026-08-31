@@ -1827,8 +1827,10 @@ if [[ $build_vscode -eq 1 ]]; then
     spin "vite bundle webview" pnpm run bundle:webview
     spin "vite bundle markdown preview" pnpm run bundle:markdown-preview
     rm -f weft-vscode-*.vsix
-    spin "package .vsix" pnpm dlx @vscode/vsce package \
-      --no-dependencies --allow-missing-repository --skip-license
+    # The repo LICENSE rides inside the .vsix (the stores refuse a
+    # licenseless extension; the local package matches CI's).
+    cp "${here}/LICENSE" LICENSE
+    spin "package .vsix" pnpm dlx @vscode/vsce package --no-dependencies
     mkdir -p "${hash_dir}"
     printf '%s' "${current_hash}" >"${hash_file}"
   fi
