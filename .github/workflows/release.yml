@@ -234,10 +234,13 @@ jobs:
       - run: pnpm -C extension-vscode run compile
       - run: pnpm -C extension-vscode run bundle:webview
       - run: pnpm -C extension-vscode run bundle:markdown-preview
+      # The repo LICENSE rides inside the .vsix (both stores refuse a
+      # licenseless extension); copied, not tracked twice.
+      - run: cp LICENSE extension-vscode/LICENSE
       # working-directory, not `pnpm -C`: dlx spawns the tool in the
       # PROCESS cwd, so with -C vsce would look for package.json at the
       # repo root and refuse.
-      - run: pnpm dlx @vscode/vsce@3.9.2 package --no-dependencies --allow-missing-repository --skip-license
+      - run: pnpm dlx @vscode/vsce@3.9.2 package --no-dependencies
         working-directory: extension-vscode
       # One stable asset name; the version lives in manifest.json and
       # in the package itself.
