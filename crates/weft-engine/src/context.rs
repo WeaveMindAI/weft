@@ -3659,11 +3659,7 @@ mod replay_tests {
         use weft_core::signal::{to_spec, Form, FormSchema};
         let spec = to_spec(Form {
             form_type: "human-query".into(),
-            schema: FormSchema {
-                title: String::new(),
-                description: None,
-                fields: Vec::new(),
-            },
+            schema: FormSchema { fields: Vec::new() },
             title: None,
             description: None,
             consumer_kind: None,

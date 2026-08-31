@@ -15,6 +15,12 @@ use uuid::Uuid;
 // compound value.
 use crate::cst::lexer::marker_len;
 use crate::file_reader::CompileFs;
+/// The bare-identifier grammar for every name the language admits
+/// (ports, entry keys, connection segments): exactly
+/// `weft_catalog::is_rust_identifier`, because these names become
+/// generated Rust items, and the tokenizer already refuses anything
+/// looser.
+pub(crate) use weft_catalog::is_rust_identifier as is_bare_ident;
 
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
@@ -2391,23 +2397,24 @@ pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
             }),
         }
     } else {
-        // No type annotation
+        // No type annotation. The name is validated once, by the
+        // shared check below, the same as the typed branch's.
         let name = rest.trim();
         let optional = name.ends_with('?');
         let name = if optional { name[..name.len() - 1].trim() } else { name };
-        if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-            return Err(format!("Invalid port name: '{}'", rest.trim()));
-        }
         (name, WeftType::default(), optional)
     };
 
     // Validate port name
-    let first = name.chars().next().ok_or_else(|| "Empty port name".to_string())?;
-    if !(first.is_alphabetic() || first == '_') {
-        return Err(format!("Port name must start with a letter or underscore: '{}'", name));
+    if name.is_empty() {
+        return Err("Empty port name".to_string());
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return Err(format!("Port name contains invalid characters: '{}'", name));
+    if !is_bare_ident(name) {
+        return Err(format!(
+            "Port name must be a letter or underscore followed by letters, digits or \
+             underscores: '{}'",
+            name
+        ));
     }
 
     Ok(ParsedPort {
@@ -2432,14 +2439,6 @@ fn parse_dotted(s: &str) -> Option<(String, String)> {
     let port = s[dot + 1..].trim();
     if node.is_empty() || port.is_empty() {
         return None;
-    }
-    fn is_bare_ident(s: &str) -> bool {
-        let mut chars = s.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-            _ => return false,
-        }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
     if !is_bare_ident(node) || !is_bare_ident(port) {
         return None;

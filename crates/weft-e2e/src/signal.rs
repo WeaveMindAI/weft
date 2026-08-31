@@ -43,22 +43,6 @@ impl DiscoveredSignal {
     pub fn kind(&self) -> Option<&str> {
         self.0.get("kind").and_then(Value::as_str)
     }
-    /// The public mount path, for public-entry / live kinds.
-    pub fn mount_path(&self) -> Option<&str> {
-        self.0.get("mount_path").and_then(Value::as_str)
-    }
-    /// The plaintext api key, if the signal declared api_key auth (surfaced
-    /// once in the enumeration payload under `auth.secret`).
-    pub fn api_key(&self) -> Option<&str> {
-        self.0
-            .get("auth")
-            .and_then(|a| a.get("secret"))
-            .and_then(Value::as_str)
-    }
-    /// The form schema, for `form` kinds.
-    pub fn form_schema(&self) -> Option<&Value> {
-        self.0.get("formSchema").or_else(|| self.0.get("form_schema"))
-    }
     /// True for a RESUME signal (a one-shot reply to a paused execution), false
     /// for an ENTRY trigger (fireable repeatedly to start a run). The consumer
     /// splits its list on this: "Triggers" vs "Tasks".

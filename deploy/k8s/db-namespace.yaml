@@ -1,3 +1,5 @@
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
 apiVersion: v1
 kind: Namespace
 metadata:

@@ -35,7 +35,7 @@ pub(crate) const WORKER_SA: &str = "weft-worker-sa";
 pub(crate) const LISTENER_SA: &str = "weft-listener-sa";
 pub(crate) const INFRA_SUPERVISOR_SA: &str = "weft-infra-supervisor-sa";
 pub(crate) const DISPATCHER_SA: &str = "weft-dispatcher";
-pub(crate) const DISPATCHER_NS: &str = "weft-system";
+pub(crate) const DISPATCHER_NS: &str = weft_core::infra::SYSTEM_NAMESPACE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {

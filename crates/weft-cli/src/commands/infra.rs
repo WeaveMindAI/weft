@@ -456,11 +456,12 @@ async fn build_infra_images(
             progress.build_start(&tag);
             let label = format!("weft.dev/project={project_id}");
             let dockerfile = img.context_dir.join("Dockerfile");
-            crate::commands::build::docker_build_image(
+            crate::images::docker_build(
                 &tag,
                 &dockerfile,
                 &img.context_dir,
                 &[label],
+                None,
             )
             .await?;
             progress.build_done(&tag);
@@ -468,7 +469,7 @@ async fn build_infra_images(
         let cfg = cluster_config();
         if cfg.backend == ClusterBackend::Kind {
             progress.image_push_start(&tag);
-            images::kind_load(&cfg.cluster_name, &tag).await?;
+            images::kind_load(&cfg.cluster_name, &tag, false).await?;
             progress.image_push_done(&tag);
         }
         // Same content-addressed accumulation as worker images: drop

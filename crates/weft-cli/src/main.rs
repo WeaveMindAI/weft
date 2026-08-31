@@ -45,6 +45,32 @@ enum Cmd {
         #[arg(long)]
         quiet: bool,
     },
+    /// Make every shared image exist locally: the four system images
+    /// (dispatcher, listener, broker, infra-supervisor) plus the worker
+    /// builder-base, each under its content-addressed registry ref
+    /// (present -> pull -> build). `--push` then pushes every ref to
+    /// its registry; the release workflow runs this on each push to the
+    /// release branch, which is what lets every install pull instead of
+    /// compile.
+    #[command(name = "build-images")]
+    BuildImages {
+        /// Push each ensured ref to its registry (requires a prior
+        /// `docker login`).
+        #[arg(long, conflicts_with = "push_suffix")]
+        push: bool,
+        /// Push each ref under `<ref><suffix>` instead of its bare
+        /// name (implies --push). The release workflow builds each
+        /// architecture on its native runner with `-amd64` / `-arm64`
+        /// here, then stitches the bare ref into one multi-arch
+        /// manifest list, so every machine pulls its own architecture.
+        #[arg(long, value_name = "SUFFIX")]
+        push_suffix: Option<String>,
+        /// Only print the refs this tree resolves to, one per line,
+        /// touching nothing (no ensure, no docker). What setup.sh
+        /// keys its engine-change sweep on.
+        #[arg(long, conflicts_with_all = ["push", "push_suffix"])]
+        print: bool,
+    },
     /// Run node self-tests. Without a target: every package. Without
     /// --tier: the basic + fake tiers (compiled + run locally, no
     /// cluster needed). With a package name or node type: just that
@@ -306,7 +332,7 @@ enum Cmd {
     /// Subjects:
     ///   (default)         journal cleanup (executions older than --keep-days)
     ///   <UUID>            one execution
-    ///   --images          dangling worker images for the cwd project
+    ///   --images          unreferenced worker images for the cwd project
     ///                     (use --all to span every project)
     ///   --build-cache     docker buildkit cache prune
     ///   --all             with the journal subject: nuke every execution
@@ -335,7 +361,9 @@ enum Cmd {
         /// --keep-days to spare the recent ones.
         #[arg(long, value_name = "project-id")]
         project: Option<String>,
-        /// Reclaim dangling worker images. Cwd-scoped unless --all.
+        /// Reclaim unreferenced worker images. Cwd-scoped unless
+        /// --all, which spans every project AND drops old builder-base
+        /// images (~1.4GB each; the next build re-makes the base).
         #[arg(long, default_value_t = false)]
         images: bool,
         /// Prune docker BuildKit cache (heavy: invalidates cargo dep cache).
@@ -534,11 +562,17 @@ enum FilesAction {
 
 #[derive(Debug, Subcommand)]
 enum DaemonAction {
-    /// Start the daemon. Ensures the kind cluster, ingress, images,
-    /// and dispatcher Deployment exist, then opens a port-forward
-    /// so the CLI can talk to it on localhost.
+    /// Bring the daemon to the desired state: ensure the kind cluster,
+    /// ingress, images and dispatcher exist, roll whatever changed,
+    /// and open the port-forwards so the CLI can talk to it on
+    /// localhost. Idempotent, so it is both the first boot and the
+    /// refresh; `restart` is an alias for the same reconcile.
+    #[command(visible_alias = "restart")]
     Start {
-        /// Force-rebuild the dispatcher and listener images.
+        /// Force-rebuild every shared image (the four system images
+        /// and the worker builder base), skipping the
+        /// present-and-pull check. For when a local image is corrupt
+        /// or hand-modified.
         #[arg(long)]
         rebuild: bool,
         /// Allow rebuilding the kind NODE when its shape changed (a
@@ -565,19 +599,6 @@ enum DaemonAction {
     Stop,
     /// Report whether the daemon is reachable.
     Status,
-    /// Stop then start the daemon.
-    Restart {
-        #[arg(long)]
-        rebuild: bool,
-        /// See `daemon start --rebuild-cluster`.
-        #[arg(long)]
-        rebuild_cluster: bool,
-        /// See `daemon start --public-url`.
-        #[arg(long, overrides_with = "no_public_url")]
-        public_url: bool,
-        #[arg(long)]
-        no_public_url: bool,
-    },
     /// Tail the daemon's stderr log.
     Logs {
         /// Number of lines to print.
@@ -650,13 +671,6 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
             }
             DaemonAction::Stop => commands::daemon::DaemonAction::Stop,
             DaemonAction::Status => commands::daemon::DaemonAction::Status,
-            DaemonAction::Restart { rebuild, rebuild_cluster, public_url, no_public_url } => {
-                commands::daemon::DaemonAction::Restart {
-                    rebuild,
-                    rebuild_cluster,
-                    public_url: public_url_choice(public_url, no_public_url),
-                }
-            }
             DaemonAction::Logs { tail, follow } => {
                 commands::daemon::DaemonAction::Logs { tail, follow }
             }
@@ -692,6 +706,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::New { name } => commands::new::run(ctx, name).await,
         Cmd::Build => commands::build::run(ctx).await,
         Cmd::BuildBase { quiet } => commands::build::run_build_base(quiet).await,
+        Cmd::BuildImages { push, push_suffix, print } => {
+            commands::build::run_build_images(push, push_suffix, print).await
+        }
         Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
             commands::test_node::run(
                 ctx,

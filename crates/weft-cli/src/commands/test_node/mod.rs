@@ -1111,12 +1111,11 @@ async fn ensure_test_image(
     let tag = weft_compiler::build::node_test_image_tag(&artifact.content_hash);
 
     if !crate::images::image_present(&tag).await? {
-        eprintln!("building test image {tag}...");
         // The package rides its own label so the stale-image GC can
         // scope to "this package's older test images": every package's
         // test image shares the one scratch project id, so the project
         // label alone would make packages evict each other's images.
-        crate::commands::build::docker_build_image(
+        crate::images::docker_build(
             &tag,
             &artifact.build_context.join("Dockerfile"),
             &artifact.build_context,
@@ -1124,6 +1123,7 @@ async fn ensure_test_image(
                 format!("weft.dev/project={}", project.id()),
                 format!("weft.dev/node-test-package={package}"),
             ],
+            None,
         )
         .await?;
     }
@@ -1132,7 +1132,7 @@ async fn ensure_test_image(
     match cfg.backend {
         crate::commands::daemon::ClusterBackend::Kind => {
             if crate::commands::build::kind_available(&cfg.cluster_name).await {
-                crate::images::kind_load(&cfg.cluster_name, &tag).await?;
+                crate::images::kind_load(&cfg.cluster_name, &tag, false).await?;
             } else {
                 bail!(
                     "no running kind cluster '{}' to load {tag} onto; start it with \

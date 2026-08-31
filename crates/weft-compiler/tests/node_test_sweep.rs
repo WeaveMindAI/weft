@@ -15,7 +15,8 @@ use std::process::Command;
 use weft_catalog::FsCatalog;
 
 fn stdlib() -> FsCatalog {
-    FsCatalog::discover(&weft_catalog::stdlib_root()).expect("stdlib discovers")
+    FsCatalog::discover(&weft_catalog::stdlib_root().expect("stdlib root"))
+        .expect("stdlib discovers")
 }
 
 fn run_package(catalog: &FsCatalog, build_root: &Path, package: &str) {

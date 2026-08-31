@@ -2,61 +2,57 @@
   import { onMount } from 'svelte';
   import {
     fetchPendingTasks,
+    isTrigger,
     submitTask,
     skipTask,
     cancelRun,
+    type FormField,
     type PendingTask,
-    type ApiToken,
   } from '../../lib/api';
-
-  // ------------- Form schema types (mirror dispatcher wire shape) ----------
-  //
-  // The dispatcher serializes weft-core's `FormField` directly (camelCase).
-  // Each field carries a `fieldType` (the catalog field-type id, e.g.
-  // `text_input`, `approve_reject`), a `render` hint the consumer
-  // interprets, optional pre-fill `value`, and the source `config`. We
-  // render purely off `render.component` plus the spec-driven flags
-  // (`source`, `multiple`, `prefilled`); we never branch on `fieldType`
-  // here because that would re-bake catalog knowledge into the consumer.
-
-  interface FormFieldRender {
-    component: string;
-    source?: 'static' | 'input';
-    multiple?: boolean;
-    prefilled?: boolean;
-  }
-
-  interface FormField {
-    fieldType: string;
-    key: string;
-    label?: string;
-    render: FormFieldRender;
-    value?: unknown;
-    config?: Record<string, unknown>;
-  }
-
-  interface FormSchema {
-    fields: FormField[];
-    title?: string;
-    description?: string;
-  }
-
-  type EnrichedTask = PendingTask & {
-    _tokenConfig?: ApiToken;
-    formSchema?: FormSchema;
-  };
+  import { singleFlight } from '../../lib/single-flight';
 
   // ------------- State -------------
 
-  /// Cross-token list of pending tasks. Sorted by createdAt asc so
-  /// "next" walks chronologically.
-  let allTasks = $state<EnrichedTask[]>([]);
+  /// Cross-token list of pending tasks, in the dispatcher's order:
+  /// triggers first, then resume tasks, each group oldest-first. So
+  /// "next" walks chronologically within a group and crosses from the
+  /// trigger group into the resume group (the trigger badge on the
+  /// card marks the crossing).
+  let allTasks = $state<PendingTask[]>([]);
   /// Index into allTasks. -1 = no task selected (initial / all done).
   let currentIndex = $state(-1);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let submitting = $state(false);
-  let completed = $state(false);
+  /// The task whose submit just landed, waiting out its 800ms advance
+  /// window. TOKEN-scoped, never a bare boolean: the user can navigate
+  /// mid-window, and a boolean would paint the "Submitted" body over
+  /// whatever task happens to be on screen when the POST resolves.
+  let settlingToken = $state<string | undefined>();
+  /// Whether the card ON SCREEN is the just-submitted one.
+  const settled = $derived(
+    currentIndex >= 0 && allTasks[currentIndex]?.token === settlingToken,
+  );
+  /// The last settle emptied the list: the "no more pending tasks"
+  /// variant of the All Clear card.
+  let justFinished = $state(false);
+  /// The URL named a task that is no longer pending (a stale
+  /// notification, an old tab); the page says so instead of quietly
+  /// substituting an unrelated task.
+  let staleTaskRequested = $state(false);
+  /// Every configured runtime answered the last fetch. When false, an
+  /// absent task is NOT proven gone (its runtime may just be down or
+  /// ungranted), so the done/stale claims soften accordingly.
+  let allReached = $state(true);
+  /// How many tokens are configured at all: zero must never read as
+  /// "All Clear" (nothing was even asked).
+  let configuredCount = $state(0);
+  /// The pending advance-after-submit timer, cleared on unmount and on
+  /// any manual navigation so it can never fire against a moved list.
+  let advanceTimer: ReturnType<typeof setTimeout> | undefined;
+  /// The answered task the pending advance will drop; carried beside
+  /// the handle so a flush can run the drop it stands for.
+  let advanceToken: string | undefined;
 
   let formValues = $state<Record<string, unknown>>({});
   let buttonDecisions = $state<Record<string, boolean | null>>({});
@@ -91,65 +87,112 @@
     // return synchronously so its cleanup callback typechecks).
     void refresh();
     window.addEventListener('hashchange', onHashChange);
-    return () => window.removeEventListener('hashchange', onHashChange);
+    return () => {
+      window.removeEventListener('hashchange', onHashChange);
+      cancelAdvance();
+    };
   });
 
   function onHashChange() {
-    const tok = readHashToken();
-    if (!tok) return;
-    const idx = allTasks.findIndex((t) => t.token === tok);
-    if (idx >= 0 && idx !== currentIndex) {
-      jumpTo(idx);
-    }
+    focusToken(readHashToken());
   }
 
-  async function refresh() {
+  /// THE one place "focus the task the URL names" lives, so a miss
+  /// behaves the same whether it arrives through a refresh or a hash
+  /// edit: no token focuses the first task; a listed token jumps to
+  /// it; a missing one (a stale notification, an old tab) shows the
+  /// Already-handled / Unreachable card instead of quietly keeping or
+  /// substituting an unrelated task the user might answer by mistake
+  /// (with an empty list the same card offers Close).
+  function focusToken(tok: string | null) {
+    if (!tok) {
+      // jumpTo no-ops on an empty list, leaving no task focused.
+      jumpTo(0);
+      return;
+    }
+    const idx = allTasks.findIndex((t) => t.token === tok);
+    if (idx < 0) {
+      currentIndex = -1;
+      staleTaskRequested = true;
+      return;
+    }
+    // Already focused on this task: re-jumping would re-init the form
+    // and wipe what the user typed.
+    if (idx === currentIndex) return;
+    jumpTo(idx);
+  }
+
+  // Single-flight: a second Refresh click joins the pending fetch
+  // instead of racing it (the slower, staler response would land last
+  // and re-init the form state the user is typing into).
+  const refreshFlight = singleFlight(async () => {
     loading = true;
     error = null;
-    completed = false;
+    settlingToken = undefined;
+    justFinished = false;
+    staleTaskRequested = false;
+    // An answered task still inside its advance window is flushed out
+    // NOW: replacing the list around a pending drop would cancel it,
+    // leaving the answered task listed, re-focusable and
+    // re-submittable (on a trigger, a second run).
+    flushAdvance();
+    const focusedToken = currentTask?.token ?? null;
     try {
       const result = await fetchPendingTasks({ timeoutMs: 10000 });
-      const tasks = result.tasks as EnrichedTask[];
-      allTasks = tasks;
-
-      if (tasks.length === 0) {
-        currentIndex = -1;
-        loading = false;
-        return;
-      }
-
-      const wantedToken = readHashToken();
-      let idx = wantedToken ? tasks.findIndex((t) => t.token === wantedToken) : -1;
-      if (idx < 0) {
-        idx = 0;
-        writeHashToken(tasks[0].token);
-      }
-      jumpTo(idx);
+      allTasks = result.tasks;
+      configuredCount = result.configured.length;
+      // A task absent from the list is only PROVEN gone when every
+      // configured runtime actually answered; a failed one (down, or
+      // its host grant revoked, or answering garbage) hides its tasks
+      // without ending them, and claiming "answered elsewhere" over
+      // that would be a confident false statement about live work.
+      allReached = result.failures.length === 0;
+      // Focus by TOKEN identity across the swap: the task the user was
+      // on keeps its focus (and their typed input) wherever it landed
+      // in the new list; positional state would either wipe the form
+      // or focus a stranger at the old index.
+      currentIndex = focusedToken
+        ? allTasks.findIndex((t) => t.token === focusedToken)
+        : -1;
+      focusToken(readHashToken());
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to fetch tasks';
     } finally {
       loading = false;
     }
-  }
+  });
+  const refresh = refreshFlight.join;
 
   function jumpTo(idx: number) {
     if (idx < 0 || idx >= allTasks.length) return;
-    currentIndex = idx;
-    completed = false;
+    // The target is held by TOKEN across the flush: a pending
+    // post-submit drop must land before the list is walked (or
+    // navigating during the 800ms window would cancel it, leaving the
+    // answered task listed and re-submittable), and the drop shifts
+    // every index after it. A target that WAS the flushed task comes
+    // back -1, and the drop's own advance already focused its
+    // neighbour, so nothing more to do.
+    const target = allTasks[idx].token;
+    flushAdvance();
+    const at = allTasks.findIndex((t) => t.token === target);
+    if (at < 0) return;
+    currentIndex = at;
+    justFinished = false;
     error = null;
-    const task = allTasks[idx];
-    writeHashToken(task.token);
-    initFormState(task);
+    staleTaskRequested = false;
+    writeHashToken(target);
+    initFormState(allTasks[at]);
   }
 
-  function initFormState(t: EnrichedTask) {
+  function initFormState(t: PendingTask) {
     const fields = t.formSchema?.fields ?? [];
     const vals: Record<string, unknown> = {};
     const decisions: Record<string, boolean | null> = {};
     for (const f of fields) {
       if (!f.key) continue;
+      // `render` is non-nullable on the wire (the runtime refuses a
+      // field without one at build time).
       const r = f.render;
-      if (!r) continue;
       if (r.component === 'buttons') decisions[f.key] = null;
       else if (r.component === 'select' && r.multiple) vals[f.key] = [];
       else if ((r.component === 'textarea' || r.component === 'text') && r.prefilled)
@@ -163,11 +206,20 @@
   function isFormValid(): boolean {
     if (!currentTask?.formSchema) return true;
     for (const f of currentTask.formSchema.fields) {
-      if (!f.key || !f.render) continue;
+      if (!f.key) continue;
       if (f.render.component === 'buttons' && buttonDecisions[f.key] === null) return false;
     }
     return true;
   }
+
+  /// THE one answer to "may submit fire right now", for the button
+  /// and the Ctrl+Enter path alike: two copies once let held-down
+  /// key auto-repeat re-submit an already-settled task (a second
+  /// POST, which for a trigger STARTS A SECOND RUN) because only the
+  /// button's copy checked the settled state.
+  const canSubmit = $derived(
+    !!currentTask && !submitting && !settled && isFormValid(),
+  );
 
   // ------------- Submit / cancel / dismiss / advance -------------
 
@@ -193,27 +245,99 @@
       // The runner doesn't branch by taskType anymore.
       await submitTask(t, inputPayload);
 
-      completed = true;
-      setTimeout(() => advanceAfterSubmit(), 800);
+      // Identity captured NOW: the user can navigate during the 800ms
+      // pause, and dropping "whatever is at the current index by then"
+      // once deleted an unanswered neighbour instead.
+      settlingToken = t.token;
+      armAdvance(t.token);
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to submit';
+      // Named, because the user may have navigated while the POST was
+      // in flight: a bare "Failed to submit" would read as being
+      // about whatever card is on screen now.
+      const detail = e instanceof Error ? e.message : String(e);
+      error = `Failed to submit '${t.title}': ${detail}`;
     } finally {
       submitting = false;
     }
   }
 
-  function advanceAfterSubmit() {
-    // Remove the submitted task from local state. The next task
-    // shifts into our current index naturally.
-    const newTasks = allTasks.filter((_, i) => i !== currentIndex);
-    allTasks = newTasks;
-    if (newTasks.length === 0) {
-      currentIndex = -1;
-      completed = true;
+  /// The ONLY writer of the advance state, with `flushAdvance` and
+  /// `cancelAdvance`: arming always flushes any pending one first, so
+  /// there can never be two live timers (an overwritten handle once
+  /// left a stray timer firing 800ms later against a list that had
+  /// moved).
+  function armAdvance(token: string) {
+    flushAdvance();
+    advanceTimer = setTimeout(() => settleTask(token), 800);
+    advanceToken = token;
+  }
+
+  /// A pending advance runs NOW instead of in 800ms: the answered
+  /// task's removal is a fact, and anything about to move the list
+  /// (navigation, a refresh) must see it landed, never cancel it.
+  function flushAdvance() {
+    if (advanceTimer === undefined) return;
+    clearTimeout(advanceTimer);
+    advanceTimer = undefined;
+    const token = advanceToken;
+    advanceToken = undefined;
+    if (token !== undefined) settleTask(token);
+  }
+
+  /// Unmount only: the page is going away, nothing left to keep true.
+  function cancelAdvance() {
+    if (advanceTimer !== undefined) {
+      clearTimeout(advanceTimer);
+      advanceTimer = undefined;
+      advanceToken = undefined;
+    }
+  }
+
+  /// The task is settled here (answered, skipped, or its run
+  /// cancelled): a resume task leaves the local list (by token, never
+  /// by position); a fired TRIGGER stays, back to a ready-to-fire
+  /// card, because it can be fired again (the dispatcher keeps
+  /// listing it, and a runner claiming it is gone would contradict
+  /// the popup). Clears any advance armed for it, so a natural timer
+  /// fire leaves no stale record behind. Focus only moves when the
+  /// settled task WAS the focused one; a user who navigated away
+  /// mid-window keeps their place (and their typed input).
+  function settleTask(token: string) {
+    // Only THIS task's pending advance is cleared: settling B while
+    // A's timer runs (skip B inside A's 800ms window) must leave A's
+    // advance live, or A stays listed and re-submittable.
+    if (advanceToken === token) {
+      if (advanceTimer !== undefined) clearTimeout(advanceTimer);
+      advanceTimer = undefined;
+      advanceToken = undefined;
+    }
+    if (settlingToken === token) settlingToken = undefined;
+    const idx = allTasks.findIndex((t) => t.token === token);
+    if (idx < 0) return;
+    const task = allTasks[idx];
+    if (isTrigger(task)) {
+      if (currentIndex === idx) initFormState(task);
       return;
     }
-    const nextIdx = Math.min(currentIndex, newTasks.length - 1);
-    jumpTo(nextIdx);
+    const wasFocused = currentIndex === idx;
+    const remaining = allTasks.filter((t) => t.token !== token);
+    allTasks = remaining;
+    if (remaining.length === 0) {
+      currentIndex = -1;
+      justFinished = true;
+      // The hash still names the settled task; left in place, the
+      // next refresh would read it, miss, and claim "answered
+      // elsewhere" over a plain all-done.
+      history.replaceState(null, '', '#/');
+      return;
+    }
+    if (wasFocused) {
+      jumpTo(Math.min(idx, remaining.length - 1));
+    } else if (currentIndex > idx) {
+      // The removal shifted everything after it down one; keep the
+      // SAME task focused without re-initing its form.
+      currentIndex -= 1;
+    }
   }
 
   /// Skip = resume this lane with null. Sibling tasks of the
@@ -221,9 +345,16 @@
   async function handleSkip() {
     const t = currentTask;
     if (!t) return;
+    if (isTrigger(t)) {
+      // "Skipping" a trigger would FIRE it (a null answer starts a
+      // run); the button is hidden for triggers, and this guard keeps
+      // any other path equally unable to do it by accident.
+      error = 'A trigger has no run to skip; use Fire to start one.';
+      return;
+    }
     try {
       await skipTask(t);
-      advanceAfterSubmit();
+      settleTask(t.token);
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to skip';
     }
@@ -234,10 +365,16 @@
   async function handleCancelRun() {
     const t = currentTask;
     if (!t) return;
+    if (isTrigger(t)) {
+      // "Cancelling" a trigger would delete the project's ENTRY POINT
+      // (the signal itself), not stop a run; same gate as the button.
+      error = 'A trigger has no run to cancel.';
+      return;
+    }
     if (!confirm('Cancel the entire run? Every related task will be dropped and the execution will be marked failed.')) return;
     try {
       await cancelRun(t);
-      advanceAfterSubmit();
+      settleTask(t.token);
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to cancel run';
     }
@@ -254,9 +391,9 @@
   }
 
   function getOptions(field: FormField): string[] {
-    if (field.render?.source === 'input')
+    if (field.render.source === 'input')
       return Array.isArray(field.value) ? (field.value as string[]) : [];
-    return (field.config?.options as string[]) ?? [];
+    return (field.config.options as string[]) ?? [];
   }
 
   function fmt(value: unknown): string {
@@ -281,7 +418,7 @@
       jumpTo(currentIndex + 1);
     } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
       e.preventDefault();
-      if (currentTask && !submitting && isFormValid()) submitForm();
+      if (canSubmit) submitForm();
     }
   }
 </script>
@@ -311,7 +448,7 @@
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>
       </button>
       <div class="spacer"></div>
-      <button class="nav-btn" onclick={refresh} title="Refresh" aria-label="Refresh">
+      <button class="nav-btn" onclick={refresh} disabled={loading} title="Refresh" aria-label="Refresh">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/>
         </svg>
@@ -338,17 +475,52 @@
             <button class="btn btn-secondary" onclick={refresh}>Retry</button>
           </div>
         </div>
-      {:else if completed && allTasks.length === 0}
+      {:else if configuredCount === 0}
+        <!-- Nothing was even asked: an "All Clear" here (from a
+             notification on a since-removed token, or a bookmarked
+             tab) would claim everything is answered when nothing is
+             connected. -->
         <div class="card">
-          <div class="card-header"><div class="dot success"></div><span class="card-title">All Clear</span></div>
+          <div class="card-header"><div class="dot error"></div><span class="card-title">Not connected</span></div>
           <div class="card-body center">
-            <div class="check-icon">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><path d="M22 4L12 14.01l-3-3"/></svg>
-            </div>
-            <p class="big-msg">No more pending tasks</p>
-            <button class="btn btn-secondary" style="margin-top: 16px" onclick={() => window.close()}>Close</button>
+            <p class="big-msg">No tokens configured</p>
+            <p class="hint">Add a token in the extension popup to connect this page to your WeaveMind projects.</p>
+            <button class="btn btn-secondary" style="margin-top: 16px" onclick={refresh}>Refresh</button>
           </div>
         </div>
+      {:else if staleTaskRequested}
+        <div class="card">
+          {#if allReached}
+            <div class="card-header"><div class="dot success"></div><span class="card-title">Already handled</span></div>
+            <div class="card-body center">
+              <p class="big-msg">That task is no longer pending</p>
+              <p class="hint">It was answered elsewhere, or its run ended.</p>
+              {#if allTasks.length > 0}
+                {@render showPendingButton()}
+              {:else}
+                <button class="btn btn-secondary" style="margin-top: 16px" onclick={() => window.close()}>Close</button>
+              {/if}
+            </div>
+          {:else}
+            <!-- An unreached runtime hides its tasks without ending
+                 them; claiming "answered" here would be a confident
+                 false statement about live work. -->
+            <div class="card-header"><div class="dot error"></div><span class="card-title">Runtime unreachable</span></div>
+            <div class="card-body center">
+              <p class="big-msg">Could not reach every runtime</p>
+              <p class="hint">This task may still be pending; its runtime did not answer (down, or its host access was turned off in the popup's settings).</p>
+              <button class="btn btn-secondary" style="margin-top: 16px" onclick={refresh}>Retry</button>
+              {#if allTasks.length > 0}
+                <!-- Retry can stay futile forever (a decommissioned
+                     runtime); the tasks that DID load must stay
+                     reachable from here. -->
+                {@render showPendingButton()}
+              {/if}
+            </div>
+          {/if}
+        </div>
+      {:else if justFinished && allTasks.length === 0}
+        {@render allClearCard(true)}
       {:else if currentTask}
         <div class="card">
           <div class="card-header">
@@ -361,16 +533,27 @@
               {#if currentTask._tokenConfig}
                 <span class="token-pill">{currentTask._tokenConfig.name}</span>
               {/if}
+              {#if isTrigger(currentTask)}
+                <!-- The walk crosses from resume tasks into triggers;
+                     the badge is what says "firing this STARTS a run"
+                     rather than answering one. -->
+                <span class="trigger-pill">Trigger: firing starts a new run</span>
+              {/if}
             </div>
           </div>
 
-          {#if completed}
+          {#if settled}
             <div class="card-body center">
               <div class="check-icon green">
                 <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
               </div>
-              <p class="big-msg">Submitted</p>
-              <p class="hint">Advancing to the next task...</p>
+              {#if isTrigger(currentTask)}
+                <p class="big-msg">Fired</p>
+                <p class="hint">A run started; the trigger stays and can be fired again.</p>
+              {:else}
+                <p class="big-msg">Submitted</p>
+                <p class="hint">Advancing to the next task...</p>
+              {/if}
             </div>
           {:else}
             <div class="card-body">
@@ -381,7 +564,7 @@
               {#if currentTask.formSchema}
                 {#each currentTask.formSchema.fields as field}
                   {@const r = field.render}
-                  {#if r?.component === 'readonly'}
+                  {#if r.component === 'readonly'}
                     <div class="field">
                       <p class="field-key">{field.label || field.key}</p>
                       {#if isComplex(field.value)}
@@ -390,7 +573,7 @@
                         <p class="readonly-line">{fmt(field.value) || '(empty)'}</p>
                       {/if}
                     </div>
-                  {:else if r?.component === 'image'}
+                  {:else if r.component === 'image'}
                     {@const imgSrc = typeof field.value === 'string' ? field.value : ((field.value as Record<string, unknown>)?.url as string | undefined)}
                     <div class="field">
                       <p class="field-key">{field.label || field.key}</p>
@@ -400,7 +583,7 @@
                         <p class="field-empty">(no image)</p>
                       {/if}
                     </div>
-                  {:else if r?.component === 'buttons'}
+                  {:else if r.component === 'buttons'}
                     {@const decision = buttonDecisions[field.key]}
                     <div class="field">
                       <p class="field-key">{field.label || field.key}</p>
@@ -408,14 +591,14 @@
                         <button
                           class="decision-btn {decision === false ? 'reject-active' : 'reject-idle'}"
                           onclick={() => { buttonDecisions = { ...buttonDecisions, [field.key]: false }; }}
-                        >{(field.config?.rejectLabel as string) || 'Reject'}</button>
+                        >{(field.config.rejectLabel as string) || 'Reject'}</button>
                         <button
                           class="decision-btn {decision === true ? 'approve-active' : 'approve-idle'}"
                           onclick={() => { buttonDecisions = { ...buttonDecisions, [field.key]: true }; }}
-                        >{(field.config?.approveLabel as string) || 'Approve'}</button>
+                        >{(field.config.approveLabel as string) || 'Approve'}</button>
                       </div>
                     </div>
-                  {:else if r?.component === 'select'}
+                  {:else if r.component === 'select'}
                     {@const options = getOptions(field)}
                     {#if r.multiple}
                       {@const selected = (formValues[field.key] as string[]) ?? []}
@@ -445,24 +628,24 @@
                         </div>
                       </div>
                     {/if}
-                  {:else if r?.component === 'text'}
+                  {:else if r.component === 'text'}
                     <div class="field">
                       <p class="field-key">{field.label || field.key}</p>
                       <input
                         type="text"
                         class="text-input"
-                        placeholder={(field.config?.placeholder as string) ?? ''}
+                        placeholder={(field.config.placeholder as string) ?? ''}
                         value={(formValues[field.key] as string) ?? ''}
                         oninput={(e) => { formValues = { ...formValues, [field.key]: e.currentTarget.value }; }}
                       />
                     </div>
-                  {:else if r?.component === 'textarea'}
+                  {:else if r.component === 'textarea'}
                     <div class="field">
                       <p class="field-key">{field.label || field.key}</p>
                       <textarea
                         class="text-input"
                         rows={r.prefilled ? 6 : 3}
-                        placeholder={(field.config?.placeholder as string) ?? ''}
+                        placeholder={(field.config.placeholder as string) ?? ''}
                         value={(formValues[field.key] as string) ?? ''}
                         oninput={(e) => { formValues = { ...formValues, [field.key]: e.currentTarget.value }; }}
                       ></textarea>
@@ -474,39 +657,54 @@
                   <button
                     class="btn btn-primary"
                     onclick={submitForm}
-                    disabled={submitting || !isFormValid()}
+                    disabled={!canSubmit}
                     title="Ctrl+Enter"
                   >
                     {#if submitting}
                       <span class="spinner-small"></span>
                     {:else}
-                      Submit
+                      {isTrigger(currentTask) ? 'Fire' : 'Submit'}
                     {/if}
                   </button>
-                  <button
-                    class="btn btn-secondary"
-                    onclick={handleSkip}
-                    title="Skip: answer this task with null. The rest of the run continues."
-                  >
-                    Skip
-                  </button>
-                  <button
-                    class="btn btn-danger"
-                    onclick={handleCancelRun}
-                    title="Cancel run: kill this whole execution. Every related task is dropped and the run is marked failed (still inspectable in the journal)."
-                  >
-                    Cancel run
-                  </button>
+                  <!-- Skip and Cancel-run act on an IN-FLIGHT run,
+                       which a trigger does not have: "skipping" a
+                       trigger would fire it (starting a run) and
+                       "cancelling" it would delete the project's
+                       entry point. Same gate as the popup's. -->
+                  {#if !isTrigger(currentTask)}
+                    <button
+                      class="btn btn-secondary"
+                      onclick={handleSkip}
+                      title="Skip: answer this task with null. The rest of the run continues."
+                    >
+                      Skip
+                    </button>
+                    <button
+                      class="btn btn-danger"
+                      onclick={handleCancelRun}
+                      title="Cancel run: kill this whole execution. Every related task is dropped and the run is marked failed (still inspectable in the journal)."
+                    >
+                      Cancel run
+                    </button>
+                  {/if}
                 </div>
               {:else}
                 <p class="hint center-text">No form fields configured for this task.</p>
                 <div class="action-row">
-                  <button class="btn btn-secondary" onclick={handleSkip}>
-                    Skip
-                  </button>
-                  <button class="btn btn-danger" onclick={handleCancelRun}>
-                    Cancel run
-                  </button>
+                  {#if isTrigger(currentTask)}
+                    <!-- A form-less trigger still fires (an empty
+                         payload starts the run). -->
+                    <button class="btn btn-primary" onclick={submitForm} disabled={!canSubmit}>
+                      Fire
+                    </button>
+                  {:else}
+                    <button class="btn btn-secondary" onclick={handleSkip}>
+                      Skip
+                    </button>
+                    <button class="btn btn-danger" onclick={handleCancelRun}>
+                      Cancel run
+                    </button>
+                  {/if}
                 </div>
               {/if}
             </div>
@@ -514,17 +712,45 @@
         </div>
         <p class="task-id-foot">Task ID: {currentTask.token.slice(0, 8)}...</p>
       {:else}
-        <div class="card">
-          <div class="card-header"><div class="dot success"></div><span class="card-title">All Clear</span></div>
-          <div class="card-body center">
-            <p class="big-msg">No pending tasks</p>
-            <button class="btn btn-secondary" style="margin-top: 16px" onclick={refresh}>Refresh</button>
-          </div>
-        </div>
+        {@render allClearCard(false)}
       {/if}
     </div>
   </div>
 </div>
+
+<!-- The escape hatch to the tasks that DID load, shared by both stale
+     cards so the two cannot drift. -->
+{#snippet showPendingButton()}
+  <button class="btn btn-primary" style="margin-top: 16px" onclick={() => { staleTaskRequested = false; jumpTo(0); }}>
+    Show the {allTasks.length === 1 ? 'pending task' : `first of ${allTasks.length} pending tasks`}
+  </button>
+{/snippet}
+
+<!-- The one All Clear card. `afterSettle` (a distinct name from the
+     `justFinished` state that FEEDS it, so neither shadows the other)
+     is the post-submit variant: checkmark, "no more", Close; the
+     plain variant is the empty landing (Refresh). -->
+{#snippet allClearCard(afterSettle: boolean)}
+  <div class="card">
+    <div class="card-header"><div class="dot success"></div><span class="card-title">All Clear</span></div>
+    <div class="card-body center">
+      {#if afterSettle}
+        <div class="check-icon">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><path d="M22 4L12 14.01l-3-3"/></svg>
+        </div>
+      {/if}
+      <p class="big-msg">{afterSettle ? 'No more pending tasks' : 'No pending tasks'}</p>
+      {#if !allReached}
+        <p class="hint">Some runtimes did not answer, so more may be waiting there.</p>
+      {/if}
+      {#if afterSettle}
+        <button class="btn btn-secondary" style="margin-top: 16px" onclick={() => window.close()}>Close</button>
+      {:else}
+        <button class="btn btn-secondary" style="margin-top: 16px" onclick={refresh}>Refresh</button>
+      {/if}
+    </div>
+  </div>
+{/snippet}
 
 <style>
   /* Full-tab page sizing. Scoped via `:global()` so the rules
@@ -532,12 +758,12 @@
      the shared `app-*.css` chunk vite builds across entries.
      Without this, the popup's own html/body sizing wins in the
      shared chunk and clamps the task page to 340px. */
+  /* Background comes from lib/reset.css (shared by both entries). */
   :global(html), :global(body) {
     margin: 0;
     padding: 0;
     width: 100%;
     min-height: 100vh;
-    background: #fafafa;
   }
   :global(#app) {
     width: 100%;
@@ -662,6 +888,20 @@
     font-weight: 500;
     background: #f4f4f5;
     color: #52525b;
+    padding: 2px 8px;
+    border-radius: 999px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .trigger-pill {
+    align-self: flex-start;
+    margin-top: 4px;
+    font-size: 10px;
+    font-weight: 500;
+    background: #fffbeb;
+    border: 1px solid #f59e0b;
+    color: #92400e;
     padding: 2px 8px;
     border-radius: 999px;
     text-transform: uppercase;

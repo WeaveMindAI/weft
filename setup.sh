@@ -10,20 +10,53 @@
 #   - VS Code extension    (compile, package .vsix, install into VS Code)
 #
 # The browser extension is OPT-IN via `--browser` since rebuilding
-# it bumps versions and signs Firefox, which is heavier than most
-# rebuild loops need.
+# it signs Firefox and builds every target, which is heavier than
+# most rebuild loops need.
+#
+# Prebuilt artifacts: on a CLEAN checkout of a commit CI has already
+# built (the rolling `mvp-latest` release), the CLI binary and the
+# .vsix are downloaded instead of compiled and the daemon images are
+# pulled from the registry, so a fresh install needs no Rust or Node
+# toolchain and takes minutes, not tens of minutes. Any local change
+# at all, tracked or not, takes the build path for everything (the
+# published artifacts are keyed to one exact commit).
 #
 # Component flags pick a subset (multiple combine):
 #   --cli         build CLI only
 #   --daemon      refresh daemon only
 #   --vscode      build/install VS Code extension only
-#   --browser     build browser extension only (bumps, signs, zips)
+#   --browser     build browser extension only (signs, zips)
 #   (e.g. --cli --daemon does both, skips the VS Code extension)
 #
+# Extension release gesture:
+#   --bump        bump the version of the extensions this run builds
+#                 (the VS Code extension on the default install and
+#                 --vscode; the browser extension with --browser). The
+#                 version is what makes CI publish the pushed build to
+#                 the stores (VS Code Marketplace, Open VSX, Chrome,
+#                 Firefox, Edge), so this is the deliberate "release
+#                 the extension" switch; a plain rebuild never bumps.
+#
 # Default-on knobs you opt OUT of:
-#   --no-bump     skip the browser-extension version bump
 #   --no-sign     skip the Firefox AMO signing step
-#   --no-daemon   skip the daemon refresh (when CLI is being built)
+#   --no-daemon   skip the daemon refresh on a default install (it does
+#                 not combine with the component flags, which already
+#                 pick what runs)
+#
+# Escape hatch:
+#   --from-source compile the CLI and the VS Code extension locally
+#                 even when a published build matches this checkout
+#                 (for when a published artifact turns out broken).
+#                 The daemon images still pull from the registry when
+#                 their content matches; add --rebuild to rebuild them
+#                 locally too.
+#
+# Diagnostics:
+#   An install writes a START line and a DONE/FAIL line (with the
+#   section it died in) to ~/.local/share/weft/setup-runs.log. A run
+#   refused on its arguments records only the FAIL; a --purge deletes
+#   the journal along with the rest of the directory, so the next
+#   install starts a fresh one.
 #
 # Public trigger surface (event triggers delivered BY providers):
 #   --public-url    expose /events/... and /signal/... to the internet
@@ -74,26 +107,27 @@
 #                 the CLI symlink. PRESERVES: kind cluster,
 #                 postgres data, the object-store container + its
 #                 data volume, docker images, BuildKit cache,
-#                 cargo target/, image-hash stamps, browser
+#                 cargo target/, manifest stamps, browser
 #                 extensions. Reinstall via ./setup.sh and your
 #                 projects + history come back instantly.
 #   --purge       TRUE clean slate. Deletes the kind cluster (and
 #                 the `kind` docker network once no clusters
 #                 remain), every weft-built docker image
-#                 (dispatcher, listener, every weft-worker-*),
+#                 (dispatcher, listener, every weft-worker),
 #                 every weft infra image, the object-store
 #                 container + data volume + seaweedfs image, the
 #                 BuildKit cache, the workspace target/ cargo
 #                 cache, ~/.local/share/weft (THE DATABASE'S FILES
-#                 under postgres-data/, image-hash stamps,
-#                 port-forward state), and every extension
-#                 build artifact. The next install pays a full
-#                 cold-rebuild cost. Can combine with --uninstall.
+#                 under postgres-data/, manifest stamps, prebuilt
+#                 binaries, port-forward state), and the untracked
+#                 extension build artifacts. The next install pays a
+#                 full cold-rebuild cost. Can combine with --uninstall.
 #
 #                 SHARED base images (commonly reused by other
 #                 docker projects on the host) are kept by default.
 #                 Add the matching flag to remove them too:
-#                   --postgres   remove postgres:18-alpine
+#                   --postgres   remove postgres:18-alpine (and the
+#                                postgres:18 image --migration pulls)
 #                   --kind       remove kindest/node images
 #                   --debian     remove debian:bookworm-slim
 #
@@ -134,7 +168,6 @@ if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then
   C_GREEN=$'\033[32m'
   C_YELLOW=$'\033[33m'
   C_BLUE=$'\033[34m'
-  C_MAGENTA=$'\033[35m'
   C_CYAN=$'\033[36m'
   HAS_TTY=1
 else
@@ -145,7 +178,6 @@ else
   C_GREEN=""
   C_YELLOW=""
   C_BLUE=""
-  C_MAGENTA=""
   C_CYAN=""
   HAS_TTY=0
 fi
@@ -179,22 +211,25 @@ warn() { printf '  %s%s%s %s\n' "${C_YELLOW}" "${SYM_WARN}" "${C_RESET}" "$*"; }
 # user sees what went wrong. Plain echo fallback when no TTY.
 spin() {
   local label="$1"; shift
+  # One per-run mktemp log on BOTH branches: a fixed /tmp name would
+  # let two concurrent runs interleave and delete each other's output
+  # (and hand any local user a symlink-overwrite seat).
+  local logfile
+  logfile="$(mktemp -t weft-setup.XXXXXX.log)"
   if [[ $HAS_TTY -eq 0 ]]; then
     printf '  %s %s\n' "${SYM_STEP}" "${label}"
-    if "$@" >/tmp/weft-setup-spin.log 2>&1; then
+    if "$@" >"${logfile}" 2>&1; then
       ok "${label}"
-      rm -f /tmp/weft-setup-spin.log
+      rm -f "${logfile}"
       return 0
     else
       local rc=$?
       fail "${label}"
-      cat /tmp/weft-setup-spin.log >&2 || true
-      rm -f /tmp/weft-setup-spin.log
+      cat "${logfile}" >&2 || true
+      rm -f "${logfile}"
       return $rc
     fi
   fi
-  local logfile
-  logfile="$(mktemp -t weft-setup.XXXXXX.log)"
   "$@" >"${logfile}" 2>&1 &
   local pid=$!
   local i=0
@@ -233,6 +268,165 @@ spin_passthrough() {
     fail "${label}"
     return $rc
   fi
+}
+
+# Portable sha256 (GNU sha256sum on Linux, shasum on macOS), same
+# output format either way. `sha256_bin` is the underlying COMMAND for
+# the call sites that go through xargs, which cannot invoke a shell
+# function; expand it unquoted there so the shasum form keeps its args.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_bin="sha256sum"
+else
+  sha256_bin="shasum -a 256"
+fi
+sha256() {
+  ${sha256_bin} "$@"
+}
+
+# IDs of host docker images whose repo, with any registry prefix
+# stripped, matches the anchored regex. Content-addressed tags mean
+# the repo is the only stable part of a ref, and the system images +
+# builder base are registry-qualified (ghcr.io/...) while workers and
+# node-test images stay bare, so every sweep matches through this one
+# helper instead of hand-rolling the strip.
+weft_image_ids() {
+  # Returns non-zero when `docker images` itself fails (pipefail
+  # carries it through the pipeline): an unanswerable daemon must
+  # never read as "no images", so every caller decides what a failed
+  # listing means instead of receiving a silent empty.
+  docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
+    | awk -v re="$1" '{repo=$1; sub(/^.*\//,"",repo); if (repo ~ re) print $2}' \
+    | sort -u
+}
+# The images an ENGINE change strands (workers + builder base + the
+# node-test image bake the engine in).
+build_plane_repos_re='^(weft-worker|weft-builder-base|weft-node-tests)$'
+
+# Remove one docker object (image | container | volume) if it is
+# there. THE one removal shape, so absence always reads as absence, a
+# stuck removal as a warning, and neither ever prints as success.
+# Callers gate on the daemon being reachable; this assumes it is.
+remove_docker_object() { # kind ref [note]
+  local kind="$1" ref="$2" note="${3:-}"
+  if ! docker "${kind}" inspect "${ref}" >/dev/null 2>&1; then
+    hint "${ref}: not present${note}"
+    return 0
+  fi
+  if docker "${kind}" rm -f "${ref}" >/dev/null 2>&1; then
+    ok "removed ${ref}${note}"
+  else
+    warn "could not remove ${ref} (still in use?)"
+  fi
+}
+
+# Remove a directory tree and report: ok exactly when it is gone,
+# warn when something survived. ONE shape for every best-effort tree
+# removal, so partial removals never print as success.
+remove_dir_reporting() { # path label [ok_note] [fail_note]
+  local path="$1" label="$2" ok_note="${3:-}" fail_note="${4:-}"
+  if [[ ! -e "${path}" ]]; then
+    hint "no ${label} to remove"
+    return 0
+  fi
+  rm -rf "${path}" 2>/dev/null || true
+  if [[ -e "${path}" ]]; then
+    warn "could not remove ${label} (permissions?)${fail_note}"
+  else
+    ok "removed ${label}${ok_note}"
+  fi
+}
+
+# Its sibling for a SET of image ids (from `weft_image_ids` or a
+# `docker images -q` listing): one shape for "remove these, say what
+# happened", so every multi-image sweep reports the same way.
+remove_docker_images_by_id() { # label ids [note] [warn_reason]
+  local label="$1" ids="$2" note="${3:-}" reason="${4:-still referenced by a container?}"
+  if [[ -z "${ids}" ]]; then
+    hint "no ${label} to remove"
+  elif echo "${ids}" | xargs docker rmi -f >/dev/null 2>&1; then
+    ok "removed ${label}${note}"
+  else
+    warn "some ${label} could not be removed (${reason})"
+  fi
+}
+
+# Drop everything an engine change strands: the tagged build-plane
+# images on host docker and inside the kind node, the BuildKit cache
+# (the cargo layers of worker/infra/test builds all bake the engine, so
+# a bounded prune would keep 20GB of dead weight), and the node-test
+# cargo cache under target/tmp. Best effort throughout: a --cli install
+# must finish even with the docker daemon down; the loud bounded prune
+# earlier in the CLI section is the one that fails visibly. Best-effort
+# still SPEAKS: a removal that could not happen warns instead of
+# printing success over it.
+sweep_stale_build_plane() {
+  # One probe up front: with docker down, every docker step below
+  # would either lie ("no X to remove" over an unanswerable daemon) or
+  # repeat the same warn. Say it once and keep the non-docker cleanup.
+  local docker_up=1
+  docker version --format '{{.Server.Version}}' >/dev/null 2>&1 || docker_up=0
+  if [[ ${docker_up} -eq 0 ]]; then
+    warn "docker unreachable; the stale build-plane images (host docker and the kind node's containerd) and the BuildKit cache stay until the next install with docker up"
+    remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
+      " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
+    return 0
+  fi
+  local ids
+  if ids="$(weft_image_ids "${build_plane_repos_re}")"; then
+    remove_docker_images_by_id "stale build-plane images" "${ids}" \
+      " ${C_DIM}(weft-worker / weft-builder-base / weft-node-tests, host docker)${C_RESET}" \
+      "still referenced by a container? they go on a later install"
+  else
+    # The daemon answered the probe above but not this listing: never
+    # turn that into "nothing to remove".
+    warn "could not list the stale build-plane images; they go on a later install"
+  fi
+  if docker builder prune --force >/dev/null 2>&1; then
+    ok "dropped the BuildKit cache (stale against the new engine)"
+  else
+    warn "could not prune the BuildKit cache; it still holds entries built against the old engine (prune it by hand: docker builder prune --force)"
+  fi
+  remove_dir_reporting "${here}/target/tmp" "${C_DIM}target/tmp${C_RESET}" \
+    " ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}" "; it goes on a later install"
+  if command -v kind >/dev/null 2>&1; then
+    local kind_node="" cluster node tags
+    for cluster in $(kind get clusters 2>/dev/null); do
+      node="${cluster}-control-plane"
+      if docker inspect "${node}" >/dev/null 2>&1; then
+        kind_node="${node}"
+        break
+      fi
+    done
+    if [[ -n "${kind_node}" ]]; then
+      # `crictl images` lists repo and tag as separate columns; the
+      # repo may carry a registry prefix, stripped the same way
+      # `weft_image_ids` strips it.
+      tags="$(
+        docker exec "${kind_node}" crictl images 2>/dev/null \
+          | awk -v re="${build_plane_repos_re}" \
+              'NR>1 {repo=$1; sub(/^.*\//,"",repo); if (repo ~ re) print $1":"$2}' \
+          | sort -u || true
+      )"
+      if [[ -n "${tags}" ]]; then
+        # shellcheck disable=SC2086
+        if docker exec "${kind_node}" crictl rmi ${tags} >/dev/null 2>&1; then
+          ok "removed cached weft-worker + weft-builder-base + weft-node-tests images in kind containerd"
+        else
+          warn "some cached build-plane images in kind containerd could not be removed (a pod still runs one?); they go on a later install"
+        fi
+      fi
+    fi
+  fi
+}
+
+# The installed version of the weft extension, queried through a live
+# IPC socket (so it reflects that VS Code window, not some global
+# registry). Empty if not installed. Shared by the install and the
+# uninstall side, so neither can claim work the other can disprove.
+installed_ext_version() {
+  local sock="$1"
+  VSCODE_IPC_HOOK_CLI="${sock}" code --list-extensions --show-versions 2>/dev/null \
+    | sed -n "s/^${ext_id//./\\.}@//p" | head -n1
 }
 
 # Print the path of a LIVE VS Code IPC socket under /run/user/$UID (closed
@@ -276,8 +470,7 @@ purge_postgres=0
 # Components: 0 = excluded, 1 = included. The default install set
 # is CLI + daemon + VS Code extension. The browser extension is
 # OPT-IN via --browser since it's heavier (extension store sign,
-# version bump, full per-target build) and most rebuild loops
-# don't need it.
+# full per-target build) and most rebuild loops don't need it.
 #
 # When the user passes any --<component> we flip every component
 # to 0 first so the listed flags act as opt-ins.
@@ -287,6 +480,7 @@ public_url_flag=""
 build_vscode=1
 build_browser=0
 component_flag_seen=0
+no_daemon_seen=0
 
 # Browser-target subset: same logic as components.
 target_chrome=1
@@ -296,9 +490,16 @@ target_opera=1
 target_safari=1
 target_flag_seen=0
 
-# Negation flags
-do_bump=1
+# The extension versions in package.json are what gate the STORE
+# publishes in CI (a pushed commit whose version moved gets submitted
+# to the VS Code Marketplace / Open VSX / Chrome / Firefox / Edge), so
+# bumping is the deliberate release gesture (--bump), never a side
+# effect of a rebuild.
+do_bump=0
 do_sign=1
+# --from-source: refuse the prebuilt CLI/.vsix fast path and compile
+# locally (the escape hatch when a published binary is broken).
+from_source=0
 
 # Called the first time a --<component> flag is seen. Zeroes every
 # component so subsequent flags act as opt-ins. No-op after the
@@ -335,23 +536,44 @@ targets_flip() {
 # entered, so a partial run names where it stopped.
 run_log_dir="${HOME}/.local/share/weft"
 run_log="${run_log_dir}/setup-runs.log"
-mkdir -p "${run_log_dir}"
+# Best-effort at both ends: the journal is a diagnostic aid, and a
+# root-owned ~/.local/share/weft (docker can auto-create such entries)
+# must not hard-kill the very install that would explain it.
+if ! mkdir -p "${run_log_dir}" 2>/dev/null || ! { : >> "${run_log}"; } 2>/dev/null; then
+  run_log=/dev/null
+  warn "cannot write the run journal under ${run_log_dir}; continuing without it"
+fi
 current_section="(argument parsing)"
-printf '%s START tree=%s args=[%s]\n' \
-  "$(date '+%Y-%m-%d %H:%M:%S')" "${here}" "${orig_args}" >> "${run_log}"
+# The exit code arrives as $1: a composite trap (`cleanup; log_run_exit`)
+# would otherwise have $? read the CLEANUP's status and journal a died
+# run as `DONE ok`.
+# One entry per tracked package.json --bump has already moved this
+# run (--vscode --browser --bump moves two): a failure AFTER a bump
+# must name every version that moved, or a re-run with the same flags
+# bumps a second time (and the version is what CI turns into a store
+# release).
+bump_pending_notes=()
 log_run_exit() {
-  local code=$?
+  local code="${1:-$?}"
   if [[ ${code} -eq 0 ]]; then
     printf '%s DONE  ok\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "${run_log}"
   else
     printf '%s FAIL  exit=%s in section %s\n' \
       "$(date '+%Y-%m-%d %H:%M:%S')" "${code}" "${current_section}" >> "${run_log}"
-    printf '  %s%s%s this run FAILED in %s%s%s; the install is incomplete (journal: %s)\n' \
+    local journal_note=""
+    [[ "${run_log}" != /dev/null ]] && journal_note=" (journal: ${run_log})"
+    printf '  %s%s%s this run FAILED in %s%s%s; the install is incomplete%s\n' \
       "${C_RED}" "${SYM_FAIL}" "${C_RESET}" "${C_BOLD}" "${current_section}" "${C_RESET}" \
-      "${run_log}" >&2
+      "${journal_note}" >&2
+    if [[ ${#bump_pending_notes[@]} -gt 0 ]]; then
+      local n
+      for n in "${bump_pending_notes[@]}"; do
+        printf '  %s%s%s %s\n' "${C_YELLOW}" "${SYM_WARN}" "${C_RESET}" "${n}" >&2
+      done
+    fi
   fi
 }
-trap log_run_exit EXIT
+trap 'log_run_exit $?' EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -366,9 +588,9 @@ while [[ $# -gt 0 ]]; do
     --vscode)    components_flip; build_vscode=1 ;;
     --browser)   components_flip; build_browser=1 ;;
 
-    --no-bump)   do_bump=0 ;;
+    --bump)      do_bump=1 ;;
     --no-sign)   do_sign=0 ;;
-    --no-daemon) refresh_daemon=0 ;;
+    --no-daemon) refresh_daemon=0; no_daemon_seen=1 ;;
 
     --public-url)    public_url_flag="--public-url" ;;
     --no-public-url) public_url_flag="--no-public-url" ;;
@@ -392,10 +614,15 @@ while [[ $# -gt 0 ]]; do
       write_migration="$1" ;;
     --release)   do_release=1 ;;
 
+    --from-source) from_source=1 ;;
+
     -h|--help)
       # The whole leading comment block, however long it grows: from
       # line 2, print `#` lines with the marker stripped, stop at the
-      # first non-comment line.
+      # first non-comment line. Never journaled: a help read is not a
+      # run, and a DONE line for it would dilute the journal's answer
+      # to "did my last install finish".
+      trap - EXIT
       awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"
       exit 0
       ;;
@@ -407,11 +634,248 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+# A flag that would silently apply to nothing is a mistyped invocation,
+# not a preference: fail naming the shape that works. An uninstall or
+# purge builds nothing, so every build-shaping flag is inapplicable
+# there; the purge-image pickers only mean something WITH a purge; and
+# --public-url / --migration both ride the daemon refresh, so a run
+# that skips it must not accept them (--public-url opens an
+# internet-facing surface: a silent no-op there is the worst outcome,
+# and --migration's draft is only APPLIED by the refresh).
+if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
+  if [[ $do_bump -eq 1 || $do_sign -eq 0 || $target_flag_seen -eq 1 || -n "${write_migration}" \
+    || -n "${public_url_flag}" || -n "${rebuild_flag}" || -n "${rebuild_cluster_flag}" \
+    || $from_source -eq 1 || "${profile}" != "release" \
+    || $component_flag_seen -eq 1 || $no_daemon_seen -eq 1 ]]; then
+    fail "an --uninstall / --purge run builds and refreshes nothing, so --bump, --no-sign, --migration, --public-url/--no-public-url, --rebuild, --rebuild-cluster, --debug, --from-source, the component flags (--cli/--daemon/--vscode/--browser), --no-daemon and the browser-target flags do not apply here"
+    exit 1
+  fi
+else
+  if [[ $purge_postgres -eq 1 || $purge_kind -eq 1 || $purge_debian -eq 1 ]]; then
+    fail "--postgres / --kind / --debian only pick which SHARED base images a purge also removes; pass them with --purge"
+    exit 1
+  fi
+  if [[ $build_cli -eq 0 && $refresh_daemon -eq 0 && $build_vscode -eq 0 && $build_browser -eq 0 ]]; then
+    # Reachable via e.g. `--daemon --no-daemon`: a run that does
+    # nothing must say so, never journal a DONE over it.
+    fail "this combination selects nothing to build or refresh"
+    exit 1
+  fi
+  if [[ -n "${public_url_flag}" && $refresh_daemon -eq 0 ]]; then
+    fail "${public_url_flag} is applied by the daemon refresh, which this run skips; drop --no-daemon or the component flags that exclude --daemon"
+    exit 1
+  fi
+  if [[ -n "${write_migration}" && $refresh_daemon -eq 0 ]]; then
+    fail "--migration writes the migration and the daemon refresh applies it, and this run skips the daemon; include --daemon (or drop --no-daemon)"
+    exit 1
+  fi
+  if [[ $no_daemon_seen -eq 1 && $component_flag_seen -eq 1 ]]; then
+    fail "--no-daemon opts out of the daemon refresh, which this component selection does not include anyway; drop it"
+    exit 1
+  fi
+  if [[ $do_bump -eq 1 && $build_vscode -eq 0 && $build_browser -eq 0 ]]; then
+    fail "--bump releases the extensions this run builds, and this run builds neither; pass it with --vscode and/or --browser (the default install covers --vscode)"
+    exit 1
+  fi
+  if [[ $build_browser -eq 0 ]]; then
+    if [[ $do_sign -eq 0 ]]; then
+      fail "--no-sign shapes the browser-extension build, which this run does not do; pass it with --browser"
+      exit 1
+    fi
+    if [[ $target_flag_seen -eq 1 ]]; then
+      fail "the browser-target flags (--chrome/--firefox/--edge/--opera/--safari) shape the browser-extension build, which this run does not do; pass them with --browser"
+      exit 1
+    fi
+  fi
+fi
+
+# The full default install (CLI + daemon + VS Code, no browser), the
+# one shape that gets the post-install summary. Computed ONCE, here,
+# where every component flag is final; an uninstall/purge run is never
+# an install, whatever the component defaults say.
+is_default_install=0
+if [[ $do_uninstall -eq 0 && $do_purge -eq 0 \
+  && $build_cli -eq 1 && $refresh_daemon -eq 1 && $build_vscode -eq 1 && $build_browser -eq 0 ]]; then
+  is_default_install=1
+fi
+
+# The journal's START line, after parsing so a --help read never
+# journals; a bad flag above still lands its FAIL line via the trap.
+printf '%s START tree=%s args=[%s]\n' \
+  "$(date '+%Y-%m-%d %H:%M:%S')" "${here}" "${orig_args}" >> "${run_log}"
+
 # Worktree banner: this script builds/installs from its OWN directory (`here`).
 # With multiple git worktrees of this repo checked out, it is easy to run the
 # wrong one and rebuild stale source; print the tree up front so a wrong-tree
 # run is obvious before anything is built.
-hint "building from ${C_BOLD}${here}${C_RESET}"
+hint "installing from ${C_BOLD}${here}${C_RESET}"
+
+# ---- prebuilt artifacts ----------------------------------------------
+#
+# CI publishes a rolling release on every push to the release branch:
+# CLI binaries, the .vsix, and a manifest.json naming the exact commit
+# they were built from plus a sha256 per asset. When this checkout IS
+# that commit with a clean tree, downloading is equivalent to building,
+# so the install skips the compilers entirely (no Rust or Node
+# toolchain needed). Any local change, a different commit, or no
+# network takes the build path instead, and every branch says so.
+#
+# SYNC: release tag + asset names + manifest.json keys (commit,
+#       vscode_version, sha256_<asset>) <->
+#       .github/workflows/release.yml (cli matrix `asset` values, the
+#       vsix `mv` target, the release job's manifest generation)
+release_assets_url="https://github.com/WeaveMindAI/weft/releases/download/mvp-latest"
+prebuilt_dir="${HOME}/.local/share/weft/prebuilt"
+prebuilt_commit=""
+prebuilt_vscode_version=""
+use_prebuilt_cli=0
+use_prebuilt_vsix=0
+cli_sha256=""
+vsix_sha256=""
+cli_asset=""
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64)   cli_asset="weft-x86_64-linux" ;;
+  Linux-aarch64)  cli_asset="weft-aarch64-linux" ;;
+  Darwin-arm64)   cli_asset="weft-aarch64-macos" ;;
+  Darwin-x86_64)  cli_asset="weft-x86_64-macos" ;;
+esac
+# One string value out of the fetched manifest, empty when the key is
+# absent (an asset key missing means "not published; build locally
+# there"). THE one JSON-string extractor, `[^"]*` so no value alphabet
+# assumption can silently zero a field (a prerelease version once
+# parsed empty and cost every user a full compile).
+manifest_value() {
+  sed -n 's/.*"'"$1"'": *"\([^"]*\)".*/\1/p' <<<"${release_manifest}"
+}
+
+# Decide, per component this run installs, whether the published build
+# can stand in for a local one. Sets use_prebuilt_cli / use_prebuilt_vsix
+# plus the shas + version the install sections consume; every path that
+# declines says why.
+decide_prebuilt_use() {
+  if ! git -C "${here}" rev-parse HEAD >/dev/null 2>&1; then
+    hint "not a git checkout, so no published build can be matched; building locally"
+    return 0
+  fi
+  if [[ -n "$(git -C "${here}" status --porcelain 2>/dev/null)" ]]; then
+    hint "local changes present; building locally"
+    return 0
+  fi
+  # Interrupted downloads leave per-PID temps; reap only STALE ones so
+  # a concurrent run's in-flight temp survives.
+  find "${prebuilt_dir}" -name '*.download' -mmin +60 -delete 2>/dev/null || true
+  release_manifest="$(curl -fsSL --max-time 10 "${release_assets_url}/manifest.json" 2>/dev/null || true)"
+  if [[ -z "${release_manifest}" ]]; then
+    hint "could not reach the published build manifest; building locally"
+    return 0
+  fi
+  prebuilt_commit="$(manifest_value "commit")"
+  prebuilt_vscode_version="$(manifest_value "vscode_version")"
+  if [[ -z "${prebuilt_commit}" ]]; then
+    hint "the published manifest names no commit; building locally"
+    return 0
+  fi
+  if [[ "${prebuilt_commit}" != "$(git -C "${here}" rev-parse HEAD)" ]]; then
+    hint "no prebuilt artifacts for this commit yet (latest published: ${prebuilt_commit:0:12}); building locally. If you just pulled, CI is likely still building; re-run in a while to download instead."
+    return 0
+  fi
+  if [[ $build_cli -eq 1 ]]; then
+    # A debug CLI (--debug) is always a local build; the published
+    # binary is a release build.
+    if [[ "${profile}" != "release" ]]; then
+      hint "a --debug CLI is always built locally"
+    elif [[ -z "${cli_asset}" ]]; then
+      hint "no published CLI for $(uname -s)-$(uname -m); building the CLI locally"
+    else
+      cli_sha256="$(manifest_value "sha256_${cli_asset}")"
+      if [[ -n "${cli_sha256}" ]]; then
+        use_prebuilt_cli=1
+      else
+        hint "this commit's ${cli_asset} was not published (its build failed in CI); building the CLI locally"
+      fi
+    fi
+  fi
+  if [[ $build_vscode -eq 1 ]]; then
+    if [[ $do_bump -eq 1 ]]; then
+      # The bump moves the version past the published package by
+      # definition; the release must ship the bumped build.
+      hint "--bump: building the VS Code extension locally at the new version"
+    else
+      vsix_sha256="$(manifest_value "sha256_weft-vscode.vsix")"
+      if [[ -n "${prebuilt_vscode_version}" && -n "${vsix_sha256}" ]]; then
+        use_prebuilt_vsix=1
+      else
+        hint "this commit's .vsix was not published (its build failed in CI); building the extension locally"
+      fi
+    fi
+  fi
+}
+
+# Probe only when this run can actually consume a prebuilt (installing
+# the CLI or the extension): an uninstall/purge or a --browser-only run
+# must neither wait on the network nor print build-path hints. --bump
+# also forces the build path for the bumped extension: the bump makes
+# the tree diverge from the published commit by definition.
+if [[ $do_uninstall -eq 0 && $do_purge -eq 0 ]] \
+  && [[ $build_cli -eq 1 || $build_vscode -eq 1 ]]; then
+  if [[ $from_source -eq 0 ]]; then
+    decide_prebuilt_use
+  else
+    hint "--from-source: compiling the CLI/.vsix locally, published artifacts ignored"
+  fi
+fi
+
+# Download one release asset to its final path, verified against the
+# sha256 the manifest recorded for it: a truncated transfer, a caching
+# proxy, or an asset mid-replacement (the release updates
+# non-atomically) all fail the compare instead of installing wrong
+# bytes. `mode` (optional) is applied to the temp BEFORE the atomic
+# move, so a binary is never observable half-installed as
+# non-executable. Per-PID temp name so two concurrent runs never race
+# the mv. Returns non-zero (having removed the temp) on any miss; the
+# caller owns the fallback.
+download_verified() {
+  local asset="$1" want_sha="$2" dest="$3" mode="${4:-}"
+  local tmp="${dest}.$$.download"
+  mkdir -p "$(dirname "${dest}")"
+  # --max-time: a stalled connection must fail (and fall back to the
+  # local build) instead of hanging the install with no output.
+  if ! curl -fsSL --retry 2 --max-time 300 -o "${tmp}" "${release_assets_url}/${asset}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+  local got_sha
+  got_sha="$(sha256 "${tmp}" | cut -d' ' -f1)"
+  if [[ "${got_sha}" != "${want_sha}" ]]; then
+    rm -f "${tmp}"
+    warn "downloaded ${asset} does not match the manifest's checksum (got ${got_sha:0:12}, want ${want_sha:0:12})"
+    return 1
+  fi
+  if [[ -n "${mode}" ]]; then
+    chmod "${mode}" "${tmp}"
+  fi
+  # Every failure path drops the temp, this one included (an
+  # unmovable temp would otherwise linger as junk nobody names).
+  mv -f "${tmp}" "${dest}" || { rm -f "${tmp}"; return 1; }
+}
+
+# Make one prebuilt asset exist at `dest`: a byte-matching copy from an
+# earlier run is reused, anything else is downloaded and verified. One
+# ladder for the CLI and the .vsix, so "already downloaded" can never
+# mean two things. Returns non-zero when neither worked; the caller
+# owns the build-locally fallback and its toolchain messaging.
+acquire_prebuilt() {
+  local asset="$1" want_sha="$2" dest="$3" mode="${4:-}"
+  if [[ -f "${dest}" && "$(sha256 "${dest}" | cut -d' ' -f1)" == "${want_sha}" ]]; then
+    ok "prebuilt $(basename "${dest}") already downloaded ${C_DIM}(commit ${prebuilt_commit:0:12})${C_RESET}"
+    return 0
+  fi
+  if download_verified "${asset}" "${want_sha}" "${dest}" ${mode:+"${mode}"}; then
+    ok "downloaded prebuilt $(basename "${dest}") ${C_DIM}(${asset}, commit ${prebuilt_commit:0:12})${C_RESET}"
+    return 0
+  fi
+  return 1
+}
 
 # ---- --migration: write the migration, then carry on installing -------
 #
@@ -427,6 +891,22 @@ fi
 
 if [[ -n "${write_migration}" ]]; then
   section "migration"
+  # Everything this run's shape needs, named up front instead of a
+  # bare command-not-found mid-run: cargo (the schema generators
+  # compile even when the CLI came prebuilt), docker (the throwaway
+  # scratch postgres), and kubectl when releasing (the release records
+  # itself on the live database through a port-forward).
+  migration_missing=""
+  command -v cargo >/dev/null 2>&1 || migration_missing="cargo (install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)"
+  command -v docker >/dev/null 2>&1 \
+    || migration_missing="${migration_missing:+${migration_missing}; }docker (runs the scratch postgres)"
+  if [[ $do_release -eq 1 ]] && ! command -v kubectl >/dev/null 2>&1; then
+    migration_missing="${migration_missing:+${migration_missing}; }kubectl (--release reaches the live database)"
+  fi
+  if [[ -n "${migration_missing}" ]]; then
+    fail "--migration needs: ${migration_missing}"
+    exit 1
+  fi
   # shellcheck source=scripts/lib/throwaway-postgres.sh
   . "${here}/scripts/lib/throwaway-postgres.sh"
   # Chain onto the script's existing exit logger so a Ctrl-C mid-run
@@ -437,7 +917,7 @@ if [[ -n "${write_migration}" ]]; then
     [[ -n "${THROWAWAY_PG_CONTAINER:-}" ]] \
       && docker rm -f "${THROWAWAY_PG_CONTAINER}" >/dev/null 2>&1 || true
   }
-  trap 'migration_cleanup; log_run_exit' EXIT
+  trap 'rc=$?; migration_cleanup; log_run_exit "${rc}"' EXIT
   if ! start_throwaway_postgres weft-migration-scratch; then
     fail "could not start a scratch postgres in docker"
     exit 1
@@ -447,6 +927,7 @@ if [[ -n "${write_migration}" ]]; then
   release_flag=""
   if [[ $do_release -eq 1 ]]; then
     release_flag="--release"
+    # SYNC: weft-db <-> crates/weft-core/src/infra/mod.rs (DB_NAMESPACE)
     if ! kubectl get namespace weft-db >/dev/null 2>&1; then
       fail "releasing has to reach the database you have been working against, and no cluster is up"
       exit 1
@@ -480,7 +961,7 @@ if [[ -n "${write_migration}" ]]; then
     fi
   done
   migration_cleanup
-  trap log_run_exit EXIT
+  trap 'log_run_exit $?' EXIT
   hint "carrying on with the install, which applies it"
 fi
 
@@ -498,7 +979,8 @@ if [[ $do_uninstall -eq 0 && $do_purge -eq 0 ]]; then
   missing=()
   install_hints=()
 
-  if [[ $build_cli -eq 1 ]]; then
+  # Prebuilt CLI: no Rust toolchain needed; the binary is downloaded.
+  if [[ $build_cli -eq 1 && $use_prebuilt_cli -eq 0 ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
       missing+=("cargo (Rust toolchain)")
       install_hints+=("  Rust:    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
@@ -520,7 +1002,8 @@ if [[ $do_uninstall -eq 0 && $do_purge -eq 0 ]]; then
     fi
   fi
 
-  if [[ $build_vscode -eq 1 ]]; then
+  # Prebuilt .vsix: no Node toolchain needed; the package is downloaded.
+  if [[ $build_vscode -eq 1 && $use_prebuilt_vsix -eq 0 ]]; then
     node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
     if [[ "${node_major}" -lt 20 ]]; then
       missing+=("node 20+")
@@ -600,8 +1083,11 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     #    graceful_shutdown to release leases cleanly. Best-effort:
     #    a missing CLI or already-stopped daemon doesn't fail.
     if command -v "${weft_bin}" >/dev/null 2>&1 || [[ -L "${weft_bin}" ]]; then
-      "${weft_bin}" daemon stop >/dev/null 2>&1 || true
-      ok "daemon stopped (cluster + data kept)"
+      if "${weft_bin}" daemon stop >/dev/null 2>&1; then
+        ok "daemon stopped (cluster + data kept)"
+      else
+        hint "daemon: already stopped, or its cluster is unreachable; nothing to stop"
+      fi
     else
       hint "daemon: no weft binary on disk; nothing to stop"
     fi
@@ -612,12 +1098,21 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     #    manual reload.
     if command -v code >/dev/null 2>&1; then
       if live_sock="$(pick_live_vscode_socket)"; then
-        VSCODE_IPC_HOOK_CLI="${live_sock}" \
-          code --uninstall-extension "${ext_id}" >/dev/null 2>&1 || true
+        if [[ -z "$(installed_ext_version "${live_sock}")" ]]; then
+          hint "VS Code extension: not installed; nothing to remove"
+        elif VSCODE_IPC_HOOK_CLI="${live_sock}" \
+            code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
+          ok "VS Code extension uninstalled"
+        else
+          warn "could not uninstall the VS Code extension; remove it by hand: code --uninstall-extension ${ext_id}"
+        fi
+      elif code --uninstall-extension "${ext_id}" >/dev/null 2>&1; then
+        ok "VS Code extension uninstalled"
       else
-        code --uninstall-extension "${ext_id}" >/dev/null 2>&1 || true
+        # With no live window this path also fires for "not
+        # installed"; the hedge is honest here.
+        hint "VS Code extension: not installed, or no window to reach; if it is still there: code --uninstall-extension ${ext_id}"
       fi
-      ok "VS Code extension uninstalled (if present)"
     else
       hint "VS Code: 'code' not on PATH; skipping extension removal"
     fi
@@ -637,15 +1132,13 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       printf '\n%s%sWhat is preserved:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
       printf "  %skind cluster%s %s'%s' (the running pods)%s\n" \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${WEFT_CLUSTER_NAME:-weft-local}" "${C_RESET}"
-      printf '  %s~/.local/share/weft%s %s(the database: postgres, history, projects)%s\n' \
+      printf '  %s~/.local/share/weft%s %s(the database: postgres, history, projects; manifest stamps, prebuilt binaries, port-forward state)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sobject store%s %s(weft-object-store container + data volume)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-      printf '  %sdocker images%s %s(dispatcher, listener, weft-worker-*)%s\n' \
+      printf '  %sdocker images%s %s(dispatcher, listener, weft-worker)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sworkspace target/%s %s(cargo cache)%s\n' \
-        "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-      printf '  %s~/.local/share/weft/%s %s(port-forward state, build hashes)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
       printf '  %sbrowser extensions%s %s(remove manually from each browser if installed)%s\n' \
         "${C_CYAN}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
@@ -658,6 +1151,17 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     section "Purge"
     hint "${C_DIM}true clean slate; next install pays a full rebuild cost${C_RESET}"
 
+    # A purge with the docker CLI present but the daemon down cannot do
+    # most of its job, and every "is it there?" probe below would read
+    # absence into the silence: refuse up front instead of printing a
+    # wall of green over untouched state.
+    if command -v docker >/dev/null 2>&1 \
+      && ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+      fail "the docker daemon is not reachable, so nothing docker holds can be purged: the kind cluster, weft images, the object-store container + volume, and the BuildKit cache all remain"
+      hint "start docker and re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
+      exit 1
+    fi
+
     # 1. Delete the kind cluster. `kind delete` leaves the shared
     #    `kind` docker network behind; once no clusters remain it is
     #    pure leftover, so remove it too (best-effort: another tool's
@@ -665,33 +1169,48 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
     if command -v kind >/dev/null 2>&1; then
       cluster="${WEFT_CLUSTER_NAME:-weft-local}"
       if kind get clusters 2>/dev/null | grep -qx "${cluster}"; then
-        kind delete cluster --name "${cluster}" >/dev/null 2>&1 || true
-        ok "kind cluster ${C_DIM}'${cluster}'${C_RESET} deleted"
+        if kind delete cluster --name "${cluster}" >/dev/null 2>&1; then
+          ok "kind cluster ${C_DIM}'${cluster}'${C_RESET} deleted"
+        else
+          warn "could not delete the kind cluster '${cluster}'; delete it by hand: kind delete cluster --name ${cluster}"
+        fi
       else
         hint "kind cluster ${C_DIM}'${cluster}'${C_RESET}: not present"
       fi
       if [[ -z "$(kind get clusters 2>/dev/null)" ]] \
         && docker network inspect kind >/dev/null 2>&1; then
-        docker network rm kind >/dev/null 2>&1 || true
-        ok "removed the ${C_DIM}kind${C_RESET} docker network"
+        if docker network rm kind >/dev/null 2>&1; then
+          ok "removed the ${C_DIM}kind${C_RESET} docker network"
+        else
+          warn "could not remove the kind docker network (another tool's container still on it?)"
+        fi
       fi
     fi
 
-    # 2. Reclaim every weft-related host docker image.
-    if command -v docker >/dev/null 2>&1; then
-      for tag in weft-dispatcher:local weft-listener:local weft-broker:local \
-                 weft-infra-supervisor:local; do
-        docker image rm -f "${tag}" >/dev/null 2>&1 || true
-      done
-      ok "removed dispatcher + listener + broker + supervisor images"
+    # 2. Reclaim every weft-related host docker image. The system images
+    # carry content-addressed tags under any registry prefix, so match
+    # the repo with the prefix stripped. (The daemon answered the gate
+    # above, so "not present" below really means absent.)
+    if ! command -v docker >/dev/null 2>&1; then
+      warn "docker not on PATH; everything docker holds (images, the object store, the BuildKit cache) is untouched"
+    else
+      system_ids="$(weft_image_ids '^(weft-dispatcher|weft-listener|weft-broker|weft-infra-supervisor)$')" || {
+        fail "could not list the weft system images (docker stopped answering?); re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
+        exit 1
+      }
+      remove_docker_images_by_id "dispatcher + listener + broker + supervisor images" "${system_ids}"
 
-      docker image prune --force \
-        --filter "label=weft.dev/project" >/dev/null 2>&1 || true
+      if docker image prune --force \
+        --filter "label=weft.dev/project" >/dev/null 2>&1; then
+        ok "pruned dangling project-labelled images"
+      else
+        warn "could not prune the dangling project-labelled images"
+      fi
       # Remove every CONTENT-ADDRESSED image the build builds, by REPOSITORY (the
       # `<repo>:<hash>` form has no hyphen, so a `<repo>-*` glob silently matches
       # nothing). These accumulate with no implicit GC, so a purge must clear ALL:
       #   - `weft-worker`        : one per project build.
-      #   - `weft-builder-base`  : one 1.37GB image per engine version.
+      #   - `weft-builder-base`  : one ~1.4GB image per engine version.
       #   - `weft-infra-<name>`  : one per infra node, built locally by the CLI as
       #                            `weft-infra-<name>:<hash>` (see weft-compiler
       #                            `infra_image_repo`). A tagged image is NOT
@@ -700,29 +1219,33 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       #     SYNC: weft-infra-<name> repo <-> crates/weft-compiler/src/image_set.rs
       #           (infra_image_repo). Sidecar images are a REMOVED concept; the
       #           current code builds no `weft-sidecar-*`, so none is matched here.
-      bp_ids="$(docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
-        | awk '$1=="weft-worker" || $1=="weft-builder-base" || $1=="weft-node-tests" || $1 ~ /^weft-infra-/ {print $2}' \
-        | sort -u)"
-      if [[ -n "${bp_ids}" ]]; then
-        echo "${bp_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
-      fi
-      ok "removed every weft-worker + weft-builder-base + weft-node-tests + weft-infra-* image"
+      bp_ids="$(weft_image_ids '^(weft-worker|weft-builder-base|weft-node-tests)$|^weft-infra-')" || {
+        fail "could not list the weft build-plane images (docker stopped answering?); re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
+        exit 1
+      }
+      remove_docker_images_by_id "weft-worker / weft-builder-base / weft-node-tests / weft-infra-* images" "${bp_ids}"
 
-      # Shared base images, gated.
+      # Shared base images, gated. `--postgres` covers BOTH postgres
+      # images weft pulls: the in-cluster one and the --migration
+      # scratch one (leaving the scratch image behind would break the
+      # clean-slate floor with a ~450MB orphan nobody is told about).
+      # SYNC: postgres image tags <-> deploy/k8s/postgres.yaml (the
+      #       postgres container image, 18-alpine),
+      #       scripts/lib/throwaway-postgres.sh (the scratch image, 18)
       if [[ $purge_postgres -eq 1 ]]; then
-        docker image rm -f postgres:18-alpine >/dev/null 2>&1 || true
-        ok "removed postgres:18-alpine ${C_DIM}(--postgres)${C_RESET}"
+        remove_docker_object image postgres:18-alpine " ${C_DIM}(--postgres)${C_RESET}"
+        remove_docker_object image postgres:18 " ${C_DIM}(--postgres, the --migration scratch image)${C_RESET}"
       fi
       if [[ $purge_kind -eq 1 ]]; then
-        kind_ids="$(docker images kindest/node -q 2>/dev/null | sort -u)"
-        if [[ -n "${kind_ids}" ]]; then
-          echo "${kind_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
-          ok "removed kindest/node images ${C_DIM}(--kind)${C_RESET}"
-        fi
+        kind_ids="$(docker images kindest/node -q 2>/dev/null | sort -u)" || {
+          fail "could not list the kindest/node images (docker stopped answering?); re-run ${C_BOLD}./setup.sh --uninstall --purge${C_RESET}"
+          exit 1
+        }
+        remove_docker_images_by_id "kindest/node images" "${kind_ids}" \
+          " ${C_DIM}(--kind)${C_RESET}" "a kind cluster still running?"
       fi
       if [[ $purge_debian -eq 1 ]]; then
-        docker image rm -f debian:bookworm-slim >/dev/null 2>&1 || true
-        ok "removed debian:bookworm-slim ${C_DIM}(--debian)${C_RESET}"
+        remove_docker_object image debian:bookworm-slim " ${C_DIM}(--debian)${C_RESET}"
       fi
 
       # The daemon's host-side object store: a docker container, its
@@ -732,28 +1255,29 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       # SYNC: weft-object-store <-> crates/weft-cli/src/commands/daemon.rs
       #       (OBJECT_STORE_CONTAINER; the volume is "<container>-data",
       #       the image is the `docker run` line below the constant)
-      docker rm -f weft-object-store >/dev/null 2>&1 || true
-      docker volume rm weft-object-store-data >/dev/null 2>&1 || true
-      docker image rm -f chrislusf/seaweedfs:3.80 >/dev/null 2>&1 || true
-      ok "removed the object-store container + data volume + seaweedfs image"
+      remove_docker_object container weft-object-store
+      remove_docker_object volume weft-object-store-data
+      remove_docker_object image chrislusf/seaweedfs:3.80
 
-      docker buildx prune --force >/dev/null 2>&1 || true
-      ok "pruned BuildKit cache"
+      if docker buildx prune --force >/dev/null 2>&1; then
+        ok "pruned BuildKit cache"
+      else
+        warn "could not prune the BuildKit cache; prune it by hand: docker buildx prune --force"
+      fi
     fi
 
     # 3. Workspace cargo target/ + the staged builder-base docker context
-    # (both derived artifacts, regenerated on the next build).
-    if [[ -d "${here}/target" ]]; then
-      rm -rf "${here}/target"
-      ok "removed ${C_DIM}target/${C_RESET}"
-    fi
+    # (both derived artifacts, regenerated on the next build). A failed
+    # removal warns and the purge keeps going: dying here would abandon
+    # every later step over one stubborn directory.
+    remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
+      "" "; remove it by hand: rm -rf ${here}/target"
     # The staging lock lives BESIDE the dir (see
     # weft-cli images.rs ensure_worker_builder_base), so it needs its
     # own removal or it survives the purge.
-    if [[ -d "${here}/.weft-base-context" || -f "${here}/.weft-base-context.lock" ]]; then
-      rm -rf "${here}/.weft-base-context" "${here}/.weft-base-context.lock"
-      ok "removed ${C_DIM}.weft-base-context/${C_RESET} (and its staging lock)"
-    fi
+    remove_dir_reporting "${here}/.weft-base-context" "${C_DIM}.weft-base-context/${C_RESET}" \
+      " ${C_DIM}(builder-base staging context)${C_RESET}" "; remove it by hand: rm -rf ${here}/.weft-base-context"
+    remove_dir_reporting "${here}/.weft-base-context.lock" "${C_DIM}.weft-base-context.lock${C_RESET}"
 
     # 4. Daemon-local state. Docker may have auto-created root-owned
     # entries under it (a missing bind-mount source becomes a root
@@ -780,16 +1304,26 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
 
     # 5. Browser-extension build artifacts. WXT writes everything
     # into extension-browser/build/ (configured via wxt.config.ts).
-    if [[ -d "${here}/extension-browser/build" ]]; then
-      rm -rf "${here}/extension-browser/build"
-      ok "removed browser-extension build artifacts"
-    fi
+    # The per-target zips and the signed .xpi are TRACKED files (the
+    # latest distributables live in git); deleting them would leave the
+    # user's working tree showing deletions they never made, so the
+    # purge takes only the untracked scratch: the unpacked per-target
+    # dirs and the AMO sources zip.
+    for ext_scratch in "${here}/extension-browser/build/"*-mv2 \
+                       "${here}/extension-browser/build/"*-mv3 \
+                       "${here}/extension-browser/build/weft-extension-sources.zip"; do
+      # Unexpanded globs pass through literally; the helper's absent
+      # hint on those would print the pattern, so skip them quietly.
+      [[ -e "${ext_scratch}" ]] || continue
+      remove_dir_reporting "${ext_scratch}" \
+        "${C_DIM}${ext_scratch#"${here}"/}${C_RESET}" " ${C_DIM}(tracked zips kept)${C_RESET}"
+    done
 
     # 6. VS Code extension's pre-packaged .vsix.
-    if compgen -G "${here}/extension-vscode/weft-vscode-*.vsix" >/dev/null; then
-      rm -f "${here}/extension-vscode/"weft-vscode-*.vsix
-      ok "removed packaged ${C_DIM}weft-vscode-*.vsix${C_RESET}"
-    fi
+    for ext_scratch in "${here}/extension-vscode/"weft-vscode-*.vsix; do
+      [[ -e "${ext_scratch}" ]] || continue
+      remove_dir_reporting "${ext_scratch}" "${C_DIM}${ext_scratch#"${here}"/}${C_RESET}"
+    done
 
     # Shared-base hint footer.
     skipped_lines=()
@@ -797,10 +1331,17 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       if docker image inspect postgres:18-alpine >/dev/null 2>&1; then
         skipped_lines+=("postgres:18-alpine|--postgres")
       fi
+      if docker image inspect postgres:18 >/dev/null 2>&1; then
+        skipped_lines+=("postgres:18|--postgres")
+      fi
     fi
     if [[ $purge_kind -eq 0 ]]; then
-      if [[ -n "$(docker images kindest/node -q 2>/dev/null)" ]]; then
-        skipped_lines+=("kindest/node|--kind")
+      # A failed listing must not read as "no images skipped": say so
+      # instead (only a footer line, so a warn is enough).
+      if kind_footer_ids="$(docker images kindest/node -q 2>/dev/null)"; then
+        [[ -n "${kind_footer_ids}" ]] && skipped_lines+=("kindest/node|--kind")
+      else
+        warn "could not list kindest/node images for the skipped-images footer"
       fi
     fi
     if [[ $purge_debian -eq 0 ]]; then
@@ -831,7 +1372,6 @@ fi
 
 if [[ $build_cli -eq 1 ]]; then
   section "CLI"
-  hint "${C_DIM}cargo's incremental cache makes re-runs near-instant${C_RESET}"
   mkdir -p "${bin_dir}"
 
   # ---- disk hygiene, BEFORE the build -------------------------------
@@ -854,15 +1394,20 @@ if [[ $build_cli -eq 1 ]]; then
   if [[ -d "${here}/target" ]]; then
     # -L: a target/ symlinked onto a scratch disk (a normal cargo
     # setup, and the case where the cap matters most) measures as 0
-    # without it. A non-numeric measurement skips the cap (wiping on
-    # an unreadable measurement is the dangerous direction).
-    target_gb="$(du -sBG -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1 | tr -d 'G')"
+    # without it. -sk (POSIX kilobytes; GNU-only -BG never works on
+    # macOS, which would silently disable the cap there forever). A
+    # non-numeric measurement skips the cap (wiping on an unreadable
+    # measurement is the dangerous direction).
+    target_kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1)"
+    target_gb=""
+    [[ "${target_kb}" =~ ^[0-9]+$ ]] && target_gb="$((target_kb / 1024 / 1024))"
     if [[ ! "${target_gb}" =~ ^[0-9]+$ ]]; then
       warn "could not measure target/; skipping the size cap"
     elif [[ "${target_gb}" -gt "${target_cap_gb}" ]]; then
       warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); cleaning before the build"
-      rm -rf "${here}/target"
-      ok "removed ${C_DIM}target/${C_RESET} ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}"
+      remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
+        " ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}" \
+        "; the cap stays exceeded"
     fi
   fi
   # Gate on daemon REACHABILITY, not binary presence: a --cli install
@@ -872,121 +1417,144 @@ if [[ $build_cli -eq 1 ]]; then
     spin "bound BuildKit cache to 20GB (LRU)" \
       docker builder prune --force --max-used-space 20GB
   fi
-  if [[ "${profile}" == "release" ]]; then
-    target_dir="${here}/target/release"
-  else
-    target_dir="${here}/target/debug"
-  fi
-  src="${target_dir}/weft"
-  # Snapshot the binary's identity before the build. If cargo
-  # decides nothing changed, the file's mtime stays put and we
-  # skip the worker-image prune. Only an actual rebuild (engine
-  # / core / cli source change) bumps mtime, which is the signal
-  # cached worker images may now be stale.
-  pre_mtime="$(stat -c %Y "${src}" 2>/dev/null || echo 0)"
-  # Sources can change WHILE this script runs (an AI session editing in
-  # parallel with a reinstall is the everyday case here). cargo builds
-  # what existed when it started, so a source edit landing mid-build
-  # ships a binary that is ALREADY stale, silently. Build, then check
-  # whether any workspace source is newer than the produced binary; if
-  # so, build again (once more is always enough: the recheck is
-  # instant), and if it STILL moves, say so loudly instead of
-  # pretending the install is current.
-  for build_pass in 1 2 3; do
-    if [[ "${profile}" == "release" ]]; then
-      spin_passthrough "cargo build --release -p weft-cli" \
-        cargo build --release -p weft-cli
-    else
-      spin_passthrough "cargo build -p weft-cli" cargo build -p weft-cli
-    fi
-    if [[ ! -x "${src}" ]]; then
-      fail "build output missing: ${src}"
-      exit 1
-    fi
-    # cargo's own freshness check is the authority on whether the
-    # binary matches the sources (mtime scans over the tree false-alarm
-    # on files that are not build inputs). A repeated build doing zero
-    # work == current; it doing work == a source edit landed mid-build
-    # and the first binary shipped stale, so loop.
-    recheck_flags=()
-    if [[ "${profile}" == "release" ]]; then recheck_flags=(--release); fi
-    recheck_out="$(cargo build "${recheck_flags[@]}" -p weft-cli 2>&1)"
-    if ! grep -q '^\s*Compiling' <<<"${recheck_out}"; then
-      break
-    fi
-    if [[ "${build_pass}" -eq 3 ]]; then
-      fail "sources are still changing under the build; the installed binary does NOT include them. Re-run setup.sh once the edits settle."
-      exit 1
-    fi
-    hint "source changed during the build; building again"
-  done
-  ln -sfn "${src}" "${weft_bin}"
-  ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${src}${C_RESET}"
 
-  post_mtime="$(stat -c %Y "${src}" 2>/dev/null || echo 0)"
-  if [[ "${pre_mtime}" != "${post_mtime}" ]]; then
-    # CLI binary actually changed → engine/core source likely
-    # changed too. Worker images bake those crates in at
-    # `weft build` time, and the builder-base bakes the engine, so cached
-    # build-plane images (host docker + kind containerd) are now stale. BuildKit
-    # cache is preserved; only the final tagged images go, so the next
-    # `weft build` is fast but produces a fresh base + worker. Match by REPOSITORY
-    # (the `weft-worker:<hash>` form has no hyphen, so the old `weft-worker-*`
-    # glob silently matched nothing).
-    stale_bp_ids="$(docker images --format '{{.Repository}} {{.ID}}' 2>/dev/null \
-      | awk '$1=="weft-worker" || $1=="weft-builder-base" || $1=="weft-node-tests" {print $2}' \
-      | sort -u)"
-    if [[ -n "${stale_bp_ids}" ]]; then
-      echo "${stale_bp_ids}" | xargs docker rmi -f >/dev/null 2>&1 || true
-      ok "removed stale weft-worker + weft-builder-base + weft-node-tests images on host docker"
-    fi
-    # A changed engine invalidates nearly every BuildKit cache entry
-    # (the cargo layers of worker/infra/test builds all bake it), so a
-    # bounded prune would just keep 20GB of dead weight: drop it all.
-    # Best effort like the rest of this sweep: a --cli install must
-    # finish even with the docker daemon down, and the bounded prune
-    # at the top (which runs only against a live daemon) is the loud
-    # one.
-    docker builder prune --force >/dev/null 2>&1 || true
-    ok "dropped the BuildKit cache (stale against the new engine)"
-    # Same for the node-test sweep's cargo cache under target/tmp: it
-    # compiles the emitted crates against the OLD engine, so keeping it
-    # only makes the next sweep re-verify 25GB of stale artifacts.
-    if [[ -d "${here}/target/tmp" ]]; then
-      rm -rf "${here}/target/tmp"
-      ok "removed ${C_DIM}target/tmp${C_RESET} ${C_DIM}(node-test sweep cache, engine-keyed)${C_RESET}"
-    fi
-    if command -v kind >/dev/null 2>&1; then
-      kind_node=""
-      for cluster in $(kind get clusters 2>/dev/null); do
-        node="${cluster}-control-plane"
-        if docker inspect "${node}" >/dev/null 2>&1; then
-          kind_node="${node}"
-          break
-        fi
-      done
-      if [[ -n "${kind_node}" ]]; then
-        # Match the build-plane repos exactly (the image ref column is the FULL
-        # `repo:tag`; the bare repo is everything before the last ':'). The new
-        # worker form `weft-worker:<hash>` has no hyphen, so the old
-        # `weft-worker-` substring matched nothing.
-        # Registry prefix FIRST, then any tag remnant: the other order
-        # eats a registry's port (`registry:5000/...` -> `registry`)
-        # and silently skips every registry-qualified ref.
-        kind_worker_tags="$(
-          docker exec "${kind_node}" crictl images 2>/dev/null \
-            | awk 'NR>1 {repo=$1; sub(/^.*\//,"",repo); sub(/:[^:]*$/,"",repo); \
-                   if (repo=="weft-worker" || repo=="weft-builder-base" || repo=="weft-node-tests") print $1":"$2}' \
-            | sort -u
-        )"
-        if [[ -n "${kind_worker_tags}" ]]; then
-          # shellcheck disable=SC2086
-          docker exec "${kind_node}" crictl rmi ${kind_worker_tags} >/dev/null 2>&1 || true
-          ok "removed cached weft-worker + weft-builder-base + weft-node-tests images in kind containerd"
-        fi
+  # Prebuilt path: this checkout matches the commit CI built, so the
+  # published binary IS this source compiled. A failed download drops
+  # to the local build when a toolchain is there (the same
+  # present -> pull -> build ladder the daemon images use).
+  if [[ $use_prebuilt_cli -eq 1 ]]; then
+    # Byte-identity lives in `acquire_prebuilt` (keyed on the PREBUILT
+    # FILE, not on what the symlink points at: the link and the
+    # recorded repo location must refresh even when the bytes are
+    # already right, since this checkout may be a different clone than
+    # the one that downloaded them).
+    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${prebuilt_dir}/weft" 0755; then
+      use_prebuilt_cli=0
+      if command -v cargo >/dev/null 2>&1; then
+        warn "prebuilt CLI download failed; building locally instead"
+      else
+        fail "the prebuilt CLI could not be downloaded and no Rust toolchain is on PATH"
+        hint "install Rust (${C_BOLD}curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh${C_RESET}${C_DIM}) or re-run once the network is back${C_RESET}"
+        exit 1
       fi
     fi
   fi
+  if [[ $use_prebuilt_cli -eq 1 ]]; then
+    # A prebuilt binary bakes its BUILDER's checkout path as its
+    # compile-time repo location, which does not exist here; record
+    # where the repo actually lives (THIS tree, every run, so a moved
+    # or re-cloned checkout re-points it) so the binary can find its
+    # own catalog / manifests / build context. Written BEFORE the
+    # symlink lands on PATH: the other order could publish a weft that
+    # cannot find its checkout. Loud on failure WITH the recovery.
+    # SYNC: repo-root file <-> crates/weft-catalog/src/lib.rs (weft_repo_root)
+    repo_root_file="${HOME}/.local/share/weft/repo-root"
+    if ! { mkdir -p "$(dirname "${repo_root_file}")" \
+        && printf '%s' "${here}" > "${repo_root_file}"; } 2>/dev/null; then
+      fail "the prebuilt CLI needs ${repo_root_file} to find this checkout, and that path is not writable"
+      hint "fix the ownership (docker can leave root-owned entries there): ${C_BOLD}sudo chown -R \"\$(id -u):\$(id -g)\" ~/.local/share/weft${C_RESET}${C_DIM}, then re-run${C_RESET}"
+      exit 1
+    fi
+    chmod 0755 "${prebuilt_dir}/weft"
+    ln -sfn "${prebuilt_dir}/weft" "${weft_bin}"
+    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${prebuilt_dir}/weft${C_RESET}"
+  fi
+
+  if [[ $use_prebuilt_cli -eq 0 ]]; then
+    hint "${C_DIM}cargo's incremental cache makes re-runs near-instant${C_RESET}"
+    if [[ "${profile}" == "release" ]]; then
+      target_dir="${here}/target/release"
+    else
+      target_dir="${here}/target/debug"
+    fi
+    src="${target_dir}/weft"
+    # Sources can change WHILE this script runs (an AI session editing in
+    # parallel with a reinstall is the everyday case here). cargo builds
+    # what existed when it started, so a source edit landing mid-build
+    # ships a binary that is ALREADY stale, silently. Build, then check
+    # whether any workspace source is newer than the produced binary; if
+    # so, build again (once more is always enough: the recheck is
+    # instant), and if it STILL moves, say so loudly instead of
+    # pretending the install is current.
+    for build_pass in 1 2 3; do
+      if [[ "${profile}" == "release" ]]; then
+        spin_passthrough "cargo build --release -p weft-cli" \
+          cargo build --release -p weft-cli
+      else
+        spin_passthrough "cargo build -p weft-cli" cargo build -p weft-cli
+      fi
+      if [[ ! -x "${src}" ]]; then
+        fail "build output missing: ${src}"
+        exit 1
+      fi
+      # cargo's own freshness check is the authority on whether the
+      # binary matches the sources (mtime scans over the tree false-alarm
+      # on files that are not build inputs). A repeated build doing zero
+      # work == current; it doing work == a source edit landed mid-build
+      # and the first binary shipped stale, so loop.
+      # A bare word, not an array: expanding an EMPTY array under
+      # `set -u` is fatal on bash 3.2 (macOS's /bin/bash), same idiom
+      # as ${rebuild_flag} elsewhere. The `||` keeps a recheck FAILURE
+      # from dying silently under `set -e` (the assignment's status is
+      # cargo's), with the captured output shown instead of discarded.
+      recheck_release_flag=""
+      [[ "${profile}" == "release" ]] && recheck_release_flag="--release"
+      recheck_out="$(cargo build ${recheck_release_flag} -p weft-cli 2>&1)" || {
+        fail "the freshness recheck build failed (a source edit landed mid-build?)"
+        printf '%s\n' "${recheck_out}" >&2
+        exit 1
+      }
+      # [[:space:]], never \s: BSD grep (macOS) has no \s and would
+      # read the pattern as a literal, silently disabling this check.
+      if ! grep -q '^[[:space:]]*Compiling' <<<"${recheck_out}"; then
+        break
+      fi
+      if [[ "${build_pass}" -eq 3 ]]; then
+        fail "sources are still changing under the build; the installed binary does NOT include them. Re-run setup.sh once the edits settle."
+        exit 1
+      fi
+      hint "source changed during the build; building again"
+    done
+    ln -sfn "${src}" "${weft_bin}"
+    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${src}${C_RESET}"
+  fi
+
+  # Engine-change sweep, on either path: worker images, the builder
+  # base and the node-test image all bake the engine crates in, so an
+  # engine change strands every cached build-plane image (host docker +
+  # kind containerd), the BuildKit cache and the node-test cargo cache.
+  # Keyed on the ENGINE'S OWN identity (the builder-base ref the
+  # freshly installed CLI computes from source content), which is the
+  # same on the prebuilt and the compiled path and does not move when
+  # only the binary does (a --debug/--release switch, a prebuilt/local
+  # switch), so those never cost a sweep.
+  engine_ref_file="${HOME}/.local/share/weft/builder-base-ref"
+  # Only the TAG (the content hash) is the identity; the registry
+  # prefix is naming, and keying on it would fire a full sweep on a
+  # WEFT_IMAGE_REGISTRY change with the engine untouched. Streams kept
+  # apart: only STDOUT is grepped for the ref (a diagnostic line on
+  # stderr that happened to mention the base would otherwise feed the
+  # parse a wrong hash), and stderr is kept so the warn below can show
+  # the resolver's own diagnostics (they name the fix), never a bare
+  # "could not compute".
+  new_engine_ref=""
+  engine_err="$(mktemp -t weft-engineref.XXXXXX)"
+  if engine_print_out="$(env WEFT_REPO_ROOT="${here}" "${weft_bin}" build-images --print 2>"${engine_err}")"; then
+    new_engine_ref="$(grep -E '(^|/)weft-builder-base:' <<<"${engine_print_out}" || true)"
+    new_engine_ref="${new_engine_ref##*:}"
+  fi
+  if [[ -z "${new_engine_ref}" ]]; then
+    warn "could not compute the engine identity (weft build-images --print); skipping the stale-image sweep this run"
+    [[ -s "${engine_err}" ]] && cat "${engine_err}" >&2
+  elif [[ "${new_engine_ref}" != "$(cat "${engine_ref_file}" 2>/dev/null || true)" ]]; then
+    sweep_stale_build_plane
+    # Braced so a redirect failure is silenced too (a bare 2>/dev/null
+    # does not cover the redirect itself) and only the warn speaks.
+    if ! { printf '%s' "${new_engine_ref}" > "${engine_ref_file}"; } 2>/dev/null; then
+      warn "could not record the engine identity at ${engine_ref_file}; the sweep re-runs next install"
+    fi
+  fi
+  rm -f "${engine_err}"
 fi
 
 # ---- daemon refresh / start ------------------------------------------
@@ -1001,11 +1569,6 @@ fi
 # source. Pre-setup.sh behavior was to skip when the daemon was down,
 # which forced a manual `weft daemon start` afterwards.
 
-is_default_install_pending=0
-if [[ $build_cli -eq 1 && $refresh_daemon -eq 1 && $build_vscode -eq 1 && $build_browser -eq 0 ]]; then
-  is_default_install_pending=1
-fi
-
 if [[ $refresh_daemon -eq 1 ]]; then
   section "Daemon"
   if [[ ! -x "${weft_bin}" && ! -L "${weft_bin}" ]]; then
@@ -1018,13 +1581,13 @@ if [[ $refresh_daemon -eq 1 ]]; then
     dispatcher_url="${WEFT_DISPATCHER_URL:-http://127.0.0.1:9999}"
     if curl --silent --max-time 2 "${dispatcher_url}/health" >/dev/null 2>&1; then
       hint "daemon running at ${C_DIM}${dispatcher_url}${C_RESET}; refreshing (no-op if nothing changed)"
-      spin_passthrough "weft daemon restart" \
-        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon restart ${rebuild_flag} ${rebuild_cluster_flag} ${public_url_flag}
     else
       hint "daemon not running; first install pulls images and creates the kind cluster (~2-3 min)"
-      spin_passthrough "weft daemon start" \
-        env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start ${rebuild_flag} ${rebuild_cluster_flag} ${public_url_flag}
     fi
+    # One verb either way: `daemon start` is an idempotent reconcile
+    # (boot and refresh are the same operation; `restart` is its alias).
+    spin_passthrough "weft daemon start" \
+      env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start ${rebuild_flag} ${rebuild_cluster_flag} ${public_url_flag}
   fi
 fi
 
@@ -1036,7 +1599,7 @@ if [[ -r "${HOME}/.local/share/weft/public-url-enabled" \
    && -r "${HOME}/.local/share/weft/public-url" ]]; then
   public_url="$(tr -d '[:space:]' < "${HOME}/.local/share/weft/public-url")"
 fi
-if [[ -n "${public_url}" && $is_default_install_pending -eq 0 ]]; then
+if [[ -n "${public_url}" && $is_default_install -eq 0 ]]; then
   # Non-default installs print no summary block, so say it here.
   hint "public surface: ${C_BOLD}${public_url}${C_RESET}${C_DIM} (event pushes, signal fire links, file share links, OAuth callback)"
 fi
@@ -1057,19 +1620,89 @@ if [[ $build_vscode -eq 1 ]]; then
   # skips the CLI step, refuse to quietly ship an extension on top of a
   # stale binary: if any Rust source is newer than the installed
   # binary, say so and stop (rerun with --cli, or the full default).
-  if [[ $build_cli -eq 0 ]]; then
-    installed_weft="$(readlink -f "${weft_bin}" 2>/dev/null || true)"
-    if [[ -n "${installed_weft}" && -x "${installed_weft}" ]]; then
+  # A precondition of the whole section, however the .vsix is produced:
+  # a downloaded extension on top of a stale local binary keeps the
+  # stale behavior exactly the same way a built one would. Checked
+  # BEFORE the --bump below, so a refused run has touched nothing.
+  if [[ $build_cli -eq 0 && -x "${weft_bin}" ]]; then
+    # The reference is the BINARY's own mtime, carried onto a temp
+    # file with `touch -r` (which dereferences the symlink; GNU
+    # `find -newer <symlink>` does NOT, it reads the link's own mtime,
+    # which every install refreshes whether or not the binary moved).
+    bin_ref="$(mktemp -t weft-binref.XXXXXX)"
+    if ! touch -r "${weft_bin}" "${bin_ref}"; then
+      rm -f "${bin_ref}"
+      warn "cannot read ${weft_bin}'s timestamp; skipping the stale-binary check"
+    else
+      # Streams kept apart: a scan can BOTH find a stale source and
+      # exit non-zero (an unreadable directory on the way), and the
+      # stale-binary refusal with its recovery must win over the scan
+      # noise in that case.
+      find_err="$(mktemp -t weft-findlog.XXXXXX)"
+      find_rc=0
       stale_src="$(find "${here}/crates" "${here}/catalog" \
         \( -name '*.rs' -o -name '*.toml' -o -name '*.json' \) \
-        -newer "${installed_weft}" -print -quit 2>/dev/null || true)"
+        -newer "${bin_ref}" -print -quit 2>"${find_err}")" || find_rc=$?
+      rm -f "${bin_ref}"
       if [[ -n "${stale_src}" ]]; then
+        rm -f "${find_err}"
         fail "the installed weft binary is OLDER than ${stale_src#"${here}"/}; the editor's parse/edit logic lives in that binary, so an extension-only install would keep the stale behavior. Run ${C_BOLD}./setup.sh --cli --vscode${C_RESET} (or the full default)."
+        exit 1
+      fi
+      if [[ ${find_rc} -ne 0 ]]; then
+        # A failed scan must not read as "binary is current": that is
+        # exactly the silent pass this guard exists to prevent.
+        fail "cannot scan for sources newer than ${weft_bin}: $(cat "${find_err}")"
+        rm -f "${find_err}"
+        exit 1
+      fi
+      rm -f "${find_err}"
+    fi
+  fi
+
+  # The release gesture, mirroring the browser extension's: the
+  # version in package.json is what makes CI publish a pushed build to
+  # the VS Code Marketplace + Open VSX, so it moves ONLY on --bump,
+  # never as a side effect of a rebuild (an automatic bump once
+  # dirtied the tree on every build, killing the prebuilt fast path
+  # for the CLI too, and turned ordinary pushes into store releases).
+  # Last thing before the build: every precondition above already
+  # passed, so a run that bumps also delivers.
+  if [[ $do_bump -eq 1 ]]; then
+    if ! command -v pnpm >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
+      fail "--bump edits extension-vscode/package.json with pnpm, which needs node + pnpm on PATH"
+      exit 1
+    fi
+    prev_ext_ver="$(node -p "require('${ext_dir}/package.json').version")"
+    (cd "${ext_dir}" && pnpm version patch --no-git-tag-version >/dev/null)
+    bumped_ext_ver="$(node -p "require('${ext_dir}/package.json').version")"
+    ok "version bumped: ${C_DIM}${prev_ext_ver} ${SYM_ARROW} ${bumped_ext_ver}${C_RESET} ${C_DIM}(pushing this publishes to the VS Code Marketplace + Open VSX)${C_RESET}"
+    bump_pending_notes+=("extension-vscode/package.json is already bumped to v${bumped_ext_ver}: re-run WITHOUT --bump, or revert it")
+  fi
+
+  # Prebuilt path: CI packaged the .vsix from this exact commit, so
+  # download it instead of compiling (same ladder as the CLI: a failed
+  # download drops to the local build when the toolchain is there).
+  vsix_path=""
+  if [[ $use_prebuilt_vsix -eq 1 ]]; then
+    if acquire_prebuilt "weft-vscode.vsix" "${vsix_sha256}" "${prebuilt_dir}/weft-vscode.vsix"; then
+      vsix_path="${prebuilt_dir}/weft-vscode.vsix"
+      current_ver="${prebuilt_vscode_version}"
+    else
+      if command -v pnpm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
+        warn "prebuilt .vsix download failed; building locally instead"
+      else
+        fail "the prebuilt .vsix could not be downloaded and no Node toolchain is on PATH"
+        hint "install Node 20+ and pnpm, or re-run once the network is back"
         exit 1
       fi
     fi
   fi
 
+  # The whole local build as one named operation (like migration_cleanup
+  # above): compile, fingerprint, bump, package. Sets `vsix_path` +
+  # `current_ver`; called just below when no prebuilt .vsix landed.
+  build_vsix_locally() {
   node_major="$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)"
   if [[ "${node_major}" -lt 20 ]]; then
     fail "needs Node 20+ (got $(node -v 2>/dev/null || echo 'none'))"
@@ -1102,75 +1735,97 @@ if [[ $build_vscode -eq 1 ]]; then
   # for the install step.
   hash_dir="${HOME}/.local/share/weft/vscode-hashes"
   hash_file="${hash_dir}/extension.hash"
-  current_hash="$(
-    {
-      # The extension's own host code lives in `src`; the webview it bundles was
-      # extracted into the shared `../packages/weft-graph` package (one renderer
-      # for the extension + the website). Both are real build inputs, so the
-      # fingerprint must cover BOTH trees, else a webview-only change leaves a
-      # stale cached .vsix that installs old code.
-      find src ../packages/weft-graph/src -type f \( -name '*.ts' -o -name '*.svelte' -o -name '*.css' \) -print0 \
-        2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
-      # The package's own svelte config sits above `src` and is a build input
-      # too, since vite's root for the webview is inside the package.
-      sha256sum ../packages/weft-graph/svelte.config.mjs 2>/dev/null
-      # package.json WITHOUT its version field: every build bumps the version
-      # (so VS Code reinstalls), and that bump must not itself count as a source
-      # change, or the skip would never hit and we'd rebuild on every run.
-      node -e "const p=require('./package.json');delete p.version;process.stdout.write(JSON.stringify(p))" 2>/dev/null
-      sha256sum pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs \
-        vite.markdown-preview.config.mjs markdown-preview/hljs-entry.js \
-        tsconfig.json tsconfig.webview.json language-configuration.json 2>/dev/null
-      # The grammars ship from `../packages/weft-syntax` (symlinked into
-      # `syntaxes/` and `markdown-preview/`), so a colour change there has to
-      # produce a new .vsix.
-      find ../packages/weft-syntax -type f -print0 2>/dev/null \
-        | sort -z | xargs -0 sha256sum 2>/dev/null
-    } | sha256sum | awk '{print $1}'
-  )"
-  prior_hash="$(cat "${hash_file}" 2>/dev/null || echo)"
-  existing_vsix="$(ls -t weft-vscode-*.vsix 2>/dev/null | head -n 1 || true)"
-
-  # Reuse the cached .vsix only if the source hash matches AND the .vsix is
-  # newer than every source file. The hash alone isn't enough: an interrupted
-  # build (crash between bundle and package) can leave a stamp whose .vsix
-  # predates the current source, silently installing stale code. The mtime
-  # guard makes that impossible (a changed source file is always newer than a
-  # stale .vsix).
-  vsix_is_fresh=""
-  if [[ -n "${existing_vsix}" && "${current_hash}" == "${prior_hash}" ]]; then
-    # NB: package.json is excluded here on purpose. Each build bumps its
-    # version (touching its mtime), so it would always look "newer" than the
-    # vsix and defeat the skip. The version-stripped content hash above already
-    # catches any real package.json change.
-    newest_src="$(find src ../packages/weft-graph/src ../packages/weft-graph/svelte.config.mjs ../packages/weft-syntax pnpm-lock.yaml svelte.config.mjs vite.webview.config.mjs vite.markdown-preview.config.mjs markdown-preview/hljs-entry.js tsconfig.json tsconfig.webview.json -type f -newer "${existing_vsix}" -print -quit 2>/dev/null)"
-    [[ -z "${newest_src}" ]] && vsix_is_fresh="yes"
+  # The fingerprint is EVERYTHING the package can ship: every tracked
+  # file of the extension and its two source-consumed sibling packages
+  # (weft-graph's webview, weft-syntax's grammars), plus untracked
+  # not-ignored ones (a just-created source file must not be invisible
+  # to the stamp), hashed by content. A hand-kept file list here
+  # repeatedly went stale (.vscodeignore, media/, the README all ship
+  # and were once missing); enumerating from git closes the class.
+  # Ignored files (out/, node_modules/) stay out, and so does
+  # media/webview (tracked but DERIVED from weft-graph's sources,
+  # which are hashed; hashing the output too would make every build
+  # dirty its own stamp). A deleted-but-still-tracked file hashes as
+  # its absence, so a mid-refactor worktree changes the fingerprint
+  # instead of killing the run.
+  if git -C "${here}" rev-parse HEAD >/dev/null 2>&1; then
+    current_hash="$(
+      {
+        git -C "${here}" ls-files -z extension-vscode packages/weft-graph packages/weft-syntax \
+          ':(exclude)extension-vscode/media/webview'
+        git -C "${here}" ls-files -z --others --exclude-standard \
+          extension-vscode packages/weft-graph packages/weft-syntax \
+          ':(exclude)extension-vscode/media/webview'
+      } | {
+        cd "${here}" && sort -z | while IFS= read -r -d '' f; do
+          if [[ -e "$f" ]]; then ${sha256_bin} "$f"; else printf 'absent  %s\n' "$f"; fi
+        done
+      } | sha256 | awk '{print $1}'
+    )"
+  else
+    # No git, no reliable input list: never reuse a cached build.
+    current_hash="no-git-$$-$(date +%s)"
   fi
 
-  # Three idempotent gates. The version is the FINGERPRINT of the compiled
-  # output: it is bumped only when source actually changes, so it uniquely and
-  # stably identifies a build. That lets each step be a no-op when already done:
-  #
-  #   1. COMPILE (tsc + vite, slow): only when the source hash changed. Bumps
-  #      the version + repackages as part of the same step (a new build => a new
-  #      version => a new .vsix). Writes the stamp last.
-  #   2. PACKAGE (vsce, slow): only inside the compile step, OR if the .vsix for
-  #      the current version is missing. Never re-zips an unchanged build.
-  #   3. INSTALL: only if VS Code's installed version differs from package.json's
-  #      version. Unchanged-and-already-installed => nothing happens at all.
+  # One build at a time: the stamp and the output filename are shared,
+  # and a second run packaging in place while this one installs could
+  # hand VS Code a half-written file.
+  vsix_lock="${hash_dir}.lock"
+  mkdir -p "$(dirname "${vsix_lock}")"
+  vsix_lock_waits=0
+  until mkdir "${vsix_lock}" 2>/dev/null; do
+    if [[ -L "${vsix_lock}" || (-e "${vsix_lock}" && ! -d "${vsix_lock}") ]]; then
+      # A plain file or a symlink on the lock path is never another
+      # run's lock (the lock is always a real directory): waiting on
+      # it would spin forever. -L separately, because a DANGLING
+      # symlink fails -e yet still makes mkdir refuse.
+      fail "the extension build lock path ${vsix_lock} exists and is not a directory; remove it and re-run"
+      exit 1
+    fi
+    # mkdir failed: another run's lock, or the parent refuses creates
+    # (a root-owned entry docker left under ~/.local/share/weft, an
+    # immutable/full filesystem). Distinguish by ATTEMPTING a create,
+    # never by predicate (`-w` lies for root and ACLs, and probing the
+    # lock's absence would false-fail on a concurrent release).
+    if probe="$(mktemp -d "$(dirname "${vsix_lock}")/.lockprobe.XXXXXX" 2>/dev/null)"; then
+      rmdir "${probe}"
+    else
+      fail "cannot create the extension build lock at ${vsix_lock}; is $(dirname "${vsix_lock}") writable?"
+      exit 1
+    fi
+    # A breadcrumb up front and then one a minute: a silent wait on a
+    # stale lock would be indistinguishable from a hang.
+    if [[ $((vsix_lock_waits % 30)) -eq 0 ]]; then
+      hint "another setup.sh is building the extension; waiting ($((vsix_lock_waits * 2))s so far; if none is running, remove the stale lock: rmdir ${vsix_lock})"
+    fi
+    vsix_lock_waits=$((vsix_lock_waits + 1))
+    sleep 2
+  done
+  trap 'rc=$?; rmdir "${vsix_lock}" 2>/dev/null || true; log_run_exit "${rc}"' EXIT
+  # Read the stamp only after the lock is held: a run that waited here
+  # must compare against the build the earlier run just finished, not
+  # against the stamp as it stood before that build.
+  prior_hash="$(cat "${hash_file}" 2>/dev/null || echo)"
+
+  # Reuse the cached .vsix when the CONTENT hash matches AND the
+  # current version's package is on disk. The hash is the whole
+  # freshness test on purpose: the stamp is written only after
+  # packaging succeeds, so a matching stamp proves the .vsix was built
+  # from inputs hashing exactly like today's (an interrupted build
+  # never stamps). An mtime guard here once cost a full extension
+  # rebuild on every branch switch (git rewrites mtimes of
+  # content-identical files); content identity does not. A missing
+  # .vsix is NOT a repackage-without-recompile (out/ is gitignored and
+  # unguaranteed at that point); it is simply not fresh.
   current_ver="$(node -p "require('./package.json').version")"
-  if [[ -n "${vsix_is_fresh}" ]]; then
+  vsix="weft-vscode-${current_ver}.vsix"
+  if [[ -f "${vsix}" && "${current_hash}" == "${prior_hash}" ]]; then
     ok "no source changes (compiled ${C_DIM}v${current_ver}${C_RESET})"
   else
     spin "pnpm install" pnpm install --prefer-offline
     spin "tsc compile" pnpm run compile
     spin "vite bundle webview" pnpm run bundle:webview
     spin "vite bundle markdown preview" pnpm run bundle:markdown-preview
-    # New compiled output => bump the fingerprint version + repackage.
-    prev_ver="${current_ver}"
-    npm version patch --no-git-tag-version >/dev/null
-    current_ver="$(node -p "require('./package.json').version")"
-    ok "version bumped: ${C_DIM}${prev_ver} ${SYM_ARROW} ${current_ver}${C_RESET}"
     rm -f weft-vscode-*.vsix
     spin "package .vsix" pnpm dlx @vscode/vsce package \
       --no-dependencies --allow-missing-repository --skip-license
@@ -1178,24 +1833,24 @@ if [[ $build_vscode -eq 1 ]]; then
     printf '%s' "${current_hash}" >"${hash_file}"
   fi
 
-  # Ensure a .vsix matching the current version exists (e.g. it was deleted, or
-  # a prior run compiled but crashed before packaging). Cheap when present.
-  vsix="weft-vscode-${current_ver}.vsix"
-  if [[ ! -f "${vsix}" ]]; then
-    rm -f weft-vscode-*.vsix
-    spin "package .vsix" pnpm dlx @vscode/vsce package \
-      --no-dependencies --allow-missing-repository --skip-license
-    vsix="$(ls -t weft-vscode-*.vsix 2>/dev/null | head -n 1 || true)"
-  fi
-
   popd >/dev/null
 
-  if [[ -z "${vsix}" || ! -f "${ext_dir}/${vsix}" ]]; then
+  # The build is done; hand the lock back before the install step (the
+  # install keys on its own content stamp and tolerates concurrency).
+  rmdir "${vsix_lock}" 2>/dev/null || true
+  trap 'log_run_exit $?' EXIT
+
+  if [[ ! -f "${ext_dir}/${vsix}" ]]; then
     fail "no .vsix for v${current_ver} was produced"
     exit 1
   fi
+  vsix_path="${ext_dir}/${vsix}"
 
-  ok "packaged ${C_DIM}${ext_dir}/${vsix}${C_RESET}"
+  ok "packaged ${C_DIM}${vsix_path}${C_RESET}"
+  }
+  if [[ -z "${vsix_path}" ]]; then
+    build_vsix_locally
+  fi
 
   # Auto-install via `code` IPC, using the shared live-socket probe (closed
   # terminals leave dead sockets in VSCODE_IPC_HOOK_CLI under WSL/remote-SSH).
@@ -1203,30 +1858,32 @@ if [[ $build_vscode -eq 1 ]]; then
   # The installed version of the extension, queried through the SAME live
   # socket we install through (so it reflects this VS Code window, not some
   # global registry). Empty if not installed / no socket.
-  installed_ext_version() {
-    local sock="$1"
-    VSCODE_IPC_HOOK_CLI="${sock}" code --list-extensions --show-versions 2>/dev/null \
-      | sed -n 's/^weavemind\.weft-vscode@//p' | head -n1
-  }
-
+  # Whether VS Code already runs these exact bytes: the version alone
+  # cannot say (it moves only on --bump, so most rebuilds keep it), so
+  # a content stamp remembers the sha of the last .vsix handed over,
+  # and `--force` makes VS Code take a same-version package.
+  vsix_sha="$(sha256 "${vsix_path}" | cut -d' ' -f1)"
+  installed_vsix_stamp="${HOME}/.local/share/weft/vscode-hashes/installed.sha"
   if ! command -v code >/dev/null 2>&1; then
     warn "'code' not on PATH"
-    hint "install manually: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
+    hint "install manually: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
   elif ! live_sock="$(pick_live_vscode_socket)"; then
     warn "no live VS Code window found"
-    hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
+    hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
   else
     installed_ver="$(installed_ext_version "${live_sock}")"
-    if [[ "${installed_ver}" == "${current_ver}" ]]; then
-      # Already installed and matches the compiled output: do nothing.
-      ok "VS Code already running ${C_DIM}v${current_ver}${C_RESET}; nothing to install"
+    if [[ "${installed_ver}" == "${current_ver}" \
+       && "$(cat "${installed_vsix_stamp}" 2>/dev/null)" == "${vsix_sha}" ]]; then
+      ok "VS Code already running ${C_DIM}v${current_ver}${C_RESET} with these exact bytes; nothing to install"
     elif VSCODE_IPC_HOOK_CLI="${live_sock}" \
-        code --install-extension "${ext_dir}/${vsix}" --force >/dev/null 2>&1; then
+        code --install-extension "${vsix_path}" --force >/dev/null 2>&1; then
+      mkdir -p "$(dirname "${installed_vsix_stamp}")"
+      printf '%s' "${vsix_sha}" > "${installed_vsix_stamp}"
       ok "installed ${C_DIM}v${current_ver}${C_RESET} into VS Code (was ${C_DIM}v${installed_ver:-none}${C_RESET})"
       hint "reload to apply: ${C_BOLD}Developer: Reload Window${C_RESET} (host code), or reopen the graph panel (webview-only changes)"
     else
       warn "code --install-extension failed via live socket"
-      hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${ext_dir}/${vsix}' --force${C_RESET}"
+      hint "run inside a VS Code terminal: ${C_BOLD}code --install-extension '${vsix_path}' --force${C_RESET}"
     fi
   fi
 fi
@@ -1257,31 +1914,44 @@ if [[ $build_browser -eq 1 ]]; then
       set +a
     fi
     if [[ -z "${WEB_EXT_API_KEY:-}" || -z "${WEB_EXT_API_SECRET:-}" ]]; then
-      fail "--sign needs WEB_EXT_API_KEY + WEB_EXT_API_SECRET in ${here}/.env.extension"
+      fail "signing needs WEB_EXT_API_KEY + WEB_EXT_API_SECRET in ${here}/.env.extension (or pass --no-sign)"
       hint "get keys: ${C_DIM}https://addons.mozilla.org/en-US/developers/addon/api/key/${C_RESET}"
-      hint "or pass ${C_BOLD}--no-sign${C_RESET} to skip Firefox signing"
       exit 1
     fi
     if ! command -v web-ext >/dev/null 2>&1; then
-      fail "--sign needs web-ext on PATH"
-      hint "install: ${C_BOLD}pnpm i -g web-ext${C_RESET} (or pass --no-sign)"
+      fail "signing needs web-ext on PATH (or pass --no-sign)"
+      hint "install: ${C_BOLD}pnpm i -g web-ext${C_RESET}"
       exit 1
     fi
   fi
 
   pushd "${bx_dir}" >/dev/null
 
-  # Bump version unless --no-bump. The version in package.json is
-  # the source of truth; zip filenames stay unversioned so callers
-  # always reference the same path. Git history + the bumped
-  # package.json track which version is in each commit.
+  # Bump only on --bump: the version in package.json is what makes CI
+  # submit a pushed build to the stores, so a plain rebuild must never
+  # move it. Zip filenames stay unversioned so callers always reference
+  # the same path; git history + package.json track which version is in
+  # each commit.
   current_version="$(node -p "require('./package.json').version")"
   if [[ $do_bump -eq 1 ]]; then
-    npm version patch --no-git-tag-version >/dev/null
+    pnpm version patch --no-git-tag-version >/dev/null
   fi
   version="$(node -p "require('./package.json').version")"
   if [[ "${version}" != "${current_version}" ]]; then
-    ok "version bumped: ${C_DIM}${current_version} ${SYM_ARROW} ${version}${C_RESET}"
+    ok "version bumped: ${C_DIM}${current_version} ${SYM_ARROW} ${version}${C_RESET} ${C_DIM}(pushing this submits to the stores)${C_RESET}"
+    bump_pending_notes+=("extension-browser/package.json is already bumped to v${version}: re-run WITHOUT --bump, or revert it")
+    # A tracked signed .xpi from an older version must not outlive the
+    # bump when this run will not re-sign it (signing needs both the
+    # sign switch AND firefox in the target set); a stale signed build
+    # beside newer zips would get committed as if it matched. Said out
+    # loud: it is a TRACKED file, and a silent removal would leave the
+    # working tree showing a deletion the user never made.
+    if [[ $do_sign -eq 0 || $target_firefox -eq 0 ]]; then
+      if [[ -f build/weft-extension-firefox.xpi ]]; then
+        rm -f build/weft-extension-firefox.xpi
+        warn "removed the tracked signed .xpi: it was signed for v${current_version} and this run does not re-sign. Run ${C_BOLD}./setup.sh --browser --firefox${C_RESET} (signing on) before committing."
+      fi
+    fi
   else
     hint "version: ${C_DIM}${version}${C_RESET}"
   fi
@@ -1299,6 +1969,10 @@ if [[ $build_browser -eq 1 ]]; then
   [[ $target_safari  -eq 1 ]] && pnpm -s build:safari
 
   # Per-target zip. WXT writes build/weft-extension-<browser>.zip
+  # SYNC: the zip basenames <-> extension-browser/wxt.config.ts (the
+  #       zip artifactTemplate/sourcesTemplate + package.json "name"),
+  #       .github/workflows/release.yml (publish-browser: the per-store
+  #       zip paths in the submit step)
   # for each. The unversioned name means each rebuild overwrites
   # cleanly; no purge step needed.
   [[ $target_chrome  -eq 1 ]] && pnpm -s zip
@@ -1356,11 +2030,6 @@ fi
 # the first thing a fresh user sees that tells them what to actually
 # DO with the install they just ran.
 
-is_default_install=0
-if [[ $build_cli -eq 1 && $refresh_daemon -eq 1 && $build_vscode -eq 1 && $build_browser -eq 0 ]]; then
-  is_default_install=1
-fi
-
 if [[ $build_cli -eq 1 ]]; then
   case ":${PATH}:" in
     *":${bin_dir}:"*)
@@ -1377,6 +2046,7 @@ if [[ $build_cli -eq 1 ]]; then
     printf '%s%s%s %s%sSetup complete.%s\n\n' "${C_GREEN}" "${SYM_OK}" "${C_RESET}" "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
 
     printf '%s%sRunning:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"
+    # SYNC: weft-system <-> crates/weft-core/src/infra/mod.rs (SYSTEM_NAMESPACE)
     printf '  %s%s%s dispatcher  %s%s%s  %s(kind cluster, weft-system ns)%s\n' \
       "${C_GREEN}" "${SYM_OK}" "${C_RESET}" \
       "${C_DIM}" "http://127.0.0.1:9999" "${C_RESET}" \
@@ -1406,9 +2076,9 @@ if [[ $build_cli -eq 1 ]]; then
 
     printf '\n%s%sBrowser extension%s %s(HumanQuery / in-page weaves)%s\n' \
       "${C_BOLD}" "${C_BLUE}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
-    printf '  %sbuild it once:%s     %s./setup.sh --browser --no-sign --no-bump%s\n' \
+    printf '  %sbuild it once:%s     %s./setup.sh --browser --no-sign%s\n' \
       "${C_DIM}" "${C_RESET}" "${C_BOLD}" "${C_RESET}"
-    printf '  %sthen load %sextension-build/weavemind-chrome.zip%s %svia chrome://extensions%s\n' \
+    printf '  %sthen Load unpacked %sextension-browser/build/chrome-mv3%s %svia chrome://extensions%s\n' \
       "${C_DIM}" "${C_RESET}${C_BOLD}" "${C_RESET}" "${C_DIM}" "${C_RESET}"
 
     printf '\n%s%sDay-to-day:%s\n' "${C_BOLD}" "${C_BLUE}" "${C_RESET}"

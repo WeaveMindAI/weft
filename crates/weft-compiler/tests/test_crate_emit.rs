@@ -19,7 +19,8 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
 }
 
 fn stdlib() -> FsCatalog {
-    FsCatalog::discover(&weft_catalog::stdlib_root()).expect("stdlib discovers")
+    FsCatalog::discover(&weft_catalog::stdlib_root().expect("stdlib root"))
+        .expect("stdlib discovers")
 }
 
 /// The emitted test crate: runner main + registry + the one package
@@ -86,7 +87,7 @@ fn emitted_test_crate_has_the_expected_shape() {
 fn staged_slack_project() -> tempfile::TempDir {
     let project_dir = tempfile::tempdir().expect("temp project");
     copy_dir(
-        &weft_catalog::stdlib_root().join("slack"),
+        &weft_catalog::stdlib_root().expect("stdlib root").join("slack"),
         &project_dir.path().join("nodes").join("slack"),
     );
     std::fs::write(
@@ -151,7 +152,7 @@ fn node_test_hash_tracks_sources_and_recipe() {
     let package_root = project_dir.path().join("nodes").join("slack");
     // A SIBLING package, for the type-registry flip below.
     copy_dir(
-        &weft_catalog::stdlib_root().join("basic"),
+        &weft_catalog::stdlib_root().expect("stdlib root").join("basic"),
         &project_dir.path().join("nodes").join("basic"),
     );
     let catalog = || {
@@ -266,7 +267,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
     // the slack package.
     let project_dir = tempfile::tempdir().expect("temp project");
     copy_dir(
-        &weft_catalog::stdlib_root().join("slack"),
+        &weft_catalog::stdlib_root().expect("stdlib root").join("slack"),
         &project_dir.path().join("nodes").join("slack"),
     );
     let catalog = FsCatalog::discover(&project_dir.path().join("nodes"))

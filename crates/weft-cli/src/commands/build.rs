@@ -1,10 +1,8 @@
 //! `weft build`: compile the current project into a worker
-//! container image. Tagged `weft-worker-<project-id>:<short-hash>`
-//! where the short-hash is the first 16 chars of the binary hash
-//! (so each rebuild yields a fresh tag and the cluster pulls the
-//! right image without cache surprises). The build itself runs
-//! in a multi-stage `docker build` so the host needs only
-//! docker + kind + kubectl.
+//! container image. Tagged `weft-worker:<binary-hash>`; the project id
+//! rides the `weft.dev/project` label, so identical sources across
+//! projects share one image. The build itself runs in a multi-stage
+//! `docker build` so the host needs only docker + kind + kubectl.
 
 use std::env;
 
@@ -32,14 +30,14 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         crate::commands::assets::resolve_project_assets(&client, &project.root, &mut definition)
             .await?;
         // The shared build brain: stage the worker context from the resolved
-        // definition. The base is ensured inside the image build; pass its tag
+        // definition. The base is ensured inside the image build; pass its ref
         // through here so the staged Dockerfile FROMs it.
-        let builder_base_tag = crate::images::ensure_worker_builder_base().await?;
+        let builder_base_ref = crate::images::ensure_worker_builder_base().await?;
         let plan = weft_compiler::build_plan::plan_build_from(
             &project,
             &definition,
             &catalog,
-            &builder_base_tag,
+            &builder_base_ref,
             &CliTagPolicy,
         )
         .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
@@ -90,6 +88,57 @@ pub async fn run_build_base(quiet: bool) -> Result<()> {
     Ok(())
 }
 
+/// `weft build-images [--push | --push-suffix <s>]`: ensure the four system
+/// images + the worker builder-base exist locally under their
+/// content-addressed refs, then optionally push each to its registry. The
+/// release workflow's verb: it runs on every push to the release branch so a
+/// clean checkout's `weft daemon start` (and every worker build's `FROM`)
+/// pulls instead of compiling. With a suffix, each ref is pushed as
+/// `<ref><suffix>` (one architecture's half; the workflow stitches the bare
+/// ref into a multi-arch manifest list afterwards).
+/// Ensures run concurrently (independent input sets, per-image buildkit cache
+/// mounts); pushes run after ALL ensures, so a failed build never publishes a
+/// partial set's siblings out of order. Stdout carries ONLY the bare refs,
+/// one per line, for the workflow to capture; progress rides stderr.
+/// `--print` stops after resolving: the refs this tree's content hashes
+/// to, touching no image (setup.sh keys its engine-change sweep on the
+/// builder-base line moving).
+pub async fn run_build_images(push: bool, push_suffix: Option<String>, print: bool) -> Result<()> {
+    if print {
+        // The SAME list the ensure path prints (`bare_refs` carries
+        // the stdout contract), never a second construction of it.
+        let shared = crate::images::SharedImages {
+            system: crate::images::SystemImages::resolve()?,
+            builder_base: Some(crate::images::builder_base_ref()?),
+        };
+        for image_ref in shared.bare_refs() {
+            println!("{image_ref}");
+        }
+        return Ok(());
+    }
+    let shared = crate::images::ensure_all_shared_images(
+        false,
+        crate::images::BaseFailure::Fatal,
+        push_suffix.as_deref(),
+    )
+    .await?;
+    if push || push_suffix.is_some() {
+        for image_ref in shared.bare_refs() {
+            // The suffixed name is exactly what the ensure materialized
+            // (one shared `suffixed_ref` on both sides).
+            crate::images::docker_push(&crate::images::suffixed_ref(
+                image_ref,
+                push_suffix.as_deref(),
+            ))
+            .await?;
+        }
+    }
+    for image_ref in shared.bare_refs() {
+        println!("{image_ref}");
+    }
+    Ok(())
+}
+
 /// Top-level helper used by every verb that needs the worker image
 /// in place. Owns the image-skip check + emits build/push events;
 /// callers don't duplicate the existence check anymore. If the
@@ -109,7 +158,7 @@ pub async fn ensure_worker_image_with_progress(
         match cfg.backend {
             ClusterBackend::Kind if kind_available(&cfg.cluster_name).await => {
                 progress.image_push_start(image_tag);
-                crate::images::kind_load(&cfg.cluster_name, image_tag).await?;
+                crate::images::kind_load(&cfg.cluster_name, image_tag, false).await?;
                 progress.image_push_done(image_tag);
             }
             ClusterBackend::Kind => {}
@@ -128,8 +177,8 @@ pub async fn ensure_worker_image_with_progress(
     // Build from the ALREADY-STAGED worker context (produced once by
     // `weft_compiler::build_plan::plan_build_from`, shared with the hashing above so
     // the project compiles once per verb, not twice). The context's Dockerfile
-    // `FROM weft-builder-base:<hash>`s the shared base; ensure it exists first (a
-    // no-op cache hit after the first clean-machine build).
+    // FROMs the shared builder base; ensure it exists first (a no-op
+    // cache hit after the first clean-machine build).
     crate::images::ensure_worker_builder_base().await?;
 
     progress.build_start(image_tag);
@@ -192,12 +241,12 @@ async fn docker_build_and_kind_load(
     context_dir: &std::path::Path,
     referenced: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<()> {
-    docker_build(tag, context_dir, project_id).await?;
+    build_worker_image(tag, context_dir, project_id).await?;
     let cfg = cluster_config();
     match cfg.backend {
         ClusterBackend::Kind if kind_available(&cfg.cluster_name).await => {
             progress.image_push_start(tag);
-            images::kind_load(&cfg.cluster_name, tag).await?;
+            images::kind_load(&cfg.cluster_name, tag, false).await?;
             progress.image_push_done(tag);
         }
         ClusterBackend::Kind => {
@@ -225,38 +274,15 @@ async fn docker_build_and_kind_load(
     Ok(())
 }
 
-async fn docker_build(
+/// Build one worker image: the shared [`images::docker_build`] with
+/// the `weft.dev/project` label [`gc_stale_images`] later selects on.
+async fn build_worker_image(
     tag: &str,
     ctx_dir: &std::path::Path,
     project_id: &str,
 ) -> Result<()> {
     let label = format!("weft.dev/project={project_id}");
-    docker_build_image(tag, &ctx_dir.join("Dockerfile"), ctx_dir, &[label]).await
-}
-
-/// Single docker build entrypoint used by worker, infra, and
-/// node-test images. The `labels` stamp the `weft.dev/*` filters
-/// (`project=<id>`, plus e.g. `node-test-package=<pkg>`) that
-/// [`gc_stale_images`] later selects on to find a build's stale
-/// leftovers.
-pub async fn docker_build_image(
-    tag: &str,
-    dockerfile: &std::path::Path,
-    ctx_dir: &std::path::Path,
-    labels: &[String],
-) -> Result<()> {
-    let mut cmd = Command::new("docker");
-    cmd.args(["build", "-t", tag]);
-    for l in labels {
-        cmd.args(["--label", l]);
-    }
-    cmd.arg("-f").arg(dockerfile).arg(ctx_dir);
-    cmd.env("DOCKER_BUILDKIT", "1");
-    let status = cmd.status().await?;
-    if !status.success() {
-        anyhow::bail!("docker build {tag} exited {status}");
-    }
-    Ok(())
+    images::docker_build(tag, &ctx_dir.join("Dockerfile"), ctx_dir, &[label], None).await
 }
 
 /// Drop STALE content-addressed images: every tag of `repo` carrying
@@ -287,7 +313,7 @@ pub async fn gc_stale_images(
 ) {
     let Some(referenced) = referenced else { return };
     let filters: Vec<String> = labels.iter().map(|l| format!("label={l}")).collect();
-    let mut list = Command::new("docker");
+    let mut list = images::docker();
     list.arg("images");
     for f in &filters {
         list.args(["--filter", f]);
@@ -297,22 +323,23 @@ pub async fn gc_stale_images(
     if !out.status.success() {
         return;
     }
-    let stale: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|line| line.rsplit_once(':').is_some_and(|(r, _)| r == repo))
-        .filter(|line| *line != fresh)
-        .filter(|line| {
-            line.rsplit_once(':').is_none_or(|(_, hash)| !referenced.contains(hash))
-        })
-        .map(str::to_string)
-        .collect();
+    // `fresh` is a well-formed content ref by construction; a split
+    // failure here would be a programming error, and skipping the GC
+    // is the safe answer to it.
+    let Ok(stale) = images::host_images_condemned(
+        fresh,
+        &String::from_utf8_lossy(&out.stdout),
+        |hash| !referenced.contains(hash),
+    ) else {
+        return;
+    };
     if stale.is_empty() {
         return;
     }
     // No `-f`: a tag docker refuses to drop (an image a host container
     // still runs) is information, and force would untag it anyway and
     // strand the container's restart.
-    let _ = Command::new("docker").args(["rmi"]).args(&stale).status().await;
+    let _ = images::docker().args(["rmi"]).args(&stale).status().await;
     // The kind node's containerd holds its own copy of every loaded
     // tag (with no labels); condemn exactly the host-stale hash set
     // there, through the one matcher every node cleanup uses (bare,
@@ -333,7 +360,7 @@ pub async fn gc_stale_images(
             let node_stale =
                 images::node_images_condemned(repo, &groups, |h| stale_hashes.contains(h));
             if !node_stale.is_empty() {
-                let _ = Command::new("docker")
+                let _ = images::docker()
                     .args(["exec", &node, "crictl", "rmi"])
                     .args(&node_stale)
                     .status()
@@ -341,7 +368,7 @@ pub async fn gc_stale_images(
             }
         }
     }
-    let mut prune = Command::new("docker");
+    let mut prune = images::docker();
     prune.args(["image", "prune", "--force", "--filter", "dangling=true"]);
     for f in &filters {
         prune.args(["--filter", f]);
@@ -354,7 +381,7 @@ pub async fn kind_available(cluster_name: &str) -> bool {
     if !matches!(which, Ok(o) if o.status.success()) {
         return false;
     }
-    let out = Command::new("kind").args(["get", "clusters"]).output().await;
+    let out = images::quiet_stdout("kind").args(["get", "clusters"]).output().await;
     matches!(out, Ok(o) if o.status.success()
         && String::from_utf8_lossy(&o.stdout).lines().any(|l| l == cluster_name))
 }

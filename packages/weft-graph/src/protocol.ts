@@ -913,7 +913,10 @@ export const ACCESS_MARKER_KEY = '__weft_access__';
 /** Render hint for one form field. Opaque to the host; the
  *  consumer (browser extension, dashboard) reads `component` to
  *  pick a UI primitive. */
-// SYNC: FormFieldRenderWire <-> crates/weft-core/src/node.rs FormFieldRender
+// SYNC: FormFieldRenderWire <-> crates/weft-core/src/node.rs FormFieldRender,
+//       extension-browser/src/lib/api.ts FormFieldRender (a separate pnpm
+//       workspace with no dependency between the two, so the shape is
+//       restated there rather than imported)
 export interface FormFieldRenderWire {
   component: string;
   source?: 'static' | 'input';

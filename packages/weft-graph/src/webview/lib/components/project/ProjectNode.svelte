@@ -9,7 +9,7 @@
 	import CodeEditor from "../CodeEditor.svelte";
 	import { toast } from "svelte-sonner";
 	import CopyButton from "../ui/CopyButton.svelte";
-	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, entryPortCollisions, entryPortName, isValidFieldKey, type PortEntryDef, type PortSpec } from '../../utils/port-specs';
+	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, entryForSource, entryPortCollisions, entryPortName, hasValue, isEmptyChoiceSet, isFilledIn, isValidFieldKey, type PortEntryDef, type PortSpec } from '../../utils/port-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "../../utils/status";
 	import type { ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink, Pencil } from '@lucide/svelte';
@@ -1000,19 +1000,21 @@
 		if (!name || !isValidFieldKey(name)) {
 			return false; // the caller lights up its own name input
 		}
-		// Emptied counts as missing: a required text field the user typed
-		// into and then cleared leaves '', and an entry with an empty
-		// required value is as incomplete as one with none.
-		const missing = (spec.fields ?? []).filter((f) => {
-			if (!f.required) return false;
-			const v = draft[f.key];
-			return v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0);
-		});
+		// The one filled-in predicate (`hasValue`) decides both what is
+		// missing here and what `entryForSource` writes, so a value that
+		// passes this check always reaches the source (an empty string
+		// is a value: a case matching "" is legal). An empty CHOICE SET
+		// on a required field is missing too, matching what the
+		// compiler refuses (see `isEmptyChoiceSet` for which fields a
+		// bare `[]` is legitimate on).
+		const missing = (spec.fields ?? []).filter(
+			(f) => f.required && (!hasValue(draft, f) || isEmptyChoiceSet(draft, f)),
+		);
 		if (missing.length > 0) {
 			toast.error(`A "${spec.label}" needs ${missing.map((f) => f.label).join(', ')}.`);
 			return false;
 		}
-		const entry: PortEntryDef = { ...draft, kind: spec.kind, [spec.keyField]: name };
+		const entry = entryForSource(draft, spec, name);
 
 		// The ports this entry would add, against the ones already there.
 		// An edit measures against every OTHER entry, so keeping a name
@@ -1180,10 +1182,8 @@
 
 </script>
 
-<!-- The live-display content (infra/trigger feed, debug preview, image/file
-     preview) rendered the SAME way in the full body and the simplified card,
-     so the two never drift. `actionBtn` is its helper. Defined at the top
-     level so both render branches can call it. -->
+<!-- The add/edit form for one config-derived entry, shared by the add
+     row and every open edit row. -->
 {#snippet entryForm(
 	draft: PortEntryDef,
 	keyError: boolean,
@@ -1245,6 +1245,10 @@
 	</div>
 {/snippet}
 
+<!-- The live-display content (infra/trigger feed, debug preview, image/file
+     preview) rendered the SAME way in the full body and the simplified card,
+     so the two never drift. `actionBtn` is its helper. Defined at the top
+     level so both render branches can call it. -->
 {#snippet actionBtn(item: LiveDataItem)}
 	{#if item.action}
 		<button
@@ -1791,7 +1795,7 @@
 					{#if field.portDriven}
 						{@const locked = portFieldLocked(field.key)}
 						{@const form = portFieldForm(field.key)}
-						{@const hasValue = ownValue(portLiterals, field.key) !== undefined && ownValue(portLiterals, field.key) !== null}
+						{@const hasLiteral = isFilledIn(ownValue(portLiterals, field.key))}
 						<!-- The form-toggle marker: which SOURCE FORM this port's
 						     value is written in. Braces `{ }` vs statement `=`;
 						     a wired-only port is locked to the statement form.
@@ -1807,8 +1811,8 @@
 									? `Written inside the node body ({ ${field.key}: ... }). Click to move it to a statement line (${id}.${field.key} = ...).`
 									: `Written as a statement (${id}.${field.key} = ...). Click to move it into the node body.`}
 							aria-label={`Toggle source form for ${field.key}`}
-							disabled={!hasValue}
-							onclick={(e) => { e.stopPropagation(); if (hasValue) togglePortValueForm(field.key); }}
+							disabled={!hasLiteral}
+							onclick={(e) => { e.stopPropagation(); if (hasLiteral) togglePortValueForm(field.key); }}
 						><span aria-hidden="true">{form === 'inline' ? '{ }' : '='}</span></button>
 						<!-- The clear (×) button for checkbox/select port fields
 						     is FieldStrip's own, via onClear. -->

@@ -176,7 +176,7 @@ async fn wait_for_single_owner(platform: &Platform, pid: &uuid::Uuid) -> anyhow:
         || async {
             let count = platform.infra_owner_count(pid).await?;
             anyhow::ensure!(count <= 1, "project owned by {count} supervisors at once (>1)");
-            Ok(platform.infra_owner_of(pid).await?)
+            platform.infra_owner_of(pid).await
         },
     )
     .await

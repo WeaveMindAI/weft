@@ -229,6 +229,13 @@ fn render_listener_manifest(name: &str, namespace: &str, image: &str, broker_url
     // NetworkPolicy in the control-plane namespace (in
     // deploy/k8s/system-namespace.yaml; selects `weft.dev/role=listener`
     // there). Here we only render the Deployment + Service.
+    // SYNC: the weft.dev/role value <->
+    //       crates/weft-cli/src/commands/daemon.rs (POOLED_TIERS, which
+    //       re-points these Deployments at a new image by this label),
+    //       crates/weft-dispatcher/src/supervisor_pool.rs (the sibling
+    //       pooled manifest's weft.dev/role),
+    //       deploy/k8s/system-namespace.yaml (the pooled-listener
+    //       NetworkPolicy podSelector)
     //
     // Auth: the broker validates the projected SA token mounted at
     // /var/run/weft/sa/token. The audience claim is `weft-broker`.

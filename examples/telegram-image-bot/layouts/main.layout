@@ -1,5 +1,5 @@
 @view simplified
-credit @layout 569 226 841x331
+credit @layout 569 226 841x348
 brief @layout 1462 136 573x376
 telegram @layout 70 142
 fal @layout 2091 136 320x152 collapsed
@@ -20,17 +20,17 @@ brief.write__provider @layout 65 92
 brief.write__params @layout 65 210
 credit @slayout 365 104 471x230 collapsed
 brief @slayout 515 40 305x319 collapsed
-telegram @slayout 40 141
+telegram @slayout 40 142
 fal @slayout 669 161
 pg @slayout 90 406
-ask @slayout 180 141
+ask @slayout 180 142
 sorry @slayout 515 161
 picture @slayout 809 161
-reply @slayout 964 218
+reply @slayout 964 219
 join @slayout 235 274
 table @slayout 230 406
 signup @slayout 395 289
-enroll @slayout 545 346
+enroll @slayout 545 347
 credit.who @slayout 29 48
 credit.debit @slayout 179 106
 credit.read @slayout 329 106

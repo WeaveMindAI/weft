@@ -1,0 +1,16 @@
+/* Shared base for BOTH entry pages (popup + full-tab tasks): the
+ * reset, the font, the ground color, and nothing sized. Sizing (and
+ * the popup's overflow clamp) lives in each page's own `:global()`
+ * style block, because vite hoists CSS imported by multiple entries
+ * into one shared chunk: a popup-sized rule in here would clamp the
+ * full-tab page. */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #fafafa;
+}

@@ -1,3 +1,5 @@
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
 ---
 # weft-broker. The trusted proxy that fronts Postgres for tenant
 # pods. Validates each request's projected SA token via TokenReview,
@@ -58,7 +60,13 @@ spec:
       serviceAccountName: weft-broker-sa
       containers:
         - name: broker
-          image: weft-broker:local
+          # Content-addressed ref substituted by the apply path; a new
+          # tag is a spec diff, so applying it IS the rollout.
+          # SYNC: WEFT_*_IMAGE names <-> crates/weft-cli/src/images.rs
+          #       (SystemService::image_env),
+          #       deploy/k8s/dispatcher.yaml (env block),
+          #       crates/weft-dispatcher/src/app.rs (backend reads)
+          image: "${WEFT_BROKER_IMAGE}"
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9090

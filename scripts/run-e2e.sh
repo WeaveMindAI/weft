@@ -46,6 +46,7 @@ cleanup_provisioned() {
 # The cluster itself must exist before anything can be port-forwarded;
 # the first test's ensure step re-runs setup.sh anyway (idempotent), so
 # this only pays the bring-up when the cluster is absent outright.
+# SYNC: weft-db <-> crates/weft-core/src/infra/mod.rs (DB_NAMESPACE)
 if ! kubectl get namespace weft-db >/dev/null 2>&1; then
   echo "cluster not up; running setup.sh first"
   ./setup.sh || exit 1
@@ -55,6 +56,7 @@ fi
 # port-forward of the cluster's own weft-postgres (the local-dev creds
 # from deploy/k8s/postgres.yaml).
 if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
+  # SYNC: weft-db <-> crates/weft-core/src/infra/mod.rs (DB_NAMESPACE)
   kubectl -n weft-db port-forward svc/weft-postgres 15433:5432 >/dev/null 2>&1 &
   PF_PID=$!
   CLEANUP+=("kill $PF_PID 2>/dev/null || true")

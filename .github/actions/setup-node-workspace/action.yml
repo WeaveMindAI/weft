@@ -1,0 +1,65 @@
+# The pnpm + node + install preamble every job touching a JS workspace
+# needs, parameterized by the workspace dir so the node version and the
+# install shape live in exactly one place (ci.yml's editor job,
+# release.yml's vsix/browser/publish jobs).
+name: setup-node-workspace
+description: pnpm + node + install for one workspace, plus optional borrow symlinks
+inputs:
+  workspace:
+    description: The workspace directory holding package.json + pnpm-lock.yaml
+    required: true
+  borrow-packages:
+    description: >-
+      Space-separated package dirs that have no installs of their own
+      and borrow this workspace's node_modules (the same wiring
+      setup.sh does locally).
+    required: false
+    default: ''
+  install:
+    description: >-
+      Whether to `pnpm install` the workspace. `false` for jobs that
+      only need pnpm + node on PATH (a `pnpm dlx` publish), so they
+      pay no workspace install and gain no failure surface from one.
+    required: false
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    # The pnpm version comes from the workspace's `packageManager`
+    # field (there is no root package.json).
+    - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      with:
+        package_json_file: ${{ inputs.workspace }}/package.json
+    # The pnpm-store cache only for callers that INSTALL: a
+    # non-installing caller never reads the store, and setup-node's
+    # post step would still try to save it (a save failure fails the
+    # job AFTER its real work, e.g. after a store publish).
+    - if: ${{ inputs.install == 'true' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: pnpm
+        cache-dependency-path: ${{ inputs.workspace }}/pnpm-lock.yaml
+    - if: ${{ inputs.install != 'true' }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+    # Inputs reach the scripts as env vars, never by interpolation into
+    # the script body (interpolated input text would execute as shell).
+    - if: ${{ inputs.install == 'true' }}
+      env:
+        WORKSPACE: ${{ inputs.workspace }}
+      run: pnpm -C "$WORKSPACE" install --frozen-lockfile
+      shell: bash
+    # The symlink target is absolute so a borrowed package at ANY depth
+    # resolves; a relative ../../ would dangle silently anywhere but
+    # two levels down.
+    - if: ${{ inputs.borrow-packages != '' }}
+      env:
+        WORKSPACE: ${{ inputs.workspace }}
+        BORROW_PACKAGES: ${{ inputs.borrow-packages }}
+      run: |
+        for pkg in $BORROW_PACKAGES; do
+          ln -sfn "$GITHUB_WORKSPACE/$WORKSPACE/node_modules" "$pkg/node_modules"
+        done
+      shell: bash

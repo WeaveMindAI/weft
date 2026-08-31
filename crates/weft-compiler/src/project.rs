@@ -219,7 +219,7 @@ pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
     // source that ever carries a build/cache dir (a `target/`, a
     // `node_modules/`) doesn't get cloned into the user's `nodes/`.
     crate::build::copy_dir_filtered(
-        &weft_catalog::stdlib_root(),
+        &weft_catalog::stdlib_root().map_err(CompileError::Build)?,
         &dest,
         weft_catalog::NODE_TREE_EXCLUDE,
     )

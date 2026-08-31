@@ -96,6 +96,7 @@ pub fn infra_images(definition: &ProjectDefinition, catalog: &FsCatalog) -> Resu
 /// `weft-infra-<image_name>:<content_hash>`. ONE source of truth for the infra
 /// tag shape, shared by the CLI (local tag) and the dispatcher (which prepends
 /// the registry prefix), so the two cannot drift.
+/// SYNC: weft-infra-<name> repo <-> setup.sh (--purge, the weft-infra-* image sweep)
 pub fn infra_image_repo(image_name: &str) -> String {
     format!("weft-infra-{image_name}")
 }

@@ -45,6 +45,7 @@ internet. See
    | Domain | your domain |
    | Path | leave empty |
    | Type | `HTTP` |
+   <!-- SYNC: weft-system <-> crates/weft-core/src/infra/mod.rs (SYSTEM_NAMESPACE) -->
    | URL | `weft-public-proxy.weft-system.svc.cluster.local:8080` |
 
    That tells Cloudflare "whatever arrives at that subdomain, hand it down the

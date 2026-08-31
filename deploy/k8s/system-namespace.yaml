@@ -1,3 +1,5 @@
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -192,6 +194,10 @@ metadata:
 spec:
   podSelector:
     matchLabels:
+      # SYNC: the weft.dev/role value <->
+      #       crates/weft-dispatcher/src/listener.rs (render_listener_manifest),
+      #       crates/weft-cli/src/commands/daemon.rs (POOLED_TIERS),
+      #       the pooled-supervisor podSelector below
       weft.dev/role: listener
   policyTypes:
     - Ingress
@@ -266,6 +272,10 @@ metadata:
 spec:
   podSelector:
     matchLabels:
+      # SYNC: the weft.dev/role value <->
+      #       crates/weft-dispatcher/src/supervisor_pool.rs (the supervisor manifest),
+      #       crates/weft-cli/src/commands/daemon.rs (POOLED_TIERS),
+      #       the pooled-listener podSelector above
       weft.dev/role: infra-supervisor
   policyTypes:
     - Ingress

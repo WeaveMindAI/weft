@@ -6,7 +6,7 @@ use weft_compiler::weft_compiler::compile;
 use weft_compiler::CompileFs;
 
 fn catalog() -> FsCatalog {
-    FsCatalog::discover(&stdlib_root()).expect("stdlib")
+    FsCatalog::discover(&stdlib_root().expect("stdlib root")).expect("stdlib")
 }
 
 #[test]

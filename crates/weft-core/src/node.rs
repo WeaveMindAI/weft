@@ -668,6 +668,15 @@ impl NodeMetadata {
                     ));
                 }
             }
+            // No specs means no entry could ever add a port, and the
+            // editor would render an entry form with an empty kind
+            // dropdown; refuse the declaration instead.
+            if ports.specs.is_empty() {
+                return Err(
+                    "portsFromConfig: declares no specs, so no entry could ever add a port"
+                        .into(),
+                );
+            }
             let mut kinds: std::collections::HashSet<&str> = std::collections::HashSet::new();
             for spec in &ports.specs {
                 if spec.kind.is_empty() {
@@ -687,9 +696,32 @@ impl NodeMetadata {
                         spec.kind
                     ));
                 }
+                let mut field_keys: std::collections::HashSet<&str> =
+                    std::collections::HashSet::new();
                 for field in &spec.fields {
                     if let Some(problem) = field.declaration_problem() {
                         return Err(format!("portsFromConfig: spec '{}' {problem}", spec.kind));
+                    }
+                    // `kind` and the key field are written into every
+                    // entry FIRST; a spec field reusing either name
+                    // would silently overwrite the entry's kind or its
+                    // validated port name with a raw draft value.
+                    if field.key == "kind" || field.key == spec.key_field {
+                        return Err(format!(
+                            "portsFromConfig: spec '{}' declares a field named '{}', which \
+                             is the key holding the entry's kind or its port name",
+                            spec.kind, field.key
+                        ));
+                    }
+                    // Two fields on one entry key is the same silent
+                    // overwrite between siblings: last one wins in the
+                    // entry map and the editor draws two controls bound
+                    // to one value.
+                    if !field_keys.insert(field.key.as_str()) {
+                        return Err(format!(
+                            "portsFromConfig: spec '{}' declares the field '{}' twice",
+                            spec.kind, field.key
+                        ));
                     }
                 }
                 if spec.fields.iter().any(|f| f.needs_matched_input())
@@ -1058,7 +1090,8 @@ impl PortsFromConfig {
 /// primitive's flags. Typed (not a raw `Value`) so the loud-load
 /// guarantee holds here too: a typo'd key inside `render` fails the
 /// metadata load instead of shipping a component-less field.
-// SYNC: FormFieldRender <-> packages/weft-graph/src/protocol.ts FormFieldRenderWire
+// SYNC: FormFieldRender <-> packages/weft-graph/src/protocol.ts FormFieldRenderWire,
+//       extension-browser/src/lib/api.ts FormFieldRender
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormFieldRender {
@@ -1258,6 +1291,26 @@ impl SpecField {
     /// matched against.
     pub fn needs_matched_input(&self) -> bool {
         self.shape != SpecShape::Typed
+    }
+
+    /// Whether an empty list in this field means the author CHOSE
+    /// NOTHING (a `valueList` of match candidates, a `typed` field
+    /// whose declared type is a list of choices), which satisfies no
+    /// requirement. For every other shape a list is a single VALUE
+    /// being matched (`equals: []` legitimately routes an empty list),
+    /// so emptiness says nothing about filled-in-ness there.
+    /// SYNC: empty-list-is-nothing-chosen <->
+    ///       crates/weft-compiler/src/validate.rs (the spec-field loop),
+    ///       packages/weft-graph/src/webview/lib/utils/port-specs.ts
+    ///       (isEmptyChoiceSet)
+    pub fn empty_list_means_nothing_chosen(&self) -> bool {
+        match self.shape {
+            SpecShape::ValueList => true,
+            SpecShape::Typed => {
+                matches!(self.value_type, Some(WeftType::List(_)))
+            }
+            _ => false,
+        }
     }
 
     /// The control to draw, the declared one or the shape's default.
@@ -2537,6 +2590,45 @@ mod input_semantics_tests {
             specs: vec![spec("case", vec![])],
         });
         assert!(empty.validate_semantics().unwrap_err().contains("adds no ports"));
+
+        // No specs at all: no entry could ever add a port, and the
+        // editor would render an empty kind dropdown.
+        let mut none = base();
+        none.ports_from_config = Some(PortsFromConfig {
+            field: "cases".into(),
+            match_input: None,
+            specs: vec![],
+        });
+        assert!(none.validate_semantics().unwrap_err().contains("declares no specs"));
+
+        // A spec field named after `kind` or the key field would
+        // overwrite the entry's kind / validated port name at commit.
+        for reserved in ["kind", "port"] {
+            let mut clash = base();
+            let mut s = spec("case", vec![PortTemplate::new("{key}", "Boolean")]);
+            s.fields = vec![SpecField::named(reserved)];
+            clash.ports_from_config = Some(PortsFromConfig {
+                field: "cases".into(),
+                match_input: None,
+                specs: vec![s],
+            });
+            assert!(
+                clash.validate_semantics().unwrap_err().contains("declares a field named"),
+                "field key '{reserved}' must be refused"
+            );
+        }
+
+        // Two spec fields on one key: last one wins in the entry map
+        // and the editor draws two controls bound to one value.
+        let mut dup = base();
+        let mut s = spec("case", vec![PortTemplate::new("{key}", "Boolean")]);
+        s.fields = vec![SpecField::named("value"), SpecField::named("value")];
+        dup.ports_from_config = Some(PortsFromConfig {
+            field: "cases".into(),
+            match_input: None,
+            specs: vec![s],
+        });
+        assert!(dup.validate_semantics().unwrap_err().contains("declares the field 'value' twice"));
     }
 
     /// A node that hands out a connection to a service it runs

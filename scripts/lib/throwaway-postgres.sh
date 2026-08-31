@@ -30,6 +30,9 @@ start_throwaway_postgres() {
   THROWAWAY_PG_CONTAINER="$container"
   # Host port 0 asks the kernel for a free loopback port; docker port
   # reports the one it got.
+  # SYNC: postgres image tag <-> setup.sh (--purge --postgres, which
+  #       reclaims exactly this image),
+  #       deploy/k8s/postgres.yaml (the in-cluster image, 18-alpine)
   if ! docker run -d --name "$container" -p 127.0.0.1:0:5432 \
        -e POSTGRES_PASSWORD=postgres postgres:18 >/dev/null; then
     echo "could not start the throwaway postgres container '$container'" >&2

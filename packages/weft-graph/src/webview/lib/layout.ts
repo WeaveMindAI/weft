@@ -50,7 +50,7 @@ export function parseViewMode(layoutCode: string): ViewMode {
 export function setViewMode(layoutCode: string, mode: ViewMode): string {
   const lines = (layoutCode || '').split('\n').filter((l) => l.trim() !== '@view simplified' && l.trim() !== '');
   if (mode === 'simplified') lines.unshift('@view simplified');
-  return lines.join('\n');
+  return terminated(lines);
 }
 
 /** Parse layoutCode into a map of scoped id -> entry. */
@@ -142,7 +142,15 @@ function rewriteVerbEntries(
     out.push(p.line);
   }
   if (!inserted) out.push(...block);
-  return out.join('\n');
+  return terminated(out);
+}
+
+/** Join layout lines into file content ending in a newline: the one
+ *  definition of how a layout file ends, so no writer can strip the
+ *  terminator off a file git had it in. */
+function terminated(lines: string[]): string {
+  const body = lines.join('\n');
+  return body === '' ? body : `${body}\n`;
 }
 
 /** Update or insert a layout entry. Returns the new layoutCode.

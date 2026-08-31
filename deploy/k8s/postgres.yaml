@@ -1,3 +1,5 @@
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
 ---
 # Postgres backing store. Lives in `weft-db`, fronted by `weft-broker`
 # for tenant pods (workers, listeners, infra pods). The dispatcher and
@@ -140,6 +142,9 @@ spec:
     spec:
       containers:
         - name: postgres
+          # SYNC: postgres image tag <-> setup.sh (--purge --postgres,
+          #       which reclaims exactly this image),
+          #       scripts/lib/throwaway-postgres.sh (the scratch image, 18)
           image: postgres:18-alpine
           ports:
             - containerPort: 5432

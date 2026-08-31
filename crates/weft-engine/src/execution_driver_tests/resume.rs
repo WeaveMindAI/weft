@@ -10,11 +10,7 @@
     fn spec() -> weft_core::primitive::SignalSpec {
         to_spec(Form {
             form_type: "human_query".into(),
-            schema: FormSchema {
-                title: String::new(),
-                description: None,
-                fields: Vec::new(),
-            },
+            schema: FormSchema { fields: Vec::new() },
             title: None,
             description: None,
             consumer_kind: None,

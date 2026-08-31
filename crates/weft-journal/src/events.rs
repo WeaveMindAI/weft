@@ -1613,11 +1613,7 @@ mod fold_pulse_tests {
             });
             let spec = to_spec(Form {
                 form_type: "human_query".into(),
-                schema: FormSchema {
-                    title: String::new(),
-                    description: None,
-                    fields: Vec::new(),
-                },
+                schema: FormSchema { fields: Vec::new() },
                 title: None,
                 description: None,
                 consumer_kind: None,
@@ -1757,11 +1753,7 @@ mod fold_pulse_tests {
             });
             let spec = to_spec(Form {
                 form_type: "human_query".into(),
-                schema: FormSchema {
-                    title: String::new(),
-                    description: None,
-                    fields: Vec::new(),
-                },
+                schema: FormSchema { fields: Vec::new() },
                 title: None,
                 description: None,
                 consumer_kind: None,
@@ -2085,11 +2077,7 @@ mod fold_pulse_tests {
         use weft_core::signal::{to_spec, Form, FormSchema};
         to_spec(Form {
             form_type: "human_query".into(),
-            schema: FormSchema {
-                title: String::new(),
-                description: None,
-                fields: Vec::new(),
-            },
+            schema: FormSchema { fields: Vec::new() },
             title: None,
             description: None,
             consumer_kind: None,

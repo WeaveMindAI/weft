@@ -22,11 +22,6 @@
 #
 # No alpine/musl to avoid the TLS/DNS issues we'd hit later with
 # reqwest's rustls vs system roots.
-#
-# The catalog (metadata + form specs + shared sources) is staged into
-# the DISPATCHER runtime stage only (its describe / compile endpoints
-# read it). The builder never touches `catalog/`, so a catalog edit
-# invalidates neither the cargo layer nor the other three images.
 FROM debian:bookworm-slim AS builder
 
 RUN apt-get update \
@@ -51,9 +46,8 @@ COPY crates ./crates
 # concurrently, and cargo's registry lock
 # file lives OUTSIDE the mounted dir while the shared target dir must
 # not see two cargo invocations at once.
-# SYNC: the `-p ... --bin ...` package list <-> the `ensure_system_image`
-#       crate names in `provision_images`,
-#       crates/weft-cli/src/commands/daemon.rs
+# SYNC: the `-p ... --bin ...` package list <-> the `SystemService`
+#       crate names in crates/weft-cli/src/images.rs
 RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=weft-cargo-target-system,target=/build/target,sharing=locked \
     cargo build --release \
@@ -72,11 +66,19 @@ RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,shari
 # `runtime-plain` for the rest.
 
 FROM debian:bookworm-slim AS runtime-kubectl
+# TARGETARCH is BuildKit's name for the platform being built
+# (amd64/arm64, the exact spelling the k8s download URLs use), so the
+# kubectl matches the image's architecture on every leg of a
+# multi-arch build. The `kubectl version` run right after is the
+# arch assertion: a wrong-arch binary fails the BUILD with `exec
+# format error` instead of failing every pod at run time.
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
-    && curl -sLo /usr/local/bin/kubectl \
-        https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl \
+    && curl -fsSLo /usr/local/bin/kubectl \
+        "https://dl.k8s.io/release/v1.31.0/bin/linux/${TARGETARCH}/kubectl" \
     && chmod +x /usr/local/bin/kubectl \
+    && kubectl version --client >/dev/null \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -87,14 +89,11 @@ RUN apt-get update \
 
 # ---
 # weft-dispatcher: pure routing + lifecycle + placement.
+# SYNC: the `AS <stage>` names of the four runtime stages below <->
+#       SystemService::dockerfile_stage in crates/weft-cli/src/images.rs
 
 FROM runtime-kubectl AS dispatcher
 COPY --from=builder /usr/local/bin/weft-dispatcher /usr/local/bin/weft-dispatcher
-# Catalog is read at runtime for describe + compile endpoints. Copied
-# straight from the build context: the builder never needs it, so a
-# catalog edit doesn't invalidate the cargo layer above.
-COPY catalog /catalog
-ENV WEFT_CATALOG_ROOT=/catalog
 # Dispatcher listens on 9999 by default; map via WEFT_HTTP_PORT.
 ENV WEFT_HTTP_PORT=9999
 EXPOSE 9999

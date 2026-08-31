@@ -65,6 +65,9 @@ impl KindHandler for FormHandler {
     fn render(&self, token: &str, sig: &RegisteredSignal) -> Result<Option<Value>> {
         let form = parse(&sig.spec)?;
         let mut obj = serde_json::Map::new();
+        // SYNC: consumer payload keys <->
+        //       extension-browser/src/lib/api.ts (PendingTask),
+        //       crates/weft-dispatcher/src/api/signal.rs (the isResume stamp)
         obj.insert("token".into(), Value::String(token.to_string()));
         obj.insert("nodeId".into(), Value::String(sig.node_id.clone()));
         obj.insert("kind".into(), Value::String(Form::TAG.into()));
@@ -75,19 +78,17 @@ impl KindHandler for FormHandler {
             .title
             .clone()
             .filter(|t| !t.trim().is_empty())
-            .unwrap_or_else(|| form.schema.title.clone());
-        let resolved_title = if resolved_title.trim().is_empty() {
-            format!("Input for {}", sig.node_id)
-        } else {
-            resolved_title
-        };
+            .unwrap_or_else(|| format!("Input for {}", sig.node_id));
         obj.insert("title".into(), Value::String(resolved_title));
         if let Some(d) = form.description {
             obj.insert("description".into(), Value::String(d));
         }
-        if let Ok(schema_json) = serde_json::to_value(&form.schema) {
-            obj.insert("formSchema".into(), schema_json);
-        }
+        // Loud on a schema that cannot serialize: silently omitting
+        // `formSchema` would hand the consumer an actionless card
+        // ("no form fields configured") over a real broken form.
+        let schema_json = serde_json::to_value(&form.schema)
+            .map_err(|e| anyhow::anyhow!("serialize form schema: {e}"))?;
+        obj.insert("formSchema".into(), schema_json);
         Ok(Some(Value::Object(obj)))
     }
 }
@@ -96,8 +97,12 @@ impl KindHandler for FormHandler {
 /// so callers (compute_routing, render) surface the error to the
 /// register/display caller rather than rendering empty.
 fn parse(spec: &SignalSpec) -> Result<Form> {
-    serde_json::from_value(spec.config.clone())
-        .map_err(|e| anyhow::anyhow!("malformed form spec: {e}"))
+    serde_json::from_value(spec.config.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "malformed form spec (its stored config does not match the current Form shape; \
+             re-register the signal by re-running the project): {e}"
+        )
+    })
 }
 
 inventory::submit!(&FormHandler as &dyn KindHandler);
@@ -108,18 +113,36 @@ mod tests {
     use weft_core::primitive::SignalSurface;
     use weft_core::signal::FormSchema;
 
-    fn form_spec() -> SignalSpec {
+    fn form_spec_with_title(title: Option<String>) -> SignalSpec {
         weft_core::signal::to_spec(Form {
             form_type: "human-query".into(),
-            schema: FormSchema {
-                title: "T".into(),
-                description: None,
-                fields: vec![],
-            },
-            title: None,
+            schema: FormSchema { fields: vec![] },
+            title,
             description: None,
             consumer_kind: None,
         })
+    }
+
+    fn form_spec() -> SignalSpec {
+        form_spec_with_title(None)
+    }
+
+    fn registered(spec: SignalSpec) -> RegisteredSignal {
+        RegisteredSignal {
+            spec,
+            node_id: "node-7".into(),
+            tenant_id: "t".into(),
+            is_resume: true,
+            color: Some("c".into()),
+            placement_generation: 0,
+            task: None,
+            routing: SignalRouting {
+                surface: SignalSurface::TaskCallback,
+                auth: SignalAuth::None,
+                auth_config: Value::Null,
+            },
+            serving: Default::default(),
+        }
     }
 
     #[test]
@@ -134,22 +157,7 @@ mod tests {
 
     #[test]
     fn render_includes_form_schema() {
-        let spec = form_spec();
-        let sig = RegisteredSignal {
-            spec,
-            node_id: "node-7".into(),
-            tenant_id: "t".into(),
-            is_resume: true,
-            color: Some("c".into()),
-            placement_generation: 0,
-            task: None,
-            routing: SignalRouting {
-                surface: SignalSurface::TaskCallback,
-                auth: SignalAuth::None,
-                auth_config: Value::Null,
-            },
-            serving: Default::default(),
-        };
+        let sig = registered(form_spec());
         let rendered = FormHandler
             .render("tok", &sig)
             .expect("render ok")
@@ -158,25 +166,27 @@ mod tests {
         assert_eq!(obj["nodeId"], serde_json::json!("node-7"));
         assert_eq!(obj["kind"], serde_json::json!("form"));
         assert!(obj.contains_key("formSchema"));
+        // No title on the spec: the fallback names the node.
+        assert_eq!(obj["title"], serde_json::json!("Input for node-7"));
+    }
+
+    #[test]
+    fn render_title_blank_and_set() {
+        // A whitespace-only title is no title: the fallback fires.
+        let sig = registered(form_spec_with_title(Some("  ".into())));
+        let rendered =
+            FormHandler.render("tok", &sig).expect("render ok").expect("renders");
+        assert_eq!(rendered["title"], serde_json::json!("Input for node-7"));
+
+        let sig = registered(form_spec_with_title(Some("Ask".into())));
+        let rendered =
+            FormHandler.render("tok", &sig).expect("render ok").expect("renders");
+        assert_eq!(rendered["title"], serde_json::json!("Ask"));
     }
 
     #[test]
     fn no_actions_defined() {
-        let sig = RegisteredSignal {
-            spec: form_spec(),
-            node_id: "n".into(),
-            tenant_id: "t".into(),
-            is_resume: true,
-            color: Some("c".into()),
-            placement_generation: 0,
-            task: None,
-            routing: SignalRouting {
-                surface: SignalSurface::TaskCallback,
-                auth: SignalAuth::None,
-                auth_config: Value::Null,
-            },
-            serving: Default::default(),
-        };
+        let sig = registered(form_spec());
         let cache = Arc::new(DashMap::new());
         let err = FormHandler
             .handle_action("tok", "regenerate_api_key", Value::Null, &sig, &cache)

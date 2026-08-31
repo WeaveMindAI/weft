@@ -16,8 +16,8 @@ weft-core = { workspace = true }
 # door compiles the uploaded source itself (computes the definition + the three
 # hashes + stages the docker build context), then submits the image build. It
 # then needs the full `build` feature (codegen + worker_image + the hash path),
-# and the dispatcher image bakes the weft workspace at `WEFT_REPO_ROOT` so the
-# binary-hash + context-staging reads resolve. DIRECT path dep, NOT
+# and the compile site needs a weft workspace on disk, resolved through
+# `weft_catalog::weft_repo_root` (WEFT_REPO_ROOT in a built image). DIRECT path dep, NOT
 # `workspace = true`, to keep feature control explicit.
 weft-compiler = { path = "../weft-compiler", features = ["build"] }
 weft-journal = { workspace = true }

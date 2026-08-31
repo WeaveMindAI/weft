@@ -206,6 +206,7 @@ fi
 # ---------- Live prerequisites ----------
 if [ "$LIVE" = 1 ]; then
   # Live tests run as pods in the cluster; bring it up if absent.
+  # SYNC: weft-db <-> crates/weft-core/src/infra/mod.rs (DB_NAMESPACE)
   if ! kubectl get namespace weft-db >/dev/null 2>&1; then
     echo "cluster not up; running weft daemon start first"
     weft daemon start || exit 1

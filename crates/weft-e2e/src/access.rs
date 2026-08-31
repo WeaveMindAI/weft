@@ -20,7 +20,11 @@ use crate::project::Project;
 /// The service's AccessSpec, read off the SAME stdlib catalog metadata
 /// the editor ships to the store.
 pub fn catalog_spec(package: &str, node_dir: &str) -> Result<Value> {
-    let path = weft_catalog::stdlib_root().join(package).join(node_dir).join("metadata.json");
+    let path = weft_catalog::stdlib_root()
+        .expect("stdlib root")
+        .join(package)
+        .join(node_dir)
+        .join("metadata.json");
     service_spec_of(&path)
 }
 

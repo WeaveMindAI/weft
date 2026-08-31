@@ -8,28 +8,31 @@ cd weft
 ./setup.sh
 ```
 
-The first run takes a while: it compiles the Rust workspace, builds container
-images, creates a local Kubernetes cluster, and starts the runtime. Later runs
-are incremental.
+On a clean checkout the first run downloads the CLI, the extension and the
+container images from the latest published build, creates a local Kubernetes
+cluster, and starts the runtime; no Rust or Node toolchain needed. Once you
+change any file, the script compiles from source instead (which needs the
+toolchains below), and later runs redo only what changed.
 
 ## What you need first
 
-If you run the script with no flags it builds every component, so it checks for
-all of these before it starts and names every missing one at once.
+The script checks for what your run needs before it starts and names every
+missing tool at once.
 
 | Tool | Why | Get it |
 |---|---|---|
-| `cargo` | compiles the CLI and the runtime | [rustup.rs](https://rustup.rs/) |
 | `docker` | runs Postgres and the cluster | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | `kubectl` | talks to the local cluster | [kubernetes.io](https://kubernetes.io/docs/tasks/tools/) |
 | `kind` | the local cluster itself | [kind.sigs.k8s.io](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) |
-| `node` 20+ and `pnpm` | builds the VS Code extension | [nodejs.org](https://nodejs.org/en/download), then `npm i -g pnpm` |
+| `cargo` | compiles the CLI and the runtime, once you have local changes | [rustup.rs](https://rustup.rs/) |
+| `node` 20+ and `pnpm` | builds the VS Code extension, once you have local changes | [nodejs.org](https://nodejs.org/en/download), then `npm i -g pnpm` |
 
 If you are on macOS you also need a newer Bash than the one Apple ships:
 `brew install bash`.
 
 And if you only want part of it, the flags below skip the rest and skip their
-checks with them. `./setup.sh --cli` needs nothing but `cargo`.
+checks with them. If a published binary turns out broken, `--from-source`
+compiles the CLI and the extension locally even on a clean checkout.
 
 ## What you get
 
@@ -53,10 +56,11 @@ Flags combine, so `--cli --daemon` does both and skips the editor.
 | just the `weft` command | `--cli` |
 | just the runtime rebuilt and restarted | `--daemon` |
 | just the VS Code extension | `--vscode` |
-| the browser extension too, which is opt-in because it bumps versions and signs | `--browser` |
+| just the browser extension, which is opt-in because it signs with Mozilla and builds every browser target | `--browser` |
 | the CLI compiled much faster, while you are iterating | `--debug` |
 | the binary somewhere other than `~/.local` | `--prefix PATH` |
-| the CLI rebuilt without touching the running daemon | `--no-daemon` |
+| everything but the daemon refresh | `--no-daemon` |
+| an extension release: bumps its version, which is what makes CI publish the pushed commit to the stores | `--bump` (with `--vscode` and/or `--browser`; the default install covers `--vscode`) |
 
 ## Your settings file
 
