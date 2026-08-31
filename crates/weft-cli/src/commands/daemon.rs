@@ -3453,6 +3453,37 @@ mod tests {
         assert_eq!(docs, ["# note\nkind: A\n"]);
     }
 
+    /// The REAL manifests through the REAL splitter: every document
+    /// the boot would pipe to kubectl must carry an object. This is
+    /// the test that catches a file-header edit (a comment above the
+    /// first `---`) producing an object-less document, which kubectl
+    /// refuses as its whole stdin and which kills the boot ("no
+    /// objects passed to apply", found in production once).
+    #[test]
+    fn every_shipped_manifest_splits_into_object_documents() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("deploy/k8s readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("manifest readable");
+            let docs = split_yaml_documents(&text);
+            assert!(!docs.is_empty(), "{} split to zero documents", path.display());
+            for doc in docs {
+                assert!(
+                    yaml_document_kind(doc).is_some(),
+                    "{} yields a document with no `kind:` (an object-less chunk \
+                     the apply would feed kubectl):\n{doc}",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected the deploy/k8s manifests, found {checked}");
+    }
+
     #[test]
     fn postgres_major_survives_yaml_spellings() {
         use super::postgres_major_in_manifest as major;
