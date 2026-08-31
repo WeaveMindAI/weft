@@ -447,6 +447,18 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: weft-vscode.vsix
+      # The namespace must exist before the first publish and creating
+      # it twice is refused, so create it here and accept exactly the
+      # already-exists answer; any other failure (bad token, network)
+      # still stops the job before the publish confuses it further.
+      - name: ensure the weavemind namespace exists
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          set -euo pipefail
+          out="$(pnpm dlx ovsx@1.1.1 create-namespace weavemind -p "$OVSX_PAT" 2>&1)" \
+            || { grep -qi "already exists" <<<"$out" || { printf '%s\n' "$out" >&2; exit 1; }; }
+          printf '%s\n' "$out"
       - env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
         run: pnpm dlx ovsx@1.1.1 publish "$GITHUB_WORKSPACE/weft-vscode.vsix"
