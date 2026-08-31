@@ -234,7 +234,11 @@ jobs:
       - run: pnpm -C extension-vscode run compile
       - run: pnpm -C extension-vscode run bundle:webview
       - run: pnpm -C extension-vscode run bundle:markdown-preview
-      - run: pnpm -C extension-vscode dlx @vscode/vsce@3.9.2 package --no-dependencies --allow-missing-repository --skip-license
+      # working-directory, not `pnpm -C`: dlx spawns the tool in the
+      # PROCESS cwd, so with -C vsce would look for package.json at the
+      # repo root and refuse.
+      - run: pnpm dlx @vscode/vsce@3.9.2 package --no-dependencies --allow-missing-repository --skip-license
+        working-directory: extension-vscode
       # One stable asset name; the version lives in manifest.json and
       # in the package itself.
       # SYNC: vsix asset name <-> setup.sh (prebuilt artifacts block:

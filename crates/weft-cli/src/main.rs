@@ -63,7 +63,9 @@ enum Cmd {
         /// architecture on its native runner with `-amd64` / `-arm64`
         /// here, then stitches the bare ref into one multi-arch
         /// manifest list, so every machine pulls its own architecture.
-        #[arg(long, value_name = "SUFFIX")]
+        /// `allow_hyphen_values`: the suffixes start with a hyphen
+        /// (`-amd64`), which clap would otherwise read as flags.
+        #[arg(long, value_name = "SUFFIX", allow_hyphen_values = true)]
         push_suffix: Option<String>,
         /// Only print the refs this tree resolves to, one per line,
         /// touching nothing (no ensure, no docker). What setup.sh
