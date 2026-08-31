@@ -36,10 +36,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # No toolchain input: the action reads rust-toolchain.toml, which
-      # is the single source of truth for the version AND the components
-      # (clippy for the gate below).
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      # Bare `rustup toolchain install` reads rust-toolchain.toml, the
+      # single source of truth for the version AND the components
+      # (clippy for the gate below). No third-party toolchain action:
+      # pinned to a commit it demands an explicit toolchain input,
+      # which would fork the version out of the toml.
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # No compile-time query macros anywhere, so the workspace suite needs no
@@ -69,7 +71,8 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      # rustup reads rust-toolchain.toml (see the rust job's comment).
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The same script developers run locally, pointed at the service
       # container, so the crate list lives in exactly one place.

@@ -86,7 +86,10 @@ jobs:
       # Android/.NET/GHC toolchains are dead weight here.
       - name: free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      # rustup reads rust-toolchain.toml (the single source of the
+      # version and components; see ci.yml's rust job for why no
+      # third-party toolchain action).
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -200,7 +203,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      # rustup reads rust-toolchain.toml (the single source of the
+      # version and components; see ci.yml's rust job for why no
+      # third-party toolchain action).
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo build --release --locked -p weft-cli
       - run: cp target/release/weft "${{ matrix.asset }}"
