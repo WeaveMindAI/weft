@@ -3015,7 +3015,10 @@ async fn kubectl_apply_stdin(manifest: &str, what: &str) -> Result<()> {
 }
 
 /// The documents of a (possibly multi-doc) YAML text, `---` separators
-/// removed, empty documents dropped.
+/// removed. A document with no content (blank, or comments only, like
+/// a file-header comment above the first `---`) holds no object and is
+/// dropped: kubectl ignores those in a whole file but refuses one as
+/// its entire stdin ("no objects passed to apply").
 fn split_yaml_documents(manifest: &str) -> Vec<&str> {
     let mut docs = Vec::new();
     let mut start = 0;
@@ -3028,7 +3031,12 @@ fn split_yaml_documents(manifest: &str) -> Vec<&str> {
         at += line.len();
     }
     docs.push(&manifest[start..]);
-    docs.retain(|d| !d.trim().is_empty());
+    docs.retain(|d| {
+        d.lines().any(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with('#')
+        })
+    });
     docs
 }
 
@@ -3438,6 +3446,42 @@ mod tests {
         assert_eq!(docs.len(), 1);
         // No separator at all: the whole text is one document.
         assert_eq!(split_yaml_documents("kind: A\n"), ["kind: A\n"]);
+        // A comments-only document (a file-header comment above the
+        // first separator) holds no object and is dropped; a comment
+        // INSIDE a real document stays with it.
+        let docs = split_yaml_documents("# header\n# more\n---\n# note\nkind: A\n");
+        assert_eq!(docs, ["# note\nkind: A\n"]);
+    }
+
+    /// The REAL manifests through the REAL splitter: every document
+    /// the boot would pipe to kubectl must carry an object. This is
+    /// the test that catches a file-header edit (a comment above the
+    /// first `---`) producing an object-less document, which kubectl
+    /// refuses as its whole stdin and which kills the boot ("no
+    /// objects passed to apply", found in production once).
+    #[test]
+    fn every_shipped_manifest_splits_into_object_documents() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/k8s");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("deploy/k8s readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("manifest readable");
+            let docs = split_yaml_documents(&text);
+            assert!(!docs.is_empty(), "{} split to zero documents", path.display());
+            for doc in docs {
+                assert!(
+                    yaml_document_kind(doc).is_some(),
+                    "{} yields a document with no `kind:` (an object-less chunk \
+                     the apply would feed kubectl):\n{doc}",
+                    path.display()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 5, "expected the deploy/k8s manifests, found {checked}");
     }
 
     #[test]
