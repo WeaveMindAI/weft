@@ -240,6 +240,13 @@ fn render_supervisor_manifest(
     // is the pod's claim identity in the broker. `weft.dev/role:
     // infra-supervisor` is the selector the reaper + pool replica-state
     // reads key on.
+    // SYNC: the weft.dev/role value <->
+    //       crates/weft-cli/src/commands/daemon.rs (POOLED_TIERS, which
+    //       re-points these Deployments at a new image by this label),
+    //       crates/weft-dispatcher/src/listener.rs (the sibling pooled
+    //       manifest's weft.dev/role),
+    //       deploy/k8s/system-namespace.yaml (the pooled-supervisor
+    //       NetworkPolicy podSelector)
     format!(
         r#"apiVersion: apps/v1
 kind: Deployment

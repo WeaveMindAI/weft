@@ -1,0 +1,519 @@
+# Publish everything a `./setup.sh` can consume, on every push to the release
+# branch:
+#
+#   - the four system images + the worker builder-base, pushed to ghcr under
+#     their content-addressed tags (the SAME tags a local install computes, so
+#     a clean checkout pulls instead of compiling; any local edit changes the
+#     hash and builds locally), one native build per architecture stitched
+#     into a multi-arch tag,
+#   - CLI binaries and the .vsix, attached to the rolling `mvp-latest`
+#     release with a manifest.json naming the exact commit and a sha256 per
+#     asset (setup.sh downloads them when its checkout matches); the browser
+#     zips ride along as the record of what went to the stores and for
+#     sideloading the targets that have no store (Opera, Safari),
+#   - the extension stores (VS Code Marketplace, Open VSX, Chrome, Firefox,
+#     Edge), but ONLY when the extension's version moved: a per-store
+#     `*-v<version>` tag records each successful publish, so bumping the
+#     version (setup.sh --bump) is the whole release gesture, ordinary
+#     pushes never spam store reviews, and one store failing retries alone
+#     on the next push.
+#
+# Third-party actions are pinned to commit SHAs: this pipeline pushes
+# images users pull and binaries users execute against shas it computes
+# itself, so a mutable action tag is a supply-chain door.
+name: release
+
+on:
+  push:
+    branches: [mvp]
+
+# One release at a time, NEVER cancelled mid-flight: a store publish
+# killed between "uploaded to the store" and "recorded the version tag"
+# would retry a version the store already has and stay red forever.
+# A newer push queues; intermediate pending runs are superseded.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+# The floor; every job that needs more (packages, releases, id-token)
+# raises its own.
+permissions:
+  contents: read
+
+jobs:
+  # ---- the gate --------------------------------------------------------
+  #
+  # The full CI suite (tests, clippy, schema agreement, editor checks)
+  # runs first and every publishing job below waits on it. A commit
+  # that fails the checks publishes NOTHING: no images, no binaries, no
+  # store uploads. Whoever pulls such a commit builds from source and
+  # hits the same loud local failure the dev did; their data is safe
+  # either way (the boot refuses on schema drift instead of guessing).
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # ---- shared images -> ghcr ------------------------------------------
+  #
+  # One leg per architecture, each on its NATIVE runner (no qemu), each
+  # pushing `<ref>-<arch>`; the stitch job below then publishes the bare
+  # `<ref>` as a multi-arch manifest list, so an Apple-silicon / ARM
+  # machine pulls arm64 and an x86 machine pulls amd64 from the same
+  # content-addressed tag. The tag itself hashes source content only, so
+  # both legs compute the identical ref (the stitch job verifies it).
+  images:
+    name: system images + builder base (${{ matrix.arch }})
+    needs: [ci]
+    strategy:
+      # One architecture failing must not kill the other's build
+      # mid-way; the stitch below requires both, so nothing partial is
+      # ever published either way.
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: amd64 }
+          - { runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      # The builder base alone is >1GB and the builds run through
+      # BuildKit on the same disk as the cargo cache; the preinstalled
+      # Android/.NET/GHC toolchains are dead weight here.
+      - name: free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Ensure = present -> pull -> build against THIS ARCH'S half
+      # (`<ref>-<arch>`), never the bare ref: a bare ref that predates
+      # multi-arch could satisfy the wrong architecture's leg and then
+      # be re-pushed as its half. Stdout is the bare refs, captured for
+      # the stitch job.
+      - name: build + push shared images
+        run: cargo run --locked -p weft-cli -- build-images --push-suffix "-${{ matrix.arch }}" > image-refs.txt
+      # The dispatcher and the supervisor exec kubectl in-pod; prove
+      # each one's kubectl actually runs on this architecture before
+      # anything gets stitched for users.
+      - name: smoke-run the kubectl-carrying images
+        run: |
+          set -euo pipefail
+          # Selected by NAME, never by line position.
+          # SYNC: stdout = one registry-qualified bare ref per line <->
+          #       crates/weft-cli/src/images.rs (SharedImages::bare_refs)
+          for repo in weft-dispatcher weft-infra-supervisor; do
+            ref="$(grep "/$repo:" image-refs.txt | head -n1)"
+            [ -n "$ref" ] || { echo "::error::no $repo ref in image-refs.txt"; exit 1; }
+            docker run --rm --entrypoint kubectl "$ref-${{ matrix.arch }}" version --client
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-refs-${{ matrix.arch }}
+          path: image-refs.txt
+          if-no-files-found: error
+
+  images-manifest:
+    name: publish multi-arch image tags
+    runs-on: ubuntu-latest
+    needs: [images]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-refs-amd64
+          path: refs-amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-refs-arm64
+          path: refs-arm64
+      # Both legs computing identical refs is the assumption the stitch
+      # rests on; a divergence (an env override or an untracked file
+      # differing between runners) must be a named failure, not an
+      # orphaned half-push.
+      - name: the two legs must agree on the refs
+        run: |
+          diff refs-amd64/image-refs.txt refs-arm64/image-refs.txt || {
+            echo "::error::the two architecture legs computed different image refs; both halves are already pushed (orphaned suffixed tags, the bare refs stay absent so users fall back to building). Check for a WEFT_IMAGE_REGISTRY or WEFT_*_IMAGE override differing between runners."
+            exit 1
+          }
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The bare ref becomes a manifest list pointing at both halves.
+      # Until this runs, the bare ref does not exist (or still names the
+      # previous content), so a half-pushed set is never picked up.
+      - name: stitch manifest lists
+        run: |
+          set -euo pipefail
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            docker buildx imagetools create -t "$ref" "$ref-amd64" "$ref-arm64"
+          done < refs-amd64/image-refs.txt
+      # The whole point of publishing is that a user's docker can pull
+      # WITHOUT credentials; a ghcr package that is still private (they
+      # are born private on first push) degrades every install to a
+      # silent full compile. Fail here, loudly, with the fix.
+      - name: the published refs must be pullable anonymously
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            docker manifest inspect "$ref" >/dev/null \
+              || { echo "::error::$ref is not anonymously pullable; open github.com/orgs/WeaveMindAI/packages and flip this package to Public"; exit 1; }
+          done < refs-amd64/image-refs.txt
+
+  # ---- CLI binaries ----------------------------------------------------
+  cli:
+    name: cli (${{ matrix.asset }})
+    needs: [ci]
+    strategy:
+      # One platform failing must not take the others' binaries down
+      # with it; the release job below ships whichever legs succeeded
+      # (a missing asset just means "build from source" there, and the
+      # manifest lists only the assets that exist).
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04: oldest supported runner glibc, so the binary
+          # runs on every distro at least that new.
+          # SYNC: CLI asset names <-> setup.sh (prebuilt artifacts
+          #       block: the uname case)
+          - { runner: ubuntu-22.04, asset: weft-x86_64-linux }
+          - { runner: ubuntu-22.04-arm, asset: weft-aarch64-linux }
+          # macos-latest is arm64 (Apple silicon); macos-15-intel is
+          # the x86_64 runner GitHub keeps until August 2027.
+          - { runner: macos-latest, asset: weft-aarch64-macos }
+          - { runner: macos-15-intel, asset: weft-x86_64-macos }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo build --release --locked -p weft-cli
+      - run: cp target/release/weft "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  # ---- VS Code extension ----------------------------------------------
+  vsix:
+    name: package .vsix
+    needs: [ci]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tags.outputs.version }}
+      pending: ${{ steps.tags.outputs.pending }}
+      tags: ${{ steps.tags.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-vscode
+          borrow-packages: packages/weft-graph packages/weft-syntax
+      - run: pnpm -C extension-vscode run compile
+      - run: pnpm -C extension-vscode run bundle:webview
+      - run: pnpm -C extension-vscode run bundle:markdown-preview
+      - run: pnpm -C extension-vscode dlx @vscode/vsce@3.9.2 package --no-dependencies --allow-missing-repository --skip-license
+      # One stable asset name; the version lives in manifest.json and
+      # in the package itself.
+      # SYNC: vsix asset name <-> setup.sh (prebuilt artifacts block:
+      #       the weft-vscode.vsix download)
+      - run: mv extension-vscode/weft-vscode-*.vsix weft-vscode.vsix
+      - id: tags
+        uses: ./.github/actions/store-publish-state
+        with:
+          workspace: extension-vscode
+          tag-prefix: vscode
+          stores: marketplace openvsx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weft-vscode.vsix
+          path: weft-vscode.vsix
+          if-no-files-found: error
+
+  # ---- browser extension ----------------------------------------------
+  browser:
+    name: package browser zips
+    needs: [ci]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tags.outputs.version }}
+      pending: ${{ steps.tags.outputs.pending }}
+      tags: ${{ steps.tags.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-browser
+      # zip:firefox also writes weft-extension-sources.zip (AMO reviews
+      # the source of bundled output).
+      - run: pnpm -C extension-browser zip
+      - run: pnpm -C extension-browser zip:firefox
+      - run: pnpm -C extension-browser zip:edge
+      - run: pnpm -C extension-browser zip:opera
+      - run: pnpm -C extension-browser zip:safari
+      - id: tags
+        uses: ./.github/actions/store-publish-state
+        with:
+          workspace: extension-browser
+          tag-prefix: browser
+          stores: chrome firefox edge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-zips
+          path: extension-browser/build/*.zip
+          if-no-files-found: error
+
+  # ---- rolling release -------------------------------------------------
+  release:
+    name: update mvp-latest release
+    runs-on: ubuntu-latest
+    needs: [cli, vsix, browser, images-manifest]
+    # Runs even when a CLI leg or the browser packaging failed (one
+    # unbuildable artifact must not strand every other's assets), but
+    # never without the vsix job (it supplies the version the manifest
+    # needs) and never without the stitched images: manifest.json is
+    # the "prebuilts for this commit are ready" signal setup.sh keys
+    # on, and publishing it while no image is pullable would hand a
+    # toolchain-less user a prebuilt CLI whose first `daemon start`
+    # falls back to a multi-GB local docker build.
+    if: ${{ !cancelled() && needs.vsix.result == 'success' && needs['images-manifest'].result == 'success' }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      # Exactly the release payload, by name: the image-refs artifacts
+      # (internal plumbing for the stitch job) must never leak into the
+      # public asset list.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: weft-*
+          path: dist
+          merge-multiple: true
+      # A pattern, so a failed browser job just means fewer files (the
+      # manifest then carries no sha for them, which setup-side reads
+      # as "not published"): `name:` would fail the whole job instead.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: browser-zips
+          path: dist
+          merge-multiple: true
+      - name: assemble + upload
+        env:
+          # Repo-derived values reach the script as env vars, never by
+          # interpolation into the body (interpolated text executes).
+          VSCODE_VERSION: ${{ needs.vsix.outputs.version }}
+        run: |
+          set -euo pipefail
+          # SYNC: the mvp-latest release tag <-> setup.sh (prebuilt
+          #       artifacts block: the release download URLs)
+          gh release view mvp-latest >/dev/null 2>&1 || gh release create mvp-latest \
+            --target "${GITHUB_SHA}" --prerelease --title "Rolling build (mvp)" \
+            --notes "Assets from the latest push to mvp; manifest.json names the commit. setup.sh consumes these."
+          # Keep the release's tag on the commit the assets came from,
+          # or its "Source code" links would forever show the first
+          # build's tree.
+          git tag -f mvp-latest "${GITHUB_SHA}"
+          git push -f origin refs/tags/mvp-latest
+          # `--clobber` deletes each existing asset and re-uploads it
+          # (that is gh's documented mechanism), so every asset has a
+          # short per-asset 404 window instead of one long all-assets
+          # gap. Safe in both directions: a 404 fails setup.sh's
+          # `curl -fsSL` (which falls back to building), a
+          # half-replaced asset fails its sha256 compare, and a
+          # missing manifest reads as "nothing published". The
+          # manifest goes LAST so its commit stamp never vouches for
+          # assets that are not up yet.
+          # SYNC: manifest.json keys <-> setup.sh (prebuilt artifacts block: manifest_value)
+          gh release upload mvp-latest dist/* --clobber
+          {
+            printf '{\n  "commit": "%s",\n' "${GITHUB_SHA}"
+            printf '  "vscode_version": "%s",\n' "${VSCODE_VERSION}"
+            for f in dist/*; do
+              printf '  "sha256_%s": "%s",\n' "$(basename "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            printf '  "built_at": "%s"\n}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > manifest.json
+          gh release upload mvp-latest manifest.json --clobber
+          # Leftovers from earlier runs (an asset this run did not
+          # produce, e.g. its build leg failed or it was renamed) go
+          # only AFTER the fresh manifest is up: the new manifest
+          # carries no sha for them, so a reader already treats them
+          # as unpublished during the window. The listing is its own
+          # checked command: a `gh` hiccup inside a `for` list would
+          # silently skip every delete.
+          assets="$(gh release view mvp-latest --json assets -q '.assets[].name')"
+          while IFS= read -r asset; do
+            [ -n "$asset" ] || continue
+            [ "$asset" = "manifest.json" ] && continue
+            [ -e "dist/$asset" ] || gh release delete-asset mvp-latest "$asset" --yes
+          done <<< "$assets"
+          gh release edit mvp-latest --notes "Built from ${GITHUB_SHA}. setup.sh downloads these when its checkout matches manifest.json's commit."
+
+  # ---- store publishes (each store gated on its own version tag, its
+  # own tag pushed immediately after its publish, so a failure or an
+  # interrupted run in one store never blocks another's retry and a
+  # recorded store is never re-published into a duplicate-version
+  # error) -----------------------------------------------------------
+  publish-marketplace:
+    name: publish to VS Code Marketplace
+    runs-on: ubuntu-latest
+    needs: [vsix]
+    # `contains` on the pending ARRAY fails closed: an unknown store
+    # name simply is not in it.
+    if: ${{ contains(fromJSON(needs.vsix.outputs.pending), 'marketplace') }}
+    # The environment carries the federated credential the Azure managed
+    # identity trusts; vsce then publishes with that identity's token.
+    # Its own job so any protection on the environment never gates the
+    # other stores. Keep the environment's deployment-branch policy
+    # pinned to mvp: workflow_dispatch-able workflows run whatever file
+    # their chosen ref carries, and the branch policy is what stops a
+    # rewritten copy on a side branch from borrowing this OIDC token.
+    environment: marketplace-publish
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      # install: false, so the job pays no workspace install: `pnpm
+      # dlx` resolves vsce into its own store and the vsix arrives
+      # prebuilt from the artifact.
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-vscode
+          install: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: weft-vscode.vsix
+      - uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - run: pnpm dlx @vscode/vsce@3.9.2 publish --packagePath "$GITHUB_WORKSPACE/weft-vscode.vsix" --azure-credential
+      - name: record the published version
+        env:
+          # The EXACT tag the probe checked (the composite is the one
+          # place the tag format exists), so probe and recorder can
+          # never drift into re-publishing an existing version.
+          TAG: ${{ fromJSON(needs.vsix.outputs.tags).marketplace }}
+        run: |
+          set -euo pipefail
+          { git tag "$TAG" && git push origin "$TAG"; } || {
+            echo "::error::published to the Marketplace but could not record $TAG; create it by hand (git tag $TAG ${GITHUB_SHA} && git push origin $TAG) or the next run will re-publish an existing version and fail"
+            exit 1
+          }
+
+  publish-openvsx:
+    name: publish to Open VSX
+    runs-on: ubuntu-latest
+    needs: [vsix]
+    if: ${{ contains(fromJSON(needs.vsix.outputs.pending), 'openvsx') }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-vscode
+          install: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: weft-vscode.vsix
+      - env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: pnpm dlx ovsx@1.1.1 publish "$GITHUB_WORKSPACE/weft-vscode.vsix"
+      - name: record the published version
+        env:
+          TAG: ${{ fromJSON(needs.vsix.outputs.tags).openvsx }}
+        run: |
+          set -euo pipefail
+          { git tag "$TAG" && git push origin "$TAG"; } || {
+            echo "::error::published to Open VSX but could not record $TAG; create it by hand (git tag $TAG ${GITHUB_SHA} && git push origin $TAG) or the next run will re-publish an existing version and fail"
+            exit 1
+          }
+
+  publish-browser:
+    name: publish to ${{ matrix.store }}
+    runs-on: ubuntu-latest
+    needs: [browser]
+    # The matrix IS the gate: it is built from the probe's `pending`
+    # array, so a store that already carries this version has no leg
+    # at all, and adding a store means touching only the probe's
+    # `stores` input. One leg per store with fail-fast off, so a
+    # rejected review or a broken credential in one store never blocks
+    # another's submit or retry. The job-level `if` exists because an
+    # EMPTY matrix vector is a workflow error, not an empty job.
+    if: ${{ needs.browser.outputs.pending != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        store: ${{ fromJSON(needs.browser.outputs.pending) }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-browser
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-zips
+          path: extension-browser/build
+      - name: submit
+        env:
+          STORE: ${{ matrix.store }}
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+          CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+          # SYNC: FIREFOX_EXTENSION_ID + the build/*.zip basenames <->
+          #       extension-browser/wxt.config.ts (the gecko.id and the
+          #       zip artifactTemplate/sourcesTemplate + package.json name),
+          #       setup.sh (the browser build block's per-target zip names)
+          FIREFOX_EXTENSION_ID: extension@weavemind.ai
+          FIREFOX_JWT_ISSUER: ${{ secrets.WEB_EXT_API_KEY }}
+          FIREFOX_JWT_SECRET: ${{ secrets.WEB_EXT_API_SECRET }}
+          FIREFOX_CHANNEL: listed
+          EDGE_PRODUCT_ID: ${{ secrets.EDGE_PRODUCT_ID }}
+          EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+          EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
+        # `exec` (not a bare command): pnpm only keeps -C for builtins
+        # and package scripts; an unknown bare command re-parses argv
+        # and dies on "extension-browser" as a command name.
+        run: |
+          set -euo pipefail
+          case "$STORE" in
+            chrome)  args="--chrome-zip build/weft-extension-chrome.zip" ;;
+            firefox) args="--firefox-zip build/weft-extension-firefox.zip --firefox-sources-zip build/weft-extension-sources.zip" ;;
+            edge)    args="--edge-zip build/weft-extension-edge.zip" ;;
+            *) echo "::error::no submit shape for store '$STORE'"; exit 1 ;;
+          esac
+          pnpm -C extension-browser exec wxt submit $args
+      - name: record the published version
+        env:
+          STORE: ${{ matrix.store }}
+          TAG: ${{ fromJSON(needs.browser.outputs.tags)[matrix.store] }}
+        run: |
+          set -euo pipefail
+          { git tag "$TAG" && git push origin "$TAG"; } || {
+            echo "::error::published to ${STORE} but could not record $TAG; create it by hand (git tag $TAG ${GITHUB_SHA} && git push origin $TAG) or the next run will re-publish an existing version and fail"
+            exit 1
+          }

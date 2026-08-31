@@ -20,6 +20,7 @@ use serde_json::{Map, Value};
 use weft::node::PortSpec;
 use weft::node::PortTemplate;
 use weft::node::NodeOutput;
+use weft::node::{FormFieldRender, FormFieldSource};
 use weft::signal::{Form, FormField, FormSchema};
 use weft::{ValueBag, WeftResult};
 
@@ -53,8 +54,6 @@ pub fn build_form(
     let title: String = inputs.get_or("title", String::new())?;
     let description: Option<String> = inputs.opt("description")?;
     let schema = FormSchema {
-        title: title.clone(),
-        description: description.clone(),
         fields: build_form_fields(&raw_fields, specs, prefill)?,
     };
     Ok(Form {
@@ -135,31 +134,32 @@ pub fn build_form_fields(
             .unwrap_or_else(|| key.clone());
         // What this kind asked the author to fill in, gathered off the
         // entry by the keys the spec asks for. `label` is a column of
-        // its own on the wire, so it is not repeated in here.
+        // its own on the wire, so it is not repeated in here. A present
+        // null is absent (the editor clears a box by writing null), so
+        // it never reaches the wire.
+        // SYNC: null-is-absent <->
+        //       crates/weft-compiler/src/validate.rs (the spec-field loop),
+        //       packages/weft-graph/src/webview/lib/utils/port-specs.ts (hasValue)
         let mut config = Map::new();
         for field in &spec.fields {
             if field.key == "label" {
                 continue;
             }
-            if let Some(value) = raw.get(field.key.as_str()) {
+            if let Some(value) = raw.get(field.key.as_str()).filter(|v| !v.is_null()) {
                 config.insert(field.key.clone(), value.clone());
             }
         }
-        let config = Value::Object(config);
 
-        // The render comes from the SPEC (a typed FormFieldRender on
-        // the metadata side, serialized to the form's wire JSON here);
-        // an entry cannot carry its own, because the compiler admits
-        // only `kind`, the key field and the spec's declared fields as
-        // entry keys. The wire shape is opaque JSON the consumer
-        // interprets via `render.component`.
-        let Some(default) = &spec.render else {
+        // The render comes from the SPEC (the typed FormFieldRender
+        // travels the wire as-is); an entry cannot carry its own,
+        // because the compiler admits only `kind`, the key field and
+        // the spec's declared fields as entry keys.
+        let Some(render) = spec.render.clone() else {
             weft::node_bail!(
                 "form field '{key}' has kind '{kind}', which declares no render, \
                  so nothing knows how to draw it"
             );
         };
-        let render = serde_json::to_value(default).expect("FormFieldRender serializes");
 
         // Pre-fill `value` for fields whose render needs an
         // upstream input port: display + image inherently
@@ -176,16 +176,10 @@ pub fn build_form_fields(
     Ok(fields)
 }
 
-fn render_needs_input(render: &Value) -> bool {
-    let component = render.get("component").and_then(|v| v.as_str());
-    let source = render.get("source").and_then(|v| v.as_str());
-    let prefilled = render
-        .get("prefilled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    matches!(component, Some("readonly") | Some("image"))
-        || source == Some("input")
-        || prefilled
+fn render_needs_input(render: &FormFieldRender) -> bool {
+    matches!(render.component.as_str(), "readonly" | "image")
+        || render.source == Some(FormFieldSource::Input)
+        || render.prefilled
 }
 
 /// Map the form response onto output ports declared by the node's

@@ -89,6 +89,9 @@ weft clean <color>               # one execution
 weft clean --all                 # everything
 weft clean --keep-days 7
 weft clean --images              # also reclaim unreferenced worker images
+                                 # (with --all: every project's, plus old
+                                 # builder-base images; the next build
+                                 # re-makes the base)
 weft clean --build-cache
 ```
 

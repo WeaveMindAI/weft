@@ -103,7 +103,7 @@ pub async fn clean(
 ) -> anyhow::Result<()> {
     if images || build_cache {
         if images {
-            clean_worker_images(&ctx, all).await?;
+            clean_build_images(&ctx, all).await?;
         }
         if build_cache {
             clean_build_cache().await?;
@@ -190,8 +190,9 @@ pub async fn clean(
     Ok(())
 }
 
-/// Reclaim worker images no live project runs. Two layers of junk, both
-/// handled:
+/// Reclaim the images a build produces (worker images, plus old
+/// builder bases under `--all`) that nothing runs any more. Three
+/// layers of junk, all handled:
 ///
 ///   1. TAGGED `weft-worker:<binary_hash>` images whose hash the dispatcher's
 ///      `GET /images/referenced` set does not cover (a rebuilt project leaves
@@ -200,22 +201,27 @@ pub async fn clean(
 ///      be up; failing that is a loud error, never a guess (guessing "nothing
 ///      is referenced" would nuke live images).
 ///   2. Dangling (untagged) `weft.dev/project`-labelled leftovers.
+///   3. With `--all` only, kind backend only: the kind node's own cached
+///      worker images, computed from the node's own list (see
+///      `images::kind_node_image_tag_groups` + `images::node_images_condemned`);
+///      system images are never touched there, and a scoped (non-`--all`)
+///      run skips the node because crictl cannot see the per-project
+///      build labels. Runs BEFORE layer 4 (see the comment at the call
+///      site: the base reclaim can hard-fail without a repo root and
+///      must never gate this one).
+///   4. With `--all` only: builder-base tags other than the current one
+///      (each engine bump mints a fresh ~1.4GB base; only the current ref
+///      is ever FROMed, and the base is shared across every project, so
+///      reclaiming it is inherently global).
 ///
-/// Then (with `--all`, kind backend only) the kind node's own cached worker
-/// images get the same treatment, computed from the node's own list (see
-/// `images::kind_node_image_tag_groups` + `images::node_images_condemned`);
-/// system images are never touched there, and a
-/// scoped (non-`--all`) run skips the node because crictl cannot see the
-/// per-project build labels. Without `--all`, the host side is scoped to
-/// the cwd project's images (label filter).
+/// Without `--all`, the host side is scoped to the cwd project's images
+/// (label filter).
 ///
 /// Not concurrent-safe with an in-flight `weft build`/`run` on this host: a
 /// freshly built image is referenced by nothing until its register lands,
 /// so a clean racing that window deletes it and that run fails loudly
 /// (rebuild heals). Run cleans between builds, not during.
-async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
-    use tokio::process::Command;
-
+async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     // Referenced set: the dispatcher's authoritative answer (see
     // `images::referenced_image_hashes`). Loud error if the daemon is
     // down; guessing "nothing is referenced" would nuke live images.
@@ -245,7 +251,7 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     } else {
         println!("reclaiming worker images no live project references");
     }
-    let out = Command::new("docker").args(&ls_args).output().await?;
+    let out = crate::images::docker().args(&ls_args).output().await?;
     if !out.status.success() {
         anyhow::bail!(
             "docker images exited {}: {}",
@@ -262,56 +268,7 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     if stale.is_empty() {
         println!("no unreferenced worker images");
     } else {
-        // No `--force`: nothing on the host should hold these (workers run
-        // in the cluster, not host docker), so a refusal is real
-        // information about state we did not expect, not an obstacle to
-        // steamroll. One exception is honest: an image that is ALREADY
-        // gone (a concurrent clean between our listing and this delete)
-        // is already reclaimed. That case is detected by OBSERVING the
-        // state (is the image still present?) rather than parsing the
-        // daemon's error prose, which varies across versions and
-        // locales. Per-image so one gone tag cannot abort the others.
-        let mut removed = 0usize;
-        let mut already_gone = 0usize;
-        for image in &stale {
-            let out = Command::new("docker").args(["rmi", image]).output().await?;
-            if out.status.success() {
-                removed += 1;
-                continue;
-            }
-            let present = Command::new("docker")
-                .args(["image", "inspect", image])
-                .output()
-                .await?
-                .status
-                .success();
-            if !present {
-                // "Absent" is only a verdict when the daemon itself
-                // still answers: a daemon that died mid-sweep fails
-                // BOTH the rmi and the inspect, and reporting that as
-                // "already reclaimed" would announce success over a
-                // failure.
-                let daemon_up = Command::new("docker")
-                    .args(["version", "--format", "{{.Server.Version}}"])
-                    .output()
-                    .await?
-                    .status
-                    .success();
-                if daemon_up {
-                    already_gone += 1;
-                    continue;
-                }
-                anyhow::bail!(
-                    "docker stopped answering while removing {image}; check the daemon \
-                     and rerun `weft clean --images`"
-                );
-            }
-            anyhow::bail!(
-                "docker rmi {image} exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        let (removed, already_gone) = reclaim_host_images(&stale).await?;
         println!(
             "removed {removed} unreferenced worker image(s){}",
             if already_gone > 0 {
@@ -323,7 +280,7 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     }
 
     // Dangling (untagged) leftovers from rebuilds under the same tag.
-    let status = Command::new("docker")
+    let status = crate::images::docker()
         .args([
             "image", "prune", "--force",
             "--filter", "dangling=true",
@@ -341,7 +298,7 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     // host's stale set would miss them). Only `weft-worker` refs are ever
     // touched. Never a blanket `crictl rmi --prune`: "unused right now"
     // includes the system images (listener pods spawn on demand, so between
-    // spawns nothing uses `weft-listener:local`), and pruning those leaves
+    // spawns nothing uses the listener image), and pruning those leaves
     // the next on-demand pod in ImagePullBackOff (the exact incident that
     // shaped this). Kind backend only: a k8s backend has no local node cache
     // to clean, so it skips quietly; on kind a failure here is a real error
@@ -353,6 +310,58 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     if !all {
         return Ok(());
     }
+
+    // The node sweep runs BEFORE the builder-base reclaim below: the
+    // base reclaim needs the weft repo root to compute the current ref
+    // and hard-fails without one, and that optional layer must never
+    // gate the node reclaim this verb exists for (leftover node images
+    // were the original ImagePullBackOff incident).
+    node_sweep(&referenced).await?;
+
+    // Old builder bases: each engine/toolchain bump mints a fresh
+    // ~1.4GB `weft-builder-base:<hash>` and nothing evicts the previous
+    // one implicitly (an implicit GC would race an in-flight build
+    // FROMing it), so this explicit clean is where they go. Everything
+    // except the CURRENT ref (the one the next build FROMs) is dead.
+    // `--all` only, like the node sweep: the base is shared across
+    // every project, so reclaiming it is inherently global. Host
+    // docker on any backend (a k8s backend still builds bases here).
+    let current_base = crate::images::builder_base_ref()?;
+    let listing = crate::images::docker()
+        .args(["images", "--format", "{{.Repository}}:{{.Tag}}"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "docker images exited {}: {}",
+        listing.status,
+        String::from_utf8_lossy(&listing.stderr).trim()
+    );
+    let stale_bases = crate::images::host_images_condemned(
+        &current_base,
+        &String::from_utf8_lossy(&listing.stdout),
+        |_| true,
+    )?;
+    if stale_bases.is_empty() {
+        println!("no stale builder-base images");
+    } else {
+        let (removed, already_gone) = reclaim_host_images(&stale_bases).await?;
+        println!(
+            "removed {removed} stale builder-base image(s){}",
+            if already_gone > 0 {
+                format!(", {already_gone} already reclaimed")
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
+}
+
+/// The kind node's own cached worker images, reclaimed against the
+/// dispatcher's referenced set (see the caller's comment block for
+/// why this is `--all`-only and kind-only).
+async fn node_sweep(referenced: &std::collections::BTreeSet<String>) -> anyhow::Result<()> {
     let cfg = crate::commands::daemon::cluster_config();
     if cfg.backend != ClusterBackend::Kind {
         return Ok(());
@@ -362,7 +371,9 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
         &crate::images::kind_node_image_tag_groups(&cfg.cluster_name).await?,
         |hash| !referenced.contains(hash),
     );
-    if !node_stale.is_empty() {
+    if node_stale.is_empty() {
+        println!("no stale worker images on the kind node");
+    } else {
         let node = format!("{}-control-plane", cfg.cluster_name);
         // Per-ref for the same reason as the host sweep above: a
         // concurrent clean may have reclaimed a ref between our listing
@@ -371,7 +382,7 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
         let mut removed = 0usize;
         let mut already_gone = 0usize;
         for image in &node_stale {
-            let out = Command::new("docker")
+            let out = crate::images::docker()
                 .args(["exec", &node, "crictl", "rmi", image])
                 .output()
                 .await?;
@@ -379,7 +390,7 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
                 removed += 1;
                 continue;
             }
-            let present = Command::new("docker")
+            let present = crate::images::docker()
                 .args(["exec", &node, "crictl", "inspecti", image])
                 .output()
                 .await?
@@ -391,7 +402,7 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
                 // the rmi and the inspecti through the same transport,
                 // and reporting that as "already reclaimed" would
                 // announce success over a dead node.
-                let node_up = Command::new("docker")
+                let node_up = crate::images::docker()
                     .args(["exec", &node, "crictl", "--version"])
                     .output()
                     .await?
@@ -424,13 +435,63 @@ async fn clean_worker_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove host docker images one by one, tolerating a tag that is
+/// ALREADY gone (a concurrent clean between the caller's listing and
+/// this delete). No `--force`: nothing on the host should hold these
+/// (workers run in the cluster, and the current builder base is never
+/// in the list), so a refusal is real information, not an obstacle to
+/// steamroll. "Already gone" is detected by OBSERVING the state (is
+/// the image still present?) rather than parsing the daemon's error
+/// prose, and only counts while the daemon itself still answers: a
+/// daemon dying mid-sweep fails BOTH probes and must not read as
+/// success. Per-image so one gone tag cannot abort the others.
+/// Returns (removed, already_gone).
+async fn reclaim_host_images(images: &[String]) -> anyhow::Result<(usize, usize)> {
+    let mut removed = 0usize;
+    let mut already_gone = 0usize;
+    for image in images {
+        let out = crate::images::docker().args(["rmi", image]).output().await?;
+        if out.status.success() {
+            removed += 1;
+            continue;
+        }
+        let present = crate::images::docker()
+            .args(["image", "inspect", image])
+            .output()
+            .await?
+            .status
+            .success();
+        if !present {
+            let daemon_up = crate::images::docker()
+                .args(["version", "--format", "{{.Server.Version}}"])
+                .output()
+                .await?
+                .status
+                .success();
+            if daemon_up {
+                already_gone += 1;
+                continue;
+            }
+            anyhow::bail!(
+                "docker stopped answering while removing {image}; check the daemon \
+                 and rerun `weft clean --images`"
+            );
+        }
+        anyhow::bail!(
+            "docker rmi {image} exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok((removed, already_gone))
+}
+
 /// `docker buildx prune` reclaims BuildKit's intermediate layers.
 /// This is the heavy reclaim: cargo deps, intermediate Rust compile
 /// state, etc. The next build will re-download deps and re-link.
 async fn clean_build_cache() -> anyhow::Result<()> {
-    use tokio::process::Command;
     println!("pruning docker BuildKit cache (next build will be slower)…");
-    let status = Command::new("docker")
+    let status = crate::images::docker()
         .args(["buildx", "prune", "--force"])
         .status()
         .await?;

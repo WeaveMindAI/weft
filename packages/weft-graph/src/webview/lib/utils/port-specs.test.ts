@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildSpecMap, entryPortCollisions, port, type PortEntryDef, type PortSpec } from './port-specs';
+import { buildSpecMap, entryForSource, entryPortCollisions, hasValue, isEmptyChoiceSet, port, type PortEntryDef, type PortSpec, type SpecField } from './port-specs';
 import { isValidFieldKey } from './port-specs';
 
 // A field key becomes a weft PORT NAME (`{key}_approved`, ...), and the parser
@@ -57,5 +57,104 @@ describe('entryPortCollisions', () => {
 			'send_approved',
 			'send_rejected',
 		]);
+	});
+});
+
+describe('entryForSource', () => {
+	const spec: PortSpec = {
+		kind: 'text_input',
+		keyField: 'key',
+		label: 'Text input',
+		fields: [
+			{ key: 'label', label: 'Label' },
+			{ key: 'placeholder', label: 'Placeholder' },
+		],
+		addsInputs: [],
+		addsOutputs: [port('{key}', 'String')],
+	};
+
+	it('keeps only the values the author filled in', () => {
+		expect(entryForSource({ kind: 'text_input', label: 'Your name' }, spec, 'name')).toEqual({
+			kind: 'text_input',
+			key: 'name',
+			label: 'Your name',
+		});
+	});
+
+	it('drops cleared values instead of writing null to source', () => {
+		// A cleared control saves null (the editor's unset convention);
+		// an entry in source says nothing for "not filled in".
+		expect(
+			entryForSource({ kind: 'text_input', label: null, placeholder: undefined }, spec, 'name'),
+		).toEqual({ kind: 'text_input', key: 'name' });
+	});
+
+	it('keeps an empty string: matching "" is a value, not a gap', () => {
+		expect(
+			entryForSource({ kind: 'text_input', placeholder: '' }, spec, 'name'),
+		).toEqual({ kind: 'text_input', key: 'name', placeholder: '' });
+	});
+
+	it('drops values left over from another kind', () => {
+		expect(
+			entryForSource({ kind: 'text_input', options: ['a', 'b'], label: 'Q' }, spec, 'name'),
+		).toEqual({ kind: 'text_input', key: 'name', label: 'Q' });
+	});
+});
+
+// The one filled-in predicate: what it accepts reaches the source, and
+// what it rejects reads as missing for a required field. Exactly
+// undefined and null are not values; an empty string and an empty list
+// ARE values (the compiler accepts a case matching "" and an optional
+// `[]`), matching the compiler's null-is-absent rule key for key.
+describe('hasValue', () => {
+	const field = { key: 'value', label: 'Value' };
+	const draft = (value: unknown): PortEntryDef => ({ kind: 'equals', value });
+	it('rejects unset and cleared', () => {
+		expect(hasValue({ kind: 'equals' }, field)).toBe(false);
+		expect(hasValue(draft(null), field)).toBe(false);
+	});
+	it('accepts real values, the empty string and empty list included', () => {
+		expect(hasValue(draft(''), field)).toBe(true);
+		expect(hasValue(draft('x'), field)).toBe(true);
+		expect(hasValue(draft(0), field)).toBe(true);
+		expect(hasValue(draft(false), field)).toBe(true);
+		expect(hasValue(draft(['a']), field)).toBe(true);
+		expect(hasValue(draft([]), field)).toBe(true);
+	});
+});
+
+// The commit gate's second rule: an empty CHOICE SET reads as chosen
+// nothing (the compiler refuses it on a required field the same way),
+// while an empty list that is one VALUE being matched stays legitimate.
+describe('isEmptyChoiceSet', () => {
+	const draft = (field: SpecField, value: unknown): PortEntryDef => ({
+		kind: 'in',
+		[field.key]: value,
+	});
+	it('flags an empty list only where the list is the choice set', () => {
+		const valueList = { key: 'value', label: 'Values', shape: 'valueList' } as SpecField;
+		const typedList = {
+			key: 'options',
+			label: 'Options',
+			shape: 'typed',
+			valueType: 'List[String]',
+		} as SpecField;
+		const singleValue = { key: 'value', label: 'Value', shape: 'value' } as SpecField;
+		expect(isEmptyChoiceSet(draft(valueList, []), valueList)).toBe(true);
+		expect(isEmptyChoiceSet(draft(typedList, []), typedList)).toBe(true);
+		// `equals: []` matches an empty list; a legitimate value.
+		expect(isEmptyChoiceSet(draft(singleValue, []), singleValue)).toBe(false);
+		expect(isEmptyChoiceSet(draft(valueList, ['a']), valueList)).toBe(false);
+		expect(isEmptyChoiceSet(draft(valueList, null), valueList)).toBe(false);
+		// A union is not a list, structurally: the Rust side matches
+		// `WeftType::List(_)` and must agree, so no string-prefix test.
+		const typedUnion = {
+			key: 'value',
+			label: 'Value',
+			shape: 'typed',
+			valueType: 'List[String] | String',
+		} as SpecField;
+		expect(isEmptyChoiceSet(draft(typedUnion, []), typedUnion)).toBe(false);
 	});
 });

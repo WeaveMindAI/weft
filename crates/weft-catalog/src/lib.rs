@@ -114,7 +114,11 @@ pub fn guard_node_tree_cycle(dir: &Path, chain: &[PathBuf]) -> std::io::Result<P
 /// node's `node_type`, a shared file's module stem) must pass this,
 /// so a bad name fails at discovery/emit with the offending file
 /// named instead of surfacing as a confusing rustc error deep inside
-/// generated code.
+/// generated code. Also the grammar of every bare name the language
+/// admits (ports, entry keys, connection segments), via the
+/// compiler's `is_bare_ident` re-export.
+/// SYNC: bare-ident grammar <->
+///       packages/weft-graph/src/webview/lib/utils/port-specs.ts (isValidFieldKey)
 pub fn is_rust_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
@@ -515,38 +519,163 @@ pub enum BuildStage {
 
 // ----- Stdlib seed location ------------------------------------------
 
-/// Filesystem path to this repo's bundled stdlib catalog. Resolved
-/// at compile time from the crate's own `CARGO_MANIFEST_DIR`.
-///
-/// Consumed by `weft new` (clones the catalog into the new project's `nodes/`
-/// so the project is self-contained) and by any environment that compiles at
-/// RUNTIME rather than from a dev checkout. So this MUST be runtime-resolvable,
-/// not just a compile-time path: honor `WEFT_REPO_ROOT` first (for environments
-/// where the compile-time `CARGO_MANIFEST_DIR` does not exist), exactly like
-/// `weft_compiler::build::resolve_weft_root`. Fall back to the repo layout
-/// (`<weft-repo>/crates/weft-catalog` → parent → parent → `catalog`) for local
-/// dev where the env is unset.
-pub fn stdlib_root() -> PathBuf {
-    weft_repo_root()
-        .expect("stdlib_root: cannot resolve weft repo layout")
-        .join("catalog")
+/// Filesystem path to this repo's bundled stdlib catalog:
+/// `weft_repo_root()/catalog`. Consumed by `weft new` (clones the
+/// catalog into the new project's `nodes/` so the project is
+/// self-contained). See `weft_repo_root` for how the root resolves;
+/// the error carries its carefully worded recovery, so callers
+/// surface it rather than panicking over it.
+pub fn stdlib_root() -> Result<PathBuf, String> {
+    weft_repo_root().map(|root| root.join("catalog"))
 }
 
-/// Resolve the on-disk weft workspace root: honor `WEFT_REPO_ROOT` first (set in a
-/// built image, where the compile-time `CARGO_MANIFEST_DIR` does not
-/// exist), else fall back to the repo layout (`<repo>/crates/weft-catalog` ->
-/// parent -> parent). THE single resolver; `weft_compiler::build::resolve_weft_root`
-/// delegates here so the two can't drift (they must return the same path or the
-/// stdlib seed and the build context disagree). Fallible (None when neither the env
-/// nor the layout resolves) so each caller chooses panic vs error.
-pub fn weft_repo_root() -> Option<PathBuf> {
-    if let Ok(root) = std::env::var("WEFT_REPO_ROOT") {
-        return Some(PathBuf::from(root));
+/// Whether `p` is a weft checkout, judged by what the consumers of the
+/// root actually read: this workspace's manifests + lockfile (staged
+/// into every worker build context) and the stdlib catalog. One
+/// predicate for every rung of `weft_repo_root`, so the rungs cannot
+/// drift on what "valid" means.
+fn looks_like_weft_root(p: &Path) -> bool {
+    p.join("crates/weft-catalog").is_dir()
+        && p.join("Cargo.toml").is_file()
+        && p.join("Cargo.lock").is_file()
+        && p.join("catalog").is_dir()
+}
+
+/// What one repo-root resolution had to work with, gathered by
+/// `weft_repo_root` and resolved by the pure(-ish) `resolve_weft_root_from`
+/// so the ladder order and its error wording are unit-testable without
+/// touching the process env.
+struct RootSources {
+    env_root: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    built_from: Option<PathBuf>,
+    recorded: RecordedInstallRoot,
+}
+
+/// The installer's recorded root, with "the file could not be read"
+/// kept apart from "no file": reporting a permission error as "nothing
+/// was recorded" would send the user looking in the wrong place.
+enum RecordedInstallRoot {
+    Absent,
+    Unreadable { file: PathBuf, error: String },
+    Recorded { file: PathBuf, root: PathBuf },
+}
+
+/// Resolve the on-disk weft workspace root, in order:
+///
+/// 1. `WEFT_REPO_ROOT` (set in a built image, where nothing else below
+///    exists). An explicit override that does not point at a checkout
+///    is a configuration error and fails loud rather than falling
+///    through to a guess.
+/// 2. The checkout the process is STANDING IN (walking up from the
+///    working directory). With several worktrees on one machine this
+///    is the only rung that picks the one the user means.
+/// 3. The compile-time repo layout (`<repo>/crates/weft-catalog` ->
+///    parent -> parent), if that directory is still a checkout. A
+///    locally built binary lives in its checkout's `target/`, so this
+///    is the everyday dev answer outside any checkout.
+/// 4. The root the installer recorded. A PREBUILT binary (downloaded
+///    by setup.sh from the rolling release) bakes its BUILDER's
+///    checkout path into (3), which does not exist on this machine;
+///    setup.sh records where the repo actually lives, one line in a
+///    file.
+///    SYNC: repo-root file <-> setup.sh (prebuilt CLI install: repo-root write)
+///
+/// THE single resolver; `weft_compiler::build::resolve_weft_root`
+/// delegates here so the two can't drift (they must return the same
+/// path or the stdlib seed and the build context disagree). The error
+/// names every source it tried and the recovery; the winning rung is
+/// traced at debug so a wrong-checkout surprise (two worktrees, rung 2
+/// answering) can be pinned from the logs.
+pub fn weft_repo_root() -> Result<PathBuf, String> {
+    let recorded = match std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".local/share/weft/repo-root"))
+    {
+        None => RecordedInstallRoot::Absent,
+        Some(file) => match std::fs::read_to_string(&file) {
+            Ok(recorded) => {
+                RecordedInstallRoot::Recorded { root: PathBuf::from(recorded.trim()), file }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RecordedInstallRoot::Absent,
+            Err(e) => RecordedInstallRoot::Unreadable { file, error: e.to_string() },
+        },
+    };
+    let sources = RootSources {
+        env_root: std::env::var_os("WEFT_REPO_ROOT").map(PathBuf::from),
+        cwd: std::env::current_dir().ok(),
+        built_from: Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf()),
+        recorded,
+    };
+    let root = resolve_weft_root_from(&sources)?;
+    tracing::debug!(target: "weft_catalog", root = %root.display(), "resolved weft repo root");
+    Ok(root)
+}
+
+fn resolve_weft_root_from(sources: &RootSources) -> Result<PathBuf, String> {
+    if let Some(root) = &sources.env_root {
+        if looks_like_weft_root(root) {
+            return Ok(root.clone());
+        }
+        return Err(format!(
+            "WEFT_REPO_ROOT is set to '{}', which is not a weft checkout \
+             (no crates/weft-catalog + catalog dirs beside the workspace \
+             Cargo.toml/Cargo.lock); fix or unset it",
+            root.display()
+        ));
     }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
+    if let Some(cwd) = &sources.cwd {
+        let mut dir = cwd.clone();
+        loop {
+            if looks_like_weft_root(&dir) {
+                return Ok(dir);
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    if let Some(built_from) = &sources.built_from {
+        if looks_like_weft_root(built_from) {
+            return Ok(built_from.clone());
+        }
+    }
+    match &sources.recorded {
+        RecordedInstallRoot::Recorded { file, root } => {
+            if looks_like_weft_root(root) {
+                return Ok(root.clone());
+            }
+            Err(format!(
+                "cannot locate the weft checkout: WEFT_REPO_ROOT is unset, this \
+                 process is not inside one, the path this binary was built from is \
+                 gone, and the recorded install location '{}' (from {}) is not a \
+                 checkout any more (moved or deleted?). Re-run ./setup.sh from your \
+                 weft checkout to record where it lives.",
+                root.display(),
+                file.display()
+            ))
+        }
+        RecordedInstallRoot::Unreadable { file, error } => Err(format!(
+            "cannot locate the weft checkout: WEFT_REPO_ROOT is unset, this \
+             process is not inside one, the path this binary was built from is \
+             gone, and the recorded install location file '{}' could not be read \
+             ({error}). Fix the file, or re-run ./setup.sh from your weft checkout.",
+            file.display()
+        )),
+        RecordedInstallRoot::Absent => Err(format!(
+            "cannot locate the weft checkout: WEFT_REPO_ROOT is unset, this process \
+             is not inside one, the path this binary was built from ('{}') is gone, \
+             and no install location was recorded. Re-run ./setup.sh from your weft \
+             checkout, or set WEFT_REPO_ROOT.",
+            sources
+                .built_from
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        )),
+    }
 }
 
 // ----- Package discovery ---------------------------------------------
@@ -1186,6 +1315,131 @@ pub enum CatalogError {
 }
 
 #[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    /// A directory shaped like a weft checkout, per `looks_like_weft_root`.
+    fn fake_checkout() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("crates/weft-catalog")).expect("mkdir");
+        std::fs::create_dir_all(dir.path().join("catalog")).expect("mkdir");
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").expect("write");
+        std::fs::write(dir.path().join("Cargo.lock"), "").expect("write");
+        dir
+    }
+
+    fn no_sources() -> RootSources {
+        RootSources {
+            env_root: None,
+            cwd: None,
+            built_from: None,
+            recorded: RecordedInstallRoot::Absent,
+        }
+    }
+
+    /// The predicate demands everything the consumers read: the crate
+    /// dir, the workspace manifests, and the catalog. Any one missing
+    /// means "not a checkout", or a deeper consumer would fail with a
+    /// worse message later.
+    #[test]
+    fn a_checkout_needs_crates_manifests_and_catalog() {
+        let dir = fake_checkout();
+        assert!(looks_like_weft_root(dir.path()));
+        for missing in ["crates/weft-catalog", "Cargo.toml", "Cargo.lock", "catalog"] {
+            let dir = fake_checkout();
+            let p = dir.path().join(missing);
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p).expect("rm");
+            } else {
+                std::fs::remove_file(&p).expect("rm");
+            }
+            assert!(!looks_like_weft_root(dir.path()), "should fail without {missing}");
+        }
+    }
+
+    /// Rung 1: an explicit WEFT_REPO_ROOT wins, and one that is not a
+    /// checkout is a loud config error naming the path, never a fall
+    /// through to a guess.
+    #[test]
+    fn env_root_wins_and_a_bad_one_fails_loud() {
+        let dir = fake_checkout();
+        let sources = RootSources { env_root: Some(dir.path().to_path_buf()), ..no_sources() };
+        assert_eq!(resolve_weft_root_from(&sources).expect("resolves"), dir.path());
+
+        let bogus = tempfile::tempdir().expect("tempdir");
+        let other = fake_checkout();
+        let sources = RootSources {
+            env_root: Some(bogus.path().to_path_buf()),
+            // Even with a perfectly good cwd rung below, the explicit
+            // override failing must NOT fall through.
+            cwd: Some(other.path().to_path_buf()),
+            ..no_sources()
+        };
+        let err = resolve_weft_root_from(&sources).expect_err("bad override fails");
+        assert!(err.contains("WEFT_REPO_ROOT"), "{err}");
+        assert!(err.contains(&bogus.path().display().to_string()), "{err}");
+    }
+
+    /// Rung 2 walks up from the working directory; rung 3 answers when
+    /// the compile-time checkout still exists; rung 4 reads what the
+    /// installer recorded.
+    #[test]
+    fn the_ladder_answers_in_order() {
+        let checkout = fake_checkout();
+        let nested = checkout.path().join("catalog");
+        let sources = RootSources { cwd: Some(nested), ..no_sources() };
+        assert_eq!(resolve_weft_root_from(&sources).expect("walk-up"), checkout.path());
+
+        let sources =
+            RootSources { built_from: Some(checkout.path().to_path_buf()), ..no_sources() };
+        assert_eq!(resolve_weft_root_from(&sources).expect("built-from"), checkout.path());
+
+        let sources = RootSources {
+            recorded: RecordedInstallRoot::Recorded {
+                file: PathBuf::from("/home/x/.local/share/weft/repo-root"),
+                root: checkout.path().to_path_buf(),
+            },
+            ..no_sources()
+        };
+        assert_eq!(resolve_weft_root_from(&sources).expect("recorded"), checkout.path());
+    }
+
+    /// Every terminal error names what was tried and the recovery, and
+    /// the three recorded-file endings stay distinct: a stale record, an
+    /// unreadable file, and no record are different situations sending
+    /// the user to different places.
+    #[test]
+    fn terminal_errors_name_the_situation() {
+        let gone = tempfile::tempdir().expect("tempdir");
+        let sources = RootSources {
+            recorded: RecordedInstallRoot::Recorded {
+                file: PathBuf::from("/home/x/.local/share/weft/repo-root"),
+                root: gone.path().to_path_buf(),
+            },
+            ..no_sources()
+        };
+        let err = resolve_weft_root_from(&sources).expect_err("stale record");
+        assert!(err.contains("not a checkout any more"), "{err}");
+        assert!(err.contains("repo-root"), "{err}");
+
+        let sources = RootSources {
+            recorded: RecordedInstallRoot::Unreadable {
+                file: PathBuf::from("/home/x/.local/share/weft/repo-root"),
+                error: "permission denied".into(),
+            },
+            ..no_sources()
+        };
+        let err = resolve_weft_root_from(&sources).expect_err("unreadable record");
+        assert!(err.contains("could not be read"), "{err}");
+        assert!(err.contains("permission denied"), "{err}");
+
+        let err = resolve_weft_root_from(&no_sources()).expect_err("nothing at all");
+        assert!(err.contains("no install location was recorded"), "{err}");
+        assert!(err.contains("./setup.sh"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod package_tests {
     use super::*;
 
@@ -1222,8 +1476,8 @@ mod package_tests {
         // (The node-type collision inside would also fire, but the
         // name is claimed BEFORE any entry inserts, so the error must
         // be the package-name collision.)
-        copy_dir(&stdlib_root().join("slack"), &root.path().join("a"));
-        copy_dir(&stdlib_root().join("slack"), &root.path().join("b"));
+        copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("a"));
+        copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("b"));
 
         let err = FsCatalog::discover(root.path()).expect_err("duplicate name refused");
         assert!(
@@ -1252,14 +1506,14 @@ mod package_tests {
     /// red suite the moment a catalog file drifts from the metadata types.
     #[test]
     fn every_stdlib_node_loads_strict() {
-        let cat = FsCatalog::discover(&stdlib_root())
+        let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root"))
             .expect("all stdlib metadata.json must load under strict parse");
         assert!(!cat.all().is_empty(), "catalog discovered no nodes");
     }
 
     #[test]
     fn human_specs_loaded() {
-        let cat = FsCatalog::discover(&stdlib_root()).unwrap();
+        let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root")).unwrap();
         let q = cat.entry("HumanQuery").expect("HumanQuery missing");
         let t = cat.entry("HumanTrigger").expect("HumanTrigger missing");
         let specs = |e: &CatalogEntry| {
@@ -1280,7 +1534,7 @@ mod package_tests {
     /// the catalog so the package compiles into a project binary.
     #[test]
     fn bailey_triad_loaded() {
-        let cat = FsCatalog::discover(&stdlib_root()).unwrap();
+        let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root")).unwrap();
         let bridge = cat.entry("BaileyBridge").expect("BaileyBridge missing");
         assert!(bridge.metadata.requires_infra, "bridge must be infra");
         assert_eq!(

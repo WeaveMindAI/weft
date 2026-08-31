@@ -8,7 +8,7 @@ use weft_compiler::weft_compiler::compile;
 use weft_compiler::{CompileFs, Diagnostic, Severity};
 
 fn catalog() -> FsCatalog {
-    FsCatalog::discover(&stdlib_root()).expect("stdlib catalog")
+    FsCatalog::discover(&stdlib_root().expect("stdlib root")).expect("stdlib catalog")
 }
 
 fn parse_enrich(source: &str) -> weft_core::ProjectDefinition {
@@ -2087,6 +2087,128 @@ out = Debug {{ data: route.taken }}
         !clean.iter().any(|c| c.starts_with("config-entry") || c.starts_with("catch-all")
             || c.starts_with("unknown-config-entry") || c == "duplicate-catch-all"),
         "a well-formed switch has nothing to say: {clean:?}"
+    );
+
+    // A required field set to null is MISSING, not mistyped: the entry
+    // needs a value, and the message says so instead of arguing about
+    // null's type. Both directions pinned: the missing-value code
+    // appears AND the bad-value code is gone, since emitting both was
+    // exactly the pre-fix behavior.
+    let nulled = switch_over(
+        r#"[{ "kind": "equals", "value": null, "port": "taken" }, { "kind": "otherwise", "port": "rest" }]"#,
+    );
+    assert!(nulled.contains(&"config-entry-missing-value".to_string()), "{nulled:?}");
+    assert!(!nulled.contains(&"config-entry-bad-value".to_string()), "{nulled:?}");
+}
+
+/// A present `null` on an OPTIONAL spec field counts as absent, the
+/// same rule record types apply: the editor clears a box by writing
+/// null, and the runtime reads null as "not filled in" (a form field's
+/// label falls back to its key). Refusing it made a graph-built form
+/// fail activation over a label nobody typed.
+#[test]
+fn a_null_optional_entry_field_counts_as_absent() {
+    let project = parse_enrich(
+        r#"
+ask = HumanQuery {
+  title: "Approve?"
+  fields: [
+    { "kind": "display", "key": "question", "label": null },
+    { "kind": "approve_reject", "key": "send" }
+  ]
+}
+q = Text { value: "ok to send?" }
+ask.question = q.value
+out = Debug { data: ask.send_approved }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    // A cleared label must trip NO entry diagnostic: `label` is a
+    // declared optional field, and null is how the editor clears it.
+    let entry_codes: Vec<&str> = codes(&d)
+        .into_iter()
+        .filter(|c| c.starts_with("config-entry") || c.starts_with("unknown-config-entry"))
+        .collect();
+    assert!(
+        entry_codes.is_empty(),
+        "a cleared optional label is absent, not an error: {entry_codes:?}"
+    );
+}
+
+#[test]
+fn a_null_unknown_key_is_still_a_typo() {
+    // null-is-absent applies to a DECLARED field's value, never to the
+    // key itself: a mistyped key whose value happens to be null must
+    // still surface, or the typo silently vanishes.
+    let project = parse_enrich(
+        r#"
+ask = HumanQuery {
+  title: "Approve?"
+  fields: [
+    { "kind": "display", "key": "question", "lbael": null },
+    { "kind": "approve_reject", "key": "send" }
+  ]
+}
+q = Text { value: "ok to send?" }
+ask.question = q.value
+out = Debug { data: ask.send_approved }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"unknown-config-entry-key"),
+        "a null-valued typo'd key must still be flagged: {d:?}"
+    );
+}
+
+#[test]
+fn an_empty_required_choice_set_is_refused() {
+    // "Chose nothing" satisfies no requirement: a select with zero
+    // options would ship a human a dropdown with nothing in it.
+    let project = parse_enrich(
+        r#"
+ask = HumanQuery {
+  title: "Pick"
+  fields: [
+    { "kind": "select", "key": "choice", "options": [] }
+  ]
+}
+out = Debug { data: ask.choice }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        codes(&d).contains(&"config-entry-bad-value"),
+        "an empty required choice set must be refused: {d:?}"
+    );
+}
+
+#[test]
+fn an_empty_list_as_a_matched_value_is_legitimate() {
+    // Where the list is one VALUE being matched (`equals` against a
+    // list-typed input), `[]` routes the empty-list case and must
+    // compile clean; only a CHOICE SET reads emptiness as "chose
+    // nothing".
+    let project = parse_enrich(
+        r#"
+sw = Switch {
+  cases: [
+    { "kind": "equals", "port": "empty", "value": [] },
+    { "kind": "otherwise", "port": "rest" }
+  ]
+}
+a = Debug { data: sw.empty }
+b = Debug { data: sw.rest }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let entry_codes: Vec<&str> = codes(&d)
+        .into_iter()
+        .filter(|c| c.starts_with("config-entry"))
+        .collect();
+    assert!(
+        entry_codes.is_empty(),
+        "`equals: []` on a list input is a legitimate value: {entry_codes:?}"
     );
 }
 

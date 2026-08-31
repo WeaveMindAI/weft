@@ -78,7 +78,7 @@ impl From<crate::project_store::StoredProjectSummary> for ProjectSummary {
 /// Control-plane only: the set spans every tenant, so no single tenant may
 /// read it (a public build-activity oracle otherwise).
 // SYNC: response shape (JSON array of bare hash strings) <->
-//       crates/weft-cli/src/commands/executions.rs clean_worker_images
+//       crates/weft-cli/src/images.rs referenced_image_hashes
 pub async fn referenced_images(
     State(state): State<DispatcherState>,
     _ops: crate::authenticator::ControlPlaneCaller,

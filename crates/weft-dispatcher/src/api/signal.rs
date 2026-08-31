@@ -880,6 +880,9 @@ pub async fn list_signals_for_token(
             // (one-shot replies to a paused execution). It's a signal-row
             // property, not part of the listener's render, so it is added here
             // where the row and its rendered payload meet.
+            // SYNC: consumer payload keys <->
+            //       extension-browser/src/lib/api.ts (PendingTask),
+            //       crates/weft-listener/src/kinds/form.rs (FormHandler::render)
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("isResume".into(), Value::Bool(sig.is_resume));
             }

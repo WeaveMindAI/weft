@@ -167,6 +167,37 @@ describe('layout round-trips', () => {
 		expect(undo.length).toBeGreaterThan(0);
 		expect(parseLayoutCode(applyLayoutOps(after, undo))).toEqual(parseLayoutCode(before));
 	});
+
+	it('every writer ends the file with exactly one newline', () => {
+		// The terminator git and editors expect; a writer once stripped
+		// it and every save showed a spurious last-line diff. One seeded
+		// file through each content writer that rewrites it.
+		// (`serializeLayoutMap` is deliberately absent: it returns a
+		// block, not file content. A no-op passthrough, e.g. a rename
+		// with no matching key, returns its input untouched and is not
+		// a write.)
+		const seed = 'a @layout 10 20\nb @layout 30 40';
+		const writers: Array<[string, (code: string) => string]> = [
+			['updateLayoutEntry', (c) => updateLayoutEntry(c, 'a', 1, 2)],
+			['removeLayoutEntry', (c) => removeLayoutEntry(c, 'b')],
+			['removeLayoutEntryEveryView', (c) => removeLayoutEntryEveryView(c, 'b')],
+			['renameLayoutSubtree', (c) => renameLayoutSubtree(c, 'a', 'z')],
+			['applyLayoutOps', (c) => applyLayoutOps(c, [{ op: 'removeEntry', id: 'b' }])],
+			['setViewMode', (c) => setViewMode(c, 'simplified')],
+		];
+		for (const [name, write] of writers) {
+			const written = write(seed);
+			expect(written.endsWith('\n'), `${name} must terminate`).toBe(true);
+			expect(written.endsWith('\n\n'), `${name} must not stack terminators`).toBe(false);
+		}
+		// Repeated writes never stack terminators, and the content
+		// round-trips unchanged.
+		const written = updateLayoutEntry(seed, 'a', 1, 2);
+		const toggled = setViewMode(setViewMode(written, 'simplified'), 'builder');
+		expect(toggled.endsWith('\n')).toBe(true);
+		expect(toggled.endsWith('\n\n')).toBe(false);
+		expect(parseLayoutCode(toggled)).toEqual(parseLayoutCode(written));
+	});
 });
 
 describe('computeContainmentFloors', () => {

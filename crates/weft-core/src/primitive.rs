@@ -249,7 +249,7 @@ pub struct ExecutionSnapshot {
     /// instantly OR re-suspends if pending. This is what makes
     /// multiple sequential awaits within one node body work.
     #[serde(default)]
-    pub awaited_sequences: HashMap<crate::liveness::FiringLocation, Vec<AwaitedEntry>>,
+    pub awaited_sequences: HashMap<crate::frames::FiringLocation, Vec<AwaitedEntry>>,
     /// Journal rows the fold could not apply because they were
     /// corrupted (unparseable UUID, broken invariants, etc.). Empty
     /// in the normal case. Surfaced to the inspector so the user sees

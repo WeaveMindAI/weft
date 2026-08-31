@@ -250,7 +250,7 @@ async fn google_drive_refreshes_lazily_and_lists_real_files() -> Result<()> {
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
     anyhow::ensure!(
-        settled.input_of("out").and_then(|i| i.get("data").cloned()).map_or(false, |v| v.is_array()),
+        settled.input_of("out").and_then(|i| i.get("data").cloned()).is_some_and(|v| v.is_array()),
         "no file list came back"
     );
 

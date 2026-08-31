@@ -1581,9 +1581,9 @@ fn check_config_derived_ports(
                     Severity::Error,
                     "config-entry-not-an-object",
                     format!(
-                        "node '{}': entry {} of '{}' is not an object",
+                        "node '{}': {} of '{}' is not an object",
                         node.id,
-                        index + 1,
+                        entry_label(index, None),
                         ports_from_config.field
                     ),
                 );
@@ -1597,10 +1597,10 @@ fn check_config_derived_ports(
                     Severity::Error,
                     "unknown-config-entry-kind",
                     format!(
-                        "node '{}': entry {} of '{}' has kind '{}', which {} does not offer \
+                        "node '{}': {} of '{}' has kind '{}', which {} does not offer \
                          (it takes: {})",
                         node.id,
-                        index + 1,
+                        entry_label(index, None),
                         ports_from_config.field,
                         kind,
                         node.node_type,
@@ -1617,9 +1617,9 @@ fn check_config_derived_ports(
                     Severity::Error,
                     "config-entry-without-a-port",
                     format!(
-                        "node '{}': entry {} of '{}' needs a '{}' naming the port it adds",
+                        "node '{}': {} of '{}' needs a '{}' naming the port it adds",
                         node.id,
-                        index + 1,
+                        entry_label(index, None),
                         ports_from_config.field,
                         spec.key_field
                     ),
@@ -1627,7 +1627,10 @@ fn check_config_derived_ports(
                 continue;
             }
             // Every key an entry may carry, so anything else is a
-            // mistyped one.
+            // mistyped one, null-valued or not: null-is-absent applies
+            // to a DECLARED field's value (the loop below), never to
+            // the key itself, or a typo'd key with a cleared value
+            // would vanish from diagnostics.
             let mut allowed: Vec<&str> = vec!["kind", spec.key_field.as_str()];
             allowed.extend(spec.fields.iter().map(|f| f.key.as_str()));
             let unknown: Vec<&String> =
@@ -1639,10 +1642,10 @@ fn check_config_derived_ports(
                     Severity::Error,
                     "unknown-config-entry-key",
                     format!(
-                        "node '{}': entry {} of '{}' carries '{}', which a '{}' entry does \
-                         not take (it takes: {})",
+                        "node '{}': {} of '{}' carries '{}', which a '{}' entry \
+                         does not take (it takes: {})",
                         node.id,
-                        index + 1,
+                        entry_label(index, Some(port_name)),
                         ports_from_config.field,
                         key,
                         spec.kind,
@@ -1658,9 +1661,46 @@ fn check_config_derived_ports(
                 .and_then(|name| node.inputs.iter().find(|p| p.name == *name))
                 .map(|p| p.port_type.clone());
             for field in &spec.fields {
-                match obj.get(field.key.as_str()) {
+                // A present `null` counts as absent, the same rule record
+                // types apply to their optional fields: the editor clears a
+                // box by writing null, and the runtime reads null as "not
+                // filled in" (a form field's label falls back to its key).
+                // SYNC: null-is-absent <->
+                //       packages/weft-graph/src/webview/lib/utils/port-specs.ts (hasValue),
+                //       catalog/human/form_helpers.rs (build_form_fields)
+                match obj.get(field.key.as_str()).filter(|v| !v.is_null()) {
                     Some(value) => {
-                        if let Some(problem) =
+                        // Where the list IS the choice set, an empty one
+                        // on a required field chose nothing: the branch
+                        // could never fire (a `valueList` `in`) or the
+                        // human would get an empty dropdown. Where a
+                        // list is one VALUE being matched, `[]` is a
+                        // legitimate value and says nothing here.
+                        // SYNC: empty-list-is-nothing-chosen <->
+                        //       crates/weft-core/src/node.rs
+                        //       (SpecField::empty_list_means_nothing_chosen),
+                        //       packages/weft-graph/src/webview/lib/utils/port-specs.ts
+                        //       (isEmptyChoiceSet)
+                        let empty_choice_set = field.required
+                            && field.empty_list_means_nothing_chosen()
+                            && value.as_array().is_some_and(|a| a.is_empty());
+                        if empty_choice_set {
+                            push(
+                                d,
+                                key_span,
+                                Severity::Error,
+                                "config-entry-bad-value",
+                                format!(
+                                    "node '{}': {} of '{}' sets `{}` to an empty list, \
+                                     which chooses nothing, and a '{}' needs at least one",
+                                    node.id,
+                                    entry_label(index, Some(port_name)),
+                                    ports_from_config.field,
+                                    field.key,
+                                    spec.kind
+                                ),
+                            );
+                        } else if let Some(problem) =
                             spec_field_problem(field, value, matched_type.as_ref())
                         {
                             push(
@@ -1669,9 +1709,9 @@ fn check_config_derived_ports(
                                 Severity::Error,
                                 "config-entry-bad-value",
                                 format!(
-                                    "node '{}': entry {} of '{}' sets `{}`, and {}",
+                                    "node '{}': {} of '{}' sets `{}`, and {}",
                                     node.id,
-                                    index + 1,
+                                    entry_label(index, Some(port_name)),
                                     ports_from_config.field,
                                     field.key,
                                     problem
@@ -1685,9 +1725,9 @@ fn check_config_derived_ports(
                         Severity::Error,
                         "config-entry-missing-value",
                         format!(
-                            "node '{}': entry {} of '{}' is a '{}', which needs a '{}'",
+                            "node '{}': {} of '{}' is a '{}', which needs a '{}'",
                             node.id,
-                            index + 1,
+                            entry_label(index, Some(port_name)),
                             ports_from_config.field,
                             spec.kind,
                             field.key
@@ -1736,6 +1776,18 @@ fn check_config_derived_ports(
                 );
             }
         }
+    }
+}
+
+/// How a diagnostic names one entry of a config-derived list: its
+/// position, plus the port it names once the entry has gotten that far
+/// (two entries can carry the same port name, so the position stays).
+fn entry_label(index: usize, port_name: Option<&str>) -> String {
+    match port_name {
+        // `None`: the diagnostic fires before the entry has named its
+        // port, so there is nothing to quote.
+        None => format!("entry {}", index + 1),
+        Some(name) => format!("entry {} ('{}')", index + 1, name),
     }
 }
 

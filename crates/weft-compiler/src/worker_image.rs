@@ -122,12 +122,11 @@ pub const WEFT_MOUNT: &str = "/weft";
 /// place node source comes from: the project owns all its nodes.
 pub const NODES_MOUNT: &str = "/weft/project-nodes";
 
-/// Image repo for the shared pre-built builder base. Tagged by a
-/// short hash of the engine workspace (`crates/`, `Cargo.toml`,
-/// `Cargo.lock`, `rust-toolchain.toml`), so an engine bump produces
-/// a fresh tag. The CLI builds + tags this image; per-project worker
-/// Dockerfiles `FROM weft-builder-base:<hash>` in their builder
-/// stage.
+/// Image repo for the shared pre-built builder base. The CLI
+/// qualifies it with the registry and a short hash of the engine
+/// workspace (`crates/`, `Cargo.toml`, `Cargo.lock`,
+/// `rust-toolchain.toml`), so an engine bump produces a fresh ref, and
+/// stamps the result into each project's worker-Dockerfile `FROM`.
 pub const BUILDER_BASE_REPO: &str = "weft-builder-base";
 
 /// Build-context-relative directory the builder-base WARM-UP crate is staged into
@@ -142,14 +141,6 @@ pub const WARMUP_CRATE_DIR: &str = ".weft-warmup";
 /// (gitignored), regenerated on every base build.
 pub const BASE_CONTEXT_DIR: &str = ".weft-base-context";
 
-/// Compose the builder-base image tag from a workspace hash. The
-/// hash is computed by the CLI (it knows the on-disk weft workspace
-/// layout); the compiler stamps the tag into the generated
-/// Dockerfile.
-pub fn builder_base_tag(short_hash: &str) -> String {
-    format!("{BUILDER_BASE_REPO}:{short_hash}")
-}
-
 /// Emit the Dockerfile for a project's worker image.
 ///
 /// `project_root` is only used to resolve a relative
@@ -161,8 +152,8 @@ pub fn builder_base_tag(short_hash: &str) -> String {
 /// the build context must include (the codegen's `#[path]`
 /// includes point at these).
 ///
-/// `builder_base_tag` is the shared pre-built builder-base image
-/// tag (`weft-builder-base:<hash>`). The CLI computes it from the
+/// `builder_base_ref` is the fully-qualified ref of the shared
+/// pre-built builder-base image. The CLI computes it from the
 /// engine workspace hash and ensures the image exists. When the
 /// user's runtime base is debian-family and they haven't supplied a
 /// custom Dockerfile template, the builder stage `FROM`s this image
@@ -178,7 +169,7 @@ pub fn emit(
     catalog: &FsCatalog,
     referenced: &BTreeSet<String>,
     binary_name: &str,
-    builder_base_tag: &str,
+    builder_base_ref: &str,
 ) -> CompileResult<WorkerDockerfile> {
     let base_image_str = build
         .base_image
@@ -225,14 +216,14 @@ pub fn emit(
     // The CLI's "ensure the builder base exists" step keys off actual
     // USAGE: whichever template was chosen (built-in or custom), if it
     // references `{{builder_base_image}}` the rendered Dockerfile will
-    // FROM that tag and the image must exist before `docker build`.
+    // FROM that ref and the image must exist before `docker build`.
     let builder_base_out = template
         .contains("{{builder_base_image}}")
-        .then(|| builder_base_tag.to_string());
+        .then(|| builder_base_ref.to_string());
 
     let body = template
         .replace("{{base_image}}", &base.raw)
-        .replace("{{builder_base_image}}", builder_base_tag)
+        .replace("{{builder_base_image}}", builder_base_ref)
         .replace(
             "{{install_builder_base}}",
             &render_builder_base(base.manager),

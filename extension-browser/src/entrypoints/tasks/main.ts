@@ -1,18 +1,4 @@
-import { mount } from 'svelte';
 import App from './App.svelte';
-import '../popup/app.css';
+import { mountWhenReady } from '../../lib/mount-entry';
 
-function initApp() {
-  const target = document.getElementById('app');
-  if (!target) {
-    console.error('[weft] Target element not found');
-    return;
-  }
-  return mount(App, { target });
-}
-
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', initApp);
-} else {
-  initApp();
-}
+mountWhenReady(App);

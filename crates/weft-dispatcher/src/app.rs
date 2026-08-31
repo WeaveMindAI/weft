@@ -183,8 +183,16 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
                 Arc::new(SubprocessListenerBackend::new(bin))
             }
             _ => {
-                let image = std::env::var("WEFT_LISTENER_IMAGE")
-                    .unwrap_or_else(|_| "weft-listener:local".into());
+                // Content-addressed ref, substituted into the dispatcher
+                // manifest by whatever applied it; there is no meaningful
+                // default to fall back to (a wrong guess would spawn
+                // listeners on a stale or absent image), so absence is a
+                // boot error.
+                // SYNC: WEFT_*_IMAGE names <-> crates/weft-cli/src/images.rs
+                //       (SystemService::image_env), deploy/k8s/dispatcher.yaml (env block),
+                //       deploy/k8s/broker.yaml (image line)
+                let image = std::env::var("WEFT_LISTENER_IMAGE").ok().filter(|v| !v.is_empty())
+                    .context("WEFT_LISTENER_IMAGE must name the listener image to spawn")?;
                 Arc::new(K8sListenerBackend::new(image, broker_url.clone(), kube.clone()))
             }
         };
@@ -271,10 +279,8 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
 
     // The control-plane namespace: where pooled, trusted, tenant-agnostic
     // services run (the infra-supervisor; pooled listeners). They serve many
-    // tenants, so they do not live in any one tenant's namespace. Defaults to
-    // the dispatcher's own namespace.
-    let control_plane_namespace = std::env::var("WEFT_CONTROL_PLANE_NAMESPACE")
-        .unwrap_or_else(|_| "weft-system".to_string());
+    // tenants, so they do not live in any one tenant's namespace.
+    let control_plane_namespace = weft_core::infra::SYSTEM_NAMESPACE.to_string();
     let listener_pool = ListenerPool::new(control_plane_namespace.clone());
 
     // Pooled infra-supervisor backend + pool, mirroring the listener.
@@ -295,8 +301,10 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
                 Arc::new(SubprocessSupervisorBackend::new(bin))
             }
             _ => {
-                let image = std::env::var("WEFT_SUPERVISOR_IMAGE")
-                    .unwrap_or_else(|_| "weft-infra-supervisor:local".into());
+                // Same contract as WEFT_LISTENER_IMAGE above (whose SYNC
+                // marker covers both names).
+                let image = std::env::var("WEFT_SUPERVISOR_IMAGE").ok().filter(|v| !v.is_empty())
+                    .context("WEFT_SUPERVISOR_IMAGE must name the infra-supervisor image to spawn")?;
                 Arc::new(K8sSupervisorBackend::new(image, broker_url.clone(), kube.clone()))
             }
         };

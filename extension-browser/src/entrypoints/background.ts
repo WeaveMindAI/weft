@@ -1,46 +1,62 @@
-import { fetchPendingTasks, type PendingTask, type ApiToken } from '../lib/api';
+import { fetchPendingTasks, isTrigger, type PendingTask } from '../lib/api';
+import { getSettings } from '../lib/settings';
+import { singleFlight } from '../lib/single-flight';
 
-const POLL_INTERVAL_MS = 30000; // 30 seconds
+const POLL_INTERVAL_MS = 30000;
+
+// Notification ids carry the signal token after this prefix, so the
+// click handler can rebuild the task URL with no state held in the
+// (restartable) background worker.
+const NOTIFICATION_ID_PREFIX = 'weft-task::';
 
 // Signal tokens the user has already been notified about, grouped by the
-// api token that surfaced them. The grouping matters: a poll only refreshes
-// the entries of api tokens whose dispatcher was actually REACHED that round.
-// An unreached dispatcher's tasks are absent from the response without being
-// gone; a single flat set rebuilt from each response would forget them on a
-// transient blip and re-notify every live task when the dispatcher recovers.
-let seenByToken = new Map<string, Set<string>>();
+// api token that surfaced them, PERSISTED in extension storage: on MV3
+// targets the browser kills this worker between polls, so anything held
+// in a module variable would forget every notified task and re-pop the
+// same notification on every poll. The grouping matters too: a poll only
+// refreshes the entries of api tokens whose dispatcher was actually
+// REACHED that round. An unreached dispatcher's tasks are absent from
+// the response without being gone; a single flat set rebuilt from each
+// response would forget them on a transient blip and re-notify every
+// live task when the dispatcher recovers.
+type SeenByToken = Record<string, string[]>;
 
-// Settings interface
-interface ExtensionSettings {
-  notificationsEnabled: boolean;
-}
-
-const DEFAULT_SETTINGS: ExtensionSettings = {
-  notificationsEnabled: true,
-};
-
-async function getSettings(): Promise<ExtensionSettings> {
+/// `null` on a failed read, NEVER `{}`: unknown state reported as
+/// known-empty would re-notify every pending task at once on one
+/// transient storage failure. The caller skips the notify phase for
+/// that round instead.
+async function readSeen(): Promise<SeenByToken | null> {
   try {
-    const result = await browser.storage.local.get('settings');
-    if (result.settings && typeof result.settings === 'object') {
-      return { ...DEFAULT_SETTINGS, ...result.settings };
-    }
-    return DEFAULT_SETTINGS;
-  } catch {
-    return DEFAULT_SETTINGS;
+    const result = await browser.storage.local.get('seenByToken');
+    return (result.seenByToken as SeenByToken) ?? {};
+  } catch (error) {
+    console.error('[weft] Could not read the notified-task state:', error);
+    return null;
   }
 }
 
-export async function saveSettings(settings: Partial<ExtensionSettings>): Promise<void> {
-  const current = await getSettings();
-  await browser.storage.local.set({ settings: { ...current, ...settings } });
+async function writeSeen(seen: SeenByToken): Promise<void> {
+  try {
+    await browser.storage.local.set({ seenByToken: seen });
+  } catch (error) {
+    console.warn('[weft] Could not persist the notified-task state:', error);
+  }
 }
 
 export default defineBackground(() => {
   console.log('[weft] Background service started', { id: browser.runtime.id });
 
-  // Set up polling alarm
-  browser.alarms.create('poll-tasks', { periodInMinutes: 0.5 });
+  // Checked on EVERY worker wake, armed only when absent: creating an
+  // alarm that already exists would reset its countdown (a wake for a
+  // notification click would keep deferring the next poll), while
+  // never re-checking would leave polling dead for the whole session
+  // any time the browser dropped the alarm without firing onInstalled
+  // or onStartup (a disable/enable cycle from the extensions page).
+  // The immediate poll runs only when the alarm was actually armed,
+  // so a wake CAUSED by the alarm never double-polls beside it.
+  ensurePolling();
+  browser.runtime.onInstalled.addListener(ensurePolling);
+  browser.runtime.onStartup.addListener(ensurePolling);
 
   browser.alarms.onAlarm.addListener(async (alarm) => {
     if (alarm.name === 'poll-tasks') {
@@ -48,117 +64,177 @@ export default defineBackground(() => {
     }
   });
 
-  // Listen for messages from content scripts (toast clicks).
-  browser.runtime.onMessage.addListener(
-    (message: { type: string; url?: string }) => {
-      if (message.type === 'OPEN_TASK_RUNNER' && message.url) {
-        // Task toast: open the extension-hosted runner. Content
-        // scripts can't navigate to chrome-extension:// URLs with
-        // `window.open` from a web-origin so the toast delegates
-        // here.
-        browser.tabs.create({ url: message.url });
-      }
-    },
-  );
-
-  // Initial poll
-  pollForTasks();
+  // A clicked notification opens the extension-hosted task runner,
+  // focused on the task whose signal token rides in the notification id
+  // (the id survives a background-worker restart; a captured URL would
+  // not).
+  browser.notifications.onClicked.addListener((id) => {
+    if (!id.startsWith(NOTIFICATION_ID_PREFIX)) return;
+    const token = id.slice(NOTIFICATION_ID_PREFIX.length);
+    browser.notifications.clear(id);
+    browser.tabs.create({
+      url: `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(token)}`,
+    });
+  });
 });
 
-async function pollForTasks() {
+// Overlapping polls collapse into one: the seen-state below is a
+// read-modify-write across awaits, and two interleaved polls would
+// have the earlier write win and re-notify tasks the later one
+// recorded.
+const pollFlight = singleFlight(runPoll);
+const pollForTasks = pollFlight.join;
+
+// Single-flight too: the module body, onInstalled and onStartup can
+// all fire on one wake, and a second concurrent `alarms.get` seeing
+// "absent" would re-create the alarm and reset its countdown.
+const ensurePolling = singleFlight(async () => {
   try {
-    // Single round-trip: fetch tasks AND infer connectivity. The
-    // previous version did checkConnection() first which doubled
-    // the per-poll cost.
-    const result = await fetchPendingTasks();
-    if (!result.anyReachable) {
-      console.log('[weft] No reachable dispatcher, skipping poll');
+    if (await browser.alarms.get('poll-tasks')) return;
+    browser.alarms.create('poll-tasks', { periodInMinutes: POLL_INTERVAL_MS / 60000 });
+    await pollForTasks();
+  } catch (error) {
+    console.error('[weft] Could not arm the task poll:', error);
+  }
+}).join;
+
+async function runPoll() {
+  try {
+    // Single round-trip: fetch tasks AND infer connectivity. Bounded,
+    // so a hung dispatcher cannot keep this poll alive into the next
+    // alarm tick.
+    const result = await fetchPendingTasks({ timeoutMs: 20000 });
+    const seenByToken = await readSeen();
+
+    // Only RESUME tasks (a paused run awaiting an answer) notify and
+    // count on the badge; triggers just stay listed in the popup (see
+    // `isTrigger` for the distinction).
+    const actionable = result.tasks.filter(t => !isTrigger(t));
+    // The badge is zero when nothing is reachable: the count is
+    // unknown then, and a stale number would contradict the popup's
+    // Offline card. (With SOME tokens failed the count is partial;
+    // the popup's per-token banner is where that is said.)
+    const badgeCount = result.anyReachable ? actionable.length : 0;
+
+    if (seenByToken === null) {
+      // Unknown notified-state: skip the notify/clear/persist phase
+      // (missing one round of alerts is recoverable, a false burst of
+      // twelve is not) but keep the badge truthful.
+      await updateBadge(badgeCount);
       return;
     }
-    const tasks = result.tasks;
 
-    // Find tasks the user hasn't been notified about yet. Signal
-    // token uniquely identifies a task; we use it as the seen-key
-    // so re-fetches don't re-notify on the same task.
-    const seen = new Set([...seenByToken.values()].flatMap(s => [...s]));
-    const newTasks = tasks.filter(t => !seen.has(t.token));
-
-    if (newTasks.length > 0) {
-      await showNotification(newTasks.length, newTasks[0]);
+    // Drop state of tokens the user deleted FIRST, reachable or not: a
+    // removed token's entries would otherwise linger forever.
+    const configured = new Set(result.configured.map(t => t.token));
+    for (const apiToken of Object.keys(seenByToken)) {
+      if (!configured.has(apiToken)) delete seenByToken[apiToken];
     }
 
-    // Rebuild the seen-sets of the api tokens that were REACHED this poll
-    // (their absent tasks are genuinely gone); carry every other token's
-    // set forward untouched (its dispatcher just didn't answer).
-    const next = new Map<string, Set<string>>(
-      result.reachedTokens.map(apiToken => [apiToken, new Set<string>()]),
+    if (!result.anyReachable) {
+      await writeSeen(seenByToken);
+      await updateBadge(badgeCount);
+      return;
+    }
+
+    // One notification PER TASK: each id carries its own signal token,
+    // so the clearing loop below (which reasons per task) is exactly
+    // right, and answering one task never silently tears down or
+    // falsifies a digest that spoke for its siblings. Each successful
+    // create is recorded and PERSISTED before the next, so a worker
+    // teardown mid-loop re-alerts nothing already shown; a FAILED
+    // create is deliberately not recorded, so it retries next poll.
+    // The settings read happens once, not per task.
+    const notificationsEnabled = (await getSettings()).notificationsEnabled;
+    const seen = new Set(Object.values(seenByToken).flat());
+    const alerted = new Set<string>();
+    for (const task of actionable) {
+      if (seen.has(task.token)) {
+        alerted.add(task.token);
+        continue;
+      }
+      if (await showNotification(task, notificationsEnabled)) {
+        alerted.add(task.token);
+        (seenByToken[task._tokenConfig!.token] ??= []).push(task.token);
+        await writeSeen(seenByToken);
+      }
+    }
+
+    // Rebuild the seen-sets of the api tokens that were REACHED this
+    // poll (their absent tasks are genuinely gone); carry every failed
+    // token's set forward untouched (its dispatcher just didn't
+    // answer). A task that LEFT a reached set was answered somewhere
+    // (popup, task page, another consumer): take its notification out
+    // of the OS tray too, or a click on the leftover would open a
+    // different task an hour later. The clears are awaited BEFORE the
+    // seen-state persists: a worker teardown between the two would
+    // otherwise leave a stale notification the state says is handled.
+    const failed = new Set(result.failures.map(f => f.token.token));
+    const reached = result.configured.filter(t => !failed.has(t.token)).map(t => t.token);
+    const live = new Set(result.tasks.map(t => t.token));
+    const gone: string[] = [];
+    for (const apiToken of reached) {
+      for (const signalToken of seenByToken[apiToken] ?? []) {
+        if (!live.has(signalToken)) {
+          gone.push(signalToken);
+        }
+      }
+      seenByToken[apiToken] = [];
+    }
+    await Promise.all(
+      gone.map(token => browser.notifications.clear(`${NOTIFICATION_ID_PREFIX}${token}`)),
     );
-    for (const t of tasks) {
-      const owner = (t as PendingTask & { _tokenConfig?: ApiToken })._tokenConfig?.token;
-      if (owner) next.get(owner)?.add(t.token);
+    // Only ALERTED tasks are recorded: the state means "the user has
+    // been notified about this", so triggers (which never notify) and
+    // a resume task whose alert FAILED this round (retried next poll)
+    // stay out. `_tokenConfig` is stamped on every fetched task; a
+    // hedge here would silently drop the task from `seen` and
+    // re-notify it on every poll forever.
+    for (const t of actionable) {
+      if (!alerted.has(t.token)) continue;
+      (seenByToken[t._tokenConfig!.token] ??= []).push(t.token);
     }
-    // Carry forward only tokens the user still has configured: a deleted
-    // token's set would otherwise linger in this long-lived worker forever.
-    const configured = new Set(result.configuredTokens);
-    for (const [apiToken, set] of seenByToken) {
-      if (!next.has(apiToken) && configured.has(apiToken)) next.set(apiToken, set);
-    }
-    seenByToken = next;
+    await writeSeen(seenByToken);
 
-    // Update badge
-    await updateBadge(tasks.length);
+    await updateBadge(badgeCount);
   } catch (error) {
     console.error('[weft] Poll error:', error);
   }
 }
 
-async function showNotification(count: number, task: PendingTask & { _tokenConfig?: ApiToken }) {
+/// Whether the task now counts as alerted: created, or deliberately
+/// discarded (notifications off; recording it keeps a later re-enable
+/// from replaying a backlog of stale alerts). A CREATE FAILURE answers
+/// false, so the caller retries it next poll.
+async function showNotification(task: PendingTask, enabled: boolean): Promise<boolean> {
+  if (!enabled) {
+    return true;
+  }
   try {
-    const settings = await getSettings();
-    if (!settings.notificationsEnabled) {
-      console.log('[weft] Notifications disabled, skipping');
-      return;
-    }
-
-    const notificationId = `task-${task.token}-${Date.now()}`;
-    // Hash fragment carries the signal token; the extension-hosted
-    // runner reads it to focus the right task.
-    const taskUrl = `${browser.runtime.getURL('/tasks.html')}#/${encodeURIComponent(task.token)}`;
-
-    const toastData = {
-      id: notificationId,
+    await browser.notifications.create(`${NOTIFICATION_ID_PREFIX}${task.token}`, {
+      type: 'basic',
+      iconUrl: browser.runtime.getURL('/icon/128.png'),
       title: 'WeaveMind Task',
-      message: count === 1
-        ? `New task: ${task.title}`
-        : `${count} new tasks waiting for your approval`,
-      taskUrl,
-    };
-
-    // Get all tabs and send message to each
-    const tabs = await browser.tabs.query({});
-    for (const tab of tabs) {
-      if (tab.id) {
-        try {
-          await browser.tabs.sendMessage(tab.id, { type: 'SHOW_TOAST', toast: toastData });
-        } catch {
-          // Tab might not have content script loaded, ignore
-        }
-      }
-    }
-    
-    console.log('[weft] Toast notification sent to tabs');
+      message: `New task: ${task.title}`,
+    });
+    return true;
   } catch (error) {
     console.error('[weft] Notification error:', error);
+    return false;
   }
 }
 
 async function updateBadge(count: number) {
   try {
-    // WXT polyfills browser.action for MV2 targets (Firefox, Safari)
-    // Fallback to browserAction for edge cases where polyfill isn't loaded
-    const badgeApi = browser.action ?? (browser as any).browserAction;
-    if (!badgeApi) return;
-    
+    // MV3 exposes `action`, MV2 (Firefox, Safari) exposes
+    // `browserAction`; WXT's `browser` is a plain namespace pick, not
+    // a polyfill, so both spellings are read here.
+    const badgeApi = browser.action ?? browser.browserAction;
+    if (!badgeApi) {
+      console.error('[weft] No badge API on this browser; the count cannot be shown');
+      return;
+    }
+
     if (count > 0) {
       await badgeApi.setBadgeText({ text: count.toString() });
       await badgeApi.setBadgeBackgroundColor({ color: '#6366f1' });

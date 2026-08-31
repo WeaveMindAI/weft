@@ -99,11 +99,13 @@ The whole thing is a runnable project in [`examples/`](examples/whatsapp-support
 ## Try it
 
 Weft runs your programs in a Kubernetes cluster, and that cluster is local:
-`setup.sh` builds it on your machine with `kind`. You will need Rust, Docker,
-kubectl, kind, Node 20 or newer, and pnpm, and if anything is missing the
-script names all of it before it starts. If you rebuild later, only what
-changed is redone; the first build compiles the whole Rust workspace and builds
-the images, so it might take a bit of time.
+`setup.sh` builds it on your machine with `kind`. You will need Docker,
+kubectl, and kind; on a clean checkout the CLI, the extension and the images
+are downloaded from the latest published build, so no Rust or Node toolchain
+is needed. Once you change anything, the script builds from source instead,
+which additionally needs Rust, Node 20 or newer, and pnpm. If anything is
+missing the script names all of it before it starts, and if you rebuild
+later, only what changed is redone.
 
 ```bash
 git clone https://github.com/WeaveMindAI/weft.git && cd weft
@@ -123,10 +125,9 @@ already had open, run CTRL+Shift+P `Developer: Reload Window` once first.
 
 When a program hits a "HumanQuery" or a "HumanTrigger", the question turns up in the
 weft browser extension, which the default install does not build. If you want
-it, `./setup.sh --browser --no-sign --no-bump` builds it: `--no-sign` skips the
-Firefox add-on signing you do not need locally, and `--no-bump` leaves the
-extension's version number alone. For how to load it into your browser and
-point it at your runtime, go and read
+it, `./setup.sh --browser --no-sign` builds it (`--no-sign` skips the
+Firefox add-on signing you do not need locally). For how to load it into your
+browser and point it at your runtime, go and read
 [the browser extension](https://weavemindai.github.io/weft/running/browser-extension.html).
 
 If you only want part of it built, or you want to uninstall the whole thing, go

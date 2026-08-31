@@ -31,7 +31,7 @@ pub async fn run(ctx: Ctx, stdlib: bool) -> Result<()> {
     // traversal as the build, only the error reaction differs (warn vs abort),
     // so the palette and the build never disagree about what a node is.
     let nodes_dir = if stdlib {
-        stdlib_root()
+        stdlib_root().map_err(|e| anyhow::anyhow!(e))?
     } else {
         ctx.project()?.root.join("nodes")
     };

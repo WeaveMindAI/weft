@@ -1,3 +1,5 @@
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
 ---
 # Dispatcher ingress: routes ALL dispatcher paths (/signal, /signal-token,
 # /connect, the public mount paths) to the dispatcher Service. No `host`

@@ -6,16 +6,28 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    # Into mvp only: main carries the old POC this suite was never
+    # written for.
+    branches: [mvp]
   workflow_dispatch:
+  # release.yml runs this as its gate on every mvp push, so nothing
+  # (images, binaries, store uploads) publishes from a commit that
+  # fails the checks. There is deliberately no `push` trigger: mvp
+  # pushes get their run through the call (a second trigger would
+  # double it), PRs into mvp get theirs through `pull_request`, and
+  # main carries the old POC this suite was never written for.
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
 
+# The workflow name is in the group: a called run (release.yml's gate)
+# reports the CALLER's workflow, so a manual `ci` dispatch on the same
+# ref lands in a different group instead of cancelling a release's
+# gate mid-flight.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -27,8 +39,8 @@ jobs:
       # No toolchain input: the action reads rust-toolchain.toml, which
       # is the single source of truth for the version AND the components
       # (clippy for the gate below).
-      - uses: dtolnay/rust-toolchain@master
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # No compile-time query macros anywhere, so the workspace suite needs no
       # database. The tests that do want one are behind the `db-tests` feature.
@@ -57,8 +69,8 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master; reads rust-toolchain.toml
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The same script developers run locally, pointed at the service
       # container, so the crate list lives in exactly one place.
       - run: scripts/run-db-tests.sh
@@ -68,22 +80,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The pnpm version comes from extension-vscode/package.json's
-      # `packageManager` field (there is no root package.json).
-      - uses: pnpm/action-setup@v4
+      - uses: ./.github/actions/setup-node-workspace
         with:
-          package_json_file: extension-vscode/package.json
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: pnpm
-          cache-dependency-path: extension-vscode/pnpm-lock.yaml
-      - run: pnpm -C extension-vscode install --frozen-lockfile
-      # weft-graph has no install of its own: it borrows the extension's,
-      # the same way setup.sh wires it locally.
-      - run: ln -sfn ../../extension-vscode/node_modules packages/weft-graph/node_modules
-      - run: ln -sfn ../../extension-vscode/node_modules packages/weft-syntax/node_modules
+          workspace: extension-vscode
+          borrow-packages: packages/weft-graph packages/weft-syntax
       - run: pnpm -C packages/weft-graph test
       - run: pnpm -C packages/weft-syntax test
       - run: pnpm -C extension-vscode test
       - run: pnpm -C extension-vscode run compile
+      # The browser extension ships to three stores gated only on a
+      # version bump, so its checks belong in the same gate as
+      # everything else JS.
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-browser
+      - run: pnpm -C extension-browser exec tsc --noEmit
+      - run: pnpm -C extension-browser check

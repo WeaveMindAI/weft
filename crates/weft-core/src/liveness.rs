@@ -32,17 +32,11 @@ use std::sync::{Arc, Weak};
 /// distinct executions, one per frame, each with its own wait liveness.
 /// This is the key the engine's stuck-check uses to tell "this lane is
 /// waiting forever" from "this lane is still computing".
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct FiringLocation {
-    pub node_id: String,
-    pub frames: crate::frames::LoopFrames,
-}
-
-impl FiringLocation {
-    pub fn new(node_id: impl Into<String>, frames: crate::frames::LoopFrames) -> Self {
-        Self { node_id: node_id.into(), frames }
-    }
-}
+/// Defined in `frames` (a pure identity persisted on `NodeRunState`,
+/// so it must exist in the parse-only build too, where this module is
+/// compiled out); re-exported here because the liveness vocabulary is
+/// where readers look for it.
+pub use crate::frames::FiringLocation;
 
 /// A single wait's identity within the engine's liveness map. One node
 /// execution can hold SEVERAL concurrent waits at once (a body that

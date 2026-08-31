@@ -77,7 +77,7 @@ impl Platform {
             .args([
                 "port-forward",
                 "-n",
-                "weft-db",
+                weft_core::infra::DB_NAMESPACE,
                 "svc/weft-postgres",
                 &format!("{PG_LOCAL_PORT}:5432"),
             ])
@@ -649,7 +649,7 @@ impl Platform {
                 "restart",
                 "statefulset/weft-dispatcher",
                 "-n",
-                "weft-system",
+                weft_core::infra::SYSTEM_NAMESPACE,
             ])
             .status()
             .await
@@ -661,7 +661,7 @@ impl Platform {
                 "status",
                 "statefulset/weft-dispatcher",
                 "-n",
-                "weft-system",
+                weft_core::infra::SYSTEM_NAMESPACE,
             ])
             .status()
             .await

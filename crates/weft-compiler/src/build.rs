@@ -60,16 +60,15 @@ pub struct StagedImageBuild {
 /// definition, not the raw source. `Structural` (not `Runtime`): a project
 /// may build without every secret filled; runtime-rule gaps surface at run.
 ///
-/// `builder_base_tag` is the shared `weft-builder-base:<hash>` tag
-/// the CLI computed + ensured. When it kicks in (debian-family
-/// runtime, no custom template), the build context omits `weft/`
-/// because the engine workspace already lives inside the base
-/// image at `/weft/`.
+/// `builder_base_ref` is the shared builder-base image ref the CLI
+/// computed + ensured. When it kicks in (debian-family runtime, no
+/// custom template), the build context omits `weft/` because the
+/// engine workspace already lives inside the base image at `/weft/`.
 pub fn build_project(
     project: &Project,
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
-    builder_base_tag: &str,
+    builder_base_ref: &str,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     crate::bail_on_errors(crate::validate::validate_with_mode(
@@ -93,7 +92,7 @@ pub fn build_project(
         catalog,
         &referenced_nodes,
         &binary_name,
-        builder_base_tag,
+        builder_base_ref,
     )?;
     let dockerfile_path = project_root.join(".weft/target/Dockerfile.worker");
     if let Some(parent) = dockerfile_path.parent() {
@@ -229,7 +228,7 @@ pub fn build_test_artifact(
     project: &Project,
     catalog: &FsCatalog,
     package_name: &str,
-    builder_base_tag: &str,
+    builder_base_ref: &str,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     let weft_root = resolve_weft_root()?;
@@ -258,7 +257,7 @@ pub fn build_test_artifact(
         catalog,
         &referenced,
         &test_crate.binary_name,
-        builder_base_tag,
+        builder_base_ref,
     )?;
     let dockerfile_path = project_root
         .join(".weft")
@@ -619,14 +618,14 @@ fn copy_dir_filtered_entries(
     Ok(())
 }
 
-/// Locate the weft workspace root (honors `WEFT_REPO_ROOT`, else the repo layout).
-/// Delegates to `weft_catalog::weft_repo_root` so this and the catalog's
-/// `stdlib_root` resolve to the SAME path (they used to be two independent copies;
-/// a drift would have the stdlib seed and the build context disagree). Public so
-/// the CLI's hash + docker-build paths share one resolver.
+/// Locate the weft workspace root. Delegates to
+/// `weft_catalog::weft_repo_root` so this and the catalog's
+/// `stdlib_root` resolve to the SAME path (they used to be two
+/// independent copies; a drift would have the stdlib seed and the
+/// build context disagree). Public so the CLI's hash + docker-build
+/// paths share one resolver.
 pub fn resolve_weft_root() -> CompileResult<PathBuf> {
-    weft_catalog::weft_repo_root()
-        .ok_or_else(|| CompileError::Build("cannot resolve weft workspace root".into()))
+    weft_catalog::weft_repo_root().map_err(CompileError::Build)
 }
 
 /// The repository segment for content-addressed worker images. No project id:

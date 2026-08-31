@@ -1,3 +1,5 @@
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
 ---
 # ServiceAccount for the dispatcher. Lives in `weft-system` (the
 # system namespace, kept separate from tenant workloads). The
@@ -121,7 +123,9 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: dispatcher
-          image: weft-dispatcher:local
+          # Content-addressed ref substituted by the apply path; a new
+          # tag is a spec diff, so applying it IS the rollout.
+          image: "${WEFT_DISPATCHER_IMAGE}"
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 9999
@@ -142,10 +146,16 @@ spec:
                   fieldPath: metadata.name
             - name: WEFT_HTTP_PORT
               value: "9999"
-            - name: WEFT_CONTROL_PLANE_NAMESPACE
-              value: weft-system
+            # The images the dispatcher spawns pooled pods from,
+            # substituted by the apply path (content-addressed refs).
+            # SYNC: WEFT_*_IMAGE names <-> crates/weft-cli/src/images.rs
+            #       (SystemService::image_env),
+            #       deploy/k8s/broker.yaml (image line),
+            #       crates/weft-dispatcher/src/app.rs (backend reads)
             - name: WEFT_LISTENER_IMAGE
-              value: weft-listener:local
+              value: "${WEFT_LISTENER_IMAGE}"
+            - name: WEFT_SUPERVISOR_IMAGE
+              value: "${WEFT_SUPERVISOR_IMAGE}"
             - name: WEFT_DATABASE_URL
               valueFrom:
                 secretKeyRef:

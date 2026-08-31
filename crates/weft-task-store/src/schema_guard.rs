@@ -1343,7 +1343,10 @@ pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
         panic!(
             "the canonical schema and the migration history disagree:\n{diff}\n\
              Write the migration that makes this change to an existing database \
-             (./setup.sh --migration <name>), under migrations/<group>/."
+             (./setup.sh --migration <name>) and RELEASE it \
+             (./setup.sh --migration <name> --release) so it lands under \
+             migrations/<group>/. A draft alone stays on your machine \
+             (gitignored), so this test cannot see it until it is released."
         );
     }
 }

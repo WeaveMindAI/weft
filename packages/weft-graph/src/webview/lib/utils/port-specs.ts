@@ -1,10 +1,5 @@
 import type { PortDefinition, PortType } from '../types';
-import type {
-	FormFieldRenderWire,
-	PortSpecWire,
-	SpecFieldWire,
-	PortTemplateWire,
-} from '../../../protocol';
+import type { PortSpecWire, SpecFieldWire, PortTemplateWire } from '../../../protocol';
 import { parseWeftType, weftTypeToWireString, type WeftType } from '../types';
 
 // The wire types ARE the webview's types: `PortType` is a plain string,
@@ -12,7 +7,6 @@ import { parseWeftType, weftTypeToWireString, type WeftType } from '../types';
 // is where the resolver logic reads most naturally; the one definition
 // lives in `protocol.ts` (which carries the SYNC markers to the Rust
 // side).
-export type FormFieldRender = FormFieldRenderWire;
 export type PortTemplate = PortTemplateWire;
 export type SpecField = SpecFieldWire;
 export type PortSpec = PortSpecWire;
@@ -23,9 +17,6 @@ export type PortSpec = PortSpecWire;
 export interface PortEntryDef {
 	kind: string;
 	key?: string;
-	render?: FormFieldRender;
-	config?: Record<string, unknown>;
-	required?: boolean;
 	[other: string]: unknown;
 }
 
@@ -44,13 +35,69 @@ export function entryPortName(entry: PortEntryDef, spec: PortSpec): string {
 	return typeof value === 'string' ? value : '';
 }
 
+/** Is this a value at all? Exactly undefined (an untouched control)
+ *  and null (a cleared one, the editor's unset convention) are not;
+ *  everything else is, the empty string and the empty list included. */
+export function isFilledIn(v: unknown): boolean {
+	return v !== undefined && v !== null;
+}
+
+/** Does the draft carry a value for this spec field? See `isFilledIn`
+ *  for what counts (an empty string is a value: a case matching "" is
+ *  one the compiler accepts, so it must survive a save).
+ *  SYNC: null-is-absent <->
+ *        crates/weft-compiler/src/validate.rs (the spec-field loop),
+ *        catalog/human/form_helpers.rs (build_form_fields) */
+export function hasValue(draft: PortEntryDef, field: SpecField): boolean {
+	return isFilledIn(draft[field.key]);
+}
+
+/** Is this field's value an empty CHOICE SET: an empty list where the
+ *  list is the set of choices (`shape: valueList`, or `typed` with a
+ *  list valueType)? Choosing nothing satisfies no requirement, so the
+ *  commit gate refuses it on a required field, matching the compiler.
+ *  Where a list is one VALUE being matched (`equals: []`), emptiness
+ *  is legitimate and this answers false.
+ *  SYNC: empty-list-is-nothing-chosen <->
+ *        crates/weft-compiler/src/validate.rs (the spec-field loop),
+ *        crates/weft-core/src/node.rs
+ *        (SpecField::empty_list_means_nothing_chosen) */
+export function isEmptyChoiceSet(draft: PortEntryDef, field: SpecField): boolean {
+	const v = draft[field.key];
+	if (!Array.isArray(v) || v.length > 0) return false;
+	if (field.shape === 'valueList') return true;
+	if (field.shape !== 'typed') return false;
+	// STRUCTURAL, exactly like the Rust side's `WeftType::List(_)`
+	// match: a string test would call a union like `List[String] |
+	// String` a choice set while Rust does not. (A NAMED alias whose
+	// body is a list reads false on BOTH sides; shared, deliberate.)
+	return parseWeftType(field.valueType ?? '')?.kind === 'list';
+}
+
+/** The entry a draft commits to source: `kind`, the port name under the
+ *  spec's key field, and only the spec fields the author actually filled
+ *  in (a cleared control saves null, the editor's unset convention, and
+ *  an entry written to source must not carry it). Building from
+ *  `spec.fields` also drops values left over from a different kind the
+ *  draft passed through. */
+export function entryForSource(draft: PortEntryDef, spec: PortSpec, name: string): PortEntryDef {
+	const entry: PortEntryDef = { kind: spec.kind, [spec.keyField]: name };
+	for (const field of spec.fields ?? []) {
+		if (hasValue(draft, field)) {
+			entry[field.key] = draft[field.key];
+		}
+	}
+	return entry;
+}
+
 /** Is `key` a legal weft bare identifier (`[A-Za-z_][A-Za-z0-9_]*`)?
  *  A field key becomes a PORT NAME (`{key}_approved`, etc.), and the
  *  parser rejects any port name outside that grammar, so the add-field
  *  form gates on this: a key with spaces or punctuation (`what do you
  *  want?`) is refused before it can emit an unparseable port.
- *  SYNC: keep in step with try_parse_port_decl in
- *  weft/crates/weft-compiler/src/weft_compiler.rs (the port-name grammar). */
+ *  SYNC: bare-ident grammar <->
+ *        crates/weft-catalog/src/lib.rs (is_rust_identifier, which the
+ *        compiler's is_bare_ident re-exports) */
 export function isValidFieldKey(key: string): boolean {
 	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key);
 }
@@ -136,9 +183,10 @@ export function deriveInputsFromEntries(
 			ports.push({
 				name: resolvePortName(t.nameTemplate, key),
 				portType: resolveAutoTypeVars(t.portType, key),
-				// Derived ports default to required (same as the language default).
-				// Set "required": false explicitly to make a port optional.
-				required: entry.required !== false,
+				// Derived inputs are required, the language default;
+				// entries carry no per-port override (the compiler
+				// admits only `kind`, the key field and spec fields).
+				required: true,
 			});
 		}
 	}

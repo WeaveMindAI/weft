@@ -21,7 +21,8 @@ fn marker(kind: FileKind, mime: &str) -> serde_json::Value {
 
 #[test]
 fn declared_chat_history_accepts_real_minillmlib_messages() {
-    let catalog = FsCatalog::discover(&stdlib_root()).expect("stdlib catalog");
+    let catalog =
+        FsCatalog::discover(&stdlib_root().expect("stdlib root")).expect("stdlib catalog");
     let history_ty = catalog
         .type_registry()
         .scoped(|| WeftType::parse("ChatHistory"))

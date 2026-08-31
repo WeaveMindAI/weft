@@ -84,11 +84,13 @@ actually do to a unit.
 
 | Command | What it does |
 |---|---|
-| `weft daemon start [--rebuild] [--rebuild-cluster] [--public-url\|--no-public-url]` | start the runtime. `--rebuild-cluster` allows deleting and recreating the kind cluster when its shape changed; every project's own database lives inside the node and is destroyed with it, so this never happens without the flag. |
+| `weft daemon start [--rebuild] [--rebuild-cluster] [--public-url\|--no-public-url]` | start the runtime. `--rebuild` re-makes the shared images under their existing tags and rolls everything onto the new bytes (kind only; on a k8s cluster, publish with `weft build-images --push` instead). `--rebuild-cluster` allows deleting and recreating the kind cluster when its shape changed; every project's own database lives inside the node and is destroyed with it, so this never happens without the flag. |
 | `weft daemon stop` | stop it |
 | `weft daemon status` | is it up, and its public address if it has one |
-| `weft daemon restart` | stop then start |
+| `weft daemon restart` | the same reconcile as `weft daemon start` (an alias): apply what changed, roll what needs it |
 | `weft daemon logs [--tail N] [-f]` | tail the runtime log |
+| `weft build-images [--push \| --push-suffix <s> \| --print]` | make every shared image (the four system images plus the worker builder base) exist locally under its content-addressed ref. `--push` publishes them to the registry (the release workflow's verb); `--print` only prints the refs this tree resolves to, touching nothing |
+| `weft build-base` | make just the worker builder-base image exist locally |
 
 Aliased to `weft d`.
 

@@ -24,11 +24,7 @@
     fn human_form() -> weft_core::signal::Form {
         weft_core::signal::Form {
             form_type: "human_query".into(),
-            schema: weft_core::signal::FormSchema {
-                title: String::new(),
-                description: None,
-                fields: Vec::new(),
-            },
+            schema: weft_core::signal::FormSchema { fields: Vec::new() },
             title: None,
             description: None,
             consumer_kind: None,

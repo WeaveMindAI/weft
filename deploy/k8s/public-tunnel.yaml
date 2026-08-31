@@ -1,3 +1,5 @@
+# SYNC: namespace names <-> crates/weft-core/src/infra/mod.rs
+#       (SYSTEM_NAMESPACE / DB_NAMESPACE; its marker lists every manifest)
 # The opt-in public trigger surface for a local install
 # (`./setup.sh --public-url` / `weft daemon start --public-url`).
 #

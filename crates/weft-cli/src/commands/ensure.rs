@@ -195,12 +195,12 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
     // compile): the three hashes + the staged worker context + the infra image set,
     // via the SHARED build brain. The base is ensured first so the staged Dockerfile
     // FROMs it.
-    let builder_base_tag = crate::images::ensure_worker_builder_base().await?;
+    let builder_base_ref = crate::images::ensure_worker_builder_base().await?;
     let plan = weft_compiler::build_plan::plan_build_from(
         &project,
         &definition,
         &catalog,
-        &builder_base_tag,
+        &builder_base_ref,
         &crate::commands::build::CliTagPolicy,
     )
     .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;

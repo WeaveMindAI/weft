@@ -1,0 +1,62 @@
+# Which stores already carry the workspace's current version, and
+# which still owe a publish. Read from the per-store
+# `<tag-prefix>-<store>-v<version>` tags that record each successful
+# publish; one place for the probe so the vsix and the browser jobs
+# cannot drift on how "already published" is decided.
+name: store-publish-state
+description: >-
+  Read a workspace's package.json version and, per store, whether its
+  publish-record tag already exists on origin.
+inputs:
+  workspace:
+    description: The workspace directory holding package.json
+    required: true
+  tag-prefix:
+    description: The record-tag prefix (e.g. `vscode`, `browser`)
+    required: true
+  stores:
+    description: Space-separated store names to probe
+    required: true
+outputs:
+  version:
+    description: The workspace's package.json version
+    value: ${{ steps.probe.outputs.version }}
+  pending:
+    description: >-
+      JSON array of the stores whose record tag is absent (the ones
+      still owing a publish); feeds a publish matrix directly, so a
+      published store has no leg at all, and gates via
+      `contains(fromJSON(...), 'store')`, which fails CLOSED for an
+      unknown store name.
+    value: ${{ steps.probe.outputs.pending }}
+  tags:
+    description: >-
+      JSON object mapping each store name to its record-tag name. THE
+      one place the tag format exists: the record steps read the exact
+      string this probe checked, so the two can never drift into
+      probe-misses-recorder re-publishes.
+    value: ${{ steps.probe.outputs.tags }}
+runs:
+  using: composite
+  steps:
+    - id: probe
+      env:
+        WORKSPACE: ${{ inputs.workspace }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        STORES: ${{ inputs.stores }}
+      run: |
+        set -euo pipefail
+        v="$(node -p "require('./$WORKSPACE/package.json').version")"
+        echo "version=$v" >> "$GITHUB_OUTPUT"
+        pending="[]"
+        tags="{}"
+        for store in $STORES; do
+          tag="$TAG_PREFIX-$store-v$v"
+          tags="$(printf '%s' "$tags" | jq -c --arg s "$store" --arg t "$tag" '. + {($s): $t}')"
+          if ! git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null 2>&1; then
+            pending="$(printf '%s' "$pending" | jq -c --arg s "$store" '. + [$s]')"
+          fi
+        done
+        echo "pending=$pending" >> "$GITHUB_OUTPUT"
+        echo "tags=$tags" >> "$GITHUB_OUTPUT"
+      shell: bash

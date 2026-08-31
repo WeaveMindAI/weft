@@ -27,16 +27,9 @@ fn cloud_compile_enumerates_the_infra_nodes_image() {
     let tmp = tempfile::tempdir().unwrap();
     copy_dir(&fixture, tmp.path());
 
-    // Precondition, checked BEFORE any assertion: the stdlib catalog must be
-    // present on disk (a stripped checkout genuinely can't run this test). Only
-    // catalog ABSENCE is a skip; once it is present, a seed failure is a real
-    // failure of the machinery under test and must fail the test, never turn it
-    // green.
-    let stdlib = weft_catalog::stdlib_root();
-    if !stdlib.is_dir() {
-        eprintln!("skipping: stdlib catalog not present at {}", stdlib.display());
-        return;
-    }
+    // `seed_base_catalog` resolves the stdlib root itself and fails
+    // loudly (with the resolver's full recovery text) on a stripped
+    // checkout; no separate precondition needed.
     weft_compiler::project::seed_base_catalog(tmp.path()).expect("seed base catalog");
 
     let project = weft_compiler::project::Project::load(tmp.path()).expect("load project");

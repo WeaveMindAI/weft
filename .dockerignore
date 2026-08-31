@@ -7,15 +7,20 @@
 # root: it uses the staged `.weft-base-context/` dir as its own context.
 #
 # The system-images Dockerfile COPYs: rust-toolchain.toml, Cargo.toml,
-# Cargo.lock, crates/, catalog/. deploy/ is kept so the Dockerfile referenced
+# Cargo.lock, crates/. deploy/ is kept so the Dockerfile referenced
 # with `-f` is inside the context too.
+#
+# SYNC: what the repo-root build context ships <-> the system-image hash
+#       inputs in crates/weft-cli/src/images.rs (NOT_IN_THE_BINARY +
+#       hash_path_skipping's skip set): a path that changes what a
+#       binary compiles TO must be covered by both, or two trees with
+#       one hash build different images.
 *
 
 !rust-toolchain.toml
 !Cargo.toml
 !Cargo.lock
 !crates/
-!catalog/
 !deploy/
 
 # Even inside the allowlisted dirs, never ship build artifacts or VCS/dev junk.
