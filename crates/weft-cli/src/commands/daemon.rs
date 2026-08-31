@@ -3015,7 +3015,10 @@ async fn kubectl_apply_stdin(manifest: &str, what: &str) -> Result<()> {
 }
 
 /// The documents of a (possibly multi-doc) YAML text, `---` separators
-/// removed, empty documents dropped.
+/// removed. A document with no content (blank, or comments only, like
+/// a file-header comment above the first `---`) holds no object and is
+/// dropped: kubectl ignores those in a whole file but refuses one as
+/// its entire stdin ("no objects passed to apply").
 fn split_yaml_documents(manifest: &str) -> Vec<&str> {
     let mut docs = Vec::new();
     let mut start = 0;
@@ -3028,7 +3031,12 @@ fn split_yaml_documents(manifest: &str) -> Vec<&str> {
         at += line.len();
     }
     docs.push(&manifest[start..]);
-    docs.retain(|d| !d.trim().is_empty());
+    docs.retain(|d| {
+        d.lines().any(|l| {
+            let l = l.trim();
+            !l.is_empty() && !l.starts_with('#')
+        })
+    });
     docs
 }
 
@@ -3438,6 +3446,11 @@ mod tests {
         assert_eq!(docs.len(), 1);
         // No separator at all: the whole text is one document.
         assert_eq!(split_yaml_documents("kind: A\n"), ["kind: A\n"]);
+        // A comments-only document (a file-header comment above the
+        // first separator) holds no object and is dropped; a comment
+        // INSIDE a real document stays with it.
+        let docs = split_yaml_documents("# header\n# more\n---\n# note\nkind: A\n");
+        assert_eq!(docs, ["# note\nkind: A\n"]);
     }
 
     #[test]
