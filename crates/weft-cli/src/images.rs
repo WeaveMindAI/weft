@@ -648,6 +648,28 @@ pub async fn kind_load(cluster: &str, image_ref: &str, force: bool) -> Result<()
     if !force && kind_node_has_tag(cluster, image_ref).await {
         return Ok(());
     }
+    // A registry-qualified ref is a content-addressed tag whose bytes
+    // are the registry's, so the NODE pulls it straight from there:
+    // streaming a registry-pulled multi-arch image through `kind load`
+    // fails on import ("content digest not found": the saved tar
+    // references manifest-list digests docker never stored). The
+    // docker-stream path below stays for what only exists locally: a
+    // bare (registry-less) build, and a `force` load, whose bytes were
+    // just rebuilt locally under an unchanged tag.
+    if !force && image_ref.contains('/') {
+        let node = format!("{cluster}-control-plane");
+        let out =
+            docker().args(["exec", &node, "crictl", "pull", image_ref]).output().await?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "the kind node could not pull {image_ref}: {}\n\
+                 Is the registry reachable from this machine and the package public? \
+                 To load a locally built image instead, re-run with --rebuild.",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        return Ok(());
+    }
     let status = quiet_stdout("kind")
         .args(["load", "docker-image", image_ref, "--name", cluster])
         .status()
