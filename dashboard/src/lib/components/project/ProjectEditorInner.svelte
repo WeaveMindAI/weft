@@ -13,6 +13,7 @@
 	import ConfigPanel from "./ConfigPanel.svelte";
 	import RightSidebar from "./RightSidebar.svelte";
 	import HistoryPanel from "./HistoryPanel.svelte";
+	import { saveProjectVersion } from "$lib/projectVersions";
 	import ActionBar from "./ActionBar.svelte";
 	import ExportDialog from "./ExportDialog.svelte";
 	import { NODE_TYPE_CONFIG, type NodeType } from "$lib/nodes";
@@ -93,7 +94,6 @@
 		untrack(() => playground) || (typeof localStorage !== 'undefined' && localStorage.getItem('wm_right_panel_collapsed') === 'true')
 	);
 	let configPanelRef: ConfigPanel | undefined = $state();
-	let historyPanelRef: HistoryPanel | undefined = $state();
 	let showCodePanel = $state(untrack(() => playground));
 	let mobileForceEditor = $state(false);
 	let mobileToolbarOpen = $state(false);
@@ -1606,6 +1606,11 @@
 	}
 
 	export function weftStreamStart(mode: 'weft' | 'weft-patch' | 'weft-continue') {
+		// Snapshot before the assistant touches anything. A full 'weft' block
+		// replaces the project outright, and a patch can land badly, so this is
+		// the last moment the current graph exists anywhere. Waiting for the
+		// ten-minute pass would lose everything written since the last one.
+		snapshotBeforeAiEdit();
 		weftStreaming = true;
 		weftSyncDirection = 'to-code';
 		streamOrganizePending = false;
@@ -2722,14 +2727,36 @@
 		localStorage.setItem('wm_right_panel_collapsed', String(rightPanelCollapsed));
 	});
 
-	// Auto-save version every 10 minutes
+	// Auto-save version every 10 minutes. This runs from the editor, not from
+	// the history panel: the panel only exists while its tab is open, and a
+	// snapshot that is only taken while somebody is looking at the history is
+	// exactly the snapshot nobody has when they need it.
 	let autoSaveInterval: ReturnType<typeof setInterval> | null = null;
 	let lastAutoSavedCode = '';
 
-	function autoSaveVersion() {
-		if (!weftCode || weftCode === lastAutoSavedCode) return;
+	/** Save the project as it stands before the assistant rewrites it. */
+	function snapshotBeforeAiEdit() {
+		// Nothing to save, or nothing has changed since the last snapshot: a
+		// reply made of several blocks would otherwise fill the history with
+		// copies of one graph and push the older ones out.
+		if (!weftCode.trim() || weftCode === lastAutoSavedCode) return;
+		const snapshot = { weftCode, loomCode: project.loomCode ?? null, layoutCode };
 		lastAutoSavedCode = weftCode;
-		historyPanelRef?.createVersion(weftCode, project.loomCode ?? null, null, 'auto');
+		saveProjectVersion(project.id, snapshot, 'Before AI edit', 'auto')
+			.catch(e => console.error('Could not snapshot before the AI edit:', e));
+	}
+
+	async function autoSaveVersion() {
+		if (!weftCode || weftCode === lastAutoSavedCode) return;
+		const snapshot = { weftCode, loomCode: project.loomCode ?? null, layoutCode };
+		lastAutoSavedCode = weftCode;
+		try {
+			await saveProjectVersion(project.id, snapshot, null, 'auto');
+		} catch (e) {
+			// Let the next tick try this code again rather than skipping it.
+			lastAutoSavedCode = '';
+			console.error('Auto-save failed, will retry on the next pass:', e);
+		}
 	}
 
 	// Flush pending edits when the component is destroyed (e.g. view mode switch)
@@ -3219,7 +3246,6 @@
 			/>
 		{:else if rightPanelTab === 'history'}
 			<HistoryPanel
-				bind:this={historyPanelRef}
 				projectId={project.id}
 				getCurrentCode={() => ({ weftCode, loomCode: project.loomCode ?? null, layoutCode })}
 				onRestore={(restoredWeft, restoredLoom, restoredLayout) => {

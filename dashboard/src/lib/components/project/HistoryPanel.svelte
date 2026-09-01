@@ -1,26 +1,17 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { authFetch } from '$lib/config';
+	import { listProjectVersions, saveProjectVersion, type ProjectVersion, type VersionSnapshot } from '$lib/projectVersions';
 
 	let { projectId, getCurrentCode, onRestore }: {
 		projectId: string;
-		getCurrentCode: () => { weftCode: string; loomCode: string | null; layoutCode: string | null };
+		getCurrentCode: () => VersionSnapshot;
 		onRestore: (weftCode: string, loomCode: string | null, layoutCode: string | null) => void;
 	} = $props();
 
-	interface Version {
-		id: string;
-		projectId: string;
-		weftCode: string | null;
-		loomCode: string | null;
-		layoutCode: string | null;
-		label: string | null;
-		versionType: 'auto' | 'manual';
-		createdAt: string;
-	}
-
-	let versions = $state<Version[]>([]);
+	let versions = $state<ProjectVersion[]>([]);
 	let loading = $state(true);
+	let error = $state<string | null>(null);
 	let saving = $state(false);
 	let saveLabel = $state('');
 	let showSaveInput = $state(false);
@@ -52,58 +43,25 @@
 
 	async function loadVersions() {
 		try {
-			const res = await authFetch(`/api/projects/${projectId}/versions`);
-			if (res.ok) versions = await res.json();
+			versions = await listProjectVersions(projectId);
+			error = null;
 		} catch (e) {
-			console.error('Failed to load versions:', e);
+			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			loading = false;
-		}
-	}
-
-	export async function createVersion(
-		weftCode: string,
-		loomCode: string | null,
-		label: string | null,
-		versionType: 'auto' | 'manual',
-	) {
-		try {
-			const res = await authFetch(`/api/projects/${projectId}/versions`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ weftCode, loomCode, label, versionType }),
-			});
-			if (res.ok) {
-				const version = await res.json();
-				versions = [version, ...versions];
-			}
-		} catch (e) {
-			console.error('Failed to create version:', e);
 		}
 	}
 
 	async function saveManualVersion() {
 		saving = true;
 		try {
-			const current = getCurrentCode();
-			const res = await authFetch(`/api/projects/${projectId}/versions`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					weftCode: current.weftCode,
-					loomCode: current.loomCode,
-					layoutCode: current.layoutCode,
-					label: saveLabel.trim() || null,
-					versionType: 'manual',
-				}),
-			});
-			if (res.ok) {
-				await loadVersions();
-				saveLabel = '';
-				showSaveInput = false;
-			}
+			await saveProjectVersion(projectId, getCurrentCode(), saveLabel.trim() || null, 'manual');
+			await loadVersions();
+			saveLabel = '';
+			showSaveInput = false;
+			error = null;
 		} catch (e) {
-			console.error('Failed to save version:', e);
+			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			saving = false;
 		}
@@ -129,7 +87,7 @@
 		deleteTarget = null;
 	}
 
-	function startEditLabel(version: Version) {
+	function startEditLabel(version: ProjectVersion) {
 		editingId = version.id;
 		editingLabel = version.label ?? '';
 	}
@@ -151,7 +109,7 @@
 		editingId = null;
 	}
 
-	function restoreVersion(version: Version) {
+	function restoreVersion(version: ProjectVersion) {
 		if (version.weftCode != null) {
 			onRestore(version.weftCode, version.loomCode, version.layoutCode ?? null);
 		}
@@ -199,6 +157,11 @@
 
 	<!-- Version list -->
 	<div class="flex-1 overflow-y-auto">
+		{#if error}
+			<div class="m-3 px-3 py-2 rounded-lg bg-red-50 border border-red-200 text-[11px] text-red-700">
+				{error}
+			</div>
+		{/if}
 		{#if loading}
 			<div class="flex items-center justify-center h-32">
 				<div class="h-5 w-5 border-2 border-zinc-300 border-t-transparent rounded-full animate-spin"></div>
