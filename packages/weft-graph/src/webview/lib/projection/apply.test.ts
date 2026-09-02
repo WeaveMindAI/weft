@@ -295,16 +295,75 @@ describe('applyOpsToProject: moves', () => {
 });
 
 describe('applyOpsToProject: ports', () => {
-  it('updateNodePorts merges metadata by name and drops dangling edges', () => {
+  it('updateNodePorts keeps unnamed ports, appends the sig, and drops only the removed', () => {
+    // A NODE's header is not its whole surface: a port the op does not
+    // name is a catalog port and survives (its edge too); only a port
+    // named in removedInputs dies with its wires.
     const p = applyOpsToProject(fixture(), ops({
       op: 'updateNodePorts', node: 'debug_1',
       inputs: [{ name: 'payload', required: true }],
       outputs: [],
+      removedInputs: ['data'],
+      removedOutputs: [],
+      revertedInputs: [],
+      revertedOutputs: [],
     }), catalog);
     const updated = p.nodes.find((n) => n.id === 'debug_1')!;
     expect(updated.inputs.map((i) => i.name)).toEqual(['payload']);
-    // The text_1 -> debug_1.data edge dangles and is dropped.
+    // The text_1 -> debug_1.data edge dies with its removed port.
     expect(p.edges.some((e) => e.target === 'debug_1')).toBe(false);
+  });
+
+  it('updateNodePorts spares a catalog port and its edge when the op does not remove it', () => {
+    const p = applyOpsToProject(fixture(), ops({
+      op: 'updateNodePorts', node: 'debug_1',
+      inputs: [{ name: 'payload', required: true }],
+      outputs: [],
+      removedInputs: [],
+      removedOutputs: [],
+      revertedInputs: [],
+      revertedOutputs: [],
+    }), catalog);
+    const updated = p.nodes.find((n) => n.id === 'debug_1')!;
+    expect(updated.inputs.map((i) => i.name)).toEqual(['data', 'payload']);
+    expect(p.edges.some((e) => e.target === 'debug_1' && e.targetHandle === 'data')).toBe(true);
+  });
+
+  it('updateNodePorts applies a REVERT: the port un-declares and takes the reverted values', () => {
+    // The gesture returned `data` to its catalog default, so the op's
+    // sigs omit it (the header line goes away); without the reverted
+    // overlay the projection would keep showing the pre-revert state
+    // until the reparse, and the NEXT gesture would write the stale
+    // value back into source.
+    const base = fixture();
+    const d = base.nodes.find((n) => n.id === 'debug_1')!;
+    d.inputs = [{ name: 'data', portType: 'String', required: true, declaredType: 'T' }];
+    const p = applyOpsToProject(base, ops({
+      op: 'updateNodePorts', node: 'debug_1',
+      inputs: [], outputs: [],
+      removedInputs: [], removedOutputs: [],
+      revertedInputs: [{ name: 'data', required: false, portType: 'String' }],
+      revertedOutputs: [],
+    }), catalog);
+    const updated = p.nodes.find((n) => n.id === 'debug_1')!;
+    const data = updated.inputs.find((i) => i.name === 'data')!;
+    expect(data.required).toBe(false);
+    expect(data.portType).toBe('String');
+    expect(data.declaredType).toBeUndefined();
+  });
+
+  it('updateNodePorts refuses a name that is both updated and removed', () => {
+    // The server would keep the port (it is in the sigs) while this side
+    // drops it (it is removed): no single meaning, so fail at the door.
+    expect(() => applyOpsToProject(fixture(), ops({
+      op: 'updateNodePorts', node: 'debug_1',
+      inputs: [{ name: 'data', required: true }],
+      outputs: [],
+      removedInputs: ['data'],
+      removedOutputs: [],
+      revertedInputs: [],
+      revertedOutputs: [],
+    }), catalog)).toThrow(/both updated and removed/);
   });
 
   it('updateGroupPorts keeps inner-handle edges for surviving ports only', () => {

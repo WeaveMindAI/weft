@@ -197,21 +197,5 @@
       "required": false,
       "description": "The Google access: wire it into Google action nodes."
     }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "GoogleAccess '{id}' has no connected account; connect one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
-    }
   ]
 }

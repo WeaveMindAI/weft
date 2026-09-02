@@ -15,7 +15,7 @@
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
 import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure } from '../types';
-import type { EditOp, EditPortSig } from '../../../protocol';
+import type { EditOp, EditPortSig, RevertedPortSig } from '../../../protocol';
 import { SHOULD_FLOW_PORT } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
 import type { FoldResult, PendingOp } from './types';
@@ -192,24 +192,112 @@ function renameContainer(project: ProjectDefinition, ref: string, newLabel: stri
   rewriteSubtreePrefix(project, oldId, newId);
 }
 
+function mergedSigPort(
+  sig: EditPortSig,
+  prior: PortDefinition | undefined,
+  // NODE sig ports are header-declared, so they mirror the reparse's
+  // `declaredType` stamp for the next header rewrite; container ports
+  // never carry one (Rust guarantees it absent there).
+  stampDeclared: boolean,
+): PortDefinition {
+  return {
+    ...(prior ?? {}),
+    name: sig.name,
+    required: sig.required,
+    // The RENDERED type is what the port shows (a reparse re-runs
+    // inference, so a required-only toggle must not repaint the port
+    // with the header's generic spelling); `portType` alone carries the
+    // header spelling when no rendered value rides along (containers).
+    portType: sig.rendered ?? sig.portType,
+    ...(stampDeclared ? { declaredType: sig.portType } : {}),
+    // A SIGNATURE port is never a carry ghost. If a name that used to be a
+    // carry ghost now arrives as a real signature input, the spread of
+    // `prior` would inherit synthesizedFromCarry:true, and a later carry
+    // clear would then wrongly sweep this genuine input. Force it off.
+    synthesizedFromCarry: false,
+  };
+}
+
+/** A CONTAINER's signature is its whole surface: the sig list replaces
+ *  the rendered list outright. */
 function updatePorts(node: NodeInstance, inputs: EditPortSig[], outputs: EditPortSig[]): void {
   const merge = (sigs: EditPortSig[], existing: PortDefinition[]): PortDefinition[] =>
-    sigs.map((sig) => {
-      const prior = existing.find((p) => p.name === sig.name);
-      return {
-        ...(prior ?? {}),
-        name: sig.name,
-        required: sig.required,
-        portType: sig.portType ?? prior?.portType ?? 'T',
-        // A SIGNATURE port is never a carry ghost. If a name that used to be a
-        // carry ghost now arrives as a real signature input, the spread of
-        // `prior` would inherit synthesizedFromCarry:true, and a later carry
-        // clear would then wrongly sweep this genuine input. Force it off.
-        synthesizedFromCarry: false,
-      };
-    });
+    sigs.map((sig) => mergedSigPort(sig, existing.find((p) => p.name === sig.name), false));
   node.inputs = merge(inputs, node.inputs);
   node.outputs = merge(outputs, node.outputs);
+}
+
+/** A NODE's header is NOT its whole surface (the catalog provides the
+ *  node type's own ports at enrich, which a re-parse restores). Mimic
+ *  that here: keep every rendered port the op does not name, overlay
+ *  the sig ports, append new ones, and drop ONLY the explicitly
+ *  removed names, so catalog ports (and their edges) survive the
+ *  optimistic rebuild exactly as they survive the real one. */
+function updateNodePortSurface(
+  node: NodeInstance,
+  inputs: EditPortSig[],
+  outputs: EditPortSig[],
+  removedInputs: string[],
+  removedOutputs: string[],
+  revertedInputs: RevertedPortSig[],
+  revertedOutputs: RevertedPortSig[],
+): void {
+  const merge = (
+    sigs: EditPortSig[],
+    existing: PortDefinition[],
+    removed: string[],
+    reverted: RevertedPortSig[],
+  ): PortDefinition[] => {
+    const gone = new Set(removed);
+    const byName = new Map(sigs.map((s) => [s.name, s]));
+    // The three lists partition the touched names: a name in two of
+    // them is a producer sending contradictory intent, and quietly
+    // picking one side would diverge from the server. Refuse at the
+    // door instead (foldOps' clone-then-adopt keeps the batch atomic).
+    const claimed = new Map<string, string>();
+    const claim = (name: string, list: string) => {
+      const other = claimed.get(name);
+      if (other) throw new Error(`port '${name}' is both ${other} and ${list}`);
+      claimed.set(name, list);
+    };
+    for (const s of sigs) claim(s.name, 'updated');
+    for (const n of removed) claim(n, 'removed');
+    for (const r of reverted) {
+      claim(r.name, 'reverted');
+      if (!existing.some((p) => p.name === r.name)) {
+        throw new Error(`reverted port '${r.name}' is not on the node`);
+      }
+    }
+    // A REVERTED port went back to its provided shape: its header line
+    // is gone (the server's rewrite omits it), so it is no longer
+    // declared, and requiredness returns to the provided value. The
+    // rendered TYPE stays as-is unless the revert carries one (a gesture
+    // revert does; a deletion revert deliberately omits it, since the
+    // provided spelling may be an uninstantiated generic and the
+    // current rendered type is the best answer until the reparse).
+    // Without this the projection would keep showing the pre-revert
+    // state until the reparse lands, and the NEXT gesture (reading this
+    // stale state) would write the reverted value back into source.
+    const revByName = new Map(reverted.map((s) => [s.name, s]));
+    const kept = existing
+      .filter((p) => !gone.has(p.name))
+      .map((p) => {
+        const sig = byName.get(p.name);
+        if (sig) return mergedSigPort(sig, p, true);
+        const rev = revByName.get(p.name);
+        if (rev) {
+          const { declaredType: _undeclared, ...rest } = p;
+          return { ...rest, required: rev.required, portType: rev.portType ?? p.portType };
+        }
+        return p;
+      });
+    const appended = sigs
+      .filter((s) => !existing.some((p) => p.name === s.name))
+      .map((s) => mergedSigPort(s, undefined, true));
+    return [...kept, ...appended];
+  };
+  node.inputs = merge(inputs, node.inputs, removedInputs, revertedInputs);
+  node.outputs = merge(outputs, node.outputs, removedOutputs, revertedOutputs);
 }
 
 /** Mirror the lowering's carry-input synthesis on a Loop: each name in the
@@ -483,7 +571,11 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       if (isContainerNodeType(node.nodeType)) {
         throw new Error(`UpdateNodePorts called on '${op.node}' which is a container`);
       }
-      updatePorts(node, op.inputs, op.outputs);
+      updateNodePortSurface(
+        node, op.inputs, op.outputs,
+        op.removedInputs, op.removedOutputs,
+        op.revertedInputs, op.revertedOutputs,
+      );
       dropDanglingPortEdges(node, project);
       return;
     }

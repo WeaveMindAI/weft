@@ -88,12 +88,14 @@ weft clean                       # purge, keeping the last 30 days
 weft clean <color>               # one execution
 weft clean --all                 # everything
 weft clean --keep-days 7
-weft clean --images              # also reclaim unreferenced worker images
-                                 # (with --all: every project's, plus old
-                                 # builder-base images; the next build
-                                 # re-makes the base)
-weft clean --build-cache
 ```
+
+The same verb also reclaims build output, and those forms touch no
+journal rows at all: `weft clean --images` (worker images nothing runs
+any more; with `--all`, every project's, the kind node's copies, stale
+`weft-infra-*` tags and old builder bases) and `weft clean
+--build-cache`. For what each one removes, go and read the `weft clean`
+row in [the CLI page](cli.md).
 
 During a run the journal is append-only, and the dispatcher never edits a row.
 

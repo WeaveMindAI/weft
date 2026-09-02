@@ -26,6 +26,10 @@ use crate::error::{CompileError, CompileResult};
 pub struct EnrichError {
     pub span: Span,
     pub message: String,
+    /// The file the span's coordinates live in, when the offending node
+    /// came from a full-mode `@include` (same rule as
+    /// `NodeDefinition::source_file`). None = the compiled source.
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,41 +85,34 @@ fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
     }
 }
 
-/// The name/type/required core the input and output merges share. The
-/// two directions genuinely need distinct instance types (an input
-/// carries exposure + editor surface, an output is a bare wire port),
-/// but the source-vs-catalog merge logic is one rule; this trait keeps
-/// it written once.
-trait MergeSlot: Clone {
-    fn name(&self) -> &str;
-    fn slot_type(&self) -> &WeftType;
-    fn set_slot_type(&mut self, ty: WeftType);
-    fn required(&self) -> bool;
-    fn set_required(&mut self, required: bool);
+/// The wire-port core the input and output merges share. The two
+/// directions genuinely need distinct instance types (an input carries
+/// exposure + editor surface, an output is a bare wire port), but both
+/// hold one [`PortDefinition`], and the source-vs-catalog merge is one
+/// rule over that struct's fields; this hands the merge that struct so
+/// a new port field never needs a second accessor list.
+trait AsPort: Clone {
+    fn port(&self) -> &PortDefinition;
+    fn port_mut(&mut self) -> &mut PortDefinition;
 }
 
-impl MergeSlot for InputDefinition {
-    fn name(&self) -> &str { &self.name }
-    fn slot_type(&self) -> &WeftType { &self.port_type }
-    fn set_slot_type(&mut self, ty: WeftType) { self.port_type = ty; }
-    fn required(&self) -> bool { self.required }
-    fn set_required(&mut self, required: bool) { self.required = required; }
+impl AsPort for InputDefinition {
+    fn port(&self) -> &PortDefinition { &self.port }
+    fn port_mut(&mut self) -> &mut PortDefinition { &mut self.port }
 }
 
-impl MergeSlot for PortDefinition {
-    fn name(&self) -> &str { &self.name }
-    fn slot_type(&self) -> &WeftType { &self.port_type }
-    fn set_slot_type(&mut self, ty: WeftType) { self.port_type = ty; }
-    fn required(&self) -> bool { self.required }
-    fn set_required(&mut self, required: bool) { self.required = required; }
+impl AsPort for PortDefinition {
+    fn port(&self) -> &PortDefinition { self }
+    fn port_mut(&mut self) -> &mut PortDefinition { self }
 }
 
-fn merge_ports<T: MergeSlot>(
+fn merge_ports<T: AsPort>(
     catalog_ports: &[T],
     weft_ports: &[T],
     can_add: bool,
     node_id: &str,
     span: Span,
+    file: Option<&str>,
     direction: PortDirection,
     errors: &mut Vec<EnrichError>,
 ) -> Vec<T> {
@@ -123,30 +120,35 @@ fn merge_ports<T: MergeSlot>(
 
     let catalog_by_name: HashMap<&str, &T> = catalog_ports
         .iter()
-        .map(|p| (p.name(), p))
+        .map(|p| (p.port().name.as_str(), p))
         .collect();
 
     let mut result: Vec<T> = catalog_ports
         .iter()
         .map(|cp| {
-            let Some(wp) = weft_ports.iter().find(|w| w.name() == cp.name()) else {
+            let Some(wp) = weft_ports.iter().find(|w| w.port().name == cp.port().name) else {
                 return cp.clone();
             };
+            let (cp_port, wp_port) = (cp.port(), wp.port());
             let mut merged = cp.clone();
-            merged.set_required(wp.required());
-            if !wp.slot_type().is_must_override() {
-                if cp.slot_type().is_must_override()
-                    || WeftType::is_compatible(wp.slot_type(), cp.slot_type())
+            merged.port_mut().required = wp_port.required;
+            // The catalog clone has no declared stamp; the header DOES
+            // declare this port, so the editor's round-trip needs the
+            // authored spelling carried onto the merged result.
+            merged.port_mut().declared_type = wp_port.declared_type.clone();
+            if !wp_port.port_type.is_must_override() {
+                if cp_port.port_type.is_must_override()
+                    || WeftType::is_compatible(&wp_port.port_type, &cp_port.port_type)
                 {
-                    merged.set_slot_type(wp.slot_type().clone());
+                    merged.port_mut().port_type = wp_port.port_type.clone();
                 } else {
-                    errors.push(EnrichError { span, message: format!(
+                    errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
                         "node '{}': {} port '{}' declared type {} incompatible with catalog type {}",
                         node_id,
                         direction.as_str(),
-                        cp.name(),
-                        wp.slot_type(),
-                        cp.slot_type(),
+                        cp_port.name,
+                        wp_port.port_type,
+                        cp_port.port_type,
                     )});
                 }
             }
@@ -155,7 +157,7 @@ fn merge_ports<T: MergeSlot>(
         .collect();
 
     for wp in weft_ports {
-        if catalog_by_name.contains_key(wp.name()) {
+        if catalog_by_name.contains_key(wp.port().name.as_str()) {
             continue;
         }
         if !can_add {
@@ -167,11 +169,11 @@ fn merge_ports<T: MergeSlot>(
             // Not gated by EnrichPolicy: that only forgives unknown node
             // TYPES; a known type rejecting an authored port is a hard
             // authoring error in every mode.
-            errors.push(EnrichError { span, message: format!(
+            errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
                 "node '{}': declares custom {} port '{}' but node type does not support custom {} ports",
                 node_id,
                 direction.as_str(),
-                wp.name(),
+                wp.port().name,
                 direction.as_str(),
             )});
             continue;
@@ -182,12 +184,12 @@ fn merge_ports<T: MergeSlot>(
         // it (the user just added it), and surface the missing-type as an
         // error diagnostic instead. Without this, the round-trip silently
         // ate the port and it vanished from the canvas.
-        if wp.slot_type().is_must_override() {
-            errors.push(EnrichError { span, message: format!(
+        if wp.port().port_type.is_must_override() {
+            errors.push(EnrichError { span, file: file.map(str::to_string), message: format!(
                 "node '{}': custom {} port '{}' needs a concrete type",
                 node_id,
                 direction.as_str(),
-                wp.name(),
+                wp.port().name,
             )});
         }
         result.push(wp.clone());
@@ -266,7 +268,7 @@ pub fn enrich_collecting(
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(EnrichError { span: node.header_span_or_default(), message: format!(
+                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a built-in language type; rename the catalog node",
                     node.node_type,
                 )});
@@ -282,7 +284,7 @@ pub fn enrich_collecting(
             if catalog.lookup(&node.node_type).is_some()
                 && reported_reserved.insert(node.node_type.clone())
             {
-                errors.push(EnrichError { span: node.header_span_or_default(), message: format!(
+                errors.push(EnrichError { span: node.header_span_or_default(), file: node.source_file.clone(), message: format!(
                     "[reserved-node-type] catalog declares '{}' but that name is a reserved language keyword",
                     node.node_type,
                 )});
@@ -294,6 +296,7 @@ pub fn enrich_collecting(
             if policy == EnrichPolicy::Strict {
                 errors.push(EnrichError {
                     span: node.header_span_or_default(),
+                    file: node.source_file.clone(),
                     message: format!("unknown node type: '{}'", node.node_type),
                 });
             }
@@ -309,10 +312,14 @@ pub fn enrich_collecting(
             .inputs
             .iter()
             .map(|spec| InputDefinition {
-                name: spec.name.clone(),
-                port_type: spec.input_type.clone(),
-                required: spec.required,
-                description: spec.description.clone(),
+                port: PortDefinition {
+                    name: spec.name.clone(),
+                    port_type: spec.input_type.clone(),
+                    required: spec.required,
+                    description: spec.description.clone(),
+                    synthesized_from_carry: false,
+                    declared_type: None,
+                },
                 exposure: spec.effective_exposure(),
                 // The DECLARED widget only; the type-derived default is
                 // stamped after TypeVar resolution (see the final pass),
@@ -321,7 +328,6 @@ pub fn enrich_collecting(
                 default: spec.default.clone(),
                 label: spec.label.clone(),
                 placeholder: spec.placeholder.clone(),
-                synthesized_from_carry: false,
                 from_spec: true,
                 requires_scopes: spec.requires_scopes.clone(),
                 requires_values: spec.requires_values.clone(),
@@ -336,6 +342,7 @@ pub fn enrich_collecting(
                 required: p.required,
                 description: p.description.clone(),
                 synthesized_from_carry: false,
+                declared_type: None,
             })
             .collect();
 
@@ -363,26 +370,29 @@ pub fn enrich_collecting(
         // instance, and the node body never sees it (the input bag drops
         // it: it is the language's decision, not the node's data).
         catalog_inputs.push(InputDefinition {
-            name: SHOULD_FLOW_PORT.to_string(),
-            // Its OWN type variable, never the node's `T`: a join whose
-            // branches carry Strings must not also force its permission
-            // to be a String.
-            port_type: WeftType::type_var("T__should_flow"),
-            // Optional: unwired and unset, the node runs. The skip rule
-            // reads this port itself, so a closure on it does not need
-            // the required-input rule to bite.
-            required: false,
-            description: Some(
-                "Whether this node runs. A `false` value or a closed input skips it, \
-                 and everything downstream closes in turn."
-                    .to_string(),
-            ),
+            port: PortDefinition {
+                name: SHOULD_FLOW_PORT.to_string(),
+                // Its OWN type variable, never the node's `T`: a join whose
+                // branches carry Strings must not also force its permission
+                // to be a String.
+                port_type: WeftType::type_var("T__should_flow"),
+                // Optional: unwired and unset, the node runs. The skip rule
+                // reads this port itself, so a closure on it does not need
+                // the required-input rule to bite.
+                required: false,
+                description: Some(
+                    "Whether this node runs. A `false` value or a closed input skips it, \
+                     and everything downstream closes in turn."
+                        .to_string(),
+                ),
+                synthesized_from_carry: false,
+                declared_type: None,
+            },
             exposure: Exposure::All,
             widget: None,
             default: None,
             label: None,
             placeholder: None,
-            synthesized_from_carry: false,
             from_spec: true,
             requires_scopes: None,
             requires_values: None,
@@ -393,11 +403,12 @@ pub fn enrich_collecting(
         // runtime bag and the editor read it off the instance. The
         // permissions are NOT materialized as an input: they are ticked
         // once at connect time and live on the stored connection, never
-        // in source.
+        // in source. The stamp itself is `AccessSpec::stamp_onto`, the
+        // one definition the compact wiring view shares.
         if let Some(service_spec) = &meta.service {
             for input in catalog_inputs.iter_mut() {
-                if let Some(Widget::Access { service }) = &mut input.widget {
-                    *service = Some(service_spec.service.clone());
+                if let Some(widget) = &mut input.widget {
+                    service_spec.stamp_onto(widget);
                 }
             }
         }
@@ -411,7 +422,7 @@ pub fn enrich_collecting(
         for wp in &weft_inputs {
             if let Some(cp) = catalog_inputs.iter().find(|cp| cp.name == wp.name) {
                 if cp.exposure == Exposure::Config {
-                    errors.push(EnrichError { span: node_span, message: format!(
+                    errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
                         "node '{}': input '{}' of node type {} is configuration-only \
                          (exposure `config`); it cannot be declared as a port. Set it in \
                          the config braces instead",
@@ -443,7 +454,7 @@ pub fn enrich_collecting(
         // so it is refused where it cannot apply.
         for key in &node.optional_ports {
             if !weft_inputs.iter().any(|p| p.name == *key) {
-                errors.push(EnrichError { span: node_span, message: format!(
+                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
                     "node '{}': '{}?' marks a port optional, but '{}' is not a port this node \
                      creates. Declare optionality on the port itself (`{}?: Type`) instead",
                     node.id, key, key, key,
@@ -457,6 +468,7 @@ pub fn enrich_collecting(
             meta.features.can_add_input_ports,
             &node.id,
             node_span,
+            node.source_file.as_deref(),
             PortDirection::Input,
             &mut errors,
         );
@@ -466,6 +478,7 @@ pub fn enrich_collecting(
             meta.features.can_add_output_ports,
             &node.id,
             node_span,
+            node.source_file.as_deref(),
             PortDirection::Output,
             &mut errors,
         );
@@ -488,10 +501,11 @@ pub fn enrich_collecting(
                 // it belongs on the author's screen at build time.
                 Some(spec) => match weft_core::access::spec::publishable_fields(spec) {
                     Ok(_) => node.published_service = Some(spec.clone()),
-                    Err(message) => errors.push(EnrichError { span: node_span, message }),
+                    Err(message) => errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message }),
                 },
                 None => errors.push(EnrichError {
                     span: node_span,
+                    file: node.source_file.clone(),
                     message: format!(
                         "node '{}' publishes a '{service}' connection, but no node in the \
                          catalog declares that service",
@@ -509,7 +523,7 @@ pub fn enrich_collecting(
     // with no single node to blame (`Span::default`).
     if errors.is_empty() {
         if let Err(e) = resolve_type_vars(project) {
-            errors.push(EnrichError { span: Span::default(), message: format!("{e}") });
+            errors.push(EnrichError { span: Span::default(), file: None, message: format!("{e}") });
         }
     }
 
@@ -823,9 +837,15 @@ fn created_input_ports(
             if weft_core::project::is_internal_config_key(key) || declared(key) {
                 continue;
             }
-            let span = node.config_spans.get(key).map(|s| s.span).unwrap_or_default();
+            // Both anchor halves from the ENTRY: on a node spliced from an
+            // included file the key's line lives in that file, and a span
+            // paired with the node's own file would jump the wrong buffer.
+            let (span, file) = match node.config_spans.get(key) {
+                Some(s) => (s.span, s.source_file.clone()),
+                None => (Span::default(), node.source_file.clone()),
+            };
             if value.is_null() {
-                errors.push(EnrichError { span, message: format!(
+                errors.push(EnrichError { span, file, message: format!(
                     "node '{}': config key '{}' creates a port, and `null` says nothing about \
                      its type. Declare it (`{}: Type` in the signature) or give it a value",
                     node.id, key, key,
@@ -858,6 +878,9 @@ fn created_input_ports(
                 required,
                 description: None,
                 synthesized_from_carry: false,
+                // Created by a config KEY, not the header: must never
+                // round-trip into the signature.
+                declared_type: None,
             })
         })
         .collect()

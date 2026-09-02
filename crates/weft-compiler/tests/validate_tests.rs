@@ -283,6 +283,7 @@ out.data = a.value
         source_handle: Some("value".into()),
         target_handle: Some("data".into()),
         span: None,
+        source_file: None,
     };
     project.edges.push(dup);
     let d = validate(&project, &catalog());
@@ -320,16 +321,19 @@ t = Text
 "#);
     let t = &mut project.nodes[0];
     t.inputs.push(weft_core::project::InputDefinition {
-        name: "value".into(),
-        port_type: WeftType::primitive(WeftPrimitive::String),
-        required: false,
-        description: None,
+        port: weft_core::project::PortDefinition {
+            name: "value".into(),
+            port_type: WeftType::primitive(WeftPrimitive::String),
+            required: false,
+            description: None,
+            synthesized_from_carry: false,
+            declared_type: None,
+        },
         exposure: weft_core::weft_type::Exposure::All,
         widget: None,
         default: None,
         label: None,
         placeholder: None,
-        synthesized_from_carry: false,
         from_spec: false,
         requires_scopes: None,
         requires_values: None,
@@ -347,18 +351,21 @@ fn required_port_unmet_is_flagged() {
 t = Text { value: "ok" }
 "#);
     project.nodes[0].inputs.push(weft_core::project::InputDefinition {
-        name: "foo".into(),
-        port_type: weft_core::weft_type::WeftType::primitive(
-            weft_core::weft_type::WeftPrimitive::String,
-        ),
-        required: true,
-        description: None,
+        port: weft_core::project::PortDefinition {
+            name: "foo".into(),
+            port_type: weft_core::weft_type::WeftType::primitive(
+                weft_core::weft_type::WeftPrimitive::String,
+            ),
+            required: true,
+            description: None,
+            synthesized_from_carry: false,
+            declared_type: None,
+        },
         exposure: weft_core::weft_type::Exposure::Wire,
         widget: None,
         default: None,
         label: None,
         placeholder: None,
-        synthesized_from_carry: false,
         from_spec: false,
         requires_scopes: None,
         requires_values: None,
@@ -964,6 +971,7 @@ out.data = b.value
         source_handle: Some("value".into()),
         target_handle: Some("value".into()),
         span: None,
+        source_file: None,
     });
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"graph-cycle"), "{d:?}");
@@ -1087,8 +1095,9 @@ send.account = ws.access
     // The connect widget carries the compiler-stamped service.
     let account = ws.inputs.iter().find(|i| i.name == "account").expect("account input");
     match &account.widget {
-        Some(weft_core::node::Widget::Access { service }) => {
+        Some(weft_core::node::Widget::Access { service, optional }) => {
             assert_eq!(service.as_deref(), Some("slack"));
+            assert!(!optional, "slack's recipe does not declare connection_optional");
         }
         other => panic!("account input is not an access widget: {other:?}"),
     }
@@ -2276,5 +2285,268 @@ sink.value = g.out
     assert!(
         !d.iter().any(|x| x.code.as_deref() == Some("unknown-type")),
         "{d:?}"
+    );
+}
+
+/// The "no connection picked" rule is the LANGUAGE's: any node declaring a
+/// `service` recipe gets it synthesized at runtime level (no metadata
+/// boilerplate), and `connection_optional: true` on the recipe turns it off.
+#[test]
+fn access_nodes_require_a_connection_by_default() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    // Unconnected access node: the synthesized rule fires in Runtime mode
+    // only (a sketch still builds), naming the access field's message shape.
+    let project = parse_enrich("ws = SlackAccess\n");
+    let runtime = validate_with_mode(&project, &catalog(), ValidationMode::Runtime);
+    let hit = runtime
+        .iter()
+        .find(|d| d.code.as_deref() == Some("rule-runtime"))
+        .expect("unconnected SlackAccess must flag rule-runtime");
+    assert!(hit.message.contains("no") && hit.message.contains("connection"), "{}", hit.message);
+    let structural = validate_with_mode(&project, &catalog(), ValidationMode::Structural);
+    assert!(!codes(&structural).contains(&"rule-runtime"), "{structural:?}");
+
+    // A picked connection satisfies it.
+    let connected =
+        parse_enrich("ws = SlackAccess { account: {\"id\":\"g-1\",\"identity\":\"q\"} }\n");
+    let diags = validate_with_mode(&connected, &catalog(), ValidationMode::Runtime);
+    assert!(
+        !diags.iter().any(|d| d.code.as_deref() == Some("rule-runtime")
+            && d.message.contains("connection")),
+        "{diags:?}"
+    );
+
+    // `connection_optional: true` (CustomProvider) opts out entirely.
+    let optional = parse_enrich(
+        "p = CustomProvider { baseUrl: \"http://localhost:1\", model: \"m\" }\n",
+    );
+    let diags = validate_with_mode(&optional, &catalog(), ValidationMode::Runtime);
+    assert!(
+        !diags.iter().any(|d| d.message.contains("connection picked")),
+        "an optional connection synthesizes no rule: {diags:?}"
+    );
+}
+
+/// A metadata that still carries its OWN rule on the picker field (a
+/// project's copied catalog predating the synthesized rule) reports the
+/// mistake ONCE: the declared rule stands, the twin is not synthesized.
+#[test]
+fn declared_picker_rule_suppresses_the_synthesized_twin() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("legacy");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "LegacyAccess",
+  "label": "Legacy access",
+  "description": "a copied catalog predating the synthesized rule",
+  "service": { "service": "legacy",
+               "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
+  "inputs": [
+    { "name": "account", "type": "Access", "exposure": "config",
+      "widget": { "kind": "access" } }
+  ],
+  "outputs": [{ "name": "access", "type": "Access" }],
+  "validate": [
+    { "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "account" } },
+      "then": { "message": "the old boilerplate wording",
+                "level": "runtime", "field": "account" } }
+  ]
+}"#,
+    )
+    .unwrap();
+    let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
+    let mut project =
+        compile("a = LegacyAccess\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &legacy).expect("enrich");
+    let diags = validate_with_mode(&project, &legacy, ValidationMode::Runtime);
+    let connection_hits: Vec<_> =
+        diags.iter().filter(|d| d.code.as_deref() == Some("rule-runtime")).collect();
+    assert_eq!(connection_hits.len(), 1, "exactly one report: {diags:?}");
+    assert!(
+        connection_hits[0].message.contains("old boilerplate"),
+        "the DECLARED rule wins: {}",
+        connection_hits[0].message
+    );
+}
+
+/// The mirror of the above, pinning the guard's NARROWNESS: an
+/// UNRELATED declared rule on the picker field (any condition other
+/// than the synthesized not-nonempty shape) must not swallow the
+/// connection requirement, so the synthesized "no connection picked"
+/// still fires. (The declared rule's own condition needs a picked
+/// connection, so on this unpicked node only the synthesized one can.)
+#[test]
+fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("legacy");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "LegacyAccess",
+  "label": "Legacy access",
+  "description": "declares its own unrelated runtime rule on the picker field",
+  "service": { "service": "legacy",
+               "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
+  "inputs": [
+    { "name": "account", "type": "Access", "exposure": "config",
+      "widget": { "kind": "access" } }
+  ],
+  "outputs": [{ "name": "access", "type": "Access" }],
+  "validate": [
+    { "when": { "kind": "config_nonempty", "field": "account" },
+      "then": { "message": "an unrelated declared rule",
+                "level": "runtime", "field": "account" } }
+  ]
+}"#,
+    )
+    .unwrap();
+    let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
+    let mut project =
+        compile("a = LegacyAccess\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &legacy).expect("enrich");
+    let diags = validate_with_mode(&project, &legacy, ValidationMode::Runtime);
+    let runtime_hits: Vec<_> =
+        diags.iter().filter(|d| d.code.as_deref() == Some("rule-runtime")).collect();
+    assert!(
+        runtime_hits.iter().any(|d| d.message.contains("has no legacy connection picked")),
+        "the synthesized rule still fires: {diags:?}"
+    );
+}
+
+/// The `declared_type` stamp: enrich marks every port with the type the
+/// SOURCE header spells for it (the editor rewrites headers from this),
+/// and nothing else. A redeclared catalog port keeps the AUTHORED
+/// spelling even though the merge clones the catalog port; catalog-only
+/// ports, `_should_flow`, and config-created ports carry none.
+#[test]
+fn enrich_stamps_declared_types_from_the_header_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("gadget");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "Gadget",
+  "label": "Gadget",
+  "description": "declared-type stamping fixture",
+  "inputs": [
+    { "name": "data", "type": "T" },
+    { "name": "seed", "type": "String", "required": false }
+  ],
+  "outputs": [{ "name": "out", "type": "String" }, { "name": "gen", "type": "T" }],
+  "features": { "canAddInputPorts": true, "canAddOutputPorts": true }
+}"#,
+    )
+    .unwrap();
+    let catalog = FsCatalog::discover(dir.path()).expect("fixture catalog");
+    let mut project = compile(
+        "g = Gadget(data: T, extra: String) -> (haiku: String, gen: T) {\n  made: \"x\"\n}\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+    )
+    .expect("compile");
+    enrich(&mut project, &catalog).expect("enrich");
+    let g = project.nodes.iter().find(|n| n.id == "g").expect("node g");
+    let input_decl = |name: &str| {
+        g.inputs.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("input {name}")).declared_type.clone()
+    };
+    assert_eq!(input_decl("data"), Some("T".into()), "redeclared catalog port keeps the authored spelling");
+    assert_eq!(input_decl("extra"), Some("String".into()), "custom header port is stamped");
+    assert_eq!(input_decl("seed"), None, "untouched catalog port carries no stamp");
+    assert_eq!(input_decl("_should_flow"), None, "enrich's own synthesis carries none");
+    assert_eq!(input_decl("made"), None, "a config-created port carries none");
+    let haiku = g.outputs.iter().find(|p| p.name == "haiku").expect("output haiku");
+    assert_eq!(haiku.declared_type, Some("String".into()), "custom output is stamped");
+    let out = g.outputs.iter().find(|p| p.name == "out").expect("output out");
+    assert_eq!(out.declared_type, None, "catalog output carries none");
+    let gen = g.outputs.iter().find(|p| p.name == "gen").expect("output gen");
+    assert_eq!(
+        gen.declared_type,
+        Some("T".into()),
+        "redeclared catalog OUTPUT keeps the authored spelling through the merge"
+    );
+}
+
+/// `declared_type` is the VERBATIM header annotation, never a re-print of
+/// the parsed type. A re-print would expand a registry alias and, worse,
+/// turn an unparseable annotation into the `MustOverride` placeholder,
+/// which the editor's next ports gesture would write back over the
+/// author's text (destroying both the typo and the squiggle naming it).
+#[test]
+fn declared_type_is_the_verbatim_header_spelling() {
+    use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
+    let (project, _) = compile_lenient(
+        "n = Debug(data: Strng?)\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        IncludeMode::Full,
+        None,
+    );
+    let n = project.nodes.iter().find(|n| n.id == "n").expect("node n");
+    let data = n.inputs.iter().find(|p| p.name == "data").expect("input data");
+    assert_eq!(data.declared_type, Some("Strng".into()), "the typo round-trips as typed");
+    assert_eq!(data.port_type.wire_string(), "MustOverride", "the parsed type is the placeholder");
+}
+
+/// An `@include` line declares no ports: the interface node's ports come
+/// from the INCLUDED file's group header, so they must carry no declared
+/// spelling (a stamp would make the editor write a signature onto a decl
+/// that has no signature slot).
+#[test]
+fn include_interface_ports_carry_no_declared_type() {
+    use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.weft"),
+        "Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = self.inp\n}\n",
+    )
+    .unwrap();
+    let (project, _) = compile_lenient(
+        "c = @include(\"sub.weft\")\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        IncludeMode::Interface,
+        None,
+    );
+    let c = project.nodes.iter().find(|n| n.id == "c").expect("include node c");
+    assert!(
+        c.inputs.iter().all(|p| p.declared_type.is_none()),
+        "include inputs unstamped: {:?}", c.inputs
+    );
+    assert!(c.outputs.iter().all(|p| p.declared_type.is_none()), "include outputs unstamped: {:?}", c.outputs);
+}
+
+/// A finding inside an `@include`d file carries that file's path on the
+/// diagnostic, so every consumer can point at the right buffer.
+#[test]
+fn diagnostics_carry_the_included_file() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.weft"),
+        "Group() -> (out: Access) {\n  ws = SlackAccess\n  self.out = ws.access\n}\n",
+    )
+    .unwrap();
+    let mut project = compile(
+        "c = @include(\"sub.weft\")\nout = Debug\nout.data = c.out\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+    )
+    .expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let diags = validate_with_mode(&project, &catalog(), ValidationMode::Runtime);
+    let hit = diags
+        .iter()
+        .find(|d| d.code.as_deref() == Some("rule-runtime"))
+        .expect("the included access node flags rule-runtime");
+    assert!(
+        hit.file.as_deref().unwrap_or_default().ends_with("sub.weft"),
+        "the finding names the included file: {:?}",
+        hit.file
     );
 }

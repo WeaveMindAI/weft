@@ -21,6 +21,11 @@ pub mod events;
 #[cfg(feature = "runtime")]
 pub mod socket;
 pub mod spec;
+// The connect wire types are runtime-side traffic (dispatcher, broker,
+// store, CLI); the parse-only WASM build never names them, so they stay
+// out of its binary.
+#[cfg(feature = "runtime")]
+pub mod wire;
 #[cfg(feature = "runtime")]
 pub mod verify;
 mod value;
@@ -205,8 +210,13 @@ impl std::fmt::Debug for OpenedConnection {
 /// weft::access_node!(SlackAccessNode);
 /// ```
 ///
-/// The input is always named `account`, the one name every access
-/// node's metadata declares.
+/// The macro requires the input to be named `account` (a node writing
+/// its own body picks its own name; the compiler finds the picker by
+/// its `access` widget, never by name). The connection is ALWAYS
+/// required here: this body's whole output is the connection, so an
+/// "optional" one would only starve everything downstream silently. A
+/// recipe wanting `connection_optional` writes its own body saying
+/// what unconnected means (see the custom LLM provider).
 #[macro_export]
 macro_rules! access_node {
     ($name:ident) => {
@@ -216,7 +226,14 @@ macro_rules! access_node {
         #[$crate::async_trait::async_trait]
         impl $crate::Node for $name {
             async fn run(&self, ctx: $crate::ExecutionContext) -> $crate::WeftResult<()> {
-                let access: $crate::Access = ctx.inputs.get("account")?;
+                let access = ctx.inputs.access("account")?.ok_or_else(|| {
+                    $crate::WeftError::Input(
+                        "this access node's recipe declares connection_optional, but its \
+                         pass-through body has no meaning without a connection; pick one \
+                         on the node, or give the node type its own body"
+                            .into(),
+                    )
+                })?;
                 ctx.pulse_downstream($crate::node::NodeOutput::new().set("access", access))
                     .await
             }

@@ -46,6 +46,28 @@ pub struct NodeHealthState {
     pub declared_flaky: bool,
 }
 
+impl NodeHealthState {
+    /// A fresh latch for a unit whose row already says `status`, so the
+    /// first tick after a latch reset (every lifecycle command clears
+    /// the project's latches) argues from the row instead of against
+    /// it. A unit the row calls `Flaky` starts declared flaky with its
+    /// not-ready edge at `now`, so it recovers only through the full
+    /// recovery window; an empty latch would instead read as "never
+    /// seen ready, nothing declared", derive `Running`, and rewrite a
+    /// frozen, still-broken unit to `Running` for as long as it never
+    /// becomes ready. Any other status seeds nothing: `Running` is what
+    /// the empty latch derives anyway, and the caller never evaluates a
+    /// unit outside {Running, Flaky}.
+    pub fn seeded_from(status: weft_broker_client::protocol::InfraNodeStatus, now: Instant) -> Self {
+        let flaky = status == weft_broker_client::protocol::InfraNodeStatus::Flaky;
+        Self {
+            last_ready_at: None,
+            last_not_ready_at: flaky.then_some(now),
+            declared_flaky: flaky,
+        }
+    }
+}
+
 /// What `evaluate_node_health` decided this tick.
 ///
 /// Three pieces:
@@ -249,6 +271,37 @@ mod tests {
 
     fn obs(desired: u32, ready: u32) -> NodeObservation {
         NodeObservation { desired, ready }
+    }
+
+    // ---------- latch seeding from the row ----------
+
+    /// A latch seeded from a `Flaky` row keeps saying Flaky while the
+    /// unit stays unready (no `Running` rewrite), and recovers only
+    /// after the recovery window of continuous readiness; a latch
+    /// seeded from `Running` is the empty latch.
+    #[test]
+    fn latch_seeded_from_row_status_argues_from_the_row() {
+        let now = t0();
+        let seeded = NodeHealthState::seeded_from(Status::Flaky, now);
+        let still_down =
+            evaluate_node_health(seeded.clone(), obs(1, 0), now, FLAKY_AFTER, RECOVERY_AFTER);
+        assert_eq!(still_down.desired_status, Status::Flaky);
+        assert_eq!(still_down.event, None);
+        // Ready right away: not yet recovered (the window has not run).
+        let ready_now =
+            evaluate_node_health(seeded.clone(), obs(1, 1), now, FLAKY_AFTER, RECOVERY_AFTER);
+        assert_eq!(ready_now.desired_status, Status::Flaky);
+        // Ready past the window since the seeded not-ready edge: recovered.
+        let ready_later = evaluate_node_health(
+            seeded,
+            obs(1, 1),
+            now + RECOVERY_AFTER,
+            FLAKY_AFTER,
+            RECOVERY_AFTER,
+        );
+        assert_eq!(ready_later.desired_status, Status::Running);
+        assert_eq!(ready_later.event, Some(NodeEdgeEvent::Recovered));
+        assert_eq!(NodeHealthState::seeded_from(Status::Running, now), NodeHealthState::default());
     }
 
     // ---------- evaluate_node_health: NoChange paths ----------

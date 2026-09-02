@@ -688,16 +688,78 @@ async fn removed_projects_do_not_keep_supervisor_leases(pool: PgPool) {
 
 /// The referenced-image set (`GET /images/referenced`) must cover a
 /// project's current hash, the hash a still-alive (e.g. draining) worker
-/// pod runs, AND the hash stamped on a pending/claimed task (a task can
+/// pod runs, the hash stamped on a pending/claimed task (a task can
 /// outlive both the project pointer and its pod between a resync and the
-/// cold-start sweep): `weft clean --images` deletes everything outside
-/// this set, so any of them escaping it would be deleted out from under a
-/// running workload. Terminal pods' and completed tasks' hashes drop out.
+/// cold-start sweep), every infra image ref in any project's tag map,
+/// AND the refs recorded on live infra units (a unit left UP across a
+/// sync stays frozen at its recorded image, which can be older than the
+/// project's current map): `weft clean --images` deletes everything
+/// outside this set, so any of them escaping it would be deleted out
+/// from under a running workload. Terminal pods' and completed tasks'
+/// hashes drop out; a project with no infra tags contributes none; a
+/// blank ref is skipped (matches no image); a unit stamped before refs
+/// were recorded contributes nothing.
 #[sqlx::test]
-async fn referenced_images_cover_projects_live_pods_and_live_tasks(pool: PgPool) {
+async fn referenced_images_cover_projects_pods_tasks_maps_and_unit_refs(
+    pool: PgPool,
+) {
     let (_journal, projects) = setup(&pool).await;
     let now = weft_dispatcher::lease::now_unix();
-    seed_project(&projects, Uuid::new_v4(), "hash-current").await;
+    let plain = Uuid::new_v4();
+    seed_project(&projects, plain, "hash-current").await;
+    // A second project whose committed infra sync recorded two nodes'
+    // image tags; both refs are the supervisor's to apply, so both are
+    // referenced no matter which node they belong to. One blank ref is
+    // skipped (a buggy writer's blank matches no image and must not be
+    // laundered into the set).
+    let with_infra = Uuid::new_v4();
+    seed_project(&projects, with_infra, "hash-infra-project").await;
+    sqlx::query("UPDATE project SET infra_image_tags_json = $1 WHERE id = $2")
+        .bind(serde_json::json!({
+            "bridge-node": { "bridge": "weft-infra-bridge:live1", "blank": "" },
+            "engine-node": { "engine": "weft-infra-engine:live2" },
+        }))
+        .bind(with_infra)
+        .execute(&pool)
+        .await
+        .expect("seed infra image tags");
+    // An infra_node row for that project: one unit UP and frozen at an
+    // image OLDER than the map above (the case the map alone cannot
+    // cover), one unit stamped before refs were recorded (contributes
+    // nothing), one unit long gone terminal.
+    sqlx::query(
+        "INSERT INTO infra_node \
+         (project_id, node_id, instance_id, namespace, status, units_json) \
+         VALUES ($1, 'n1', 'inst1', 'ns', 'running', $2)",
+    )
+    // `infra_node.project_id` is TEXT (the row keys by the id's string
+    // form), unlike `project.id`.
+    .bind(with_infra.to_string())
+    .bind(serde_json::json!({
+        "frozen": {
+            "status": "running",
+            "stop_behavior": { "kind": "no_op" },
+            "flaky_after_seconds": 30,
+            "recovery_after_seconds": 30,
+            "image_refs": ["weft-infra-bridge:0ld-frozen"]
+        },
+        "legacy": {
+            "status": "running",
+            "stop_behavior": { "kind": "no_op" },
+            "flaky_after_seconds": 30,
+            "recovery_after_seconds": 30
+        },
+        "terminal": {
+            "status": "stopped",
+            "stop_behavior": { "kind": "scale_to_zero" },
+            "flaky_after_seconds": 30,
+            "recovery_after_seconds": 30,
+            "image_refs": ["weft-infra-bridge:terminal-gone"]
+        }
+    }))
+    .execute(&pool)
+    .await
+    .expect("seed infra_node units");
     for (pod, hash, terminal) in [
         ("wp-drain", "hash-draining", false),
         ("wp-done", "hash-terminal", true),
@@ -716,7 +778,11 @@ async fn referenced_images_cover_projects_live_pods_and_live_tasks(pool: PgPool)
         .await
         .expect("seed worker_pod");
     }
-    for (status, hash) in [("pending", "hash-pending-task"), ("complete", "hash-done-task")] {
+    for (status, hash) in [
+        ("pending", "hash-pending-task"),
+        ("claimed", "hash-claimed-task"),
+        ("complete", "hash-done-task"),
+    ] {
         sqlx::query(
             "INSERT INTO task \
              (id, kind, target, project_id, status, binary_hash, payload, attempts, created_at_unix) \
@@ -731,19 +797,35 @@ async fn referenced_images_cover_projects_live_pods_and_live_tasks(pool: PgPool)
         .expect("seed task");
     }
 
-    let mut hashes = weft_dispatcher::api::project::referenced_image_hashes(&pool)
+    let referenced = weft_dispatcher::api::project::referenced_images_query(&pool)
         .await
         .expect("referenced set");
+    let mut hashes = referenced.worker_hashes.clone();
     hashes.sort();
     assert_eq!(
         hashes,
         vec![
+            "hash-claimed-task".to_string(),
             "hash-current".to_string(),
             "hash-draining".to_string(),
+            "hash-infra-project".to_string(),
             "hash-pending-task".to_string(),
         ],
-        "project + live pod + live task hashes in; terminal pod and \
-         completed task hashes out"
+        "project + live pod + live task hashes in (pending AND claimed); \
+         terminal pod and completed task hashes out"
+    );
+    assert_eq!(
+        referenced.infra_refs,
+        vec![
+            "weft-infra-bridge:0ld-frozen".to_string(),
+            "weft-infra-bridge:live1".to_string(),
+            "weft-infra-bridge:terminal-gone".to_string(),
+            "weft-infra-engine:live2".to_string(),
+        ],
+        "every ref of every project's tag map AND every recorded unit \
+         ref is referenced (all rows, all units: over-keeping is the \
+         safe direction); the blank ref and the ref-less legacy unit \
+         contribute nothing"
     );
 }
 

@@ -825,7 +825,7 @@ pub async fn publish_access(
     .await
     .map_err(store_err)?;
     Ok(Json(PublishAccessResponse {
-        connection: weft_broker_client::protocol::PublishedConnection {
+        connection: weft_core::access::wire::PublishedConnection {
             connection_id: done.grant.id.to_string(),
             identity: done.grant.identity,
         },
@@ -841,7 +841,7 @@ pub async fn published_access(
     Json(mut req): Json<PublishedAccessRequest>,
 ) -> Resp<PublishedAccessResponse> {
     let owner = publisher_scope(&state, &caller, &req.color, &mut req.node_id).await?;
-    let found = weft_access_store::published_grant(
+    let found = weft_access_store::published_connection(
         &state.pool,
         &owner.tenant,
         &owner.project,
@@ -851,12 +851,7 @@ pub async fn published_access(
     .await
     .map_err(store_err)?;
     Ok(Json(match found {
-        Some(g) => PublishedAccessResponse::Published {
-            connection: weft_broker_client::protocol::PublishedConnection {
-                connection_id: g.id.to_string(),
-                identity: g.identity,
-            },
-        },
+        Some(connection) => PublishedAccessResponse::Published { connection },
         None => PublishedAccessResponse::NothingPublished,
     }))
 }
@@ -1149,12 +1144,12 @@ pub async fn supervisor_infra_nodes(
         let units_json: serde_json::Value = r
             .try_get("units_json")
             .map_err(|e| internal(anyhow::anyhow!("decode units_json: {e}")))?;
-        let units: std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime> =
-            serde_json::from_value(units_json).map_err(|e| {
-                internal(anyhow::anyhow!(
-                    "infra_node.units_json for node='{node_id}' is not a unit map: {e}"
-                ))
-            })?;
+        let units = weft_broker_client::protocol::decode_units_json(
+            units_json,
+            &req.project_id,
+            &node_id,
+        )
+        .map_err(internal)?;
         nodes.push(SupervisorInfraNode {
             node_id,
             instance_id,
@@ -1345,28 +1340,21 @@ pub async fn supervisor_event_record(
     Ok(Json(SupervisorEventRecordResponse { id: row.0 }))
 }
 
-/// SQL fragment computing the node-level rollup status from a units
-/// Roll a units jsonb expression up to one node status (worst-of-units
-/// by `InfraNodeStatus::rollup_rank`). Must match
-/// `InfraNodeStatus::rollup_rank` in the protocol crate. Empty map ->
-/// 'stopped' (the rank-0 default). `units_expr` is the SQL expression
-/// holding the units map: this is parameterized (not hardcoded to the
-/// `units_json` column) because in a single UPDATE every SET RHS is
-/// evaluated against the OLD row, so rolling up the bare column would
-/// use the PRE-update unit statuses. We must roll up the SAME new-units
-/// expression we're writing.
-fn rollup_sql(units_expr: &str) -> String {
-    format!(
-        "(SELECT COALESCE( \
-            (SELECT v->>'status' FROM jsonb_each({units_expr}) AS e(k, v) \
-             ORDER BY CASE v->>'status' \
-               WHEN 'terminating' THEN 7 WHEN 'stopping' THEN 6 \
-               WHEN 'provisioning' THEN 5 WHEN 'failed' THEN 4 \
-               WHEN 'flaky' THEN 3 WHEN 'running' THEN 2 \
-               WHEN 'stopped' THEN 1 ELSE 0 END DESC \
-             LIMIT 1), \
-            'stopped'))"
-    )
+/// Map a fenced lifecycle write's outcome to the wire: Applied is the
+/// 2xx body, Displaced is 410, Gone is 409. The supervisor client
+/// reads exactly these two codes back into `WriteOutcome`.
+// SYNC: the two status codes <-> crates/weft-broker-client/src/client.rs
+//       (post_fenced, the one reader of them)
+fn fenced_to_http(
+    outcome: crate::lifecycle_writes::FencedWrite,
+    what: impl FnOnce() -> String,
+) -> Result<(), (StatusCode, String)> {
+    use crate::lifecycle_writes::FencedWrite;
+    match outcome {
+        FencedWrite::Applied => Ok(()),
+        FencedWrite::Displaced => Err((StatusCode::GONE, format!("{}: project ownership moved", what()))),
+        FencedWrite::Gone => Err((StatusCode::CONFLICT, format!("{}: target gone", what()))),
+    }
 }
 
 pub async fn supervisor_set_status(
@@ -1378,130 +1366,24 @@ pub async fn supervisor_set_status(
     require_node_id(&mut req.node_id)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, &req.project_id)
         .await?;
-    // Per-unit (`unit = Some`): set that unit's status inside
-    // `units_json`, then recompute the node-level `status` as the
-    // rollup over the UPDATED units. Node-wide (`unit = None`): set
-    // every unit's status AND the node status to the same value (a
-    // lifecycle-driven uniform transition like Stopping/Terminating).
-    // Both run in ONE UPDATE so the per-unit write and the rollup are
-    // atomic, and so the lease/fence WHERE clause guards them together.
-    // CRITICAL: the rollup must read the NEW units expression, not the
-    // `units_json` column. In one UPDATE, Postgres evaluates every SET
-    // RHS against the pre-update row, so `status = rollup_sql("units_json")`
-    // would roll up the OLD statuses (leaving e.g. `stopping` after the
-    // unit already went `stopped`).
-    let set_clause = if req.unit.is_some() {
-        let new_units = "jsonb_set(units_json, ARRAY[$1], \
-            COALESCE(units_json->$1, '{}'::jsonb) || jsonb_build_object('status', $2::text))";
-        format!(
-            "units_json = {new_units}, status = {rollup}, failure_stage = $3, failure_message = $4",
-            rollup = rollup_sql(new_units),
-        )
-    } else {
-        // No unit: rewrite every unit's status to $2, then the rollup
-        // collapses to $2 too (all units equal).
-        let new_units = "(SELECT COALESCE(jsonb_object_agg(k, v || jsonb_build_object('status', $2::text)), '{}'::jsonb) \
-            FROM jsonb_each(units_json) AS e(k, v))";
-        format!(
-            "units_json = {new_units}, status = {rollup}, failure_stage = $3, failure_message = $4",
-            rollup = rollup_sql(new_units),
-        )
-    };
-    // The lease-ownership check lives inside the UPDATE's WHERE
-    // clause so the check and the write are evaluated atomically
-    // by Postgres on the same row snapshot. No TOCTOU window.
-    // `$1` is the unit name (or a placeholder, unused when unit=None,
-    // but the jsonb_set path needs it bound regardless).
-    let unit_key = req.unit.clone().unwrap_or_default();
-    let res = if let Some(cid) = req.command_id {
-        // Lifecycle-driven write: require we still OWN the project
-        // (the supervisor's single-actor authority) and that the
-        // command still applies (targets this row, not yet completed).
-        // The pod identity is the supervisor's claim id (`req.pod_name`
-        // = WEFT_POD_NAME, what keys `infra_owner`), NOT the auth token's
-        // Pod name (which carries a ReplicaSet suffix and would never
-        // match the lease). The instant ownership moves to another pod,
-        // this write is rejected and the command flows to the new owner.
-        sqlx::query(&format!(
-            "UPDATE infra_node SET {set_clause} \
-             WHERE project_id = $5 AND node_id = $6 AND EXISTS ( \
-               SELECT 1 FROM infra_lifecycle_command \
-               WHERE id = $7 \
-                 AND project_id = $5 \
-                 AND (node_id = $6 OR node_id IS NULL) \
-                 AND completed_at_unix IS NULL \
-             ) AND {owns}",
-            owns = weft_broker_client::lifecycle_command::owns_project_predicate("$8", "$5"),
-        ))
-        .bind(&unit_key)
-        .bind(req.status.as_str())
-        .bind(req.failure_stage.map(|s| s.as_str()))
-        .bind(req.failure_message.as_deref())
-        .bind(&req.project_id)
-        .bind(&req.node_id)
-        .bind(cid)
-        .bind(&req.pod_name)
-        .execute(&state.pool)
+    // The write, its fence and its stale answers live in
+    // `lifecycle_writes::set_status` (pool-level, db-tested); this is
+    // the scope-checked HTTP wrapper. The pod identity is the
+    // supervisor's claim id (`req.pod_name` = WEFT_POD_NAME, what keys
+    // `infra_owner`), NOT the auth token's Pod name (which carries a
+    // ReplicaSet suffix and would never match the lease).
+    let outcome = crate::lifecycle_writes::set_status(&state.pool, &req)
         .await
-    } else {
-        // Autonomous health write: tenant scope already enforced
-        // above; no command to anchor to. Fence it against an
-        // in-flight user infra action: if any uncompleted
-        // infra_lifecycle_command targets this project/node, the
-        // lifecycle handler owns the status and the health reconcile
-        // must NOT write (it would clobber an apply/stop/terminate
-        // mid-flight). The supervisor's tick-level gate already skips
-        // these, but this closes the window between the dispatcher
-        // accepting the action and the command row existing: the
-        // EXISTS is evaluated atomically with the write, so a command
-        // that appeared after the supervisor's gate-read still blocks
-        // here. rows_affected=0 -> the supervisor logs + skips.
-        sqlx::query(&format!(
-            "UPDATE infra_node SET {set_clause} \
-             WHERE project_id = $5 AND node_id = $6 AND NOT EXISTS ( \
-               SELECT 1 FROM infra_lifecycle_command \
-               WHERE project_id = $5 \
-                 AND (node_id = $6 OR node_id IS NULL) \
-                 AND completed_at_unix IS NULL \
-             )"
-        ))
-        .bind(&unit_key)
-        .bind(req.status.as_str())
-        .bind(req.failure_stage.map(|s| s.as_str()))
-        .bind(req.failure_message.as_deref())
-        .bind(&req.project_id)
-        .bind(&req.node_id)
-        .execute(&state.pool)
-        .await
-    }
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    // rows_affected = 0 means one of:
-    //   - the infra_node row was removed (concurrent remove_node);
-    //   - (command branch) the lifecycle command was completed, named a
-    //     (project, node) that doesn't match, OR this pod no longer owns
-    //     the project (ownership moved to another supervisor mid-command);
-    //   - (autonomous branch) a user infra action's command is in
-    //     flight for this node, so the health reconcile must stand
-    //     down (the fence blocked it).
-    // All are "this caller's view is stale or it must not write right
-    // now"; surface as 410 so the supervisor logs + skips (and, for a
-    // lost-ownership command, leaves it uncompleted for the new owner).
-    if res.rows_affected() == 0 {
-        return Err((
-            StatusCode::GONE,
-            format!(
-                "set_status raced: infra_node row gone, command completed, \
-                 or project ownership moved (project={}, node={}, cmd={:?})",
-                req.project_id, req.node_id, req.command_id
-            ),
-        ));
-    }
+        .map_err(internal)?;
+    fenced_to_http(outcome, || {
+        format!(
+            "set_status(project={}, node={}, unit={:?}, cmd={:?})",
+            req.project_id, req.node_id, req.unit, req.command_id
+        )
+    })?;
     Ok(Json(SupervisorSetStatusResponse {}))
 }
 
-/// Atomic post-apply write of every infra_node field the supervisor
-/// produced: status=Running, instance_id, applied_spec_hash,
-/// endpoints, namespace. UPSERT keyed on (project_id, node_id).
 /// Write the `infra_node` row for an apply command, gated on the
 /// caller still owning the command's claim. Shared by
 /// `set_applied` (Running + hash/endpoints) and
@@ -1596,13 +1478,10 @@ async fn write_apply_row(
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     if res.rows_affected() == 0 {
-        return Err((
-            StatusCode::GONE,
-            format!(
-                "{op} raced: command id={command_id} already completed, or project \
-                 ownership moved away from {owner_pod}"
-            ),
-        ));
+        let outcome = crate::lifecycle_writes::stale_answer(&state.pool, owner_pod, project_id)
+            .await
+            .map_err(internal)?;
+        fenced_to_http(outcome, || format!("{op}(command id={command_id})"))?;
     }
     Ok(())
 }
@@ -1632,7 +1511,14 @@ pub async fn supervisor_set_applied(
         req.command_id,
         &req.pod_name,
         ApplyRowState {
-            status: weft_broker_client::protocol::InfraNodeStatus::Running.as_str(),
+            // Flaky if a frozen unit still is, Running otherwise: the
+            // node status must agree with the roster it is written with
+            // (the health reconcile only rewrites on per-unit drift, so
+            // a flat Running here would stand until the next edge).
+            status: weft_broker_client::protocol::InfraNodeStatus::applied_rollup(
+                req.units.values().map(|u| &u.status),
+            )
+            .as_str(),
             applied_spec_hash: Some(req.applied_spec_hash.clone()),
             stamp_applied_at: true,
             endpoints_json,
@@ -1789,52 +1675,26 @@ pub async fn supervisor_project_image_tags(
     // No row = project doesn't exist; broker returns empty tags
     // (the supervisor's caller will surface "MissingLocalImage"
     // downstream against a clear context). Row exists but decode
-    // fails = schema drift; fail loud rather than coerce to empty
-    // (which would mask the real cause).
+    // fails = schema drift; fail loud through the canonical decode
+    // rather than coerce to empty (which would mask the real cause).
+    // A node missing from the decoded map is a legal empty (the
+    // project's map exists but this node hasn't been written).
     let tags: std::collections::HashMap<String, String> = match row {
         None => std::collections::HashMap::new(),
         Some(r) => {
             let value: serde_json::Value = r
                 .try_get("infra_image_tags_json")
                 .map_err(|e| internal(anyhow::anyhow!("decode infra_image_tags_json: {e}")))?;
-            // The column is structured as `{ node_id: { image_name: tag } }`.
-            // Treat NULL or empty-object as "no tags set yet" (legal
-            // for projects with no Local images). Anything else
-            // that isn't an object is corruption.
-            let outer = match value {
-                serde_json::Value::Null => return Ok(Json(SupervisorProjectImageTagsResponse {
-                    tags: Default::default(),
-                })),
-                serde_json::Value::Object(m) => m,
-                other => {
-                    return Err(internal(anyhow::anyhow!(
-                        "infra_image_tags_json for project={} is not an object: {other:?}",
-                        req.project_id
-                    )));
-                }
-            };
-            let Some(inner) = outer.get(&req.node_id) else {
-                return Ok(Json(SupervisorProjectImageTagsResponse {
-                    tags: Default::default(),
-                }));
-            };
-            let inner_obj = inner.as_object().ok_or_else(|| {
-                internal(anyhow::anyhow!(
-                    "infra_image_tags_json[{}] is not a string-to-string map",
-                    req.node_id
-                ))
-            })?;
-            let mut out = std::collections::HashMap::with_capacity(inner_obj.len());
-            for (k, v) in inner_obj {
-                let s = v.as_str().ok_or_else(|| {
-                    internal(anyhow::anyhow!(
-                        "infra_image_tags_json[{}][{k}] is not a string",
-                        req.node_id
-                    ))
-                })?;
-                out.insert(k.clone(), s.to_string());
-            }
-            out
+            weft_broker_client::protocol::decode_infra_image_tags(
+                value,
+                &format!("project={}", req.project_id),
+            )
+            .map_err(internal)?
+            .get(&req.node_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
         }
     };
     Ok(Json(SupervisorProjectImageTagsResponse { tags }))
@@ -2008,10 +1868,14 @@ pub async fn supervisor_remove_node(
     .await
     .map_err(|e| internal(anyhow::anyhow!("remove_node ownership check: {e}")))?;
     if !owns {
+        // 410 = displaced (see `fenced_to_http`; here the ownership check
+        // is explicit, so no second lookup). A row that is already gone
+        // is NOT stale for this write: the DELETE below simply removes
+        // nothing and reports `removed: false`.
         return Err((
             StatusCode::GONE,
             format!(
-                "remove_node rejected: {} no longer owns project {}",
+                "remove_node: {} no longer owns project {}",
                 req.pod_name, req.project_id
             ),
         ));
@@ -2196,60 +2060,16 @@ pub async fn supervisor_command_complete(
             .map_err(|e| internal(anyhow::anyhow!("decode tenant_id: {e}")))?,
     };
     scope::require_tenant_in_scope(&caller, &tenant_id)?;
-    // Supervisor completions: success (error=None), failure
-    // (error=Some), or a user-requested cancellation the supervisor
-    // honored mid-command (`cancelled=true`; `error` then carries the
-    // halt point as the outcome message, never counted as a failure).
-    use weft_broker_client::protocol::LifecycleOutcome;
-    let outcome = if req.cancelled {
-        LifecycleOutcome::Cancelled
-    } else {
-        match req.error {
-            Some(_) => LifecycleOutcome::Failed,
-            None => LifecycleOutcome::Succeeded,
-        }
-    };
-    // Ownership check: only the pod that currently OWNS the project may
-    // stamp the command terminal. A supervisor that lost ownership mid-
-    // command (drain / lease takeover) must NOT complete it: leaving it
-    // uncompleted is exactly what lets the new owner re-run and finish
-    // it (no user re-action). Combined with `completed_at_unix IS NULL`,
-    // this gives "exactly the current owner, exactly once."
-    // Ownership identity is the supervisor's claim id (`req.pod_name` =
-    // WEFT_POD_NAME, what keys `infra_owner`), not the auth token's Pod
-    // name (suffixed, never matches the lease). Tenant scope was already
-    // re-checked above via the token.
-    let res = sqlx::query(&format!(
-        "UPDATE infra_lifecycle_command \
-         SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
-             outcome = $1, \
-             outcome_message = $2 \
-         WHERE id = $3 \
-           AND completed_at_unix IS NULL \
-           AND {owns}",
-        owns = weft_broker_client::lifecycle_command::owns_project_predicate("$4", "project_id"),
-    ))
-    .bind(outcome.as_str())
-    .bind(req.error.as_deref())
-    .bind(req.command_id)
-    .bind(&req.pod_name)
-    .execute(&state.pool)
-    .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    // rows_affected=0 means the row was completed already, OR this pod
-    // no longer owns the project (ownership moved to a sibling). Either
-    // way this caller's view is stale; surface 410 so it aborts the
-    // command without completing it.
-    if res.rows_affected() == 0 {
-        return Err((
-            StatusCode::GONE,
-            format!(
-                "infra_lifecycle_command id={} not completable by {}: \
-                 either already completed or project ownership moved to another pod",
-                req.command_id, req.pod_name
-            ),
-        ));
-    }
+    // The terminal write, its ownership fence and its stale answers
+    // live in `lifecycle_writes::complete_command` (pool-level,
+    // db-tested). Ownership identity is the supervisor's claim id
+    // (`req.pod_name` = WEFT_POD_NAME, what keys `infra_owner`), not
+    // the auth token's Pod name (suffixed, never matches the lease).
+    // Tenant scope was already re-checked above via the token.
+    let outcome = crate::lifecycle_writes::complete_command(&state.pool, &req)
+        .await
+        .map_err(internal)?;
+    fenced_to_http(outcome, || format!("command_complete(id={})", req.command_id))?;
     Ok(Json(SupervisorCommandCompleteResponse {}))
 }
 

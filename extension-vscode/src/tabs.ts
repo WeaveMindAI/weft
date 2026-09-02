@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { canonicalPath } from './locations';
 
 /// Every open text-editor tab (with its group) whose document is `fsPath`.
 /// The one place that scans `tabGroups` for a text tab by path, so callers
@@ -9,11 +10,34 @@ import * as vscode from 'vscode';
 ///   - close all:   `tabGroups.close(textTabsForPath(p).map(e => e.tab))`
 export function textTabsForPath(
   fsPath: string,
-): { tab: vscode.Tab; group: vscode.TabGroup }[] {
+): { tab: vscode.Tab; group: vscode.TabGroup; uri: vscode.Uri }[] {
+  // Compare canonicalized on both sides: the tab may hold the symlinked
+  // workspace spelling while the caller holds the compiler's resolved
+  // path, and a raw compare would miss the open tab (piling up a second
+  // tab of the same file, the exact thing this helper exists to prevent).
+  // `uri` is the tab's own (possibly symlinked) spelling, handed out so
+  // callers need no re-narrowing cast to reach it.
+  const wanted = canonicalPath(fsPath);
   return vscode.window.tabGroups.all.flatMap((group) =>
-    group.tabs
-      .filter((tab) => tab.input instanceof vscode.TabInputText && tab.input.uri.fsPath === fsPath)
-      .map((tab) => ({ tab, group })),
+    group.tabs.flatMap((tab) =>
+      tab.input instanceof vscode.TabInputText
+        && canonicalPath(tab.input.uri.fsPath) === wanted
+        ? [{ tab, group, uri: tab.input.uri }]
+        : [],
+    ),
+  );
+}
+
+/// The canonical path of every open text-editor tab, in one scan. For
+/// callers checking MANY paths against the open set (a batch of closed
+/// tabs), where per-path `textTabsForPath` scans would multiply.
+export function openTextTabPaths(): Set<string> {
+  return new Set(
+    vscode.window.tabGroups.all.flatMap((group) =>
+      group.tabs
+        .filter((tab) => tab.input instanceof vscode.TabInputText)
+        .map((tab) => canonicalPath((tab.input as vscode.TabInputText).uri.fsPath)),
+    ),
   );
 }
 

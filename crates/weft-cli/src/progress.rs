@@ -68,6 +68,7 @@ pub enum ActionVerb {
 
 /// All phases any verb can emit. Closed enum so the extension's
 /// reducer covers every variant via match-exhaustiveness.
+// SYNC: Phase <-> packages/weft-graph/src/protocol.ts CliPhase
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {

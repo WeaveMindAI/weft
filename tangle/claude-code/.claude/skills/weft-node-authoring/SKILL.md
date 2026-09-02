@@ -1,0 +1,249 @@
+---
+name: weft-node-authoring
+description: The node authoring manual and the dispatch protocol. Read before dispatching a node-smith (writing the brief, reviewing the report) and when an expert writes a node by hand. The node-smith subagent reads this same file as its manual.
+---
+
+# Writing a custom node
+
+This file has two readers. Tangle reads the dispatch protocol and the review checklist; the `node-smith` subagent reads the manual below as its bible. An expert taking the hand reads the manual too. One file, one truth about how nodes are built.
+
+## The dispatch protocol (Tangle)
+
+A node is missing only after the catalog says so (a direct `metadata.json` read or a `catalog-scout` sweep). Then:
+
+1. **Design the contract yourself.** One job, in a sentence. Every input port (name, type, required or optional, exposure) and every output port (name, type). The service it wraps, if any. Anything the surrounding program depends on (a form schema, a trigger registration, infra). The contract is the interface other wires will attach to; it is never the specialist's to invent.
+2. **Dispatch one node-smith per node.** The brief is the contract plus the project context the specialist cannot see (what stage this node feeds, what the upstream types are). Several missing nodes go out in parallel, one specialist each; nodes that depend on each other's types go out in sequence.
+3. **Review the report** against the checklist below. A failed review is a new dispatch whose brief carries the previous attempt's folder, the critique, and what to keep; you never fix the specialist's node yourself unless the fix is one line and obvious, because the next dispatch will need to know the pattern anyway.
+4. **Wire it.** With the node green and in the catalog, it is a normal node type: read its `metadata.json` one more time as delivered, and write the weft code.
+
+The short-circuit: if the catalog already holds a node that does the job, no specialist is dispatched; you go straight to the weft code.
+
+### The review checklist
+
+You never trust a report you can re-verify for the cost of one command, and everything important here can be re-verified.
+
+**Re-verify first, always:**
+
+- Re-run the tests yourself: `weft test-node <Type>` (local tiers, fast, free). The quoted output in the report is a claim; your run is the verdict. A report that claimed green and runs red is redispatched with the dishonesty named as the finding.
+- Diff the delivered `metadata.json` against the report's port list yourself. Metadata drift (a port renamed or dropped between report and file) is redispatched.
+- Read every test and ask one question: how would this test fail? A test with no answer (runs the node, ignores the result, asserts nothing about the outputs) is not a test, whatever its name says.
+- `weft validate --file main.weft < main.weft` still passes with the node in the catalog, and `weft describe-nodes --node <Type> --compact` succeeds. The folder is under `nodes/`, never inside `nodes/base_catalog/`.
+
+**Then check the contract and the body:**
+
+- The contract held: no port renamed, added, or dropped; the one job is still the one job.
+- A skim of `mod.rs`: no fallbacks, no swallowed errors, no retry loops, no orchestration inside the body; failures are loud.
+- The live-tier tests are written (the real service path, with the service named and fixtures declared) and named in the report as not run: they spend real money, and the user runs them later through `/weft-live-test`.
+
+**The half-arsing catalog.** Each of these fails the review and goes back as a redispatch with the specific finding:
+
+- **smoke-only**: one test that runs the node once and asserts nothing.
+- **happy-path-only**: the error paths (the loud `node_bail!` failures) are never exercised.
+- **no closure test**: nothing covers an optional input arriving closed.
+- **weakened assertions**: the test checks that an output exists, not that it holds the expected value.
+- **swallowed in the test**: patterns like `if let Err(_) = ... {}` that pass on failure.
+- **coverage gap against the contract**: a port behavior in the contract with no test that would fail if it broke. Count the tests against the ports; the count should make sense.
+- **live tests missing or hollow**: the contract names a service but there is no `NodeTest::live` entry for it, or the entry declares no service and no fixtures.
+- **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and the report did not say so.
+- **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) is a patch on the symptom and fails the review on both counts.
+- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node.
+
+The redispatch brief carries the previous attempt's folder, the specific finding (not "do better"), and what to keep. A redispatch that comes back with the same finding gets the finding restated in one sentence and nothing else; the third identical failure comes back to the user as "this contract is not landing, here is what I suspect", because at that point the blocker is probably real.
+
+If the report is blocked rather than green, judge the blocker: a real impossibility comes back to the user as "this cannot be done honestly, here is the closest shape"; a soft blocker (missing docs, rig limits) goes back out with what you know.
+
+## The manual
+
+A node does one thing: calls an API, transcribes audio, writes a row. It
+never orchestrates (looping, retrying, branching, waiting for a person are
+the graph's job, and the engine gives journaling, resumability, and
+cancellation for free) and it never does plumbing (transport, credentials,
+acknowledgement protocols, subscriptions, retry bookkeeping are the
+language's). A real node body is usually under a hundred lines.
+
+When the catalog lacks a capability, the node goes in this project's `nodes/`
+folder and is immediately usable by its `type` name. Nothing outside the
+project folder is reached; the build compiles the node's Rust directly.
+
+## Anatomy
+
+A node is a directory (folder snake_case, `"type"` PascalCase, struct
+`<Type>Node`):
+
+```
+nodes/my_thing/
+  metadata.json    the declared surface: ports, config, presentation
+  mod.rs           the Rust body, a Node trait impl
+  deps.toml        optional: extra cargo crates, OS packages, build env
+  tests.rs         optional: the node's own tests
+```
+
+A package is a directory with `package.toml` (`[package] name`, shared
+`[dependencies]`); members are auto-detected as immediate subdirs holding a
+`metadata.json`; shared `.rs` files at the package root are reached by
+members as `use super::<file>;`. A package root may hold a partial
+`metadata.json` of defaults every member inherits (key-by-key, member wins;
+`type`/`label`/`description` are never inherited). Never place any of this
+under `nodes/base_catalog/`: it is wiped by `weft catalog update`.
+
+`weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow`, `tracing`,
+`uuid` are always available without declaring them.
+
+## metadata.json
+
+Unknown keys are a loud parse error. Top level:
+
+| Key | Meaning |
+|---|---|
+| `type`, `label`, `description` | identity, required |
+| `tags`, `icon`, `color` | search and presentation |
+| `inputs` | one list for wired data and design-time config |
+| `outputs` | output ports |
+| `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
+| `features` | flags: `isTrigger`, `isOutputDefault`, `canAddInputPorts`, `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint`, `castPorts`, `hidden` |
+| `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
+| `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
+| `validate` | declarative rules: `{ "when": {...}, "then": {message, level: "structural"\|"runtime", field} }` |
+| `requires_infra`, `images`, `publishes` | infra nodes |
+| `service` | access nodes only, the connection recipe |
+| `accessApps` | project-shipped OAuth apps |
+
+Input entry: `name`, `type`, `required`, `exposure` (`all`, `assignment`,
+`config`, `wire`), `widget`, `default`, `label`, `placeholder`,
+`description`, `requiresScopes`, `requiresValues`. Output entry: `name`,
+`type`, `required`, `description`.
+
+A minimal, real example (the catalog's `Text`):
+
+```json
+{
+  "type": "Text",
+  "label": "Text",
+  "description": "Emit a literal string.",
+  "tags": ["literal", "string"],
+  "icon": "Type",
+  "color": "#64748b",
+  "inputs": [
+    { "name": "value", "type": "String", "widget": { "kind": "textarea" },
+      "required": true, "exposure": "config", "label": "Value" }
+  ],
+  "outputs": [
+    { "name": "value", "type": "String", "required": false }
+  ],
+  "requires_infra": false
+}
+```
+
+## mod.rs
+
+```rust
+//! One doc line saying what the node does.
+
+use async_trait::async_trait;
+
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::node::NodeOutput;
+
+#[derive(NodeManifest)]
+pub struct MyThingNode;
+
+#[cfg(feature = "node-tests")]
+mod tests;
+
+#[async_trait]
+impl Node for MyThingNode {
+    #[cfg(feature = "node-tests")]
+    fn tests(&self) -> Vec<weft::NodeTest> { tests::tests() }
+
+    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        let value: String = ctx.inputs.get("value")?;
+        ctx.pulse_downstream(NodeOutput::new().set("out", value)).await
+    }
+}
+```
+
+The `NodeManifest` derive embeds the sibling `metadata.json` at compile time
+(a missing or malformed file is a compile error), so the manifest and the
+catalog are one document. Ports are camelCase in JSON, and `ctx.inputs` is
+keyed by them.
+
+Config and wired inputs are one bag: `ctx.inputs.get::<T>("name")` returns
+the value however it arrived (wire, braces literal, assignment literal, or
+the declared `default`).
+
+Fail loudly, always: `WeftResult<()>`; `ctx.inputs.get(...)?` stamps its own
+errors; `node_bail!("message")` for conditions the node detects;
+`.node_err("context")?` wraps an external error with context. A node body
+never names a `WeftError` variant and never falls back to a default: a
+failure is recorded in the journal where the user reads it.
+
+Emit only through `ctx.pulse_downstream(NodeOutput::new().set(port, value))`;
+ports you did not emit are closed, which is the skip signal downstream. For
+user-added output ports use `ctx.fan_declared(...)`. Long external work runs
+under `tokio::select!` against `ctx.cancellation().cancelled_err()` so a
+cancelled execution stops mid-flight. Work that must not happen twice across
+a restart goes through `ctx.run(...)`, which replays the recorded result.
+
+## The special shapes
+
+**Access node**: the whole body is `weft::access_node!(MyServiceAccessNode);`
+plus a `service` recipe in metadata (acquisition fields with `secret: true`,
+auth steps, a test URL, an identity template). The macro reads the `account`
+input and pulses it on `access`. Credentials live sealed in the runtime's
+access store, never in the project. Declaring the `service` block is
+sufficient: the compiler synthesizes the runtime "no connection picked"
+rule from it. You never write that rule by hand (a hand-written one is a
+finding, not a feature), and `"connection_optional": true` inside the
+service block is reserved for a node that genuinely runs unconnected.
+An optional-connection node is the one access shape the macro cannot
+serve: `access_node!` on a `connection_optional` service fails loudly at
+run time. Such a node writes its own body and reads the pick with
+`ctx.inputs.access("<picker input>")?`, which returns `None` when nothing
+is picked.
+
+**Infra node**: `"requires_infra": true`, plus `images` (dirs with a
+Dockerfile the CLI builds) and `publishes` (the service name it hands out).
+Implement `async fn provision_infra(&self, ctx, input) -> WeftResult<InfraSpec>`
+returning the desired-state spec; the engine applies it, then calls `run`.
+
+**Trigger**: `"features": { "isTrigger": true }` and implement
+`async fn setup_trigger(&self, ctx)`, called instead of `run` at activation,
+where the node registers its wake signal. Polling triggers carry an
+`intervalSecs` config; activation starts from now, history never replays.
+
+## deps.toml
+
+```toml
+[dependencies]
+regex = "1"
+
+[system.runtime.apt]
+debian_12 = ["libpq5"]
+```
+
+Sections: `[dependencies]` (cargo), `[build-dependencies]`, `[system.build]`
+/ `[system.runtime]` (OS packages per manager: `apt`, `apk`, `yum`, `brew`,
+keyed by distro like `debian_12`, `ubuntu_24_04`, `alpine_3_19`, or
+`default`), `[build.env]`.
+
+## Tests
+
+`tests.rs` exports `pub fn tests() -> Vec<NodeTest>`. Each fake test is an
+`async fn(rig: FakeRig) -> WeftResult<()>` driving the node with
+`rig.run(&MyThingNode, json!({...})).await` and asserting on the result, and
+`NodeTest::live(...)` is the real-credential tier. The three tiers: `basic`
+(no external world at all), `fake` (a stubbed client), `live` (the real
+service, real credentials, real money: write these tests, name the service,
+declare any fixtures the test cannot self-provide; the user runs them, with
+consent, through `/weft-live-test`). A test name states its assertion
+("a_matching_case_takes_its_branch", not "test_switch"). Run the local tiers
+with `weft test-node <type-or-package>`; the `live` tier spends money and
+asks first. Write tests for a node the same change you write the node.
+
+## After writing the node
+
+The catalog walk picks the folder up automatically; no registration exists.
+Check it landed: `weft describe-nodes --node MyThing --compact` must
+succeed, or re-run `weft validate`, which compiles against `nodes/` fresh. Then use the
+type in `main.weft` like any catalog node. Custom type names must not collide
+with existing ones (loud error, no shadowing).

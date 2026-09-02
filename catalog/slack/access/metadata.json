@@ -409,21 +409,5 @@
       "required": false,
       "description": "The workspace's access: wire it into Slack action nodes."
     }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "SlackAccess '{id}' has no connected workspace; connect one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
-    }
   ]
 }

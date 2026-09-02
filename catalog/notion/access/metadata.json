@@ -101,21 +101,5 @@
       "required": false,
       "description": "The Notion access: wire it into the Notion nodes."
     }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "NotionAccess '{id}' has no connected workspace; connect one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
-    }
   ]
 }

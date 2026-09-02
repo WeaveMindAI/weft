@@ -72,6 +72,26 @@ pub fn truncate_user_string(s: &str, max_bytes: usize) -> String {
     format!("{}... [truncated, original {} bytes]", &s[..end], s.len())
 }
 
+/// True if `s` is a plain Rust identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+/// Every name codegen interpolates into generated Rust source (a
+/// node's `node_type`, a shared file's module stem) must pass this,
+/// so a bad name fails at discovery/emit with the offending file
+/// named instead of surfacing as a confusing rustc error deep inside
+/// generated code. Also the grammar of every bare name the language
+/// admits (ports, entry keys, connection segments), via the
+/// compiler's `is_bare_ident` re-export. Lives in the pure type layer
+/// so the parse-only build (which carries no catalog crate) has it too.
+/// SYNC: bare-ident grammar <->
+///       packages/weft-graph/src/webview/lib/utils/port-specs.ts (isValidFieldKey)
+pub fn is_rust_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 // Re-export `inventory` so the `register_signal_kind!` macro
 // expanded in third-party crates (or other workspace crates) can
 // reach the same crate version without adding a direct dep.
@@ -174,6 +194,16 @@ pub type Color = uuid::Uuid;
 #[cfg(test)]
 mod helper_tests {
     use super::*;
+
+    #[test]
+    fn rust_identifier_check() {
+        for ok in ["Text", "SlackSendMessage", "_hidden", "a1", "A_b_2"] {
+            assert!(is_rust_identifier(ok), "{ok} should pass");
+        }
+        for bad in ["", "1abc", "my-node", "my.node", "with space", "émoji", "a\"b"] {
+            assert!(!is_rust_identifier(bad), "{bad} should fail");
+        }
+    }
 
     #[test]
     fn truncate_user_string_short_passes_through() {

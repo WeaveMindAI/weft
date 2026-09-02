@@ -703,6 +703,33 @@ pub struct ValueBag {
     /// so [`Self::custom`] can hand back just the instance data. Empty
     /// on wake and nested bags.
     spec_names: std::collections::HashSet<String>,
+    /// The node's access (connection-picker) inputs, keyed by input
+    /// name, carrying what the compiler stamped from the service
+    /// recipe. [`Self::access`] reads the pick through this, so the
+    /// metadata's `connection_optional` is the single source of truth
+    /// for whether a node runs unconnected: no body restates it.
+    /// pub(crate): the node-test rig builds its bag from the manifest
+    /// and fills this from the recipe, the same facts enrich stamps.
+    pub(crate) access_ports: std::collections::BTreeMap<String, AccessPort>,
+}
+
+/// What [`ValueBag::access`] knows about one access input: the service
+/// the widget was stamped with and whether the recipe declared the
+/// connection optional.
+#[derive(Debug, Clone)]
+pub struct AccessPort {
+    pub service: String,
+    pub optional: bool,
+}
+
+impl AccessPort {
+    /// The bag entry a service recipe implies: the same two facts
+    /// enrich stamps onto the access widget. The node-test rig (which
+    /// runs with no enrich pass) fills its bag through this, so the
+    /// two derivations cannot drift.
+    pub fn from_recipe(spec: &crate::access::spec::AccessSpec) -> Self {
+        Self { service: spec.service.clone(), optional: spec.connection_optional }
+    }
 }
 
 impl ValueBag {
@@ -711,7 +738,14 @@ impl ValueBag {
         spec_names: std::collections::HashSet<String>,
         order: Vec<String>,
     ) -> Self {
-        Self { values, order: Some(order), side: BagSide::Inputs, no_record: None, spec_names }
+        Self {
+            values,
+            order: Some(order),
+            side: BagSide::Inputs,
+            no_record: None,
+            spec_names,
+            access_ports: Default::default(),
+        }
     }
 
     /// The wake bag: the fire payload's top-level fields when the
@@ -726,7 +760,14 @@ impl ValueBag {
             None => Some("no wake payload was delivered for this firing".into()),
         };
         let values = payload.and_then(Value::as_object).cloned().unwrap_or_default();
-        Self { values, order: None, side: BagSide::Wake, no_record, spec_names: Default::default() }
+        Self {
+            values,
+            order: None,
+            side: BagSide::Wake,
+            no_record,
+            spec_names: Default::default(),
+            access_ports: Default::default(),
+        }
     }
 
     /// The whole bag as one record. The inputs bag always has one; a
@@ -815,6 +856,30 @@ impl ValueBag {
             .collect()
     }
 
+    /// Read the picked connection on the access input `name`. `Some`
+    /// when a connection is picked; `None` when none is AND the service
+    /// recipe declared `connection_optional` (the node runs
+    /// unconnected). A missing pick on a required connection errors
+    /// naming the service, and reading a non-access input this way is
+    /// its own loud error. The metadata is the single source of truth:
+    /// no node body declares whether its connection is required.
+    pub fn access(&self, name: &str) -> WeftResult<Option<crate::access::Access>> {
+        let Some(port) = self.access_ports.get(name) else {
+            return Err(self.err(format!(
+                "{} '{name}' is not an access (connection picker) input",
+                self.noun()
+            )));
+        };
+        match self.opt::<crate::access::Access>(name)? {
+            Some(marker) => Ok(Some(marker)),
+            None if port.optional => Ok(None),
+            None => Err(self.err(format!(
+                "no {} connection picked; connect one on the node",
+                port.service
+            ))),
+        }
+    }
+
     /// The raw value behind `name`, if any. For pass-through reads that
     /// must not reinterpret the value; a REQUIRED raw read is
     /// `get::<Value>(name)`.
@@ -838,7 +903,14 @@ impl ValueBag {
                 )))
             }
         };
-        Ok(Self { values, order: None, side: self.side, no_record: None, spec_names: Default::default() })
+        Ok(Self {
+            values,
+            order: None,
+            side: self.side,
+            no_record: None,
+            spec_names: Default::default(),
+            access_ports: Default::default(),
+        })
     }
 
     /// Iterate over every named value (name + raw value), the node's
@@ -952,9 +1024,14 @@ pub fn node_input_bag(
     // reads (the label is an editor-side display cache, never data).
     // The rewrite exists only in the bag; the config value on disk /
     // in the journal is untouched.
+    let mut access_ports = std::collections::BTreeMap::new();
     for input in &node.inputs {
         match &input.widget {
-            Some(crate::node::Widget::Access { service: Some(service) }) => {
+            Some(crate::node::Widget::Access { service: Some(service), optional }) => {
+                access_ports.insert(
+                    input.name.clone(),
+                    AccessPort { service: service.clone(), optional: *optional },
+                );
                 let Some(obj) = delivered.get(&input.name).and_then(Value::as_object) else {
                     // Not connected yet: leave the input absent so a
                     // REQUIRED read errors as a missing input, and an
@@ -977,7 +1054,7 @@ pub fn node_input_bag(
             // reaching a firing without one is a broken node spec, and
             // building a marker without a service would misroute every
             // downstream resolution.
-            Some(crate::node::Widget::Access { service: None }) => {
+            Some(crate::node::Widget::Access { service: None, .. }) => {
                 return Err(format!(
                     "input '{}': access widget carries no service stamp (the compiler \
                      stamps it from the node metadata's `service` recipe); the node spec \
@@ -1031,7 +1108,9 @@ pub fn node_input_bag(
         .map(|i| i.name.clone())
         .filter(|name| name != crate::exec::skip::SHOULD_FLOW_PORT)
         .collect();
-    Ok(ValueBag::inputs(delivered, spec_names, order))
+    let mut bag = ValueBag::inputs(delivered, spec_names, order);
+    bag.access_ports = access_ports;
+    Ok(bag)
 }
 
 /// A consumer input declaring `requiresScopes`/`requiresValues` stamps
@@ -2192,6 +2271,46 @@ mod node_input_bag_tests {
 
     fn delivered(values: serde_json::Value) -> serde_json::Map<String, Value> {
         values.as_object().unwrap().clone()
+    }
+
+    /// A node whose one input carries a stamped access widget.
+    fn access_node(optional: bool, config: serde_json::Value) -> crate::project::NodeDefinition {
+        serde_json::from_value(json!({
+            "id": "n1", "nodeType": "Test", "label": null,
+            "config": config, "position": {"x": 0.0, "y": 0.0},
+            "inputs": [{
+                "name": "account", "portType": "Access", "required": false,
+                "widget": { "kind": "access", "service": "slack", "optional": optional }
+            }],
+            "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
+            "requiresInfra": false, "images": []
+        }))
+        .expect("test access node")
+    }
+
+    /// The four arms of [`ValueBag::access`]: picked, optional and
+    /// unpicked, required and unpicked (errors naming the service),
+    /// and a non-access input (its own loud error).
+    #[test]
+    fn access_reads_the_pick_through_the_stamped_port() {
+        let picked = access_node(false, json!({"account": {"id": "g-1", "identity": "Q"}}));
+        let bag = node_input_bag(&picked, delivered(json!({})), &[]).expect("bag");
+        let marker = bag.access("account").expect("read").expect("picked");
+        assert_eq!(marker.service(), "slack");
+
+        let optional = access_node(true, json!({}));
+        let bag = node_input_bag(&optional, delivered(json!({})), &[]).expect("bag");
+        assert!(bag.access("account").expect("read").is_none(), "optional + unpicked = None");
+
+        let required = access_node(false, json!({}));
+        let bag = node_input_bag(&required, delivered(json!({})), &[]).expect("bag");
+        let err = bag.access("account").unwrap_err().to_string();
+        assert!(err.contains("no slack connection picked"), "{err}");
+
+        let plain = node(&[("prompt", None)], json!({}));
+        let bag = node_input_bag(&plain, delivered(json!({})), &[]).expect("bag");
+        let err = bag.access("prompt").unwrap_err().to_string();
+        assert!(err.contains("not an access (connection picker) input"), "{err}");
     }
 
     /// Delivered values and braces config values land in the ONE bag;

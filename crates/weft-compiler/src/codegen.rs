@@ -516,7 +516,7 @@ fn write_package_lib_rs(
         // The stem becomes a generated `pub mod {mod_name};`, so a
         // stem that is not a plain identifier must fail here, naming
         // the file, instead of as a rustc error inside the crate.
-        if !weft_catalog::is_rust_identifier(mod_name) {
+        if !weft_core::is_rust_identifier(mod_name) {
             return Err(CompileError::Build(format!(
                 "package {}: shared file {} would become module `{mod_name}`, \
                  which is not a valid Rust identifier ([A-Za-z_][A-Za-z0-9_]*); \
@@ -1513,6 +1513,7 @@ mod tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            source_file: None,
         }
     }
 

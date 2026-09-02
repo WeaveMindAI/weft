@@ -18,9 +18,10 @@ use sqlx::PgPool;
 
 use weft_access_store::{
     begin_oauth, complete_oauth, connect_direct, delete_grant, list_grants, lookup,
-    resolve_for_worker, take_connect_result, AccessError, BeginOAuth, ConnectDirect,
+    resolve_for_worker, take_connect_result, AccessError,
 };
 use weft_core::access::spec::Door;
+use weft_core::access::wire::{BeginOAuth, ConnectDirect, GrantSummary};
 use weft_core::{AccessSpec, AppRegistration, CredentialOwner};
 
 /// The app a project declares for the OAuth fixture service (client id +
@@ -209,7 +210,7 @@ async fn full_consent(
     spec: &AccessSpec,
     scopes: &[&str],
     upgrade: Option<uuid::Uuid>,
-) -> anyhow::Result<weft_access_store::GrantSummary> {
+) -> anyhow::Result<GrantSummary> {
     let started = begin_oauth(
         pool,
         tenant,
@@ -1636,13 +1637,13 @@ async fn publishing_twice_updates_one_connection(pool: PgPool) {
     assert_eq!(second.grant.identity.as_deref(), Some("db.new"));
     assert_eq!(list_grants(&pool, TENANT_A, Some("selfrun")).await.unwrap().len(), 1);
 
-    let found = weft_access_store::published_grant(&pool, TENANT_A, "project-1", "db", "selfrun")
+    let found = weft_access_store::published_connection(&pool, TENANT_A, "project-1", "db", "selfrun")
         .await
         .expect("look up")
         .expect("the node finds what it published");
-    assert_eq!(found.id, first.grant.id);
+    assert_eq!(found.connection_id, first.grant.id.to_string());
     assert!(
-        weft_access_store::published_grant(&pool, TENANT_A, "project-1", "other", "selfrun")
+        weft_access_store::published_connection(&pool, TENANT_A, "project-1", "other", "selfrun")
             .await
             .unwrap()
             .is_none(),

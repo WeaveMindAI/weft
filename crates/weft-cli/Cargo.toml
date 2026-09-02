@@ -34,6 +34,10 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 # User-level CLI settings file (`~/.config/weft/cli.toml`).
 toml = { workspace = true }
+# Hidden-echo terminal input for pasted credentials (`weft connect`).
+rpassword = { workspace = true }
+# Open the browser on the OAuth consent URL (`weft connect`).
+open = { workspace = true }
 sha2 = { workspace = true }
 ipnet = { workspace = true }
 

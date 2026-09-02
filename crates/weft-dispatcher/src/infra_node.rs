@@ -87,49 +87,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     seed: &[],
 };
 
-/// Upsert a row in `infra_node`. Used by the apply task's status
-/// transitions and by the supervisor's lifecycle commands. The
-/// caller supplies the full target state; this function overwrites
-/// all columns (idempotent UPSERT on the (project, node) key).
-pub async fn upsert(pool: &PgPool, row: &InfraNodeRow) -> Result<()> {
-    let endpoints_json = serde_json::to_value(&row.endpoints)?;
-    let preserve_pvcs_json = serde_json::to_value(&row.preserve_pvcs)?;
-    let units_json = serde_json::to_value(&row.units)?;
-    sqlx::query(
-        "INSERT INTO infra_node \
-         (project_id, node_id, instance_id, namespace, status, \
-          failure_stage, failure_message, applied_spec_hash, \
-          applied_at_unix, endpoints_json, preserve_pvcs_json, units_json) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-         ON CONFLICT (project_id, node_id) DO UPDATE SET \
-            instance_id        = EXCLUDED.instance_id, \
-            namespace          = EXCLUDED.namespace, \
-            status             = EXCLUDED.status, \
-            failure_stage      = EXCLUDED.failure_stage, \
-            failure_message    = EXCLUDED.failure_message, \
-            applied_spec_hash  = EXCLUDED.applied_spec_hash, \
-            applied_at_unix    = EXCLUDED.applied_at_unix, \
-            endpoints_json     = EXCLUDED.endpoints_json, \
-            preserve_pvcs_json = EXCLUDED.preserve_pvcs_json, \
-            units_json         = EXCLUDED.units_json",
-    )
-    .bind(&row.project_id)
-    .bind(&row.node_id)
-    .bind(&row.instance_id)
-    .bind(&row.namespace)
-    .bind(row.status.as_str())
-    .bind(row.failure_stage.map(|f| f.as_str()))
-    .bind(row.failure_message.as_deref())
-    .bind(row.applied_spec_hash.as_deref())
-    .bind(row.applied_at_unix)
-    .bind(endpoints_json)
-    .bind(preserve_pvcs_json)
-    .bind(units_json)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 /// Update just the status column. Idempotent: identical writes
 /// produce no observable effect. Used by the supervisor and the
 /// stop/terminate API handlers for transient states like Stopping.
@@ -299,13 +256,7 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
             )
         })?;
     let units_json: Value = row.try_get("units_json")?;
-    let units: BTreeMap<String, UnitRuntime> = serde_json::from_value(units_json)
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "infra_node.units_json for project={project_id} node={node_id} \
-                 is not a unit-name-to-UnitRuntime map: {e}"
-            )
-        })?;
+    let units = weft_broker_client::protocol::decode_units_json(units_json, &project_id, &node_id)?;
     Ok(InfraNodeRow {
         project_id,
         node_id,

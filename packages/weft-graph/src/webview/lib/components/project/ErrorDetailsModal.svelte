@@ -7,17 +7,25 @@
 
 	import { CircleAlert, Copy, Check, X as XIcon } from '@lucide/svelte';
 	import * as Dialog from '../ui/dialog';
-	import type { ActionBarError } from '../../../../protocol';
+	import type { ActionBarError, SourceLocation } from '../../../../protocol';
 
 	let {
 		error,
 		open = $bindable(),
 		onDismissError,
+		onOpenLocation,
 	}: {
 		error: ActionBarError | undefined;
 		open: boolean;
 		onDismissError: () => void;
+		onOpenLocation: (location: SourceLocation) => void;
 	} = $props();
+
+	/// A location's `file` is a full path; the row shows just the file
+	/// name (the full path rides the hover title and the copy text).
+	function basename(p: string): string {
+		return p.split('/').pop()?.split('\\').pop() ?? p;
+	}
 
 	const details = $derived(error?.details);
 	const diagnostics = $derived(details?.diagnostics ?? []);
@@ -164,9 +172,15 @@
 										<span class="text-[10px] font-mono px-1.5 py-0.5 rounded bg-zinc-100 text-zinc-600">{d.code}</span>
 									{/if}
 									{#if d.location}
-										<span class="text-[10px] font-mono text-zinc-500">
-											{d.location.file}:{d.location.line}:{d.location.column}
-										</span>
+										{@const loc = d.location}
+										<button
+											type="button"
+											class="text-[10px] font-mono text-zinc-500 hover:text-zinc-800 hover:underline"
+											title="Open {loc.file} in the source editor"
+											onclick={() => onOpenLocation(loc)}
+										>
+											{basename(loc.file)}:{loc.line}:{loc.column}
+										</button>
 									{/if}
 								</div>
 								<div class="mt-1.5 text-xs {severityColor(d.severity)} break-words">{d.message}</div>

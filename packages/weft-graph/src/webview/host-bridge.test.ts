@@ -26,9 +26,14 @@ describe('translateProject', () => {
               name: 'systemPrompt', portType: 'String', required: false,
               exposure: 'all', widget: { kind: 'textarea' }, default: 'be nice',
               label: 'System prompt', placeholder: 'You are...',
+              declaredType: 'String',
+              fromSpec: true, requiresScopes: ['chat:write'], requiresValues: { team: 'x' },
             },
           ],
-          outputs: [],
+          outputs: [
+            { name: 'haiku', portType: 'String', required: false, declaredType: 'String' },
+            { name: 'response', portType: 'Number', required: false },
+          ],
           features: {},
           portLiterals: { systemPrompt: 'test' },
           portLiteralSpans: {
@@ -54,6 +59,21 @@ describe('translateProject', () => {
     expect(node.inputs[0].default).toBe('be nice');
     expect(node.inputs[0].label).toBe('System prompt');
     expect(node.inputs[0].placeholder).toBe('You are...');
+    // `declaredType` survives on both sides. When the translation
+    // dropped it, every parse round-trip un-declared every header
+    // port, and the next ports gesture rewrote the header without
+    // them: custom ports silently vanished from the source.
+    expect(node.inputs[0].declaredType).toBe('String');
+    expect(node.outputs[0].declaredType).toBe('String');
+    expect(node.outputs[1].declaredType).toBeUndefined();
+    // The permission-shortfall fields survive too (the same old copy
+    // dropped them, deadening the shortfall check on parsed nodes).
+    expect(node.inputs[0].fromSpec).toBe(true);
+    expect(node.inputs[0].requiresScopes).toEqual(['chat:write']);
+    expect(node.inputs[0].requiresValues).toEqual({ team: 'x' });
+    // Every port is a FRESH object: the projection mutates the graph in
+    // place and must never alias the parse message.
+    expect(node.inputs[0]).not.toBe(host.nodes[0].inputs[0]);
   });
 
   it('labels a group by its local id segment, never the full dotted path', () => {

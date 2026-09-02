@@ -25,7 +25,7 @@ CLI.
 | `weft executions [--limit N]` | recent executions |
 | `weft events <color>` | every journal event for one execution, in order |
 | `weft logs [color]` | log lines |
-| `weft clean [color]` | purge journal data. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images`, `--build-cache`. |
+| `weft clean [color]` | purge journal data. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images` (reclaim worker images nothing runs any more, scoped to the current project's images; a global sweep of dangling untagged build leftovers rides along. With `--all`: every project's, the kind node's copies, stale `weft-infra-*` tags, and old builder-base images; whatever the dispatcher's referenced set covers survives) and `--build-cache`. `setup.sh` runs `--images --all` after every daemon refresh. |
 
 ## Triggers
 
@@ -101,7 +101,7 @@ Aliased to `weft d`.
 | `weft test-node [target]` | run node self-tests: the basic and fake tiers, locally, no cluster. `--tier live` adds the real-credential tier, which **can spend money**, so it asks first (`--yes` to skip the prompt). See [Testing a node](../nodes/testing.md). |
 | `weft node-test-hash [target]` | the content hash of a package's test inputs. Run it when you want to know whether anything a package's tests depend on has changed since they last passed. |
 | `weft catalog update` | re-sync `nodes/base_catalog/` to the installed weft's standard library. It **wipes and recopies** that folder, so copy anything you edited in there out first. |
-| `weft describe-nodes [--stdlib]` | print the catalog as JSON. This is how you hand a model the full node vocabulary. |
+| `weft describe-nodes [--stdlib] [--node <Type>] [--compact]` | print the catalog as JSON. This is how you hand a model the full node vocabulary. `--compact` strips it to the wiring view (no labels, icons, connect recipes, or null knobs) so the vocabulary costs a fraction of the tokens; `--node` prints one type only. |
 
 ## Compiler surfaces
 
@@ -118,6 +118,7 @@ answers on incomplete source; `validate` is strict.
 
 | Command | What it does |
 |---|---|
+| `weft connect` | the editor's Connect panel, in the terminal: pick a stored connection for an access node, connect a new account (paste a key, browser sign-in, shared app), upgrade one, forget one, or disconnect the node. Sees access nodes inside `@include`d files too, however deeply nested; a subgraph included in two places is one file, so one pick connects every inclusion. Interactive by default; every choice has a flag (`--help` lists them) so scripts never hang on a prompt. `--json` works with the flag-driven actions (`--list`, `--grant`, `--disconnect`, `--forget`); the walkthroughs print for a person. |
 | `weft files ls` | stored runtime files |
 | `weft files inspect <key>` | one file's metadata |
 | `weft files download <key>` | fetch it |

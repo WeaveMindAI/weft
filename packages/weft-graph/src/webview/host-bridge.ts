@@ -35,23 +35,16 @@ export function boundaryOutId(groupId: string): string {
   return `${groupId}${BOUNDARY_OUT}`;
 }
 
-function toV1Port(p: HostPort | HostInput): V1Port {
-  // An INPUT additionally carries its resolved editor surface
-  // (exposure/widget/default/label/placeholder); a pure wire port
-  // (outputs, group interfaces) leaves those absent.
-  const input = p as HostInput;
-  return {
-    name: p.name,
-    portType: p.portType,
-    required: p.required,
-    description: p.description ?? undefined,
-    exposure: input.exposure,
-    widget: input.widget,
-    default: input.default,
-    label: input.label,
-    placeholder: input.placeholder,
-    synthesizedFromCarry: p.synthesizedFromCarry,
-  };
+/// A FRESH top-level copy of a wire port. The render shape IS the
+/// wire's `InputDefinition` (an output/group port rides it with the
+/// input-only members absent), so a generic spread carries every field
+/// and adding one needs no edit here; a field-by-field copy here once
+/// silently dropped several. The copy keeps the mutated-in-place render
+/// graph from aliasing the parse message; it is shallow, which holds
+/// because the projection only ever replaces whole port fields, never
+/// mutates inside one.
+function copyPort(p: HostPort | HostInput): V1Port {
+  return { ...p };
 }
 
 function toV1Edge(e: HostEdge, groupIds: Set<string>): V1Edge {
@@ -164,8 +157,8 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     // node's do, so everything downstream reads one place for both.
     portLiterals: g.portLiterals,
     portLiteralSpans: g.portLiteralSpans,
-    inputs: g.inPorts.map(toV1Port),
-    outputs: g.outPorts.map(toV1Port),
+    inputs: g.inPorts.map(copyPort),
+    outputs: g.outPorts.map(copyPort),
     features: {
       oneOfRequired: g.oneOfRequired,
     },
@@ -209,8 +202,8 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     portLiteralSpans: n.portLiteralSpans,
     position: n.position,
     parentId,
-    inputs: n.inputs.map(toV1Port),
-    outputs: n.outputs.map(toV1Port),
+    inputs: n.inputs.map(copyPort),
+    outputs: n.outputs.map(copyPort),
     features: n.features,
     scope: n.scope,
     groupBoundary: n.groupBoundary ?? undefined,

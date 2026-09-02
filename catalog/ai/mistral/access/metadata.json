@@ -69,21 +69,5 @@
       "required": false,
       "description": "The Mistral access: wire it into Parse Document."
     }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "MistralAccess '{id}' has no connected account; connect one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
-    }
   ]
 }

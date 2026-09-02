@@ -1258,7 +1258,17 @@ fn manifest_input_bag(
             order.push(name.clone());
         }
     }
-    Ok((ValueBag::inputs(delivered, spec_names, order), feeds))
+    let mut bag = ValueBag::inputs(delivered, spec_names, order);
+    // The production bag reads the picker off the enrich-stamped widget;
+    // a rig run has no enrich pass, so fill the same facts straight from
+    // the manifest's recipe (the stamp's source).
+    if let Some(spec) = &manifest.service {
+        if let Some(input) = manifest.access_input() {
+            bag.access_ports
+                .insert(input.name.clone(), crate::context::AccessPort::from_recipe(spec));
+        }
+    }
+    Ok((bag, feeds))
 }
 
 /// The generator-feed registrations one rig run installed. OWNS the

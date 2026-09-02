@@ -57,21 +57,5 @@
       "required": false,
       "description": "The bot's access: wire it into Telegram action nodes."
     }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "TelegramAccess '{id}' has no connected bot; connect one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
-    }
   ]
 }

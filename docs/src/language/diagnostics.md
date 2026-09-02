@@ -118,21 +118,27 @@ one producer and one taker.
 | `require-one-of-unmet` | an `@require_one_of` group where nothing is satisfied. |
 | `no-required-skip` | **a warning.** Every wireable input on this node is optional and there is no `@require_one_of`, so the node runs even when everything upstream is dead. Usually not what you want; add `@require_one_of`. |
 | `rule-structural` | a node's own declarative validation rule failed at compile time. The message is the node author's. |
-| `rule-runtime` | a node's own rule flagged something checkable only at run time. |
+| `rule-runtime` | a node's own rule flagged something checkable only at run time. The language writes one of these itself: every access node requires a connection picked (unless its recipe declares `connection_optional`), with no rule in its metadata. |
 
 ## Where these run
 
 There are two validation modes, and the same slugs appear in both.
 
 **Structural** is what a build runs, and what the editor runs constantly while
-you type. It decides whether your program compiles.
+you type: it fills the Problems panel and decides whether your program
+compiles.
 
 **Runtime** adds the `rule-runtime` checks on top, the ones about things only
 knowable once a program is about to run, such as a provider node with no
-connection picked. A build skips those deliberately, so that a program you are
-still wiring up still builds. `weft validate` runs this mode, which is what
-fills the editor's Problems panel.
+connection picked. A build and the Problems panel skip those deliberately, so
+that a program you are still wiring up builds without squiggles. They run when
+the question is whether the program is ready: the editor checks them right
+before Run/Activate/Resync (findings land on the action bar, and nothing is
+sent until they are fixed), and `weft validate` runs this mode in the
+terminal.
 
 Both read source on stdin and print JSON. `--file` does not open a file: it
 names the path the source came from, so `@file` and `@include` resolve against
-the right directory.
+the right directory. A finding inside an `@include`d file carries that file's
+path (a `file` key in the JSON), and the terminal output prefixes it as
+`path:line:col`.

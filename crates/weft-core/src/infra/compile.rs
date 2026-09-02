@@ -468,7 +468,7 @@ fn compile_container(
     _unit: &Unit,
     ctx: &CompileContext<'_>,
 ) -> Result<Value, CompileError> {
-    let image = resolve_image(&c.image, ctx)?;
+    let image = resolve_image(&c.image, ctx.node_id, ctx.local_image_tags)?;
     let mut obj = Map::new();
     obj.insert("name".into(), json!(c.name));
     obj.insert("image".into(), json!(image));
@@ -519,18 +519,42 @@ fn compile_container(
     Ok(Value::Object(obj))
 }
 
-fn resolve_image(image: &Image, ctx: &CompileContext<'_>) -> Result<String, CompileError> {
+/// Resolve one image reference to the ref string an apply puts in the
+/// cluster: upstream literals pass through verbatim, local names must be
+/// in the tag map (the apply's compile context carries it). Standalone
+/// (node id + tags, no full context) so the supervisor can resolve a
+/// unit's images without fabricating a context.
+fn resolve_image(
+    image: &Image,
+    node_id: &str,
+    tags: &std::collections::BTreeMap<String, String>,
+) -> Result<String, CompileError> {
     match image {
         Image::Upstream { reference } => Ok(reference.clone()),
-        Image::Local { name } => ctx
-            .local_image_tags
-            .get(name)
-            .cloned()
-            .ok_or_else(|| CompileError::MissingLocalImage {
-                node: ctx.node_id.to_string(),
+        Image::Local { name } => tags.get(name).cloned().ok_or_else(|| {
+            CompileError::MissingLocalImage {
+                node: node_id.to_string(),
                 name: name.clone(),
-            }),
+            }
+        }),
     }
+}
+
+/// Every image ref a unit's containers (main + init) resolve to against
+/// the tag map: the refs an apply of this unit actually puts in the
+/// cluster. The supervisor stamps this on the unit's runtime entry at
+/// apply (see `UnitRuntime::image_refs`) so image reclamation can keep
+/// what running units still use, frozen old versions included.
+pub fn unit_image_refs(
+    unit: &super::types::Unit,
+    node_id: &str,
+    tags: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeSet<String>, CompileError> {
+    let mut refs = std::collections::BTreeSet::new();
+    for container in unit.containers.iter().chain(unit.init_containers.iter()) {
+        refs.insert(resolve_image(&container.image, node_id, tags)?);
+    }
+    Ok(refs)
 }
 
 fn compile_env(env: &[EnvEntry]) -> Vec<Value> {

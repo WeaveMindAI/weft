@@ -28,6 +28,7 @@
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            source_file: None,
         }
     }
 
@@ -39,6 +40,7 @@
             source_handle: None,
             target_handle: None,
             span: None,
+            source_file: None,
         }
     }
 

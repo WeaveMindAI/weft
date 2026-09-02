@@ -268,11 +268,19 @@ async fn tick_project(
                     desired: desired.max(0) as u32,
                     ready: ready.max(0) as u32,
                 };
-                let prior = registry.state.get(&key).cloned().unwrap_or_default();
+                // No latch yet (first tick, or every latch of the
+                // project was cleared by a lifecycle command): start
+                // from what the row says, see `seeded_from`.
+                let now = state.clock.now();
+                let prior = registry
+                    .state
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| NodeHealthState::seeded_from(unit_rt.status, now));
                 let decision = evaluate_node_health(
                     prior,
                     observation,
-                    state.clock.now(),
+                    now,
                     Duration::from_secs(unit_rt.flaky_after_seconds as u64),
                     Duration::from_secs(unit_rt.recovery_after_seconds as u64),
                 );
@@ -335,8 +343,11 @@ async fn tick_project(
             // flight. `command_id = None` skips the broker's
             // command-ownership check; tenant scope still applies. The
             // broker sets this unit's status then recomputes the node
-            // rollup. A Raced means the row was removed (or a command
-            // appeared, fenced); drop the write silently.
+            // rollup. A stale outcome means the row was removed, the
+            // unit left the roster (an apply dropped it after this tick
+            // read the roster; the broker fences per-unit stamps on
+            // membership) or a command appeared (fenced); drop the
+            // write silently.
             let outcome = state
                 .broker
                 .set_status(
@@ -350,12 +361,13 @@ async fn tick_project(
                     None,
                 )
                 .await?;
-            if outcome.is_raced() {
+            if !outcome.is_applied() {
                 tracing::debug!(
                     project_id = %project.project_id,
                     node_id = %node_id,
                     unit = %unit,
-                    "health-reconcile set_status raced (row removed); skipping"
+                    ?outcome,
+                    "health-reconcile set_status not applied (row removed, unit left the roster, or a command is in flight); skipping"
                 );
             }
         }

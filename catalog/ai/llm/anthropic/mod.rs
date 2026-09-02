@@ -26,6 +26,6 @@ impl Node for AnthropicProviderNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        provider::emit(&ctx, "anthropic", true).await
+        provider::emit(&ctx, "anthropic").await
     }
 }

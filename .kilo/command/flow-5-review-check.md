@@ -1,0 +1,18 @@
+---
+description: Paranoid red-team pass over the fixes made during review, re-verifying each one
+---
+
+The paranoid pass. The review rounds found bugs and fixed them, and experience says the fixes themselves are the most likely source of NEW bugs. This pass exists on its own for a reason: when you review and fix in one go you stop being obsessive about your own fixes, but coming back fresh, you can be genuinely less lenient. Switch to [red team mode]. Be paranoid. Default to "this fix is probably hiding something" until you've proven otherwise.
+
+Focus on the fixes and reshapes made since we started reviewing this feature, plus anything they touched. For each one, assume the worst and try to disprove it:
+- **Did it introduce a new bug?** Trace the new code paths, probe the edges, check the reshape's blast radius for things that were never re-checked.
+- **Is it actually clean, or secretly dirty?** No dirty fallback, no silent error recovery, no patch dressed up as a fix, no spaghetti, no "for now". If any fix is dirty, it isn't done: redo it as the right shape.
+- **Did it walk back a deliberate past decision?** Across many rounds, a "fix" can quietly revert something we settled earlier for a real reason. If a fix changed the shape, confirm that shape wasn't a past intentional choice before you trust it (the comments in the code tell you). Don't ping-pong the architecture.
+
+Per [red team mode], after each fix you assess, output "counter-perspective:" and actively hunt how it could be wrong. Look for the blind spot, not the confirmation.
+
+Don't trust your own eyes alone. Launch review agents to adversarially verify the fixes: in ONE message, multiple task tool calls in parallel, all with `subagent_type: code-reviewer`, never sequential. Build each dispatch so the agent never has to find anything: give the exact file references, the fix locations (files and line ranges) plus the context files to open. Do NOT paste diff hunks into the dispatch; the agent reads the named files directly and never re-derives anything with git commands. Pass each agent ONLY the shape rules its scope touches (subagents don't share your instructions); the reply and punctuation rules stay with you, agent reports are internal working text. Their job here is to REFUTE each fix, not bless it and not redesign it: prove it dirty, incomplete, or bug-introducing. They verify by reading and tracing; if a runtime check is truly needed they may run one targeted probe test by name, never a suite (suites are the implementer's job, not the reviewer's). If an agent does surface a better shape, treat it as an input you judge against the whole architecture, as usual: they hold a slice, you hold the whole.
+
+Keep going, round after round, until a pass surfaces nothing new and real. Don't stop at the first clean-looking result; the tail is where the surprises hide. It does not matter how many back-and-forths it takes, no shortcuts. But know the clean bill when you see it: a pass counts as clean, and the loop ends, when it surfaces nothing new and real OR only non-functional findings (comments, doc lines, formatting, renames with no behavior change). If the last thing that got fixed was literally just comments, that IS the clean bill; launching another review agent to re-verify prose polish is pure waste. When a fix turns out dirty or buggy, fix it cleanly (reshape not patch, DRY, fail loud, never silent) and re-verify with an agent before you call it settled.
+
+When you're satisfied that every fix is clean and nothing new is surfacing, tell me below the `---` line: a short account of what you re-verified, and what, if anything, you had to redo.

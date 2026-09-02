@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "claudeMdExcludes": [
+    "/home/*/.claude/CLAUDE.md",
+    "/Users/*/.claude/CLAUDE.md",
+    "/home/*/.claude/rules/**",
+    "/Users/*/.claude/rules/**"
+  ],
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/validate_weft.py\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(weft validate:*)",
+      "Bash(weft parse:*)",
+      "Bash(weft build)",
+      "Bash(weft build-base:*)",
+      "Bash(weft run:*)",
+      "Bash(weft describe-nodes:*)",
+      "Bash(weft executions:*)",
+      "Bash(weft events:*)",
+      "Bash(weft logs:*)",
+      "Bash(weft status)",
+      "Bash(weft ps)",
+      "Bash(weft follow:*)",
+      "Bash(weft daemon start:*)",
+      "Bash(weft daemon stop:*)",
+      "Bash(weft daemon restart:*)",
+      "Bash(weft daemon status)",
+      "Bash(weft daemon logs:*)",
+      "Bash(weft catalog update)",
+      "Bash(weft activate:*)",
+      "Bash(weft cancel-activate:*)",
+      "Bash(weft cancel-build:*)",
+      "Bash(weft cancel-running:*)",
+      "Bash(weft stop:*)",
+      "Bash(weft infra start:*)",
+      "Bash(weft infra stop:*)",
+      "Bash(weft infra upgrade:*)",
+      "Bash(weft infra status)",
+      "Bash(weft infra node-stop:*)",
+      "Bash(weft test-node:*)",
+      "Bash(weft node-test-hash:*)",
+      "Bash(weft files ls:*)",
+      "Bash(weft files inspect:*)",
+      "Bash(weft listener:*)",
+      "Bash(weft connect:*)",
+      "Bash(weft token:*)"
+    ],
+    "ask": [
+      "Bash(weft test-node --tier live:*)",
+      "Bash(weft test-node --yes:*)",
+      "Bash(weft test-node * --tier live:*)",
+      "Bash(weft test-node * --yes:*)",
+      "Bash(weft connect --forget:*)",
+      "Bash(weft connect * --forget:*)",
+      "Bash(weft deactivate:*)",
+      "Bash(weft resync:*)",
+      "Bash(weft rm:*)",
+      "Bash(weft clean:*)",
+      "Bash(weft infra terminate:*)",
+      "Bash(weft infra node-terminate:*)",
+      "Bash(weft files rm:*)"
+    ]
+  }
+}

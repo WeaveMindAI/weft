@@ -119,10 +119,20 @@ pub struct Diagnostic {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    /// The file the span's coordinates live in, when it is NOT the
+    /// source that was compiled: an `@include` splices another file's
+    /// nodes into the project with their own line numbers, and without
+    /// this a finding on an included node points a reader (and the
+    /// editor's click-to-jump) at the wrong file. None = the compiled
+    /// source itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
 }
 
 impl Diagnostic {
     /// A diagnostic bounded to a source `Span` (the culprit's exact range).
+    /// `file` follows the same rule as the field: the span's own file when
+    /// it differs from the compiled source, else None.
     pub fn at(span: crate::project::Span, severity: Severity, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             line: span.start_line,
@@ -132,7 +142,13 @@ impl Diagnostic {
             severity,
             message: message.into(),
             code: Some(code.into()),
+            file: None,
         }
+    }
+
+    pub fn in_file(mut self, file: Option<&str>) -> Self {
+        self.file = file.map(str::to_string);
+        self
     }
 }
 
@@ -349,6 +365,16 @@ impl NodeMetadata {
     /// the definition cannot drift between them.
     pub fn has_generator_input(&self) -> bool {
         self.inputs.iter().any(|p| p.input_type.as_generator().is_some())
+    }
+
+    /// The connection-picker input: the one input carrying the `access`
+    /// widget. THE one spelling of the lookup for every caller (the
+    /// validator, the synthesized connection rule, `weft connect`), so
+    /// none re-derives it. Metadata load enforces exactly one on any
+    /// node declaring a `service` recipe; `None` means the node
+    /// declares no picker at all.
+    pub fn access_input(&self) -> Option<&InputSpec> {
+        self.inputs.iter().find(|i| matches!(i.effective_widget(), Widget::Access { .. }))
     }
 
     /// Parse a compile-time-embedded `metadata.json`, merging the package
@@ -817,6 +843,243 @@ impl NodeMetadata {
         }
         out
     }
+
+    /// The compact wiring view of this node, as JSON: the resolved
+    /// metadata with everything a WIRING reader never needs stripped,
+    /// so `weft describe-nodes --compact` can hand an AI the whole
+    /// node vocabulary for a fraction of the tokens the full files
+    /// cost. What survives is what decides how the node connects:
+    /// ports with types, exposure and widgets (an access widget
+    /// carrying its stamped service and `optional`), features,
+    /// config-derived port shapes, declared types, validation rules.
+    /// What goes is presentation (an input's `label`/`placeholder`,
+    /// an entry kind's dropdown label and render hint, the palette
+    /// dressing), authoring machinery (the `service` connect recipe,
+    /// `accessApps`, `images`, `display`), and noise nulls (an
+    /// `Option` serialized as null, on port entries and in widgets,
+    /// wherever a widget sits, which only ever mean "absent"). Data
+    /// is never touched: a remote-select source's `label` path, a
+    /// literal's own fields, and the nulls inside a `default` or a
+    /// rule's `equals` ride through untouched. Node authors keep
+    /// reading the full
+    /// `metadata.json`: this is the view for writing programs WITH a
+    /// node, not for writing the node.
+    pub fn compact_json(&self) -> serde_json::Value {
+        let mut resolved = self.resolved();
+        // Presentation is removed at its TYPED sites, never by key
+        // name: a `label`-shaped key also names real data (a
+        // remote-select source's display path, a literal's own
+        // fields), and a name sweep over the JSON cannot tell the two
+        // apart. An input's `label`/`placeholder` name it to a human,
+        // so they are nulled here; the entry-kind presentation inside
+        // `portsFromConfig` is swept by key after serialization, a
+        // sweep that must STOP at widgets (see
+        // `strip_ports_presentation`): a spec field's widget is a full
+        // `Widget`, and a remote-select source's `label` under it is
+        // a data path, not the editor's name for the entry.
+        for input in &mut resolved.inputs {
+            input.label = None;
+            input.placeholder = None;
+        }
+        // The access widget's `service`/`optional` are stamped by the
+        // compiler at enrich time; stamp them here from the node's
+        // own recipe so the compact view answers "can this node run
+        // without a connection picked" without the recipe it drops.
+        // This covers every access widget that can exist: load
+        // validation ties an access widget to a node carrying the
+        // recipe (a widget with no recipe, or two widgets, is a load
+        // error), so there is no second stamp site to miss.
+        if let Some(recipe) = &resolved.service {
+            for input in &mut resolved.inputs {
+                if let Some(widget) = &mut input.widget {
+                    recipe.stamp_onto(widget);
+                }
+            }
+        }
+        let mut value = serde_json::to_value(&resolved)
+            .expect("NodeMetadata serializes to JSON");
+        compact_wiring_view(&mut value);
+        value
+    }
+}
+
+/// Top-level metadata keys the compact wiring view keeps (see
+/// [`NodeMetadata::compact_json`]). Everything a wiring reader needs:
+/// identity, description, ports, features, port-deriving config
+/// shapes, validation rules, declared types, and what service an
+/// infra node publishes.
+///
+/// An allow-list on purpose. A top-level key is schema growth (a new
+/// concept the whole toolchain learns), so a new one lands
+/// UNCLASSIFIED and is dropped from the compact view until somebody
+/// decides whether a wiring reader needs it;
+/// `compact_view_tests::every_metadata_top_level_key_is_classified`
+/// and the stdlib census in weft-catalog hold the schema to that
+/// decision. Below the top level, DATA rides through untouched: an
+/// input's presentation is removed at its typed site in
+/// `compact_json`, the one key sweep left runs only inside the closed
+/// `portsFromConfig` subtree and stops at widgets, and noise nulls
+/// are dropped only from port entries and from widgets (input
+/// widgets and the spec-field widgets under `portsFromConfig`).
+/// Free-form values (a `default`'s contents, a rule's `equals`
+/// payload) keep every key name and every null they hold.
+pub const COMPACT_KEEP_TOP_LEVEL: [&str; 10] = [
+    "type",
+    "description",
+    "inputs",
+    "outputs",
+    "requires_infra",
+    "features",
+    "validate",
+    "portsFromConfig",
+    "publishes",
+    "types",
+];
+
+/// Top-level metadata keys the compact wiring view drops by NOT being
+/// in [`COMPACT_KEEP_TOP_LEVEL`]: the palette dressing (`label`,
+/// `tags`, `icon`, `color`), the connect recipe (`service`), the
+/// declared OAuth apps (`accessApps`), the image build list
+/// (`images`), and the graph-body rendering (`display`).
+///
+/// This list does no filtering (non-membership in the keep-list does
+/// that); it exists so every top-level key has exactly one declared
+/// disposition, keep or drop, which is what the classification tests
+/// hold to account when the schema grows.
+pub const COMPACT_DROP_TOP_LEVEL: [&str; 8] = [
+    "label",
+    "tags",
+    "icon",
+    "color",
+    "images",
+    "display",
+    "service",
+    "accessApps",
+];
+
+/// Presentation keys stripped inside the `portsFromConfig` subtree of
+/// the compact wiring view: an entry kind's dropdown `label` and its
+/// `render` hint. The sweep stops at any `widget` value (see
+/// `strip_ports_presentation`): the subtree is closed structs, but a
+/// spec field's widget can be a remote_select whose sources carry
+/// `label` DATA paths.
+const PORTS_PRESENTATION_KEYS: [&str; 2] = ["label", "render"];
+
+/// Filter one RESOLVED metadata serialization (input presentation
+/// already nulled at its typed sites, see [`NodeMetadata::compact_json`])
+/// down to the compact wiring view: keep only
+/// [`COMPACT_KEEP_TOP_LEVEL`] at the top level, sweep
+/// [`PORTS_PRESENTATION_KEYS`] through the `portsFromConfig` subtree
+/// (stopping at widgets), and drop noise nulls from the port entries
+/// and from every widget, wherever one sits. Everything else rides
+/// through untouched, INCLUDING free-form data: a `default`'s
+/// contents and a rule's `equals` payload keep every key name and
+/// every null they hold, because those are values the runtime would
+/// really supply or compare, not schema fields.
+fn compact_wiring_view(value: &mut serde_json::Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    map.retain(|key, _| COMPACT_KEEP_TOP_LEVEL.contains(&key.as_str()));
+    if let Some(ports) = map.get_mut("portsFromConfig") {
+        strip_ports_presentation(ports);
+        strip_widget_noise(ports);
+    }
+    for entry_key in ["inputs", "outputs"] {
+        if let Some(entries) = map.get_mut(entry_key) {
+            for entry in entries.as_array_mut().into_iter().flatten() {
+                strip_noise_nulls(entry);
+            }
+        }
+    }
+}
+
+/// [`PORTS_PRESENTATION_KEYS`] out at every depth of the
+/// `portsFromConfig` subtree, without descending into `widget`
+/// values: those are full [`Widget`]s, and a remote-select source's
+/// `label` is a data path, not the editor's name for an entry.
+fn strip_ports_presentation(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|key, _| !PORTS_PRESENTATION_KEYS.contains(&key.as_str()));
+            for (key, inner) in map.iter_mut() {
+                if key.as_str() != "widget" {
+                    strip_ports_presentation(inner);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_ports_presentation(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Null-valued keys out of every `widget` value under the
+/// `portsFromConfig` subtree: the spec fields' widgets are the same
+/// closed [`Widget`] family as input widgets (`resolved()` fills
+/// them, and `Number` serializes its absent knobs as null), so the
+/// same noise rule applies. Hunting by key is safe ONLY inside this
+/// subtree, because it holds no free-form values a `widget` key of
+/// the user's own could hide in.
+fn strip_widget_noise(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(widget) = map.get_mut("widget") {
+                strip_nulls(widget);
+            }
+            for inner in map.values_mut() {
+                strip_widget_noise(inner);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_widget_noise(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Null-valued keys out of ONE port entry's own fields, and out of
+/// its widget at every depth. An `Option` serialized as null only
+/// ever means "absent" (`"default": null` IS no default; serde's
+/// `Option` already conflates the two on the way in), so on the
+/// entry's own typed fields a null is noise. The sweep deliberately
+/// stops there: a `default` that IS present keeps its value whole
+/// (nulls inside it are data the runtime would supply), and the
+/// widget is a closed struct family where every null is an absent
+/// knob.
+fn strip_noise_nulls(entry: &mut serde_json::Value) {
+    let Some(map) = entry.as_object_mut() else {
+        return;
+    };
+    map.retain(|_, value| !value.is_null());
+    if let Some(widget) = map.get_mut("widget") {
+        strip_nulls(widget);
+    }
+}
+
+/// Null-valued keys out at every depth, for closed struct families
+/// only (a port entry's widget): every null there is an absent
+/// optional knob, never data.
+fn strip_nulls(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.retain(|_, value| !value.is_null());
+            for inner in map.values_mut() {
+                strip_nulls(inner);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_nulls(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// One validation rule. The `when` condition is evaluated against the
@@ -841,9 +1104,11 @@ pub enum ValidationLevel {
     /// Not checked when a project is BUILT (e.g. missing
     /// credentials), so an AI builder or a human can compile a
     /// project they are still sketching, secrets unfilled. The
-    /// editor's Problems panel does report them: it validates in
-    /// `ValidationMode::Runtime` (see `weft-cli`'s `do_validate`),
-    /// the only mode that runs them.
+    /// editor's Problems panel skips them too (it validates in
+    /// `ValidationMode::Structural`); they surface in the editor's
+    /// pre-flight gate before Run/Activate/Resync and in the terminal
+    /// `weft validate`, both of which validate in
+    /// `ValidationMode::Runtime` (see `weft-cli`'s `do_validate`).
     Runtime,
 }
 
@@ -1591,10 +1856,17 @@ pub enum Widget {
     /// list (existing connections plus the declared doors of "+ Add a
     /// connection"); the stored config value is the small
     /// `{"id": "<connection id>", "identity": "..."}` handle, never a
-    /// secret. `service` is COMPILER-STAMPED from the node metadata's
-    /// `service.service` at enrich time; authors write only
-    /// `{"kind": "access"}`.
-    Access { service: Option<String> },
+    /// secret. `service` and `optional` are COMPILER-STAMPED from the
+    /// node metadata's recipe (`service.service` /
+    /// `service.connection_optional`) at enrich time; authors write only
+    /// `{"kind": "access"}`. `optional` = the node runs without a
+    /// connection picked, so the editor neither pins it open nor
+    /// synthesizes the "no connection picked" rule for it.
+    Access {
+        service: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
+    },
     /// Pick a resource on the connected service (a spreadsheet, a
     /// channel, a repo) on ONE field with several declared SOURCES;
     /// the editor uses the richest source the chosen connection
@@ -2364,6 +2636,17 @@ mod catalog_wire_tests {
         assert_eq!(keys(&v["inputs"][0]["widget"]), ["kind", "language"]);
         assert_eq!(keys(&v["inputs"][1]["widget"]), ["kind", "options"]);
         assert_eq!(keys(&v["inputs"][2]["widget"]), ["kind", "max", "min", "step"]);
+        // The access widget: `service` always rides (null until the
+        // compiler stamps it), `optional` only when true.
+        assert_eq!(keys(&v["inputs"][3]["widget"]), ["kind", "service"]);
+        let optional_access: Widget = serde_json::from_value(
+            serde_json::json!({ "kind": "access", "service": "s", "optional": true }),
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&serde_json::to_value(&optional_access).unwrap()),
+            ["kind", "optional", "service"]
+        );
         assert_eq!(keys(&v["inputs"][4]["widget"]), ["access", "depends_on", "kind", "sources"]);
         assert_eq!(keys(&v["inputs"][5]["widget"]), ["accept", "kind", "type"]);
         assert_eq!(
@@ -2424,6 +2707,19 @@ mod diagnostic_wire_tests {
             "line": 1, "column": 0, "severity": "warning", "message": "m"
         })).expect("diagnostic without end bounds still deserializes");
         assert_eq!(pointy.end_line, 0, "absent endLine defaults to 0");
+        assert_eq!(pointy.file, None, "absent file defaults to None (the compiled source)");
+        // `file` (an @include's own file) serializes under that key, and
+        // is OMITTED when None so old consumers see the old shape.
+        let d2 = Diagnostic::at(Span::default(), Severity::Error, "x", "m");
+        assert!(serde_json::to_value(&d2).unwrap().get("file").is_none(), "None file emits no key");
+        let with_file: Diagnostic = serde_json::from_value(serde_json::json!({
+            "line": 1, "column": 0, "severity": "error", "message": "m", "file": "/a/b.weft"
+        })).unwrap();
+        assert_eq!(with_file.file.as_deref(), Some("/a/b.weft"));
+        assert_eq!(
+            serde_json::to_value(&with_file).unwrap()["file"], "/a/b.weft",
+            "file round-trips under the `file` key"
+        );
     }
 
     /// The name is the key's identity, so it is validated to [a-z0-9_]+: a
@@ -2748,7 +3044,7 @@ mod input_semantics_tests {
             Widget::Select { options: vec!["a".into()] },
             Widget::Multiselect { options: vec!["a".into()] },
             Widget::Password,
-            Widget::Access { service: None },
+            Widget::Access { service: None, optional: false },
             Widget::RemoteSelect {
                 access: "account".into(),
                 sources: vec![ResourceSource::FromUrl { pattern: "(x)".into() }],
@@ -2847,7 +3143,7 @@ mod input_semantics_tests {
     fn validate_semantics_types_the_access_widget_input() {
         // Default (Wire) exposure: the config requirement fires.
         let mut n = input("account", WeftType::Access);
-        n.widget = Some(Widget::Access { service: None });
+        n.widget = Some(Widget::Access { service: None, optional: false });
         let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
         assert!(e.contains("exposure: config"), "{e}");
 
@@ -2858,7 +3154,7 @@ mod input_semantics_tests {
         let with_service = |ty: WeftType| -> NodeMetadata {
             let mut n = input("account", ty);
             n.exposure = Some(Exposure::Config);
-            n.widget = Some(Widget::Access { service: None });
+            n.widget = Some(Widget::Access { service: None, optional: false });
             let mut m = metadata_with(vec![n]);
             m.service = Some(
                 serde_json::from_value(json!({
@@ -3101,6 +3397,7 @@ fn materialize_port(template: &PortTemplate, key: &str, is_output: bool) -> Port
         required: !is_output,
         description: None,
         synthesized_from_carry: false,
+        declared_type: None,
     }
 }
 
@@ -3204,6 +3501,360 @@ mod package_defaults_tests {
         merge_package_defaults(&mut member, &defaults).unwrap();
         let meta: NodeMetadata = serde_json::from_value(member).unwrap();
         assert_eq!(meta.access_apps["slack"].client_id, "mine", "member wins wholesale");
+    }
+}
+
+#[cfg(test)]
+mod compact_view_tests {
+    use super::*;
+
+    /// The keep/drop lists must cover the WHOLE top-level schema, both
+    /// directions: a struct key nobody classified is schema growth
+    /// nobody decided about, and a classified key the struct no longer
+    /// has is a stale list entry. Keys that serialize only when
+    /// non-empty are absent from a minimal parse, so they are pinned
+    /// by hand here; the stdlib census in weft-catalog is the net that
+    /// catches one of those being added and used before this list
+    /// hears of it.
+    #[test]
+    fn every_metadata_top_level_key_is_classified() {
+        let minimal: NodeMetadata =
+            serde_json::from_str(r#"{ "type": "T", "label": "", "description": "" }"#)
+                .unwrap();
+        let serialized = serde_json::to_value(&minimal).unwrap();
+        let mut observed: Vec<&str> = serialized
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        const SERIALIZED_WHEN_NON_EMPTY: [&str; 8] = [
+            "images",
+            "publishes",
+            "display",
+            "validate",
+            "portsFromConfig",
+            "service",
+            "accessApps",
+            "types",
+        ];
+        observed.extend(SERIALIZED_WHEN_NON_EMPTY);
+
+        let classified =
+            |key: &str| COMPACT_KEEP_TOP_LEVEL.contains(&key) || COMPACT_DROP_TOP_LEVEL.contains(&key);
+        for key in &observed {
+            assert!(classified(key), "unclassified top-level metadata key: `{key}`");
+        }
+        for key in COMPACT_KEEP_TOP_LEVEL {
+            assert!(
+                observed.contains(&key),
+                "keep-list names a key the schema does not have: `{key}`"
+            );
+            assert!(
+                !COMPACT_DROP_TOP_LEVEL.contains(&key),
+                "`{key}` is both kept and dropped"
+            );
+        }
+        for key in COMPACT_DROP_TOP_LEVEL {
+            assert!(
+                observed.contains(&key),
+                "drop-list names a key the schema does not have: `{key}`"
+            );
+        }
+    }
+
+    /// What `compact_json` keeps on a node carrying the interesting
+    /// shapes: an input whose label/placeholder are presentation but
+    /// whose description/default/exposure are wiring facts; a
+    /// remote-select whose sources' `label`/`value` are DATA paths and
+    /// must survive untouched; a config-derived port spec whose
+    /// kind/keyField/fields/addsOutputs survive while its label and
+    /// render hint go; and a validation rule whose `equals` payload
+    /// carries a `label` key of its own.
+    #[test]
+    fn compact_json_keeps_wiring_facts_and_strips_presentation() {
+        let metadata: NodeMetadata = serde_json::from_str(
+            r##"{
+                "type": "HumanQuery",
+                "label": "Human query",
+                "description": "Ask a person mid-flow.",
+                "tags": ["human"],
+                "icon": "User",
+                "color": "#ffffff",
+                "inputs": [{
+                    "name": "title",
+                    "type": "String",
+                    "required": true,
+                    "exposure": "config",
+                    "widget": { "kind": "text" },
+                    "label": "Title",
+                    "placeholder": "Question title",
+                    "description": "The form's title.",
+                    "default": "Approve?"
+                }, {
+                    "name": "media",
+                    "type": "Image",
+                    "default": null,
+                    "widget": { "kind": "file_drop", "accept": null, "type": "Image" }
+                }, {
+                    "name": "account",
+                    "type": "Access",
+                    "widget": { "kind": "access" }
+                }, {
+                    "name": "model",
+                    "type": "String",
+                    "widget": {
+                        "kind": "remote_select",
+                        "access": "account",
+                        "free_text": true,
+                        "sources": [
+                            { "kind": "list", "get": "https://api.example.com/models", "items": "data", "label": "displayName", "value": "id" },
+                            { "kind": "granted", "from": "models", "label": "name", "value": "id" }
+                        ]
+                    }
+                }],
+                "outputs": [{
+                    "name": "send",
+                    "type": "Boolean",
+                    "required": false,
+                    "description": "True when approved."
+                }],
+                "portsFromConfig": {
+                    "field": "fields",
+                    "specs": [{
+                        "kind": "approve_reject",
+                        "keyField": "key",
+                        "label": "Approve / Reject",
+                        "render": { "component": "approve_reject" },
+                        "fields": [
+                            { "key": "key", "required": true, "shape": "typed", "valueType": "String" },
+                            { "key": "threshold", "required": false, "shape": "number" },
+                            { "key": "resource", "required": true, "shape": "typed", "valueType": "String",
+                              "widget": { "kind": "remote_select", "access": "account",
+                                          "sources": [ { "kind": "list", "get": "u", "items": "i", "label": "name", "value": "id" } ] } }
+                        ],
+                        "addsOutputs": [ { "nameTemplate": "{key}_approved", "portType": "Boolean" } ]
+                    }]
+                },
+                "types": { "ChatMessage": "{ role: String }" },
+                "validate": [{
+                    "when": { "kind": "config_present", "field": "title" },
+                    "then": { "message": "fill the title" }
+                }, {
+                    "when": { "kind": "config_equals", "field": "model", "equals": { "label": "fast", "id": "gpt-x", "spare": null } },
+                    "then": { "message": "pick a faster one", "severity": "warning" }
+                }]
+            }"##,
+        )
+        .unwrap();
+
+        let compact = metadata.compact_json();
+        let mut top: Vec<&str> = compact.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        top.sort_unstable();
+        assert_eq!(
+            top,
+            vec![
+                "description",
+                "features",
+                "inputs",
+                "outputs",
+                "portsFromConfig",
+                "requires_infra",
+                "type",
+                "types",
+                "validate",
+            ],
+            "only the keep-list keys survive, and only the ones this node sets"
+        );
+
+        let input = &compact["inputs"][0];
+        assert_eq!(input["name"], "title");
+        assert_eq!(input["type"], "String");
+        assert_eq!(input["exposure"], "config", "resolved exposure is a wiring fact");
+        assert_eq!(input["widget"]["kind"], "text");
+        assert_eq!(input["description"], "The form's title.");
+        assert_eq!(input["default"], "Approve?", "a default changes whether wiring is needed");
+        assert!(input.get("label").is_none(), "an input label names it to a human");
+        assert!(input.get("placeholder").is_none(), "placeholder is editor hint text");
+
+        // A null value only ever means "absent" (`"default": null` IS
+        // no default; `Option` serde already conflates the two), so it
+        // is stripped like the presentation keys: pure token noise.
+        let media = &compact["inputs"][1];
+        assert!(media.get("default").is_none(), "a null default is no default");
+        assert_eq!(media["widget"]["kind"], "file_drop");
+        assert!(media["widget"].get("accept").is_none(), "a null widget knob is noise");
+        assert_eq!(media["widget"]["type"], "Image", "the widget's file type is a wiring fact");
+
+        // The `label` KEY is ambiguous between presentation (an
+        // input's human name, removed above at its typed site) and
+        // DATA (a remote-select source's display path, `Lookup.label`
+        // being a REQUIRED field). The name sweep never runs outside
+        // the closed `portsFromConfig` subtree, so these survive.
+        let account = &compact["inputs"][2];
+        assert_eq!(account["widget"]["kind"], "access");
+        let model = &compact["inputs"][3];
+        let sources = model["widget"]["sources"].as_array().unwrap();
+        assert_eq!(sources[0]["label"], "displayName", "a source's display path is data");
+        assert_eq!(sources[0]["value"], "id");
+        assert_eq!(sources[1]["label"], "name", "a granted source's display path is data");
+        assert_eq!(sources[1]["value"], "id");
+        assert_eq!(model["widget"]["access"], "account", "the authenticating input is a wiring fact");
+        assert_eq!(model["widget"]["free_text"], true, "free_text says typing is allowed");
+
+        let output = &compact["outputs"][0];
+        assert_eq!(output["description"], "True when approved.");
+        assert_eq!(output["required"], false);
+
+        let spec = &compact["portsFromConfig"]["specs"][0];
+        assert_eq!(spec["kind"], "approve_reject");
+        assert_eq!(spec["keyField"], "key");
+        assert_eq!(spec["addsOutputs"][0]["nameTemplate"], "{key}_approved");
+        assert!(spec.get("label").is_none(), "the spec label names the dropdown entry");
+        assert!(spec.get("render").is_none(), "render picks the UI primitive");
+        let field = &spec["fields"][0];
+        assert_eq!(field["key"], "key");
+        assert_eq!(field["shape"], "typed");
+        assert_eq!(field["valueType"], "String");
+        assert!(field.get("label").is_none());
+        assert_eq!(field["widget"]["kind"], "text", "resolved() fills the spec field's widget");
+
+        // A number-shaped spec field gets a `Number` widget from
+        // `resolved()`, whose absent knobs serialize as null: the
+        // widget-noise sweep under `portsFromConfig` must take them,
+        // end to end through the resolve-and-filter path (the stdlib
+        // `Switch` ships six fields of exactly this shape).
+        let threshold = &spec["fields"][1];
+        assert_eq!(threshold["shape"], "number");
+        let threshold_widget = threshold["widget"].as_object().unwrap();
+        assert_eq!(threshold_widget["kind"], "number");
+        for knob in ["min", "max", "step"] {
+            assert!(
+                threshold_widget.get(knob).is_none(),
+                "an absent `{knob}` knob on a spec field's widget is noise"
+            );
+        }
+
+        // The widget-stop, end to end: a spec field's remote_select
+        // carries `label` DATA paths in its sources, which the
+        // presentation sweep must not eat.
+        let picker = &spec["fields"][2];
+        assert!(picker.get("label").is_none(), "a spec field's label is presentation");
+        let source = picker["widget"]["sources"][0].as_object().unwrap();
+        assert_eq!(source["label"], "name", "a source's display path is data, under a spec field too");
+        assert_eq!(source["value"], "id");
+
+        assert_eq!(compact["types"]["ChatMessage"], "{ role: String }");
+        assert_eq!(compact["validate"][0]["then"]["message"], "fill the title");
+        // A validation rule's `equals` payload is user JSON the rule
+        // matches on exactly: its `label` key AND its null value are
+        // data, and the null sweep (scoped to port entries) never
+        // reaches them.
+        let equals = compact["validate"][1]["when"]["equals"].as_object().unwrap();
+        assert_eq!(equals["label"], "fast", "data-shaped keys inside rule payloads are never stripped by name");
+        assert_eq!(
+            equals.get("spare"),
+            Some(&serde_json::Value::Null),
+            "a null inside a data payload is a comparison target, not absence"
+        );
+    }
+
+    /// The JSON half of the filter, pinned without building a full
+    /// `AccessSpec`: the authoring machinery blocks (`service`,
+    /// `accessApps`, `images`, `display`) go by non-membership in the
+    /// keep-list; the `portsFromConfig` subtree is swept for the entry
+    /// kind's presentation pair but STOPS at widgets (a spec field's
+    /// remote_select carries `label` data paths in its sources); and
+    /// noise nulls go from port entries and from widgets, wherever a
+    /// widget sits. An input's `label` SURVIVES this half on purpose:
+    /// input presentation is nulled at its typed site in
+    /// `compact_json` before serialization, precisely so a
+    /// `label`-shaped DATA key can never be eaten by a name sweep.
+    #[test]
+    fn compact_wiring_view_drops_authoring_blocks() {
+        let mut value = serde_json::json!({
+            "type": "T",
+            "label": "Presentation",
+            "icon": "Hash",
+            "service": { "service": "slack" },
+            "images": ["images/bridge"],
+            "display": { "port": "file" },
+            "accessApps": { "slack": { "label": "app" } },
+            "inputs": [
+                {
+                    "name": "account",
+                    "type": "Access",
+                    "label": "Workspace",
+                    "default": null,
+                    "widget": { "kind": "number", "min": null, "max": 5, "step": null }
+                }
+            ],
+            "portsFromConfig": {
+                "field": "fields",
+                "specs": [{
+                    "kind": "approve_reject",
+                    "label": "Approve / Reject",
+                    "render": { "component": "approve_reject" },
+                    "fields": [
+                        { "key": "key", "label": "Key", "required": true, "shape": "typed", "valueType": "String" },
+                        { "key": "threshold", "required": false, "shape": "number",
+                          "widget": { "kind": "number", "min": null, "max": 5, "step": null } },
+                        { "key": "resource", "required": true, "shape": "typed", "valueType": "String",
+                          "widget": { "kind": "remote_select", "access": "account",
+                                      "sources": [ { "kind": "list", "get": "u", "items": "i", "label": "name", "value": "id" } ] } }
+                    ],
+                    "addsOutputs": [ { "nameTemplate": "{key}_approved", "portType": "Boolean", "spare": null } ]
+                }]
+            }
+        });
+        compact_wiring_view(&mut value);
+        let top = value.as_object().unwrap();
+        for gone in ["label", "icon", "service", "images", "display", "accessApps"] {
+            assert!(top.get(gone).is_none(), "`{gone}` must not survive the compact view");
+        }
+        assert_eq!(top.len(), 3, "type, inputs, portsFromConfig are all this node keeps");
+
+        let input = &value["inputs"][0];
+        assert_eq!(input["name"], "account");
+        assert_eq!(
+            input["label"], "Workspace",
+            "the JSON half never strips an input label; the typed half in compact_json does"
+        );
+        assert!(input.get("default").is_none(), "an absent default is noise and goes");
+        let widget = input["widget"].as_object().unwrap();
+        assert!(widget.get("min").is_none(), "an absent widget knob is noise and goes");
+        assert!(widget.get("step").is_none(), "an absent widget knob is noise and goes");
+        assert_eq!(widget["max"], 5, "a set widget knob stays");
+
+        let spec = &value["portsFromConfig"]["specs"][0];
+        assert!(spec.get("label").is_none(), "the spec label names the dropdown entry");
+        assert!(spec.get("render").is_none(), "render picks the UI primitive");
+        let plain_field = &spec["fields"][0];
+        assert!(plain_field.get("label").is_none(), "a spec field's label is presentation");
+        // A spec field's widget is the same closed family as an input's
+        // widget: absent knobs go there too.
+        let threshold_widget = spec["fields"][1]["widget"].as_object().unwrap();
+        assert!(threshold_widget.get("min").is_none(), "an absent knob on a spec field's widget is noise");
+        assert!(threshold_widget.get("step").is_none(), "an absent knob on a spec field's widget is noise");
+        assert_eq!(threshold_widget["max"], 5, "a set knob stays");
+        // The presentation sweep stops at that same widget: its
+        // remote-select source's `label` is a data path.
+        let picker_field = &spec["fields"][2];
+        assert!(picker_field.get("label").is_none(), "a spec field's label is presentation");
+        let source = picker_field["widget"]["sources"][0].as_object().unwrap();
+        assert_eq!(
+            source["label"], "name",
+            "the sweep stops at widgets: a source's display path is data"
+        );
+        assert_eq!(source["value"], "id");
+        // The noise sweep under `portsFromConfig` touches WIDGETS only:
+        // a stray null anywhere else in the subtree rides through like
+        // any data, because no other noise site exists there.
+        assert_eq!(
+            spec["addsOutputs"][0].get("spare"),
+            Some(&serde_json::Value::Null),
+            "the null sweep under portsFromConfig is scoped to widgets"
+        );
     }
 }
 

@@ -10,6 +10,11 @@ repository.workspace = true
 # into a link-time-collected registry, so adding a provider needs no edit to
 # any central list (same pattern weft-core uses for signal kinds).
 inventory = { workspace = true }
+# Pure type layer only (no runtime): the shared percent_encode.
+# Direct path dep (NOT `workspace = true`): `default-features = false`
+# must take effect, and cargo ignores a member-level
+# `default-features = false` on a `workspace = true` inherited dep.
+weft-core = { path = "../weft-core", default-features = false }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

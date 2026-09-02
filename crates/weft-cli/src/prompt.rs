@@ -8,30 +8,45 @@
 
 use std::io::{IsTerminal, Write};
 
+/// Is there a human at every end? Prompting needs stdin, stdout AND
+/// stderr on a terminal. The question rides stderr (so a `--json`
+/// run's stdout stays one JSON object per line even when a prompt
+/// fires), but the CONTEXT the question refers to (a numbered
+/// connection list, a consent URL) prints on stdout, so a redirected
+/// stdout would leave the user answering a question whose list went
+/// into a file; and a read from a pipe blocks on nobody. THE one
+/// definition of "interactive"; every prompt and every
+/// prompt-or-default decision reads it, never a bare `is_terminal()`
+/// probe of its own.
+pub fn is_interactive() -> bool {
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+}
+
 /// Read one line from the user for `prompt`. On a terminal: print the
-/// prompt, flush, read a trimmed line. With NO terminal (piped/closed
-/// stdin): bail naming `flag_hint`, the flag(s) that choose this
-/// non-interactively, so a scripted/AI run fails fast with a fix instead
-/// of blocking forever. The caller interprets the returned line (yes/no,
-/// a number, a menu choice); this owns only the terminal gate + read.
+/// prompt to stderr, flush, read a trimmed line. With NO terminal
+/// (piped/closed stdin or stderr): bail naming `flag_hint`, the flag(s) that choose
+/// this non-interactively, so a scripted/AI run fails fast with a fix
+/// instead of blocking forever. The caller interprets the returned line
+/// (yes/no, a number, a menu choice); this owns only the terminal gate
+/// + read.
 pub fn prompt_line(prompt: &str, flag_hint: &str) -> anyhow::Result<String> {
-    if !std::io::stdin().is_terminal() {
-        anyhow::bail!(
-            "no input for this prompt (stdin is not a terminal); pass {flag_hint} \
-             to choose non-interactively"
-        );
+    if !is_interactive() {
+        // Name the failing end: a run with a piped output stream reads
+        // fine but the prompt (stderr) or its context (stdout) would
+        // vanish into the pipe.
+        let why = if !std::io::stdin().is_terminal() {
+            "no terminal to read this prompt's answer from"
+        } else if !std::io::stdout().is_terminal() {
+            "stdout is not a terminal, so what the prompt refers to would be invisible"
+        } else {
+            "stderr is not a terminal, so the prompt would be invisible"
+        };
+        anyhow::bail!("{why}; pass {flag_hint} to choose non-interactively");
     }
-    // A prompt whose text goes into a pipe while the read comes from the
-    // terminal is an invisible hang (the user never sees the question).
-    // Prompting requires BOTH ends to be the terminal.
-    if !std::io::stdout().is_terminal() {
-        anyhow::bail!(
-            "cannot prompt (stdout is not a terminal, the prompt would be invisible); \
-             pass {flag_hint} to choose non-interactively"
-        );
-    }
-    print!("{prompt}");
-    std::io::stdout().flush()?;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line.trim().to_string())

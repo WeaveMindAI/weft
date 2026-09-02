@@ -6,7 +6,7 @@
 	import type { NodeDataUpdates, PortDefinition, NodeExecution, FieldDefinition } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
 	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx } from "../../constants/container-layout";
-	import { createPortContextMenu, buildPortMenuItems } from '../../utils/port-context-menu';
+	import { openPortMenu, buildPortMenuItems } from '../../utils/port-context-menu';
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
 	import { portMarkerStyle } from '../../utils/port-marker';
@@ -266,18 +266,13 @@
 	let newOutputName = $state('');
 	let portContextMenu = $state<{ portName: string; side: 'input' | 'output'; x: number; y: number } | null>(null);
 
-	function togglePortRequired(portName: string, side: 'input' | 'output') {
-		if (side === 'input') {
-			const newInputs = inputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ inputs: newInputs });
-		} else {
-			const newOutputs = outputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ outputs: newOutputs });
-		}
+	// Inputs only: requiredness has no runtime meaning on an output, and
+	// the menu offers the row on inputs alone.
+	function setInputPortRequired(portName: string, required: boolean) {
+		const newInputs = inputs.map((p: PortDefinition) =>
+			p.name === portName ? { ...p, required } : { ...p }
+		);
+		data.onUpdate?.({ inputs: newInputs });
 	}
 
 	function setPortType(portName: string, side: 'input' | 'output', newType: string) {
@@ -340,49 +335,52 @@
 		}
 	}
 
-	// Port context menu rendered on document.body to avoid CSS transform positioning issues.
-	// Group interface ports are always user-added and always support custom
-	// add/remove, so isCustom=true and canAddPorts=true for every port.
+	// Port context menu rendered on document.body to avoid CSS transform
+	// positioning issues. This effect tracks ONLY `portContextMenu`
+	// (open/close); openPortMenu builds the items untracked, as a
+	// snapshot of the gesture (see its doc). Group interface ports are
+	// always user-added and always support custom add/remove, so every
+	// port's delete action is a true removal.
 	$effect(() => {
 		if (!portContextMenu) return;
 		const { portName, side, x, y } = portContextMenu;
-		const port = side === 'input'
-			? inputs.find((p: PortDefinition) => p.name === portName)
-			: outputs.find((p: PortDefinition) => p.name === portName);
-		if (!port) return;
+		return openPortMenu({ x, y }, () => {
+			const port = side === 'input'
+				? inputs.find((p: PortDefinition) => p.name === portName)
+				: outputs.find((p: PortDefinition) => p.name === portName);
+			if (!port) return null;
 
-		const loopRole = isLoop
-			? (side === 'input'
-				? (() => {
-					const c = classifyInputPort(port, (data.config as Record<string, unknown>) ?? {});
-					return {
-						currentRole: c.role,
-						conflictReason: c.conflictReason,
-						onToggleRole: () => cycleLoopRole(portName, side),
-					};
-				})()
-				: (() => {
-					const c = classifyOutputPort(port, (data.config as Record<string, unknown>) ?? {}, inputs);
-					return {
-						currentRole: c.role,
-						conflictReason: c.conflictReason,
-						onToggleRole: () => cycleLoopRole(portName, side),
-					};
-				})())
-			: undefined;
+			const loopRole = isLoop
+				? (side === 'input'
+					? (() => {
+						const c = classifyInputPort(port, (data.config as Record<string, unknown>) ?? {});
+						return {
+							currentRole: c.role,
+							conflictReason: c.conflictReason,
+							onToggleRole: () => cycleLoopRole(portName, side),
+						};
+					})()
+					: (() => {
+						const c = classifyOutputPort(port, (data.config as Record<string, unknown>) ?? {}, inputs);
+						return {
+							currentRole: c.role,
+							conflictReason: c.conflictReason,
+							onToggleRole: () => cycleLoopRole(portName, side),
+						};
+					})())
+				: undefined;
 
-		const items = buildPortMenuItems({
-			port,
-			side,
-			isCustom: true,
-			canAddPorts: true,
-			onToggleRequired: () => togglePortRequired(portName, side),
-			onSetType: (newType) => setPortType(portName, side, newType),
-			onRemove: () => removePort(side, portName),
-			loopRole,
-		});
-
-		return createPortContextMenu(x, y, items, () => { portContextMenu = null; });
+			return buildPortMenuItems({
+				port,
+				...(side === 'input'
+					? { side, onSetRequired: (required: boolean) => setInputPortRequired(portName, required) }
+					: { side }),
+				deleteAction: 'remove',
+				onSetType: (newType) => setPortType(portName, side, newType),
+				onRemove: () => removePort(side, portName),
+				loopRole,
+			});
+		}, () => { portContextMenu = null; });
 	});
 
 	function computeMinHeightFor(numInputs: number, numOutputs: number, collapsed: boolean): number {

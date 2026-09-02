@@ -19,8 +19,10 @@ use tokio::sync::RwLock;
 
 /// The complete per-node infra image-tag map: `node_id -> { image_name ->
 /// image_ref }`. Written atomically alongside the running hashes (see
-/// `ProjectStoreOps::set_running_hashes`); the supervisor reads it per node to
-/// resolve `Image::Local { name }`.
+/// `ProjectStoreOps::set_running_hashes`); the supervisor reads it per node
+/// (through the broker) to resolve `Image::Local { name }`. The column's
+/// canonical decode is `weft_broker_client::protocol::decode_infra_image_tags`
+/// (shared with the broker's read so the two cannot drift).
 pub type InfraImageTags =
     std::collections::BTreeMap<String, std::collections::HashMap<String, String>>;
 
@@ -295,15 +297,10 @@ pub trait ProjectStoreOps: Send + Sync {
     // `set_running_hashes` (atomically alongside the running hashes), never
     // as a standalone per-node write, so a project can never be stamped
     // runnable with its infra tags missing/half-written. See that method.
-
-    /// Read the per-(project, node) image-tag map. Empty map if
-    /// never set. `Err` on DB failure (vs empty-map = "set to
-    /// empty", which is legal if a project has no Local images).
-    async fn infra_image_tags(
-        &self,
-        project_id_str: &str,
-        node_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>>;
+    // The map has no per-node reader on the store: the supervisor reads it
+    // through the broker, and the referenced-images keep-set reads the
+    // whole column (api/project.rs), both via the canonical decode in
+    // weft-broker-client.
 
     /// Persist the project's HealthProtocols override (JSON shape
     /// per supervisor `HealthProtocols`). `None` payload = use weft
@@ -1355,44 +1352,6 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(())
     }
 
-
-    async fn infra_image_tags(
-        &self,
-        project_id_str: &str,
-        node_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        use sqlx::Row;
-        let id = project_id_str
-            .parse::<uuid::Uuid>()
-            .map_err(|e| anyhow::anyhow!("bad project_id '{project_id_str}': {e}"))?;
-        let row = sqlx::query("SELECT infra_image_tags_json FROM project WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(r) = row else {
-            return Ok(Default::default());
-        };
-        let value: serde_json::Value = r
-            .try_get("infra_image_tags_json")
-            .map_err(|e| anyhow::anyhow!("decode infra_image_tags_json: {e}"))?;
-        // Typed decode through the canonical shape:
-        // `{ "<node_id>": { "<image_name>": "<tag>" } }`. Shape
-        // drift is a 500-level bug; silently returning empty would
-        // mask schema corruption as "no images registered."
-        let by_node: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, String>,
-        > = serde_json::from_value(value).map_err(|e| {
-            anyhow::anyhow!(
-                "infra_image_tags_json for project={project_id_str} has wrong shape \
-                 (expected {{node: {{image: tag}}}}): {e}"
-            )
-        })?;
-        // Missing this node IS a legitimate empty (the project's
-        // image-tag map exists but this node hasn't been written).
-        Ok(by_node.get(node_id).cloned().unwrap_or_default())
-    }
-
     async fn set_health_protocols(
         &self,
         id: uuid::Uuid,
@@ -1496,7 +1455,10 @@ impl ProjectStoreOps for MockProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
-        // The mock does not model infra image tags (its reader returns empty).
+        // The mock does not model the infra image-tag column (the real
+        // readers are SQL-direct: the broker handler and the
+        // referenced-images keep-set); accepted to satisfy the trait,
+        // ignored.
         _infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
@@ -1651,8 +1613,10 @@ impl ProjectStoreOps for MockProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
-        // The mock does not model infra image tags (its `infra_image_tags`
-        // reader returns empty); accepted to satisfy the trait, ignored.
+        // The mock does not model the infra image-tag column (the real
+        // readers are SQL-direct: the broker handler and the
+        // referenced-images keep-set); accepted to satisfy the trait,
+        // ignored.
         _infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<()> {
         if !self.inner.read().await.contains_key(&id) {
@@ -1984,14 +1948,6 @@ impl ProjectStoreOps for MockProjectStore {
     async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()> {
         self.namespaces.write().await.insert(id, String::new());
         Ok(())
-    }
-
-    async fn infra_image_tags(
-        &self,
-        _project_id_str: &str,
-        _node_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        Ok(std::collections::HashMap::new())
     }
 
     async fn set_health_protocols(

@@ -124,9 +124,16 @@ pub type SourceHash = String;
 ///   which IS hashed, so the path here is editor-routing metadata: renaming
 ///   the file with identical content must not flip the hash) and
 ///   `includePath` (an interface-parse-only pointer to an `@include`d file;
-///   the file's PATH is non-semantic, its expanded topology is what runs).
-/// - per edge: `span`. Per group: `span` / `headerSpan` /
-///   `portLiteralSpans`.
+///   the file's PATH is non-semantic, its expanded topology is what runs)
+///   and `sourceFile` (the absolute path a diagnostic anchors to; the same
+///   project compiled from two directories must hash the same).
+/// - per edge: `span` / `sourceFile`. Per group: `span` / `headerSpan` /
+///   `portLiteralSpans` / `sourceFile` / `description` (the authored
+///   `# ...` comment: prose, not shape).
+/// - per port (any of `inputs` / `outputs` / `inPorts` / `outPorts`):
+///   `declaredType` (header spelling) and the catalog prose an input
+///   mirrors from its metadata: `description`, `label`, `placeholder`.
+///   None of it is runtime shape.
 ///
 /// `publishedService` IS hashed, and it is the one enriched field that
 /// carries ANOTHER node's metadata (the recipe a publishing node hands
@@ -153,12 +160,15 @@ pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<So
     // NIL uuid (the id is not a parse input), while the build/dispatcher computes
     // the stored hash with the real project id. If `id` were hashed, those two
     // would NEVER agree and the "out of sync / resync" light would be stuck on.
-    obj.remove("id");
-    obj.remove("createdAt");
-    obj.remove("updatedAt");
+    for key in ["id", "createdAt", "updatedAt"] {
+        obj.remove(key);
+    }
     strip_keys(obj.get_mut("nodes"), NODE_HASH_STRIPS);
     strip_keys(obj.get_mut("edges"), EDGE_HASH_STRIPS);
     strip_keys(obj.get_mut("groups"), GROUP_HASH_STRIPS);
+    strip_port_presentation(obj.get_mut("nodes"));
+    strip_port_presentation(obj.get_mut("groups"));
+    canonicalize_key_order(&mut value);
     let json = serde_json::to_vec(&value)
         .map_err(|e| anyhow::anyhow!("re-serialize ProjectDefinition: {e}"))?;
     hasher.update(&json);
@@ -197,10 +207,47 @@ pub fn compute_source_hash(files: &[(String, String)]) -> SourceHash {
 /// The non-semantic keys stripped before hashing, shared by
 /// [`compute_definition_hash`] and the infra slice hasher so the two
 /// digests can never disagree on what "semantic" means.
-const NODE_HASH_STRIPS: &[&str] =
-    &["span", "headerSpan", "configSpans", "portLiteralSpans", "position", "fileRefs", "includePath"];
-const EDGE_HASH_STRIPS: &[&str] = &["span"];
-const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans"];
+const NODE_HASH_STRIPS: &[&str] = &[
+    "span",
+    "headerSpan",
+    "configSpans",
+    "portLiteralSpans",
+    "position",
+    "fileRefs",
+    "includePath",
+    "sourceFile",
+];
+const EDGE_HASH_STRIPS: &[&str] = &["span", "sourceFile"];
+// `description` is the group's authored `# ...` comment: prose, never
+// the runtime shape, so rewording it must not light a resync.
+const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans", "sourceFile", "description"];
+
+/// Remove the per-port PRESENTATION members from every port list of
+/// every element. `declaredType` records how the source HEADER spells a
+/// port (the editor's round-trip anchor); `description`, `label` and
+/// `placeholder` are catalog prose mirrored onto the instance. None is
+/// the runtime shape, so the same runtime graph written with or without
+/// a redundant header line, or against a catalog whose wording changed,
+/// must hash identically (the editor's header healing, or a reworded
+/// label, would otherwise flip the hash and light a resync for a
+/// cosmetic change).
+const PORT_HASH_STRIPS: &[&str] = &["declaredType", "description", "label", "placeholder"];
+fn strip_port_presentation(array: Option<&mut serde_json::Value>) {
+    let Some(serde_json::Value::Array(items)) = array else { return };
+    for item in items {
+        for list in ["inputs", "outputs", "inPorts", "outPorts"] {
+            if let Some(serde_json::Value::Array(ports)) = item.get_mut(list) {
+                for port in ports {
+                    if let Some(obj) = port.as_object_mut() {
+                        for key in PORT_HASH_STRIPS {
+                            obj.remove(*key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Remove `keys` from every object in a JSON array. Top level of
 /// each element only: deliberately does NOT recurse into `config`.
@@ -208,10 +255,39 @@ fn strip_keys(array: Option<&mut serde_json::Value>, keys: &[&str]) {
     let Some(serde_json::Value::Array(items)) = array else { return };
     for item in items {
         if let Some(obj) = item.as_object_mut() {
-            for k in keys {
-                obj.remove(*k);
+            for key in keys {
+                obj.remove(*key);
             }
         }
+    }
+}
+
+/// Rebuild every object in `value`, recursively, with its keys sorted
+/// by name. Hashed JSON MUST pass through this before serializing:
+/// serde_json's map is a BTreeMap (already sorted) by default but an
+/// insertion-ordered map under its `preserve_order` feature, and that
+/// feature flips with the build (`minillmlib` enables it, feature
+/// unification spreads it to any build that includes `weft-providers`,
+/// while a build without it, like the standalone CLI's, leaves it off).
+/// Without this normalization the same project would hash differently
+/// depending on which binary computed it, and the "out of sync /
+/// resync" light would be stuck on between them.
+fn canonicalize_key_order(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(obj).into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, v) in entries.iter_mut() {
+                canonicalize_key_order(v);
+            }
+            *obj = entries.into_iter().collect();
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                canonicalize_key_order(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -735,6 +811,8 @@ mod fs_hashes {
         let mut slice = serde_json::json!({ "nodes": nodes, "edges": edges });
         strip_keys(slice.get_mut("nodes"), super::NODE_HASH_STRIPS);
         strip_keys(slice.get_mut("edges"), super::EDGE_HASH_STRIPS);
+        super::strip_port_presentation(slice.get_mut("nodes"));
+        super::canonicalize_key_order(&mut slice);
         hasher.update(b"definition-slice:");
         hasher.update(
             &serde_json::to_vec(&slice)
@@ -940,16 +1018,28 @@ mod tests {
                 "label": null,
                 "config": {"value": config_value},
                 "position": {"x": 0.0, "y": 0.0},
-                "inputs": [],
-                "outputs": [],
+                "inputs": [{ "name": "a", "portType": "String", "required": true }],
+                "outputs": [{ "name": "out", "portType": "String", "required": true }],
                 "features": {},
                 "scope": [],
                 "groupBoundary": null,
                 "requiresInfra": false,
                 "images": [],
             }],
-            "edges": [],
-            "groups": [],
+            "edges": [{
+                "id": "e",
+                "source": "n",
+                "target": "n",
+                "sourceHandle": null,
+                "targetHandle": null,
+            }],
+            "groups": [{
+                "id": "g",
+                "kind": "group",
+                "label": null,
+                "inPorts": [{ "name": "gi", "portType": "String", "required": true }],
+                "outPorts": [{ "name": "go", "portType": "String", "required": true }],
+            }],
             "createdAt": ts,
             "updatedAt": ts,
         }))
@@ -1017,8 +1107,10 @@ mod tests {
     /// metadata). Renaming the referenced file WITHOUT changing the resolved
     /// value must not flip the definition hash, or every file rename would
     /// light the resync drift signal spuriously.
+    /// Also pins every other non-runtime member the hash strips: diagnostic
+    /// anchors, the header's declared spelling, and port / group prose.
     #[test]
-    fn definition_hash_ignores_file_ref_and_include_paths() {
+    fn definition_hash_ignores_non_runtime_fields() {
         let plain = project_at("2024-01-01T00:00:00Z", "hi");
         let mut renamed = serde_json::to_value(&plain).unwrap();
         let node = &mut renamed["nodes"][0];
@@ -1026,10 +1118,55 @@ mod tests {
         node["fileRefs"] =
             serde_json::json!({ "value": { "path": "renamed.txt", "type": "String", "marker": "file" } });
         node["includePath"] = serde_json::json!("some/other/path.weft");
+        // The same project compiled from another directory stamps different
+        // absolute diagnostic anchors on nodes, edges AND groups; the
+        // runtime graph is unchanged.
+        node["sourceFile"] = serde_json::json!("/somewhere/else/main.weft");
+        // A header restating a port (the editor's healing later drops
+        // it) differs only in `declaredType`; the runtime shape is
+        // identical, so the hash must not move.
+        node["inputs"][0]["declaredType"] = serde_json::json!("String");
+        // Prose is not shape: a catalog reworded a port's description,
+        // an author reworded a group's `# ...` comment.
+        node["inputs"][0]["description"] = serde_json::json!("catalog prose changed");
+        node["inputs"][0]["label"] = serde_json::json!("Prompt text");
+        node["inputs"][0]["placeholder"] = serde_json::json!("Type here");
+        // Every port list the strip walks: node outputs, group interface.
+        node["outputs"][0]["declaredType"] = serde_json::json!("String");
+        node["outputs"][0]["description"] = serde_json::json!("reworded");
+        renamed["groups"][0]["inPorts"][0]["description"] = serde_json::json!("reworded");
+        renamed["groups"][0]["outPorts"][0]["description"] = serde_json::json!("reworded");
+        renamed["edges"][0]["sourceFile"] = serde_json::json!("/somewhere/else/main.weft");
+        renamed["groups"][0]["sourceFile"] = serde_json::json!("/somewhere/else/main.weft");
+        renamed["groups"][0]["description"] = serde_json::json!("reworded comment");
         let renamed: ProjectDefinition = serde_json::from_value(renamed).unwrap();
         let h1 = compute_definition_hash(&plain).unwrap();
         let h2 = compute_definition_hash(&renamed).unwrap();
         assert_eq!(h1, h2, "file-ref / include path-only differences must hash identically");
+    }
+
+    /// The hash serializes through `canonicalize_key_order`, so the map
+    /// implementation behind `serde_json::Value` (sorted by default,
+    /// insertion-ordered under `preserve_order`, which feature
+    /// unification flips between builds) cannot move the digest. The
+    /// property is checked directly: two structurally equal values
+    /// built in different key orders serialize identically after
+    /// canonicalization, at every nesting depth.
+    #[test]
+    fn canonicalized_serialization_ignores_key_insertion_order() {
+        let mut a = serde_json::json!({});
+        a["zeta"] = serde_json::json!({ "y": 1, "x": [{ "b": 2, "a": 3 }] });
+        a["alpha"] = serde_json::json!(true);
+        let mut b = serde_json::json!({});
+        b["alpha"] = serde_json::json!(true);
+        b["zeta"] = serde_json::json!({ "x": [{ "a": 3, "b": 2 }], "y": 1 });
+        super::canonicalize_key_order(&mut a);
+        super::canonicalize_key_order(&mut b);
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            serde_json::to_string(&b).unwrap(),
+            "canonicalized serialization must not depend on key insertion order"
+        );
     }
 
     /// Counterpoint to the above: the hash MUST change when the

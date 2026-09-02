@@ -423,8 +423,8 @@ impl AccessBroker for FakeAccessBroker {
 fn published_connection(
     node_id: &str,
     service: &str,
-) -> weft_broker_client::protocol::PublishedConnection {
-    weft_broker_client::protocol::PublishedConnection {
+) -> weft_core::access::wire::PublishedConnection {
+    weft_core::access::wire::PublishedConnection {
         connection_id: format!("published-{node_id}-{service}"),
         identity: Some(format!("{service} run by {node_id}")),
     }

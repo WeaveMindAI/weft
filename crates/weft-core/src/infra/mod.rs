@@ -33,6 +33,6 @@ pub mod types;
 pub const SYSTEM_NAMESPACE: &str = "weft-system";
 pub const DB_NAMESPACE: &str = "weft-db";
 
-pub use compile::{compile, CompileContext, CompileError};
+pub use compile::{compile, unit_image_refs, CompileContext, CompileError};
 pub use hash::hash_spec;
 pub use types::*;

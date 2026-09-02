@@ -11,7 +11,8 @@ end up in git history.
 
 Every kind of credential is the same concept: an OAuth sign-in, a pasted API
 key, a GitHub App's private key, a mail server's host and user and password.
-One store, one connect screen, one way for a node to use it.
+One store, one connect flow (the node's Connect panel in the editor, or
+`weft connect` in a terminal), one way for a node to use it.
 
 ## The four objects
 

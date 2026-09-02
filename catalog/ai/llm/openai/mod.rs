@@ -23,6 +23,6 @@ impl Node for OpenAIProviderNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        provider::emit(&ctx, "openai", true).await
+        provider::emit(&ctx, "openai").await
     }
 }

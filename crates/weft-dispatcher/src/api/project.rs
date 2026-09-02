@@ -63,27 +63,46 @@ impl From<crate::project_store::StoredProjectSummary> for ProjectSummary {
     }
 }
 
-/// `GET /images/referenced`: every worker-image tag suffix the system still
-/// needs, across ALL tenants. The union of each project's
-/// `running_binary_hash` (what a fresh spawn would run), the `binary_hash`
-/// of every non-terminal worker pod (a pod draining in-flight work may
-/// still run an image its project no longer points at), and the
-/// `binary_hash` stamped on every pending/claimed task (a task can outlive
-/// both the project pointer and its pod between a resync and the
-/// cold-start sweep that fails superseded tasks). THE authority image
+/// `GET /images/referenced`: every image the system still needs, across
+/// ALL tenants, as one object with two lists. `workerHashes` is the union
+/// of each project's `running_binary_hash` (what a fresh spawn would run),
+/// the `binary_hash` of every non-terminal worker pod (a pod draining
+/// in-flight work may still run an image its project no longer points
+/// at), and the `binary_hash` stamped on every pending/claimed task (a
+/// task can outlive both the project pointer and its pod between a
+/// resync and the cold-start sweep that fails superseded tasks).
+/// `infraRefs` is the union of every project's complete infra image-tag
+/// map (`infra_image_tags_json`, written atomically with the running-hash
+/// trio on every infra sync) AND the image refs recorded on every
+/// `infra_node` unit (the infra mirror of the draining-pod rule: an UP
+/// unit is deliberately left frozen at its old image across syncs until
+/// it is force-stopped, so its recorded ref can be older than the
+/// project's current map and must stay referenced while the unit runs).
+/// Both lists hold BARE refs (`weft-worker:<hash>` suffixes and
+/// `weft-infra-<name>:<hash>` full refs; the CLI's tag policy never
+/// writes a registry prefix into either). THE authority image
 /// reclamation deletes against: `weft clean --images` keeps exactly this
 /// set and reclaims everything else, so under-reporting here deletes an
 /// image something still runs.
 ///
 /// Control-plane only: the set spans every tenant, so no single tenant may
 /// read it (a public build-activity oracle otherwise).
-// SYNC: response shape (JSON array of bare hash strings) <->
-//       crates/weft-cli/src/images.rs referenced_image_hashes
+// SYNC: response shape ({"workerHashes": [bare worker-hash strings],
+//       "infraRefs": [bare weft-infra-<name>:<hash> refs]}) <->
+//       crates/weft-cli/src/images.rs referenced_images
+#[derive(Debug, serde::Serialize)]
+pub struct ReferencedImages {
+    #[serde(rename = "workerHashes")]
+    pub worker_hashes: Vec<String>,
+    #[serde(rename = "infraRefs")]
+    pub infra_refs: Vec<String>,
+}
+
 pub async fn referenced_images(
     State(state): State<DispatcherState>,
     _ops: crate::authenticator::ControlPlaneCaller,
-) -> Result<Json<Vec<String>>, (StatusCode, String)> {
-    referenced_image_hashes(&state.pg_pool)
+) -> Result<Json<ReferencedImages>, (StatusCode, String)> {
+    referenced_images_query(&state.pg_pool)
         .await
         .map(Json)
         .map_err(|e| {
@@ -94,10 +113,12 @@ pub async fn referenced_images(
         })
 }
 
-/// The query behind `GET /images/referenced` (see `referenced_images` for
-/// the contract). Split out so the layer-3 db tests exercise the exact SQL
-/// the endpoint serves.
-pub async fn referenced_image_hashes(pool: &sqlx::PgPool) -> anyhow::Result<Vec<String>> {
+/// The queries behind `GET /images/referenced` (see `referenced_images`
+/// for the contract). Split out so the layer-3 db tests exercise the exact
+/// SQL the endpoint serves.
+pub async fn referenced_images_query(
+    pool: &sqlx::PgPool,
+) -> anyhow::Result<ReferencedImages> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT running_binary_hash FROM project \
          WHERE running_binary_hash IS NOT NULL AND running_binary_hash <> '' \
@@ -111,7 +132,64 @@ pub async fn referenced_image_hashes(pool: &sqlx::PgPool) -> anyhow::Result<Vec<
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(|(h,)| h).collect())
+    // One row per project, each the COMPLETE per-node tag map written by
+    // its last committed infra sync. Rows are small and few (one per
+    // project), so decoding in Rust beats a JSON-path query nobody can
+    // read. The canonical decode names the project in its error, so one
+    // corrupt row among many is diagnosable, and a row that fails it is a
+    // loud error, never a skipped keep-set entry (skipping it would
+    // condemn images the supervisor may still apply). Blank refs are
+    // skipped, mirroring the `<> ''` convention of the worker-hash arms
+    // (a blank matches no image; keeping it would only launder a
+    // buggy-writer blank into the set).
+    let tag_rows: Vec<(uuid::Uuid, serde_json::Value)> =
+        sqlx::query_as("SELECT id, infra_image_tags_json FROM project")
+            .fetch_all(pool)
+            .await?;
+    let mut infra_refs = std::collections::BTreeSet::new();
+    for (project_id, tags) in tag_rows {
+        let by_node = weft_broker_client::protocol::decode_infra_image_tags(
+            tags,
+            &format!("project={project_id}"),
+        )?;
+        for node_tags in by_node.values() {
+            for tag in node_tags.values() {
+                if !tag.is_empty() {
+                    infra_refs.insert(tag.clone());
+                }
+            }
+        }
+    }
+    // The refs live units actually run, recorded per unit on the
+    // infra_node row at every apply (see `UnitRuntime::image_refs`).
+    // Covers what the project-row map cannot: an UP unit frozen at an
+    // older image across one or more syncs keeps running that ref until
+    // it is force-stopped, so its old ref must stay referenced. Units
+    // recorded before the field existed (or frozen since before it did)
+    // contribute nothing until their next apply stamps them; the map's
+    // current refs already cover everything reconciled from now on.
+    // All rows, all units, regardless of status: over-keeping a ref is
+    // bounded (rows die with the node on terminate) and the safe
+    // direction for a set reclamation deletes against.
+    let unit_rows: Vec<(String, String, serde_json::Value)> =
+        sqlx::query_as("SELECT project_id, node_id, units_json FROM infra_node")
+            .fetch_all(pool)
+            .await?;
+    for (project_id, node_id, units) in unit_rows {
+        let by_unit =
+            weft_broker_client::protocol::decode_units_json(units, &project_id, &node_id)?;
+        for runtime in by_unit.into_values() {
+            for image_ref in runtime.image_refs {
+                if !image_ref.is_empty() {
+                    infra_refs.insert(image_ref);
+                }
+            }
+        }
+    }
+    Ok(ReferencedImages {
+        worker_hashes: rows.into_iter().map(|(h,)| h).collect(),
+        infra_refs: infra_refs.into_iter().collect(),
+    })
 }
 
 pub async fn list(

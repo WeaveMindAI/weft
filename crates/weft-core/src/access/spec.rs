@@ -64,6 +64,14 @@ pub struct AccessSpec {
     /// as a template over captured/stored values ("{team} / {user}").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Template>,
+    /// The node can RUN without a connection picked (a custom endpoint
+    /// that may be unauthenticated). By default every access node
+    /// requires one: the language synthesizes the runtime "no
+    /// connection picked" rule and the editor pins the unconnected
+    /// node open, so node metadata never restates that boilerplate.
+    /// Declaring this true turns both off for this node.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub connection_optional: bool,
     /// The connect doors this service offers. `own` is the page where
     /// the user brings (or creates) their own credential; `shared` is
     /// the one-click door on a credential weft itself holds (a
@@ -1220,6 +1228,18 @@ pub fn spec_for_service<'a>(
 }
 
 impl AccessSpec {
+    /// Stamp this recipe's identity onto an access widget: the service
+    /// name, and whether the owning node runs without a connection
+    /// picked. THE one definition of the stamp, shared by the
+    /// compiler's enrich pass and the metadata's compact wiring view,
+    /// so the two can never drift apart. No-op on any other widget.
+    pub fn stamp_onto(&self, widget: &mut crate::node::Widget) {
+        if let crate::node::Widget::Access { service, optional } = widget {
+            *service = Some(self.service.clone());
+            *optional = self.connection_optional;
+        }
+    }
+
     /// Every template this spec declares, for validation and for
     /// computing the worker handoff set (the auth steps' placeholders).
     fn auth_templates(&self) -> Vec<&Template> {
@@ -1528,6 +1548,25 @@ impl AccessSpec {
         matches!(self.acquisition, Acquisition::OAuth2 { .. })
     }
 
+    /// Does connecting run a BROWSER consent (begin + callback + poll)?
+    /// Narrower than [`is_oauth`]: a `client_credentials` grant uses an
+    /// app registration but exchanges it server-to-server in one
+    /// request, so it connects through the direct path.
+    // SYNC: needs_browser_consent <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte isConsent
+    pub fn needs_browser_consent(&self) -> bool {
+        matches!(
+            self.acquisition,
+            Acquisition::OAuth2 { grant: OAuthGrant::AuthorizationCode { .. }, .. }
+        )
+    }
+
+    /// The service's display name: the declared label, else the service
+    /// name itself.
+    // SYNC: display_label <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte label
+    pub fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.service)
+    }
+
     /// The catalogue entries that start ticked.
     // SYNC: AccessSpec::default_permissions <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts defaultPermissions
     // Own-account-only entries are capability declarations, never
@@ -1594,6 +1633,40 @@ impl AccessSpec {
         let joined = labels.join(", ");
         guide.steps.iter().map(|s| s.replace("{permissions}", &joined)).collect()
     }
+
+    /// The guide's link with `{permissions}` replaced by the ticked
+    /// permission IDS, urlencoded and comma-joined: a link goes to a
+    /// provider console, which wants machine ids where the steps'
+    /// prose wants labels. The ONE substitution, so no surface renders
+    /// the same link differently. None when no guide or no link is
+    /// declared.
+    // SYNC: guide_link <-> packages/weft-graph/src/webview/lib/components/project/own-fields.ts guideLink
+    pub fn guide_link(&self, ticked: &[String]) -> Option<String> {
+        let link = self.own_page.as_ref()?.guide.as_ref()?.link.as_ref()?;
+        Some(link.replace("{permissions}", &percent_encode(&ticked.join(","))))
+    }
+}
+
+/// Percent-encode everything outside the RFC 3986 unreserved set.
+/// Hand-rolled because the pure type layer carries no url crate;
+/// public so callers with the same need (a provider building a query
+/// path) do not grow their own copy.
+pub fn percent_encode(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn validate_captures(captures: &[Capture]) -> Result<(), String> {
@@ -1907,6 +1980,21 @@ mod tests {
         assert_eq!(steps[0], "Create an app at api.slack.com/apps.");
         assert_eq!(steps[1], "Add these bot scopes: Send messages, Upload files.");
         assert!(spec.guide_steps(&[])[1].ends_with(": ."), "no ticks, empty list");
+    }
+
+    /// The guide LINK interpolates the ticked permission IDS,
+    /// urlencoded (a provider console wants machine ids where the
+    /// steps' prose wants labels).
+    #[test]
+    fn guide_link_interpolates_urlencoded_ids() {
+        let mut spec = slack_spec();
+        if let Some(guide) = spec.own_page.as_mut().and_then(|p| p.guide.as_mut()) {
+            guide.link = Some("https://example.com/apps?scopes={permissions}".into());
+        }
+        let link = spec
+            .guide_link(&["chat:write".into(), "files:write".into()])
+            .expect("a link is declared");
+        assert_eq!(link, "https://example.com/apps?scopes=chat%3Awrite%2Cfiles%3Awrite");
     }
 
     /// A signing service declaring the shared door is a PARSE error:

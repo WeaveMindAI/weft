@@ -176,7 +176,8 @@ async fn infra_sync(
     opts: InfraOpts,
 ) -> Result<()> {
     let handle = super::ensure::ensure_registered(ctx, progress).await?;
-    let image_tags = build_infra_images(progress, &handle.plan, &handle.id).await?;
+    let image_tags =
+        build_infra_images(progress, &handle.plan, &handle.id, &handle.client).await?;
     let verb_label = action_verb_label(&action);
 
     // A START never deactivates: an active project's triggers stay
@@ -433,9 +434,19 @@ async fn build_infra_images(
     progress: &Progress,
     plan: &weft_compiler::build_plan::BuildPlan,
     project_id: &str,
+    client: &crate::client::DispatcherClient,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut seen_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // What must survive each image's post-ensure GC beyond its fresh
+    // tag. Infra tags are content-addressed with no project in them,
+    // so another project's running unit can be on a tag this project
+    // just moved off; the dispatcher's keep-set (every project's tag
+    // map + every recorded unit ref) is the only thing that knows.
+    // Fetched once for the whole plan; None + a warning when the
+    // answer is unlearnable, and then every GC below is skipped, never
+    // guessed.
+    let referenced = images::referenced_set_for_gc(client).await;
 
     for img in plan.images.iter().filter(|i| i.kind == weft_compiler::build_plan::ImageKind::Infra)
     {
@@ -472,21 +483,29 @@ async fn build_infra_images(
             images::kind_load(&cfg.cluster_name, &tag, false).await?;
             progress.image_push_done(&tag);
         }
-        // Same content-addressed accumulation as worker images: drop
-        // this project's prior tags of this infra repo now that the
-        // fresh one is ensured. Infra pods are long-lived (never
-        // scale-to-zero), so beyond the fresh tag nothing is
-        // referenced by design: an old tag a not-yet-synced pod still
-        // runs refuses its node-side remove and survives.
-        if let Some((repo, _)) = tag.rsplit_once(':') {
-            crate::commands::build::gc_stale_images(
-                repo,
-                &tag,
-                &[format!("weft.dev/project={project_id}")],
-                Some(&std::collections::BTreeSet::new()),
-            )
-            .await;
-        }
+    }
+    // Same content-addressed accumulation as worker images: drop this
+    // project's prior tags of each infra repo now that every fresh one
+    // is ensured, keeping whatever the dispatcher still references
+    // (this project's frozen units, and any other project sharing the
+    // tag: the `weft.dev/project` label names whoever built the image
+    // first, never every user of it). One GC per REPO over the plan's
+    // whole tag set for it, after the loop: two node types shipping an
+    // image directory of the same name mint one repo under two hashes,
+    // and a per-image GC keyed on one fresh tag would delete the
+    // sibling built a moment ago.
+    let mut fresh_by_repo: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for tag in &seen_tags {
+        let (repo, _) = images::ref_repo_tag(tag)?;
+        fresh_by_repo.entry(repo).or_default().push(tag.clone());
+    }
+    for fresh in fresh_by_repo.values() {
+        crate::commands::build::gc_stale_images(
+            fresh,
+            &[format!("weft.dev/project={project_id}")],
+            referenced.as_ref(),
+        )
+        .await;
     }
     Ok(out)
 }

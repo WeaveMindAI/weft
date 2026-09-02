@@ -31,6 +31,7 @@ fn unit_map(
             stop_behavior: weft_core::StopBehavior::ScaleToZero,
             flaky_after_seconds: 30,
             recovery_after_seconds: 30,
+            image_refs: Default::default(),
         },
     );
     m
@@ -698,6 +699,53 @@ async fn set_applied_landing_mid_flaky_is_re_observed_next_tick() {
         Status::Flaky,
         "next tick must re-observe degraded replicas and rewrite Flaky"
     );
+}
+
+/// A frozen unit the row calls `Flaky`, still at 0 ready, must stay
+/// `Flaky` on the first tick after the project's latches were cleared
+/// (every lifecycle command clears them): the fresh latch is seeded
+/// from the row, so the reconcile has nothing to rewrite. Before the
+/// seeding, the empty latch derived `Running` and rewrote the unit,
+/// and the node with it, while nothing was ready.
+#[tokio::test]
+async fn frozen_flaky_unit_is_not_rewritten_running_after_latch_reset() {
+    let rig = rig();
+    rig.broker.add_infra_node_with(
+        PROJECT,
+        NODE,
+        "inst1",
+        Status::Flaky,
+        Some("hash".into()),
+        std::collections::BTreeMap::new(),
+        unit_map(NODE, Status::Flaky),
+    );
+    rig.kube
+        .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 0)]);
+    // A command in flight clears the project's latches and stands
+    // the tick down.
+    rig.broker.set_infra_command_in_flight(PROJECT, true);
+    rig.tick_health().await.unwrap();
+    rig.broker.set_infra_command_in_flight(PROJECT, false);
+
+    rig.advance(Duration::from_secs(1));
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Flaky);
+    assert!(
+        !rig.broker.calls().iter().any(|c| matches!(c, BrokerCall::SetStatus { .. })),
+        "no status rewrite for a unit the row already calls Flaky; calls={:?}",
+        rig.broker.calls()
+    );
+
+    // Ready for the whole recovery window: recovered, and only then
+    // written Running.
+    rig.kube
+        .set_workloads(NAMESPACE, vec![workload("inst1-bridge", NODE, 1, 1)]);
+    rig.advance(Duration::from_secs(1));
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Flaky);
+    rig.advance(Duration::from_secs(35));
+    rig.tick_health().await.unwrap();
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().status, Status::Running);
 }
 
 // ---------- regression: two-stage default protocols ----------

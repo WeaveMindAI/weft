@@ -77,9 +77,9 @@ impl HttpCore {
     /// Single POST core: build the request (url join, bearer token,
     /// JSON body), send, hand back the raw response. Status
     /// interpretation lives in the thin wrappers (`post_with` =
-    /// 2xx-or-error, `post_or_404` = 404 is "no row", `post_or_raced`
-    /// = 410 is `WriteOutcome::Raced`) so the build/send body exists
-    /// exactly once.
+    /// 2xx-or-error, `post_or_404` = 404 is "no row", `post_fenced`
+    /// = 410 / 409 are the two stale `WriteOutcome`s) so the build/send
+    /// body exists exactly once.
     async fn post_raw<Req: Serialize>(
         &self,
         path: &str,
@@ -124,7 +124,7 @@ impl HttpCore {
     /// Variant of `post` for content-addressed reads where 404 means
     /// "no row exists for this key" (a real "not found", NOT a race).
     /// Returns `Ok(None)` on 404 and `Ok(Some(_))` on 2xx; any other
-    /// non-2xx is an error. Distinct from `post_or_raced` because a
+    /// non-2xx is an error. Distinct from `post_fenced` because a
     /// content-addressed read CANNOT race: the row either exists
     /// under the requested key or it doesn't.
     pub async fn post_or_404<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
@@ -139,41 +139,59 @@ impl HttpCore {
         Ok(Some(Self::parse_success(resp, path).await?))
     }
 
-    /// Variant of `post` that converts HTTP 410 Gone into
-    /// `WriteOutcome::Raced`. Used by lifecycle write paths where
-    /// the broker returns 410 when the row was already-completed
-    /// or reclaimed by a sibling pod (lease takeover, remove_node
-    /// cascade). Lets callers distinguish "this raced, no-op
-    /// gracefully" from "real failure, bubble up."
-    pub async fn post_or_raced<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
+    /// Variant of `post` for the fenced lifecycle writes: HTTP 410
+    /// (this pod lost the project) is `WriteOutcome::Displaced`, HTTP
+    /// 409 (the target is gone while the pod still owns the project)
+    /// is `WriteOutcome::Gone`, and both are answers rather than
+    /// errors so the caller decides what each means for its command.
+    // SYNC: the two status codes <-> crates/weft-broker/src/handlers.rs
+    //       (stale_write, the one place that emits them)
+    pub async fn post_fenced<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
         path: &str,
         body: &Req,
     ) -> Result<WriteOutcome<Res>> {
         let resp = self.post_raw(path, body, &self.client).await?;
-        if resp.status() == reqwest::StatusCode::GONE {
-            return Ok(WriteOutcome::Raced);
+        match resp.status() {
+            reqwest::StatusCode::GONE => Ok(WriteOutcome::Displaced),
+            reqwest::StatusCode::CONFLICT => Ok(WriteOutcome::Gone),
+            _ => Ok(WriteOutcome::Applied(Self::parse_success(resp, path).await?)),
         }
-        Ok(WriteOutcome::Applied(Self::parse_success(resp, path).await?))
     }
 }
 
-/// Outcome of a lifecycle-bound broker write. `Applied(_)` means
-/// the write landed and the caller can rely on its effect.
-/// `Raced` means the broker returned 410 Gone: the row was
-/// already completed, the lease was reassigned to a sibling pod,
-/// or the underlying object (infra_node) was removed mid-flight.
-/// Callers should treat `Raced` as "someone else handled it" and
-/// move on (log + return, don't bubble as error).
+/// Outcome of a fenced lifecycle write. `Applied(_)`: the write
+/// landed and the caller can rely on its effect. The two stale
+/// outcomes are deliberately distinct because the caller must do
+/// different things with them:
+/// - `Displaced` (HTTP 410): this pod no longer owns the project (the
+///   `infra_owner` lease moved to a sibling). The caller stops touching
+///   the project and leaves the command UNCOMPLETED, so the new owner
+///   re-runs it; `command_complete` is displaced for the same reason.
+/// - `Gone` (HTTP 409): the target of the write is not there any more
+///   while this pod still owns the project: the infra_node row was
+///   removed, the unit left the roster, or the command is already
+///   completed. The caller's work for THAT target is moot; the rest of
+///   the command proceeds and completes normally.
+/// Conflating the two (one "raced" answer) once let a terminate whose
+/// row vanished mid-flight return early, complete as succeeded, and
+/// never delete the instance's workloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOutcome<T> {
     Applied(T),
-    Raced,
+    Displaced,
+    Gone,
 }
 
 impl<T> WriteOutcome<T> {
-    pub fn is_raced(&self) -> bool {
-        matches!(self, WriteOutcome::Raced)
+    pub fn is_applied(&self) -> bool {
+        matches!(self, WriteOutcome::Applied(_))
+    }
+    pub fn is_displaced(&self) -> bool {
+        matches!(self, WriteOutcome::Displaced)
+    }
+    pub fn is_gone(&self) -> bool {
+        matches!(self, WriteOutcome::Gone)
     }
 }
 
@@ -710,7 +728,7 @@ impl BrokerSupervisorClient {
             failure_message: failure_message.map(|s| s.to_string()),
         };
         self.http
-            .post_or_raced::<_, SupervisorSetStatusResponse>("/v1/supervisor/set_status", &req)
+            .post_fenced::<_, SupervisorSetStatusResponse>("/v1/supervisor/set_status", &req)
             .await
     }
 
@@ -729,7 +747,7 @@ impl BrokerSupervisorClient {
             node_id: node_id.to_string(),
         };
         self.http
-            .post_or_raced::<_, SupervisorRemoveNodeResponse>("/v1/supervisor/remove_node", &req)
+            .post_fenced::<_, SupervisorRemoveNodeResponse>("/v1/supervisor/remove_node", &req)
             .await
     }
 
@@ -747,7 +765,7 @@ impl BrokerSupervisorClient {
             cancelled,
         };
         self.http
-            .post_or_raced::<_, SupervisorCommandCompleteResponse>(
+            .post_fenced::<_, SupervisorCommandCompleteResponse>(
                 "/v1/supervisor/command_complete",
                 &req,
             )
@@ -827,7 +845,7 @@ impl BrokerSupervisorClient {
             units,
         };
         self.http
-            .post_or_raced::<_, SupervisorSetAppliedResponse>("/v1/supervisor/set_applied", &req)
+            .post_fenced::<_, SupervisorSetAppliedResponse>("/v1/supervisor/set_applied", &req)
             .await
     }
 
@@ -859,7 +877,7 @@ impl BrokerSupervisorClient {
             units,
         };
         self.http
-            .post_or_raced::<_, SupervisorSetProvisioningResponse>(
+            .post_fenced::<_, SupervisorSetProvisioningResponse>(
                 "/v1/supervisor/set_provisioning",
                 &req,
             )

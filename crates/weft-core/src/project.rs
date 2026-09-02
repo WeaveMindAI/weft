@@ -93,6 +93,10 @@ pub struct GroupDefinition {
     pub span: Option<Span>,
     #[serde(default, rename = "headerSpan")]
     pub header_span: Option<Span>,
+    /// The file the spans live in when the group came from a full-mode
+    /// `@include` (same rule as `NodeDefinition::source_file`).
+    #[serde(default, rename = "sourceFile", skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
     /// The group's description: the plain `# ...` comment that is the first
     /// body line of the group body (text without the `# `).
     #[serde(default)]
@@ -156,18 +160,26 @@ pub enum ConfigOrigin {
 /// Source range of one config field plus how it was written. The editor edits
 /// a single field surgically using `span`, and uses `origin` to reconstruct
 /// the correct line prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigFieldSpan {
     pub span: Span,
     pub origin: ConfigOrigin,
+    /// The file the span's coordinates live in, when a full-mode
+    /// `@include` spliced it out of another file. None = the compiled
+    /// source. Carried on the SPAN (not derived from the owning node)
+    /// because a boundary node holds spans from two files at once: its
+    /// loop knobs from the included file, its interface-port fills from
+    /// the file that wrote `alias.port = value`.
+    #[serde(default, rename = "sourceFile", skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
 }
 
 impl ConfigFieldSpan {
     pub fn inline(span: Span) -> Self {
-        Self { span, origin: ConfigOrigin::Inline }
+        Self { span, origin: ConfigOrigin::Inline, source_file: None }
     }
     pub fn connection(span: Span) -> Self {
-        Self { span, origin: ConfigOrigin::Connection }
+        Self { span, origin: ConfigOrigin::Connection, source_file: None }
     }
 }
 
@@ -199,6 +211,12 @@ pub struct NodeDefinition {
     /// side.
     #[serde(default, rename = "groupBoundary")]
     pub group_boundary: Option<GroupBoundary>,
+    /// The file this node was written in, when it is NOT the compiled
+    /// source: a full-mode `@include` splices another file's nodes in
+    /// with their own spans, and diagnostics on them must name that
+    /// file. None = the compiled source itself.
+    #[serde(default, rename = "sourceFile", skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
     /// Enriched inputs. Empty before compile.
     #[serde(default)]
     pub inputs: Vec<InputDefinition>,
@@ -404,14 +422,15 @@ pub struct GroupBoundary {
 /// (widget/default/label/placeholder) stamped from the metadata so the
 /// editor never re-derives any of it. The instance twin of the
 /// metadata's `InputSpec`; outputs use the slim [`PortDefinition`].
+// SYNC: InputDefinition <-> packages/weft-graph/src/protocol.ts InputDefinition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputDefinition {
-    pub name: String,
-    #[serde(rename = "portType")]
-    pub port_type: WeftType,
-    pub required: bool,
-    #[serde(default)]
-    pub description: Option<String>,
+    /// The wire-port half (name, type, requiredness, declared spelling,
+    /// carry flag), flattened onto the wire so the JSON shape is the
+    /// same as the TS `InputDefinition extends PortDefinition`. The
+    /// `Deref` impls below let readers keep writing `input.name`.
+    #[serde(flatten)]
+    pub port: PortDefinition,
     /// Where this input's value may come from (resolved from the
     /// metadata's explicit level or the type default).
     // SYNC: InputDefinition.exposure <-> packages/weft-graph/src/protocol.ts InputDefinition.exposure
@@ -433,11 +452,6 @@ pub struct InputDefinition {
     /// Editor placeholder (mirrored from the metadata).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
-    /// True for the auto-synthesized INPUT half of a loop carry port.
-    /// The editor uses this to render it as a non-editable ghost mirroring
-    /// the carry output of the same name. Never set on a user-declared input.
-    #[serde(default, rename = "synthesizedFromCarry", skip_serializing_if = "std::ops::Not::not")]
-    pub synthesized_from_carry: bool,
     /// True when this input comes from the node TYPE's own spec (its
     /// metadata: `code` on ExecPython, `title` on a form node), false
     /// when it was added on this INSTANCE (a custom header port, a
@@ -480,51 +494,60 @@ impl InputDefinition {
     pub fn from_wire_port(port: PortDefinition) -> Self {
         Self {
             exposure: port.port_type.default_exposure(),
-            name: port.name,
-            port_type: port.port_type,
-            required: port.required,
-            description: port.description,
+            port,
             widget: None,
             default: None,
             label: None,
             placeholder: None,
-            synthesized_from_carry: port.synthesized_from_carry,
             from_spec: false,
             requires_scopes: None,
             requires_values: None,
         }
     }
 
-    /// The slim wire-port view of this input (drops the input-only
-    /// surface). Used where a group/boundary interface mirrors a node's
-    /// input list.
-    pub fn to_wire_port(&self) -> PortDefinition {
-        PortDefinition {
-            name: self.name.clone(),
-            port_type: self.port_type.clone(),
-            required: self.required,
-            description: self.description.clone(),
-            synthesized_from_carry: self.synthesized_from_carry,
-        }
+}
+
+impl std::ops::Deref for InputDefinition {
+    type Target = PortDefinition;
+    fn deref(&self) -> &PortDefinition {
+        &self.port
+    }
+}
+
+impl std::ops::DerefMut for InputDefinition {
+    fn deref_mut(&mut self) -> &mut PortDefinition {
+        &mut self.port
     }
 }
 
 /// A pure WIRE port on a node instance's OUTPUT side or a group/loop
 /// interface: a named, typed dock for edges. Inputs are the richer
 /// [`InputDefinition`].
+// SYNC: PortDefinition <-> packages/weft-graph/src/protocol.ts PortDefinition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortDefinition {
     pub name: String,
     #[serde(rename = "portType")]
     pub port_type: WeftType,
     pub required: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// True for the auto-synthesized side of a loop carry port (mirrored
     /// on the loop group's interface). The editor renders it as a
     /// non-editable ghost of the carry output of the same name.
     #[serde(default, rename = "synthesizedFromCarry", skip_serializing_if = "std::ops::Not::not")]
     pub synthesized_from_carry: bool,
+    /// The VERBATIM type annotation the SOURCE header declares for this
+    /// port (never a re-print of the parsed type, so a registry alias or
+    /// even an unparseable typo round-trips as the author typed it);
+    /// None when the header does not declare it (a catalog port, a
+    /// config-derived one, a synthesized one). The editor rewrites the
+    /// header from this, never from `port_type`: the rendered type may
+    /// be an inference-resolved instantiation of a generic, which must
+    /// not get frozen into source as if the author wrote it.
+    // SYNC: PortDefinition.declared_type <-> packages/weft-graph/src/protocol.ts PortDefinition.declaredType
+    #[serde(default, rename = "declaredType", skip_serializing_if = "Option::is_none")]
+    pub declared_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -547,6 +570,10 @@ pub struct Edge {
     /// Used by tooling to remove or rewrite the edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span: Option<Span>,
+    /// The file the span lives in when the edge came from a full-mode
+    /// `@include` (same rule as `NodeDefinition::source_file`).
+    #[serde(default, rename = "sourceFile", skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
 }
 
 /// Pre-indexed edge lookups. Build once per compiled project, use
@@ -682,16 +709,19 @@ mod project_wire_tests {
     #[test]
     fn project_definition_nested_wire_keys() {
         let input = InputDefinition {
-            name: "inp".into(),
-            port_type: WeftType::primitive(crate::weft_type::WeftPrimitive::String),
-            required: true,
-            description: None,
+            port: PortDefinition {
+                name: "inp".into(),
+                port_type: WeftType::primitive(crate::weft_type::WeftPrimitive::String),
+                required: true,
+                description: None,
+                synthesized_from_carry: false,
+                declared_type: None,
+            },
             exposure: crate::weft_type::Exposure::Assignment,
             widget: None,
             default: None,
             label: None,
             placeholder: None,
-            synthesized_from_carry: false,
             from_spec: false,
             requires_scopes: None,
             requires_values: None,
@@ -718,12 +748,13 @@ mod project_wire_tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            source_file: None,
         };
         let group = GroupDefinition {
             id: "g".into(),
             kind: GroupKind::Group,
             label: None,
-            in_ports: vec![input.to_wire_port()],
+            in_ports: vec![input.port.clone()],
             out_ports: vec![],
             one_of_required: vec![],
             parent_group_id: None,
@@ -732,6 +763,7 @@ mod project_wire_tests {
             anonymous: false,
             span: None,
             header_span: None,
+            source_file: None,
             description: None,
             port_literals: [("_should_flow".to_string(), Value::Bool(false))].into(),
             port_literal_spans: Default::default(),
@@ -743,6 +775,7 @@ mod project_wire_tests {
             target: "g.m".into(),
             target_handle: Some("in".into()),
             span: None,
+            source_file: None,
         };
         let p = ProjectDefinition {
             id: Uuid::nil(),
@@ -762,7 +795,7 @@ mod project_wire_tests {
         // when absent (never `null`, which the TS optional types don't
         // model).
         assert_eq!(v["nodes"][0]["inputs"][0]["exposure"], "assignment", "exposure tag: {v}");
-        for absent in ["widget", "default", "label", "placeholder"] {
+        for absent in ["widget", "default", "label", "placeholder", "description", "declaredType"] {
             assert!(
                 v["nodes"][0]["inputs"][0].get(absent).is_none(),
                 "unset `{absent}` must be omitted: {v}"
@@ -810,6 +843,7 @@ mod project_wire_tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            source_file: None,
         }
     }
 

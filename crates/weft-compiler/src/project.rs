@@ -68,6 +68,7 @@ pub struct WorkerBuildSection {
     pub dockerfile_template: Option<String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct Project {
     pub root: PathBuf,
     pub manifest: ProjectManifest,
@@ -183,16 +184,14 @@ impl Project {
         }
     }
 
-    /// Like [`find`], but a missing project is an error (the common case for
-    /// commands that require a project root). Lets the user invoke `weft run`
-    /// from a subfolder without naming the project root every time.
-    pub fn discover(start: &Path) -> CompileResult<Self> {
-        Self::find(start)?.ok_or_else(|| {
-            CompileError::Project(format!(
-                "no weft.toml found at {} or any parent",
-                start.display()
-            ))
-        })
+    /// The one wording for "no project here", so [`Self::find`]'s
+    /// callers that treat "not found" as an error cannot fork the
+    /// message.
+    pub fn no_project_here(start: &Path) -> CompileError {
+        CompileError::Project(format!(
+            "no weft.toml found at {} or any parent",
+            start.display()
+        ))
     }
 }
 

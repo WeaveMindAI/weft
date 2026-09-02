@@ -11,11 +11,15 @@
 # Postgres never comes up or the container dies, and leaves the
 # connection URL in $THROWAWAY_DATABASE_URL and the container name in
 # $THROWAWAY_PG_CONTAINER. The CALLER owns cleanup (its own EXIT trap
-# running `docker rm -f "$THROWAWAY_PG_CONTAINER"`): scripts already
+# running `docker rm -f -v "$THROWAWAY_PG_CONTAINER"`): scripts already
 # carry traps of their own, and a trap set here would silently replace
 # them. That caller-side removal is also why there is no `--rm` here:
 # a container that crashes must stay around long enough for the
-# failure branch below to read its logs.
+# failure branch below to read its logs. Every removal in here and in
+# the callers takes `-v`: postgres:18 declares a VOLUME, so a plain
+# `rm` strands the container's anonymous volume (an initdb cluster)
+# forever; `-v` removes anonymous volumes with the container and never
+# touches named ones.
 
 start_throwaway_postgres() {
   local container="$1-$$"
@@ -23,7 +27,10 @@ start_throwaway_postgres() {
     echo "docker is not on PATH, so no throwaway postgres can be started" >&2
     return 1
   fi
-  docker rm -f "$container" >/dev/null 2>&1 || true
+  # A leftover same-name container from a run whose trap never fired
+  # (SIGKILL, crashed caller, pre-helper leftover): remove it WITH its
+  # anonymous volume (-v), the same volume this would otherwise strand.
+  docker rm -f -v "$container" >/dev/null 2>&1 || true
   # Exported BEFORE the container runs, so a Ctrl-C anywhere in the
   # readiness wait still leaves the caller's trap pointing at the right
   # container instead of an unset variable and an orphan.
@@ -44,7 +51,7 @@ start_throwaway_postgres() {
   if [ -z "$port" ]; then
     echo "docker reported no host port for '$container'; its logs:" >&2
     docker logs "$container" >&2 2>&1 || true
-    docker rm -f "$container" >/dev/null 2>&1 || true
+    docker rm -f -v "$container" >/dev/null 2>&1 || true
     return 1
   fi
   local tries=0
@@ -54,7 +61,7 @@ start_throwaway_postgres() {
        || [ "$tries" -gt 60 ]; then
       echo "the throwaway postgres '$container' never became ready; its logs:" >&2
       docker logs "$container" >&2 2>&1 || true
-      docker rm -f "$container" >/dev/null 2>&1 || true
+      docker rm -f -v "$container" >/dev/null 2>&1 || true
       return 1
     fi
     sleep 1

@@ -71,6 +71,23 @@ pub fn infra_images(definition: &ProjectDefinition, catalog: &FsCatalog) -> Resu
                     )
                 })?
                 .to_string();
+            // Reserved repo: an image named `supervisor` would mint the
+            // `weft-infra-supervisor` repo, which belongs to the SYSTEM
+            // supervisor image. The collision is invisible until the two
+            // sweeps that own those repos race (the system sweep would
+            // reclaim a live project image's tags; the infra sweep would
+            // skip them), so the name is refused at enumeration time,
+            // the one place every caller derives image names from.
+            // SYNC: the reserved spelling <-> crates/weft-cli/src/images.rs
+            //       (SystemService::Supervisor)
+            if infra_image_repo(&image_name) == "weft-infra-supervisor" {
+                return Err(anyhow!(
+                    "node type '{}' declares an image named '{image_name}', whose repo \
+                     'weft-infra-supervisor' is reserved for the system supervisor image; \
+                     rename the image directory",
+                    node.node_type
+                ));
+            }
             let dockerfile = source_dir.join("Dockerfile");
             if !dockerfile.is_file() {
                 return Err(anyhow!(
@@ -96,7 +113,9 @@ pub fn infra_images(definition: &ProjectDefinition, catalog: &FsCatalog) -> Resu
 /// `weft-infra-<image_name>:<content_hash>`. ONE source of truth for the infra
 /// tag shape, shared by the CLI (local tag) and the dispatcher (which prepends
 /// the registry prefix), so the two cannot drift.
-/// SYNC: weft-infra-<name> repo <-> setup.sh (--purge, the weft-infra-* image sweep)
+/// SYNC: `weft-infra-<name>` repo <-> setup.sh (--purge, the weft-infra-* image
+///       sweep), crates/weft-cli/src/images.rs (is_infra_node_repo, the
+///       `weft clean --images --all` sweep)
 pub fn infra_image_repo(image_name: &str) -> String {
     format!("weft-infra-{image_name}")
 }
@@ -106,4 +125,23 @@ pub fn infra_image_repo(image_name: &str) -> String {
 /// the dispatcher prepends its registry prefix to the same suffix.
 pub fn infra_image_tag(image_name: &str, content_hash: &str) -> String {
     format!("{}:{}", infra_image_repo(image_name), content_hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reserved-name guard turns on the minter's own output: an
+    /// image directory named `supervisor` mints exactly the system
+    /// supervisor's repo, and nothing else a node could name does. If
+    /// the repo shape ever changes, this test is what fails first.
+    // SYNC: the reserved spelling <-> crates/weft-cli/src/images.rs
+    //       (SystemService::Supervisor)
+    #[test]
+    fn only_the_supervisor_name_mints_the_reserved_repo() {
+        assert_eq!(infra_image_repo("supervisor"), "weft-infra-supervisor");
+        assert_ne!(infra_image_repo("bridge"), "weft-infra-supervisor");
+        assert_ne!(infra_image_repo("supervisors"), "weft-infra-supervisor");
+        assert_ne!(infra_image_repo("mini_service"), "weft-infra-supervisor");
+    }
 }

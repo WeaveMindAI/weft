@@ -25,7 +25,11 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use weft_core::access::spec::{lookup_path, Door};
-use weft_access_store::{DoorsAnswer, GrantedQuery, MintAppRequest, MintAppResponse, SharedAppChoice, SharedDoorPick};
+use weft_access_store::GrantedQuery;
+use weft_core::access::wire::{
+    BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, MintAppRequest,
+    MintAppResponse, SharedAppChoice, SharedDoorPick, StartedOAuth,
+};
 use weft_core::storage::Tenanted;
 use weft_core::AccessSpec;
 
@@ -114,8 +118,8 @@ fn shared_key_gate(service: &str, credential_available: bool) -> Result<(), Stri
 async fn connect_direct(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(req): Json<Tenanted<SharedDoorPick<weft_access_store::ConnectDirect>>>,
-) -> Result<Json<weft_access_store::CompletedConnect>, ApiError> {
+    Json(req): Json<Tenanted<SharedDoorPick<ConnectDirect>>>,
+) -> Result<Json<CompletedConnect>, ApiError> {
     control_plane(&state, &headers).await?;
     let SharedDoorPick { shared_app, mut inner } = req.inner;
     if inner.door == Door::Shared {
@@ -145,8 +149,8 @@ async fn connect_direct(
 async fn oauth_begin(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(req): Json<Tenanted<SharedDoorPick<weft_access_store::BeginOAuth>>>,
-) -> Result<Json<weft_access_store::StartedOAuth>, ApiError> {
+    Json(req): Json<Tenanted<SharedDoorPick<BeginOAuth>>>,
+) -> Result<Json<StartedOAuth>, ApiError> {
     control_plane(&state, &headers).await?;
     let SharedDoorPick { shared_app, mut inner } = req.inner;
     if inner.door == Door::Shared {
@@ -160,14 +164,6 @@ async fn oauth_begin(
         .map_err(crate::handlers::store_err)
 }
 
-/// The door probe's request: the service's spec (for the catalogue the
-/// registered apps' `covers` are validated against).
-#[derive(Deserialize)]
-struct DoorsQuery {
-    spec: AccessSpec,
-}
-
-
 /// POST /v1/access/admin/doors: which shared-door options exist. Also
 /// where a typo'd `covers` entry surfaces loudly (the broker never
 /// holds the catalogue at file-load time, so the probe and the
@@ -175,7 +171,7 @@ struct DoorsQuery {
 async fn doors(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
-    Json(q): Json<DoorsQuery>,
+    Json(q): Json<DoorsRequest>,
 ) -> Result<Json<DoorsAnswer>, ApiError> {
     control_plane(&state, &headers).await?;
     // Validate before recording anything, like every sibling verb: a
@@ -296,7 +292,7 @@ async fn oauth_complete(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
     Json(req): Json<weft_access_store::OAuthComplete>,
-) -> Result<Json<weft_access_store::CompletedConnect>, ApiError> {
+) -> Result<Json<CompletedConnect>, ApiError> {
     control_plane(&state, &headers).await?;
     weft_access_store::complete_oauth(&state.pool, &req.state, &req.code)
         .await

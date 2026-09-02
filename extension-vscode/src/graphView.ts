@@ -16,7 +16,7 @@ import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
@@ -67,12 +67,7 @@ export class GraphViewController {
   private runHandler: ((targets: string[]) => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
-  /// Hooks fired when the user triggers an action that spawns an
-  /// execution whose color we don't yet know (activate / infra
-  /// start). Extension.ts uses these to tell AutoFollow "next
-  /// ExecutionStarted on this project, jump to it."
-  private lifecycleStartHandler: (() => void) | undefined;
-  private openSourceHandler: (() => void) | undefined;
+  private openSourceHandler: ((location?: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
   /// process or POST /executions/{color}/cancel.
@@ -130,10 +125,7 @@ export class GraphViewController {
   setRunHandler(fn: (targets: string[]) => void): void { this.runHandler = fn; }
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
-  setLifecycleStartHandler(fn: () => void): void {
-    this.lifecycleStartHandler = fn;
-  }
-  setOpenSourceHandler(fn: () => void): void { this.openSourceHandler = fn; }
+  setOpenSourceHandler(fn: (location?: SourceLocation) => void): void { this.openSourceHandler = fn; }
   /// Stop / Cancel pressed on the action bar. Extension dispatches
   /// based on whether the bar is in cli_running (kill CLI) or
   /// execution_running (POST /cancel) state.
@@ -937,13 +929,10 @@ export class GraphViewController {
   }
 
   private async dispatchVerb(verb: string, args: string[]): Promise<void> {
-    if (
-      verb === 'activate'
-      || verb === 'resync'
-      || (verb === 'infra' && (args[0] === 'start' || args[0] === 'upgrade'))
-    ) {
-      this.lifecycleStartHandler?.();
-    }
+    // Follow-latest for the lifecycle verbs is armed by the host, past
+    // every refusal (the in-flight guard, the pre-flight gate): an
+    // aborted click must not reset the user's pinned execution view.
+    //
     // Errors flow through the host's CLI runner: the spawned `weft
     // <verb> --json` emits an `error` phase event; the host's
     // ActionBarStore picks it up and renders an error banner.
@@ -1100,7 +1089,7 @@ export class GraphViewController {
         this.followCatchUpHandler?.();
         break;
       case 'openSource':
-        this.openSourceHandler?.();
+        this.openSourceHandler?.(msg.location);
         break;
       case 'stopAction':
         this.stopActionHandler?.();

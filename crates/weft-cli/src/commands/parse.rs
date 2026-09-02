@@ -118,6 +118,7 @@ fn do_parse(
 /// `@file`/`@include` base + the project to resolve. `reload_catalog` drops
 /// the warm catalog for this project first (the host sends it when its
 /// `nodes/` watcher fired, so the server never needs its own watcher).
+// SYNC: ServerRequest <-> extension-vscode/src/parseServer.ts ParseServerRequest
 #[derive(Debug, Deserialize)]
 struct ServerRequest {
     id: u64,
@@ -135,6 +136,14 @@ struct ServerRequest {
     /// path). Applied to `source`, then parsed, like `edit`.
     #[serde(default, rename = "textEdit")]
     text_edit: Option<weft_compiler::edit::TextEdit>,
+    /// Which validation tier to run (only for `kind: "validate"`).
+    /// `structural` = graph shape only (the Problems panel), `runtime` =
+    /// additionally the rules flagged `level: runtime` such as missing
+    /// credentials (the editor's pre-flight gate before Run). Required for
+    /// validate requests: the server refuses to guess which tier a caller
+    /// meant.
+    #[serde(default)]
+    mode: Option<ValidationMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +171,7 @@ struct EditResponse {
 /// payload is the same `ParseResponse`/`ValidateResponse` the one-shot
 /// commands print; on failure (e.g. validate with no project) `error` carries
 /// the reason and `payload` is null. Fail loud: the host surfaces `error`.
+// SYNC: ServerResponse <-> extension-vscode/src/parseServer.ts ServerResponseEnvelope
 #[derive(Debug, Serialize)]
 struct ServerResponse {
     id: u64,
@@ -242,6 +252,15 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
             }
         }
         ServerRequestKind::Validate => {
+            // The caller states which tier it wants; a request without one is
+            // a caller bug, not something to paper over with a default.
+            // Answered before the validation itself runs, so a caller
+            // sending no mode hears about the mode, not about whatever
+            // the project happens to contain.
+            let mode = match req.mode {
+                Some(m) => m,
+                None => return ServerResponse { id, payload: None, error: Some("validate requires a mode (\"structural\" or \"runtime\")".into()) },
+            };
             // Strict: validating outside a project is meaningless. Fail loud.
             let project = match project {
                 Some(p) => p,
@@ -249,7 +268,7 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
             };
             match warm_catalog(catalogs, &project.root, req.reload_catalog) {
                 Ok(cat) => {
-                    let v = do_validate(&req.source, project.id(), base.as_deref(), cat, req.file.as_deref());
+                    let v = do_validate(&req.source, project.id(), base.as_deref(), cat, req.file.as_deref(), mode);
                     envelope(id, &v)
                 }
                 Err(e) => ServerResponse { id, payload: None, error: Some(e) },
@@ -399,22 +418,26 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
     // Same single-discovery shape as `parse`: derive the `@file`/`@include` base
     // from the project we already resolved, not a second `ctx.project()` call.
     let base = base_dir_for(file.as_deref(), Some(project.root.as_path()));
-    let resp = do_validate(&source, project.id(), base.as_deref(), &catalog, file.as_deref());
+    // Runtime: the terminal command is the complete pre-flight check (graph
+    // shape plus runtime rules like missing credentials); callers that want
+    // the structural tier go through the parse-server's mode field.
+    let resp = do_validate(&source, project.id(), base.as_deref(), &catalog, file.as_deref(), ValidationMode::Runtime);
     println!("{}", serde_json::to_string(&resp).context("serialize validate response")?);
     Ok(())
 }
 
 /// The pure strict-validate pipeline. Shared by the one-shot `weft validate`
 /// command and the parse-server. The compile -> enrich -> validate pipeline
-/// (and its error-to-diagnostic mapping) lives in `compile_strict`; this only
-/// picks the mode. `Runtime` mode = the complete check the Problems panel
-/// wants (graph shape plus runtime rules like missing credentials).
+/// (and its error-to-diagnostic mapping) lives in `compile_strict`; the caller
+/// picks the mode (`Structural` for the editor's Problems panel, `Runtime`
+/// for pre-flight checks that must also catch missing credentials).
 fn do_validate(
     source: &str,
     id: uuid::Uuid,
     base: Option<&std::path::Path>,
     catalog: &FsCatalog,
     file: Option<&std::path::Path>,
+    mode: ValidationMode,
 ) -> ValidateResponse {
     // Same anonymous-group id derivation as parse, so a standalone file's
     // diagnostics reference the same filename-derived id the editor renders.
@@ -428,7 +451,7 @@ fn do_validate(
         id,
         fs,
         catalog,
-        ValidationMode::Runtime,
+        mode,
         Some(&source_id),
     );
     ValidateResponse { diagnostics }
@@ -461,8 +484,29 @@ fn collect_catalog(
 
 #[cfg(test)]
 mod tests {
-    use super::file_dir;
+    use super::{file_dir, handle_request, ServerRequest, ServerRequestKind};
     use std::path::Path;
+
+    #[test]
+    fn server_request_carries_the_validation_mode() {
+        // The extension sends `mode` on validate requests; absent stays
+        // None (and the validate handler then refuses the request).
+        let req: ServerRequest = serde_json::from_str(
+            r#"{"id":1,"kind":"validate","source":"","mode":"structural"}"#,
+        )
+        .unwrap();
+        assert!(matches!(req.kind, ServerRequestKind::Validate));
+        assert_eq!(req.mode, Some(weft_compiler::validate::ValidationMode::Structural));
+        let req: ServerRequest =
+            serde_json::from_str(r#"{"id":2,"kind":"validate","source":""}"#).unwrap();
+        assert_eq!(req.mode, None);
+        // And the handler refuses it before touching any project state.
+        let resp = handle_request(req, &mut Default::default());
+        assert_eq!(
+            resp.error.as_deref(),
+            Some("validate requires a mode (\"structural\" or \"runtime\")")
+        );
+    }
 
     #[test]
     fn file_dir_treats_bare_filename_as_absent() {

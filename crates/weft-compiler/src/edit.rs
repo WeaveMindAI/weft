@@ -62,8 +62,28 @@ pub enum EditOp {
     MoveNodeScope { node: String, target_group: Option<String> },
     /// Move a group into another group (top level when None).
     MoveGroupScope { group: String, target_group: Option<String> },
-    /// Rewrite a node's port signature.
-    UpdateNodePorts { node: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
+    /// Rewrite a node's declared port surface. `inputs`/`outputs` are the
+    /// header's ports ONLY: custom additions, plus a catalog port whose type
+    /// or requiredness the author overrides (filling a MustOverride output).
+    /// The catalog provides the node type's own ports at enrich, so restating
+    /// them here would freeze the whole signature into source. A port the
+    /// gesture DELETED is named in `removed_inputs`/`removed_outputs`, and
+    /// only THOSE ports lose their wires: a port merely absent from the
+    /// header may be a catalog port with live wires. The removed lists
+    /// are REQUIRED on the wire (empty when nothing was deleted): a
+    /// missing list is refused at deserialization rather than read as
+    /// "sweep nothing", which would leave a deleted port's wires in
+    /// source silently. The editor's op additionally carries
+    /// projection-only `revertedInputs`/`revertedOutputs` members, which
+    /// serde ignores here by design.
+    // SYNC: UpdateNodePorts <-> packages/weft-graph/src/protocol.ts EditOp updateNodePorts
+    UpdateNodePorts {
+        node: String,
+        inputs: Vec<PortSig>,
+        outputs: Vec<PortSig>,
+        removed_inputs: Vec<String>,
+        removed_outputs: Vec<String>,
+    },
     /// Rewrite a group's port signature.
     UpdateGroupPorts { group: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
     /// Set (or clear) a group's description: the plain `# ...` comment that is
@@ -113,18 +133,21 @@ pub enum ValueForm {
 }
 
 /// A port in a signature rewrite. `required: false` renders `name: Type?`.
+/// The editor's sig additionally carries a projection-only `rendered`
+/// member, which serde ignores here by design.
+// SYNC: PortSig <-> packages/weft-graph/src/protocol.ts EditPortSig
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortSig {
     pub name: String,
-    #[serde(default = "default_true")]
+    /// Required on the wire (the editor always writes it): a missing
+    /// flag is refused rather than defaulted, since a default here
+    /// would rewrite an author's `name: Type?` as `name: Type`.
     pub required: bool,
-    #[serde(default)]
-    pub port_type: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
+    /// Required on the wire for the same reason: a default here would
+    /// write the `MustOverride` placeholder over the author's declared
+    /// type. Where a placeholder is meant, the editor spells it out.
+    pub port_type: String,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

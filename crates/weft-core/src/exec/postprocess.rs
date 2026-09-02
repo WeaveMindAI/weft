@@ -404,6 +404,7 @@ mod fan_in_tests {
             target: target.into(),
             target_handle: Some(target_handle.into()),
             span: None,
+            source_file: None,
         }
     }
 
@@ -497,6 +498,7 @@ mod fan_in_tests {
             required: false,
             description: None,
             synthesized_from_carry: false,
+            declared_type: None,
         }
     }
 
@@ -526,6 +528,7 @@ mod fan_in_tests {
             port_literal_spans: Default::default(),
             file_refs: Default::default(),
             include_path: None,
+            source_file: None,
         };
         serde_json::to_value(n).unwrap()
     }

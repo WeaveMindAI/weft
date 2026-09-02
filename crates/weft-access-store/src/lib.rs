@@ -25,9 +25,8 @@ pub use crypt::{open_json, open_str, seal_json, seal_str};
 pub use flows::{
     begin_oauth, begin_picker, complete_oauth, connect_direct, delete_grant,
     delete_published_grants, finish_picker, list_grants, load_picker, publish_grant,
-    published_grant, sweep_expired_connects, take_connect_result, BeginOAuth, BeginPicker,
-    CompletedConnect, ConnectDirect, MintAppRequest, MintAppResponse, OAuthComplete,
-    PickerSession, PublishAccess, PublishedGrant, SharedDoorPick, StartedOAuth,
+    published_connection, sweep_expired_connects, take_connect_result, BeginPicker, OAuthComplete,
+    PickerSession, PublishAccess,
 };
 pub use subscriptions::{
     drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
@@ -41,71 +40,8 @@ pub use resolve::{
     ResolvedEventSource,
 };
 
-use serde::{Deserialize, Serialize};
-
-/// One registered app the editor offers as its own shared-door option:
-/// its label and its FIXED permission set. The user picks an option;
-/// they never tick permissions on the shared door.
-// SYNC: SharedAppChoice <-> packages/weft-graph/src/webview/lib/components/project/AccessField.svelte SharedAppChoice
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SharedAppChoice {
-    pub label: String,
-    pub covers: Vec<String>,
-}
-
-/// The doors probe's answer core: which shared-door options exist right
-/// now. The ONE definition every service answering or forwarding the
-/// probe uses (the editor hides what is not offered; it never greys).
-// SYNC: DoorsAnswer <-> crates/weft-dispatcher/src/api/access.rs DoorsStatus (flattens it), packages/weft-graph/src/webview/lib/components/project/AccessField.svelte DoorsStatus
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoorsAnswer {
-    /// The registered apps, one shared-door option each (oauth
-    /// services only). Empty = the one-click door is hidden.
-    pub shared_apps: Vec<SharedAppChoice>,
-    /// Whether a runtime credential backs the shared door of a
-    /// non-oauth (key) service.
-    pub shared_credential: bool,
-}
-
-/// A connection row as the EDITOR sees it: names, ids, identity,
-/// permissions. Never a stored value. Everything the connection list
-/// renders (identity / app label / what it can do, plus the
-/// spends-credits and verified marks) rides here, so the list needs no
-/// second call.
-// SYNC: GrantSummary <-> packages/weft-graph/src/protocol.ts GrantSummary
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GrantSummary {
-    pub id: uuid::Uuid,
-    pub service: String,
-    /// The owning project for a `coexisting`-class grant; `None` for an
-    /// `exclusive`-class shared grant (every project referencing it
-    /// follows its rotations).
-    pub project_id: Option<String>,
-    pub identity: Option<String>,
-    /// The connection list's middle column: the app's label, or the
-    /// name the user typed for a pasted credential. `None` only for
-    /// rows with neither (a runtime-supplied credential).
-    pub label: Option<String>,
-    /// The granted permission set (the "what it can do" column).
-    pub scopes: Vec<String>,
-    /// Whether `scopes` came from the provider (verified) or from the
-    /// user's ticks (claimed). Decides how hard a shortfall fails.
-    pub permissions_verified: bool,
-    /// The NAMES of the values this connection stores (never the
-    /// values themselves). What the editor's live `requiresValues`
-    /// check compares against, for a service whose optional fields
-    /// decide what a connection can do (a mailbox holding only the
-    /// sending server can send and cannot receive).
-    #[serde(default)]
-    pub value_names: Vec<String>,
-    /// Whose credential the row resolves to. `Ours` rows are the
-    /// spends-credits connections.
-    pub owner: weft_core::CredentialOwner,
-    /// Which door created it; drives the shared-door displacement
-    /// warning (shown once per connection created through it).
-    pub door: weft_core::access::spec::Door,
-    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-}
+// The connect flow's wire shapes live in weft-core `access::wire`,
+// under ONE import path for every crate; nothing re-exports them.
 
 /// The store's failure vocabulary, downcast at the API edge for status
 /// codes. Everything else rides `anyhow` as a 500.

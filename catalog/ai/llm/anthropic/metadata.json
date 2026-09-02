@@ -101,20 +101,6 @@
         "kind": "not",
         "of": {
           "kind": "config_nonempty",
-          "field": "connection"
-        }
-      },
-      "then": {
-        "message": "AnthropicProvider '{id}' has no connection picked; pick one on the node.",
-        "level": "runtime",
-        "field": "connection"
-      }
-    },
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
           "field": "model"
         }
       },

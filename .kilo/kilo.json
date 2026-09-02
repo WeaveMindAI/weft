@@ -1,0 +1,18 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+  "default_agent": "working-partner",
+  "instructions": ["MEMORY.md"],
+  "permission": {
+    "bash": {
+      "git stash": "deny",
+      "git stash *": "deny",
+      "git restore *": "deny",
+      "git reset --hard*": "deny",
+      "git clean -f*": "deny",
+      "git checkout *": "ask",
+      "git reset*": "ask",
+      "git clean*": "ask",
+      "git push*": "ask"
+    }
+  }
+}

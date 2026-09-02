@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fieldForInput, clampToRange, inputRendersField, nextPortLiterals, shouldFlowField } from './input-field';
+import { fieldForInput, clampToRange, hasUnpickedAccess, inputRendersField, nextPortLiterals, shouldFlowField } from './input-field';
 import { SHOULD_FLOW_PORT } from '../../../protocol';
 import { inputExposure } from '../types';
 import type { PortDefinition } from '../types';
@@ -168,5 +168,60 @@ describe('nextPortLiterals', () => {
 		expect(nextPortLiterals({ other: 1 }, 'tags', ['a'])).toEqual({ other: 1, tags: ['a'] });
 		expect(nextPortLiterals({}, 'flag', false)).toEqual({ flag: false });
 		expect(nextPortLiterals({}, 'n', 0)).toEqual({ n: 0 });
+	});
+});
+
+/** The pin that keeps an unconnected access node open: read by both the
+ *  node renderer (chevron/toggle) and buildNodes' `expanded` overlay, so
+ *  what it answers decides the drawn state AND the computed sizing. */
+describe('hasUnpickedAccess', () => {
+	const none = new Set<string>();
+	const access = (over: Partial<PortDefinition> = {}): PortDefinition => ({
+		name: 'connection',
+		portType: 'Access',
+		required: false,
+		// Real access inputs declare `exposure: "config"` (the handle
+		// lives in node config); the port-driven variant is exercised
+		// explicitly below.
+		exposure: 'config',
+		widget: { kind: 'access', service: 'openrouter' },
+		...over,
+	});
+
+	it('pins a node whose access field has no value', () => {
+		expect(hasUnpickedAccess([access()], {}, none)).toBe(true);
+	});
+
+	it('unlocks once a connection handle is stored', () => {
+		const config = { connection: { id: 'g-1', identity: 'Quentin' } };
+		expect(hasUnpickedAccess([access()], config, none)).toBe(false);
+	});
+
+	it('never pins an optional connection (the node runs without one)', () => {
+		const optional = access({ widget: { kind: 'access', service: 'custom', optional: true } });
+		expect(hasUnpickedAccess([optional], {}, none)).toBe(false);
+	});
+
+	it('treats an explicit null (a disconnect) as unpicked', () => {
+		expect(hasUnpickedAccess([access()], { connection: null }, none)).toBe(true);
+	});
+
+	it('ignores a wired access input (the edge is the driver)', () => {
+		expect(hasUnpickedAccess([access()], {}, new Set(['connection']))).toBe(false);
+	});
+
+	it('ignores nodes with no access field at all', () => {
+		const plain: PortDefinition = {
+			name: 'prompt', portType: 'String', required: false, exposure: 'all',
+			widget: { kind: 'textarea' },
+		};
+		expect(hasUnpickedAccess([plain], {}, none)).toBe(false);
+	});
+
+	it('access fields are always config-homed (the metadata validator enforces it)', () => {
+		// The invariant the predicate's config-only read leans on:
+		// `exposure: config` makes the field non-port-driven, so the
+		// handle can only ever live in node config.
+		expect(fieldForInput(access()).portDriven).toBe(false);
 	});
 });

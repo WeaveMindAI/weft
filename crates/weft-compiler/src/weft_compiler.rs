@@ -5,7 +5,7 @@
 //! 2. Flattens groups by injecting Passthrough nodes at group boundaries
 //! 3. Produces a flat ProjectDefinition ready for execution
 //!
-//! This is a pure function: &str -> Result<ProjectDefinition, Vec<CompileError>>
+//! This is a pure function: `&str -> Result<ProjectDefinition, Vec<CompileError>>`
 
 use uuid::Uuid;
 
@@ -17,10 +17,10 @@ use crate::cst::lexer::marker_len;
 use crate::file_reader::CompileFs;
 /// The bare-identifier grammar for every name the language admits
 /// (ports, entry keys, connection segments): exactly
-/// `weft_catalog::is_rust_identifier`, because these names become
+/// `weft_core::is_rust_identifier`, because these names become
 /// generated Rust items, and the tokenizer already refuses anything
 /// looser.
-pub(crate) use weft_catalog::is_rust_identifier as is_bare_ident;
+pub(crate) use weft_core::is_rust_identifier as is_bare_ident;
 
 use weft_core::node::NodeFeatures;
 use weft_core::project::{
@@ -37,12 +37,25 @@ pub struct CompileError {
     /// error allows. 1-based lines, 0-based character columns, end-exclusive.
     pub span: Span,
     pub message: String,
+    /// The file the span lives in, when it is NOT the compiled source:
+    /// a parse error inside an `@include`d file keeps its own
+    /// coordinates and names its file here. None = the compiled source.
+    pub file: Option<String>,
 }
 
 impl CompileError {
     /// An error anchored to a span (the normal case: the offending token/node).
     pub fn at(span: Span, message: impl Into<String>) -> Self {
-        Self { span, message: message.into() }
+        Self { span, message: message.into(), file: None }
+    }
+
+    /// Stamp the file the span lives in. Fills only when unset, so an
+    /// error already stamped by a deeper include keeps its own file.
+    pub fn in_file(mut self, file: Option<&str>) -> Self {
+        if self.file.is_none() {
+            self.file = file.map(str::to_string);
+        }
+        self
     }
 
     /// 1-based start line (convenience for consumers that only show a line).
@@ -53,7 +66,12 @@ impl CompileError {
 
 impl std::fmt::Display for CompileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `line:col: message` (rustc/TSC convention; columns shown 1-based).
+        // `[file:]line:col: message` (rustc/TSC convention; columns shown
+        // 1-based). The file appears only for an error inside an
+        // `@include`d file.
+        if let Some(file) = &self.file {
+            write!(f, "{file}:")?;
+        }
         write!(f, "{}:{}: {}", self.span.start_line, self.span.start_column + 1, self.message)
     }
 }
@@ -75,6 +93,18 @@ pub(crate) struct ParsedPort {
     /// vanish; this carries the diagnostic the caller records as a squiggle.
     /// `None` for a well-typed port.
     type_error: Option<String>,
+    /// The VERBATIM type annotation the source header spells (no `?`), which
+    /// becomes the port's `declared_type`. Never a re-print of the parsed
+    /// type: re-printing expands a registry alias (`Thing` becomes
+    /// `Thing={...}`) and turns an unparseable annotation into the
+    /// `MustOverride` placeholder, and the editor writes the header back from
+    /// this, so a re-print would overwrite what the author typed. The one
+    /// deliberate exception: a declared port with NO annotation (`(x)`) is
+    /// stamped with the default type's spelling, so a header rewrite
+    /// canonicalizes it to `x: MustOverride` (same parse, made explicit)
+    /// rather than dropping it as undeclared. `None` only for a port no
+    /// header line declares (a carry-synthesized ghost).
+    type_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +137,9 @@ struct ParsedNode {
     /// of the included `.weft` file. The editor renders this node as an
     /// expandable group that navigates into the file.
     include_path: Option<String>,
+    /// The file this node's spans live in, when a full-mode `@include`
+    /// spliced it out of another file. None = the compiled source.
+    source_file: Option<String>,
 }
 
 /// What lowering a node body produced: the config map plus the per-key
@@ -133,6 +166,9 @@ struct ParsedConnection {
     /// Source range of the connection line (`target.port = source.port`).
     /// None for synthetic edges produced by inline expressions.
     span: Option<Span>,
+    /// The file the span lives in, when a full-mode `@include` spliced
+    /// this connection out of another file. None = the compiled source.
+    source_file: Option<String>,
 }
 
 /// What kind of grouping construct this is. Determines the boundary
@@ -167,6 +203,10 @@ struct ParsedGroup {
     loop_config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
     span: Option<Span>,
     header_span: Option<Span>,
+    /// The file this group's spans (loop config spans included) live in,
+    /// when a full-mode `@include` spliced it out of another file.
+    /// None = the compiled source.
+    source_file: Option<String>,
     /// The group's description: the plain `# ...` comment that is the first
     /// body line, text without the `# `. None when absent or empty.
     description: Option<String>,
@@ -424,6 +464,9 @@ fn resolve_includes(
         }
         match resolve_one_include(&inc, fs, mode, in_progress) {
             Ok(IncludeResult::Group(mut group)) => {
+                // Root-level fills need no stamping: an unstamped span
+                // already means "the compiled source", which is exactly
+                // where these are written.
                 apply_pending_literals(&inc, &mut group, errors);
                 state.groups.push(*group);
             }
@@ -431,7 +474,7 @@ fn resolve_includes(
                 apply_pending_literals_to_node(&inc, &mut node, errors);
                 state.nodes.push(*node);
             }
-            Err(msg) => errors.push(CompileError::at(inc.span, msg)),
+            Err(errs) => errors.extend(errs),
         }
     }
     // Resolve includes nested inside group bodies, anywhere in the tree.
@@ -459,6 +502,17 @@ fn resolve_group_includes(
         match resolve_one_include(&inc, fs, mode, in_progress) {
             Ok(IncludeResult::Group(mut g)) => {
                 apply_pending_literals(&inc, &mut g, errors);
+                // The fills just landed with the INCLUDING file's spans
+                // (this group's file); the included group's own spans were
+                // already stamped with its file, so only the fresh
+                // (file-less) entries take this one.
+                if let Some(pf) = &group.source_file {
+                    for s in g.port_literal_spans.values_mut() {
+                        if s.source_file.is_none() {
+                            s.source_file = Some(pf.clone());
+                        }
+                    }
+                }
                 group.child_groups.push(*g);
             }
             Ok(IncludeResult::Node(mut n)) => {
@@ -469,9 +523,14 @@ fn resolve_group_includes(
                 // Without this its scope is empty and edges from siblings trip
                 // the scope-reachability check.
                 n.parent_id = Some(group.id.clone());
+                // An interface-mode opaque node's span is the `@include`
+                // line, which is written in THIS group's file.
+                if n.source_file.is_none() {
+                    n.source_file = group.source_file.clone();
+                }
                 group.nodes.push(*n);
             }
-            Err(msg) => errors.push(CompileError::at(inc.span, msg)),
+            Err(errs) => errors.extend(errs),
         }
     }
     for child in &mut group.child_groups {
@@ -510,12 +569,54 @@ enum IncludeResult {
     Node(Box<ParsedNode>),
 }
 
+/// Stamp `file` as the source of every node, connection, and nested group
+/// in `group` that does not already carry one. Run on a full-mode include's
+/// sub-parse BEFORE its own nested includes resolve, so each file's content
+/// is stamped exactly once, with its own identity.
+fn stamp_source_file(group: &mut ParsedGroup, file: &str) {
+    let stamp_spans = |spans: &mut std::collections::BTreeMap<String, ConfigFieldSpan>| {
+        for s in spans.values_mut() {
+            if s.source_file.is_none() {
+                s.source_file = Some(file.to_string());
+            }
+        }
+    };
+    if group.source_file.is_none() {
+        group.source_file = Some(file.to_string());
+    }
+    // The per-field spans are stamped INDIVIDUALLY: a value filled onto
+    // this group's interface later (`alias.port = v` in the INCLUDING
+    // file) lands after this pass with its own file, and a diagnostic on
+    // it must name that file, not this one.
+    stamp_spans(&mut group.loop_config_spans);
+    stamp_spans(&mut group.port_literal_spans);
+    for n in &mut group.nodes {
+        if n.source_file.is_none() {
+            n.source_file = Some(file.to_string());
+        }
+        stamp_spans(&mut n.config_spans);
+    }
+    for c in &mut group.connections {
+        if c.source_file.is_none() {
+            c.source_file = Some(file.to_string());
+        }
+    }
+    for g in &mut group.child_groups {
+        stamp_source_file(g, file);
+    }
+}
+
 fn resolve_one_include(
     inc: &ParsedInclude,
     fs: &CompileFs,
     mode: IncludeMode,
     in_progress: &mut Vec<std::path::PathBuf>,
-) -> Result<IncludeResult, String> {
+) -> Result<IncludeResult, Vec<CompileError>> {
+    // A problem with the INCLUDE ITSELF (unresolvable path, cycle, wrong
+    // file shape) anchors on the `@include` line here; an error INSIDE
+    // the included file keeps its own span and names its file, so the
+    // editor jumps to the real line.
+    let at_include = |message: String| vec![CompileError::at(inc.span, message)];
     // The caller has already gated `fs.base.is_none()` (an `@include` outside a
     // project), so an anchor is present here.
     let base = fs
@@ -528,10 +629,10 @@ fn resolve_one_include(
     let resolved = fs
         .reader
         .resolve_and_read(base, std::path::Path::new(&inc.path))
-        .map_err(|e| format!("@include {e}"))?;
+        .map_err(|e| at_include(format!("@include {e}")))?;
     let canonical = resolved.identity;
     if in_progress.contains(&canonical) {
-        return Err(format!("@include cycle: {:?} includes itself", inc.path));
+        return Err(at_include(format!("@include cycle: {:?} includes itself", inc.path)));
     }
 
     let source = resolved.content;
@@ -547,10 +648,12 @@ fn resolve_one_include(
     // included file's own directory.)
     let mut sub = parse_and_resolve_file_refs(source.as_str(), &included_fs, &inc.alias)
         .map_err(|errs| {
+            // The errors keep their own spans and name the included
+            // file (a deeper include's stamp wins), so a click lands
+            // on the real line rather than on this `@include`.
             errs.into_iter()
-                .map(|e| format!("{}: {}", inc.path, e))
+                .map(|e| e.in_file(Some(&canonical.to_string_lossy())))
                 .collect::<Vec<_>>()
-                .join("; ")
         })?;
 
     // An included file must be exactly one anonymous top-level Group and
@@ -565,10 +668,10 @@ fn resolve_one_include(
         && sub.groups.len() == 1
         && sub.groups[0].anonymous;
     if !single_anon {
-        return Err(format!(
+        return Err(at_include(format!(
             "@include(\"{}\"): an included file must be exactly one anonymous top-level Group, e.g. `Group(in: T) -> (out: U) {{ ... }}`",
             inc.path
-        ));
+        )));
     }
     let mut group = sub.groups.pop().unwrap();
 
@@ -582,8 +685,15 @@ fn resolve_one_include(
                 label: None,
                 config: serde_json::Map::new(),
                 parent_id: None,
-                in_ports: group.in_ports.clone(),
-                out_ports: group.out_ports.clone(),
+                // The declared spellings belong to the INCLUDED file's group
+                // header, not to this file's `@include` line (which declares
+                // no ports at all), so they are stripped: a stamped port
+                // would make the editor write a signature onto a decl that
+                // has no signature slot.
+                in_ports: group.in_ports.iter().cloned()
+                    .map(|mut p| { p.type_text = None; p }).collect(),
+                out_ports: group.out_ports.iter().cloned()
+                    .map(|mut p| { p.type_text = None; p }).collect(),
                 one_of_required: group.one_of_required.clone(),
                 span: Some(inc.span),
                 header_span: Some(inc.span),
@@ -591,10 +701,16 @@ fn resolve_one_include(
                 optional_ports: Default::default(),
                 file_refs: Default::default(),
                 include_path: Some(inc.path.clone()),
+                source_file: None,
             };
             Ok(IncludeResult::Node(Box::new(node)))
         }
         IncludeMode::Full => {
+            // Everything spliced out of this file keeps ITS coordinates, so
+            // stamp its file identity onto every node/edge/group that does
+            // not already carry one (a nested include stamped its own file
+            // first). Diagnostics then name the right file.
+            stamp_source_file(&mut group, &canonical.to_string_lossy());
             // Resolve the included group's OWN nested @includes first, against
             // the included file's directory (not the parent's), so nested
             // composition inlines fully. Cycle stack guards self-inclusion.
@@ -603,11 +719,13 @@ fn resolve_one_include(
             resolve_group_includes(&mut group, &included_fs, mode, in_progress, &mut errs);
             in_progress.pop();
             if !errs.is_empty() {
+                // Nested include errors already stamped with their own
+                // file keep it; an unstamped one is about THIS file's
+                // compiled source, which is the included file.
                 return Err(errs
                     .into_iter()
-                    .map(|e| format!("{}: {}", inc.path, e))
-                    .collect::<Vec<_>>()
-                    .join("; "));
+                    .map(|e| e.in_file(Some(&canonical.to_string_lossy())))
+                    .collect());
             }
             // The group was parsed with the alias as its anon-root id, so its id
             // is already `{alias}` and its internals `{alias}.*`: no rescope.
@@ -1352,6 +1470,7 @@ fn lower_node(
         optional_ports: body_out.optional_ports,
         file_refs: Default::default(),
         include_path: None,
+        source_file: None,
     })
 }
 
@@ -1460,6 +1579,7 @@ fn lower_config_field(
                         target_id: host_local.to_string(),
                         target_port: key.clone(),
                         span: Some(span),
+                        source_file: None,
                     });
                     return;
                 }
@@ -1582,6 +1702,7 @@ fn lower_inline_expr(
         optional_ports: body_out.optional_ports,
         file_refs: Default::default(),
         include_path: None,
+        source_file: None,
     });
     inline.connections.push(ParsedConnection {
         source_id: anon_id,
@@ -1590,6 +1711,7 @@ fn lower_inline_expr(
         target_id: host_local.to_string(),
         target_port: field_key.to_string(),
         span: Some(li.span_of(inline_node)),
+        source_file: None,
     });
 }
 
@@ -1814,6 +1936,7 @@ fn lower_connection(
         target_id: t_id,
         target_port: t_port,
         span: Some(li.span_of(conn)),
+        source_file: None,
     })
 }
 
@@ -1872,6 +1995,7 @@ fn lower_group(
     let mut group = ParsedGroup {
         id: id.clone(),
         kind: GroupKind::Group,
+        source_file: None,
         in_ports: Vec::new(),
         out_ports,
         one_of_required: Vec::new(),
@@ -1918,6 +2042,7 @@ fn lower_loop(
     let mut group = ParsedGroup {
         id: id.clone(),
         kind: GroupKind::Loop,
+        source_file: None,
         in_ports: Vec::new(),
         out_ports,
         one_of_required: Vec::new(),
@@ -2167,6 +2292,9 @@ fn lower_grouplike_body(
                     port_type: out.port_type,
                     synthesized_from_carry: true,
                     type_error: None,
+                    // No header line declares this input; the carry OUTPUT
+                    // is the source of truth.
+                    type_text: None,
                 });
             }
         }
@@ -2369,7 +2497,7 @@ fn scoped(parent: Option<&str>, local: &str) -> String {
 pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
     let s = trimmed.trim();
     let rest = s;
-    let (name, port_type, optional) = if let Some(colon_pos) = rest.find(':') {
+    let (name, port_type, optional, type_text) = if let Some(colon_pos) = rest.find(':') {
         let name = rest[..colon_pos].trim();
         let mut type_str = rest[colon_pos + 1..].trim();
 
@@ -2380,7 +2508,7 @@ pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
         }
 
         match WeftType::parse(type_str) {
-            Some(pt) => (name, pt, optional),
+            Some(pt) => (name, pt, optional, Some(type_str.to_string())),
             // An invalid / unknown type is RECOVERABLE: keep the port (with the
             // `MustOverride` placeholder, which the editor renders red as
             // "needs a type") and surface the bad type as a diagnostic, rather
@@ -2394,15 +2522,25 @@ pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
                 required: !optional,
                 synthesized_from_carry: false,
                 type_error: Some(format!("Invalid port type '{}' on port '{}'", type_str, name)),
+                // The unparseable annotation stays the declared spelling:
+                // the editor rewrites headers from it, and stamping the
+                // placeholder here would overwrite the author's typo (and
+                // the squiggle pointing at it) on the next ports gesture.
+                type_text: Some(type_str.to_string()),
             }),
         }
     } else {
         // No type annotation. The name is validated once, by the
-        // shared check below, the same as the typed branch's.
+        // shared check below, the same as the typed branch's. The
+        // header still DECLARES the port, so it gets a declared
+        // spelling (the default type's), or the editor's next ports
+        // gesture would treat it as catalog-provided and drop it.
         let name = rest.trim();
         let optional = name.ends_with('?');
         let name = if optional { name[..name.len() - 1].trim() } else { name };
-        (name, WeftType::default(), optional)
+        let default = WeftType::default();
+        let text = default.wire_string();
+        (name, default, optional, Some(text))
     };
 
     // Validate port name
@@ -2423,6 +2561,7 @@ pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
         required: !optional, // v2: required by default, ? makes optional
         synthesized_from_carry: false,
         type_error: None,
+        type_text,
     })
 }
 
@@ -2824,6 +2963,11 @@ fn collect_group_definitions(
             required: p.required,
             description: None,
             synthesized_from_carry: p.synthesized_from_carry,
+            // Containers rewrite their headers from the FULL rendered
+            // signature, and this list can hold a synthesized carry
+            // ghost, so a declared stamp here would contradict the
+            // field's contract. Only NODE decl ports carry one.
+            declared_type: None,
         })
         .collect();
     let out_ports: Vec<PortDefinition> = group
@@ -2835,6 +2979,7 @@ fn collect_group_definitions(
             required: false,
             description: None,
             synthesized_from_carry: false,
+            declared_type: None,
         })
         .collect();
 
@@ -2871,6 +3016,7 @@ fn collect_group_definitions(
         anonymous: group.anonymous,
         span: group.span,
         header_span: group.header_span,
+        source_file: group.source_file.clone(),
         description: group.description.clone(),
         port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         port_literal_spans: group.port_literal_spans.clone(),
@@ -2954,6 +3100,11 @@ fn flatten_group(
             required: p.required,
             description: None,
             synthesized_from_carry: p.synthesized_from_carry,
+            // Containers rewrite their headers from the FULL rendered
+            // signature, and this list can hold a synthesized carry
+            // ghost, so a declared stamp here would contradict the
+            // field's contract. Only NODE decl ports carry one.
+            declared_type: None,
         })
     }).collect();
     // A group or loop takes `_should_flow` like any node, on its IN
@@ -2974,6 +3125,7 @@ fn flatten_group(
                 .to_string(),
         ),
         synthesized_from_carry: false,
+        declared_type: None,
     }));
     let mut in_pt_outputs: Vec<PortDefinition> = group.in_ports.iter().map(|p| {
         let ty = if matches!(group.kind, GroupKind::Loop) && loop_over.contains(&p.name) {
@@ -2987,6 +3139,7 @@ fn flatten_group(
             required: false,
             description: None,
             synthesized_from_carry: false,
+            declared_type: None,
         }
     }).collect();
     // Implicit `self.index: Number` for loops. If the user declared a
@@ -3001,6 +3154,7 @@ fn flatten_group(
             required: false,
             description: None,
             synthesized_from_carry: false,
+            declared_type: None,
         });
     }
 
@@ -3057,6 +3211,12 @@ fn flatten_group(
         port_literal_spans: group.port_literal_spans.clone(),
         file_refs: Default::default(),
         include_path: None,
+        // The node's file covers its own spans (the loop config spans
+        // above live in the group's file). Its port-literal spans may
+        // each name a DIFFERENT file: an interface-port fill is written
+        // in the including file and carries its own `source_file`, which
+        // diagnostics take verbatim over the node's.
+        source_file: group.source_file.clone(),
     });
 
     let out_pt_id = weft_core::project::boundary_out_id(&group.id);
@@ -3080,6 +3240,7 @@ fn flatten_group(
             required,
             description: None,
             synthesized_from_carry: false,
+            declared_type: None,
         })
     }).collect();
     // Implicit `self.done: Boolean` for loops. Skip if the user declared a
@@ -3092,6 +3253,7 @@ fn flatten_group(
             required: false,
             description: None,
             synthesized_from_carry: false,
+            declared_type: None,
         }));
     }
     let out_pt_outputs: Vec<PortDefinition> = group.out_ports.iter().map(|p| PortDefinition {
@@ -3100,6 +3262,7 @@ fn flatten_group(
         required: false,
         description: None,
         synthesized_from_carry: false,
+        declared_type: None,
     }).collect();
 
     // The OUT boundary carries only the parent pointer. Loop config
@@ -3129,6 +3292,7 @@ fn flatten_group(
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
+        source_file: group.source_file.clone(),
     });
 
     // 3. Add internal nodes
@@ -3169,6 +3333,12 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
             required: p.required,
             description: None,
             synthesized_from_carry: false,
+            // These ARE the node header's own declarations: the editor
+            // round-trips the header from this, never from the rendered
+            // type (which inference may later instantiate). The spelling
+            // is the source's verbatim annotation, never a re-print of
+            // the parsed type (see `ParsedPort::type_text`).
+            declared_type: p.type_text.clone(),
         })
     }).collect();
     let outputs = pn.out_ports.iter().map(|p| PortDefinition {
@@ -3177,6 +3347,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         required: p.required,
         description: None,
         synthesized_from_carry: false,
+        declared_type: p.type_text.clone(),
     }).collect();
     let features = NodeFeatures {
         one_of_required: pn.one_of_required.clone(),
@@ -3210,6 +3381,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         port_literal_spans: Default::default(),
         file_refs: pn.file_refs.clone(),
         include_path: pn.include_path.clone(),
+        source_file: pn.source_file.clone(),
     }
 }
 
@@ -3221,6 +3393,7 @@ fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
         source_handle: Some(pc.source_port.clone()),
         target_handle: Some(pc.target_port.clone()),
         span: pc.span,
+        source_file: pc.source_file.clone(),
     }
 }
 

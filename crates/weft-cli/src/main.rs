@@ -32,8 +32,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Scaffold a new project (git init, main.weft, weft.toml).
-    New { name: String },
+    /// Scaffold a new project (git init, main.weft, weft.toml). With
+    /// `--assistant <name>` also install the Tangle assistant persona for
+    /// that AI coding assistant, symlinked from this weft checkout's
+    /// `tangle/<name>/`, so a later `git pull` + `./setup.sh` of the
+    /// checkout refreshes Tangle in every such project at once. The choice
+    /// is remembered: later runs of `weft new` install the same assistants
+    /// with no flag; `--assistant none` clears it.
+    New {
+        name: String,
+        /// Install the Tangle persona for this AI coding assistant
+        /// (e.g. `claude-code`, shorthand `cc`), symlinked from the weft
+        /// checkout so updating weft updates Tangle. Repeatable, and
+        /// remembered as the default for future projects; `none` opts out.
+        #[arg(long = "assistant", value_name = "NAME")]
+        assistants: Vec<String>,
+    },
     /// Compile the current project to a native rust binary.
     Build,
     /// Build (if stale) the shared worker builder-base image and print its
@@ -72,6 +86,15 @@ enum Cmd {
         /// keys its engine-change sweep on.
         #[arg(long, conflicts_with_all = ["push", "push_suffix"])]
         print: bool,
+    },
+    /// Manage a node's service connection from the terminal: list the
+    /// stored connections and pick one, connect a new account (paste a
+    /// key, browser sign-in, shared app), upgrade or forget one, or
+    /// disconnect the node. Interactive by default; every choice has a
+    /// flag for scripts.
+    Connect {
+        #[command(flatten)]
+        opts: commands::connect::ConnectOpts,
     },
     /// Run node self-tests. Without a target: every package. Without
     /// --tier: the basic + fake tiers (compiled + run locally, no
@@ -262,6 +285,18 @@ enum Cmd {
         /// parser's catalog asset.
         #[arg(long)]
         stdlib: bool,
+        /// Print only this node TYPE's metadata (resolved). Unknown
+        /// type is an error naming the fix.
+        #[arg(long)]
+        node: Option<String>,
+        /// The wiring-only view: presentation (labels, icons, tags,
+        /// placeholders, form render hints) and authoring machinery
+        /// (connect recipes, image lists, graph-body display) stripped,
+        /// so an AI reading the catalog burns tokens only on what
+        /// decides how nodes connect. Without `--node`, the whole
+        /// catalog compacted.
+        #[arg(long)]
+        compact: bool,
     },
     /// Parse weft source (read from stdin) against the project's
     /// `nodes/` catalog and print the project + referenced catalog +
@@ -705,12 +740,13 @@ async fn main() -> anyhow::Result<()> {
     let ctx = commands::Ctx::new(cli.dispatcher, cli.json);
 
     match cli.command {
-        Cmd::New { name } => commands::new::run(ctx, name).await,
+        Cmd::New { name, assistants } => commands::new::run(ctx, name, assistants).await,
         Cmd::Build => commands::build::run(ctx).await,
         Cmd::BuildBase { quiet } => commands::build::run_build_base(quiet).await,
         Cmd::BuildImages { push, push_suffix, print } => {
             commands::build::run_build_images(push, push_suffix, print).await
         }
+        Cmd::Connect { opts } => commands::connect::run(ctx, opts).await,
         Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
             commands::test_node::run(
                 ctx,
@@ -780,7 +816,9 @@ async fn main() -> anyhow::Result<()> {
             let (verb, opts) = action.split();
             commands::infra::run(ctx, verb, opts).await
         }
-        Cmd::DescribeNodes { stdlib } => commands::describe_nodes::run(ctx, stdlib).await,
+        Cmd::DescribeNodes { stdlib, node, compact } => {
+            commands::describe_nodes::run(ctx, stdlib, node, compact).await
+        }
         Cmd::Parse { file } => commands::parse::parse(file).await,
         Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
         Cmd::ParseServer => commands::parse::serve(ctx).await,

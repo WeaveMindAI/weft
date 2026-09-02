@@ -6,8 +6,31 @@
 import type { FieldDefinition, PortDefinition } from '../types';
 import type { Widget } from '../../../protocol';
 import type { SpecField } from './port-specs';
-import { inputExposure } from '../types';
+import { declaredHomeValue, inputExposure } from '../types';
 import { SHOULD_FLOW_PORT } from '../../../protocol';
+
+/// A node's rendered input list, read off its data. Every parse and
+/// every projection path fills the list (the wire type is a required
+/// array), so a missing one is a broken node payload and is refused
+/// loudly rather than papered over with the catalog defaults. Every
+/// reader of "which inputs does this node show" goes through it, so the
+/// unconnected-access pin, the fields, and the port handles can never
+/// disagree on the list.
+export function inputsOf(inputs: unknown): PortDefinition[] {
+	return portList(inputs, 'input');
+}
+
+/// The output twin of [`inputsOf`]: same contract, same loud refusal.
+export function outputsOf(outputs: unknown): PortDefinition[] {
+	return portList(outputs, 'output');
+}
+
+function portList(list: unknown, which: 'input' | 'output'): PortDefinition[] {
+	if (!Array.isArray(list)) {
+		throw new Error(`node data carries no ${which} list`);
+	}
+	return list as PortDefinition[];
+}
 
 /// The render field for one input. `portDriven` follows the exposure: a
 /// wireable input's literal lives in `portLiterals` (the port home), a
@@ -55,6 +78,35 @@ export function inputRendersField(
 	if (opts.wired) return false;
 	if (input.name === SHOULD_FLOW_PORT) return opts.hasWrittenValue;
 	return true;
+}
+
+/// Does this node render an access field with no connection picked?
+/// Such a node is pinned open: the Connect button lives in the expanded
+/// body, so a collapsed unconnected node would hide the only way to fix
+/// it. ONE definition, read by both the node renderer (chevron/toggle)
+/// and the projection's build step (which overlays `expanded` from it),
+/// so the drawn state and the computed sizing can never disagree.
+/// The handle is read from node CONFIG only: an access widget requires
+/// `exposure: config` (the metadata validator refuses anything else),
+/// so a port-literal home for it cannot exist.
+export function hasUnpickedAccess(
+	inputs: PortDefinition[],
+	config: unknown,
+	wiredInputPorts: ReadonlySet<string>,
+): boolean {
+	for (const input of inputs) {
+		if (input.widget?.kind !== 'access') continue;
+		// An optional connection (compiler-stamped from the recipe's
+		// `connection_optional`) never pins: the node runs without one.
+		if (input.widget.optional) continue;
+		const rendered = inputRendersField(input, {
+			wired: wiredInputPorts.has(input.name),
+			hasWrittenValue: false,
+		});
+		if (!rendered) continue;
+		if (declaredHomeValue(undefined, config, fieldForInput(input)) == null) return true;
+	}
+	return false;
 }
 
 /// The render field for one value a config entry kind asks for (a

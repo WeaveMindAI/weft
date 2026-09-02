@@ -1,5 +1,5 @@
 import type { PortDefinition, PortType } from '../types';
-import type { PortSpecWire, SpecFieldWire, PortTemplateWire } from '../../../protocol';
+import { SHOULD_FLOW_PORT, type PortSpecWire, type SpecFieldWire, type PortTemplateWire } from '../../../protocol';
 import { parseWeftType, weftTypeToWireString, type WeftType } from '../types';
 
 // The wire types ARE the webview's types: `PortType` is a plain string,
@@ -96,7 +96,7 @@ export function entryForSource(draft: PortEntryDef, spec: PortSpec, name: string
  *  form gates on this: a key with spaces or punctuation (`what do you
  *  want?`) is refused before it can emit an unparseable port.
  *  SYNC: bare-ident grammar <->
- *        crates/weft-catalog/src/lib.rs (is_rust_identifier, which the
+ *        crates/weft-core/src/lib.rs (is_rust_identifier, which the
  *        compiler's is_bare_ident re-exports) */
 export function isValidFieldKey(key: string): boolean {
 	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(key);
@@ -219,20 +219,41 @@ export function deriveOutputsFromEntries(
  *  editing an entry and keeping its name is not a clash with itself,
  *  while renaming it onto a neighbour's name is. Empty means the entry
  *  can be written. */
+// Duplicate detection runs PER SIDE, matching the compiler's rule: a
+// node legitimately has an input and an output sharing a name (a
+// passthrough's `value`/`value`), so crossing the sides would
+// false-positive every one of them.
+// SYNC: entryPortCollisions <-> crates/weft-compiler/src/validate.rs duplicate-port
 export function entryPortCollisions(
 	entry: PortEntryDef,
 	others: PortEntryDef[],
 	specMap: Record<string, PortSpec>,
+	// Names the node type itself already owns on each side (its catalog
+	// ports): a derived port shadowing one would write a header the
+	// build rejects, so it is refused at the door like an entry-vs-entry
+	// collision. `_should_flow` is reserved on the input side of every
+	// node (the enricher synthesizes it), so it is seeded here rather
+	// than left to each caller.
+	reserved: { inputs: string[]; outputs: string[] },
 ): string[] {
-	const added = [
-		...deriveInputsFromEntries([entry], specMap),
-		...deriveOutputsFromEntries([entry], specMap),
-	].map((p) => p.name);
-	const taken = new Set(
-		[
-			...deriveInputsFromEntries(others, specMap),
-			...deriveOutputsFromEntries(others, specMap),
-		].map((p) => p.name),
-	);
-	return added.filter((name) => taken.has(name));
+	const collide = (
+		added: { name: string }[],
+		existing: { name: string }[],
+		reservedNames: string[],
+	): string[] => {
+		const taken = new Set([...reservedNames, ...existing.map((p) => p.name)]);
+		return added.map((p) => p.name).filter((name) => taken.has(name));
+	};
+	return [
+		...collide(
+			deriveInputsFromEntries([entry], specMap),
+			deriveInputsFromEntries(others, specMap),
+			[...reserved.inputs, SHOULD_FLOW_PORT],
+		),
+		...collide(
+			deriveOutputsFromEntries([entry], specMap),
+			deriveOutputsFromEntries(others, specMap),
+			reserved.outputs,
+		),
+	];
 }

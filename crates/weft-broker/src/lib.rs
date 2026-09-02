@@ -14,6 +14,7 @@ pub mod auth;
 pub mod credential;
 pub mod entitlement;
 pub mod handlers;
+pub mod lifecycle_writes;
 pub mod access_admin;
 pub mod app_provider;
 pub mod events;

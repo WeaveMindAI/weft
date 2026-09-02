@@ -19,6 +19,8 @@ import { formatConfigValue } from '../value-format';
 /// `configCollapsed` into source). `parentId` is non-source but is owned by
 /// the layout file's scope re-key, not a live node merge, so VIEW_KEYS (the
 /// keys live-merged into the rendered node) excludes it.
+/// (The unconnected-access pin is node DATA, never a config key, so it
+/// needs no entry here.)
 export const NON_SOURCE_KEYS = new Set(['parentId', 'textareaHeights', 'width', 'height', 'expanded', 'configCollapsed']);
 
 /// View-state keys merged LIVE into the rendered node for instant feedback

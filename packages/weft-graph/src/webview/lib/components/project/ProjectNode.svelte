@@ -16,9 +16,10 @@
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
-	import { createPortContextMenu, buildPortMenuItems } from "../../utils/port-context-menu";
+	import { openPortMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
-	import { fieldForInput, fieldForSpecField, inputRendersField, nextPortLiterals, shouldFlowField } from "../../utils/input-field";
+	import { portDeleteAction } from "../../projection/header-ports";
+	import { fieldForInput, fieldForSpecField, inputRendersField, inputsOf, nextPortLiterals, shouldFlowField } from "../../utils/input-field";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
@@ -54,6 +55,9 @@
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: NodeFeatures;
+			/// The unconnected-access pin (view state from buildNodes,
+			/// never a config key): drawn open, collapse disabled.
+			pinnedOpen?: boolean;
 			// Resolved state of @file targets, keyed by the marker's relative
 			// path (content or read error). A config field whose value is a
 			// `@file(...)` tag displays fileContents[path]; config itself never
@@ -185,7 +189,7 @@
 	 *  home; 'all'/'assignment' inputs edit the port-literal home
 	 *  (portDriven), with 'assignment' locked to the statement form. */
 	const displayedFields: FieldDefinition[] = $derived.by(() => {
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		const result: FieldDefinition[] = [];
 		for (const input of inputList) {
 			const rendered = inputRendersField(input, {
@@ -212,7 +216,7 @@
 	/** An assignment-only input's field is locked to the statement form:
 	 *  the braces form cannot drive it, so the toggle is disabled. */
 	function portFieldLocked(key: string): boolean {
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		const input = inputList.find((p) => p.name === key);
 		return input !== undefined && inputExposure(input) === 'assignment';
 	}
@@ -271,8 +275,16 @@
 	// instead of a bare square.
 	const hasLiveDisplay = $derived(showBodyFeed || showDebugDisplay || showFileDisplay);
 
-	// Get expanded state from config (persisted), default collapsed for regular nodes
-	const expanded = $derived((data.config?.expanded as boolean) ?? false);
+	// An access field with no connection picked pins the node open (the
+	// Connect button lives in the expanded body). The pin arrives as
+	// node DATA from buildNodes (view state, never a config key): it
+	// forces the drawn state open below and disables the collapse
+	// control, and it unlocks the moment a connection is picked.
+	const unconnectedAccess = $derived(!!data.pinnedOpen);
+
+	// Drawn state: the pin wins; otherwise config (persisted), default
+	// collapsed for regular nodes.
+	const expanded = $derived(unconnectedAccess || ((data.config?.expanded as boolean) ?? false));
 	
 	// Resize end: save the new dimensions (width/height only; `expanded` is
 	// unchanged so we don't resend it). The host classifies resize vs collapse
@@ -323,46 +335,48 @@
 		}
 	}
 
-	function togglePortRequired(portName: string, side: 'input' | 'output') {
-		if (side === 'input') {
-			const newInputs = inputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ inputs: newInputs });
-		} else {
-			const newOutputs = outputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ outputs: newOutputs });
-		}
+	// Inputs only: requiredness has no runtime meaning on an output, and
+	// the menu offers the row on inputs alone.
+	function setInputPortRequired(portName: string, required: boolean) {
+		const newInputs = inputs.map((p: PortDefinition) =>
+			p.name === portName ? { ...p, required } : { ...p }
+		);
+		data.onUpdate?.({ inputs: newInputs });
 	}
 	
-	// Port context menu rendered on document.body to avoid CSS transform positioning issues
+	// Port context menu rendered on document.body to avoid CSS transform
+	// positioning issues. This effect tracks ONLY `portContextMenu`
+	// (open/close); openPortMenu builds the items untracked, as a
+	// snapshot of the gesture (see its doc).
 	$effect(() => {
 		if (!portContextMenu) return;
 		const { portName, side, x, y } = portContextMenu;
-		const port = side === 'input'
-			? inputs.find((p) => p.name === portName)
-			: outputs.find((p) => p.name === portName);
-		if (!port) return;
-
-		const defaultPorts = side === 'input' ? typeConfig.defaultInputs : typeConfig.defaultOutputs;
-		const isCustom = !defaultPorts.some((p) => p.name === portName);
-		const canAddPorts = (side === 'input'
-			? typeConfig.features?.canAddInputPorts
-			: typeConfig.features?.canAddOutputPorts) ?? false;
-
-		const items = buildPortMenuItems({
-			port,
-			side,
-			isCustom,
-			canAddPorts,
-			onToggleRequired: () => togglePortRequired(portName, side),
-			onSetType: (newType) => setPortType(portName, side, newType),
-			onRemove: () => { if (side === 'input') removeInputPort(portName); else removeOutputPort(portName); },
-		});
-
-		return createPortContextMenu(x, y, items, () => { portContextMenu = null; });
+		return openPortMenu({ x, y }, () => {
+			const port = side === 'input'
+				? inputs.find((p) => p.name === portName)
+				: outputs.find((p) => p.name === portName);
+			if (!port) return null;
+			const provided = side === 'input' ? providedInputs : providedOutputs;
+			const derivedNames = side === 'input' ? derivedPortLists.ins : derivedPortLists.outs;
+			const canAddPorts = (side === 'input'
+				? typeConfig.features?.canAddInputPorts
+				: typeConfig.features?.canAddOutputPorts) ?? false;
+			return buildPortMenuItems({
+				port,
+				...(side === 'input'
+					? { side, onSetRequired: (required: boolean) => setInputPortRequired(portName, required) }
+					: { side }),
+				deleteAction: portDeleteAction(port, provided, canAddPorts),
+				// Derived-ness is per PORT (only the ports the config list
+				// creates; a switch's `value` stays editable), and a DECLARED
+				// shadow line over a derived name round-trips like any
+				// declaration, so it keeps its edits too.
+				configDerived: derivedNames.some((d) => d.name === port.name)
+					&& port.declaredType === undefined,
+				onSetType: (newType) => setPortType(portName, side, newType),
+				onRemove: () => { if (side === 'input') removeInputPort(portName); else removeOutputPort(portName); },
+			});
+		}, () => { portContextMenu = null; });
 	});
 
 
@@ -399,7 +413,7 @@
 		return getPortTypeColor(portType);
 	}
 
-	const inputs = $derived(data.inputs || typeConfig.defaultInputs);
+	const inputs = $derived(inputsOf(data.inputs));
 	/** Inputs that render a PORT DOCK. A `config`-exposure input is a
 	 *  design-time setting the graph never wires, so it gets a field in
 	 *  the body but no handle on the edge rail. `inputs` stays the
@@ -419,6 +433,29 @@
 	// Check if node allows adding ports based on its features
 	const canAddInputPorts = $derived(typeConfig.features?.canAddInputPorts ?? false);
 	const canAddOutputPorts = $derived(typeConfig.features?.canAddOutputPorts ?? false);
+
+	// The ports each side is PROVIDED (the header aside): catalog
+	// defaults plus the ports the config entry list derives. The one
+	// input to every delete surface (see portDeleteAction) and to the
+	// menu's derived-port explainer. Reads the render mirror's config,
+	// which can lag the projection by one flush; that is tolerable here
+	// because the DESTRUCTIVE routing (remove vs revert) happens in the
+	// emitter against the projection's own derivation, so a stale
+	// window can only mislabel the button or menu item, never change
+	// what the gesture does. A future portsFromConfig type that also
+	// accepts custom ports should still derive this from the projection
+	// so the labels cannot lie either.
+	const derivedPortLists = $derived.by(() => {
+		const pfc = typeConfig.portsFromConfig;
+		if (!pfc) return { ins: [] as PortDefinition[], outs: [] as PortDefinition[] };
+		const entries = (data.config?.[pfc.field] as PortEntryDef[] | undefined) ?? [];
+		return {
+			ins: deriveInputsFromEntries(entries, entryKindByName),
+			outs: deriveOutputsFromEntries(entries, entryKindByName),
+		};
+	});
+	const providedInputs = $derived([...typeConfig.defaultInputs, ...derivedPortLists.ins]);
+	const providedOutputs = $derived([...typeConfig.defaultOutputs, ...derivedPortLists.outs]);
 	const oneOfRequiredGroups: string[][] = $derived(
 		[...(typeConfig.features?.oneOfRequired ?? []), ...(data.features?.oneOfRequired ?? [])]
 	);
@@ -575,7 +612,10 @@
 		data.onUpdate?.({ config: { ...data.config, [key]: flipped } });
 	}
 
-	function updateConfig(key: string, value: string | string[] | number | boolean | PortEntryDef[] | Record<string, unknown> | WeftFileRefValue | WeftFileRefValue[] | null) {
+	// `extra`: additional config keys committed IN THE SAME update as the
+	// field's value (an access pick persisting `expanded: true` so the
+	// pinned-open node doesn't snap shut). One write, one undo step.
+	function updateConfig(key: string, value: string | string[] | number | boolean | PortEntryDef[] | Record<string, unknown> | WeftFileRefValue | WeftFileRefValue[] | null, extra?: Record<string, unknown>) {
 		// File-backed field: the edit goes to the referenced file, never to the
 		// weft source. The `@file(...)` marker in config (and source) is left
 		// untouched; only the file's content changes.
@@ -611,13 +651,40 @@
 			// config holds the `@file(...)` tag for file-backed fields (never the
 			// resolved content), so serializing the whole config re-emits the
 			// marker. No special handling needed for sibling file-backed fields.
-			const newConfig = { ...data.config, [key]: value };
+			const newConfig = { ...data.config, [key]: value, ...(extra ?? {}) };
 			if (typeConfig.portsFromConfig && key === typeConfig.portsFromConfig.field) {
 				const fields = value as PortEntryDef[];
+				// The update's port lists are the node's FULL next surface
+				// (the emitter diffs surfaces): every current port that is
+				// not derived from the OLD entry list, plus the NEW list's
+				// derived ports. Sending only the derived ports would read
+				// as "every other port was deleted" and wipe the header's
+				// real declarations.
+				const prevFields = (data.config?.[typeConfig.portsFromConfig.field] as PortEntryDef[] | undefined) ?? [];
+				const prevDerived = new Set([
+					...deriveInputsFromEntries(prevFields, entryKindByName),
+					...deriveOutputsFromEntries(prevFields, entryKindByName),
+				].map((p) => p.name));
+				// A DECLARED port survives even when its name is derived (a
+				// hand-authored shadow line over a derived port round-trips
+				// like any declaration); only bare derived ports are swapped
+				// for the new list's derivation.
+				const keptIn = inputs.filter((p: PortDefinition) =>
+					!prevDerived.has(p.name) || p.declaredType !== undefined);
+				const keptOut = outputs.filter((p: PortDefinition) =>
+					!prevDerived.has(p.name) || p.declaredType !== undefined);
 				data.onUpdate({
 					config: newConfig,
-					inputs: deriveInputsFromEntries(fields, entryKindByName),
-					outputs: deriveOutputsFromEntries(fields, entryKindByName),
+					inputs: [
+						...keptIn,
+						...deriveInputsFromEntries(fields, entryKindByName)
+							.filter((d) => !keptIn.some((p: PortDefinition) => p.name === d.name)),
+					],
+					outputs: [
+						...keptOut,
+						...deriveOutputsFromEntries(fields, entryKindByName)
+							.filter((d) => !keptOut.some((p: PortDefinition) => p.name === d.name)),
+					],
 				});
 			} else {
 				data.onUpdate({ config: newConfig });
@@ -653,10 +720,22 @@
 	 *  the file write; only a plain field goes to its declared home
 	 *  (port literal vs config). THE one routing rule; every control
 	 *  calls this. */
-	function updateFieldValue(key: string, value: unknown, portDriven?: boolean) {
+	function updateFieldValue(key: string, value: unknown, portDriven?: boolean, extra?: Record<string, unknown>) {
+		// `extra` rides only the plain config route: a file-backed write
+		// goes to the referenced file and a port literal to the source
+		// statement, and neither carries extra config keys. Today this
+		// cannot fire (the one `extra` sender is the access pick, and
+		// Rust refuses any access widget that is not `exposure: config`,
+		// so it is never port-driven or file-backed); the guard makes a
+		// future exposure change fail VISIBLY instead of silently losing
+		// the write (a throw out of an event handler reaches nobody).
+		if (extra && (fileFieldState(key) || portDriven)) {
+			toast.error(`field '${key}': extra config keys cannot ride a file-backed or port-driven write`);
+			return;
+		}
 		if (fileFieldState(key)) updateConfig(key, value as Parameters<typeof updateConfig>[1]);
 		else if (portDriven) updatePortLiteral(key, value);
-		else updateConfig(key, value as Parameters<typeof updateConfig>[1]);
+		else updateConfig(key, value as Parameters<typeof updateConfig>[1], extra);
 	}
 
 	/** Flip a port-driven field's WRITTEN form (braces `key: value` vs
@@ -692,7 +771,7 @@
 	 *  and the dropdown's connect-first wording (pick here vs wire in). */
 	function accessInputIsOwnWidget(accessInput: string | undefined): boolean {
 		if (!accessInput) return false;
-		const ownInputs = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const ownInputs = inputsOf(data.inputs);
 		return ownInputs.some((i) => i.name === accessInput && i.widget?.kind === 'access');
 	}
 
@@ -719,7 +798,7 @@
 		const tpl = NODE_TYPE_CONFIG[srcData.nodeType as NodeType];
 		const service = tpl?.service?.service;
 		if (!service) return null;
-		const srcInputs = (srcData.inputs ?? tpl?.defaultInputs ?? []) as PortDefinition[];
+		const srcInputs = inputsOf(srcData.inputs);
 		const connectInput = srcInputs.find((i) => i.widget?.kind === 'access');
 		if (!connectInput) return null;
 		const handle = ownValue(srcData.config as Record<string, unknown> | undefined, connectInput.name);
@@ -750,7 +829,7 @@
 	/// authenticating input (its sources filter on the granted set).
 	const watchedAccessInputs = $derived.by(() => {
 		const names = new Set<string>();
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			if (i.requiresScopes && i.requiresScopes.length > 0) names.add(i.name);
 			if (i.requiresValues && i.requiresValues.length > 0) names.add(i.name);
@@ -831,7 +910,7 @@
 	/// sets never mark (nobody actually knows what they hold).
 	const permissionShortfalls = $derived.by(() => {
 		const out: string[] = [];
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			const required = i.requiresScopes ?? [];
 			if (required.length === 0) continue;
@@ -854,7 +933,7 @@
 	/// refusal is the backstop.
 	const ownAccountShortfalls = $derived.by(() => {
 		const out: { text: string; link?: string }[] = [];
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			const required = i.requiresScopes ?? [];
 			if (required.length === 0) continue;
@@ -879,7 +958,7 @@
 	/// this marks whenever the grant was read.
 	const valueShortfalls = $derived.by(() => {
 		const out: string[] = [];
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			const required = i.requiresValues ?? [];
 			if (required.length === 0) continue;
@@ -1021,7 +1100,22 @@
 		// is not a conflict with itself.
 		const existing = getEntries();
 		const others = replacing === null ? existing : existing.filter((_, i) => i !== replacing);
-		const collisions = entryPortCollisions(entry, others, entryKindByName);
+		// Reserved on each side: the node type's own ports AND the ports
+		// this instance's header declares, EXCEPT a header line that
+		// shadows a port the current entry list already derives (the
+		// enricher merges such a shadow by name, so it is legal source,
+		// and reserving it would refuse every edit of its own entry).
+		// Per SIDE: an input-side derivation must not un-reserve a
+		// declared OUTPUT of the same name (the two are separate name
+		// spaces, and a spec can derive the bare `{key}` on either).
+		const derivedIns = new Set(deriveInputsFromEntries(existing, entryKindByName).map((p) => p.name));
+		const derivedOuts = new Set(deriveOutputsFromEntries(existing, entryKindByName).map((p) => p.name));
+		const declaredNames = (ports: PortDefinition[], derived: Set<string>) =>
+			ports.filter((p) => p.declaredType !== undefined && !derived.has(p.name)).map((p) => p.name);
+		const collisions = entryPortCollisions(entry, others, entryKindByName, {
+			inputs: [...typeConfig.defaultInputs.map((p) => p.name), ...declaredNames(inputs, derivedIns)],
+			outputs: [...typeConfig.defaultOutputs.map((p) => p.name), ...declaredNames(outputs, derivedOuts)],
+		});
 		if (collisions.length > 0) {
 			toast.error(`Port name conflict: "${collisions.join('", "')}" already exists. Choose a different name.`);
 			return false;
@@ -1148,7 +1242,7 @@
 	}
 
 	function toggleExpand(e: MouseEvent) {
-		if (!hasExpandableContent) return;
+		if (!hasExpandableContent || unconnectedAccess) return;
 		
 		const currentExpanded = (data.config?.expanded as boolean) ?? false;
 		if (data.onUpdate) {
@@ -1553,9 +1647,10 @@
 		{/if}
 		{#if hasExpandableContent}
 			<button
-				class="w-5 h-5 flex items-center justify-center rounded hover:bg-black/5 cursor-pointer transition-colors text-zinc-400"
+				class="w-5 h-5 flex items-center justify-center rounded transition-colors text-zinc-400 {unconnectedAccess ? 'opacity-40 cursor-not-allowed' : 'hover:bg-black/5 cursor-pointer'}"
 				onclick={toggleExpand}
-				title={expanded ? 'Collapse' : 'Expand'}
+				disabled={unconnectedAccess}
+				title={unconnectedAccess ? 'Pick a connection first' : expanded ? 'Collapse' : 'Expand'}
 			>
 				{#if expanded}
 					<Minimize2 size={12} />
@@ -1603,6 +1698,7 @@
 			<div class="space-y-1 min-w-0 flex-1">
 				{#each wireableInputs as input}
 					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortColor(input.portType), 'input')}
+					{@const inputDeleteAction = portDeleteAction(input, providedInputs, canAddInputPorts)}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						class="relative flex items-center gap-1 group pl-3"
@@ -1622,11 +1718,11 @@
 							oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
 						/>
 						<span class="truncate">{input.name}</span>
-						{#if canAddInputPorts}
-							<button 
+						{#if inputDeleteAction}
+							<button
 								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 ml-auto text-xs leading-none"
 								onclick={(e) => { e.stopPropagation(); removeInputPort(input.name); }}
-								title="Remove port"
+								title={inputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 							>×</button>
 						{/if}
 					</div>
@@ -1660,6 +1756,7 @@
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
 				{#each outputs as output}
 				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortColor(output.portType), 'output')}
+				{@const outputDeleteAction = portDeleteAction(output, providedOutputs, canAddOutputPorts)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<div
 					class="relative flex items-center gap-1 justify-end group pr-3"
@@ -1677,11 +1774,11 @@
 						class={oMarker.class}
 						oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}
 					/>
-					{#if canAddOutputPorts}
-						<button 
+					{#if outputDeleteAction}
+						<button
 							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 mr-auto text-xs leading-none"
 							onclick={(e) => { e.stopPropagation(); removeOutputPort(output.name); }}
-							title="Remove port"
+							title={outputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 						>×</button>
 					{/if}
 					<span class="truncate" title={output.name}>{output.name}</span>
@@ -1889,7 +1986,13 @@
 									projectApp={typeConfig.accessApps?.[typeConfig.service.service]}
 									nodeType={data.nodeType}
 									value={declaredValue(field) as { id: string; identity?: string } | undefined}
-									onUpdate={(v) => updateFieldValue(field.key, v, field.portDriven)}
+									onUpdate={(v) =>
+										// Picking a connection unlocks the pin; persist the node
+										// as expanded IN THE SAME update so it doesn't snap shut
+										// the instant the pick lands. The pin lives on node data,
+										// never in config, so this `expanded: true` travels the
+										// ordinary layout path and sticks.
+										updateFieldValue(field.key, v, field.portDriven, v != null ? { expanded: true } : undefined)}
 								/>
 							{:else}
 								<div class="text-[10px] text-red-500">

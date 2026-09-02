@@ -1086,6 +1086,7 @@
       {onRun}
       {onStop}
       {onDismissError}
+      onOpenLocation={(location) => send({ kind: 'openSource', location })}
       {onActivate}
       {onCancelActivate}
       {onCancelBuild}

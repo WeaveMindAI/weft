@@ -2012,6 +2012,58 @@ c = @include("cleaner.weft")
     assert!(project.nodes.iter().any(|n| n.id == "c.strip"));
 }
 
+/// Every spliced node, edge, and per-field span names the FILE it was
+/// written in, two levels of `@include` deep, and a value written in
+/// the MIDDLE file onto the inner file's port carries the middle file,
+/// while sitting on a boundary node whose own file is the inner one's.
+/// This is what lets a diagnostic point at the right buffer.
+#[test]
+fn include_stamps_the_owning_file_on_nodes_edges_and_spans() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("inner.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n  deep = Text { value: \"x\" }\n  self.cleaned = deep.value\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("mid.weft"),
+        "Group() -> (out: String) {\n  i = @include(\"inner.weft\")\n  i.raw = \"from-mid\"\n  m = Text { value: \"y\" }\n  self.out = i.cleaned\n}\n",
+    )
+    .unwrap();
+    let project = compile("c = @include(\"mid.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path()))
+        .expect("compile");
+    let node = |id: &str| project.nodes.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id}"));
+    let file_of = |id: &str| node(id).source_file.clone().unwrap_or_default();
+    assert!(file_of("c.i.deep").ends_with("inner.weft"), "{}", file_of("c.i.deep"));
+    assert!(file_of("c.m").ends_with("mid.weft"), "{}", file_of("c.m"));
+    // The inner group's IN boundary belongs to inner.weft, and the fill
+    // `i.raw = "from-mid"` written in mid.weft carries mid.weft on ITS
+    // span entry, on that same node.
+    let boundary = node("c.i__in");
+    assert!(
+        boundary.source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
+        "{:?}",
+        boundary.source_file
+    );
+    let fill = boundary.port_literal_spans.get("raw").expect("fill span");
+    assert!(
+        fill.source_file.as_deref().unwrap_or_default().ends_with("mid.weft"),
+        "{:?}",
+        fill.source_file
+    );
+    // An edge written inside the inner file names it too.
+    let edge = project
+        .edges
+        .iter()
+        .find(|e| e.source == "c.i.deep")
+        .expect("inner edge");
+    assert!(
+        edge.source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
+        "{:?}",
+        edge.source_file
+    );
+}
+
 /// An included file with INTERNAL nesting (a nested group + an inline-expr) must
 /// scope every id under the call-site alias in ONE pass (no `rescope_group`
 /// string surgery). Pins the include-reshape: the included file is parsed with
@@ -2306,9 +2358,15 @@ fn nested_include_error_keeps_line() {
         "Group -> (x: String) {\n inner = @include(\"inner.weft\")\n self.x = inner.x\n}\n",
     ).unwrap();
     let errs = compile("c = @include(\"outer.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
-    // The error path carries the inner file + its line (`inner.weft: 2:...`),
-    // not a bare message with the location dropped.
-    assert!(errs.iter().any(|e| e.message.contains("inner.weft: 2:")), "errs: {errs:?}");
+    // The error keeps its OWN span (line 2 of inner.weft) and names the
+    // file STRUCTURALLY, so a click lands on the real line instead of
+    // the `@include` line; the rendered form still reads `inner.weft:2:...`.
+    let hit = errs
+        .iter()
+        .find(|e| e.file.as_deref().unwrap_or_default().ends_with("inner.weft"))
+        .unwrap_or_else(|| panic!("no error names inner.weft: {errs:?}"));
+    assert_eq!(hit.span.start_line, 2, "errs: {errs:?}");
+    assert!(hit.to_string().contains("inner.weft"), "{hit}");
 }
 
 #[test]

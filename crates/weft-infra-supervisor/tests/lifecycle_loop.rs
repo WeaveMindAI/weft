@@ -169,6 +169,7 @@ async fn stop_skips_noop_units_and_scales_only_scale_to_zero() {
             stop_behavior: weft_core::StopBehavior::ScaleToZero,
             flaky_after_seconds: 30,
             recovery_after_seconds: 30,
+            image_refs: Default::default(),
         },
     );
     units.insert(
@@ -178,6 +179,7 @@ async fn stop_skips_noop_units_and_scales_only_scale_to_zero() {
             stop_behavior: weft_core::StopBehavior::NoOp,
             flaky_after_seconds: 30,
             recovery_after_seconds: 30,
+            image_refs: Default::default(),
         },
     );
     rig.broker.add_infra_node_with(
@@ -235,6 +237,7 @@ async fn force_stop_takes_down_noop_units_too() {
                 stop_behavior: sb,
                 flaky_after_seconds: 30,
                 recovery_after_seconds: 30,
+                image_refs: Default::default(),
             },
         );
     }
@@ -527,6 +530,7 @@ async fn apply_skip_path_no_provisioning() {
                     stop_behavior: weft_core::StopBehavior::ScaleToZero,
                     flaky_after_seconds: 30,
                     recovery_after_seconds: 30,
+                    image_refs: Default::default(),
                 },
             );
             m
@@ -573,12 +577,14 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
         stop_behavior: weft_core::StopBehavior::ScaleToZero,
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
+        image_refs: Default::default(),
     });
     prior_units.insert("license".to_string(), UnitRuntime {
         status: Status::Running,
         stop_behavior: weft_core::StopBehavior::NoOp,
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
+        image_refs: Default::default(),
     });
     rig.broker.add_infra_node_with(
         PROJECT, NODE, "inst1", Status::Running, Some("oldhash".into()),
@@ -632,6 +638,54 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
     assert_eq!(row.units.get("license").unwrap().status, Status::Running);
 }
 
+/// A Fresh apply over a `Terminating` row (a terminate that stamped
+/// the row and then failed or died before its delete landed) must
+/// first delete the PRIOR instance by its own label, honoring the PVC
+/// list its row recorded: every other sweep selects by the NEW
+/// instance id, so without this the old pods would stay up while the
+/// post-readiness stamp drops their image refs from the keep-set.
+#[tokio::test]
+async fn fresh_apply_over_terminating_row_deletes_the_prior_instance_first() {
+    use weft_broker_client::protocol::UnitRuntime;
+    let rig = rig();
+    let mut prior_units = std::collections::BTreeMap::new();
+    prior_units.insert("bridge".to_string(), UnitRuntime {
+        status: Status::Terminating,
+        stop_behavior: weft_core::StopBehavior::ScaleToZero,
+        flaky_after_seconds: 30,
+        recovery_after_seconds: 30,
+        image_refs: ["weft-infra-bridge:old".to_string()].into_iter().collect(),
+    });
+    rig.broker.add_infra_node_with(
+        PROJECT, NODE, "inst-old", Status::Terminating, Some("oldhash".into()),
+        std::collections::BTreeMap::new(), prior_units,
+    );
+    rig.broker.set_preserve_pvcs(PROJECT, NODE, vec!["data".to_string()]);
+    rig.kube.set_workloads(
+        NAMESPACE,
+        vec![workload_with_unit("inst-old", "inst-old-bridge", "bridge", 1, 1)],
+    );
+    rig.broker.enqueue_command(apply_cmd(9));
+
+    rig.tick_lifecycle().await.unwrap();
+
+    let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
+    assert_ne!(row.instance_id, "inst-old", "a Terminating row never reuses its instance id");
+    // The first kube delete is the whole prior instance, with the PVC
+    // list the prior row recorded; it precedes every new-instance sweep.
+    let deletes = rig.kube.delete_calls();
+    assert_eq!(
+        deletes.first().map(|(_, sel, pvcs)| (sel.as_str(), pvcs.as_slice())),
+        Some(("weft.dev/instance=inst-old", ["data".to_string()].as_slice())),
+        "deletes={deletes:?}"
+    );
+    assert!(
+        deletes.iter().skip(1).all(|(_, sel, _)| sel.contains(&row.instance_id)),
+        "every later sweep targets the new instance; deletes={deletes:?}"
+    );
+    assert_eq!(row.status, Status::Running);
+}
+
 // ---------- ownership fence: a displaced owner must not finish its command ----------
 //
 // The supervisor's single-actor authority is the exclusive `infra_owner`
@@ -640,7 +694,7 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
 // write from the old pod is rejected by the broker, so the old pod must
 // NOT complete the command: it stays uncompleted for the new owner to
 // re-run (the user never re-acts). The fake models the move with
-// `set_project_owned(false)`, which returns `Raced` from every
+// `set_project_owned(false)`, which returns `Displaced` from every
 // ownership-gated write exactly as the broker's `owns_project_predicate`
 // would. These tests pin "a displaced owner leaves the command for the
 // new owner" for each verb that mutates cluster state.
@@ -652,7 +706,7 @@ async fn stop_aborts_without_completing_when_ownership_moves_mid_command() {
     rig.kube
         .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
     // Ownership has already moved to another pod by the time the per-unit
-    // `set_status` write lands. The broker rejects it (Raced).
+    // `set_status` write lands. The broker rejects it (Displaced).
     rig.broker.set_project_owned(PROJECT, false);
     rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
 
@@ -668,7 +722,7 @@ async fn stop_aborts_without_completing_when_ownership_moves_mid_command() {
 }
 
 #[tokio::test]
-async fn terminate_does_not_remove_node_when_ownership_moves_mid_command() {
+async fn terminate_aborts_before_kubectl_when_ownership_moves_mid_command() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
     rig.kube
@@ -678,11 +732,17 @@ async fn terminate_does_not_remove_node_when_ownership_moves_mid_command() {
 
     rig.tick_lifecycle().await.unwrap();
 
-    // The cascade delete was rejected: the node row survives for the new
+    // The Terminating stamp (the first ownership-gated write) was
+    // displaced, so no kubectl ran, the node row survives for the new
     // owner to terminate, and the command is left uncompleted.
     assert!(
+        rig.kube.delete_calls().is_empty(),
+        "a displaced owner must not delete anything; deletes={:?}",
+        rig.kube.delete_calls()
+    );
+    assert!(
         rig.broker.infra_node(PROJECT, NODE).is_some(),
-        "remove_node must be rejected when ownership moved; the row must survive"
+        "the row must survive for the new owner"
     );
     assert!(
         rig.broker.completed_commands().is_empty(),
@@ -704,7 +764,7 @@ async fn apply_does_not_complete_when_ownership_moves_mid_command() {
 
     rig.tick_lifecycle().await.unwrap();
 
-    // set_provisioning is rejected (Raced) before any kube apply, and the
+    // set_provisioning is rejected (Displaced) before any kube apply, and the
     // command is left uncompleted for the new owner.
     assert!(
         rig.broker.completed_commands().is_empty(),
