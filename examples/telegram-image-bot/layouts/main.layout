@@ -1,36 +1,35 @@
-@view simplified
-credit @layout 569 226 841x348
-brief @layout 1462 136 573x376
-telegram @layout 70 142
-fal @layout 2091 136 320x152 collapsed
-pg @layout 40 759
-ask @layout 312 125
-sorry @layout 1462 537
-picture @layout 2333 136
-reply @layout 2590 40
-join @layout 297 617
-table @layout 282 759
-signup @layout 539 759
-enroll @layout 791 723
-credit.who @layout 76 165
-credit.debit @layout 328 80
-credit.read @layout 580 80
-brief.write @layout 307 137
+credit @layout 689 206 826x331
+brief @layout 1567 322 693x611 collapsed
+telegram @layout 40 142
+fal @layout 1823 136 320x152 collapsed
+pg @layout 180 442
+ask @layout 402 125
+sorry @layout 1567 136
+picture @layout 2185 136
+reply @layout 2442 40
+join @layout 427 592
+table @layout 422 442
+signup @layout 679 574
+enroll @layout 1567 489
+credit.who @layout 61 165
+credit.debit @layout 313 80
+credit.read @layout 565 80
+brief.write @layout 427 372
 brief.write__provider @layout 65 92
-brief.write__params @layout 65 210
-credit @slayout 365 104 471x230 collapsed
-brief @slayout 515 40 305x319 collapsed
-telegram @slayout 40 142
-fal @slayout 669 161
-pg @slayout 90 406
-ask @slayout 180 142
-sorry @slayout 515 161
-picture @slayout 809 161
-reply @slayout 964 219
-join @slayout 235 274
-table @slayout 230 406
-signup @slayout 395 289
-enroll @slayout 545 347
+brief.write__params @layout 185 445
+credit @slayout 487 287 471x230 collapsed
+brief @slayout 637 224 305x319 collapsed
+telegram @slayout 40 324
+fal @slayout 791 345
+pg @slayout 192 182
+ask @slayout 180 314
+sorry @slayout 637 345
+picture @slayout 931 345
+reply @slayout 1086 403
+join @slayout 215 40
+table @slayout 332 182
+signup @slayout 487 103
+enroll @slayout 637 103
 credit.who @slayout 29 48
 credit.debit @slayout 179 106
 credit.read @slayout 329 106
