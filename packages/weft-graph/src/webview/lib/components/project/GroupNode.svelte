@@ -1036,6 +1036,15 @@
 	   rules restate the hex. The config strip takes its colour from the
 	   container instead, through the `--strip-color` property set inline. */
 	/* ═══════════════ EXPANDED MODE ═══════════════ */
+	/* The expanded group draws ABOVE the wires (ProjectEditorInner puts the
+	   wrapper at z-index 3, edges at 1) so its header, and the collapse
+	   button on it, win the click in a crowded graph. The price is paid
+	   here: the body is see-through and lets the pointer through, so a wire
+	   crossing it is still visible and still the thing you click; only the
+	   parts that mean something catch the pointer (header, config strip,
+	   side ports, the flow dock, the resize handles). The wrapper itself is
+	   `pointer-events: none` (set globally on `.svelte-flow__node-group`),
+	   so the group is dragged by its header. */
 	.expanded-container {
 		width: 100%;
 		height: 100%;
@@ -1045,6 +1054,16 @@
 		min-width: 250px;
 		min-height: 200px;
 		position: relative;
+		pointer-events: none;
+	}
+	.expanded-header,
+	.config-strip,
+	.expanded-side-ports {
+		pointer-events: auto;
+	}
+	:global(.svelte-flow__node-group .svelte-flow__resize-control),
+	:global(.svelte-flow__node-group .svelte-flow__handle) {
+		pointer-events: auto;
 	}
 
 	.expanded-container.selected {

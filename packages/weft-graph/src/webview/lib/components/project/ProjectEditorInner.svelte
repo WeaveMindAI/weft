@@ -1146,14 +1146,17 @@
 			const e = layoutMap?.[n.id];
 			if (e) nextFreeY = Math.max(nextFreeY, e.y + (e.h ?? 120) + 40);
 		}
-		// Fallback placements chosen this pass, persisted below as REAL layout
-		// entries (no undo slot: not user-authored). Anchoring the guess makes
-		// it a one-time commitment: without it, "below everything else" is
-		// recomputed on every rebuild, so a node typed into the code tab
-		// drifted downward every time an unrelated node was dragged further
-		// down. Persisting re-derives the layout once more; the second pass
-		// finds the entries and places nothing, so this reaches a fixpoint.
-		const placedAnchors: Array<[string, { x: number; y: number }]> = [];
+		// Visible nodes with no saved position in the active view, with the
+		// fallback position this pass gave them. Nobody placed these: they were
+		// typed into the source tab, written by an agent, or the view is being
+		// shown for the first time (a fresh file, or the simplified view of a
+		// project only ever laid out in the builder). Every graph gesture that
+		// creates a node writes its layout entry in the same edit, so a node
+		// the user placed by hand never lands here. One rule follows, in
+		// `organizeUnplaced`: any unplaced node organizes the whole active
+		// view once, automatically, after which every visible node holds an
+		// entry and the next rebuild places nothing (a fixpoint).
+		const unplaced: Array<[string, { x: number; y: number }]> = [];
 
 		// Containment floors: an expanded container's drawn box grows to enclose
 		// its children, recursively, so a container child (a Loop inside a
@@ -1297,20 +1300,23 @@
 			});
 
 			// Position is layout's job: the merge places a node at its saved layout
-			// entry when present. A node with NO entry (just typed, fresh file) is
-			// placed below existing laid-out content (top-level) so it's visible, not
-			// stacked at the origin; a child with no entry keeps its parent-relative
-			// position. This single placement rule lives here so mount and re-render
-			// agree. (`n.position` is the structural parse's 0,0.)
+			// entry when present. A node with NO entry is placed somewhere visible
+			// for the moment (top-level: below existing laid-out content; a child:
+			// its parent-relative position) and reported as unplaced, which
+			// organizes the view (see `unplaced` above). Hidden nodes are not
+			// reported: an organize never writes them, so they would ask forever.
+			// This single placement rule lives here so mount and re-render agree.
+			// (`n.position` is the structural parse's 0,0.)
 			let position: { x: number; y: number };
 			if (layoutEntry) {
 				position = { x: layoutEntry.x, y: layoutEntry.y };
 			} else if (!rawParentId) {
 				position = { x: 0, y: nextFreeY };
 				nextFreeY += 140;
-				placedAnchors.push([n.id, position]);
+				if (!hiddenByCollapsedGroup) unplaced.push([n.id, position]);
 			} else {
 				position = n.position;
+				if (!hiddenByCollapsedGroup) unplaced.push([n.id, position]);
 			}
 
 			return {
@@ -1358,19 +1364,52 @@
 				parentId,
 			};
 		});
-		if (placedAnchors.length > 0) {
-			// Deferred: buildNodes runs inside reactive derivations, and a
-			// synchronous layout write would mutate engine state mid-derive.
+		if (unplaced.length > 0) {
+			// Deferred: buildNodes runs inside reactive derivations, and the
+			// organize writes layout, which would mutate engine state mid-derive.
 			const verb = layoutVerb;
 			queueMicrotask(() => {
 				if (destroyed) return;
-				persistLayoutEdit((layout) => placedAnchors.reduce(
-					(l, [id, p]) => updateLayoutEntry(l, id, p.x, p.y, undefined, undefined, undefined, undefined, verb),
-					layout,
-				));
+				organizeUnplaced(verb, unplaced);
 			});
 		}
 		return built;
+	}
+
+	// The one automatic organize: fired by a rebuild that found unplaced
+	// nodes (see buildNodes). Runs at most one ELK pass at a time; a rebuild
+	// landing mid-run (live data, another external edit) queues one re-check
+	// instead of racing a second `nodes =` write. After a run that APPLIED,
+	// every visible node has an entry, so the re-check finds nothing and stops
+	// (the fixpoint). After a run that FAILED (ELK refused the graph; the user
+	// saw the toast), the fallback placements are persisted as real entries
+	// so the rebuild stops asking. 'view-changed' leaves the new view to its
+	// own rebuild, which is exactly what the queued re-check is.
+	let organizeInFlight: Promise<OrganizeOutcome> | null = null;
+	let organizeRecheck = false;
+	function organizeUnplaced(verb: LayoutVerb, fallback: Array<[string, { x: number; y: number }]>): void {
+		if (organizeInFlight) { organizeRecheck = true; return; }
+		organizeInFlight = runAutoOrganize(true, false);
+		void organizeInFlight.then((outcome) => {
+			if (outcome === 'failed') {
+				persistLayoutEdit((layout) => fallback.reduce(
+					(l, [id, p]) => updateLayoutEntry(l, id, p.x, p.y, undefined, undefined, undefined, undefined, verb),
+					layout,
+				));
+			}
+			if (outcome !== 'destroyed') canvasReady = true;
+		}).finally(() => {
+			organizeInFlight = null;
+			if (!organizeRecheck || destroyed) return;
+			organizeRecheck = false;
+			// Re-derive against the ACTIVE view: an entry-less visible node
+			// means the mid-run rebuild (or a view switch) still needs a pass.
+			const entries = parseLayoutCode(layoutCode, layoutVerb);
+			const still: Array<[string, { x: number; y: number }]> = nodes
+				.filter(n => n.style !== 'display: none;' && !entries[n.id])
+				.map(n => [n.id, n.position]);
+			if (still.length > 0) organizeUnplaced(layoutVerb, still);
+		});
 	}
 
 	// The INITIAL graph snapshot, seeded ONCE from the props. The live
@@ -1947,9 +1986,12 @@
 			.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`)
 			.join('|');
 		untrack(() => {
-			// Skip until the active view has had its initial organize (the mount /
-			// view-switch effects own that); only react to LATER resizes.
-			if (!organizedVerbs.has(layoutVerb)) { leafSizeSig = sig; return; }
+			// Skip until the active view is laid out (every visible node placed,
+			// no organize in flight; `organizeUnplaced` owns that); only react
+			// to LATER resizes.
+			const entries = parseLayoutCode(layoutCode, layoutVerb);
+			const laidOut = !organizeInFlight && nodes.every(n => n.style === 'display: none;' || entries[n.id]);
+			if (!laidOut) { leafSizeSig = sig; return; }
 			if (sig === leafSizeSig) return;
 			leafSizeSig = sig;
 			if (resizeReflowTimer) clearTimeout(resizeReflowTimer);
@@ -2117,7 +2159,10 @@
 			if (s.isExpanded) {
 				const w = s.configWidth || s.fallbackWidth || 400;
 				const h = s.configHeight || s.fallbackHeight || 300;
-				return { type: 'group', zIndex: -1 + (s.nestingDepth ?? 0), style: `width: ${w}px; height: ${h}px;` };
+				// Above the wires (edges sit at 1) so the header wins the click;
+				// nested groups share the level and paint in DOM order, parent
+				// first. The stylesheet pins the same value on the class.
+				return { type: 'group', zIndex: 3, style: `width: ${w}px; height: ${h}px;` };
 			}
 			if (s.simplified) return simplifiedSizing('groupCollapsed');
 			const minW = computeMinNodeWidth(s.inputs, s.outputs);
@@ -2300,12 +2345,12 @@
 	// because live-display content arrived) persists without one, so a streaming
 	// execution can't bury the user's real edits under reflow frames.
 	// Outcome of an organize: it APPLIED, or it bailed because the active view
-	// CHANGED mid-run (a later toggle back will re-fire and re-organize), or because
-	// the component was DESTROYED. Callers that claimed a verb in `organizedVerbs`
-	// un-claim ONLY on 'view-changed' (so the toggle-back recovers); 'destroyed'
-	// needs no recovery, and re-inferring the reason at the call site is fragile, so
-	// it's returned explicitly.
-	type OrganizeOutcome = 'applied' | 'view-changed' | 'destroyed';
+	// CHANGED mid-run (the new view's own rebuild organizes it if it needs
+	// it), or because the component was DESTROYED, or ELK FAILED (nothing
+	// moved, the user was told by toast). `organizeUnplaced` persists its
+	// fallback placements only on 'failed', and re-inferring the reason at the
+	// call site is fragile, so it's returned explicitly.
+	type OrganizeOutcome = 'applied' | 'view-changed' | 'destroyed' | 'failed';
 	async function runAutoOrganize(andFitView = false, undoable = true): Promise<OrganizeOutcome> {
 		// The view this organize is FOR. ELK runs across an up-to-2s measure-wait,
 		// during which the user can toggle views or close the editor. The result is
@@ -2427,6 +2472,12 @@
 			else persistLayoutEdit(persistAll);
 			if (andFitView) setTimeout(() => doFitView(), 50);
 			return 'applied';
+		}, (e: unknown) => {
+			// ELK refused the graph. Nothing moved, and the user has to be
+			// told, because from the canvas a failed organize and a no-op
+			// look the same.
+			if (!destroyed) toast.error(`Auto organize failed: ${e instanceof Error ? e.message : String(e)}`, { duration: 8000 });
+			return 'failed';
 		});
 	}
 
@@ -2441,78 +2492,37 @@
 
 	// Fit view to graph on initial load
 	let hasFitView = $state(false);
-	// Hide canvas until initial ELK layout completes to avoid flash of ugly unorganized positions
+	// Hide canvas until the first layout is settled, to avoid a flash of
+	// unorganized positions. Set by the mount effect when every node already
+	// had a saved position, or by the unplaced-node organize otherwise.
 	let canvasReady = $state(false);
-	// The set of view verbs (@layout / @slayout) whose positions have already been
-	// established (saved on disk OR organized-on-first-show), so neither the mount
-	// effect nor the view-switch effect organizes the same view twice. Seeded by
-	// BOTH effects: whichever first handles a verb claims it, so they can't both
-	// fire runAutoOrganize for one view (the double-organize race: two concurrent
-	// recordEdits + racing `nodes=`). A plain Set (not $state) on purpose: it's a
-	// write-only ledger; making it reactive would re-run the effects on their own
-	// mutation. The wait-for-measured + ELK run lives solely in runAutoOrganize, so
-	// both effects just `await runAutoOrganize(true)` (no duplicated wait loop).
-	let organizedVerbs = new Set<LayoutVerb>();
+	// The mount only fits the view. Laying out a view that has no positions
+	// (a fresh file, a view shown for the first time, nodes that arrived from
+	// the source tab or an agent) is not a mount concern: buildNodes reports
+	// every visible node without a saved position and `organizeUnplaced`
+	// organizes the view, on mount and at any later time alike, so there is
+	// exactly one path that decides "this needs a layout".
 	$effect(() => {
-		if (!hasFitView && nodes.length > 0) {
+		if (hasFitView) return;
+		if (nodes.length === 0) {
+			// An empty project's mount is complete; the first node an agent
+			// writes arrives unplaced and organizes, the first node the user
+			// places by hand arrives with its entry and stays where it was put.
 			hasFitView = true;
-			// Auto-organize if the ACTIVE VIEW has no saved positions (the builder
-			// and simplified views keep separate position blocks; a project laid out
-			// in builder has none for simplified, so it must organize on first show).
-			const activeViewHasPositions = Object.keys(parseLayoutCode(layoutCode, layoutVerb)).length > 0;
-			// Claim this verb so the view-switch effect below doesn't ALSO organize it
-			// on this same mount (both would otherwise see empty positions and race).
-			const claimedVerb = layoutVerb;
-			organizedVerbs.add(claimedVerb);
-			if (!activeViewHasPositions || autoOrganizeOnMount) {
-				// No saved layout or explicitly requested: run ELK to compute positions.
-				// runAutoOrganize waits for measured sizes internally (see its body).
-				void (async () => {
-					// Un-claim ONLY on 'view-changed' (the user switched away mid-run): a
-					// toggle BACK then re-fires the view-switch effect, which re-claims and
-					// re-organizes. 'destroyed' needs no recovery (component is gone), so
-					// leave the claim.
-					if (await runAutoOrganize(true) === 'view-changed') organizedVerbs.delete(claimedVerb);
-					canvasReady = true;
-				})();
-			} else {
-				// Saved layout exists: just fit the view, don't reorganize
-				setTimeout(() => { doFitView(); canvasReady = true; }, 100);
-			}
-		} else if (!hasFitView && nodes.length === 0) {
-			// An EMPTY project's mount is complete: claim it fully, exactly like
-			// the populated branch. Leaving `hasFitView` unset would keep this
-			// effect armed, and with the host's organize-on-mount flag set (an
-			// empty project has no saved layout) it would fire the moment the
-			// user creates their first node, yanking it away from where they
-			// placed it. An automatic re-layout is only ever allowed on mount
-			// of an unpositioned view, a user resize, expand/collapse, or the
-			// explicit organize action; "first node created" is none of those.
-			hasFitView = true;
-			organizedVerbs.add(layoutVerb);
 			canvasReady = true;
+			return;
 		}
-	});
-
-	// Switching to a view whose position block is empty (first time the simplified
-	// view is shown for a project laid out only in builder, or vice versa)
-	// organizes it once, then fits. Guarded by `organizedVerbs` so it can't loop,
-	// double-fire with the mount effect, or fight a user who then drags things.
-	$effect(() => {
-		const verb = layoutVerb;
-		void layoutCode;
-		untrack(() => {
-			if (!hasFitView || organizedVerbs.has(verb)) return;
-			if (Object.keys(parseLayoutCode(layoutCode, verb)).length > 0) {
-				organizedVerbs.add(verb);
-				return;
-			}
-			if (nodes.length === 0) return;
-			organizedVerbs.add(verb);
-			// Un-claim ONLY on 'view-changed' (switched away mid-run): a toggle back
-			// re-fires this effect and re-organizes. 'destroyed' needs no recovery.
-			void runAutoOrganize(true).then((outcome) => { if (outcome === 'view-changed') organizedVerbs.delete(verb); });
-		});
+		hasFitView = true;
+		const entries = parseLayoutCode(layoutCode, layoutVerb);
+		const everyNodePlaced = nodes.every(n => n.style === 'display: none;' || entries[n.id]);
+		if (everyNodePlaced && !autoOrganizeOnMount) {
+			setTimeout(() => { doFitView(); canvasReady = true; }, 100);
+		} else if (everyNodePlaced && autoOrganizeOnMount) {
+			// The host asked for a layout on open (no layout file at all).
+			void runAutoOrganize(true).then(() => { canvasReady = true; });
+		}
+		// Otherwise buildNodes already queued the organize, which fits and
+		// reveals the canvas when it lands.
 	});
 
 	// Handle actions from command palette
@@ -3955,11 +3965,19 @@
 </div>
 
 <style>
-	/* Z-index order: groups (0) < edge paths (1) < normal nodes (2) < edge labels/anchors (3+) */
+	/* Z-index order: edge paths (1) < expanded groups (3) < normal nodes (4,
+	   set per node in computeSizing) < edge labels/anchors (5+).
+	   An expanded group sits ABOVE the wires, not below them, because its
+	   header carries the collapse button and the wires used to take every
+	   click on it in a crowded graph. Its body is see-through (a 6% tint) so
+	   the wires crossing it stay visible, and it lets pointer events through
+	   (see GroupNode's `.expanded-container`), so a wire behind the body is
+	   still the thing you click; only the header, the config strip, the
+	   ports and the resize handles catch the pointer. */
 	:global(.svelte-flow .svelte-flow__edges) {
 		z-index: 1 !important;
 	}
-	
+
 	:global(.svelte-flow .svelte-flow__node) {
 		z-index: 2;
 	}
@@ -3973,7 +3991,10 @@
 	}
 	
 	:global(.svelte-flow .svelte-flow__node-group) {
-		z-index: 0 !important;
+		z-index: 3 !important;
+		/* The wrapper is transparent to the pointer; GroupNode opts its
+		   interactive parts back in. Dragging a group is by its header. */
+		pointer-events: none !important;
 		background: transparent !important;
 		border: none !important;
 		box-shadow: none !important;

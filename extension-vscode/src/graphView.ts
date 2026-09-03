@@ -50,6 +50,8 @@ export class GraphViewController {
   /// Rebound whenever the panel follows a .weft file in a different
   /// project (its `nodes/` dir moves with it).
   private nodesWatcher: vscode.Disposable | undefined;
+  /// Watches the watched `.weft` file ITSELF on disk (see watchSelfFile).
+  private selfWatcher: vscode.Disposable | undefined;
   /// Watches the `@file`/`@include` targets the current view references, so
   /// editing a backing file externally re-parses the graph (file -> graph).
   /// Rebuilt after each parse from the response's fileRefs + include paths.
@@ -228,6 +230,8 @@ export class GraphViewController {
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Active);
       this.watchedDoc = doc;
+      this.watchNodesDir(doc);
+      this.watchSelfFile(doc);
       await this.triggerParse();
       return;
     }
@@ -320,6 +324,7 @@ export class GraphViewController {
           const newId = readProjectIdFromToml(ed.document.uri.fsPath);
           this.watchedProjectId = newId ?? undefined;
           this.watchNodesDir(ed.document);
+          this.watchSelfFile(ed.document);
           // Switching to a different graph is a fresh mount: rebuild from the
           // new project + its saved layout, not the in-place edit-reconcile
           // path (which would diff the new graph against the old one's
@@ -351,8 +356,47 @@ export class GraphViewController {
       vscode.window.tabGroups.onDidChangeTabs(() => this.pushSourceState()),
     );
     this.watchNodesDir(doc);
+    this.watchSelfFile(doc);
     // Initial state push.
     this.pushSourceState();
+  }
+
+  /// Watch the watched `.weft` file on disk. `onDidChangeTextDocument`
+  /// only reports edits to a TextDocument VS Code still holds; once the
+  /// source tab is closed, VS Code detaches that document at a moment
+  /// nothing here controls, and a detached document's text is frozen. An
+  /// agent writing `main.weft` while only the graph is open then changes
+  /// nothing the change event can see, and the graph shows the old program
+  /// until the source tab is opened by hand. This watcher is the other ear:
+  /// a write on disk re-latches a live document (liveDoc re-opens the file
+  /// when the held one is detached) and reparses through the same debounce
+  /// and the same "skip if the render is current" gate as a typed edit, so
+  /// the extension's own writes, which land on disk too, are not reparsed
+  /// twice: their text already matches the render by the time this fires.
+  ///
+  /// Rebound when the panel follows a .weft in a different project, like
+  /// the nodes-dir watcher.
+  private watchSelfFile(doc: vscode.TextDocument): void {
+    this.selfWatcher?.dispose();
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(nodePath.dirname(doc.uri.fsPath), nodePath.basename(doc.uri.fsPath)),
+    );
+    const onDiskChange = () => {
+      void (async () => {
+        if (!this.watchedDoc || this.watchedDoc.uri.fsPath !== doc.uri.fsPath) return;
+        await this.liveDoc(this.watchedDoc);
+        if (this.isRenderCurrent()) return;
+        // An external process wrote the file: the same auto-lock a text-tab
+        // edit engages, and never for our own writes (see selfWriteDepth).
+        if (this.selfWriteDepth === 0) this.post({ kind: 'codeEditTouched' });
+        this.scheduleParse('watched-text');
+      })();
+    };
+    this.selfWatcher = vscode.Disposable.from(
+      watcher,
+      watcher.onDidChange(onDiskChange),
+      watcher.onDidCreate(onDiskChange),
+    );
   }
 
   /// Watch the project's `nodes/` directory. Editing a node's
@@ -1870,6 +1914,8 @@ export class GraphViewController {
     if (this.catalogRefreshTimer) clearTimeout(this.catalogRefreshTimer);
     this.nodesWatcher?.dispose();
     this.nodesWatcher = undefined;
+    this.selfWatcher?.dispose();
+    this.selfWatcher = undefined;
     this.refWatcher?.dispose();
     this.refWatcher = undefined;
     this.stopAllLivePollers();

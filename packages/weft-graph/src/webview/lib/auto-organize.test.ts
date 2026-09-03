@@ -109,11 +109,14 @@ describe('moon parking picks the majority path', () => {
 			{ id: 's', source: 'side1', target: 'side2', sourceHandle: 'value', targetHandle: 'value' },
 		] as any;
 		const { positions } = await autoOrganize(nodes, edges);
-		// Boxed beside side1 (earliest consumer of the two-consumer path),
-		// down in the side band rather than up with the main flow.
+		// Boxed beside side1 (earliest consumer of the two-consumer path):
+		// directly to its left, and level with it, not up with the main flow.
+		// Which path sits above the other is ELK's call (fewest crossings);
+		// source order does not decide it.
 		expect(positions.get('access')!.x).toBeLessThan(positions.get('side1')!.x);
-		const mainBottom = Math.max(positions.get('main1')!.y, positions.get('main2')!.y);
-		expect(positions.get('access')!.y).toBeGreaterThan(mainBottom);
+		const side1 = positions.get('side1')!;
+		const access = positions.get('access')!;
+		expect(Math.abs(access.y - side1.y)).toBeLessThan(120);
 	});
 });
 
