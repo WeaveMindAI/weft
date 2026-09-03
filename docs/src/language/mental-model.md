@@ -219,6 +219,14 @@ Every other trigger in the subgraph is kicked with no payload, which closes its
 outputs, and [the skip cascade](#the-closed-pulse) prunes the branches that
 belong to it.
 
+The boundary is drawn a little differently from an aimed run's. A node the
+fired trigger cannot reach at all belongs to another program in the file, and a
+value that spills into it from a shared node (one database feeding two
+programs) is dropped with no row. A node the trigger can reach but no output
+depends on is yours, and it shows the "outside the part of the graph this
+execution runs" skip: that is how you find a side-effect node you forgot to
+mark as an output.
+
 Four things follow, and the third is why `isOutputDefault` is worth thinking
 about at all:
 

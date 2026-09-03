@@ -275,6 +275,152 @@
         assert_eq!(skip_reason(&events, "behind"), Some(SkipReason::OutsideThisRun));
     }
 
+    /// Two programs in one file sharing an upstream node, the shape a
+    /// trigger fire journals its subgraph for.
+    ///
+    ///   my_trigger ──► mine ──► leaf          (the fired program; `leaf`
+    ///   shared ───────┘                        feeds no output)
+    ///   shared ──► theirs ◄── their_trigger   (the other program)
+    ///
+    /// `shared` feeds both programs and emits down every wire it has,
+    /// so on a fire of `my_trigger` a pulse lands on `theirs` too. Three
+    /// things are pinned. The other program's node absorbs it SILENTLY:
+    /// no row, it is someone else's program. The fired program's own
+    /// dangling node (`leaf`, reachable from the trigger but wanted by
+    /// no output) journals ONE skip saying it is outside this run: that
+    /// row is the hint its author forgot to mark it as an output. And
+    /// without the boundary the same fire ends Stuck, `theirs` parked on
+    /// a partial input set, which is the failure every two-trigger
+    /// project used to hit on every fire.
+    fn two_programs_project() -> ProjectDefinition {
+        fn source(id: &str, trigger: bool) -> serde_json::Value {
+            json!({
+                "id": id, "nodeType": "Source", "label": null,
+                "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [],
+                "outputs": [
+                    { "name": "value", "portType": "String", "required": false },
+                    { "name": "allowed", "portType": "Boolean", "required": false }
+                ],
+                "features": { "isTrigger": trigger }, "scope": [], "groupBoundary": null,
+                "requiresInfra": false, "images": []
+            })
+        }
+        fn sink(id: &str, node_type: &str, inputs: &[&str]) -> serde_json::Value {
+            let mut ins: Vec<serde_json::Value> = inputs
+                .iter()
+                .map(|n| json!({ "name": n, "portType": "String", "required": true }))
+                .collect();
+            ins.push(json!({ "name": SHOULD_FLOW_PORT, "portType": "T", "required": false }));
+            json!({
+                "id": id, "nodeType": node_type, "label": null,
+                "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": ins,
+                "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                "features": {}, "scope": [], "groupBoundary": null,
+                "requiresInfra": false, "images": []
+            })
+        }
+        serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                source("my_trigger", true),
+                source("shared", false),
+                source("their_trigger", true),
+                sink("mine", "Echo", &["value", "extra"]),
+                sink("leaf", "Behind", &["value"]),
+                sink("theirs", "Behind", &["value", "go"])
+            ],
+            "edges": [
+                { "id": "e1", "source": "my_trigger", "target": "mine",
+                  "sourceHandle": "value", "targetHandle": "value" },
+                { "id": "e2", "source": "shared", "target": "mine",
+                  "sourceHandle": "value", "targetHandle": "extra" },
+                { "id": "e3", "source": "mine", "target": "leaf",
+                  "sourceHandle": "value", "targetHandle": "value" },
+                { "id": "e4", "source": "shared", "target": "theirs",
+                  "sourceHandle": "value", "targetHandle": "value" },
+                { "id": "e5", "source": "their_trigger", "target": "theirs",
+                  "sourceHandle": "value", "targetHandle": "go" }
+            ],
+            "groups": []
+        }))
+        .expect("two-programs project")
+    }
+
+    fn touched(events: &[ExecEvent], node: &str) -> bool {
+        events.iter().any(|e| match e {
+            ExecEvent::NodeStarted { node_id, .. }
+            | ExecEvent::NodeSkipped { node_id, .. }
+            | ExecEvent::NodeCompleted { node_id, .. } => node_id == node,
+            _ => false,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_fire_keeps_a_shared_node_out_of_the_other_program() {
+        use super::engine_test_rig::{drive_fire, drive_scoped};
+        use weft_core::cancellation::CancellationFlag;
+
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let (outcome, events) = drive_fire(
+            two_programs_project(),
+            branch_catalog(json!(true), &ran),
+            "my_trigger",
+            &["my_trigger", "shared"],
+            Some(&["my_trigger", "shared", "mine"]),
+        )
+        .await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert_eq!(ran.lock().unwrap().as_slice(), &["guarded"], "only the fired program's node runs");
+        // The other program: nothing, not even a skip row.
+        assert!(!touched(&events, "theirs"), "another program's node must leave no trace: {events:?}");
+        // The fired program's own dangling node: one skip that says why.
+        assert_eq!(skip_reason(&events, "leaf"), Some(SkipReason::OutsideThisRun));
+
+        // The same fire with no boundary: the shared pulse parks on
+        // `theirs`, whose other input never comes, and the run is Stuck.
+        // Pinned so "trigger fires run the whole graph" cannot come back
+        // looking harmless.
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let (outcome, _) = drive_scoped(
+            two_programs_project(),
+            branch_catalog(json!(true), &ran),
+            &["my_trigger", "shared"],
+            None,
+            CancellationFlag::new_arc(),
+        )
+        .await;
+        assert!(matches!(outcome, ExecutionOutcome::Stuck), "{outcome:?}");
+    }
+
+    /// A color whose journal already holds a terminal when the worker
+    /// boots (cancelled in the dispatcher's route window, or a late
+    /// second execute task for a color that already ran) is not driven:
+    /// no body runs, and nothing is journaled on top of the terminal.
+    #[tokio::test]
+    async fn a_color_with_a_terminal_is_not_driven_again() {
+        use super::engine_test_rig::drive_settled;
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let (outcome, events) =
+            drive_settled(guarded_project(), branch_catalog(json!(true), &ran), &["source"]).await;
+        assert!(matches!(outcome, ExecutionOutcome::AlreadySettled), "{outcome:?}");
+        assert!(ran.lock().unwrap().is_empty(), "no body may run: {:?}", ran.lock().unwrap());
+        let terminals = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ExecEvent::ExecutionCompleted { .. }
+                        | ExecEvent::ExecutionFailed { .. }
+                        | ExecEvent::ExecutionCancelled { .. }
+                )
+            })
+            .count();
+        assert_eq!(terminals, 1, "the pre-existing terminal stays the only one: {events:?}");
+        assert!(!touched(&events, "source") && !touched(&events, "guarded"));
+    }
+
     /// An out-of-scope node fed by only SOME of its parents (its other
     /// parent is an unkicked entry node outside the subgraph) still
     /// skips immediately instead of parking its pulse forever waiting

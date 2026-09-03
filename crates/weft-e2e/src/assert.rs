@@ -272,8 +272,11 @@ impl SettledRun {
         Ok(self)
     }
 
-    /// Assert the replay holds NO events at all for `node`: it was never
-    /// kicked, started, skipped, or closed. The shape of a node BEYOND
+    /// Assert the replay holds NO lifecycle events at all for `node`: it
+    /// was never started, skipped, or closed. (A kick is not in the
+    /// replay: `NodeKicked` is not projected into dispatcher events, so
+    /// the kick set is pinned at the unit level, in the dispatcher's
+    /// `trigger_kick_tests`.) The shape of a node BEYOND
     /// an aimed run's boundary: nothing manufactures pulses past the
     /// first out-of-scope node, so deeper nodes stay blank rather than
     /// painting the whole graph "skipped".

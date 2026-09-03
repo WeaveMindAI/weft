@@ -43,7 +43,7 @@ use weft_core::generator::{StreamEnd, DEFAULT_MAX_BUFFERED_ITEMS};
 use weft_core::liveness::FiringLocation;
 use weft_core::node::NodeOutput;
 use weft_core::primitive::ExecutionSnapshot;
-use weft_core::project::EdgeIndex;
+use weft_core::project::{downstream_closure, upstream_closure, EdgeIndex};
 use weft_core::pulse::{PulseStatus, PulseTable};
 use weft_core::cancellation::CancellationFlag;
 use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
@@ -98,6 +98,13 @@ pub enum ExecutionOutcome {
     /// Scheduler ran to quiescence but pulses remain pending and
     /// nothing is waiting. Treat as a graph-shape bug.
     Stuck,
+    /// The journal already held a terminal event when the worker
+    /// booted: the color was cancelled, or ran to its end, before this
+    /// task was claimed (a dispatcher re-run enqueued a second execute
+    /// for it, or a cancel landed in the route window). Nothing was
+    /// driven and nothing is journaled; running the bodies again would
+    /// repeat their side effects.
+    AlreadySettled,
 }
 
 /// Run one execution to a terminal state or a stall. Each call folds
@@ -191,6 +198,22 @@ pub async fn run_one_execution(
              arrived within 6s; the dispatcher contract is broken"
         );
     }
+    // A terminal already in the journal means this color is finished:
+    // cancelled during the dispatcher's route window, or run to its end
+    // by an earlier task. Refuse to drive it. This is the worker-side
+    // half of the guard the dispatcher applies before it enqueues: the
+    // enqueue can race a cancel, and an execute task's dedup key frees
+    // once the first task completes, so a late re-run can enqueue a
+    // second execute for a color that already ran. Driving it would
+    // repeat every node body's side effects.
+    if events.iter().any(weft_journal::ExecEvent::is_execution_terminal) {
+        tracing::info!(
+            target: "weft_engine::execution_driver",
+            color = %color,
+            "journal already holds a terminal for this color; not driving it"
+        );
+        return Ok(ExecutionOutcome::AlreadySettled);
+    }
     // Phase derives from the ExecutionStarted event we now have. No
     // unwrap_or fallback: if events is non-empty but contains no
     // ExecutionStarted, the journal is malformed and we fail loud.
@@ -206,8 +229,9 @@ pub async fn run_one_execution(
             "color {color} has journal events but no ExecutionStarted; \
              journal is malformed"
         ))?;
-    // A manual run journaled the subgraph it set out to execute;
-    // resumes rebuild the same boundary from the same row.
+    // The subgraph the run set out to execute (a trigger fire, or a
+    // manual run aimed at targets); resumes rebuild the same boundary
+    // from the same row.
     let run_subgraph: Option<std::collections::HashSet<String>> =
         run_subgraph.map(|v| v.into_iter().collect());
     let snap = weft_journal::fold_to_snapshot(color, &events);
@@ -215,6 +239,8 @@ pub async fn run_one_execution(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let doomed =
         apply_snapshot(project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences);
+    let other_programs =
+        nodes_of_other_programs(project, &edge_idx, phase, run_subgraph.as_ref(), &kicked);
     fail_unresumable_stream_consumers(
         doomed, color, project, &edge_idx, &mut pulses, &mut executions,
         journal.as_ref(), &pod_name,
@@ -301,6 +327,7 @@ pub async fn run_one_execution(
             &mut loop_runtime,
             phase,
             run_subgraph.as_ref(),
+            &other_programs,
             event_count_before,
         )
         .await?;
@@ -431,6 +458,10 @@ pub async fn run_one_execution(
             // linger (so the user can still download a run's output), then
             // the broker's expiry sweep deletes them. A worker-side eager
             // delete would defeat that linger.
+        }
+        ExecutionOutcome::AlreadySettled => {
+            // Returned before the drive loop; unreachable here, and there
+            // is nothing to journal for it anyway.
         }
         ExecutionOutcome::Stalled => {
             // Worker exits cleanly without writing a terminal event.
@@ -836,9 +867,13 @@ async fn drive(
     mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     phase: weft_core::context::Phase,
-    // A manual run's journaled subgraph: in Phase::Fire, only these
-    // nodes dispatch and everything else skips. None = whole graph.
+    // The journaled subgraph (a trigger fire, or a manual run aimed at
+    // targets): in Phase::Fire, only these nodes dispatch and everything
+    // else skips. None = whole graph.
     run_subgraph: Option<&std::collections::HashSet<String>>,
+    // On a trigger fire, the other programs' nodes: a pulse landing on
+    // one is absorbed with no journal row (see `nodes_of_other_programs`).
+    other_programs: &std::collections::HashSet<String>,
     // Number of journal events the caller already folded into the
     // snapshot it handed us. The bus-held resume poll compares against
     // this to detect newly-landed rows without a redundant re-fetch.
@@ -893,9 +928,10 @@ async fn drive(
     // the dispatch loop decides whether the skip is journaled or
     // silent).
     //
-    // Phase::Fire is bounded for every manual run (the dispatcher
-    // journaled the computed subgraph); a trigger-fired execution
-    // carries none and reaches everything via pulses.
+    // Phase::Fire is bounded when the dispatcher journaled a subgraph:
+    // every trigger fire, and a manual run aimed at targets. An
+    // untargeted manual run carries none and reaches everything via
+    // pulses.
     let dispatchable: Option<std::collections::HashSet<String>> =
         match phase {
             weft_core::context::Phase::TriggerSetup => {
@@ -1212,7 +1248,7 @@ async fn drive(
             };
             // Scope is decided inside `find_ready_nodes` (an
             // out-of-scope node arrives here already carrying its skip
-            // reason and forms a group on ANY pulse). Two cases absorb
+            // reason and forms a group on ANY pulse). Three cases absorb
             // SILENTLY, journaling nothing:
             //  - a location already terminally skipped: scope is a
             //    per-run constant, so once skipped, a later pulse batch
@@ -1220,8 +1256,11 @@ async fn drive(
             //    second lifecycle pair;
             //  - a setup phase: its scope is engine plumbing the user
             //    never chose, so an activation must not paint the
-            //    business graph "skipped".
-            // Both settle any delivery gate through the same
+            //    business graph "skipped";
+            //  - another program's node on a trigger fire (see
+            //    `nodes_of_other_programs`): not this run's edge, so
+            //    not this run's business to paint.
+            // All three settle any delivery gate through the same
             // skip-absorb path a journaled skip uses.
             if matches!(
                 group.skip,
@@ -1235,7 +1274,7 @@ async fn drive(
                     })
                 });
                 let setup_phase = !matches!(phase, weft_core::context::Phase::Fire);
-                if already_skipped || setup_phase {
+                if already_skipped || setup_phase || other_programs.contains(&node_id) {
                     if let Some(bucket) = pulses.get_mut(&node_id) {
                         for p in bucket.iter_mut() {
                             if group.pulse_ids.contains(&p.id)
@@ -5161,7 +5200,7 @@ fn compute_trigger_setup_scope(
         .filter(|n| n.features.is_trigger)
         .map(|n| n.id.clone())
         .collect();
-    upstream_closure(project, edge_idx, triggers)
+    upstream_closure(project, edge_idx, &triggers)
 }
 
 /// Compute the node-id set that a `Phase::InfraSetup` run should
@@ -5179,29 +5218,61 @@ fn compute_infra_setup_scope(
         .filter(|n| n.requires_infra)
         .map(|n| n.id.clone())
         .collect();
-    upstream_closure(project, edge_idx, infra)
+    upstream_closure(project, edge_idx, &infra)
 }
 
-fn upstream_closure(
+/// On a trigger fire, the nodes that belong to OTHER programs in the
+/// file: outside the fire's subgraph AND not reachable from the fired
+/// trigger by following wires forward. Empty for anything that has no
+/// fired trigger: a setup phase, and a manual run whether aimed or not
+/// (no kick of a manual run carries `firing`).
+///
+/// A file can hold several programs (one per trigger) sharing upstream
+/// nodes, and a shared node emits down every wire it has, so on every
+/// fire one pulse lands on the first node of each other program. Those
+/// nodes are not this program's edge, they are someone else's program,
+/// and a skip row for each of them on every fire is noise about work
+/// that was never going to happen. So the engine absorbs their pulses
+/// silently, like a setup phase's scope. A node the fired trigger CAN
+/// reach but no output depends on (a side-effect node whose author
+/// forgot `_is_output`) is not in this set and keeps its row: that skip
+/// is the one hint that the node is dangling.
+///
+/// The safety property this rests on: the journaled subgraph is
+/// upstream-closed except at triggers (`RunSubgraph::aimed` in the
+/// dispatcher), and every trigger in it is kicked, so no in-scope node
+/// ever waits on a node in this set. A silent absorb and a journaled
+/// `OutsideThisRun` both emit no closures, so if that property ever
+/// broke, an in-scope consumer would park and the run would end Stuck
+/// with no row naming the cause. Keep the walk here the same walk the
+/// dispatcher uses to pick the fire's targets: both read
+/// `weft_core::project::downstream_closure`.
+///
+/// Every input is a per-execution constant: `NodeKicked` rows are
+/// written only at the execution's birth and `firing` survives the fold,
+/// so every refold reproduces the same `kicked` map. Computed once per
+/// worker boot, not per drive.
+fn nodes_of_other_programs(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
-    seeds: Vec<String>,
+    phase: weft_core::context::Phase,
+    run_subgraph: Option<&std::collections::HashSet<String>>,
+    kicked: &HashMap<String, weft_core::primitive::KickedNode>,
 ) -> std::collections::HashSet<String> {
-    let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut frontier: Vec<String> = seeds;
-    while let Some(id) = frontier.pop() {
-        if !scope.insert(id.clone()) {
-            continue;
-        }
-        for edge in edge_idx.get_incoming(project, &id) {
-            if !scope.contains(&edge.source) {
-                frontier.push(edge.source.clone());
-            }
-        }
-    }
-    scope
+    let (weft_core::context::Phase::Fire, Some(scope)) = (phase, run_subgraph) else {
+        return Default::default();
+    };
+    let Some(fired) = kicked.iter().find(|(_, k)| k.firing).map(|(id, _)| id.as_str()) else {
+        return Default::default();
+    };
+    let mine = downstream_closure(project, edge_idx, fired);
+    project
+        .nodes
+        .iter()
+        .filter(|n| !scope.contains(&n.id) && !mine.contains(&n.id))
+        .map(|n| n.id.clone())
+        .collect()
 }
-
 
 async fn fetch_events(
     journal: &dyn JournalClient,
@@ -5308,6 +5379,9 @@ async fn journal_terminal(
     }
     let at_unix = now_unix();
     let event = match outcome {
+        // Returned before anything ran; there is no terminal of ours to
+        // write, the journal already holds one.
+        ExecutionOutcome::AlreadySettled => return,
         ExecutionOutcome::Completed { outputs } => weft_journal::ExecEvent::ExecutionCompleted {
             color,
             outputs: outputs.clone(),

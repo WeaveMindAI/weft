@@ -277,13 +277,7 @@ impl Journal for MockJournal {
         let color_str = color.to_string();
         g.tasks.retain(|t| t.color.as_deref() != Some(color_str.as_str()));
         let has_terminal = g.events.iter().any(|e| {
-            e.color() == color
-                && matches!(
-                    e,
-                    ExecEvent::ExecutionCompleted { .. }
-                        | ExecEvent::ExecutionFailed { .. }
-                        | ExecEvent::ExecutionCancelled { .. }
-                )
+            e.color() == color && e.is_execution_terminal()
         });
         if !has_terminal {
             g.events.push(ExecEvent::ExecutionCancelled {
@@ -467,13 +461,7 @@ impl Journal for MockJournal {
                 continue;
             }
             let terminal = g.events.iter().any(|e2| {
-                e2.color() == *color
-                    && matches!(
-                        e2,
-                        ExecEvent::ExecutionCompleted { .. }
-                            | ExecEvent::ExecutionFailed { .. }
-                            | ExecEvent::ExecutionCancelled { .. }
-                    )
+                e2.color() == *color && e2.is_execution_terminal()
             });
             if !terminal {
                 out.push(*color);
@@ -493,13 +481,7 @@ impl Journal for MockJournal {
                 continue;
             }
             let terminal = g.events.iter().any(|e2| {
-                e2.color() == *color
-                    && matches!(
-                        e2,
-                        ExecEvent::ExecutionCompleted { .. }
-                            | ExecEvent::ExecutionFailed { .. }
-                            | ExecEvent::ExecutionCancelled { .. }
-                    )
+                e2.color() == *color && e2.is_execution_terminal()
             });
             if terminal {
                 out.insert(*color);

@@ -83,12 +83,16 @@ fn short(v: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// Whether an SSE event ends the followed execution. A cancel is a
+/// terminal too: without it `weft run` / `weft follow` sat on the stream
+/// after a cancel until the connection itself dropped.
+// SYNC: is_terminal (SSE kind list) <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal
 fn is_terminal(raw: &str) -> bool {
     let Ok(value): Result<serde_json::Value, _> = serde_json::from_str(raw) else {
         return false;
     };
     matches!(
         value.get("kind").and_then(|v| v.as_str()),
-        Some("execution_completed") | Some("execution_failed")
+        Some("execution_completed") | Some("execution_failed") | Some("execution_cancelled")
     )
 }

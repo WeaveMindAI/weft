@@ -240,9 +240,7 @@ async fn process_one_row(
     // first pod observing the terminal row removes the signal
     // entries; sibling pods see an empty result and skip.
     match &event {
-        ExecEvent::ExecutionCompleted { .. }
-        | ExecEvent::ExecutionFailed { .. }
-        | ExecEvent::ExecutionCancelled { .. } => {
+        e if e.is_execution_terminal() => {
             terminal_cleanup(state, color).await?;
             // Storage terminate sweep: queue the un-kept exec-file
             // sweep DURABLY (workers stall-then-die, so worker-side

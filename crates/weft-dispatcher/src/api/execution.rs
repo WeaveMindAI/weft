@@ -245,6 +245,7 @@ pub(crate) async fn terminal_outcome(
     pool: &sqlx::PgPool,
     color: Color,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
+    // SYNC: terminal_outcome (SQL kind list) <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal, crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list)
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT kind FROM exec_event \
          WHERE color = $1 \

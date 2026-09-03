@@ -13,7 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::project::EdgeIndex;
+use weft_core::project::{downstream_closure, upstream_closure, upstream_closure_stop_at, EdgeIndex};
 use weft_core::ProjectDefinition;
 
 use crate::authenticator::{authorize_project, CallerTenant};
@@ -645,12 +645,15 @@ pub async fn run(
         // Only an AIMED run (non-empty targets) journals a boundary:
         // the user narrowed the graph, so the engine holds the run
         // (resumes included) to that set and skips everything outside
-        // it as OutsideThisRun. An untargeted run journals None and
-        // behaves like a trigger fire: its kicks come from the output
-        // closure's roots, and pulses then run whatever they reach,
-        // downstream fan-out included (a side-effect leaf that feeds
-        // no output still runs). The subgraph would be WRONG for it:
-        // an upstream closure excludes exactly that fan-out.
+        // it as OutsideThisRun. An untargeted run journals None: the
+        // user asked for the whole project, its kicks come from the
+        // output closure's roots, and pulses then run whatever they
+        // reach, downstream fan-out included (a side-effect leaf that
+        // feeds no output still runs). The subgraph would be WRONG for
+        // it: an upstream closure excludes exactly that fan-out. A
+        // trigger fire is different again: it always journals its
+        // subgraph, because the file may hold other programs sharing
+        // its upstream nodes (see `TriggerFire`).
         bound,
     )
     .await?;
@@ -929,6 +932,34 @@ async fn start_queued_execution(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execute task spec: {e}")))?;
+    let (start, kick_events) =
+        execution_birth_events(color, project_id, phase, entry_node, kicks, definition_hash, subgraph, now);
+    state
+        .journal
+        .start_execution(&start, &kick_events, task)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start execution: {e}")))?;
+    Ok(())
+}
+
+/// The two event shapes that give an execution its identity: the one
+/// `ExecutionStarted` and one `NodeKicked` per root. Every start path
+/// (manual run, setup phases, entry-trigger fire, live-trigger fire)
+/// builds them here, so a field added to either event has one home and
+/// the journaled subgraph is always written the same way (sorted, so the
+/// row is deterministic). The COMMIT differs per path (one transaction
+/// here, dedup-keyed writes in route_entry, an admission transaction for
+/// a live fire); the events do not.
+pub(crate) fn execution_birth_events(
+    color: weft_core::Color,
+    project_id: &str,
+    phase: weft_core::context::Phase,
+    entry_node: &str,
+    kicks: &[Kick],
+    definition_hash: &str,
+    subgraph: Option<&HashSet<String>>,
+    at_unix: u64,
+) -> (weft_journal::ExecEvent, Vec<weft_journal::ExecEvent>) {
     let start = weft_journal::ExecEvent::ExecutionStarted {
         color,
         project_id: project_id.to_string(),
@@ -937,14 +968,13 @@ async fn start_queued_execution(
         definition_hash: Some(definition_hash.to_string()),
         node_test: false,
         subgraph: subgraph.map(|s| {
-            // Sorted so the journaled row is deterministic.
             let mut v: Vec<String> = s.iter().cloned().collect();
             v.sort();
             v
         }),
-        at_unix: now,
+        at_unix,
     };
-    let kick_events: Vec<weft_journal::ExecEvent> = kicks
+    let kick_events = kicks
         .iter()
         .map(|kick| weft_journal::ExecEvent::NodeKicked {
             color,
@@ -952,15 +982,10 @@ async fn start_queued_execution(
             firing: kick.firing,
             payload: kick.payload.clone(),
             port_snapshot: kick.port_snapshot.clone(),
-            at_unix: now,
+            at_unix,
         })
         .collect();
-    state
-        .journal
-        .start_execution(&start, &kick_events, task)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start execution: {e}")))?;
-    Ok(())
+    (start, kick_events)
 }
 
 /// The `requires_infra` nodes whose infra is NOT currently Running. Empty means
@@ -1134,6 +1159,32 @@ pub async fn await_infra_setup(
     }
 }
 
+/// What one trigger fire runs: the roots to kick and the node set they
+/// were computed from. The set is journaled on `ExecutionStarted` as the
+/// execution's subgraph, so the engine holds the run to it and skips
+/// everything outside as `OutsideThisRun`. Both come out of one
+/// `RunSubgraph`, so "what runs" and "what gets kicked" cannot disagree.
+///
+/// Why the boundary matters for a fire: emission is scope-blind, so a
+/// node shared by two programs in one file (a database, a provider)
+/// pushes a pulse into the OTHER program's consumers too. Unbounded,
+/// those consumers hold a partial input set forever and the run ends
+/// Stuck after all its real work completed. Bounded, they skip.
+///
+/// The cost, and it is deliberate: the set is an UPSTREAM closure of
+/// the outputs, so a node the trigger reaches that no output depends on
+/// (a side-effect node whose author forgot `_is_output`) is outside it
+/// and does not run. Before the boundary it ran by accident of pulse
+/// flow. It now journals one `OutsideThisRun` skip, which is the hint
+/// the author needs; the engine keeps that row precisely for this case
+/// (see `nodes_of_other_programs` in the engine for the other case, the
+/// silent one). An untargeted manual run keeps the old behaviour, see
+/// the comment in `run`.
+pub struct TriggerFire {
+    pub kicks: Vec<Kick>,
+    pub subgraph: HashSet<String>,
+}
+
 /// Kicks for a trigger fire.
 ///
 /// Rule: from the FIRING trigger, walk downstream to find the output
@@ -1157,19 +1208,19 @@ pub async fn await_infra_setup(
 /// (a sibling branch fed by another trigger or by static sources
 /// alone) is someone else's work; this fire must not re-run it.
 ///
-/// Returns an empty vec if the fired trigger reaches no output; the
-/// caller treats that as "nothing to run."
-pub fn compute_trigger_kicks(
+/// Returns `None` if the fired trigger reaches no output; the caller
+/// treats that as "nothing to run."
+pub fn compute_trigger_fire(
     project: &ProjectDefinition,
     firing_node_id: &str,
     payload: &Value,
     port_snapshot: Option<&Value>,
-) -> Vec<Kick> {
+) -> Option<TriggerFire> {
     // All trigger nodes register signals during TriggerSetup; that set
     // is what fires route to.
     let (edge_idx, triggers) = RunSubgraph::graph_base(project);
     if !triggers.contains(firing_node_id) {
-        return Vec::new();
+        return None;
     }
 
     // Targets = the output nodes the FIRED trigger reaches downstream.
@@ -1181,7 +1232,7 @@ pub fn compute_trigger_kicks(
         .map(|n| n.id.clone())
         .collect();
     if targets.is_empty() {
-        return Vec::new();
+        return None;
     }
 
     // Upstream closure from those outputs, stopping at triggers
@@ -1189,69 +1240,9 @@ pub fn compute_trigger_kicks(
     // edges). The fired trigger is in this set by construction: every
     // target was picked from its downstream closure. Only the firing
     // trigger's kick carries the wake payload and the snapshot.
-    RunSubgraph::aimed(project, edge_idx, triggers, &targets)
-        .root_kicks(project, payload, Some((firing_node_id, port_snapshot)))
-}
-
-/// BFS downstream from `start` through outgoing edges, returning
-/// every reachable node id (including `start`).
-fn downstream_closure(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    start: &str,
-) -> HashSet<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut frontier: Vec<String> = vec![start.to_string()];
-    while let Some(node_id) = frontier.pop() {
-        if !seen.insert(node_id.clone()) {
-            continue;
-        }
-        for edge in edge_idx.get_outgoing(project, &node_id) {
-            if !seen.contains(&edge.target) {
-                frontier.push(edge.target.clone());
-            }
-        }
-    }
-    seen
-}
-
-/// BFS upstream from `targets` through incoming edges, returning
-/// every reachable node id.
-fn upstream_closure(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    targets: &[String],
-) -> HashSet<String> {
-    upstream_closure_stop_at(project, edge_idx, targets, &HashSet::new())
-}
-
-/// BFS upstream from `targets`, but do not walk through any node in
-/// `stop_at`. Stopped nodes are still included in the returned set
-/// (so they can be kicked as roots), but their incoming edges are
-/// not followed. Used by the fire-time subgraph so triggers act as
-/// terminators.
-fn upstream_closure_stop_at(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    targets: &[String],
-    stop_at: &HashSet<String>,
-) -> HashSet<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut frontier: Vec<String> = targets.to_vec();
-    while let Some(node_id) = frontier.pop() {
-        if !seen.insert(node_id.clone()) {
-            continue;
-        }
-        if stop_at.contains(&node_id) {
-            continue;
-        }
-        for edge in edge_idx.get_incoming(project, &node_id) {
-            if !seen.contains(&edge.source) {
-                frontier.push(edge.source.clone());
-            }
-        }
-    }
-    seen
+    let subgraph = RunSubgraph::aimed(project, edge_idx, triggers, &targets);
+    let kicks = subgraph.root_kicks(project, payload, Some((firing_node_id, port_snapshot)));
+    Some(TriggerFire { kicks, subgraph: subgraph.nodes })
 }
 
 /// Nodes of `in_subgraph` whose incoming edges all come from
@@ -2618,9 +2609,10 @@ pub async fn activate_inner(
 ///   3. Release the row claim FENCED on our nonce (so we never clear a
 ///      sibling's claim that took over), regardless of outcome.
 ///
-/// A pod crash between steps 1 and 3 leaves the claim set; the next
-/// activate's pre-pass releases stale claims older than the threshold
-/// so the row becomes drainable again.
+/// A pod crash between steps 1 and 3 leaves the claim set;
+/// [`release_stale_drain_claims`] (run by this pass's pre-step and by
+/// the reaper's parked-fire sweep) releases claims older than the
+/// threshold so the row becomes drainable again.
 async fn drain_parked_fires(
     state: &DispatcherState,
     project_id: &str,
@@ -2628,9 +2620,11 @@ async fn drain_parked_fires(
     use sqlx::Row;
 
     // Pre-pass: release stale claims. A crashed pod could have left
-    // drain_claimed_at set; older than DRAIN_CLAIM_STALE_SECS means
-    // any owner is definitely dead.
-    const DRAIN_CLAIM_STALE_SECS: i64 = 300;
+    // drain_claimed_at set; the shared release clears any claim older
+    // than the threshold (globally: a claim that old is dead whichever
+    // pass notices it) so this pass can claim the rows itself.
+    release_stale_drain_claims(&state.pg_pool).await?;
+
     // Bound on the snapshot-loop below. A fire whose
     // `lookup_signal_routing` saw status=Activating just before the
     // CAS to Active commits will append to parked_fires AFTER our
@@ -2640,18 +2634,6 @@ async fn drain_parked_fires(
     // we can dispatch) cannot livelock the activate handler; an
     // operator-visible failure beats an infinite loop.
     const MAX_DRAIN_PASSES: u32 = 3;
-    let now = crate::lease::now_unix();
-    sqlx::query(
-        "UPDATE signal SET drain_claimed_at_unix = NULL \
-         WHERE project_id = $1 \
-           AND drain_claimed_at_unix IS NOT NULL \
-           AND drain_claimed_at_unix < $2",
-    )
-    .bind(project_id)
-    .bind(now - DRAIN_CLAIM_STALE_SECS)
-    .execute(&state.pg_pool)
-    .await?;
-
     for pass in 0..MAX_DRAIN_PASSES {
         let rows = sqlx::query(
             "SELECT token FROM signal \
@@ -2694,6 +2676,89 @@ async fn drain_parked_fires(
              leftover fires will drain on next activate"
         );
     }
+    Ok(())
+}
+
+/// The reaper's half of the parked-fire retry: every unclaimed signal row
+/// of an Active project whose queue head is due gets one drain pass. A
+/// fire that failed to route re-parked itself with a backoff stamp
+/// (`ParkedFire::not_before_unix`); nothing else drains an Active
+/// project's queue (activate drains once, at activation), so without this
+/// sweep a re-parked fire would wait for the next activate, which may
+/// never come. Idempotent across pods: `drain_one_token` claims the row.
+pub(crate) async fn drain_due_parked_fires(state: &DispatcherState) -> anyhow::Result<()> {
+    // Stale drain claims first: a pod that died mid-drain leaves its
+    // claim set, and this sweep is the only thing that re-drives an
+    // Active project's queue, so a stale claim would starve that
+    // token's retries until the next activate. The same release the
+    // activate pre-pass runs; a mistaken release is safe because every
+    // pop and re-stamp is fenced on the claim nonce.
+    release_stale_drain_claims(&state.pg_pool).await?;
+    for (token, project_id) in due_parked_tokens(&state.pg_pool, crate::lease::now_unix()).await? {
+        if let Err(e) = drain_one_token(state, &project_id, &token).await {
+            // One token's dispatch failure must not stop the others;
+            // the failed head was re-stamped with a longer backoff by
+            // the drain itself, so this token comes back when due.
+            tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                project_id = %project_id,
+                token = %token,
+                error = %e,
+                "parked-fire sweep: dispatch failed; the head's backoff was lengthened"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The sweep's selection: every signal row of an ACTIVE project whose
+/// queue holds at least one element, is unclaimed, and whose HEAD is due
+/// (`not_before_unix` in the past; an element from before the field
+/// existed reads as due now). Pool-level on purpose so the db-tests can
+/// pin the predicate against the real statement. Head-only on purpose:
+/// the queue is FIFO, so a backing-off head blocks its token's tail (a
+/// later fire overtaking it would reorder one trigger's events) and the
+/// sweep simply comes back for the token once the head is due.
+pub async fn due_parked_tokens(
+    pool: &sqlx::PgPool,
+    now: i64,
+) -> anyhow::Result<Vec<(String, String)>> {
+    Ok(sqlx::query_as::<_, (String, String)>(
+        "SELECT s.token, s.project_id FROM signal s \
+         JOIN project p ON p.id::text = s.project_id \
+         WHERE p.status = 'active' \
+           AND jsonb_array_length(s.parked_fires) > 0 \
+           AND s.drain_claimed_at_unix IS NULL \
+           AND COALESCE((s.parked_fires -> 0 ->> 'not_before_unix')::bigint, 0) <= $1",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// How old a drain claim must be before any owner is considered dead.
+/// A claim is held for one pop-dispatch pass, so five minutes is far
+/// beyond any live drain; a takeover younger than this would race a
+/// healthy drain for nothing (the fence keeps it safe, not pointless).
+const DRAIN_CLAIM_STALE_SECS: i64 = 300;
+
+/// Release every drain claim older than [`DRAIN_CLAIM_STALE_SECS`],
+/// clearing both claim columns. Run by the activate pre-pass (so an
+/// activation's own drain can claim rows a crashed pod left held) and
+/// by the reaper's parked-fire sweep (so a stale claim cannot starve an
+/// Active project's retries). Global on purpose: a claim that old is
+/// dead whichever pass notices it, and the fenced pops make a mistaken
+/// release safe (the old owner aborts on its next fenced write, the new
+/// owner re-drives, and dispatched elements dedup at the task table).
+pub async fn release_stale_drain_claims(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE signal SET drain_claimed_at_unix = NULL, drain_claimed_by = NULL \
+         WHERE drain_claimed_at_unix IS NOT NULL \
+           AND drain_claimed_at_unix < $1",
+    )
+    .bind(crate::lease::now_unix() - DRAIN_CLAIM_STALE_SECS)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2771,9 +2836,26 @@ pub(crate) async fn drain_one_token(
             serde_json::from_value(head).map_err(|e| {
                 anyhow::anyhow!("malformed parked_fires element for token {token}: {e}")
             })?;
-        // Keep the id: the dispatch moves `fire.payload`, and we need the
-        // id afterward to remove this exact element by id.
+        // A re-parked fire in its backoff window blocks its token's
+        // queue: the queue is FIFO, and letting a later fire overtake it
+        // would reorder one trigger's events. The reaper's parked-fire
+        // sweep re-drives this token once the head is due.
+        let now = crate::lease::now_unix();
+        if fire.not_before_unix > now {
+            tracing::debug!(
+                target: "weft_dispatcher::activate",
+                project_id, token, fire_id = %fire.id, attempts = fire.attempts,
+                due_in_secs = fire.not_before_unix - now,
+                "head of the parked queue is backing off; leaving the token for the sweep"
+            );
+            break Ok(());
+        }
+        // Keep the id and the attempt count: the dispatch moves
+        // `fire.payload`, and both are needed afterward (the id to
+        // remove or re-stamp this exact element by id, the count to
+        // lengthen the backoff when the dispatch failed).
         let fire_id = fire.id.clone();
+        let attempts_before = fire.attempts;
 
         match crate::api::signal::dispatch_listener_outcome(
             state,
@@ -2781,7 +2863,7 @@ pub(crate) async fn drain_one_token(
             project_id,
             &tenant,
             fire.payload,
-            Some(&fire.id),
+            Some(crate::api::signal::ParkedRef { id: &fire_id, attempts: attempts_before }),
         )
         .await
         {
@@ -2808,13 +2890,41 @@ pub(crate) async fn drain_one_token(
                 }
             }
             Err((status, msg)) => {
-                // Leave the unsent remainder in place (FIFO order
-                // preserved) and break. Next activate retries.
+                // The dispatch failed without popping the element, so
+                // the fire is still the queue's head. Re-stamp it IN
+                // PLACE with a longer backoff (a pop-and-re-append would
+                // send it to the back of the queue, reordering one
+                // trigger's events), and leave the remainder behind it.
+                // The retry is whoever drains next: this activate's next
+                // pass re-selects the token but stops at the future
+                // stamp, and the reaper's parked-fire sweep comes back
+                // once the head is due. Without the re-stamp that sweep
+                // would retry a persistently failing dispatch every 5s
+                // forever.
+                let attempts = attempts_before + 1;
+                let backoff = crate::api::signal::park_backoff_secs(attempts);
+                let restamped = crate::api::signal::restamp_parked_fire(
+                    &state.pg_pool,
+                    token,
+                    &fire_id,
+                    attempts,
+                    crate::lease::now_unix() + backoff,
+                    Some(&owner),
+                )
+                .await?;
+                if restamped == 0 {
+                    // Our claim was taken over mid-drain: nothing of
+                    // ours committed (the dispatch failed), so there is
+                    // nothing to finish; the new owner re-reads the same
+                    // head and retries.
+                    break Ok(());
+                }
                 tracing::warn!(
                     target: "weft_dispatcher::activate",
-                    project_id, token, %status, error = %msg,
-                    "drain_parked_fires: dispatch failed; leaving \
-                     remainder queued for retry"
+                    project_id, token, fire_id = %fire_id, %status,
+                    attempts, retry_in_secs = backoff,
+                    error = %msg,
+                    "drain: dispatch failed; head re-stamped, retries when due"
                 );
                 break Err(anyhow::anyhow!("dispatch failed: {msg}"));
             }
@@ -4177,6 +4287,16 @@ mod trigger_kick_tests {
         v
     }
 
+    fn sorted(set: &HashSet<String>) -> Vec<String> {
+        let mut v: Vec<String> = set.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn fire(p: &ProjectDefinition, node: &str, payload: Value) -> TriggerFire {
+        compute_trigger_fire(p, node, &payload, None).expect("the fire reaches an output")
+    }
+
     #[test]
     fn trigger_only_upstream_node_is_skipped() {
         // A ──► TriggerX ──► B ──► Out
@@ -4191,13 +4311,18 @@ mod trigger_kick_tests {
             ],
             &[("a", "trigger_x"), ("trigger_x", "b"), ("b", "out")],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()), None);
+        let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::String("payload".into()));
         assert_eq!(
             ids(&kicks),
             vec!["trigger_x".to_string()],
             "only the firing trigger should be a kick"
         );
         assert_eq!(kicks[0].payload, Some(Value::String("payload".into())));
+        assert_eq!(
+            sorted(&subgraph),
+            vec!["b".to_string(), "out".to_string(), "trigger_x".to_string()],
+            "A feeds only the trigger, so it is outside the fire's subgraph"
+        );
     }
 
     #[test]
@@ -4223,12 +4348,13 @@ mod trigger_kick_tests {
                 ("b", "out"),
             ],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("payload".into()), None);
+        let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::String("payload".into()));
         assert_eq!(
             ids(&kicks),
             vec!["a".to_string(), "trigger_x".to_string()],
             "A must run via its non-trigger path; trigger carries payload"
         );
+        assert_eq!(sorted(&subgraph), vec!["a", "b", "c", "out", "trigger_x"]);
         for k in &kicks {
             if k.node_id == "trigger_x" {
                 assert_eq!(k.payload, Some(Value::String("payload".into())));
@@ -4251,9 +4377,9 @@ mod trigger_kick_tests {
             ],
             &[("trigger_x", "out"), ("trigger_y", "out")],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::String("fire".into()), None);
-        let sorted = ids(&kicks);
-        assert_eq!(sorted, vec!["trigger_x".to_string(), "trigger_y".to_string()]);
+        let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::String("fire".into()));
+        assert_eq!(ids(&kicks), vec!["trigger_x".to_string(), "trigger_y".to_string()]);
+        assert_eq!(sorted(&subgraph), vec!["out", "trigger_x", "trigger_y"]);
         for k in &kicks {
             if k.node_id == "trigger_x" {
                 assert_eq!(k.payload, Some(Value::String("fire".into())));
@@ -4270,8 +4396,7 @@ mod trigger_kick_tests {
             &[("trigger_x", true, false), ("dead_end", false, false)],
             &[("trigger_x", "dead_end")],
         );
-        let kicks = compute_trigger_kicks(&p, "trigger_x", &Value::Null, None);
-        assert!(kicks.is_empty());
+        assert!(compute_trigger_fire(&p, "trigger_x", &Value::Null, None).is_none());
     }
 
     #[test]
@@ -4282,8 +4407,47 @@ mod trigger_kick_tests {
             &[("a", false, false), ("out", false, true)],
             &[("a", "out")],
         );
-        let kicks = compute_trigger_kicks(&p, "a", &Value::Null, None);
-        assert!(kicks.is_empty());
+        assert!(compute_trigger_fire(&p, "a", &Value::Null, None).is_none());
+    }
+
+    /// Two programs in one file sharing an upstream node (a database, a
+    /// provider). Firing one trigger must leave the other program's
+    /// consumers OUTSIDE the subgraph: the shared node still runs (it
+    /// feeds the fired program) and still emits down every wire, so the
+    /// engine needs the boundary to skip the other program's nodes
+    /// instead of parking their partial input sets forever. This is the
+    /// shape that ended every fire of a two-trigger project as Stuck.
+    #[test]
+    fn a_shared_upstream_node_does_not_pull_the_other_program_in() {
+        //  Shared ──┬──► TriggerX ──► Bx ──► OutX
+        //           └──► TriggerY ──► By ──► OutY
+        // (Shared also wires straight into Bx and By.)
+        let p = project(
+            &[
+                ("shared", false, false),
+                ("trigger_x", true, false),
+                ("trigger_y", true, false),
+                ("bx", false, false),
+                ("by", false, false),
+                ("out_x", false, true),
+                ("out_y", false, true),
+            ],
+            &[
+                ("shared", "bx"),
+                ("shared", "by"),
+                ("trigger_x", "bx"),
+                ("trigger_y", "by"),
+                ("bx", "out_x"),
+                ("by", "out_y"),
+            ],
+        );
+        let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::String("msg".into()));
+        assert_eq!(ids(&kicks), vec!["shared".to_string(), "trigger_x".to_string()]);
+        assert_eq!(
+            sorted(&subgraph),
+            vec!["bx", "out_x", "shared", "trigger_x"],
+            "the other program's trigger and consumers stay outside the fire"
+        );
     }
 }
 

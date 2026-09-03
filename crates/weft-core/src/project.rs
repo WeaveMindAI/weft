@@ -633,40 +633,90 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
 /// `weft-core` is the only one: neither side maintains a mirror.
 pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
     let edge_idx = EdgeIndex::build(project);
-    let triggers: Vec<&str> = project
+    let triggers: Vec<String> = project
         .nodes
         .iter()
         .filter(|n| n.features.is_trigger)
-        .map(|n| n.id.as_str())
+        .map(|n| n.id.clone())
         .collect();
     let mut out: Vec<(String, String)> = Vec::new();
-    for infra in project.nodes.iter().filter(|n| n.requires_infra) {
-        for trigger in &triggers {
-            let mut visited: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut frontier: Vec<String> = vec![(*trigger).to_string()];
-            let mut reached = false;
-            while let Some(id) = frontier.pop() {
-                if !visited.insert(id.clone()) {
-                    continue;
-                }
-                if id == infra.id {
-                    reached = true;
-                    break;
-                }
-                for e in edge_idx.get_incoming(project, &id) {
-                    if !visited.contains(&e.source) {
-                        frontier.push(e.source.clone());
-                    }
-                }
-            }
-            if reached {
-                out.push((infra.id.clone(), (*trigger).to_string()));
+    for trigger in &triggers {
+        let upstream = upstream_closure(project, &edge_idx, std::slice::from_ref(trigger));
+        for infra in project.nodes.iter().filter(|n| n.requires_infra) {
+            if upstream.contains(&infra.id) {
+                out.push((infra.id.clone(), trigger.clone()));
             }
         }
     }
     out.sort();
     out
+}
+
+/// Every node reachable from `start` by following wires forward,
+/// `start` included.
+///
+/// The one definition of "what this node can reach". The dispatcher
+/// uses it to pick a trigger fire's targets, the engine uses it to tell
+/// the fired trigger's own program from the other programs in the file;
+/// the two decisions have to agree, so they share this walk.
+pub fn downstream_closure(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    start: &str,
+) -> std::collections::HashSet<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: Vec<String> = vec![start.to_string()];
+    while let Some(id) = frontier.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        for edge in edge_idx.get_outgoing(project, &id) {
+            if !seen.contains(&edge.target) {
+                frontier.push(edge.target.clone());
+            }
+        }
+    }
+    seen
+}
+
+/// Every node `seeds` depend on by following wires backward, seeds
+/// included. The scope of a setup phase (everything the triggers, or
+/// the infra nodes, need) and of an untargeted manual run.
+pub fn upstream_closure(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    seeds: &[String],
+) -> std::collections::HashSet<String> {
+    upstream_closure_stop_at(project, edge_idx, seeds, &std::collections::HashSet::new())
+}
+
+/// `upstream_closure`, but a node in `stop_at` is included and not
+/// walked through: its own inputs stay out of the set. This is how
+/// triggers act as terminators on a fire (at fire time a trigger's
+/// outputs are the event, not a function of its inputs) and why a
+/// stopped node still ends up in the set: it has to be kicked as a root.
+pub fn upstream_closure_stop_at(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    seeds: &[String],
+    stop_at: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: Vec<String> = seeds.to_vec();
+    while let Some(id) = frontier.pop() {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if stop_at.contains(&id) {
+            continue;
+        }
+        for edge in edge_idx.get_incoming(project, &id) {
+            if !seen.contains(&edge.source) {
+                frontier.push(edge.source.clone());
+            }
+        }
+    }
+    seen
 }
 
 #[cfg(test)]

@@ -571,14 +571,7 @@ impl Journal for PostgresJournal {
         // skip the per-node rows forever). A payload that fails to decode
         // fails the whole read, matching `events_log`.
         let events = decode_all(color, payload_rows(&mut *tx, color).await?)?;
-        let has_terminal = events.iter().any(|e| {
-            matches!(
-                e,
-                ExecEvent::ExecutionCompleted { .. }
-                    | ExecEvent::ExecutionFailed { .. }
-                    | ExecEvent::ExecutionCancelled { .. }
-            )
-        });
+        let has_terminal = events.iter().any(ExecEvent::is_execution_terminal);
         if !has_terminal {
             // The write list comes from the ONE shared definition of a
             // dispatcher-side cancel (`cancel_terminal_events`), so this

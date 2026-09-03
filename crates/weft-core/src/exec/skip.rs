@@ -55,8 +55,11 @@ pub enum SkipReason {
     /// Every port of a `@require_one_of` group arrived closed.
     OneOfGroupClosed { ports: Vec<String> },
     /// This execution runs only a scoped part of the graph (a setup
-    /// phase's upstream closure, or a manual run aimed at targets);
-    /// this firing is outside that set.
+    /// phase's upstream closure, a manual run aimed at targets, or a
+    /// trigger fire's subgraph); this firing is outside that set. On a
+    /// fire the row is kept only for a node the fired trigger reaches
+    /// that no output depends on: the hint that its author forgot to
+    /// mark it as an output. Another program's node absorbs silently.
     OutsideThisRun,
 }
 

@@ -52,10 +52,12 @@ pub enum ExecEvent {
         node_test: bool,
         /// The node set this execution is allowed to dispatch, or
         /// `None` for the whole graph. A manual run aimed at targets
-        /// journals its computed subgraph here, so the engine skips
-        /// everything outside it (`OutsideThisRun`) and a resume
-        /// rebuilds the same boundary; a trigger-fired execution
-        /// carries `None`. (Named `subgraph`, not `scope`:
+        /// and every trigger fire journal their computed subgraph
+        /// here, so the engine skips everything outside it
+        /// (`OutsideThisRun`) and a resume rebuilds the same boundary;
+        /// an untargeted manual run and the setup phases carry `None`
+        /// (the setup phases compute their scope engine-side). (Named
+        /// `subgraph`, not `scope`:
         /// `NodeDefinition.scope` is a node's group-nesting path, a
         /// different thing entirely.)
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -593,6 +595,21 @@ impl From<weft_core::exec::PulseEmission> for LaunchedEmission {
 }
 
 impl ExecEvent {
+    /// Whether this event ends the execution: completed, failed, or
+    /// cancelled. The ONE definition of the terminal set in Rust; the
+    /// SQL that filters on it lives in
+    /// `weft-dispatcher/src/api/execution.rs` (`terminal_outcome`) and
+    /// carries a marker back here.
+    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-dispatcher/src/api/execution.rs terminal_outcome (SQL kind list), crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list)
+    pub fn is_execution_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecutionCompleted { .. }
+                | Self::ExecutionFailed { .. }
+                | Self::ExecutionCancelled { .. }
+        )
+    }
+
     pub fn color(&self) -> Color {
         match self {
             Self::ExecutionStarted { color, .. }

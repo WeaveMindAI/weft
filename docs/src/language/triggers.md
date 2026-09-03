@@ -40,6 +40,15 @@ stopping at trigger nodes. So sibling branches it cannot reach do not run, and
 neither do the other triggers in that subgraph: their output ports close, and a
 node fed by several triggers proceeds with the firing branch.
 
+That set is written into the run itself, so it holds on a resume too, and the
+rest of the file is left alone. A database or a provider shared by two programs
+emits down every wire it has, so on every fire a value does reach the other
+program's first node; the runtime drops it there without a trace, because that
+program is not this run's business. The one node outside the set that does get
+a row is your own: a node the fired trigger reaches but no output depends on
+shows as skipped with "it is outside the part of the graph this execution
+runs". That is the hint that you forgot to mark it as an output.
+
 Why the runtime picks the subgraph that way, and what it buys you:
 [What actually runs](mental-model.md#what-actually-runs).
 

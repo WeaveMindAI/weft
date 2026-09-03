@@ -183,6 +183,55 @@
         subgraph: Option<&[&str]>,
         cancellation: Arc<CancellationFlag>,
     ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        drive_kicked(project, catalog, kicks, None, subgraph, cancellation).await
+    }
+
+    /// `drive_scoped` for a TRIGGER FIRE: `firing` names the kick that
+    /// is the fired trigger (journaled with `firing: true`, the way the
+    /// dispatcher's route_entry writes it), and `subgraph` is the fire's
+    /// computed set. The shape every two-programs test drives.
+    pub(super) async fn drive_fire(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        firing: &str,
+        kicks: &[&str],
+        subgraph: Option<&[&str]>,
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        drive_kicked(project, catalog, kicks, Some(firing), subgraph, CancellationFlag::new_arc()).await
+    }
+
+    /// `drive` for a color whose journal ALREADY holds a terminal
+    /// (cancelled before the worker claimed it): the shape of a cancel
+    /// landing in the dispatcher's route window, or a late second
+    /// execute task for a finished color.
+    pub(super) async fn drive_settled(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        kicks: &[&str],
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        drive_kicked_settled(project, catalog, kicks, None, None, CancellationFlag::new_arc(), true).await
+    }
+
+    async fn drive_kicked(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        kicks: &[&str],
+        firing: Option<&str>,
+        subgraph: Option<&[&str]>,
+        cancellation: Arc<CancellationFlag>,
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        drive_kicked_settled(project, catalog, kicks, firing, subgraph, cancellation, false).await
+    }
+
+    async fn drive_kicked_settled(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        kicks: &[&str],
+        firing: Option<&str>,
+        subgraph: Option<&[&str]>,
+        cancellation: Arc<CancellationFlag>,
+        already_cancelled: bool,
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
         let color = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         journal
@@ -207,9 +256,22 @@
                     &ExecEvent::NodeKicked {
                         color,
                         node_id: kick.to_string(),
-                        firing: false,
+                        firing: firing == Some(*kick),
                         payload: None,
                         port_snapshot: None,
+                        at_unix: 0,
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        if already_cancelled {
+            journal
+                .record_event(
+                    &ExecEvent::ExecutionCancelled {
+                        color,
+                        reason: "cancelled in the route window".into(),
                         at_unix: 0,
                     },
                     None,

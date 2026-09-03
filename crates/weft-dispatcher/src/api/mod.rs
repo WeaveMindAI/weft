@@ -32,7 +32,11 @@ mod provider_events;
 mod signal_token;
 mod signal_token_names;
 mod infra;
-pub(crate) mod signal;
+// `pub` (not `pub(crate)`) like `project` above: the parked-fire queue
+// helpers (`append_parked_fire` and siblings) are the dispatcher's
+// correctness-critical SQL that the db-test rig in `tests/db_lifecycle.rs`
+// exercises against a real Postgres.
+pub mod signal;
 pub mod access;
 pub mod node_tests;
 pub mod storage;

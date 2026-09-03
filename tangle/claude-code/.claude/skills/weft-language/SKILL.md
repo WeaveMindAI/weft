@@ -233,7 +233,12 @@ executing the union (`--target <node>` narrows it; a target must be an output
 node). A trigger fire starts at the trigger that fired, walks downstream to
 the outputs it can reach, then back up, stopping at other triggers. A branch
 wired to no output never executes. One file can hold several programs, one
-per trigger.
+per trigger, and they may share upstream nodes (one database, one provider):
+on a fire the shared node runs for the fired program and the other programs
+are left without a trace. A node skipped with reason `outside_this_run` on a
+fire is in the fired program but no output depends on it: almost always a
+side-effect node missing `_is_output: true`, so fix the wiring, never the
+runtime.
 
 Ends: completed (no pulse in flight), suspended (every live firing parked on
 an external wait: a person, a timer; costs nothing), or stuck (provably

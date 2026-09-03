@@ -24,6 +24,11 @@ pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(60), "worker_scaledown", sweep_worker_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions);
+    // Re-parked fires (a route that failed) retry with a backoff stamp on
+    // the element; this is what drives the retry once the stamp is due.
+    spawn_loop(state.clone(), Duration::from_secs(5), "parked_fires", |s| async move {
+        crate::api::project::drain_due_parked_fires(&s).await
+    });
     // Storage plane: the durable terminate sweep (un-kept exec files of a
     // terminated color). Idempotent across pods: the queue deletes a color's
     // row only after the broker confirms the sweep. The kept-file expiry sweep
