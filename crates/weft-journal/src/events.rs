@@ -1084,7 +1084,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                     {
                         e.status = NodeExecutionStatus::Completed;
                         e.completed_at = Some(*at_unix);
-                        e.output = Some(output.clone());
+                        e.set_output(output);
                         e.callback_id = None;
                     }
                 }
@@ -1527,6 +1527,39 @@ mod fold_pulse_tests {
             Some(&payload),
             "wake payload preserved so resume can replay it into the wake bag"
         );
+    }
+
+    #[test]
+    fn a_sink_that_emitted_nothing_folds_to_no_output() {
+        // Live, a firing that hands out nothing never writes an output
+        // on its record. The completion row still carries the (empty)
+        // bag, so the fold must land on the same `None`, or a replayed
+        // run holds an explicit "nothing" where the live run held no
+        // note at all.
+        let events = vec![
+            ExecEvent::NodeStarted {
+                color: color(),
+                node_id: "debug".into(),
+                frames: frames(&[]),
+                input: json!({"data": []}),
+                pulses_absorbed: vec![],
+                closed_ports: vec![],
+                at_unix: 0,
+            },
+            ExecEvent::NodeCompleted {
+                color: color(),
+                node_id: "debug".into(),
+                frames: frames(&[]),
+                output: Value::Null,
+                closure_emissions: vec![],
+                at_unix: 1,
+            },
+        ];
+        let snap = fold_to_snapshot(color(), &events);
+        let execs = snap.executions.get("debug").expect("debug execs");
+        assert_eq!(execs[0].status, weft_core::exec::NodeExecutionStatus::Completed);
+        assert_eq!(execs[0].output, None, "an empty bag is no output, not Some(Null)");
+        assert_eq!(execs[0].input, Some(json!({"data": []})), "the value it received is still on the record");
     }
 
     #[test]

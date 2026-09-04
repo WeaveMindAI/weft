@@ -1535,6 +1535,15 @@ async fn drive(
                             project, edge_idx, pulses, None,
                         ));
                         mark_completed(executions, &node_id, color, &group.frames);
+                        // A boundary forwards synchronously, so it never
+                        // goes through the emission merge above; record
+                        // what it forwarded here, or the live record and
+                        // the folded one disagree on this firing.
+                        if let Some(rec) = executions.get_mut(&node_id).and_then(|v| {
+                            v.iter_mut().rev().find(|e| e.color == color && e.frames == group.frames)
+                        }) {
+                            rec.set_output(&forwarded);
+                        }
                         ship_node_completed(journal, pod_name, color, &node_id, &group.frames, &forwarded, all_emissions).await;
                     }
                     Err(e) => {
@@ -4650,7 +4659,7 @@ async fn apply_one_emission(
                             }
                             _ => output_value.clone(),
                         };
-                        rec.output = Some(merged);
+                        rec.set_output(&merged);
                     }
                     set
                 }
