@@ -42,6 +42,7 @@ impl Node for ElevenLabsMusicNode {
             http.post(format!("{API}/music")).json(&body),
             "elevenlabs: compose the music",
             "music.mp3",
+            "audio/mpeg",
         )
         .await
     }

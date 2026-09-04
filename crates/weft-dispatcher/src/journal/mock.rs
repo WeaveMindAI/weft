@@ -104,11 +104,11 @@ impl MockJournal {
     /// `summary_from_payloads` helper.
     fn summary_for_color(&self, color: Color) -> Option<ExecutionSummary> {
         let g = self.inner.lock().unwrap();
-        let (project_id, entry_node, started_at) = g.events.iter().find_map(|e| match e {
-            ExecEvent::ExecutionStarted { color: c, project_id, entry_node, at_unix, .. }
+        let (project_id, entry_node, phase, started_at) = g.events.iter().find_map(|e| match e {
+            ExecEvent::ExecutionStarted { color: c, project_id, entry_node, phase, at_unix, .. }
                 if *c == color =>
             {
-                Some((project_id.clone(), entry_node.clone(), *at_unix))
+                Some((project_id.clone(), entry_node.clone(), *phase, *at_unix))
             }
             _ => None,
         })?;
@@ -139,7 +139,7 @@ impl MockJournal {
             .collect();
         tagged.sort();
         let tags = tagged.into_iter().map(|(_, tag)| tag).collect();
-        Some(ExecutionSummary { color, project_id, entry_node, status, started_at, completed_at, tags })
+        Some(ExecutionSummary { color, project_id, entry_node, status, phase, started_at, completed_at, tags })
     }
 
     /// Every execution summary owned by `tenant` (unordered). Tenant ownership
@@ -478,24 +478,20 @@ impl Journal for MockJournal {
             .map_or(ColorLookup::NotFound, ColorLookup::Found))
     }
 
-    async fn logs_for(&self, color: Color, _limit: u32) -> anyhow::Result<Vec<LogEntry>> {
-        Ok(self
+    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
+        // The same tail as Postgres, through the one `LogEntry::tail`:
+        // the two journals have to answer `weft logs` the same way or
+        // nothing tested here means anything about the real one.
+        let entries: Vec<LogEntry> = self
             .inner
             .lock()
             .unwrap()
             .events
             .iter()
-            .filter_map(|e| match e {
-                ExecEvent::LogLine { color: c, level, message, at_unix } if *c == color => {
-                    Some(LogEntry {
-                        at_unix: *at_unix,
-                        level: level.clone(),
-                        message: message.clone(),
-                    })
-                }
-                _ => None,
-            })
-            .collect())
+            .filter(|e| e.color() == color)
+            .filter_map(LogEntry::from_event)
+            .collect();
+        Ok(LogEntry::tail(entries, limit))
     }
 
     async fn list_executions(
@@ -511,6 +507,7 @@ impl Journal for MockJournal {
             .filter(|s| query.project_id.as_deref().is_none_or(|p| s.project_id == p))
             .filter(|s| query.started_after.is_none_or(|a| s.started_at >= a))
             .filter(|s| query.started_before.is_none_or(|b| s.started_at < b))
+            .filter(|s| query.phase.is_none_or(|p| s.phase == p))
             .collect();
         all.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.color.cmp(&a.color)));
         let total = all.len() as u64;
@@ -1022,5 +1019,47 @@ mod tests {
         let paget2 = j.list_executions("t2", &qt2).await.unwrap();
         assert_eq!(paget2.total, 1);
         assert_eq!(paget2.executions[0].color, x1);
+    }
+
+    /// The phase filter separates a trigger's real fires from the
+    /// setup runs an activate makes, and the summary carries the phase
+    /// so a listing can say which is which.
+    #[tokio::test]
+    async fn list_executions_filters_by_phase() {
+        let j = MockJournal::new();
+        j.set_project_tenant("p", "t");
+        let fire = weft_core::Color::new_v4();
+        let setup = weft_core::Color::new_v4();
+        j.record_event(&started_at(fire, "p", 10)).await.unwrap();
+        let ExecEvent::ExecutionStarted { color, project_id, entry_node, definition_hash, node_test, subgraph, at_unix, .. } =
+            started_at(setup, "p", 20)
+        else {
+            unreachable!()
+        };
+        j.record_event(&ExecEvent::ExecutionStarted {
+            color,
+            project_id,
+            entry_node,
+            phase: weft_core::context::Phase::TriggerSetup,
+            definition_hash,
+            node_test,
+            subgraph,
+            at_unix,
+        })
+        .await
+        .unwrap();
+
+        let all = j.list_executions("t", &ExecutionQuery { limit: 10, ..Default::default() }).await.unwrap();
+        assert_eq!(all.total, 2);
+        assert_eq!(all.executions[0].phase, weft_core::context::Phase::TriggerSetup, "newest first");
+        let fires = j
+            .list_executions(
+                "t",
+                &ExecutionQuery { limit: 10, phase: Some(weft_core::context::Phase::Fire), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(fires.total, 1);
+        assert_eq!(fires.executions[0].color, fire);
     }
 }

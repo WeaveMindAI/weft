@@ -129,7 +129,7 @@ describe('catalog wire fixture', () => {
 			switch (w.kind) {
 				case 'text': case 'textarea': case 'checkbox': case 'password':
 				case 'entry_list': case 'text_list': case 'code': case 'number': case 'select':
-				case 'multiselect': case 'access': case 'remote_select': case 'file_drop':
+				case 'multiselect': case 'access': case 'remote_select': case 'file_drop': case 'datetime':
 					return w.kind;
 				default: {
 					const unhandled: never = w;

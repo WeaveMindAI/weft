@@ -62,7 +62,22 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         path.push_str(h);
     }
 
-    let data: serde_json::Value = ctx.client().get_json(&path).await?;
+    // A project that exists on disk but was never built is not an error:
+    // it is the state every project starts in, and the answer is the
+    // command that leaves it. The marked 404 is how the dispatcher says
+    // "no project I know under this id" (as opposed to a missing route).
+    let Some(data) = ctx.client().get_json_if_found(&path).await? else {
+        if ctx.json() {
+            println!("{}", serde_json::json!({ "registered": false, "project_id": project_id }));
+        } else {
+            println!(
+                "project: {} ({project_id})\n  not registered with the dispatcher yet: \
+                 run `weft build` (or `weft run`) to register it",
+                project.manifest.package.name
+            );
+        }
+        return Ok(());
+    };
 
     if ctx.json() {
         // One JSON object on stdout; the extension reads it.

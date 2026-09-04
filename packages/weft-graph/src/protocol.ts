@@ -712,6 +712,9 @@ export type Widget =
   /// `step` is the input's granularity (arrow/slider increment).
   | { kind: 'number'; min?: number | null; max?: number | null; step?: number | null }
   | { kind: 'checkbox' }
+  /// A calendar-and-clock picker; the stored String is ISO-8601 with
+  /// the picker's own zone offset.
+  | { kind: 'datetime' }
   | { kind: 'select'; options: string[] }
   | { kind: 'multiselect'; options: string[] }
   | { kind: 'password' }

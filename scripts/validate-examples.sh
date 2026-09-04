@@ -30,7 +30,7 @@ for main in examples/*/main.weft; do
     .diagnostics[]
     | select((.code == "rule-runtime"
               and ((.message | contains("has no connected"))
-                   or (.message | contains("no connection picked")))) | not)
+                   or (.message | contains("connection picked")))) | not)
     | "  line \(.line): [\(.code)] \(.message)"')"; then
     echo "FAIL $dir: could not read the validate output as JSON:" >&2
     printf '%s\n' "$out" >&2

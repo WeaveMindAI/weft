@@ -52,8 +52,9 @@ impl Node for ElevenLabsSpeakFileNode {
             "{API}/text-to-speech/{voice}?output_format={}",
             urlencoding::encode(&output_format)
         );
-        let filename = format!("speech.{}", audio_file_type(&output_format)?.0);
-        emit_audio(&ctx, http.post(url).json(&body), "elevenlabs: text to speech", &filename)
+        let (extension, mime) = audio_file_type(&output_format)?;
+        let filename = format!("speech.{extension}");
+        emit_audio(&ctx, http.post(url).json(&body), "elevenlabs: text to speech", &filename, mime)
             .await
     }
 }

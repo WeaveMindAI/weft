@@ -20,7 +20,9 @@
     {
       "name": "text",
       "type": "String",
-      "widget": { "kind": "textarea" },
+      "widget": {
+        "kind": "textarea"
+      },
       "required": true,
       "description": "The text to speak."
     },
@@ -73,10 +75,16 @@
           "mp3_44100_192",
           "pcm_16000",
           "pcm_44100",
-          "ulaw_8000"
+          "ulaw_8000",
+          "opus_48000_32",
+          "opus_48000_64",
+          "opus_48000_96",
+          "opus_48000_128",
+          "opus_48000_192"
         ]
       },
-      "label": "Output format"
+      "label": "Output format",
+      "description": "mp3 for anything that plays a file, pcm or ulaw for telephony, opus_48000_* for a WhatsApp voice note (stored as Ogg Opus)."
     },
     {
       "name": "stability",

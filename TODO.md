@@ -554,6 +554,13 @@ no-suspension-while-open rule keeps the gap honest until then.
 [Update Notice Warning] If we touch the BusCoordinator, implement
 Generator[T], or rework await_signal journaling, revisit this entry.
 
+## A time type?
+`Cron` takes a cron string plus a `timezone`, `WaitUntil` an ISO-8601
+string, `Wait` a number of seconds: three spellings of "a moment" with
+no type behind them. Worth deciding whether time (and a repeating time)
+should be a WeftType of its own, or whether three string-ish inputs on
+three nodes is fine.
+
 ## Rename color to exec
 Color was a concept I was experimenting with for mutliple execution in the same runtime but I changed my mind and never ended up changing the name.
 

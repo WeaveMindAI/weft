@@ -1,4 +1,3 @@
-import { downloadMediaMessage } from 'baileys';
 import { extractTextContent } from './message-store.js';
 
 /**
@@ -26,7 +25,10 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
       return { messageId: result.key.id };
     },
 
-    async sendMedia({ to, mediaUrl, mediaBase64, caption, mimetype, filename }) {
+    // `ptt` marks audio as a voice note (WhatsApp renders it as a
+    // playable bubble instead of an audio file); ignored for any other
+    // media type.
+    async sendMedia({ to, mediaUrl, mediaBase64, caption, mimetype, filename, ptt }) {
       const sock = bridge.getSocket();
       if (!sock || !bridge.isConnected()) {
         return { error: 'WhatsApp not connected' };
@@ -53,6 +55,7 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
           caption: caption || undefined,
           mimetype: mimetype || undefined,
           fileName: filename || undefined,
+          ptt: mediaType === 'audio' && ptt === true ? true : undefined,
         });
         return { messageId: result.key.id };
       }
@@ -85,6 +88,7 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
         caption: caption || undefined,
         mimetype: resolvedMime || undefined,
         fileName: filename || undefined,
+        ptt: mediaType === 'audio' && ptt === true ? true : undefined,
       };
       const result = await sock.sendMessage(to, msg);
       return { messageId: result.key.id };
@@ -267,13 +271,18 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
       const sock = bridge.getSocket();
 
       // Serialize raw WAMessages, lazy-downloading audio at query time
-      const messages = await Promise.all(rawMessages.map(async (msg) => {
+      // History carries what a message SAYS, never its bytes. A voice
+      // bot reading its own history would otherwise download every
+      // clip it ever received on every read, and the base64 would ride
+      // the pulse into the journal. The entry names the message, and
+      // BaileyFetchMedia pulls one message's bytes when something
+      // actually needs them.
+      const messages = rawMessages.map((msg) => {
         const { content, messageType } = extractTextContent(msg);
-        const entry = {
+        return {
           from: msg.key.remoteJid,
           pushName: msg.pushName || null,
           content,
-          audio: null,
           messageType,
           messageId: msg.key.id,
           timestamp: typeof msg.messageTimestamp === 'number'
@@ -281,23 +290,7 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
             : Number(msg.messageTimestamp) || 0,
           fromMe: !!msg.key.fromMe,
         };
-
-        // Lazy-download audio data from protobuf
-        if (messageType === 'audio' && msg.message?.audioMessage && sock) {
-          try {
-            const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
-              reuploadRequest: sock.updateMediaMessage,
-            });
-            const mimetype = msg.message.audioMessage.mimetype || 'audio/ogg';
-            entry.audio = `data:${mimetype};base64,${buffer.toString('base64')}`;
-          } catch (err) {
-            console.warn(`[action] Failed to download audio for ${msg.key.id}:`, err.message);
-            entry.content = '[audio message, media unavailable]';
-          }
-        }
-
-        return entry;
-      }));
+      });
 
       return { messages };
     },

@@ -1,9 +1,9 @@
 with account as (
-  select 1 from users where telegram_id = $1
+  select 1 from users where telegram_id = $telegram_id
 ),
 spent as (
   update users set credits = credits - 1
-  where telegram_id = $1 and credits > 0
+  where telegram_id = $telegram_id and credits > 0
   returning telegram_id
 )
 select

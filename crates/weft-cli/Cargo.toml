@@ -34,6 +34,9 @@ tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
 # User-level CLI settings file (`~/.config/weft/cli.toml`).
 toml = { workspace = true }
+# Local-time rendering of the journal's unix stamps (`weft executions`,
+# `weft events`, `weft logs`).
+chrono = { workspace = true }
 # Hidden-echo terminal input for pasted credentials (`weft connect`).
 rpassword = { workspace = true }
 # Open the browser on the OAuth consent URL (`weft connect`).

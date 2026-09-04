@@ -388,3 +388,269 @@ pub async fn query_json(
         .map_err(|e| weft::error::node_error(format!("postgres: run the query: {}", pg_detail(&e))))?;
     rows_to_json(&rows)
 }
+
+/// A query's named placeholders resolved to what the driver wants:
+/// the SQL with every `$name` rewritten to its positional `$N`, the
+/// port names in that order (so `names[N-1]` is what `$N` binds), and
+/// how many statements the text holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceholderSql {
+    pub sql: String,
+    pub names: Vec<String>,
+    pub statements: usize,
+}
+
+/// Read a query's `$name` placeholders, the way a node's custom input
+/// ports reach its SQL. Each distinct name gets the position of its
+/// first appearance (`$a ... $b ... $a` becomes `$1 ... $2 ... $1`),
+/// so the same port can be read several times and binds once.
+///
+/// Only SQL that Postgres itself would read as a parameter is
+/// touched: a `$` inside a string literal, a quoted identifier, a
+/// comment, or a dollar-quoted body (`$$ ... $$`, `$fn$ ... $fn$`, the
+/// way a `DO` block or a function body is written) stays exactly as
+/// written. Statements are counted the same way (a `;` inside any of
+/// those is not a separator) so the caller can tell a script from one
+/// statement.
+///
+/// A positional `$1` is refused: there is no parameter list for it to
+/// index any more, and naming the port is the fix.
+pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut names: Vec<String> = Vec::new();
+    // The first `$1`-shaped tag seen, if any: what it means depends on
+    // whether this turns out to be one statement or a script.
+    let mut positional: Option<String> = None;
+    let mut statements = 0usize;
+    // Whether the current statement has any text besides whitespace
+    // and comments, so a trailing `;` (or `;;`) does not count an
+    // empty statement.
+    let mut statement_has_text = false;
+    let ident_start = |c: char| c.is_ascii_alphabetic() || c == '_';
+    let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            // Line comment: copied through, never scanned.
+            '-' if next == Some('-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            // Block comment, nested the way Postgres nests them.
+            '/' if next == Some('*') => {
+                let mut depth = 0usize;
+                loop {
+                    if i >= chars.len() {
+                        weft::node_bail!("the SQL opens a /* comment it never closes");
+                    }
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        out.push_str("/*");
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        out.push_str("*/");
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+            }
+            // String literal (`''` is the escape; an `E'...'` string also
+            // escapes with a backslash) and quoted identifier.
+            '\'' | '"' => {
+                let quote = c;
+                let escapes_with_backslash = quote == '\''
+                    && i > 0
+                    && matches!(chars[i - 1], 'e' | 'E')
+                    && (i < 2 || !ident_char(chars[i - 2]));
+                statement_has_text = true;
+                out.push(quote);
+                i += 1;
+                loop {
+                    let Some(&ch) = chars.get(i) else {
+                        weft::node_bail!("the SQL opens a {quote} quote it never closes");
+                    };
+                    if ch == '\\' && escapes_with_backslash {
+                        out.push(ch);
+                        if let Some(&escaped) = chars.get(i + 1) {
+                            out.push(escaped);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    out.push(ch);
+                    i += 1;
+                    if ch == quote {
+                        if chars.get(i) == Some(&quote) {
+                            out.push(quote);
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            // `$` inside an identifier (`x$y` is a legal name) is the name.
+            '$' if i > 0 && ident_char(chars[i - 1]) => {
+                out.push('$');
+                i += 1;
+            }
+            '$' => {
+                // The tag between this `$` and the next: empty for `$$`,
+                // an identifier for `$tag$`. Digits after `$` cannot be
+                // a tag, so `$1` is a positional parameter.
+                let mut j = i + 1;
+                while j < chars.len() && ident_char(chars[j]) {
+                    j += 1;
+                }
+                let tag: String = chars[i + 1..j].iter().collect();
+                let is_tag = tag.is_empty() || ident_start(tag.chars().next().unwrap_or(' '));
+                if is_tag && chars.get(j) == Some(&'$') {
+                    // Dollar-quoted body: copy through to the closing tag.
+                    let close: Vec<char> = format!("${tag}$").chars().collect();
+                    let body_start = j + 1;
+                    let mut k = body_start;
+                    let mut found = None;
+                    while k + close.len() <= chars.len() {
+                        if chars[k..k + close.len()] == close[..] {
+                            found = Some(k);
+                            break;
+                        }
+                        k += 1;
+                    }
+                    let Some(end) = found else {
+                        weft::node_bail!("the SQL opens a ${tag}$ quote it never closes");
+                    };
+                    out.extend(&chars[i..end + close.len()]);
+                    i = end + close.len();
+                    statement_has_text = true;
+                    continue;
+                }
+                // A tag that cannot be a port name: all digits (`$1`,
+                // the positional form) or digit-leading (`$1st`). In a
+                // SCRIPT it is not a weft placeholder at all (`PREPARE
+                // ... $1` is the author's own SQL), so it is copied
+                // through and the refusal is left to the end, where the
+                // statement count is known.
+                if !tag.is_empty() && !ident_start(tag.chars().next().unwrap_or(' ')) {
+                    positional.get_or_insert_with(|| tag.clone());
+                    out.push('$');
+                    out.push_str(&tag);
+                    i = j;
+                    statement_has_text = true;
+                    continue;
+                }
+                if tag.is_empty() {
+                    // A bare `$` (an operator such as `$>` in some
+                    // extensions) is SQL, not a placeholder.
+                    out.push('$');
+                    i += 1;
+                    statement_has_text = true;
+                    continue;
+                }
+                let position = match names.iter().position(|n| n == &tag) {
+                    Some(p) => p + 1,
+                    None => {
+                        names.push(tag.clone());
+                        names.len()
+                    }
+                };
+                out.push_str(&format!("${position}"));
+                i = j;
+                statement_has_text = true;
+            }
+            ';' => {
+                if statement_has_text {
+                    statements += 1;
+                    statement_has_text = false;
+                }
+                out.push(';');
+                i += 1;
+            }
+            _ => {
+                if !c.is_whitespace() {
+                    statement_has_text = true;
+                }
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    if statement_has_text {
+        statements += 1;
+    }
+    if statements == 0 {
+        weft::node_bail!(
+            "the query is empty (nothing but whitespace or comments); write the SQL to run"
+        );
+    }
+    // One statement is a parameterised query, where `$1` is weft's own
+    // numbering and the author cannot write it. A script sends its SQL
+    // verbatim, so `$1` there is theirs and stays.
+    if let Some(tag) = positional {
+        if statements == 1 && names.is_empty() {
+            weft::node_bail!(
+                "the SQL uses `${tag}`, which is not a name this node can bind: parameters are \
+                 the node's own input ports, read by name. Declare the port and name it: \
+                 `PostgresExecuteQuery(user_id: String) {{ ... WHERE id = $user_id }}`"
+            );
+        }
+        if statements == 1 {
+            weft::node_bail!(
+                "the SQL mixes named parameters ({}) with `${tag}`, which is not a name this \
+                 node can bind; name every parameter after the input port that carries it",
+                names.join(", ")
+            );
+        }
+    }
+    Ok(PlaceholderSql { sql: out, names, statements })
+}
+
+/// Run a script (several statements) in one round trip through the
+/// simple-query protocol, which is the only one Postgres runs several
+/// statements through, and answer the rows the LAST statement
+/// produced. The simple protocol carries no parameters and types no
+/// column, so every cell comes back as the text Postgres prints (or
+/// null); a script that wants typed values ends with a single
+/// parameterised query instead.
+pub async fn script_json(client: &tokio_postgres::Client, sql: &str) -> WeftResult<Vec<Value>> {
+    use tokio_postgres::SimpleQueryMessage;
+    let messages = client
+        .simple_query(sql)
+        .await
+        .map_err(|e| weft::error::node_error(format!("postgres: run the script: {}", pg_detail(&e))))?;
+    // The rows of the statement being read, and the rows of the last
+    // statement that FINISHED. A statement that returns nothing (an
+    // INSERT, a CREATE, a COMMIT) announces no columns and only
+    // completes, so its completion has to clear what the statement
+    // before it produced. Without that, `SELECT 1; INSERT ...` answers
+    // with the select's row as if the insert had returned it.
+    let mut current: Vec<Value> = Vec::new();
+    let mut last: Vec<Value> = Vec::new();
+    for message in messages {
+        match message {
+            SimpleQueryMessage::RowDescription(_) => current.clear(),
+            SimpleQueryMessage::Row(row) => {
+                let mut obj = Map::new();
+                for (i, column) in row.columns().iter().enumerate() {
+                    obj.insert(column.name().to_string(), json!(row.get(i)));
+                }
+                current.push(Value::Object(obj));
+            }
+            SimpleQueryMessage::CommandComplete(_) => last = std::mem::take(&mut current),
+            // The enum is `#[non_exhaustive]` in the driver.
+            _ => {}
+        }
+    }
+    Ok(last)
+}

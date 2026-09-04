@@ -1,0 +1,67 @@
+{
+  "type": "ElevenLabsTranscribeFile",
+  "label": "ElevenLabs Transcribe File",
+  "description": "Speech-to-text for a stored audio file (Scribe): a voice note, a recording, a call. Audio file in, the transcript out as text, with the language the model heard. For a live audio stream use ElevenLabsTranscribe instead.",
+  "tags": [
+    "ai",
+    "audio",
+    "speech",
+    "transcription",
+    "stt",
+    "file"
+  ],
+  "icon": "FileAudio",
+  "color": "#7c6f9f",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "required": true,
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node): whose key the call spends."
+    },
+    {
+      "name": "audio",
+      "type": "Audio",
+      "required": true,
+      "description": "The recording to transcribe (any common audio format; a WhatsApp voice note is Ogg Opus)."
+    },
+    {
+      "name": "language",
+      "type": "String",
+      "required": false,
+      "exposure": "config",
+      "label": "Language",
+      "placeholder": "(auto-detect)",
+      "description": "ISO language code of the audio (en, fr, ...). Empty lets the model detect it."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "exposure": "config",
+      "default": "scribe_v1",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "scribe_v1",
+          "scribe_v1_experimental"
+        ]
+      },
+      "label": "Model"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "required": false,
+      "description": "The transcript."
+    },
+    {
+      "name": "language",
+      "type": "String",
+      "required": false,
+      "description": "The language the model heard (ISO code)."
+    }
+  ],
+  "requires_infra": false
+}

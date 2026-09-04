@@ -414,8 +414,25 @@ pub enum ExecEvent {
 
     LogLine {
         color: Color,
+        /// The node that wrote it, and the iteration it was in: a log
+        /// line is about one firing, and a graph where ten nodes log
+        /// is unreadable without it. `default` so the rows written
+        /// before the field existed still decode (they read as an
+        /// empty id, which the log renders as a run-level line).
+        #[serde(default)]
+        node_id: String,
+        #[serde(default)]
+        frames: LoopFrames,
         level: String,
         message: String,
+        /// The worker's clock at the write, in milliseconds (`at_unix`
+        /// is its seconds), and the line's place among its firing's
+        /// side effects. Absent on rows written before they were
+        /// carried, which read at the end of their second.
+        #[serde(default)]
+        at_unix_ms: Option<u64>,
+        #[serde(default)]
+        seq: Option<u64>,
         at_unix: u64,
     },
 

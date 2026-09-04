@@ -167,7 +167,7 @@ fn next_fire(spec: &TimerSpec, pinned_after_unix_ms: Option<i64>) -> Option<(Ins
                 Some((Instant::now() + Duration::from_millis(ms as u64), *when))
             }
         }
-        TimerSpec::Cron { expression } => {
+        TimerSpec::Cron { expression, timezone } => {
             // The expression is supposed to be validated at register
             // time (Signal::validate inside register_signal). If the
             // validator and the `cron` parser drift apart on a minor
@@ -189,8 +189,24 @@ fn next_fire(spec: &TimerSpec, pinned_after_unix_ms: Option<i64>) -> Option<(Ins
                     return None;
                 }
             };
+            let zone = match weft_core::signal::timer::parse_timezone(timezone) {
+                Ok(z) => z,
+                Err(e) => {
+                    tracing::error!(target: "weft_listener::timer", timezone, error = %e,
+                        "cron zone rejected after validation; skipping this timer");
+                    return None;
+                }
+            };
+            // The next moment is found on the zone's wall clock
+            // (`WallClock`: one answer inside the hour the clocks
+            // change, where the bare zone would skip a day), so a
+            // schedule at nine stays at nine all year, then carried as
+            // UTC like every other deadline.
             let now: DateTime<Utc> = Utc::now();
-            let next_dt = schedule.upcoming(Utc).next()?;
+            let next_dt = schedule
+                .upcoming(weft_core::signal::timer::WallClock(zone))
+                .next()?
+                .with_timezone(&Utc);
             let delta = next_dt - now;
             let ms = delta.num_milliseconds().max(0) as u64;
             Some((Instant::now() + Duration::from_millis(ms), next_dt))

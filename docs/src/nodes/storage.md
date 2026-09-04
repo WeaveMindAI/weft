@@ -42,6 +42,7 @@ storage.put(bytes, mime, filename, keep).await?;
 storage.put_stream(stream, mime, filename, keep).await?;
 storage.put_response(resp, what, mime, filename, keep).await?;  // straight from an HTTP response
 storage.put_from_url(url, filename, keep).await?;               // the runtime fetches it
+storage.identified("whatsapp:m1").put_from_url(url, None, None).await?; // once per identity, see below
 
 storage.get(&handle).await?;
 storage.get_bytes(&handle).await?;
@@ -57,6 +58,15 @@ storage.public_link(&handle, ttl_secs).await?;  // a token-protected link, Optio
 
 Scope governs writes and lists. Key-addressed verbs act on the key's own
 scope, so reading a handle works regardless of which scope you asked for.
+
+If you pull a thing by a stable id (a message, a document at a provider),
+name it: `.identified("<service>:<id>")` before the put. The same identity in
+the same scope is then one file, however many runs ask for it: a
+`put_from_url` asks the store first and fetches nothing when the file is
+there, and two runs fetching at once cannot both land (the second sees a
+conflict and retries). Pair it with `Project` scope so the copy outlives the
+run that first pulled it. The identity is a label, scoped to the scope you
+put in; choose one that names the source, never the content.
 
 ## The keep rule
 

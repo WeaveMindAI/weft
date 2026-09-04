@@ -26,7 +26,23 @@ struct NodesResponse<T> {
     warnings: Vec<String>,
 }
 
-pub async fn run(ctx: Ctx, stdlib: bool, node: Option<String>, compact: bool) -> Result<()> {
+/// One row of `--list`: what a reader scanning for a node needs to
+/// pick one, and nothing else.
+#[derive(Serialize)]
+struct ListRow<'a> {
+    #[serde(rename = "type")]
+    node_type: &'a str,
+    tags: &'a [String],
+    description: &'a str,
+}
+
+pub async fn run(
+    ctx: Ctx,
+    stdlib: bool,
+    node: Option<String>,
+    compact: bool,
+    list: bool,
+) -> Result<()> {
     // `--stdlib`: describe the bundled stdlib catalog directly (no project on
     // disk). Otherwise describe the project's own `nodes/`. Lenient discovery
     // either way: the editor's palette must survive a node mid-edit. Same
@@ -48,6 +64,41 @@ pub async fn run(ctx: Ctx, stdlib: bool, node: Option<String>, compact: bool) ->
         // Ship RESOLVED metadata: every input's exposure + widget filled
         // with its effective value, so the editor never re-derives either.
         catalog.insert(entry.node_type.clone(), entry.metadata.resolved());
+    }
+
+    // The listing: one line per type, sorted (the BTreeMap's order), so a
+    // reader (a person, an agent) scans a catalog of a hundred nodes in
+    // a hundred short lines and reaches for `--node` on the one they
+    // want. Tags come before the description because they are what
+    // one greps for.
+    if list {
+        let rows: Vec<ListRow<'_>> = catalog
+            .iter()
+            .map(|(node_type, metadata)| ListRow {
+                node_type,
+                tags: &metadata.tags,
+                description: &metadata.description,
+            })
+            .collect();
+        // The scan warnings go out either way: a node mid-rename that
+        // dropped out of the listing has to say so, JSON or not.
+        for warning in cat.warnings() {
+            eprintln!("warning: {warning}");
+        }
+        if ctx.json() {
+            println!("{}", serde_json::to_string(&rows).context("serialize node listing")?);
+            return Ok(());
+        }
+        let width = rows.iter().map(|r| r.node_type.len()).max().unwrap_or(0);
+        for row in &rows {
+            let tags = if row.tags.is_empty() {
+                String::new()
+            } else {
+                format!("[{}] ", row.tags.join(","))
+            };
+            println!("{:<width$}  {tags}{}", row.node_type, row.description);
+        }
+        return Ok(());
     }
 
     // One node: the full resolved metadata (pretty, a person reads it), or

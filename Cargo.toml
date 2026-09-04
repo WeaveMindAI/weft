@@ -99,6 +99,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # utils
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+# IANA time zones, for a cron schedule that means "nine in Paris".
+chrono-tz = "0.10"
 bytes = "1"
 regex = "1"
 inventory = "0.3"

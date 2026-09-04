@@ -7,7 +7,9 @@ use weft::{FakeRig, NodeTest, WeftResult};
 use super::BaileyBridgeNode;
 
 pub fn tests() -> Vec<NodeTest> {
-    vec![NodeTest::fake("provisions_one_recreate_deployment_with_auth_volume", provisions)]
+    vec![
+        NodeTest::fake("provisions_one_recreate_deployment_with_auth_volume", provisions),
+    ]
 }
 
 async fn provisions(rig: FakeRig) -> WeftResult<()> {

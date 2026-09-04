@@ -46,12 +46,14 @@ impl Node for ElevenLabsChangeVoiceNode {
             "{API}/speech-to-speech/{voice}?output_format={}",
             urlencoding::encode(&output_format)
         );
-        let filename = format!("revoiced.{}", audio_file_type(&output_format)?.0);
+        let (extension, mime) = audio_file_type(&output_format)?;
+        let filename = format!("revoiced.{extension}");
         emit_audio(
             &ctx,
             http.post(url).header("content-type", content_type).body(body),
             "elevenlabs: change the voice",
             &filename,
+            mime,
         )
         .await
     }

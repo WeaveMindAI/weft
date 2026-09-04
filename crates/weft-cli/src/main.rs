@@ -259,6 +259,11 @@ enum Cmd {
     Logs {
         #[arg(value_name = "color")]
         target: Option<String>,
+        /// How many lines, counted from the END of the log: a run that
+        /// wrote more than this shows its last lines, and says so.
+        /// Unset, the dispatcher's own default applies.
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Print a summary of the cwd project's current state.
     /// Registration, listener, infra per-node, recent executions.
@@ -277,9 +282,17 @@ enum Cmd {
         #[command(subcommand)]
         action: InfraAction,
     },
-    /// Print the per-project catalog as JSON (for editor / tooling
-    /// introspection).
+    /// Print the per-project catalog: `--list` for one line per node
+    /// type (the way to find a node), `--node <Type> --compact` for
+    /// how one node wires, the bare form for the whole catalog as
+    /// JSON (the editor's palette; large).
     DescribeNodes {
+        /// One line per node type: the type, its tags, and its
+        /// one-line description. The cheap first look at a catalog;
+        /// pick a type, then `--node <Type> --compact` for its ports.
+        /// `--json` prints the same as an array.
+        #[arg(long, conflicts_with_all = ["node", "compact"])]
+        list: bool,
         /// Describe the bundled stdlib catalog instead of a project's
         /// `nodes/`. Needs no project on disk; used to produce the browser
         /// parser's catalog asset.
@@ -338,15 +351,44 @@ enum Cmd {
         #[command(subcommand)]
         action: TokenAction,
     },
-    /// List past executions for any project (newest first).
+    /// List past executions (newest first): one line per run with its
+    /// status, phase, start time, entry node and tags. `--json` prints
+    /// the page as the dispatcher returns it.
     Executions {
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Only this project's runs (a project id). Without it, every
+        /// project's.
+        #[arg(long)]
+        project: Option<String>,
+        /// Only runs of this phase: `fire` (a trigger fired, or a
+        /// manual run), `trigger_setup` or `infra_setup` (the runs an
+        /// activate, resync or infra start makes). "Has my trigger
+        /// fired since the change" is `--phase fire`.
+        #[arg(long, value_parser = parse_phase)]
+        phase: Option<weft_core::context::Phase>,
     },
-    /// Print a past execution's node events in order. Use for
-    /// offline inspection; `weft replay <color>` drives the graph
-    /// view animation.
-    Events { color: String },
+    /// Print a past execution's events in order, one line each:
+    /// time, kind, node, and a short summary of the value or error.
+    /// Values are truncated so a long run stays readable; `--node`
+    /// and `--kind` narrow it, `--full` opens the values, and `--json`
+    /// prints the replay rows the graph view reads.
+    Events {
+        color: String,
+        /// Only events of this node (its id in the source).
+        #[arg(long)]
+        node: Option<String>,
+        /// Only events of this kind (`node_failed`, `node_completed`,
+        /// `node_skipped`, `execution_cancelled`, ...), or of every
+        /// kind containing it (`failed` matches both failure kinds).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Print every value in full instead of the truncated summary.
+        /// Only the human output truncates, so this changes nothing
+        /// under `--json`, which always carries the whole row.
+        #[arg(long)]
+        full: bool,
+    },
     /// Inspect every active listener: per-tenant, prints the
     /// journal's signal count alongside the listener's local
     /// registry. Drift between the two means cleanup went wrong.
@@ -715,6 +757,21 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
     }
 }
 
+/// `--phase` as the phase itself, so the set of names has ONE
+/// definition (`Phase::as_str`) instead of a copy in the flag.
+fn parse_phase(text: &str) -> Result<weft_core::context::Phase, String> {
+    weft_core::context::Phase::from_tag(text).ok_or_else(|| {
+        format!(
+            "unknown phase '{text}': one of {}",
+            weft_core::context::Phase::ALL
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     weft_core::net::install_crypto_provider();
@@ -809,15 +866,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Cmd::Logs { target } => commands::logs::run(ctx, target).await,
+        Cmd::Logs { target, limit } => commands::logs::run(ctx, target, limit).await,
         Cmd::Status => commands::status::run(ctx).await,
         Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
         Cmd::Infra { action } => {
             let (verb, opts) = action.split();
             commands::infra::run(ctx, verb, opts).await
         }
-        Cmd::DescribeNodes { stdlib, node, compact } => {
-            commands::describe_nodes::run(ctx, stdlib, node, compact).await
+        Cmd::DescribeNodes { list, stdlib, node, compact } => {
+            commands::describe_nodes::run(ctx, stdlib, node, compact, list).await
         }
         Cmd::Parse { file } => commands::parse::parse(file).await,
         Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
@@ -826,8 +883,17 @@ async fn main() -> anyhow::Result<()> {
             CatalogAction::Update => commands::catalog::update(ctx).await,
         },
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
-        Cmd::Executions { limit } => commands::executions::list(ctx, limit).await,
-        Cmd::Events { color } => commands::executions::events(ctx, color).await,
+        Cmd::Executions { limit, project, phase } => {
+            commands::executions::list(ctx, limit, project, phase).await
+        }
+        Cmd::Events { color, node, kind, full } => {
+            commands::executions::events(
+                ctx,
+                color,
+                commands::executions::EventsFilter { node, kind, full },
+            )
+            .await
+        }
         Cmd::Listener { action } => match action {
             ListenerAction::Inspect => commands::listener::inspect(ctx).await,
         },

@@ -607,6 +607,7 @@ impl NodeMetadata {
                 Widget::Text
                 | Widget::Password
                 | Widget::Code { .. }
+                | Widget::Datetime
                 | Widget::Select { .. } => Some(WeftType::primitive(WeftPrimitive::String)),
                 Widget::Multiselect { .. } => {
                     Some(WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::String))))
@@ -1845,6 +1846,11 @@ pub enum Widget {
     /// third knob of a number input alongside `min`/`max`.
     Number { min: Option<f64>, max: Option<f64>, step: Option<f64> },
     Checkbox,
+    /// A calendar-and-clock picker for a String that holds one moment.
+    /// The stored value is ISO-8601 with the zone of whoever picked
+    /// it (`2026-09-03T11:00:00+02:00`), so the source says which
+    /// eleven o'clock it means.
+    Datetime,
     Select { options: Vec<String> },
     Multiselect { options: Vec<String> },
     /// A list of short text values the author adds and removes one at a
@@ -1938,6 +1944,7 @@ impl Widget {
             Widget::Code { .. } => "code",
             Widget::Number { .. } => "number",
             Widget::Checkbox => "checkbox",
+            Widget::Datetime => "datetime",
             Widget::Select { .. } => "select",
             Widget::Multiselect { .. } => "multiselect",
             Widget::TextList => "text_list",
@@ -2180,6 +2187,14 @@ impl NodeOutput {
     /// LLM completion, an HTTP POST already sent). Intersecting here
     /// is the honest contract: "emit the declared fields I have."
     ///
+    /// A declared key whose value is NULL is skipped too, when the port
+    /// cannot hold a null. A dynamic payload says "this message has no
+    /// caption" with a null, and firing it at a `String` port makes the
+    /// engine record a type mismatch and CLOSE the port, on every run,
+    /// for a message that was simply a picture without a caption. Not
+    /// firing says the same thing without the noise, and a port that
+    /// declares `Null` among its types still gets the value.
+    ///
     /// Nodes use it through [`crate::ExecutionContext::fan_declared`],
     /// which supplies the declared set. Same last-write-wins precedence
     /// as `extend_from_object`.
@@ -2193,9 +2208,11 @@ impl NodeOutput {
     ) -> Self {
         if let Value::Object(map) = source {
             for (k, v) in map {
-                if declared.contains_key(k) {
-                    self.outputs.insert(k.clone(), v.clone());
+                let Some(declared_type) = declared.get(k) else { continue };
+                if v.is_null() && !declared_type.accepts_runtime_value(v) {
+                    continue;
                 }
+                self.outputs.insert(k.clone(), v.clone());
             }
         }
         self
@@ -2208,6 +2225,34 @@ impl NodeOutput {
 
 #[cfg(test)]
 mod node_output_tests {
+    /// A dynamic payload says "no caption on this picture" with a
+    /// null. Firing that at a `String` port makes the engine record a
+    /// mismatch and close the port on every run; the fan skips it, and
+    /// a port that declares Null among its types still receives it.
+    #[test]
+    fn a_null_is_skipped_unless_the_port_can_hold_one() {
+        use crate::weft_type::{WeftPrimitive, WeftType};
+        let declared: std::collections::HashMap<String, WeftType> = [
+            ("content".to_string(), WeftType::Primitive(WeftPrimitive::String)),
+            (
+                "maybe".to_string(),
+                WeftType::Union(vec![
+                    WeftType::Primitive(WeftPrimitive::String),
+                    WeftType::Primitive(WeftPrimitive::Null),
+                ]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let out = NodeOutput::new().extend_from_declared(
+            &serde_json::json!({ "content": null, "maybe": null, "undeclared": "x" }),
+            &declared,
+        );
+        assert!(!out.outputs.contains_key("content"), "a null on a String port never fires");
+        assert_eq!(out.outputs["maybe"], serde_json::Value::Null, "a nullable port takes it");
+        assert!(!out.outputs.contains_key("undeclared"));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -3041,6 +3086,7 @@ mod input_semantics_tests {
             Widget::Code { language: "python".into() },
             Widget::Number { min: None, max: None, step: None },
             Widget::Checkbox,
+            Widget::Datetime,
             Widget::Select { options: vec!["a".into()] },
             Widget::Multiselect { options: vec!["a".into()] },
             Widget::Password,

@@ -11,7 +11,7 @@ This file has two readers. Tangle reads the dispatch protocol and [the review] c
 
 A node is missing only after the catalog says so (a direct `metadata.json` read or a `catalog-scout` sweep). Then:
 
-1. **Design the contract yourself.** One job, in a sentence. Every input port (name, type, required or optional, exposure) and every output port (name, type). The service it wraps, if any. Anything the surrounding program depends on (a form schema, a trigger registration, infra). The contract is the interface other wires will attach to; it is never the specialist's to invent.
+1. **Design the contract yourself.** One job, in a sentence. Every input port (name, type, required or optional, exposure) and every output port (name, type). The service it wraps, if any. Anything the surrounding program depends on (a form schema, a trigger registration, infra). The contract is the interface other wires will attach to; it is never the specialist's to invent. Every value the node takes from the graph is its own input port: never a `List` or `JsonDict` the program has to assemble from wires first (a list literal cannot hold a wire, so that shape forces a Python node whose whole body is `return {'params': [a, b]}`). When the set of values is open-ended (a query's parameters, a template's holes), the node declares `canAddInputPorts` and reads them with `ctx.inputs.custom()`, the way `ExecPython`, `Format` and `PostgresExecuteQuery` do.
 2. **Dispatch one node-smith per node.** [the brief] is the contract plus the project context the specialist cannot see (what [stage] this node feeds, what the upstream types are). Several missing nodes go out in parallel, one specialist each; nodes that depend on each other's types go out in sequence.
 3. **Run [the review]** on the report against the checklist below. A report that fails it goes back as a new dispatch; [the brief] for the redispatch carries the previous attempt's folder, the critique, and what to keep. You never fix the specialist's node yourself unless the fix is one line and obvious, because the next dispatch will need to know the pattern anyway.
 4. **Wire it.** With the node green and in the catalog, it is a normal node type: read its `metadata.json` one more time as delivered, and write the weft code.
@@ -32,6 +32,7 @@ You never trust a report you can re-verify for the cost of one command, and ever
 **Then check the contract and the body:**
 
 - The contract held: no port renamed, added, or dropped; the one job is still the one job.
+- No input asks the program to assemble values: a `List` or `JsonDict` input whose elements would come from separate wires is the wrong shape (it forces a Python node just to build the list). Each value is its own port, or the node declares `canAddInputPorts` for an open-ended set.
 - A skim of `mod.rs`: no fallbacks, no swallowed errors, no retry loops, no orchestration inside the body; failures are loud.
 - The live-tier tests are written (the real service path, with the service named and fixtures declared) and named in the report as not run: they spend real money, and the user runs them later through `/weft-live-test`.
 
@@ -86,6 +87,14 @@ members as `use super::<file>;`. A package root may hold a partial
 `type`/`label`/`description` are never inherited). Never place any of this
 under `nodes/base_catalog/`: it is wiped by `weft catalog update`.
 
+A package is also the limit of what `use` can reach: a project's own node
+sees its own package's shared files and nothing under `nodes/base_catalog/`.
+You cannot `use` a stdlib helper such as `elevenlabs.rs` from a project
+package, because each package compiles as its own crate. If you need one
+function from a stdlib helper, copy it into your package's own shared file
+and say so in the report. If you need a whole capability, report it as a ctx
+feature the language is missing.
+
 `weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow`, `tracing`,
 `uuid` are always available without declaring them.
 
@@ -100,7 +109,7 @@ Unknown keys are a loud parse error. Top level:
 | `inputs` | one list for wired data and design-time config |
 | `outputs` | output ports |
 | `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
-| `features` | flags: `isTrigger`, `isOutputDefault`, `canAddInputPorts`, `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint`, `castPorts`, `hidden` |
+| `features` | flags: `isTrigger`, `isOutputDefault`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint`, `castPorts`, `hidden` |
 | `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
 | `validate` | declarative rules: `{ "when": {...}, "then": {message, level: "structural"\|"runtime", field} }` |

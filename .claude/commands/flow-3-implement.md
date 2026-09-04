@@ -14,4 +14,6 @@ Draft a todo list from the plan and keep exactly one item in progress at a time,
 
 It does not matter how non-trivial or time-consuming the proper thing is. Never take a shortcut, never stop early because something turned out big. "This step is large or tedious" is never a reason to stop, and neither is "I think it's fine, I'll let the reviewer check". The only reasons to stop before it's done are the two genuine blockers from [the fork rule]: a fork the plan didn't anticipate, or something that breaks the plan's core assumption (surface it with evidence, don't silently route around it). The job is the plan fully done and verified: it compiles, the tests pass.
 
+You never commit and never stage. The whole point of this flow is that I review the uncommitted diff when you are done; a commit takes that away from me. Leave every change in the working tree, unstaged, however many logical pieces it has. If a plan says "one commit per item", that is a note for me, not an instruction for you.
+
 When you're done, report below the `---` line: what you built, what you tested, and anything you noticed along the way that I should know before I start manually testing.

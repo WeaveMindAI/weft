@@ -40,6 +40,16 @@ console.
 
 ## Inputs
 
+Every value a node takes from the graph is an input port, one value per port.
+A node never asks the author to pack several values into one list or dict
+first: `PostgresExecuteQuery` once took its parameters as a `List`, and every
+query with two parameters cost the program a Python node whose whole body was
+`return {'params': [a, b]}`. When the set of values is open-ended (a query's
+parameters, a template's holes, a script's variables), the node declares
+`canAddInputPorts` in `features` and the author declares the ports inline:
+`PostgresExecuteQuery(user_id: String) { query: "... WHERE id = $user_id" }`.
+The body reads them with `ctx.inputs.custom()`.
+
 ```json
 {
   "name": "method",
@@ -96,6 +106,7 @@ per file.
 | `textarea` | a multi-line box, for a String that holds prose |
 | `code` | a code editor; takes `language` |
 | `number` | takes `min` / `max` / `step`, enforced by both the editor and the compiler |
+| `datetime` | a calendar-and-clock picker for a String holding one moment; stores ISO-8601 with the picker's zone offset |
 | `password` | a masked field |
 | `file_drop` | narrows the file filter beyond the type; takes `accept` |
 | `text_list` | a list of short text values, added one at a time |
@@ -149,7 +160,7 @@ The complete set, `hidden` aside, which only catalog nodes use:
 | `optionalCustomInputs` | ports created by a wire on this node are optional by default |
 | `customInputType` | the type every WIRED created port takes; a shared variable (`T`) makes them one type. A port created by a config literal takes the literal's own inferred type instead, so a non-string literal on a `String`-typed node is caught at run time by the node, loudly |
 | `liveEndpoint` | names the endpoint serving `/live` for an infra node |
-| `canAddInputPorts` | the `.weft` author may add input ports to this node, by declaring them or by wiring a config key that names no declared port. Without it, an extra port is a compile error. |
+| `canAddInputPorts` | the `.weft` author may add input ports to this node, by declaring them or by wiring a config key that names no declared port. Without it, an extra port is a compile error. This is how a node takes an open-ended set of values (`ExecPython`, `Format`, `PostgresExecuteQuery`); never a `List` input the author has to assemble. |
 | `canAddOutputPorts` | the same for outputs |
 | `showDebugPreview` | the editor renders the node's latest output inline on its body |
 | `oneOfRequired` | groups of ports where at least one of each group has to arrive, or the node is **skipped**. `[["message", "attachment"]]` means a send needs one or the other. |

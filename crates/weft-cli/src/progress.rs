@@ -295,8 +295,12 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
         ),
+        // The image is what is cached: node code and the engine. The
+        // definition (config, `@file` contents) always registers fresh,
+        // so a SQL or prompt edit runs without a rebuild and this line
+        // must not read as "your change was skipped".
         Phase::BuildSkip => format!(
-            "{} cached, skipping build",
+            "{} unchanged since the last build, reusing the image (config and @file contents still update)",
             ev.detail
                 .and_then(|d| d.get("image"))
                 .and_then(|v| v.as_str())

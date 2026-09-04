@@ -63,7 +63,11 @@ in advance:
 | `.in_order()` | every value that ARRIVED, in the node's port order |
 
 `.custom()` is the one for nodes that treat "whatever the user wired in" as a
-dynamic set: script variables, form prefill.
+dynamic set: script variables, a query's parameters, a template's holes, form
+prefill. It pairs with `canAddInputPorts` in the metadata, and it is the shape
+for any open-ended set of values: a node never takes a `List` the author has
+to assemble from wires, because a list literal cannot hold a wire and the
+author ends up writing a Python node just to build it.
 
 `.in_order()` is for a node that answers by ORDER. A port that delivered
 nothing is absent, so the first pair is the first branch that spoke, which is

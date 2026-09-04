@@ -78,7 +78,11 @@ fn format_event(raw: &str) -> String {
             value.get("service").and_then(|v| v.as_str()).unwrap_or("?"),
             value.get("amount_usd").and_then(|v| v.as_f64()).unwrap_or(0.0),
         ),
-        _ => format!("  {raw}"),
+        // Every other event (a node starting, completing, skipping, a
+        // loop turning) renders as the same compact line `weft events`
+        // prints, so the live stream and the replay read alike and a
+        // node's output is a summary rather than a raw JSON row.
+        _ => format!("  {}", crate::commands::executions::event_line(&value, false)),
     }
 }
 

@@ -1603,6 +1603,7 @@ pub async fn status(
                 project_id: Some(project_id.clone()),
                 started_after: None,
                 started_before: None,
+                phase: None,
             },
         )
         .await

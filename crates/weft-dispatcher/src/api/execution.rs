@@ -277,6 +277,7 @@ pub async fn get(
         "project_id": summary.project_id,
         "entry_node": summary.entry_node,
         "status": summary.status,
+        "phase": summary.phase,
         "started_at": summary.started_at,
         "completed_at": summary.completed_at,
         "tags": summary.tags,
@@ -287,33 +288,73 @@ pub async fn get(
 pub struct LogLineOut {
     pub at_unix: u64,
     pub level: String,
+    /// The firing this line is about: the node, and the loop
+    /// iteration it was in. Absent on the wire for a run-level line
+    /// (the run itself failing or being cancelled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: weft_core::LoopFrames,
     pub message: String,
+}
+
+/// How many log lines one read returns, and the ceiling on asking for
+/// more. The journal answers with the TAIL, so the default holds the
+/// end of a long run, which is where a run goes wrong. A `limit`
+/// outside `1..=MAX` is refused, not quietly moved: a caller who
+/// asked for more than the ceiling would otherwise read a cut log as
+/// the whole one.
+const DEFAULT_LOG_LINES: u32 = 1_000;
+const MAX_LOG_LINES: u32 = 20_000;
+
+#[derive(Debug, Deserialize)]
+pub struct ListLogsParams {
+    pub limit: Option<u32>,
+}
+
+/// A run's log: the tail, and the limit that cut it, so a reader who
+/// sent none still knows how long a full page is.
+#[derive(Debug, Serialize)]
+pub struct LogsOut {
+    pub limit: u32,
+    pub lines: Vec<LogLineOut>,
 }
 
 pub async fn list_logs(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(color_str): Path<String>,
-) -> Result<Json<Vec<LogLineOut>>, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_execution(&*state.journal, &caller.0, color)
-        .await
-        .map_err(|(s, _)| s)?;
+    Query(params): Query<ListLogsParams>,
+) -> Result<Json<LogsOut>, (StatusCode, String)> {
+    let color: Color = color_str
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("'{color_str}' is not a color (a uuid)")))?;
+    authorize_execution(&*state.journal, &caller.0, color).await?;
+    let limit = params.limit.unwrap_or(DEFAULT_LOG_LINES);
+    if !(1..=MAX_LOG_LINES).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("limit is {limit}; one read holds between 1 and {MAX_LOG_LINES} lines"),
+        ));
+    }
+    // The journal's error names the color and `weft clean` when a row
+    // no longer decodes; the reader gets it, not a bare 500.
     let entries = state
         .journal
-        .logs_for(color, 1_000)
+        .logs_for(color, limit)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(
-        entries
-            .into_iter()
-            .map(|e| LogLineOut {
-                at_unix: e.at_unix,
-                level: e.level,
-                message: e.message,
-            })
-            .collect(),
-    ))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let lines = entries
+        .into_iter()
+        .map(|e| LogLineOut {
+            at_unix: e.at_unix,
+            level: e.level,
+            node: e.node,
+            frames: e.frames,
+            message: e.message,
+        })
+        .collect();
+    Ok(Json(LogsOut { limit, lines }))
 }
 
 /// Replay a past execution: returns every journaled event the SSE
@@ -404,6 +445,8 @@ pub struct ListExecutionsParams {
     pub started_after: Option<u64>,
     /// Exclusive upper bound on start time (unix seconds).
     pub started_before: Option<u64>,
+    /// Only runs of this phase (`fire`, `trigger_setup`, `infra_setup`).
+    pub phase: Option<weft_core::context::Phase>,
 }
 
 const DEFAULT_PAGE: u32 = 50;
@@ -420,6 +463,7 @@ pub async fn list_executions(
         project_id: params.project_id,
         started_after: params.started_after,
         started_before: params.started_before,
+        phase: params.phase,
     };
     let mut page = state
         .journal
@@ -450,6 +494,7 @@ pub async fn latest_for_project(
         project_id: Some(id_str),
         started_after: None,
         started_before: None,
+        phase: None,
     };
     let mut page = state
         .journal

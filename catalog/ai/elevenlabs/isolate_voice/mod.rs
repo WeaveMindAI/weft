@@ -41,6 +41,8 @@ impl Node for ElevenLabsIsolateVoiceNode {
                 .body(body),
             "elevenlabs: isolate the voice",
             &filename,
+            // Isolation gives back the same kind of audio it was given.
+            &meta.mime_type,
         )
         .await
     }

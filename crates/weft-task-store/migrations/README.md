@@ -17,7 +17,8 @@ the schema.
 `drafts/` holds migrations that exist only on the machine that wrote them:
 gitignored, applied to that one database while a shape is still being decided,
 and collapsed into a single released file by
-`./setup.sh --migration <name> --release`.
+`./setup.sh --migration <name> --release`. A draft pass is optional: a release
+on a database that never saw one runs the released file on it right there.
 
 Nothing lists these files. The crate's build script walks this directory, so a
 file being here is the whole of it being a migration. How to write one, and the

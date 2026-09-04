@@ -982,7 +982,7 @@ fn trigger_wiring_rules_are_compile_errors() {
     // trigger-into-trigger, via a plain node in between (transitive).
     let project = parse_enrich(
         r#"
-t1 = Cron { cron: "* * * * *" }
+t1 = Cron { cron: "0 * * * * *" }
 mid = Debug
 mid.data = t1.scheduledTime
 t2 = HumanTrigger
@@ -1001,7 +1001,7 @@ fn a_trigger_inside_a_loop_is_a_compile_error() {
         r#"
 my = Loop(items: List[String]) -> (results: List[String | Null]) {
     over: ["items"]
-    t = Cron { cron: "* * * * *" }
+    t = Cron { cron: "0 * * * * *" }
     p = Text {}
     p.value = self.items
     self.results = p.value
@@ -1019,7 +1019,7 @@ fn a_trigger_wired_into_an_infra_node_is_a_compile_error() {
     // the rule guards the definition shape itself.
     let mut project = parse_enrich(
         r#"
-t = Cron { cron: "* * * * *" }
+t = Cron { cron: "0 * * * * *" }
 mid = Debug
 mid.data = t.scheduledTime
 sink = Debug
@@ -2472,6 +2472,81 @@ fn enrich_stamps_declared_types_from_the_header_only() {
     );
 }
 
+/// Narrowing a typevar port in the header narrows it on every port of
+/// that node that shares the var. `Wait(value: String)` pins the `T`
+/// the pass-through carries in AND out; before this, only the input
+/// narrowed and the output stayed `T`, so the program that had just
+/// named its type failed with `unresolved-typevar`.
+#[test]
+fn declaring_a_typevar_port_narrows_the_whole_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("hold");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "Hold",
+  "label": "Hold",
+  "description": "pass-through fixture",
+  "inputs": [{ "name": "value", "type": "T", "required": false }],
+  "outputs": [{ "name": "value", "type": "T" }, { "name": "many", "type": "List[T]" }]
+}"#,
+    )
+    .unwrap();
+    let catalog = FsCatalog::discover(dir.path()).expect("fixture catalog");
+    let mut project =
+        compile("h = Hold(value: String)\n", uuid::Uuid::new_v4(), CompileFs::none())
+            .expect("compile");
+    enrich(&mut project, &catalog).expect("enrich");
+    let h = project.nodes.iter().find(|n| n.id == "h").expect("node h");
+    let out = h.outputs.iter().find(|p| p.name == "value").expect("output value");
+    assert_eq!(out.port_type.wire_string(), "String", "the pass-through output narrowed too");
+    let many = h.outputs.iter().find(|p| p.name == "many").expect("output many");
+    assert_eq!(many.port_type.wire_string(), "List[String]", "a nested occurrence narrows as well");
+}
+
+/// Two ports that pin the same type variable to different types is a
+/// contradiction: the node would get a contract it never had, so
+/// enrich refuses it naming both types.
+#[test]
+fn two_declarations_of_one_typevar_must_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("pick");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "Pick",
+  "label": "Pick",
+  "description": "two ports of one var",
+  "inputs": [
+    { "name": "a", "type": "T", "required": false },
+    { "name": "b", "type": "T", "required": false }
+  ],
+  "outputs": [{ "name": "out", "type": "T" }]
+}"#,
+    )
+    .unwrap();
+    let catalog = FsCatalog::discover(dir.path()).expect("fixture catalog");
+    let mut project =
+        compile("p = Pick(a: String, b: Number)\n", uuid::Uuid::new_v4(), CompileFs::none())
+            .expect("compile");
+    let err = enrich(&mut project, &catalog).expect_err("a contradiction is refused");
+    let text = format!("{err:?}");
+    assert!(text.contains("String") && text.contains("Number"), "{text}");
+
+    // Agreeing declarations are fine, and narrow the whole node.
+    let mut project =
+        compile("p = Pick(a: String, b: String)\n", uuid::Uuid::new_v4(), CompileFs::none())
+            .expect("compile");
+    enrich(&mut project, &catalog).expect("agreeing declarations enrich");
+    let p = project.nodes.iter().find(|n| n.id == "p").expect("node p");
+    assert_eq!(
+        p.outputs.iter().find(|o| o.name == "out").unwrap().port_type.wire_string(),
+        "String"
+    );
+}
+
 /// `declared_type` is the VERBATIM header annotation, never a re-print of
 /// the parsed type. A re-print would expand a registry alias and, worse,
 /// turn an unparseable annotation into the `MustOverride` placeholder,
@@ -2550,3 +2625,266 @@ fn diagnostics_carry_the_included_file() {
         hit.file
     );
 }
+
+/// `@require_one_of` on a catalog-typed node survives enrich (the
+/// catalog's features once replaced it wholesale, so it guarded
+/// nothing), a name that is not a port is refused naming the inputs,
+/// and a satisfied group is not warned about as "no required input".
+#[test]
+fn require_one_of_survives_the_catalog_merge_and_checks_its_names() {
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+act = ExecPython(a: String?, b: String?, @require_one_of(a, b)) -> (out: String) {
+    code: "return {'out': a or b}"
+    a: seed.value
+}
+"#,
+    );
+    let act = project.nodes.iter().find(|n| n.id == "act").expect("act");
+    assert_eq!(act.features.one_of_required, vec![vec!["a".to_string(), "b".to_string()]]);
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"no-required-skip"), "the group counts as a requirement: {d:?}");
+    assert!(!codes(&d).contains(&"require-one-of-unmet"), "a is wired: {d:?}");
+
+    // A name that is not a port on a node whose ports are the
+    // catalog's is a typo, and the directive guarded nothing.
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+look = Debug(@require_one_of(data, bogus))
+look.data = seed.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown = d
+        .iter()
+        .find(|e| e.code.as_deref() == Some("require-one-of-unknown-port"))
+        .expect("an unknown name in the directive is refused");
+    assert!(unknown.message.contains("'bogus'") && unknown.message.contains("Inputs: ["), "{}", unknown.message);
+
+    // Where the author can add input ports, a name is a port once the
+    // header declares it, a wire lands on it, or a config key names it;
+    // a name that is none of those does not exist, whatever the node
+    // type, and is refused the same way.
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+act = ExecPython(@require_one_of(a, b)) -> (out: String) {
+    code: "return {'out': a}"
+    a: seed.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown = d
+        .iter()
+        .find(|e| e.code.as_deref() == Some("require-one-of-unknown-port"))
+        .expect("`b` is no port of this instance");
+    assert!(unknown.message.contains("'b'"), "{}", unknown.message);
+
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+act = ExecPython(b?: String, @require_one_of(a, b)) -> (out: String) {
+    code: "return {'out': a}"
+    a: seed.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        !codes(&d).contains(&"require-one-of-unknown-port"),
+        "declared in the header, `b` exists even unwired: {d:?}"
+    );
+}
+
+/// One unknown node type must not switch type inference off for the
+/// whole file: the generic nodes elsewhere still resolve, so the
+/// only diagnostics are the unknown type's own.
+#[test]
+fn an_unknown_node_type_does_not_unresolve_every_typevar() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+seed = Text { value: "yes" }
+route = Switch {
+    value: seed.value
+    cases: [
+        { "kind": "equals", "value": "yes", "port": "go" },
+        { "kind": "otherwise", "port": "stop" }
+    ]
+}
+show = Debug { data: route.go }
+ghost = NoSuchNodeType { x: seed.value }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let typevars: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|e| e.code.as_deref() == Some("unresolved-typevar"))
+        .collect();
+    assert!(typevars.is_empty(), "the Switch and Debug resolved against the Text: {typevars:?}");
+}
+
+/// `self.<port>` inside a loop nested in a group, where the port is the
+/// GROUP's input: the rule holds (`self` is the loop's own boundary)
+/// and the message says so, naming the fix, instead of reading like
+/// the port does not exist.
+#[test]
+fn a_loop_reading_the_enclosing_groups_self_is_told_to_thread_it_in() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+outer = Group(db: String, items: List[String]) -> (done: List[String | Null]) {
+    run = Loop(items: List[String]) -> (results: List[String | Null]) {
+        over: ["items"]
+        step = ExecPython(row: String, db: String) -> (out: String) {
+            code: "return {'out': row + db}"
+            row: self.items
+            db: self.db
+        }
+        self.results = step.out
+    }
+    run.items = self.items
+    self.done = run.results
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hint = d
+        .iter()
+        .find(|e| e.code.as_deref() == Some("unknown-source-port"))
+        .expect("the missing port is reported");
+    assert!(hint.message.contains("inside the loop 'outer.run'"), "{}", hint.message);
+    assert!(hint.message.contains("enclosing group 'outer'"), "{}", hint.message);
+    assert!(hint.message.contains("run.db = self.db"), "{}", hint.message);
+}
+
+/// A loop's OUT boundary's gather ports are optional by construction,
+/// so the "no required input" warning never lands on it; a loop whose
+/// declared inputs are all optional does get it, under the loop's own
+/// name and at its header (the boundary id `my__in` appears nowhere in
+/// the source, and line 0 is nowhere to point). The OUT side's own
+/// warning, nobody consuming the loop's results, names the loop too.
+#[test]
+fn boundary_warnings_name_the_group_at_its_header() {
+    let project = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String]) { code: "return {'items': ['a']}" }
+my = Loop(items: List[String]?) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.items = seed.items
+out = Debug { data: my.results }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let on_boundaries: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|e| e.message.contains("__out") || e.message.contains("__in"))
+        .collect();
+    assert!(on_boundaries.is_empty(), "no diagnostic names a boundary node: {on_boundaries:?}");
+    let on_loop: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|e| e.code.as_deref() == Some("no-required-skip") && e.message.contains("node 'my'"))
+        .collect();
+    assert_eq!(on_loop.len(), 1, "the all-optional header warns under the loop's name: {d:?}");
+    assert_eq!(on_loop[0].line, 3, "at the loop's header, not line 0: {:?}", on_loop[0]);
+
+    let unread = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String]) { code: "return {'items': ['a']}" }
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.items = seed.items
+out = Debug { data: seed.items }
+"#,
+    );
+    let d = validate(&unread, &catalog());
+    assert!(
+        !d.iter().any(|e| e.message.contains("__out") || e.message.contains("__in")),
+        "no diagnostic names a boundary node: {d:?}"
+    );
+    let orphan: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|e| e.code.as_deref() == Some("orphan-outputs") && e.message.contains("node 'my'"))
+        .collect();
+    assert_eq!(orphan.len(), 1, "unconsumed loop results warn under the loop's name: {d:?}");
+    assert_eq!(orphan[0].line, 3, "{:?}", orphan[0]);
+
+    // A mistyped group port names the group, not the boundary the
+    // edge was rewritten onto.
+    let typo = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String]) { code: "return {'items': ['a']}" }
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.itmes = seed.items
+out = Debug { data: my.results }
+"#,
+    );
+    let d = validate(&typo, &catalog());
+    assert!(
+        d.iter().any(|e| e.code.as_deref() == Some("unknown-target-port") && e.message.contains("node 'my'")),
+        "the typo is refused under the loop's name: {d:?}"
+    );
+    assert!(
+        !d.iter().any(|e| e.message.contains("__out") || e.message.contains("__in")),
+        "no diagnostic names a boundary node (the unmet required input included): {d:?}"
+    );
+
+    // Two drivers on a group port, and a wrong type into one: named
+    // after the group as well.
+    let driven_twice = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String], n: Number) { code: "return {'items': ['a'], 'n': 1}" }
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.items = seed.items
+my.items = seed.n
+out = Debug { data: my.results }
+"#,
+    );
+    let d = validate(&driven_twice, &catalog());
+    assert!(
+        d.iter().any(|e| e.code.as_deref() == Some("duplicate-input-port") && e.message.contains("'my.items'")),
+        "{d:?}"
+    );
+    assert!(
+        !d.iter().any(|e| e.message.contains("__out") || e.message.contains("__in")),
+        "no diagnostic names a boundary node: {d:?}"
+    );
+
+    // A component file's root boundaries are its interface: nothing
+    // inside consumes its outputs by construction, and that warns on
+    // nobody.
+    let component = parse_enrich(
+        r#"
+Group(raw: String?) -> (cleaned: String) {
+    s = Text { value: "x" }
+    self.cleaned = s.value
+}
+"#,
+    );
+    let d = validate(&component, &catalog());
+    assert!(
+        !d.iter().any(|e| e.code.as_deref() == Some("orphan-outputs") || e.code.as_deref() == Some("no-required-skip")),
+        "a component's interface is nobody's orphan: {d:?}"
+    );
+}
+
+

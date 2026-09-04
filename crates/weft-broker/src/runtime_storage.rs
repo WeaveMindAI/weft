@@ -83,6 +83,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/files/{*key}", delete(delete_file))
         .route("/v1/storage/meta/{*key}", get(get_meta))
         .route("/v1/storage/list", get(list_files))
+        .route("/v1/storage/identity", post(find_identity))
         .route("/v1/storage/keep", post(keep_file))
         .route("/v1/storage/presign", post(presign))
         .route("/v1/storage/public-link", post(public_link))
@@ -219,6 +220,7 @@ async fn upload_begin(
                 keep: req.keep,
                 declared_size: req.declared_size,
                 content_hash: None,
+                identity: req.identity.as_deref(),
             },
             state.entitlements.as_ref(),
         )
@@ -228,13 +230,13 @@ async fn upload_begin(
         crate::runtime_store::BeginUpload::Ready { key, part_size } => {
             Ok(Json(UploadBeginResponse { key, part_size, already_stored: false }))
         }
-        // Only content-addressed (asset) begins can answer already-stored,
-        // and this path never carries a content hash: reaching here is a
-        // store invariant break, not a caller error.
-        crate::runtime_store::BeginUpload::AlreadyStored { key } => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("begin without a content hash answered already-stored for '{key}'"),
-        )),
+        // An identified begin whose scope already holds that identity:
+        // the caller's own dedup answer, so it uploads nothing and reads
+        // the file it named. There is no part size because there are no
+        // parts to send.
+        crate::runtime_store::BeginUpload::AlreadyStored { key } => {
+            Ok(Json(UploadBeginResponse { key, part_size: 0, already_stored: true }))
+        }
     }
 }
 
@@ -385,6 +387,20 @@ async fn list_files(
     Ok(Json(ListFilesResponse { files }))
 }
 
+/// `POST /v1/storage/identity`: the file stored under an identity in a
+/// scope, or null. Answers from the row alone; no bucket access, no
+/// expiry bump (nothing was read).
+async fn find_identity(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<weft_core::storage::IdentityLookupRequest>,
+) -> Result<Json<weft_core::storage::IdentityLookupResponse>, ApiError> {
+    let caller = worker_caller(&state, &headers).await?;
+    let store = store(&state)?;
+    let file = store.find_identity(&caller, &req.scope, &req.identity).await.map_err(map_err)?;
+    Ok(Json(weft_core::storage::IdentityLookupResponse { file }))
+}
+
 async fn keep_file(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
@@ -530,6 +546,7 @@ async fn admin_upload_begin(
                 keep: None,
                 declared_size: req.declared_size,
                 content_hash: Some(&req.content_hash),
+                identity: None,
             },
             state.entitlements.as_ref(),
         )

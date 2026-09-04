@@ -207,8 +207,26 @@ pub struct RecordCostPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordLogPayload {
     pub color: String,
+    /// The node that wrote the line, and the iteration it was in.
+    /// `default` so a task enqueued by an older worker still decodes.
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub frames: weft_core::LoopFrames,
     pub level: String,
     pub message: String,
+    /// When the node wrote it, on the worker's clock, in milliseconds:
+    /// the dispatcher journals the line later, whenever it drains the
+    /// task, and that moment says nothing about the run. `default` so
+    /// a task enqueued by an older worker still decodes; it then reads
+    /// at the drain, which is all that worker ever recorded.
+    #[serde(default)]
+    pub at_unix_ms: Option<u64>,
+    /// Its place among the firing's side effects: the same counter
+    /// the dedup key carries, so two lines one firing wrote in the
+    /// same millisecond still read back in order.
+    #[serde(default)]
+    pub seq: Option<u64>,
 }
 
 #[cfg(test)]

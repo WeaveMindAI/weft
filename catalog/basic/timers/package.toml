@@ -1,0 +1,8 @@
+[package]
+name = "timers"
+
+# The two nodes that park a branch on a timer signal: `Wait` for a
+# duration, `WaitUntil` for a moment. What they emit once the timer
+# fired is the shared `timers.rs`.
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }

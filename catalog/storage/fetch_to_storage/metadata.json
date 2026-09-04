@@ -1,7 +1,7 @@
 {
   "type": "FetchToStorage",
   "label": "Fetch to Storage",
-  "description": "Download a file from a URL straight into execution storage and emit a file reference. The bytes stream directly into storage (never buffered whole), so it handles large files. Wire `file` into MediaDisplay, DownloadLink, KeepFile, or any node that takes a stored file.",
+  "description": "Download a file from a URL straight into storage and emit a file reference. The bytes stream directly into storage (never buffered whole), so it handles large files. Wire `file` into MediaDisplay, DownloadLink, KeepFile, or any node that takes a stored file. To fetch a thing ONCE per project however many runs ask for it, set `scope` to `project` and give it an `identity` (a label for the source, such as `docs:invoice-42`): a second fetch of the same identity answers the file already stored and downloads nothing.",
   "tags": [
     "storage",
     "fetch",
@@ -29,7 +29,30 @@
       "exposure": "config",
       "default": false,
       "label": "Keep past the run",
-      "description": "Store the file already flagged to survive the execution-end sweep (30-day access-extended TTL)."
+      "description": "Store the file already flagged to survive the execution-end sweep (30-day access-extended TTL). Only with `scope: execution`: a project file outlives the run already, and the pair is refused."
+    },
+    {
+      "name": "scope",
+      "type": "String",
+      "exposure": "config",
+      "default": "execution",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "execution",
+          "project"
+        ]
+      },
+      "label": "Store in",
+      "description": "`execution`: the file belongs to this run (swept when it ends unless kept). `project`: it belongs to the project and outlives the run, shared by every run."
+    },
+    {
+      "name": "identity",
+      "type": "String",
+      "exposure": "config",
+      "required": false,
+      "label": "Identity",
+      "description": "What the file is a copy of, as a stable label (`<source>:<id>`). A fetch whose identity is already stored in the chosen scope answers that file and downloads nothing, so the same document asked for by many runs is one file. Leave empty for a file that is its own thing."
     }
   ],
   "outputs": [

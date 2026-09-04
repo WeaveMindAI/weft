@@ -16,15 +16,15 @@ CLI.
 | `weft follow <project>` | live event stream for a project |
 | `weft stop <color>` | cancel a running execution |
 | `weft ps` | list registered projects |
-| `weft status` | the runtime's overall state |
+| `weft status` | the runtime's overall state. A project on disk that was never built is told so, and named `weft build`, rather than failing. |
 
 ## Executions
 
 | Command | What it does |
 |---|---|
-| `weft executions [--limit N]` | recent executions, with the tags each run put on itself ([stopping other runs](../nodes/steering-executions.md)) |
-| `weft events <color>` | every journal event for one execution, in order |
-| `weft logs [color]` | log lines |
+| `weft executions [--limit N] [--project <id>] [--phase fire\|trigger_setup\|infra_setup]` | recent executions, newest first, with each run's status, phase, local start time, entry node and the tags it put on itself ([stopping other runs](../nodes/steering-executions.md)). "Has my trigger fired since the change" is `--phase fire`: it hides the setup runs an activate or resync makes. |
+| `weft events <color> [--node <id>] [--kind <kind>] [--full]` | one execution's events in order, one line each: local time, kind, node, and a short summary of the value or error. Values are cut short so a long run stays readable; `--node` keeps one node's events, `--kind` one kind (`node_failed`; a substring works, so `failed` catches both failure kinds), `--full` prints the values whole, and `--json` prints the replay rows the graph view reads. |
+| `weft logs [color]` | the run's log: the lines its nodes wrote, and every failure the journal recorded about it (a node failing, a port refusing a value, the run failing or being cancelled) as `error` and `warn` lines naming the node they are about. The last 1000 lines; `--limit` raises that (up to 20000), and a full page says the run may have written more. |
 | `weft clean [color]` | purge journal data. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images` (reclaim worker images nothing runs any more, scoped to the current project's images; a global sweep of dangling untagged build leftovers rides along. With `--all`: every project's, the kind node's copies, stale `weft-infra-*` tags, and old builder-base images; whatever the dispatcher's referenced set covers survives) and `--build-cache`. `setup.sh` runs `--images --all` after every daemon refresh. |
 
 ## Triggers
@@ -101,7 +101,7 @@ Aliased to `weft d`.
 | `weft test-node [target]` | run node self-tests: the basic and fake tiers, locally, no cluster. `--tier live` adds the real-credential tier, which **can spend money**, so it asks first (`--yes` to skip the prompt). See [Testing a node](../nodes/testing.md). |
 | `weft node-test-hash [target]` | the content hash of a package's test inputs. Run it when you want to know whether anything a package's tests depend on has changed since they last passed. |
 | `weft catalog update` | re-sync `nodes/base_catalog/` to the installed weft's standard library. It **wipes and recopies** that folder, so copy anything you edited in there out first. |
-| `weft describe-nodes [--stdlib] [--node <Type>] [--compact]` | print the catalog as JSON. This is how you hand a model the full node vocabulary. `--compact` strips it to the wiring view (no labels, icons, connect recipes, or null knobs) so the vocabulary costs a fraction of the tokens; `--node` prints one type only. |
+| `weft describe-nodes [--stdlib] [--list \| --node <Type> [--compact]]` | print the catalog. `--list` is one line per node type (type, tags, one-line description): the cheap first look, and how you find a node. `--node <Type> --compact` is one node's wiring view (no labels, icons, connect recipes, or null knobs), the token-cheap thing a model reads before wiring it; without `--compact` it is the full resolved metadata. The bare form prints the whole catalog as JSON for the editor's palette, and it is large. |
 
 ## Compiler surfaces
 

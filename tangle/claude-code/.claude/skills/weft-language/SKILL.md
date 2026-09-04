@@ -51,6 +51,15 @@ obj  = SomeNode { opts: { "k": "v" } }
 Commas between fields are optional; a field per line with no commas reads the
 same. `null` is never a literal: omit the field instead (`config-null-literal`).
 
+A list or object literal holds plain values only, so `params: [self.chatId,
+self.pushName]` is refused. When a node needs several values from the graph,
+each one is its own input port. When a node accepts however many values you
+give it, declare them in its inline signature:
+`PostgresExecuteQuery(chat_id: String, push_name: String) { ... }` and the
+SQL reads `$chat_id`; `Format(user: String) { template: "Hi {{user}}" }`.
+If you find yourself writing a Python node whose only job is to put wires
+into a list, declare the ports on the consumer instead.
+
 ### Wires in the braces
 
 A field whose value is `source.port` is a wire, the same edge as a connection
@@ -135,6 +144,13 @@ decides never spoke) skips the node, closing its outputs, skipping everything
 behind it. `_should_flow: false` in the braces turns one node off. Groups and
 Loops take it too, inside the braces or on the container's name from outside.
 
+`_should_flow` is also the ORDERING wire. It takes a value of any type and
+only `false` says no, so `typed = ExecPython { _should_flow: typing.done }`
+means run once `typing` has fired. The value itself is never read. Never
+invent an input port for that (an `after: typing.done` port the code
+ignores): it puts a value on the graph that nothing reads, and
+`_should_flow` already shows in the graph as a permission wire.
+
 ## Inline port signatures
 
 Types that leave ports open declare them in the declaration:
@@ -182,7 +198,10 @@ lookup = SlackFindUser {
 
 `@require_one_of(a, b)` on its own line in a node, group, or inline
 signature: at least one named input must be satisfied. Compile error when
-unmet; at run time the node skips when every port in the group arrives closed.
+unmet, and a compile error when a name is not a port of that node (on a node
+that takes custom ports, a name is a port once the header declares it, a wire
+lands on it, or a config key names it); at run time the node skips when every
+port in the group arrives closed.
 
 ## Types
 
@@ -212,6 +231,20 @@ creates is optional.
 `history = Cast() -> (value: ChatHistory)`. The conversion table is checked
 at compile time (`cast-not-allowed` for impossible pairs); record and named
 targets are validated at run time, errors name the offending field.
+
+If you have a file and the port wants one KIND of file, that is a Cast too.
+A node that fetches whatever a message held emits `File` (any stored file);
+a node that transcribes emits nothing until it is given `Audio`. `File` into
+`Audio` is `type-mismatch`, because the kind is only known once the bytes are
+there. So say which kind you are claiming, and the run checks the claim:
+
+```weft
+voice = Cast -> (value: Audio) { value: msg.file }
+say   = ElevenLabsTranscribeFile { account: key.access, audio: voice.value }
+```
+
+A file that really is audio passes through untouched; one that is not fails
+the Cast loudly, naming what it got.
 
 Compatibility: identical types; unions member-wise; `JsonDict` with any
 string dict; named types with `JsonDict` and their own shape; containers
@@ -376,6 +409,13 @@ Two implicit ports: `self.index: Number` (read-only, zero-based) and
 `self.done: Boolean` (write `true` to stop launching, sequential only).
 Both names are reserved.
 
+Inside a loop, `self` is the LOOP's own boundary, never the group around it.
+A loop nested in a group cannot read the group's `self.db`; the value has to
+come in as a broadcast input of the loop, declared in its signature and wired
+from the group (`run = Loop(db: Access, ...) { ... }` then `run.db = self.db`
+at the group level). If you try, you get `unknown-source-port`, and it
+names both scopes and the two lines to write.
+
 `parallel` defaults `false`. Five shapes: parallel map (true, over, no
 carry), sequential map, fold (carry), while (no over, stop vote or
 `max_iters`), side effect (no over, no carry). Refused: parallel with carry;
@@ -439,7 +479,8 @@ Streams: `generator-multiple-consumers`, `generator-through-group`,
 
 Names: `reserved-name`, `reserved-port-name`.
 
-Requirements: `require-one-of-unmet`, `no-required-skip` (a warning: all
+Requirements: `require-one-of-unmet`, `require-one-of-unknown-port`,
+`no-required-skip` (a warning: all
 wireable inputs optional, add `@require_one_of`), `rule-structural`,
 `rule-runtime` (a node's own declarative validation; the message is the node
 author's).

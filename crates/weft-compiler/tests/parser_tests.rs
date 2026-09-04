@@ -2948,3 +2948,67 @@ fn a_literal_on_an_include_alias_port_lands_on_the_included_group() {
     let node = p2.nodes.iter().find(|n| n.id == "c").expect("opaque include node");
     assert_eq!(node.config.get("raw"), Some(&serde_json::json!("hi")));
 }
+
+/// `name?: Type` is the same optional port as `name: Type?`: the `?`
+/// on the name once closed the declaration early, so `: Type` became
+/// a second port named after the type and the error read
+/// "Duplicate in port \"Boolean\"".
+#[test]
+fn optional_marker_on_the_name_precedes_the_type() {
+    let source = r#"
+act = ExecPython(sent?: JsonDict, reacted?: Boolean, stale?: Boolean, done: Boolean?) -> (ok: Boolean) {
+    code: "return {'ok': True}"
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none())
+        .expect("`name?: Type` compiles");
+    let node = &result.nodes[0];
+    let names: Vec<&str> = node.inputs.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["sent", "reacted", "stale", "done"], "no phantom port named after a type");
+    assert!(node.inputs.iter().all(|p| !p.required), "every one is optional: {:?}", node.inputs);
+    assert_eq!(node.inputs[0].port_type.wire_string(), "JsonDict");
+    assert_eq!(node.inputs[1].port_type.wire_string(), "Boolean");
+}
+
+/// A wire written inside a list or object literal is refused with the
+/// rule the author needs (values from the graph are input ports), not
+/// with the JSON reader's "expected value at line 1 column 2".
+#[test]
+fn a_wire_inside_a_list_literal_names_the_rule() {
+    let source = r#"
+a = Text { value: "x" }
+q = HttpRequest {
+    url: "https://example.test"
+    headers: [a.value, "plain"]
+}
+"#;
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none())
+        .expect_err("a wire in a list literal is refused");
+    let text = errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("holds plain values only") && text.contains("`a.value`"), "{text}");
+    assert!(text.contains("declare an input port"), "{text}");
+    assert!(!text.contains("expected value at line"), "the serde text is gone: {text}");
+
+    // A plain JSON typo keeps the JSON reader's diagnosis.
+    let typo = r#"
+q = HttpRequest {
+    url: "https://example.test"
+    headers: ["a", "b",]
+}
+"#;
+    let errors = compile(typo, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("bad JSON is refused");
+    let text = errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("invalid JSON value"), "{text}");
+
+    // An unquoted path or version is a missing pair of quotes, not a
+    // wire: only a word that starts a value AND parses as `node.port`
+    // gets the wire message. (`{ file: a.txt }` is genuinely
+    // indistinguishable from a wire and keeps the wire message.)
+    for unquoted in ["[logs/app.log]", "[v1.2.beta]", "[a.b.c]", "[1.5.2]"] {
+        let source = format!("q = HttpRequest {{\n    url: \"https://example.test\"\n    headers: {unquoted}\n}}\n");
+        let errors = compile(&source, uuid::Uuid::new_v4(), CompileFs::none())
+            .expect_err("still invalid JSON");
+        let text = errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("invalid JSON value"), "{unquoted}: {text}");
+    }
+}

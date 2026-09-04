@@ -41,7 +41,7 @@ If you want to see what a run actually did:
 
 ```bash
 weft events <color>        # every event for one execution, in order
-weft logs <color>          # just the log lines
+weft logs <color>          # what the run's nodes wrote, plus every failure
 weft executions            # recent executions
 weft follow <project>      # live, as they happen
 ```

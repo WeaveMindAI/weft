@@ -274,8 +274,6 @@ export async function createBridge(authDir, webhookManager, messageStore) {
         timestamp: toNumber(msg.messageTimestamp),
         isGroup,
         chatId: from,
-        // messageKey: the handle a future /media/:id resolve needs.
-        messageKey: msg.key,
       });
     }
   }
@@ -368,10 +366,10 @@ export async function createBridge(authDir, webhookManager, messageStore) {
  *
  * Returns { content, messageType }. Text messages carry their text in
  * `content`; media messages report their `messageType` and a caption
- * (if any) as `content`. Media payloads (audio/image/video) are NOT
- * downloaded here: the receive node is text-only for now. When media
- * support lands it should be a generic media-fetch path, not the
- * per-type eager download this used to do.
+ * (if any) as `content`, so an audio message has `content: null`. The
+ * bytes are never downloaded here: the message is kept in the store
+ * and served on demand by `/media/:messageId`, which is where the
+ * receive node (live) and the fetch-media node (history) get them.
  */
 function extractMessageContent(msg) {
   const m = msg.message;

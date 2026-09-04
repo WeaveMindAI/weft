@@ -415,6 +415,16 @@ impl<'a> Parser<'a> {
                     self.builder.start_node(SyntaxKind::PORT_DECL.into());
                     self.bump(); // name
                     self.bump_trivia_inline();
+                    // `name?` marks the port optional; it may stand alone
+                    // (`name?`) or precede the type (`name?: Type`), so the
+                    // `?` is consumed first and the colon checked after.
+                    // Treating the two as alternatives once left `: Type`
+                    // outside the declaration, where the loop opened a
+                    // second port named after the type.
+                    if self.cur() == Some(SyntaxKind::QUESTION) {
+                        self.bump();
+                        self.bump_trivia_inline();
+                    }
                     if self.cur() == Some(SyntaxKind::COLON) {
                         self.bump();
                         // consume the type run up to a top-level comma/paren
@@ -426,9 +436,6 @@ impl<'a> Parser<'a> {
                                 Some(_) => self.bump(),
                             }
                         }
-                    } else if self.cur() == Some(SyntaxKind::QUESTION) {
-                        // bare optional port `name?` (no type annotation)
-                        self.bump();
                     }
                     self.builder.finish_node();
                 }

@@ -2501,11 +2501,15 @@ pub(crate) fn try_parse_port_decl(trimmed: &str) -> Result<ParsedPort, String> {
         let name = rest[..colon_pos].trim();
         let mut type_str = rest[colon_pos + 1..].trim();
 
-        // Check for `?` suffix (optional marker)
-        let optional = type_str.ends_with('?');
-        if optional {
+        // The optional marker sits on the name (`name?: Type`) or on the
+        // type (`name: Type?`); both spellings mean the same port.
+        let name_optional = name.ends_with('?');
+        let name = if name_optional { name[..name.len() - 1].trim() } else { name };
+        let type_optional = type_str.ends_with('?');
+        if type_optional {
             type_str = type_str[..type_str.len() - 1].trim();
         }
+        let optional = name_optional || type_optional;
 
         match WeftType::parse(type_str) {
             Some(pt) => (name, pt, optional, Some(type_str.to_string())),
@@ -2782,9 +2786,22 @@ fn parse_kv(
         match serde_json::from_str(&quote_markers(raw)) {
             Ok(v) => v,
             Err(e) => {
-                errors.push(CompileError::at(span, format!(
-                    "'{key}' has an invalid JSON value `{raw}`: {e}. A literal string must be quoted (`{key}: \"...\"`)."
-                )));
+                // The commonest way here is a wire written inside the
+                // brackets (`[self.a, other.b]`): the reader chokes on
+                // the bare name at the second character, which says
+                // nothing about what was meant. Name the real rule.
+                let message = match first_wire_in_literal(raw) {
+                    Some(wire) => format!(
+                        "'{key}' is a list or object literal, which holds plain values only; \
+                         it cannot carry a wire such as `{wire}`. To pass values from the graph, \
+                         declare an input port per value and wire each one \
+                         (`Node(a: String, b: String) {{ a: x.y, b: z.w }}`)."
+                    ),
+                    None => format!(
+                        "'{key}' has an invalid JSON value `{raw}`: {e}. A literal string must be quoted (`{key}: \"...\"`)."
+                    ),
+                };
+                errors.push(CompileError::at(span, message));
                 return None;
             }
         }
@@ -3201,7 +3218,10 @@ fn flatten_group(
         images: Vec::new(),
         published_service: None,
         span: None,
-        header_span: None,
+        // The group's header is where a diagnostic about either
+        // boundary points: the boundaries are the header's two
+        // halves, and their own ids appear nowhere in the source.
+        header_span: group.header_span,
         config_spans: loop_spans,
         optional_ports: Default::default(),
         // Literals written on the container's interface ports. Enrich never
@@ -3285,7 +3305,7 @@ fn flatten_group(
         images: Vec::new(),
         published_service: None,
         span: None,
-        header_span: None,
+        header_span: group.header_span,
         config_spans: Default::default(),
         optional_ports: Default::default(),
         port_literals: Default::default(),
@@ -3427,3 +3447,64 @@ fn parsed_to_edge(pc: &ParsedConnection) -> Edge {
 //     up in the same pass.
 
 
+
+/// The first `node.port` reference written bare (outside any string)
+/// inside a bracketed literal, or `None` when there is none. What
+/// makes `[self.a, x.b]` a wire-in-a-list mistake rather than a JSON
+/// typo, so the refusal can name the rule the author needs.
+///
+/// A candidate is only a word that STARTS a value (after `[`, `{`,
+/// `,`, `:` or space), and it is a wire only if `parse_dotted` says so,
+/// which is the compiler's one definition of a wire. Both matter:
+/// without the first, `[logs/app.log]` reports `app.log` and sends the
+/// author to declare a port when the fix is a pair of quotes; without
+/// the second, `[a.b.c]` is called a wire though nothing else in the
+/// compiler would read it as one.
+fn first_wire_in_literal(raw: &str) -> Option<String> {
+    let mut in_string = false;
+    let mut escaped = false;
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    // What may precede a value: nothing (the literal's own opener is
+    // always first), a separator, or space.
+    let mut value_may_start = true;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            value_may_start = false;
+            i += 1;
+            continue;
+        }
+        if value_may_start && (c.is_ascii_alphabetic() || c == '_') {
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+            {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if !matches!(word.as_str(), "true" | "false" | "null")
+                && parse_dotted(&word).is_some()
+            {
+                return Some(word);
+            }
+            value_may_start = false;
+            continue;
+        }
+        value_may_start = matches!(c, '[' | '{' | ',' | ':') || c.is_whitespace();
+        i += 1;
+    }
+    None
+}

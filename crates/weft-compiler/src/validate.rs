@@ -120,7 +120,7 @@ fn check_named_type_conflicts(project: &ProjectDefinition, d: &mut Vec<Diagnosti
             let mut named = Vec::new();
             walk(port_type, &mut named);
             for (name, body) in named {
-                let site = format!("{}.{}", node.id, port_name);
+                let site = format!("{}.{}", author_name(node), port_name);
                 if let Some(weft_core::weft_type::WeftType::Named { body: declared, .. }) =
                     registry.lookup(name)
                 {
@@ -209,7 +209,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                     format!(
                         "input '{}.{}: {}': Generator[T] is a port type; a stream cannot \
                          sit inside a list, dict, record, or union",
-                        node.id, port.name, port.port_type
+                        author_name(node), port.name, port.port_type
                     ));
             }
             // An unwired stream has no meaning: a stream cannot be
@@ -233,7 +233,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                         "input '{}.{}': a Generator input must be required and cannot \
                          have a default; a stream has no zero value, so an unwired \
                          stream port could never be satisfied",
-                        node.id, port.name
+                        author_name(node), port.name
                     ));
             }
         }
@@ -243,7 +243,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                     format!(
                         "output '{}.{}: {}': Generator[T] is a port type; a stream cannot \
                          sit inside a list, dict, record, or union",
-                        node.id, port.name, port.port_type
+                        author_name(node), port.name, port.port_type
                     ));
             }
             if port.port_type.as_generator().is_some() {
@@ -260,7 +260,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                             "stream '{}.{}' feeds {consumers} inputs; a Generator output \
                              connects to exactly ONE consumer (a stream has one taker). \
                              To broadcast, use a Bus",
-                            node.id, port.name
+                            author_name(node), port.name
                         ));
                 }
             }
@@ -277,12 +277,8 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
     // one diagnostic, by construction. The project-interface boundary
     // (the root anonymous component's `__in`/`__out`) gets its own
     // wording: there IS no outer scope to move the producer into.
-    let root_group_ids: std::collections::HashSet<&str> = project
-        .groups
-        .iter()
-        .filter(|g| g.parent_group_id.is_none() && g.anonymous)
-        .map(|g| g.id.as_str())
-        .collect();
+    let root_group_ids: std::collections::HashSet<&str> =
+        component_root(project).into_iter().collect();
     for node in &project.nodes {
         let Some(gb) = node.group_boundary.as_ref() else { continue };
         if node.node_type != "Passthrough" {
@@ -371,9 +367,9 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                          declares '{}', a generic type that cannot consume one. A stream \
                          needs a port declared Generator[T]; to inspect items, consume \
                          the stream in a node and emit what you want to see",
-                        edge.source,
+                        author_name_by_id(project, &edge.source),
                         edge.source_handle.as_deref().unwrap_or("?"),
-                        edge.target,
+                        author_name_by_id(project, &edge.target),
                         edge.target_handle.as_deref().unwrap_or("?"),
                         tgt_port.map(|p| p.port_type.to_string()).unwrap_or_default(),
                     ));
@@ -398,9 +394,9 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                          source declares '{}', a generic type that cannot produce one. \
                          Declare the source output as Generator[T] (or feed the port \
                          from a real stream producer)",
-                        edge.source,
+                        author_name_by_id(project, &edge.source),
                         edge.source_handle.as_deref().unwrap_or("?"),
-                        edge.target,
+                        author_name_by_id(project, &edge.target),
                         edge.target_handle.as_deref().unwrap_or("?"),
                         src_port.map(|p| p.port_type.to_string()).unwrap_or_default(),
                     ));
@@ -425,9 +421,9 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
                      stream is a live edge between two running nodes. Put the producer \
                      and its consumer in the same scope (a loop consumes a stream only \
                      through its own `over`)",
-                    edge.source,
+                    author_name_by_id(project, &edge.source),
                     edge.source_handle.as_deref().unwrap_or("?"),
-                    edge.target,
+                    author_name_by_id(project, &edge.target),
                     edge.target_handle.as_deref().unwrap_or("?"),
                 ));
         }
@@ -484,9 +480,10 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                             let span =
                                 culprit.map(|n| n.header_span_or_default()).unwrap_or_default();
                             let file = culprit.and_then(|n| n.source_file.as_deref());
+                            let through = culprit.map(author_name).unwrap_or(child);
                             push(d, file, span, Severity::Error, "graph-cycle",
                                 format!(
-                                    "the wires form a cycle through '{child}'; a wire graph \
+                                    "the wires form a cycle through '{through}'; a wire graph \
                                      must be acyclic (iterate with a Loop, exchange feedback \
                                      over a bus)"
                                 ));
@@ -519,7 +516,7 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 format!(
                     "trigger '{}' is inside a Loop; a trigger registers once and fires \
                      outside any iteration, so it cannot live in a loop body",
-                    node.id
+                    author_name(node)
                 ));
         }
     }
@@ -867,7 +864,7 @@ fn check_duplicates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 "duplicate-node-id",
                 format!(
                     "duplicate node id '{}' (first declared at line {})",
-                    node.id, first_line
+                    author_name(node), first_line
                 ),
             ),
             None => {
@@ -909,7 +906,7 @@ fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic
                     format!(
                         "input '{}' of '{}' has two drivers: it is wired from upstream AND \
                          set in the node body; remove one",
-                        name, node.id
+                        name, author_name(node)
                     ),
                 );
             }
@@ -990,9 +987,9 @@ fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>
             "scope-reachability",
             format!(
                 "edge '{}.{} -> {}.{}' crosses scope boundaries without a group or loop boundary",
-                edge.source,
+                author_name_by_id(project, &edge.source),
                 edge.source_handle.as_deref().unwrap_or("?"),
-                edge.target,
+                author_name_by_id(project, &edge.target),
                 edge.target_handle.as_deref().unwrap_or("?"),
             ),
         );
@@ -1000,6 +997,69 @@ fn check_scope_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>
 }
 
 // ─── group 2: port resolution ───────────────────────────────────────────────
+
+/// The message for `self.<port>` read inside a loop or group whose own
+/// boundary has no such port, when an ENCLOSING scope's boundary does.
+/// The rule is right (`self` inside a loop is the loop's own input
+/// boundary, never the group around it) and the bare "no output port"
+/// reads like the port is missing; what the author has to do is thread
+/// the value in as an input of the inner scope, so the message says
+/// exactly that, naming both scopes. `None` when no enclosing boundary
+/// carries the port (then it really is unknown).
+fn enclosing_scope_hint(
+    by_id: &std::collections::HashMap<&str, &weft_core::project::NodeDefinition>,
+    src: &weft_core::project::NodeDefinition,
+    handle: &str,
+) -> Option<String> {
+    let boundary = src.group_boundary.as_ref()?;
+    if boundary.role != weft_core::project::GroupBoundaryRole::In {
+        return None;
+    }
+    // `scope` is outermost first (and never contains the node's own
+    // group), so the nearest enclosing scope wins.
+    let outer = src.scope.iter().rev().find(|g| {
+        by_id
+            .get(weft_core::project::boundary_in_id(g).as_str())
+            .is_some_and(|n| n.outputs.iter().any(|p| p.name == handle))
+    })?;
+    let inner_kind = if src.node_type == "LoopIn" { "loop" } else { "group" };
+    let inner = &boundary.group_id;
+    let inner_short = inner.rsplit('.').next().unwrap_or(inner);
+    Some(format!(
+        "node '{}' has no output port '{handle}': inside the {inner_kind} '{inner}', `self` is \
+         the {inner_kind}'s own inputs, and `{handle}` is an input of the enclosing group \
+         '{outer}'. Declare it on the {inner_kind} (`{inner_short} = {}({handle}: <type>, ...)`) \
+         and wire it in from the group (`{inner_short}.{handle} = self.{handle}`).",
+        author_name(src),
+        if inner_kind == "loop" { "Loop" } else { "Group" },
+    ))
+}
+
+/// The root anonymous group of a component file (one used through
+/// `@include`), whose boundaries are the file's own interface: there is
+/// no outer scope to wire from, and nothing inside consumes its outputs
+/// by construction. `None` for a runnable project.
+fn component_root(project: &ProjectDefinition) -> Option<&str> {
+    project
+        .groups
+        .iter()
+        .find(|g| g.parent_group_id.is_none() && g.anonymous)
+        .map(|g| g.id.as_str())
+}
+
+/// The name a diagnostic calls a node: its id, or for a group's
+/// boundary node the group's, since the boundary's own id (`my__in`,
+/// `my__out`) appears nowhere in the source.
+fn author_name(node: &weft_core::project::NodeDefinition) -> &str {
+    node.group_boundary.as_ref().map(|b| b.group_id.as_str()).unwrap_or(&node.id)
+}
+
+/// `author_name` for a node an edge names by id. An id no node carries
+/// is reported as it is: `unknown-source-node` / `unknown-target-node`
+/// own that case, and the author wrote that id.
+fn author_name_by_id<'a>(project: &'a ProjectDefinition, id: &'a str) -> &'a str {
+    project.nodes.iter().find(|n| n.id == id).map(author_name).unwrap_or(id)
+}
 
 /// unknown-source-port / unknown-target-port: the edge handles must
 /// resolve to real ports on the enriched node. port-typo-suggestion:
@@ -1021,14 +1081,24 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             if !src.outputs.iter().any(|p| p.name == handle) {
                 let names: Vec<&str> = src.outputs.iter().map(|p| p.name.as_str()).collect();
                 let suggestion = did_you_mean(handle, &names);
-                let msg = match suggestion {
-                    Some(s) => format!(
+                // The scope hint fires only on an EXACT port of an
+                // enclosing group, so when it fires it is the answer;
+                // the typo guess (any name within two edits) is what is
+                // left when no enclosing scope has the name. The other
+                // way round, a group `outer(id)` around a loop over
+                // `ids` would tell the author who wrote `self.id` to
+                // try `ids`.
+                let msg = match (suggestion, enclosing_scope_hint(&by_id, src, handle)) {
+                    (_, Some(hint)) => hint,
+                    (Some(s), None) => format!(
                         "node '{}' has no output port '{}'. Did you mean '{}'?",
-                        edge.source, handle, s
+                        author_name(src),
+                        handle,
+                        s
                     ),
-                    None => format!(
+                    (None, None) => format!(
                         "node '{}' has no output port '{}'. Available: [{}]",
-                        edge.source,
+                        author_name(src),
                         handle,
                         names.join(", ")
                     ),
@@ -1044,11 +1114,13 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 let msg = match suggestion {
                     Some(s) => format!(
                         "node '{}' has no input port '{}'. Did you mean '{}'?",
-                        edge.target, handle, s
+                        author_name(tgt),
+                        handle,
+                        s
                     ),
                     None => format!(
                         "node '{}' has no input port '{}'. Available: [{}]",
-                        edge.target,
+                        author_name(tgt),
                         handle,
                         names.join(", ")
                     ),
@@ -1076,7 +1148,7 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 "duplicate-input-port",
                 format!(
                     "port '{}.{}' already has a driver at line {}; an input can be fed by exactly one edge",
-                    edge.target, handle, first
+                    author_name_by_id(project, &edge.target), handle, first
                 ),
             );
         } else {
@@ -1194,7 +1266,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             push(d, file, span, Severity::Error, "must-override-unmet",
                 format!(
                     "source port '{}.{}' is MustOverride. Declare a concrete type in weft source.",
-                    edge.source, src_port.name,
+                    author_name(src), src_port.name,
                 ));
             continue;
         }
@@ -1202,7 +1274,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             push(d, file, span, Severity::Error, "must-override-unmet",
                 format!(
                     "target port '{}.{}' is MustOverride. Declare a concrete type in weft source.",
-                    edge.target, tgt_port.name,
+                    author_name(tgt), tgt_port.name,
                 ));
             continue;
         }
@@ -1213,7 +1285,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             push(d, file, span, Severity::Error, "unresolved-typevar",
                 format!(
                     "source port '{}.{}' type '{}' unresolved; connect it to something concrete or declare the type",
-                    edge.source, src_port.name, src_port.port_type,
+                    author_name(src), src_port.name, src_port.port_type,
                 ));
             continue;
         }
@@ -1221,7 +1293,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             push(d, file, span, Severity::Error, "unresolved-typevar",
                 format!(
                     "target port '{}.{}' type '{}' unresolved; connect it to something concrete or declare the type",
-                    edge.target, tgt_port.name, tgt_port.port_type,
+                    author_name(tgt), tgt_port.name, tgt_port.port_type,
                 ));
             continue;
         }
@@ -1243,8 +1315,8 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             push(d, file, span, Severity::Error, "type-mismatch",
                 format!(
                     "cannot connect '{}.{}: {}' to '{}.{}: {}'{cast_hint}",
-                    edge.source, src_port.name, src_port.port_type,
-                    edge.target, tgt_port.name, tgt_port.port_type,
+                    author_name(src), src_port.name, src_port.port_type,
+                    author_name(tgt), tgt_port.name, tgt_port.port_type,
                 ));
         }
     }
@@ -1418,7 +1490,7 @@ fn check_port_coverage(
                     format!(
                         "input '{}.{}' is configuration-only: it cannot be driven by a \
                          wire. Set it in the config braces instead",
-                        node.id, input.name
+                        author_name(node), input.name
                     ),
                 );
             }
@@ -1443,12 +1515,12 @@ fn check_port_coverage(
                     format!(
                         "input '{}.{}' takes a literal only in the config braces: write \
                          it as {{ {}: ... }} on the node",
-                        node.id, input.name, input.name
+                        author_name(node), input.name, input.name
                     )
                 } else {
                     format!(
                         "input '{}.{}' takes no literal: wire it from another node",
-                        node.id, input.name
+                        author_name(node), input.name
                     )
                 };
                 push(d, file, lit_span, Severity::Error, "port-literal-placement", message);
@@ -1465,7 +1537,7 @@ fn check_port_coverage(
                     "required-port-unmet",
                     format!(
                         "required input '{}.{}' has no driver (no edge, no body value, no default)",
-                        node.id, input.name
+                        author_name(node), input.name
                     ),
                 );
             }
@@ -1480,12 +1552,12 @@ fn check_port_coverage(
                     format!(
                         "input '{}.{}' takes a literal only as an assignment: the braces \
                          form cannot drive it. Wire it or write {}.{} = ...",
-                        node.id, input.name, node.id, input.name
+                        author_name(node), input.name, author_name(node), input.name
                     )
                 } else {
                     format!(
                         "input '{}.{}' takes no literal: wire it from another node",
-                        node.id, input.name
+                        author_name(node), input.name
                     )
                 };
                 push(d, cfg_file, cfg_span, Severity::Error, "port-literal-placement", message);
@@ -1541,7 +1613,7 @@ fn check_port_coverage(
                             "literal-out-of-range",
                             format!(
                                 "input '{}.{}': {} is outside the allowed range [{}, {}]",
-                                node.id,
+                                author_name(node),
                                 input.name,
                                 n,
                                 min.map_or("-inf".into(), |m| m.to_string()),
@@ -1553,10 +1625,52 @@ fn check_port_coverage(
             }
         }
 
-        // @require_one_of: each inner group must have at least one
-        // satisfied (driven or configured-non-null) input.
+        // @require_one_of: every name must be one of the node's inputs
+        // (the enriched set, so a created or config-derived port counts),
+        // and each group must have at least one satisfied (driven or
+        // configured-non-null) input. An unknown name once passed
+        // silently, so a typo'd directive guarded nothing.
         for group in &node.features.one_of_required {
             if group.is_empty() {
+                continue;
+            }
+            // Every name has to be a port of this instance, on every
+            // node type. Where the author can ADD input ports, a name
+            // becomes one by being declared in the header, wired, or
+            // configured; a name that is none of those is not an
+            // alternative the instance did not take, it is a port that
+            // does not exist, and a guard over a port that does not
+            // exist is a typo whichever way it happened.
+            let unknown: Vec<&str> = group
+                .iter()
+                .filter(|name| !node.inputs.iter().any(|p| &p.name == *name))
+                .map(String::as_str)
+                .collect();
+            if !unknown.is_empty() {
+                // Every input the check would have accepted, so the
+                // list and the test agree (a config-exposure input is a
+                // legitimate member of a group).
+                let available: Vec<&str> = node
+                    .inputs
+                    .iter()
+                    .filter(|p| p.name != SHOULD_FLOW_PORT)
+                    .map(|p| p.name.as_str())
+                    .collect();
+                push(
+                    d,
+                    file,
+                    span,
+                    Severity::Error,
+                    "require-one-of-unknown-port",
+                    format!(
+                        "node '{}' declares @require_one_of({}) but has no input port {}; declare \
+                         it, or drop it from the list. Inputs: [{}]",
+                        author_name(node),
+                        group.join(", "),
+                        unknown.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", "),
+                        available.join(", ")
+                    ),
+                );
                 continue;
             }
             let any_met = group.iter().any(|port_name| {
@@ -1576,7 +1690,7 @@ fn check_port_coverage(
                     "require-one-of-unmet",
                     format!(
                         "node '{}' declares @require_one_of({}) but none is driven",
-                        node.id,
+                        author_name(node),
                         group.join(", ")
                     ),
                 );
@@ -1661,7 +1775,7 @@ fn check_port_coverage(
                         span,
                         Severity::Error,
                         "duplicate-port",
-                        format!("node '{}' has two ports named '{}' on one side", node.id, name),
+                        format!("node '{}' has two ports named '{}' on one side", author_name(node), name),
                     );
                 }
             }
@@ -1712,7 +1826,7 @@ fn check_config_derived_ports(
                 format!(
                     "node '{}': '{}' holds the list this node's ports come from, so it must be \
                      a list",
-                    node.id, ports_from_config.field
+                    author_name(node), ports_from_config.field
                 ),
             );
             continue;
@@ -1730,7 +1844,7 @@ fn check_config_derived_ports(
                     "config-entry-not-an-object",
                     format!(
                         "node '{}': {} of '{}' is not an object",
-                        node.id,
+                        author_name(node),
                         entry_label(index, None),
                         ports_from_config.field
                     ),
@@ -1748,7 +1862,7 @@ fn check_config_derived_ports(
                     format!(
                         "node '{}': {} of '{}' has kind '{}', which {} does not offer \
                          (it takes: {})",
-                        node.id,
+                        author_name(node),
                         entry_label(index, None),
                         ports_from_config.field,
                         kind,
@@ -1768,7 +1882,7 @@ fn check_config_derived_ports(
                     "config-entry-without-a-port",
                     format!(
                         "node '{}': {} of '{}' needs a '{}' naming the port it adds",
-                        node.id,
+                        author_name(node),
                         entry_label(index, None),
                         ports_from_config.field,
                         spec.key_field
@@ -1795,7 +1909,7 @@ fn check_config_derived_ports(
                     format!(
                         "node '{}': {} of '{}' carries '{}', which a '{}' entry \
                          does not take (it takes: {})",
-                        node.id,
+                        author_name(node),
                         entry_label(index, Some(port_name)),
                         ports_from_config.field,
                         key,
@@ -1845,7 +1959,7 @@ fn check_config_derived_ports(
                                 format!(
                                     "node '{}': {} of '{}' sets `{}` to an empty list, \
                                      which chooses nothing, and a '{}' needs at least one",
-                                    node.id,
+                                    author_name(node),
                                     entry_label(index, Some(port_name)),
                                     ports_from_config.field,
                                     field.key,
@@ -1863,7 +1977,7 @@ fn check_config_derived_ports(
                                 "config-entry-bad-value",
                                 format!(
                                     "node '{}': {} of '{}' sets `{}`, and {}",
-                                    node.id,
+                                    author_name(node),
                                     entry_label(index, Some(port_name)),
                                     ports_from_config.field,
                                     field.key,
@@ -1880,7 +1994,7 @@ fn check_config_derived_ports(
                         "config-entry-missing-value",
                         format!(
                             "node '{}': {} of '{}' is a '{}', which needs a '{}'",
-                            node.id,
+                            author_name(node),
                             entry_label(index, Some(port_name)),
                             ports_from_config.field,
                             spec.kind,
@@ -1903,7 +2017,7 @@ fn check_config_derived_ports(
                         format!(
                             "node '{}': entries {} and {} of '{}' both match anything; the \
                              second can never be reached",
-                            node.id,
+                            author_name(node),
                             first + 1,
                             index + 1,
                             ports_from_config.field
@@ -1924,7 +2038,7 @@ fn check_config_derived_ports(
                     format!(
                         "node '{}': entry {} of '{}' matches anything, so the {} after it can \
                          never be reached. Write it last",
-                        node.id,
+                        author_name(node),
                         at + 1,
                         ports_from_config.field,
                         entries.len() - at - 1
@@ -2373,18 +2487,41 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         .map(|e| e.source.as_str())
         .collect();
 
+    let root = component_root(project);
     for node in &project.nodes {
-        if node.node_type == "Passthrough" {
+        // A group's two boundary nodes are the two halves of its
+        // header, and their ids (`my__in`, `my__out`) appear nowhere
+        // in the source: a warning about either names the GROUP and
+        // points at its header. Which warnings apply follows the
+        // half. The IN side holds the header's inputs and config, so
+        // "no required input" and "null config" are the author's to
+        // fix there. The OUT side holds the header's outputs, so
+        // "nobody consumes these" is the author's to fix there; its
+        // input ports are optional by construction (a gather port is
+        // `List[T | Null]` because a missed iteration leaves null),
+        // so "no required input" would be one they cannot act on. A
+        // component file's root boundaries are the file's interface:
+        // its outputs are consumed by whoever includes it, and its
+        // inputs are theirs to make required, so neither warns here.
+        if node.group_boundary.as_ref().is_some_and(|b| Some(b.group_id.as_str()) == root) {
             continue;
         }
+        let role = node.group_boundary.as_ref().map(|b| b.role);
+        let in_boundary = role == Some(weft_core::project::GroupBoundaryRole::In);
+        let out_boundary = role == Some(weft_core::project::GroupBoundaryRole::Out);
+        let name = author_name(node);
         let span = node.header_span_or_default();
         let file = node.source_file.as_deref();
 
         // orphan-outputs: only flag when the node has outputs at all.
         // Nodes like Debug (no outputs) are terminal and exempt, and so is
         // any node marked as an output (`_is_output: true`): it is a
-        // declared terminus, its unconsumed ports are the point.
-        if !node.outputs.is_empty()
+        // declared terminus, its unconsumed ports are the point. An IN
+        // boundary's outputs face the inside of its group, so "none
+        // consumed" would say the group's outputs go unread when it is
+        // the group's INPUTS nobody inside reads; not this warning.
+        if !in_boundary
+            && !node.outputs.is_empty()
             && !node.is_output()
             && !source_nodes.contains(node.id.as_str())
         {
@@ -2394,11 +2531,11 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 span,
                 Severity::Warning,
                 "orphan-outputs",
-                format!(
-                    "node '{}' produces outputs but none are consumed by downstream nodes",
-                    node.id
-                ),
+                format!("node '{name}' produces outputs but none are consumed by downstream nodes"),
             );
+        }
+        if out_boundary {
+            continue;
         }
 
         // no-required-skip: only applies when the node has inputs,
@@ -2432,8 +2569,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 Severity::Warning,
                 "no-required-skip",
                 format!(
-                    "node '{}' has no required inputs; it will run even when all upstream values are null. Consider marking one input required or adding @require_one_of.",
-                    node.id
+                    "node '{name}' has no required inputs; it will run even when all upstream values are null. Consider marking one input required or adding @require_one_of."
                 ),
             );
         }
@@ -2451,8 +2587,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                         Severity::Warning,
                         "config-null-literal",
                         format!(
-                            "config '{}.{}: null' is redundant; omit the key to let the default apply",
-                            node.id, key
+                            "config '{name}.{key}: null' is redundant; omit the key to let the default apply"
                         ),
                     );
                 }
@@ -2480,11 +2615,8 @@ fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic
     // interface ports, surfaced as the root group's __out Passthrough. Use
     // that as the output set so the no-output / unreachable rules don't fire
     // spuriously when the file is opened on its own.
-    let component_out: Option<String> = project
-        .groups
-        .iter()
-        .find(|g| g.parent_group_id.is_none() && g.anonymous)
-        .map(|g| weft_core::project::boundary_out_id(&g.id));
+    let component_out: Option<String> =
+        component_root(project).map(weft_core::project::boundary_out_id);
 
     let outputs: Vec<&str> = if let Some(ref out_pt) = component_out {
         // The component's output sink: everything upstream of the group's
@@ -2530,8 +2662,10 @@ fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic
     }
 
     for node in &project.nodes {
-        // Group boundaries are plumbing, not user-visible nodes.
-        if node.node_type == "Passthrough" {
+        // Group boundaries are plumbing, not user-visible nodes: the
+        // nodes inside an unreachable group are the ones flagged,
+        // and they have lines to point at.
+        if node.group_boundary.is_some() {
             continue;
         }
         // Triggers are entry points: they legitimately lack
@@ -2554,7 +2688,7 @@ fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic
                      Its value won't appear in run results. \
                      Add an output (e.g. a Debug node) downstream, or \
                      flip the node's config `is_output: true`.",
-                    node.id
+                    author_name(node)
                 ),
             );
         }

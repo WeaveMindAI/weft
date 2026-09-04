@@ -157,6 +157,7 @@ function fieldFromWidget(key: string, label: string, w: Widget): FieldDefinition
 		case 'text':
 		case 'textarea':
 		case 'checkbox':
+		case 'datetime':
 		case 'password':
 		case 'text_list':
 		case 'entry_list':

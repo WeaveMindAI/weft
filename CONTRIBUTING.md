@@ -177,9 +177,13 @@ the drafts into the one migration that goes in the PR:
 Releasing also needs your cluster up, since it has to reach the database you
 have been developing against.
 
-That collapses every draft into one released migration per table group and
-tells your database they are already in it, so nothing re-runs. Forget the step
-and the `schema_agreement` test fails.
+That collapses every draft into one released migration per table group. For
+each group it then looks at your database: if it ran the drafts, it is told
+the release is already in it, so nothing re-runs; if you skipped the draft
+pass for that group, the release runs the file on it now. Both can happen in
+one command, and it all lands in one transaction, so a refusal leaves your
+tree and your database as they were. Forget the step and the
+`schema_agreement` test fails.
 
 Never edit a released migration by hand unless you really know what you are doing. Ideally ask for another one instead.
 

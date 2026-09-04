@@ -47,6 +47,17 @@ impl Phase {
             Self::Fire => "fire",
         }
     }
+
+    /// The inverse of `as_str`: a stored or typed tag back to the
+    /// phase, `None` for anything else. Every reader of a phase
+    /// written as text (the DB column, a CLI flag) comes through here,
+    /// so the set of names has one definition.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == tag)
+    }
+
+    /// Every phase, for a caller that has to offer the choice.
+    pub const ALL: [Phase; 3] = [Self::InfraSetup, Self::TriggerSetup, Self::Fire];
 }
 
 /// How long a node's provider work may take, unless it says otherwise
@@ -433,6 +444,7 @@ impl ExecutionContext {
         StorageHandle {
             handle: self.handle.clone(),
             scope,
+            identity: None,
         }
     }
 
@@ -992,6 +1004,57 @@ impl ValueBag {
         self.values.iter().filter(|(k, _)| !self.spec_names.contains(k.as_str()))
     }
 
+    /// The values behind the named holes of a text, in hole order.
+    ///
+    /// A node whose input ports ARE its parameters (a SQL query
+    /// reading `$user_id`, a template reading `{{user}}`) has the same
+    /// job twice over: every hole needs a port, and every custom port
+    /// needs a hole. Both mismatches are the author's, and both
+    /// refusals have to name the thing they wrote, so the matching
+    /// lives here instead of once per node. `what` is the node's own
+    /// word for the text ("query", "template"), `spell` writes a name
+    /// back the way that text spells a hole, and `declare` is the
+    /// header the refusal tells them to write.
+    ///
+    /// A hole with no port is an error rather than a null: a
+    /// placeholder reading nothing is a bug to name, not a value to
+    /// invent. A port with no hole is an error too: a wired value the
+    /// text never reads is a typo waiting to be found in production.
+    pub fn for_holes(
+        &self,
+        holes: &[String],
+        what: &str,
+        spell: impl Fn(&str) -> String,
+        declare: impl Fn(&str) -> String,
+    ) -> WeftResult<Vec<&Value>> {
+        let ports: std::collections::BTreeMap<&String, &Value> = self.custom().collect();
+        let arrived: Vec<&str> = ports.keys().map(|k| k.as_str()).collect();
+        let mut values = Vec::with_capacity(holes.len());
+        for hole in holes {
+            let Some(value) = ports.get(hole) else {
+                return Err(self.err(format!(
+                    "the {what} reads `{}` but no `{hole}` input carried a value; declare the \
+                     port on the node (`{}`) and wire it. Ports that arrived: [{}]",
+                    spell(hole),
+                    declare(hole),
+                    arrived.join(", ")
+                )));
+            };
+            values.push(*value);
+        }
+        for port in ports.keys() {
+            if !holes.iter().any(|h| h == *port) {
+                return Err(self.err(format!(
+                    "the `{port}` input is wired but the {what} never reads `{}`; read it, or \
+                     drop the port. Holes in the {what}: [{}]",
+                    spell(port),
+                    holes.iter().map(|h| spell(h)).collect::<Vec<_>>().join(", ")
+                )));
+            }
+        }
+        Ok(values)
+    }
+
     /// Every input the firing DELIVERED, in the node's port order (a
     /// created port's order is where it was written in source). A port
     /// that arrived closed, or that the node never declared, is absent:
@@ -1332,9 +1395,37 @@ impl EndpointHandle {
 pub struct StorageHandle {
     handle: Arc<dyn ContextHandle>,
     scope: crate::storage::StorageScope,
+    /// What the next put is a copy OF; see [`Self::identified`].
+    identity: Option<String>,
 }
 
 impl StorageHandle {
+    /// Name what the file about to be stored is a copy of, so storing
+    /// it twice stores it once.
+    ///
+    /// A node that pulls a thing by a stable id (a WhatsApp message, a
+    /// document at a provider) would otherwise download and store a
+    /// fresh copy every time a run asks. With an identity on the put,
+    /// the storage service answers a second put of the same identity
+    /// in the same scope with the file it already holds, and no bytes
+    /// move. Pair it with the project scope so the copy outlives the
+    /// run that first fetched it:
+    ///
+    /// ```ignore
+    /// ctx.storage(StorageScope::Project)
+    ///     .identified(format!("whatsapp:{message_id}"))
+    ///     .put_from_url(&url, None, None)
+    ///     .await?
+    /// ```
+    ///
+    /// The identity is a label, scoped to the handle's scope: the same
+    /// string in two projects is two files. Choose one that names the
+    /// SOURCE (`<service>:<id>`), never the content.
+    pub fn identified(mut self, identity: impl Into<String>) -> Self {
+        self.identity = Some(identity.into());
+        self
+    }
+
     /// Store `bytes` under this handle's scope. Returns the
     /// self-describing stored-file value (`key` + `mimeType` +
     /// `sizeBytes` + `filename`, NO url) to emit downstream. `keep` flags an
@@ -1357,6 +1448,7 @@ impl StorageHandle {
         self.handle
             .storage_put(
                 &self.scope,
+                self.identity.as_deref(),
                 crate::storage::bytes_stream(bytes),
                 mime_type,
                 filename,
@@ -1377,7 +1469,7 @@ impl StorageHandle {
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
         self.handle
-            .storage_put(&self.scope, stream, mime_type, filename, keep, None)
+            .storage_put(&self.scope, self.identity.as_deref(), stream, mime_type, filename, keep, None)
             .await
     }
 
@@ -1407,14 +1499,16 @@ impl StorageHandle {
                 crate::truncate_user_string(&body, 500)
             )));
         }
+        // The header goes through the one normalizer every remote
+        // stream uses, so a `image/png; charset=binary` is stored as
+        // `image/png` here exactly as it is from `put_from_url`.
         let mime = match mime {
             Some(m) => m.to_string(),
-            None => resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/octet-stream")
-                .to_string(),
+            None => crate::storage::normalize_content_type(
+                resp.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+            ),
         };
         let stored = self
             .put_stream(crate::storage::response_stream(resp), &mime, filename, keep)
@@ -1435,7 +1529,9 @@ impl StorageHandle {
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
-        self.handle.storage_put_from_url(&self.scope, url, filename, keep).await
+        self.handle
+            .storage_put_from_url(&self.scope, self.identity.as_deref(), url, filename, keep)
+            .await
     }
 
     /// Stream a file's bytes. Takes the file's parsed HANDLE (the typed
@@ -1859,6 +1955,7 @@ pub trait ContextHandle: Send + Sync {
     async fn storage_put(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         data: crate::storage::ByteStream,
         mime_type: &str,
         filename: &str,
@@ -1878,6 +1975,7 @@ pub trait ContextHandle: Send + Sync {
     async fn storage_put_from_url(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         url: &str,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
@@ -2105,8 +2203,8 @@ mod value_bag_tests {
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
         fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
         fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
-        async fn storage_put(&self, _: &crate::storage::StorageScope, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
-        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
         async fn storage_get(&self, _: &str, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
         async fn storage_get_url(&self, _: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
         async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -2145,8 +2243,8 @@ mod value_bag_tests {
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
         fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
         fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
-        async fn storage_put(&self, _: &crate::storage::StorageScope, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
-        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
         async fn storage_get(&self, key: &str, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
             let meta = crate::storage::StoredFileMeta {
                 key: key.to_string(),

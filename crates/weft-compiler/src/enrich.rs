@@ -485,7 +485,64 @@ pub fn enrich_collecting(
 
         node.inputs = inputs;
         node.outputs = outputs;
+        // A declared port that narrows a catalog typevar narrows it
+        // EVERYWHERE on this node: `Wait(value: String)` pins the `T`
+        // that `value` carries in and out, so the pass-through output
+        // is String too. Without this the input alone narrows and the
+        // output stays `T`, which the validator then reports as an
+        // unresolvable typevar on a program that named the type.
+        //
+        // Two ports of the same var narrowed to different types is a
+        // contradiction the merge cannot see (each declaration is only
+        // ever compared against the catalog's `T`, and everything is
+        // compatible with an unresolved type), so it is refused here,
+        // naming both: silently keeping the first would give the node a
+        // contract it never had.
+        let mut narrowings: Vec<(String, WeftType)> = Vec::new();
+        for cp in &catalog_inputs {
+            if let Some(merged) = node.inputs.iter().find(|p| p.name == cp.name) {
+                collect_type_var_bindings(&cp.port_type, &merged.port_type, &mut narrowings);
+            }
+        }
+        for cp in &catalog_outputs {
+            if let Some(merged) = node.outputs.iter().find(|p| p.name == cp.name) {
+                collect_type_var_bindings(&cp.port_type, &merged.port_type, &mut narrowings);
+            }
+        }
+        let mut settled: Vec<(String, WeftType)> = Vec::new();
+        for (var, concrete) in narrowings {
+            match settled.iter().find(|(v, _)| *v == var) {
+                Some((_, first)) if *first != concrete => {
+                    errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                        "node '{}': the declared ports pin type '{var}' to two different types \
+                         ({first} and {concrete}); every port that carries '{var}' on one node \
+                         has to name the same type",
+                        node.id,
+                    )});
+                }
+                Some(_) => {}
+                None => settled.push((var, concrete)),
+            }
+        }
+        for (var, concrete) in &settled {
+            substitute_type_var_on(node, var, concrete);
+        }
+        // The instance's own `@require_one_of` groups were lowered from
+        // source onto `node.features` before enrich; the catalog's
+        // features replace everything else but must not wipe them
+        // (they once did, and every `@require_one_of` on a catalog-typed
+        // node silently vanished). A group the catalog itself declares
+        // stays too.
+        let own_one_of = std::mem::take(&mut node.features.one_of_required);
         node.features = meta.features.clone();
+        // A group the catalog declares and the author repeats at the
+        // call site is ONE constraint; appending both would report one
+        // unsatisfied node twice at the same span.
+        for group in own_one_of {
+            if !node.features.one_of_required.contains(&group) {
+                node.features.one_of_required.push(group);
+            }
+        }
         node.requires_infra = meta.requires_infra;
         node.images = meta.images.clone();
         // A node that hands out a connection to something it runs
@@ -517,15 +574,15 @@ pub fn enrich_collecting(
         normalize_port_literals(node);
     }
 
-    // Port errors mean the topology is malformed; skip type resolution (it would
-    // walk a broken graph) and return them. A clean merge runs type resolution,
-    // whose failure (an unresolvable TypeVar) is a project-level enrich error
-    // with no single node to blame (`Span::default`).
-    if errors.is_empty() {
-        if let Err(e) = resolve_type_vars(project) {
-            errors.push(EnrichError { span: Span::default(), file: None, message: format!("{e}") });
-        }
-    }
+    // Type resolution runs whatever the merge found: it is a per-edge
+    // fixed-point walk over the ports that DO exist, so a node the
+    // catalog could not resolve (empty ports) or a port the merge
+    // refused simply contributes no binding. Gating it on a clean
+    // merge once meant one unknown node type anywhere left every
+    // type variable in the project unresolved, and the validator then
+    // buried the one real error under an `unresolved-typevar` for
+    // every Switch, Debug and `_should_flow` in the file.
+    resolve_type_vars(project);
 
     // Effective-widget stamping, AFTER TypeVar resolution so a `T` input
     // resolved to Image gets the file picker its concrete type implies.
@@ -587,7 +644,7 @@ fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
     }
 }
 
-fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
+fn resolve_type_vars(project: &mut ProjectDefinition) {
     loop {
         let mut changed = false;
 
@@ -645,8 +702,6 @@ fn resolve_type_vars(project: &mut ProjectDefinition) -> CompileResult<()> {
             break;
         }
     }
-
-    Ok(())
 }
 
 /// Walk `port` and `other` in parallel and record every typevar in
@@ -714,6 +769,18 @@ fn substitute_type_var(
     let Some(node) = project.nodes.iter_mut().find(|n| n.id == node_id) else {
         return false;
     };
+    substitute_type_var_on(node, var_name, concrete)
+}
+
+/// Replace every occurrence of `var_name` on ONE node's ports, at any
+/// depth, and say whether anything moved. The single substitution
+/// step: the edge-driven fixed point above and the declared-narrowing
+/// pass in `enrich_collecting` both go through it.
+fn substitute_type_var_on(
+    node: &mut weft_core::project::NodeDefinition,
+    var_name: &str,
+    concrete: &WeftType,
+) -> bool {
     let mut changed = false;
     for input in node.inputs.iter_mut() {
         changed |= replace_in_type(&mut input.port_type, var_name, concrete);

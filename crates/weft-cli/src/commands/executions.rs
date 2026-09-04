@@ -2,7 +2,7 @@
 //! and cleanup. Graph view replay is an extension command; these are
 //! the scripting surface.
 
-use super::Ctx;
+use super::{local_time, Ctx};
 use crate::commands::daemon::ClusterBackend;
 
 /// One page of the dispatcher's execution listing. The body is
@@ -13,11 +13,16 @@ async fn executions_page(
     limit: u32,
     offset: u64,
     project: Option<&str>,
+    phase: Option<&str>,
 ) -> anyhow::Result<(Vec<serde_json::Value>, u64)> {
-    let filter = project.map(|p| format!("&project_id={p}")).unwrap_or_default();
-    let resp: serde_json::Value = client
-        .get_json(&format!("/executions?limit={limit}&offset={offset}{filter}"))
-        .await?;
+    let mut path = format!("/executions?limit={limit}&offset={offset}");
+    if let Some(p) = project {
+        path.push_str(&format!("&project_id={p}"));
+    }
+    if let Some(p) = phase {
+        path.push_str(&format!("&phase={p}"));
+    }
+    let resp: serde_json::Value = client.get_json(&path).await?;
     let rows = resp
         .get("executions")
         .and_then(|v| v.as_array())
@@ -32,21 +37,32 @@ async fn executions_page(
     Ok((rows, total))
 }
 
-pub async fn list(ctx: Ctx, limit: u32) -> anyhow::Result<()> {
+pub async fn list(
+    ctx: Ctx,
+    limit: u32,
+    project: Option<String>,
+    phase: Option<weft_core::context::Phase>,
+) -> anyhow::Result<()> {
     let client = ctx.client();
-    let (arr, total) = executions_page(&client, limit, 0, None).await?;
+    let (arr, total) =
+        executions_page(&client, limit, 0, project.as_deref(), phase.map(|p| p.as_str())).await?;
+    if ctx.json() {
+        println!("{}", serde_json::json!({ "executions": arr, "total": total }));
+        return Ok(());
+    }
     if arr.is_empty() {
         println!("(no executions)");
         return Ok(());
     }
     println!(
-        "{:<38} {:<38} {:<12} {:<20} entry_node  tags",
-        "color", "project_id", "status", "started_at"
+        "{:<36}  {:<9}  {:<13}  {:<19}  {:<36}  entry_node  tags",
+        "color", "status", "phase", "started", "project_id"
     );
     for row in &arr {
         let color = row.get("color").and_then(|v| v.as_str()).unwrap_or("?");
         let project = row.get("project_id").and_then(|v| v.as_str()).unwrap_or("?");
         let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+        let phase = row.get("phase").and_then(|v| v.as_str()).unwrap_or("?");
         let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
         let entry = row.get("entry_node").and_then(|v| v.as_str()).unwrap_or("?");
         // The tags the run put on itself (`ctx.tag_execution`), the
@@ -57,65 +73,162 @@ pub async fn list(ctx: Ctx, limit: u32) -> anyhow::Result<()> {
             .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
             .unwrap_or_default();
         let tags = if tags.is_empty() { String::new() } else { format!("  {}", tags.join(",")) };
-        println!("{color:<38} {project:<38} {status:<12} {started:<20} {entry}{tags}");
+        println!(
+            "{color:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}",
+            local_time(started)
+        );
     }
     // The server clamps the page size, so a big --limit can come back
     // short; say so rather than letting the page read as the total.
+    // It does NOT say "raise --limit": past the server's cap that is
+    // advice the CLI knows will not work.
     if (arr.len() as u64) < total {
-        println!("showing {} of {total} (raise --limit or page with the API)", arr.len());
+        println!(
+            "showing {} of {total} (one page; the dispatcher caps how many a page can hold, \
+             so read the rest through the API)",
+            arr.len()
+        );
     }
     Ok(())
 }
 
-pub async fn events(ctx: Ctx, color: String) -> anyhow::Result<()> {
+/// What `weft events` keeps and how much of each row it shows. The
+/// default is the compact read a person or an agent can hold for a
+/// long run: every row, values cut short. The filters narrow to one
+/// node or one kind of event, and `full` opens the values.
+#[derive(Debug, Default, Clone)]
+pub struct EventsFilter {
+    pub node: Option<String>,
+    pub kind: Option<String>,
+    pub full: bool,
+}
+
+impl EventsFilter {
+    /// Whether one replay row survives the filters. A node filter is
+    /// exact (a node's id), so a run-level row (a start, a completion,
+    /// the run failing) never passes one: it names no node. A kind
+    /// filter matches the kind exactly or as a substring, so `failed`
+    /// finds both `node_failed` and `execution_failed`, and `loop`
+    /// finds the loop lifecycle.
+    pub fn keeps(&self, row: &serde_json::Value) -> bool {
+        let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
+        let node_ok = self.node.as_deref().is_none_or(|n| row_node(row) == Some(n));
+        kind_ok && node_ok
+    }
+}
+
+/// How much of a value the compact line shows before `...`. Long
+/// enough to recognise a value, short enough that a row of forty
+/// nodes fits a screen.
+const SUMMARY_CHARS: usize = 120;
+
+/// The columns every line prints in its own place, plus the two every
+/// row of one run repeats (they name the run, which you already have:
+/// you asked for it by color). Nothing here reaches the generic tail.
+const COLUMNS: &[&str] = &["kind", "node", "node_id", "at_unix", "color", "project_id"];
+
+/// The node a replay row is about. Most rows name it `node`; the two
+/// that come off a pulse rather than a journal row (`cost_reported`,
+/// `bus_participant`) name it `node_id`. One reader, so the filter and
+/// the printed column can never disagree about which rows have a node.
+fn row_node(row: &serde_json::Value) -> Option<&str> {
+    row.get("node")
+        .or_else(|| row.get("node_id"))
+        .and_then(|v| v.as_str())
+}
+
+/// One replay row as the line `weft events` prints: local time, the
+/// kind, the node, then everything else the row carries, `key=value`,
+/// in the row's own field order. The tail is generic on purpose: a
+/// hand-picked key list silently swallows whatever a new event kind
+/// carries (a cost's amount, a suspension's token, a loop's index),
+/// and the one thing a reader wants from a row is exactly the field
+/// that kind was added for. `full` prints values whole; otherwise
+/// each is cut at `SUMMARY_CHARS`, on a character boundary.
+pub fn event_line(row: &serde_json::Value, full: bool) -> String {
+    let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+    // Every row projected from a journal row carries the journal's
+    // `at_unix`; the derived rows (a bus participant sniffed off a
+    // pulse, a corruption the replay found) have none and get a blank
+    // of the same width, so the columns still line up.
+    let at = match row.get("at_unix").and_then(|v| v.as_u64()) {
+        Some(at) => format!("[{:<19}]", local_time(at)),
+        None => " ".repeat(21),
+    };
+    let node = row_node(row).unwrap_or("");
+    let mut line = format!("{at} {kind:<23} {node}");
+    let Some(fields) = row.as_object() else {
+        return line;
+    };
+    for (key, value) in fields {
+        // An absent value and an empty one say the same nothing: a
+        // `frames=[]` on every root-level firing is noise in the column
+        // the reader is scanning.
+        let empty = match value {
+            serde_json::Value::Null => true,
+            serde_json::Value::Array(items) => items.is_empty(),
+            serde_json::Value::Object(map) => map.is_empty(),
+            serde_json::Value::String(text) => text.is_empty(),
+            _ => false,
+        };
+        if COLUMNS.contains(&key.as_str()) || empty {
+            continue;
+        }
+        line.push_str(&format!("  {key}={}", field_text(value, full)));
+    }
+    line
+}
+
+/// One field of a replay row as the line shows it: a string bare (an
+/// error message reads as itself, not as a quoted JSON string), a list
+/// of strings joined, anything else as its JSON, and all of it cut to
+/// `SUMMARY_CHARS` unless `full`.
+fn field_text(value: &serde_json::Value, full: bool) -> String {
+    let text = match value {
+        serde_json::Value::String(text) => text.clone(),
+        // A skip's reason is structured (`{"kind": "did_not_flow"}`);
+        // its kind is the readable part, and the rest is machinery.
+        serde_json::Value::Object(map) if map.len() == 1 => match map.get("kind") {
+            Some(serde_json::Value::String(kind)) => kind.clone(),
+            _ => serde_json::to_string(value).unwrap_or_default(),
+        },
+        serde_json::Value::Array(items) if items.iter().all(|i| i.is_string()) => items
+            .iter()
+            .filter_map(|i| i.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    if full || text.chars().count() <= SUMMARY_CHARS {
+        return text;
+    }
+    let cut: String = text.chars().take(SUMMARY_CHARS.saturating_sub(3)).collect();
+    format!("{cut}...")
+}
+
+pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Result<()> {
     let client = ctx.client();
     let resp: serde_json::Value = client
         .get_json(&format!("/executions/{color}/replay"))
         .await?;
-    let Some(arr) = resp.as_array() else {
-        println!("(no events)");
+    let arr = resp
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {resp}"))?;
+    let kept: Vec<&serde_json::Value> = arr.iter().filter(|row| filter.keeps(row)).collect();
+    if ctx.json() {
+        println!("{}", serde_json::Value::Array(kept.into_iter().cloned().collect()));
         return Ok(());
-    };
-    for row in arr {
-        let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-        // The replay rows are `DispatcherEvent`s: a node event names its
-        // node under `node`; an execution-level event (started, tagged,
-        // completed, cancelled) has none. Every row projected from a
-        // journal row carries the journal's `at_unix`; the derived rows
-        // (a bus participant sniffed off a pulse, a corruption the
-        // replay found) have none and get a blank of the same width.
-        // The kind column is padded to the longest kind
-        // (`loop_iteration_launched`) so the node column lines up too.
-        let node = row.get("node").and_then(|v| v.as_str()).unwrap_or("");
-        let at = match row.get("at_unix").and_then(|v| v.as_u64()) {
-            Some(at) => format!("[{at}]"),
-            None => " ".repeat(12),
-        };
-        print!("{at} {kind:<23} {node}");
-        if let Some(err) = row.get("error").and_then(|v| v.as_str()) {
-            print!("  error={err}");
-        }
-        // A cancel's reason says who stopped the run: a person, or a
-        // sibling run's `ctx.stop_tagged` naming the run and the tag.
-        if let Some(reason) = row.get("reason").and_then(|v| v.as_str()) {
-            print!("  reason={reason}");
-        }
-        if let Some(tags) = row.get("tags").and_then(|v| v.as_array()) {
-            let tags: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
-            print!("  tags={}", tags.join(","));
-        }
-        if let Some(output) = row.get("output") {
-            if !output.is_null() {
-                let summary = serde_json::to_string(output).unwrap_or_default();
-                let trimmed = if summary.len() > 120 {
-                    format!("{}...", &summary[..117])
-                } else {
-                    summary
-                };
-                print!("  output={trimmed}");
-            }
-        }
-        println!();
+    }
+    if kept.is_empty() {
+        println!(
+            "(no events{})",
+            if arr.is_empty() { String::new() } else { format!(" match; the run has {}", arr.len()) }
+        );
+        return Ok(());
+    }
+    for row in kept {
+        println!("{}", event_line(row, filter.full));
     }
     Ok(())
 }
@@ -177,7 +290,7 @@ pub async fn clean(
         let mut deleted_this_pass = 0usize;
         loop {
             let (rows, total) =
-                executions_page(&client, 200, offset, project.as_deref()).await?;
+                executions_page(&client, 200, offset, project.as_deref(), None).await?;
             if rows.is_empty() {
                 break;
             }
@@ -606,7 +719,85 @@ async fn clean_build_cache() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Reclaimed;
+    use super::{event_line, EventsFilter, Reclaimed};
+    use serde_json::json;
+
+    /// The kind filter matches exactly or by substring, the node filter
+    /// exactly, and a run-level row (no node) never passes a node filter.
+    #[test]
+    fn events_filter_narrows_by_node_and_kind() {
+        let failed = json!({"kind": "node_failed", "node": "llm"});
+        let done = json!({"kind": "node_completed", "node": "reply"});
+        let run_failed = json!({"kind": "execution_failed"});
+        let all = EventsFilter::default();
+        assert!(all.keeps(&failed) && all.keeps(&done) && all.keeps(&run_failed));
+        let by_kind = EventsFilter { kind: Some("failed".into()), ..Default::default() };
+        assert!(by_kind.keeps(&failed) && by_kind.keeps(&run_failed) && !by_kind.keeps(&done));
+        let exact = EventsFilter { kind: Some("node_completed".into()), ..Default::default() };
+        assert!(exact.keeps(&done) && !exact.keeps(&failed));
+        let by_node = EventsFilter { node: Some("llm".into()), ..Default::default() };
+        assert!(by_node.keeps(&failed) && !by_node.keeps(&done) && !by_node.keeps(&run_failed));
+    }
+
+    /// The compact line cuts a long value at the summary width on a
+    /// character boundary; `full` prints it whole; and everything the
+    /// row carries reaches the line, including the fields only one
+    /// kind has.
+    #[test]
+    fn event_line_summarises_and_expands() {
+        let long: String = "é".repeat(300);
+        let row = json!({
+            "kind": "node_completed",
+            "node": "llm",
+            "at_unix": 1_756_838_207u64,
+            "output": {"text": long},
+        });
+        let compact = event_line(&row, false);
+        assert!(compact.contains(" node_completed ") && compact.contains(" llm"), "{compact}");
+        assert!(compact.ends_with("..."), "{compact}");
+        assert!(compact.chars().count() < 200, "{}", compact.chars().count());
+        let full = event_line(&row, true);
+        assert!(full.contains(&long), "full keeps the whole value");
+
+        let cancelled = json!({
+            "kind": "execution_cancelled",
+            "reason": "stopped by sibling",
+            "tags": ["user:1"],
+            "at_unix": 1_756_838_207u64,
+        });
+        let line = event_line(&cancelled, false);
+        assert!(line.contains("reason=stopped by sibling") && line.contains("tags=user:1"), "{line}");
+        let skipped = json!({
+            "kind": "node_skipped",
+            "node": "send",
+            "reason": {"kind": "did_not_flow"},
+            "closed_ports": ["ok"],
+            "at_unix": 5u64,
+        });
+        let line = event_line(&skipped, false);
+        assert!(line.contains("reason=did_not_flow") && line.contains("closed_ports=ok"), "{line}");
+        // A derived row with no stamp keeps the columns aligned, and
+        // the row that names its node `node_id` still shows it.
+        let derived = json!({"kind": "journal_corruption", "reason": "bad row"});
+        assert!(event_line(&derived, false).starts_with(&" ".repeat(21)));
+        let cost = json!({
+            "kind": "cost_reported",
+            "node_id": "llm",
+            "project_id": "e8969195-52aa-42e0-8a9b-f9577ddd8bed",
+            "frames": [],
+            "service": "openai",
+            "amount_usd": 0.0123,
+            "at_unix": 5u64,
+        });
+        let line = event_line(&cost, false);
+        assert!(line.contains(" llm") && line.contains("service=openai") && line.contains("amount_usd=0.0123"), "{line}");
+        assert!(!line.contains("project_id") && !line.contains("frames"), "the run's own name and an empty frame stack are not news: {line}");
+        // The fields the old hand-picked key list dropped.
+        let suspended = json!({"kind": "node_suspended", "node": "ask", "token": "a44e5cad", "at_unix": 5u64});
+        assert!(event_line(&suspended, false).contains("token=a44e5cad"));
+        let iteration = json!({"kind": "loop_iteration_launched", "node": "run__in", "index": 7, "at_unix": 5u64});
+        assert!(event_line(&iteration, false).contains("index=7"));
+    }
 
     /// One report line per sweep: the count always, each tail only
     /// when it happened.

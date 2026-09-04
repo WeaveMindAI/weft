@@ -25,16 +25,17 @@ happens in it is journaled, node by node, with the values on the wires.
 | `weft stop <color>` | cancel an execution |
 | `weft status` | registration, build state, listener, infra, drift |
 | `weft ps` | every registered project |
-| `weft executions [--limit N]` | past executions, newest first |
-| `weft events <color>` | a run's node events in order, with emitted values |
-| `weft logs [color]` | a run's log lines (no argument: the latest execution) |
+| `weft executions [--limit N] [--project <id>] [--phase fire]` | past executions, newest first (see Reading a run) |
+| `weft events <color> [--node <id>] [--kind <kind>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run) |
+| `weft logs [color]` | a run's log (no argument: the latest execution; see Reading a run) |
 | `weft follow <project>` | live events for a project |
 | `weft activate` / `weft deactivate` | turn triggers on / off (deactivate default wipes; `--mode hibernate` or `park` preserves in-flight human work) |
 | `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph |
-| `weft infra start` / `weft infra status` / `weft infra stop` / `weft infra terminate` | the project's long-running infra (Postgres, bridges); stop pauses keeping data, terminate destroys it |
+| `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` | the project's long-running infra (Postgres, bridges); the verbs are explained below |
 | `weft daemon start` / `status` / `logs` | the local runtime |
 | `weft catalog update` | re-sync `nodes/base_catalog/` to the installed weft's stdlib |
-| `weft describe-nodes [--node <Type>] [--compact]` | the project catalog as JSON; `--compact` is the wiring view, `--node` one type |
+| `weft describe-nodes --list` | one line per node type, which is how you find one |
+| `weft describe-nodes --node <Type> --compact` | one node's wiring view, which is what you read before wiring it. With no flags you get the whole catalog as JSON, which is large |
 | `weft test-node <target>` | run node self-tests (`--tier live` spends money, asks first) |
 | `weft connect` | the editor's Connect panel as a CLI verb: `--list` access nodes, pick a stored connection (`--node`, `--grant`), connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect` |
 | `weft rm [--all] [--force]` | unregister the project, terminate infra, reclaim data |
@@ -77,17 +78,90 @@ Editing a trigger's subgraph needs `weft resync` to take effect. Infra nodes
 must be running for a run that touches them: `weft infra status`, then
 `weft infra start`.
 
+## The infra verbs
+
+An infra node (`PostgresDatabase`, `BaileyBridge`) is a container the runtime
+keeps running, with a disk that survives restarts. Which verb you reach for
+depends on what you want to keep:
+
+- **If the infra is not running yet**, or was stopped: `weft infra start`.
+  It brings every unit up to its spec and waits until it is ready. Running it
+  again does nothing for units that are already up.
+- **If you changed an infra node's spec** (its image, its env, its volumes)
+  and want the change live: `weft infra upgrade`. Each unit whose spec
+  changed goes down and comes back up on the new spec, the others are left
+  alone, and every disk is kept. Once the infra reports ready, run
+  `weft activate`.
+
+  Stop, terminate and upgrade all take the project's triggers down first
+  (nothing can fire at infra that is going away) and leave it deactivated,
+  so each of them ends with `weft activate` when you want it listening
+  again. Start does not: it brings the infra up and leaves activation
+  alone.
+- **If you want it off for a while and the data kept** (a paired WhatsApp
+  session, a database's rows): `weft infra stop`. The containers go, the
+  disks stay, and `weft infra start` brings it back with everything in it.
+- **If you want it gone** (the database and its rows, the bridge and its
+  pairing): `weft infra terminate`. Every resource is deleted, disks included
+  unless the node's own spec preserves them. There is no undo. A database
+  comes back empty on the next start, and a bridge needs its QR scanned
+  again.
+- **If a verb is stuck mid-way**: `weft infra cancel` stops it between
+  steps; whatever it already did stays done.
+
+`weft infra status` says per node whether it is running and what its
+endpoint is. A run that touches infra is refused until that infra is
+running, both from the CLI and from the editor's Run button.
+
 Suspended executions are alive and cost nothing: a `HumanQuery` waiting on a
 person parks, the worker exits, and the answer resumes it. The browser
 extension (built with `./setup.sh --browser --no-sign`) is where people
 answer.
 
-## Inspecting a run
+## Reading a run
 
-- `weft executions --limit 5`: what ran, statuses, entry nodes.
-- `weft events <color>`: every node event in order, `output=` carries the
-  emitted value (trimmed in the terminal; full JSON with `--json`).
-- `weft logs <color>`: the run's log lines.
+Each verb below prints one compact line per run or per event and has a flag
+that opens the part you want, so you can read a forty-node run without
+loading the whole journal. Read in this order and stop when you hold the
+failing node and the wrong value.
+
+- **If you want to know what ran, or whether your trigger fired since the
+  change**: `weft executions --limit 10 --phase fire`. One line per run:
+  color, status (`running`, `completed`, `failed`, `cancelled`), phase, the
+  local start time, the entry node (the trigger that fired), the tags. An
+  activate, a resync or an infra start creates setup runs, whose phases are
+  `trigger_setup` and `infra_setup`; `--phase fire` hides them.
+  `--project <id>` narrows to one project.
+- **If a run failed and you want the reason**: `weft logs <color>`. It prints
+  what the run's nodes wrote, and every failure the journal recorded, as
+  `error` and `warn` lines. A line about one node names it (and the loop
+  iteration it was in, `llm#3:`); a line about the run itself (the run
+  failing, a cancel) names none:
+  `[2026-09-02 21:36:47] error llm: node failed: the service answered 401 ...`. It is
+  the last 1000 lines (`--limit` raises that) and says so when a run wrote more. For most
+  failures this is enough, and you never open the events. `(no logs: ...)`
+  means the run wrote nothing and recorded no failure. It did not fail, so
+  check its status to see what it did.
+- **If you want the values on the wires**: `weft events <color>`. One line
+  per event: local time, kind, node, then everything that row carries as
+  `key=value`, each cut to a screen's width (`input=` on `node_started`,
+  `output=` on `node_completed`, `error=` on `node_failed`, `reason=` on a
+  skip or a cancel, `token=` on a suspension, and so on). Narrow before you
+  read: `--kind failed` for the failures
+  (a substring matches, so this catches `node_failed` and
+  `execution_failed`), `--kind node_skipped` for what did not run and why,
+  `--node <id>` for every event on one node. `--full` prints the values
+  uncut, once you know which line you want; `--json` prints the replay rows
+  for `grep` or `jq`.
+- **If a node did not run**: its `node_skipped` line carries the reason.
+  `did_not_flow` means the node's `_should_flow` said no. `flow_closed` or
+  `required_input_closed` means whatever should have fed it never fired, so
+  walk to that node's line. `outside_this_run` means this run was aimed at
+  some output nodes and none of them depends on this node; usually that is a
+  missing `_is_output`.
+- **If a `Debug` shows `output=` empty**: that is correct, because a
+  `Debug` has no outputs. Its value is on its `node_started` line as
+  `input=`, or `weft events <color> --node <debug id>`.
 - In VS Code with the weft extension: the Executions view, "View in Graph"
   replays the run in the graph, values on every wire; `Debug` nodes render
   their latest value inline. The full editor surface (inspector, action
@@ -101,8 +175,10 @@ answer.
    A diagnostic naming the catalog (an enrichment error, an unknown field,
    "a stale base_catalog copy") means the stdlib copy lags the installed
    weft: run `weft catalog update`, then re-check, before anything else.
-2. **A run failed.** `weft events <color>` and `weft logs <color>`: the node
-   that failed, the error text, the values that reached it. The slug
+2. **A run failed.** `weft logs <color>` names the node and the error. If
+   the error alone does not say enough, `weft events <color> --node <that
+   node>` shows the values that reached it, on its `node_started` line. The
+   slug
    catalogue is in the `weft-language` skill; node errors are the node
    author's message. A node error like "no connection picked; pick one on
    the node" is the runtime tier firing at execution, not a source bug:

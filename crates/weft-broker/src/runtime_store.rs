@@ -90,6 +90,13 @@ fn part_size_for(declared_size: Option<u64>) -> u64 {
 const RUNTIME_PREFIX: &str = "runtime/";
 
 /// The bucket object key for a canonical storage key: `runtime/<tenant>/...`.
+/// The scope a key lives in: everything before its id. What an
+/// identity is unique within (the same message fetched by two projects
+/// is two files), and the expression the identity index is built on.
+fn scope_prefix(key: &str) -> &str {
+    key.rsplit_once('/').map(|(prefix, _)| prefix).unwrap_or(key)
+}
+
 fn object_key(key: &str) -> String {
     format!("{RUNTIME_PREFIX}{key}")
 }
@@ -137,6 +144,11 @@ pub struct UploadSpec<'a> {
     /// The sha256 id for `StorageScope::Asset` (required there, refused
     /// elsewhere); every other scope mints a uuid.
     pub content_hash: Option<&'a str>,
+    /// What the file is a copy OF (a message id, a document id), so a
+    /// second begin naming the same identity in the same scope answers
+    /// the file already there. Refused on the asset scope, which is
+    /// content-addressed already.
+    pub identity: Option<&'a str>,
 }
 
 /// What a begin answered: a fresh reservation to upload into, or (asset
@@ -151,7 +163,10 @@ pub enum BeginUpload {
 /// Internal outcome of the begin's reservation transaction.
 enum Reserved {
     Fresh,
-    AlreadyActive,
+    /// The file is already there, under this key: a content-addressed
+    /// begin whose content is active (the minted key), or an identified
+    /// begin whose identity the scope holds (that file's key).
+    AlreadyActive(String),
 }
 
 type StoreResult<T> = Result<T, RuntimeStoreError>;
@@ -228,8 +243,19 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Progress clock for the abandoned-pending reap: bumped whenever a
             -- part is reserved, so a long multi-part upload that is still
             -- moving is never reaped mid-flight.
-            progressed_at_unix BIGINT NOT NULL DEFAULT 0
+            progressed_at_unix BIGINT NOT NULL DEFAULT 0,
+            -- What the file is a copy OF, when the writer said (a message
+            -- id, a document id at a provider): a begin naming an identity
+            -- the scope already holds answers that file instead of minting
+            -- another. NULL for a file that is its own thing.
+            identity           TEXT
         );
+        -- One file per identity per scope (the key minus its id): the
+        -- lookup begin makes, and the guarantee that two runs fetching the
+        -- same thing at once cannot both land.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_file_identity
+            ON runtime_file((regexp_replace(key, '/[^/]+$', '')), identity)
+            WHERE identity IS NOT NULL;
         -- One row per RESERVED part of a pending upload: the exact size signed
         -- into its URL, and the etag once the caller reports it landed (NULL =
         -- reserved but not yet landed, i.e. what resume re-presigns). Rows are
@@ -434,7 +460,17 @@ impl RuntimeStore {
         spec: &UploadSpec<'_>,
         entitlements: &dyn EntitlementSource,
     ) -> StoreResult<BeginUpload> {
-        let UploadSpec { scope, mime, filename, keep, declared_size, content_hash } = *spec;
+        let UploadSpec { scope, mime, filename, keep, declared_size, content_hash, identity } = *spec;
+        if identity.is_some() && matches!(scope, StorageScope::Asset) {
+            return Err(RuntimeStoreError::Invalid(
+                "an identity does not apply to the asset scope, which is addressed by content".into(),
+            ));
+        }
+        if identity.is_some_and(|i| i.is_empty() || i.len() > 512) {
+            return Err(RuntimeStoreError::Invalid(
+                "a file identity is a non-empty label of at most 512 characters".into(),
+            ));
+        }
         // keep only applies to execution scope (project/shared/asset are
         // persistent without a flag); reject loud rather than silently
         // dropping the flag.
@@ -529,10 +565,41 @@ impl RuntimeStore {
                 .context("runtime begin_upload: check content-addressed key")
                 .map_err(RuntimeStoreError::Other)?;
                 match existing.as_deref() {
-                    Some("active") => return Ok(Reserved::AlreadyActive),
+                    Some("active") => return Ok(Reserved::AlreadyActive(key.clone())),
                     Some(status) => {
                         return Err(RuntimeStoreError::Conflict(format!(
                             "asset '{key}' already exists ({status})"
+                        )));
+                    }
+                    None => {}
+                }
+            }
+            // An identified begin: the same source stored twice in one
+            // scope is one file. Checked under the lock, like the
+            // content-addressed case: an ACTIVE row is this begin's
+            // answer, a row still uploading (or being reaped) is a
+            // conflict to retry once it settles. The scope is the key's
+            // prefix (everything before the id), the same expression the
+            // unique index is built on.
+            if let Some(identity) = identity {
+                let existing: Option<(String, String)> = sqlx::query_as(
+                    "SELECT key, status FROM runtime_file \
+                     WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2",
+                )
+                .bind(scope_prefix(&key))
+                .bind(identity)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("runtime begin_upload: check identity")
+                .map_err(RuntimeStoreError::Other)?;
+                match existing {
+                    Some((existing_key, status)) if status == "active" => {
+                        return Ok(Reserved::AlreadyActive(existing_key));
+                    }
+                    Some((existing_key, status)) => {
+                        return Err(RuntimeStoreError::Conflict(format!(
+                            "a file with identity '{identity}' is already {status} in this scope \
+                             ('{existing_key}'); retry once it settles"
                         )));
                     }
                     None => {}
@@ -572,8 +639,8 @@ impl RuntimeStore {
                 "INSERT INTO runtime_file \
                  (key, tenant_id, mime_type, filename, size_bytes, status, keep, expires_at_unix, \
                   keep_ttl_secs, created_at_unix, upload_id, part_size, declared_size, \
-                  reserved_bytes, progressed_at_unix) \
-                 VALUES ($1, $2, $3, $4, 0, 'pending', $5, NULL, $6, $7, $8, $9, $10, $11, $7)",
+                  reserved_bytes, progressed_at_unix, identity) \
+                 VALUES ($1, $2, $3, $4, 0, 'pending', $5, NULL, $6, $7, $8, $9, $10, $11, $7, $12)",
             )
             .bind(&key)
             .bind(&tenant)
@@ -586,6 +653,7 @@ impl RuntimeStore {
             .bind(part_size as i64)
             .bind(declared_size.map(|s| s as i64))
             .bind(declared_size.unwrap_or(0) as i64)
+            .bind(identity)
             .execute(&mut *tx)
             .await
             .context("runtime begin_upload: reserve pending row")
@@ -615,9 +683,9 @@ impl RuntimeStore {
         };
         match reserve {
             Ok(Reserved::Fresh) => Ok(BeginUpload::Ready { key, part_size }),
-            Ok(Reserved::AlreadyActive) => {
+            Ok(Reserved::AlreadyActive(existing)) => {
                 abort_opened_multipart().await;
-                Ok(BeginUpload::AlreadyStored { key })
+                Ok(BeginUpload::AlreadyStored { key: existing })
             }
             Err(e) => {
                 abort_opened_multipart().await;
@@ -1467,6 +1535,32 @@ impl RuntimeStore {
         .fetch_optional(&self.pool)
         .await
         .context("runtime row")
+    }
+
+    /// The ACTIVE file stored under `identity` in the caller's `scope`,
+    /// if any: the read half of an identified put, so a caller can ask
+    /// before it fetches anything. The scope is the same prefix the
+    /// begin's collision check and the identity index use.
+    pub async fn find_identity(
+        &self,
+        caller: &CallerAuth,
+        scope: &StorageScope,
+        identity: &str,
+    ) -> StoreResult<Option<StoredFileMeta>> {
+        let prefix = weft_core::storage::key::prefix_for_list(caller, scope)
+            .map_err(RuntimeStoreError::Denied)?;
+        let row = sqlx::query_as::<_, FileRow>(
+            "SELECT key, mime_type, filename, size_bytes, keep, expires_at_unix, keep_ttl_secs, created_at_unix \
+             FROM runtime_file \
+             WHERE regexp_replace(key, '/[^/]+$', '') = $1 AND identity = $2 AND status = 'active'",
+        )
+        .bind(prefix.trim_end_matches('/'))
+        .bind(identity)
+        .fetch_optional(&self.pool)
+        .await
+        .context("runtime find_identity")
+        .map_err(RuntimeStoreError::Other)?;
+        Ok(row.as_ref().map(FileRow::to_meta))
     }
 
     /// Metadata only (no access bump). The caller has already passed the wall.

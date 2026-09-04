@@ -139,6 +139,43 @@ pub fn filename_from_url(url: &str) -> String {
     }
 }
 
+/// The filename a response names for itself, out of its
+/// `Content-Disposition` header: `attachment; filename="voice.ogg"`,
+/// quoted or bare, and the RFC 5987 `filename*=UTF-8''voice.ogg`
+/// form. `None` when the header is absent or names nothing usable.
+///
+/// A server that says what its file is called knows better than the
+/// URL does (`/media/3EB0C767` is an id, not a name), and a file that
+/// keeps its extension is the difference between a document arriving
+/// as `voice.ogg` and arriving as an unnamed blob. Any path separator
+/// is dropped: the name is a label, never a place to write.
+pub fn filename_from_disposition(header: &str) -> Option<String> {
+    let mut best: Option<String> = None;
+    for part in header.split(';') {
+        let part = part.trim();
+        // `inline` / `attachment` carry no `=`; they are not the name.
+        let Some((key, value)) = part.split_once('=') else { continue };
+        let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
+        let value = match key.as_str() {
+            // The extended form carries a charset and a language
+            // before the name; only the name is wanted.
+            "filename*" => value.rsplit('\'').next().unwrap_or(value),
+            "filename" if best.is_none() => value,
+            _ => continue,
+        };
+        let value = value.trim().trim_matches('"');
+        let name = value.rsplit(['/', '\\']).next().unwrap_or(value).trim();
+        if !name.is_empty() && name != "." && name != ".." {
+            let owned = name.to_string();
+            if key == "filename*" {
+                return Some(owned);
+            }
+            best = Some(owned);
+        }
+    }
+    best
+}
+
 /// Normalize an HTTP `Content-Type` header into a storable mime type:
 /// drop any `; charset=...` parameter and trim, falling back to
 /// `application/octet-stream` for an absent or empty value. Every node
@@ -430,6 +467,22 @@ pub struct ListFilesResponse {
     pub files: Vec<StoredFileMeta>,
 }
 
+/// `POST /v1/storage/identity`: the file stored under `identity` in
+/// `scope`, if there is one. What an identified `put_from_url` asks
+/// BEFORE fetching, so a source already stored costs no download at
+/// all (the begin's own already-stored answer is the race-safe
+/// backstop, but by then the bytes are already on their way).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityLookupRequest {
+    pub scope: StorageScope,
+    pub identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityLookupResponse {
+    pub file: Option<StoredFileMeta>,
+}
+
 /// `POST /v1/storage/presign`: a presigned GET URL for one file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignResponse {
@@ -457,6 +510,14 @@ pub struct UploadBeginRequest {
     pub keep: Option<KeepTtl>,
     #[serde(default)]
     pub declared_size: Option<u64>,
+    /// What this file is a copy OF, when the caller knows (a WhatsApp
+    /// message id, a document id at some provider). A begin naming an
+    /// identity that is already stored ACTIVE in the same scope
+    /// answers `already_stored` with that file's key instead of a
+    /// fresh reservation: the same source, fetched twice, is one
+    /// file. `None` for a file that is its own thing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
 }
 
 /// Begin response: the minted key + the fixed part size for this upload.
@@ -687,6 +748,37 @@ pub struct SweepExecResponse {
     /// Completed un-kept files stamped with the post-run linger expiry
     /// (deleted by the expiry sweep once it passes).
     pub lingering: u64,
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::filename_from_disposition;
+
+    /// The name a server gives its own file, in the three shapes a
+    /// server writes it, and never a path.
+    #[test]
+    fn a_server_names_its_file() {
+        assert_eq!(
+            filename_from_disposition("inline; filename=\"voice.ogg\""),
+            Some("voice.ogg".to_string())
+        );
+        assert_eq!(
+            filename_from_disposition("attachment; filename=report.pdf"),
+            Some("report.pdf".to_string())
+        );
+        assert_eq!(
+            filename_from_disposition("attachment; filename=\"fallback.txt\"; filename*=UTF-8\'\'real.txt"),
+            Some("real.txt".to_string()),
+            "the extended form wins"
+        );
+        assert_eq!(
+            filename_from_disposition("attachment; filename=\"../../etc/passwd\""),
+            Some("passwd".to_string()),
+            "a name is a label, never a path"
+        );
+        assert_eq!(filename_from_disposition("inline"), None);
+        assert_eq!(filename_from_disposition("attachment; filename=\"\""), None);
+    }
 }
 
 #[cfg(test)]

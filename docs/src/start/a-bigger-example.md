@@ -11,16 +11,12 @@ fal = FalAccess
 ask = TelegramReceiveMessage { account: telegram.access }
 
 credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String?) {
-  # Take one credit off this telegram account, or say why we cannot
-  who = ExecPython(user: String) -> (params: List[String]) {
-    code: @file("scripts/lookup_params.py")
-    user: self.telegramUser
-  }
-
-  debit = PostgresExecuteQuery {
+  # Take one credit off this telegram account, or say why we cannot.
+  # The query reads the sender's id as `$telegram_id`.
+  debit = PostgresExecuteQuery(telegram_id: String) {
     query: @file("sql/spend_credit.sql")
     account: self.db
-    params: who.params
+    telegram_id: self.telegramUser
   }
 
   # `refusal` says nothing when the credit was taken
@@ -76,20 +72,21 @@ one, a model turns their message into an image brief, fal draws it, and the
 picture goes back to the chat. No credits, or no account at all, and they get
 told so instead.
 
-Four files sit beside it, none of them weft:
+Three files sit beside it, none of them weft:
 
 | File | What it holds |
 |---|---|
 | `sql/spend_credit.sql` | one statement that takes a credit and reports what happened |
-| `scripts/lookup_params.py` | wraps the sender's id as the query's parameter list |
 | `scripts/outcome.py` | turns the query's row into `paid` and, when it failed, a sentence |
 | `prompts/image_brief.md` | the system prompt that turns a message into an image brief |
 
 `@file` pulls each one in as that field's value, so the SQL lives in a real
 `.sql` file your editor can highlight while still being the node's config.
-`lookup_params.py` is there because `PostgresExecuteQuery` wants its parameters
-as a list and `ask.user` is a single string. For what else `@file` can do, and
-its read-only sibling, go and read [Files and reuse](../language/files-and-reuse.md).
+The query's parameter is a port the node declares for itself,
+`PostgresExecuteQuery(telegram_id: String)`, and the SQL reads it as
+`$telegram_id`. For what
+else `@file` can do, and its read-only sibling, go and read
+[Files and reuse](../language/files-and-reuse.md).
 
 ## The credit group
 

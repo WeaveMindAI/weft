@@ -23,7 +23,12 @@
       "Bash(git checkout:*)",
       "Bash(git push:*)",
       "Bash(git reset:*)",
-      "Bash(git clean:*)"
+      "Bash(git clean:*)",
+      "Bash(git commit:*)",
+      "Bash(git add:*)",
+      "Bash(git merge:*)",
+      "Bash(git rebase:*)",
+      "Bash(git tag:*)"
     ]
   }
 }

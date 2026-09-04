@@ -43,6 +43,7 @@ impl Node for ElevenLabsSoundEffectNode {
             http.post(format!("{API}/sound-generation")).json(&body),
             "elevenlabs: generate the sound effect",
             "sound_effect.mp3",
+            "audio/mpeg",
         )
         .await
     }

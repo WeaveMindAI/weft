@@ -19,16 +19,12 @@ pg = PostgresDatabase { database: "imagebot" }
 ask = TelegramReceiveMessage { account: telegram.access }
 
 credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String?) {
-  # Take one credit off this telegram account, or say why we cannot
-  who = ExecPython(user: String) -> (params: List[String]) {
-    code: @file("scripts/lookup_params.py")
-    user: self.telegramUser
-  }
-
-  debit = PostgresExecuteQuery {
+  # Take one credit off this telegram account, or say why we cannot.
+  # The query reads the sender's id as `$telegram_id`.
+  debit = PostgresExecuteQuery(telegram_id: String) {
     query: @file("sql/spend_credit.sql")
     account: self.db
-    params: who.params
+    telegram_id: self.telegramUser
   }
 
   # `refusal` says nothing when the credit was taken
@@ -97,18 +93,14 @@ table = PostgresExecuteQuery {
   account: pg.access
 }
 
-# Waits for the table (its `ready` input), then shapes the form's two
-# values into the insert's parameter list.
-signup = ExecPython(ready: List[JsonDict], telegramId: String, credits: String) -> (params: List[String]) {
-  code: @file("scripts/signup_params.py")
-  ready: table.rows
-  telegramId: join.telegramId
-  credits: join.credits
-}
-
-enroll = PostgresExecuteQuery {
+# Waits for the table (`_should_flow` on its rows), then writes the
+# form's two values, which the SQL reads as `$telegram_id` and
+# `$credits` (an empty credits field enrolls with 5).
+enroll = PostgresExecuteQuery(telegram_id: String, credits: String) {
   _is_output: true
+  _should_flow: table.rows
   query: @file("sql/add_user.sql")
   account: pg.access
-  params: signup.params
+  telegram_id: join.telegramId
+  credits: join.credits
 }

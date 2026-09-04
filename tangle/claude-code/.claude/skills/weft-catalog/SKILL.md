@@ -64,7 +64,7 @@ wire, e.g. an LLM's `provider`, `params`, `history`, `tools`). Exactly one
 driver per port.
 
 `widget` is the editor's control (`select`, `textarea`, `code`, `number`,
-`checkbox`, `text_list`, `entry_list`, `password`, `access`, `file_drop`,
+`checkbox`, `datetime`, `text_list`, `entry_list`, `password`, `access`, `file_drop`,
 `remote_select`). A select widget's `options` are the accepted literals.
 
 `features`: `isTrigger` (starts executions from outside), `isOutputDefault`
@@ -118,15 +118,24 @@ Orientation, not inventory. The inventory is on disk and grows.
   `weft-language` skill.
 - **live**: `ApiEndpoint` (HTTP), `LiveSocket` (WebSocket). Triggers; a fresh
   execution per request or connection.
-- **triggers**: `Cron` (`cron` expression, standard five-field).
+- **triggers**: `Cron` (`cron` expression, SIX fields with seconds first:
+  `0 */5 * * * *` is every five minutes; a five-field expression is refused
+  at activation. `timezone` is an IANA name, `UTC` unless set: with
+  `Europe/Paris`, `0 0 9 * * *` is nine in Paris all year).
 - **postgres**: `PostgresDatabase` (infra: the project's own Postgres,
   emits `.access`), `PostgresAccess` (external one), `PostgresExecuteQuery`
-  (`$1` placeholders, `params` list), `PostgresInsertRow`,
+  (its parameters are its own input ports, declared inline and read by name:
+  `PostgresExecuteQuery(user_id: String) { query: "... WHERE id = $user_id" }`;
+  several statements run as a script, which takes no parameters),
+  `PostgresInsertRow`,
   `PostgresUpdateRows`.
 - **bailey** (WhatsApp), **telegram**, **slack**, **email**, **google**
   (Drive, Sheets, Docs, Gmail, Calendar), **notion**, **airtable**, **s3**,
   **web** (FetchPage, CrawlSite, WebSearch), **rss**, **storage**
-  (FetchToStorage, KeepFile, MediaDisplay, DownloadLink).
+  (FetchToStorage, KeepFile, MediaDisplay, DownloadLink). `FetchToStorage`
+  with `scope: "project"` and an `identity` fetches a thing once per
+  project: a second fetch of the same identity is the same file, no
+  download.
 - **http**: `HttpRequest` (`method` is config, `url`/`body`/`headers` wireable).
 
 ## Wiring patterns that recur

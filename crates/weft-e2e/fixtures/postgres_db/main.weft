@@ -3,14 +3,15 @@
 # connection like any other, without a password anywhere in the graph.
 #
 # The three statements run in order because each one waits on the
-# previous one's rows: create the table (idempotent, so a second run
-# is a no-op), write a row, then read back exactly the row that was
-# written. The read's `$1` is the row the write returned, so the value
-# has to survive the whole way out to weft and back into the database.
+# previous one: create the table (idempotent, so a second run is a
+# no-op), write a row, then read back exactly the row that was
+# written. The read's `$written` port is the row the write returned,
+# so the value has to survive the whole way out to weft and back into
+# the database.
 #
-# The `params` edges into `write` and `read` are what ORDER them; a
-# statement's placeholder count has to match what its edge carries, so
-# `create` must keep returning no rows and `write` exactly one.
+# `write` runs only once `create` has answered (`_should_flow` is the
+# ordering wire, any value on it means go); `read` waits on `write`
+# through the port it reads.
 
 db = PostgresDatabase
 
@@ -23,13 +24,13 @@ write = PostgresExecuteQuery {
   query: "INSERT INTO notes (body) VALUES ('__E2E_BODY__') RETURNING body"
 }
 write.account = db.access
-write.params = create.rows
+write._should_flow = create.rows
 
-read = PostgresExecuteQuery {
-  query: "SELECT body FROM notes WHERE body = ($1::jsonb ->> 'body') ORDER BY id"
+read = PostgresExecuteQuery(written: List[JsonDict]) {
+  query: "SELECT body FROM notes WHERE body = ($written::jsonb -> 0 ->> 'body') ORDER BY id"
 }
 read.account = db.access
-read.params = write.rows
+read.written = write.rows
 
 out = Debug
 out.data = read.rows

@@ -8,11 +8,12 @@ import { readFileSync, writeFileSync, existsSync } from 'fs';
  *      includes messages from before the server started.
  *   2. Live messages (`messages.upsert`), new messages as they arrive.
  *
- * Stores raw Baileys WAMessage protobufs so audio can be lazy-downloaded
- * at query time via `downloadMediaMessage`. The protobuf is small (few KB),
- * the actual audio bytes are only fetched when explicitly requested (the
- * `/media` route and the fetchMessages action; the live receive/SSE path
- * is text-only and never downloads media).
+ * Stores raw Baileys WAMessage protobufs so media can be lazy-downloaded
+ * at query time via `downloadMediaMessage`. The protobuf is small (few KB);
+ * the actual bytes are only fetched when a node asks for them through the
+ * `/media/:messageId` route (the receive node for a live message, the
+ * fetch-media node for one out of history). The live SSE path and the
+ * fetchMessages action carry text and captions only.
  *
  * Each chat keeps at most `maxPerChat` messages (oldest evicted).
  * If `persistPath` is provided, the store is loaded from disk on construction

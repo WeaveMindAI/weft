@@ -20,6 +20,9 @@ export interface ExecutionSummary {
   project_id: string;
   entry_node: string;
   status: string;
+  /** A trigger fire or manual run (`fire`), or one of the two setup
+   *  runs an activate / resync / infra start makes. */
+  phase: 'fire' | 'trigger_setup' | 'infra_setup';
   started_at: number;
   completed_at?: number | null;
   /** The tags the run put on itself (`ctx.tag_execution`), in claim

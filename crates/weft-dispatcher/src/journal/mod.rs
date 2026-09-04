@@ -204,8 +204,16 @@ pub trait Journal: Send + Sync {
         color: Color,
     ) -> anyhow::Result<ColorLookup<String>>;
 
-    /// Log lines for a color, oldest first. Folded from
-    /// `ExecEvent::LogLine` events.
+    /// The LAST `limit` log lines of a color, oldest first: every
+    /// event `LogEntry::from_event` projects (node log lines and the
+    /// failures the journal recorded), in the order they were written
+    /// (`LogEntry::tail`). The tail, not the head: a run that wrote
+    /// more lines than the limit went wrong at the END, and a head
+    /// would cut off exactly the failure the reader came for. A
+    /// DISPLAY read, like `events_log_lossy`: a row that no longer
+    /// decodes is an `error` line naming it and `weft clean`
+    /// (`LogEntry::corrupt_row`), so the lines that survive still
+    /// read.
     async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
 
     /// A page of `tenant`'s executions, newest first, matching `query`'s filters
@@ -491,6 +499,14 @@ pub struct ExecutionSummary {
     /// then, and the row is listed so it can be inspected via replay
     /// and deleted).
     pub status: String,
+    /// What kind of run this was: a `fire` (a trigger fired or a
+    /// manual run), or one of the two setup phases an activate /
+    /// resync / infra start runs. The listing mixes all three, and
+    /// "has my trigger fired since the change" is unanswerable without
+    /// it. Copied from the `ExecutionStarted` row, or, when that row
+    /// no longer decodes, from the `execution_color.phase` column the
+    /// listing filtered on.
+    pub phase: weft_core::context::Phase,
     pub started_at: u64,
     pub completed_at: Option<u64>,
     /// The tags the run put on itself (`ctx.tag_execution`), in the
@@ -511,6 +527,10 @@ pub struct ExecutionQuery {
     pub project_id: Option<String>,
     pub started_after: Option<u64>,
     pub started_before: Option<u64>,
+    /// Only runs of this phase (the `execution_color.phase` column):
+    /// `Fire` hides the activate / resync / infra-start runs so a
+    /// listing answers "what did my triggers actually do".
+    pub phase: Option<weft_core::context::Phase>,
 }
 
 /// One page of executions plus the total number matching the same filters
@@ -554,9 +574,320 @@ pub struct SignalToken {
     pub created_at: u64,
 }
 
+/// One line of a run's log. A `LogLine` a node
+/// wrote is one; so is every failure the journal recorded about the
+/// run (a node failing, a port refusing a value, the run failing or
+/// being cancelled), projected here as an `error` / `warn` line so
+/// "why did this run go wrong" is answered by the log and not only
+/// by the full replay. `node` names the firing for the node-level
+/// ones and is `None` for a run-level line.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub at_unix: u64,
     pub level: String,
+    pub node: Option<String>,
+    /// The iteration the firing was in, empty at the root. Without it
+    /// a loop over two hundred items gives two hundred identical
+    /// lines and the reader has to open the replay anyway.
+    pub frames: weft_core::LoopFrames,
     pub message: String,
+    /// When the line was written, in milliseconds, the key the log is
+    /// ordered by: the worker's clock for a node's line, and for a row
+    /// without one (a failure the journal wrote, a line from before
+    /// the clock was carried) the end of its second.
+    pub written_at_ms: u64,
+    /// A node's line carries its place among the firing's side
+    /// effects, from the worker; the journal's own rows (a failure)
+    /// have none. Breaks the tie between lines of one millisecond.
+    pub seq: Option<u64>,
+}
+
+impl LogEntry {
+    /// The lines as the run wrote them. A node's log line reaches the
+    /// journal through a task a dispatcher pod drains later, eight at
+    /// a time, so the journal's row order is the drain's, not the
+    /// run's: the read sorts by the worker's clock, to the
+    /// millisecond, then by the firing's own sequence. A row the
+    /// journal wrote itself (a failure) has no clock of its own and
+    /// sorts at the end of its second. Stable, so what neither key
+    /// separates keeps its journal order.
+    pub fn in_written_order(mut entries: Vec<LogEntry>) -> Vec<LogEntry> {
+        entries.sort_by_key(|e| (e.written_at_ms, e.seq.unwrap_or(u64::MAX)));
+        entries
+    }
+
+    /// The last `limit` lines in written order: THE `logs_for` answer,
+    /// the same code for both journals, so what a mock-backed test
+    /// pins is what the real read does. The cut is made after the
+    /// sort, so it is the last lines the run wrote and never the last
+    /// rows a pod happened to drain.
+    pub fn tail(entries: Vec<LogEntry>, limit: u32) -> Vec<LogEntry> {
+        let mut entries = Self::in_written_order(entries);
+        if entries.len() > limit as usize {
+            entries.drain(..entries.len() - limit as usize);
+        }
+        entries
+    }
+
+    /// The end of a second, where a row with no millisecond clock
+    /// sorts: after every line written during it.
+    pub fn end_of_second_ms(at_unix: u64) -> u64 {
+        at_unix * 1000 + 999
+    }
+
+    /// The line a journal row that no longer decodes reads as: the
+    /// decode error, which names the color and `weft clean`. Its own
+    /// clock is unreadable, so it is stamped with when the row was
+    /// written and sorted last, where the tail always holds it.
+    pub fn corrupt_row(written_at_unix: u64, error: String) -> LogEntry {
+        LogEntry {
+            at_unix: written_at_unix,
+            level: "error".into(),
+            node: None,
+            frames: Vec::new(),
+            message: error,
+            written_at_ms: u64::MAX,
+            seq: None,
+        }
+    }
+
+    /// The log line a journal event projects to, or `None` for an
+    /// event that is not log-worthy (a pulse, a completion). The ONE
+    /// place the journal-to-log projection lives, shared by the
+    /// Postgres and mock journals so `weft logs` reads the same thing
+    /// against both.
+    pub fn from_event(event: &ExecEvent) -> Option<LogEntry> {
+        // `KINDS` is the one gate, for both journals: the SQL read
+        // fetches those rows and nothing else, and this projection
+        // answers for those kinds and nothing else, so a kind the
+        // match knows and the list omits is unprojected everywhere
+        // rather than reaching the log from the mock alone. A kind
+        // the list carries and the match does not is a bug the tests
+        // pin (`every_listed_kind_projects`), never a quiet `None`.
+        if !Self::KINDS.contains(&event.kind_str()) {
+            return None;
+        }
+        Some(match event {
+            ExecEvent::LogLine { node_id, frames, level, message, at_unix, at_unix_ms, seq, .. } => {
+                LogEntry {
+                    at_unix: *at_unix,
+                    level: level.clone(),
+                    // Rows written before the line carried its node read as
+                    // an empty id; they are run-level lines from here on.
+                    node: (!node_id.is_empty()).then(|| node_id.clone()),
+                    frames: frames.clone(),
+                    message: message.clone(),
+                    written_at_ms: at_unix_ms.unwrap_or_else(|| Self::end_of_second_ms(*at_unix)),
+                    seq: *seq,
+                }
+            }
+            ExecEvent::NodeFailed { node_id, frames, error, at_unix, .. } => LogEntry {
+                at_unix: *at_unix,
+                level: "error".into(),
+                node: Some(node_id.clone()),
+                frames: frames.clone(),
+                message: format!("node failed: {error}"),
+                written_at_ms: Self::end_of_second_ms(*at_unix),
+                seq: None,
+            },
+            ExecEvent::NodeCancelled { node_id, frames, reason, at_unix, .. } => LogEntry {
+                at_unix: *at_unix,
+                level: "warn".into(),
+                node: Some(node_id.clone()),
+                frames: frames.clone(),
+                message: format!("node cancelled: {reason}"),
+                written_at_ms: Self::end_of_second_ms(*at_unix),
+                seq: None,
+            },
+            ExecEvent::PortTypeMismatch { node_id, frames, port, expected, actual, at_unix, .. } => {
+                LogEntry {
+                    at_unix: *at_unix,
+                    level: "warn".into(),
+                    node: Some(node_id.clone()),
+                    frames: frames.clone(),
+                    message: format!(
+                        "port `{port}` refused a value: expected {expected}, got {actual}; \
+                         the port was closed"
+                    ),
+                    written_at_ms: Self::end_of_second_ms(*at_unix),
+                    seq: None,
+                }
+            }
+            ExecEvent::ExecutionFailed { error, at_unix, .. } => LogEntry {
+                at_unix: *at_unix,
+                level: "error".into(),
+                node: None,
+                frames: Vec::new(),
+                message: format!("execution failed: {error}"),
+                written_at_ms: Self::end_of_second_ms(*at_unix),
+                seq: None,
+            },
+            ExecEvent::ExecutionCancelled { reason, at_unix, .. } => LogEntry {
+                at_unix: *at_unix,
+                level: "warn".into(),
+                node: None,
+                frames: Vec::new(),
+                message: format!("execution cancelled: {reason}"),
+                written_at_ms: Self::end_of_second_ms(*at_unix),
+                seq: None,
+            },
+            other => unreachable!(
+                "`{}` is in LogEntry::KINDS but the projection has no arm for it",
+                other.kind_str()
+            ),
+        })
+    }
+
+    /// The `exec_event.kind` values the log is made of: what the SQL
+    /// read fetches, and what `from_event` answers for.
+    pub const KINDS: &'static [&'static str] = &[
+        "log_line",
+        "node_failed",
+        "node_cancelled",
+        "port_type_mismatch",
+        "execution_failed",
+        "execution_cancelled",
+    ];
+}
+
+#[cfg(test)]
+mod log_entry_tests {
+    use super::LogEntry;
+    use weft_journal::ExecEvent;
+
+    fn sample_events() -> Vec<ExecEvent> {
+        let color = weft_core::Color::new_v4();
+        vec![
+            ExecEvent::LogLine {
+                color,
+                node_id: "greet".into(),
+                frames: Default::default(),
+                level: "info".into(),
+                message: "hi".into(),
+                at_unix: 1,
+                at_unix_ms: Some(1_000),
+                seq: Some(0),
+            },
+            ExecEvent::NodeFailed {
+                color,
+                node_id: "llm".into(),
+                frames: Default::default(),
+                error: "boom".into(),
+                closure_emissions: Vec::new(),
+                at_unix: 2,
+            },
+            ExecEvent::NodeCancelled {
+                color,
+                node_id: "llm".into(),
+                frames: Default::default(),
+                reason: "stopped".into(),
+                closure_emissions: Vec::new(),
+                at_unix: 3,
+            },
+            ExecEvent::PortTypeMismatch {
+                color,
+                node_id: "bridge".into(),
+                frames: Default::default(),
+                port: "jid".into(),
+                expected: "String".into(),
+                actual: "Null".into(),
+                at_unix: 4,
+            },
+            ExecEvent::ExecutionFailed { color, error: "stuck".into(), at_unix: 5 },
+            ExecEvent::ExecutionCancelled {
+                color,
+                reason: "by hand".into(),
+                cause: None,
+                at_unix: 6,
+            },
+            ExecEvent::ExecutionCompleted { color, outputs: serde_json::Value::Null, at_unix: 7 },
+            ExecEvent::ExecutionTagged { color, tags: vec!["t".into()], at_unix: 8 },
+        ]
+    }
+
+    /// Every failure the journal records about a run reaches the log as
+    /// an error / warn line naming its node, so `weft logs` answers "why
+    /// did this go wrong" without the full replay.
+    #[test]
+    fn failures_project_to_log_lines() {
+        let events = sample_events();
+        let lines: Vec<LogEntry> = events.iter().filter_map(LogEntry::from_event).collect();
+        assert_eq!(lines.len(), 6, "six log-worthy events: {lines:?}");
+        assert_eq!((lines[0].level.as_str(), lines[0].node.as_deref()), ("info", Some("greet")));
+        assert_eq!((lines[1].level.as_str(), lines[1].node.as_deref()), ("error", Some("llm")));
+        assert!(lines[1].message.contains("boom"), "{}", lines[1].message);
+        assert_eq!(lines[2].level, "warn");
+        assert_eq!(lines[3].node.as_deref(), Some("bridge"));
+        assert!(lines[3].message.contains("jid"), "{}", lines[3].message);
+        assert_eq!((lines[4].level.as_str(), lines[4].node.as_deref()), ("error", None));
+        assert!(lines[5].message.contains("by hand"), "{}", lines[5].message);
+    }
+
+    /// Every kind in `KINDS` has a sample here and projects: the
+    /// projection panics on a listed kind it has no arm for, and this
+    /// is the test that reaches every arm. The `kind` column is the
+    /// serde tag, so the samples are serialized to read it the way
+    /// the row was written.
+    #[test]
+    fn every_listed_kind_projects() {
+        let samples = sample_events();
+        for kind in LogEntry::KINDS {
+            let event = samples
+                .iter()
+                .find(|e| serde_json::to_value(e).unwrap()["kind"] == *kind)
+                .unwrap_or_else(|| panic!("no sample event of kind `{kind}`; add one"));
+            assert!(LogEntry::from_event(event).is_some(), "`{kind}` is listed but does not project");
+        }
+        for event in samples {
+            let kind = serde_json::to_value(&event).unwrap()["kind"].as_str().unwrap().to_string();
+            assert_eq!(
+                LogEntry::KINDS.contains(&kind.as_str()),
+                LogEntry::from_event(&event).is_some(),
+                "kind `{kind}` is listed and projected inconsistently"
+            );
+        }
+    }
+
+    /// Nodes' lines drain through tasks in whatever order eight
+    /// pickers land them, so the journal's row order is not the
+    /// run's; the read puts them back by the worker's millisecond
+    /// clock, across nodes, with a failure the journal wrote itself
+    /// at the end of its second and a line from before the clock was
+    /// carried likewise.
+    #[test]
+    fn lines_read_in_the_order_they_were_written() {
+        let color = weft_core::Color::new_v4();
+        let line = |node: &str, seq: u64, at_ms: Option<u64>, at_unix: u64| ExecEvent::LogLine {
+            color,
+            node_id: node.into(),
+            frames: Default::default(),
+            level: "info".into(),
+            message: format!("{node} {seq}"),
+            at_unix,
+            at_unix_ms: at_ms,
+            seq: Some(seq),
+        };
+        let failed = ExecEvent::NodeFailed {
+            color,
+            node_id: "a".into(),
+            frames: Default::default(),
+            error: "boom".into(),
+            closure_emissions: Vec::new(),
+            at_unix: 10,
+        };
+        // Journal (drain) order: the failure first, then a's second
+        // line, b's line, a's first line, and an old-style line of the
+        // second before, drained last.
+        let journal = [
+            failed,
+            line("a", 1, Some(10_900), 10),
+            line("b", 0, Some(10_500), 10),
+            line("a", 0, Some(10_100), 10),
+            line("c", 0, None, 9),
+        ];
+        let read = LogEntry::in_written_order(journal.iter().filter_map(LogEntry::from_event).collect());
+        let messages: Vec<&str> = read.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, ["c 0", "a 0", "b 0", "a 1", "node failed: boom"]);
+        assert_eq!(read[0].written_at_ms, LogEntry::end_of_second_ms(9));
+    }
 }

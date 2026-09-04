@@ -152,12 +152,13 @@ async fn put_via(
                 keep,
                 declared_size: Some(bytes.len() as u64),
                 content_hash: None,
+                identity: None,
             },
             budget,
         )
         .await?
     else {
-        panic!("a uuid-id begin can never answer already-stored");
+        panic!("an unidentified uuid-id begin never answers already-stored");
     };
     upload_parts(s, bucket, caller, &key, part_size, &bytes, budget).await?;
     s.complete_upload(caller, &key).await
@@ -180,14 +181,14 @@ async fn begin_via(
     match s
         .begin_upload(
             caller,
-            &UploadSpec { scope, mime, filename, keep, declared_size, content_hash: None },
+            &UploadSpec { scope, mime, filename, keep, declared_size, content_hash: None, identity: None },
             budget,
         )
         .await?
     {
         BeginUpload::Ready { key, part_size } => Ok((key, part_size)),
         BeginUpload::AlreadyStored { .. } => {
-            panic!("a uuid-id begin can never answer already-stored")
+            panic!("an unidentified uuid-id begin never answers already-stored")
         }
     }
 }
@@ -244,6 +245,61 @@ async fn put_then_get_round_trips_and_records_metadata(pool: PgPool) {
 
     // per-tenant usage reflects the one file (an ACTIVE row).
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 5));
+}
+
+/// An identified put is idempotent within its scope: the same source
+/// asked for twice is one file and one upload, another project asking
+/// for the same source is its own file, and a begin racing an upload
+/// of the same identity is a conflict rather than a second file.
+#[sqlx::test]
+async fn an_identified_put_stores_one_file_per_scope(pool: PgPool) {
+    let (s, bucket, _clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let spec = |identity: Option<&'static str>| UploadSpec {
+        scope: &StorageScope::Project,
+        mime: "audio/ogg",
+        filename: "voice.ogg",
+        keep: None,
+        declared_size: Some(5),
+        content_hash: None,
+        identity,
+    };
+    let BeginUpload::Ready { key, part_size } =
+        s.begin_upload(&w, &spec(Some("whatsapp:m1")), &big()).await.expect("first begin")
+    else {
+        panic!("nothing stored yet")
+    };
+    // Mid-upload, the same identity is a conflict, not a second file.
+    assert!(matches!(
+        s.begin_upload(&w, &spec(Some("whatsapp:m1")), &big()).await,
+        Err(RuntimeStoreError::Conflict(_))
+    ));
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"hello"), &big()).await.expect("parts");
+    let first = s.complete_upload(&w, &key).await.expect("complete");
+
+    // Stored: the second begin answers the file, and opens no upload.
+    let BeginUpload::AlreadyStored { key: again } =
+        s.begin_upload(&w, &spec(Some("whatsapp:m1")), &big()).await.expect("second begin")
+    else {
+        panic!("the identity is stored")
+    };
+    assert_eq!(again, first.key);
+    assert!(bucket.in_progress_uploads().is_empty(), "no lingering multipart upload");
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 5), "one file");
+
+    // Another project's copy of the same source is its own file.
+    let other = worker("t1", "p2", Some("c2"));
+    assert!(matches!(
+        s.begin_upload(&other, &spec(Some("whatsapp:m1")), &big()).await,
+        Ok(BeginUpload::Ready { .. })
+    ));
+
+    // The asset scope is addressed by content, never by identity.
+    let asset = UploadSpec { scope: &StorageScope::Asset, identity: Some("x"), ..spec(None) };
+    assert!(matches!(
+        s.begin_upload(&w, &asset, &big()).await,
+        Err(RuntimeStoreError::Invalid(_))
+    ));
 }
 
 #[sqlx::test]
@@ -704,6 +760,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
         keep: None,
         declared_size: Some(11),
         content_hash: Some(sha_static),
+        identity: None,
     };
     let sources = vec![("chunks/c1".to_string(), 6u64), ("chunks/c2".to_string(), 5u64)];
     let meta = s.assemble(&w, &spec, &sources, &big()).await.unwrap();
@@ -754,6 +811,7 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
         keep: None,
         declared_size: Some(4),
         content_hash: hash,
+        identity: None,
     };
 
     // A missing or malformed hash is refused loud (assets ARE their hash).

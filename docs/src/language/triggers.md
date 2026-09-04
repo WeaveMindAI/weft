@@ -70,7 +70,7 @@ path, fire it. The editor can send a hand-written payload.
 |---|---|
 | `ApiEndpoint { path }` | an HTTP request arrives, and a node can answer it live |
 | `LiveSocket { path }` | a WebSocket connects, and nodes hold a two-way conversation |
-| `Cron { cron }` | the schedule says so |
+| `Cron { cron, timezone }` | the schedule says so, on that zone's clock (UTC unless you pick one) |
 | `HumanTrigger { fields }` | a person submits a form |
 
 Beyond those, node authors write triggers that subscribe to an event stream,

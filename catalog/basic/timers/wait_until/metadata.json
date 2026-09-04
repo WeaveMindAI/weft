@@ -1,0 +1,50 @@
+{
+  "type": "WaitUntil",
+  "label": "Wait until",
+  "description": "Pause this branch until a date and time, at no cost: the run parks on a timer and resumes when it fires. `when` is ISO-8601 (`2026-09-03T09:00:00Z`, or with an offset) and must be in the future. Whatever arrives on `value` comes out unchanged afterwards; `wokeAt` is when it resumed. To wait for a duration instead, use Wait.",
+  "tags": [
+    "wait",
+    "until",
+    "schedule",
+    "timer",
+    "basic"
+  ],
+  "icon": "CalendarClock",
+  "color": "#64748b",
+  "inputs": [
+    {
+      "name": "when",
+      "type": "String",
+      "required": true,
+      "label": "When",
+      "description": "The ISO-8601 date and time to resume at, e.g. `2026-09-03T09:00:00Z` or `2026-09-03T11:00:00+02:00`. Must be in the future.",
+      "placeholder": "2026-09-03T09:00:00Z",
+      "widget": {
+        "kind": "datetime"
+      }
+    },
+    {
+      "name": "value",
+      "type": "T",
+      "required": false,
+      "exposure": "wire",
+      "label": "Value",
+      "description": "Passed through unchanged once the time has come. Optional: the node also works as a pure delay on `_should_flow`."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "value",
+      "type": "T",
+      "required": false,
+      "description": "The `value` that came in, emitted once the time has come."
+    },
+    {
+      "name": "wokeAt",
+      "type": "String",
+      "required": false,
+      "description": "ISO-8601 time the wait ended."
+    }
+  ],
+  "requires_infra": false
+}

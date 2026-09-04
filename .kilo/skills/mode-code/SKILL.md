@@ -5,6 +5,10 @@ description: "Code mode: rules for writing and refactoring code. Style (DRY, SYN
 
 Write or refactor code. Clean, not just simple: no dev-only hacks, no temporary workarounds, no "for now". The [decision framework] from the working-partner agent file (`.kilo/agent/working-partner.md`), perfectionist not patcher, extend before adding, no shippable phases, info on the object, is how you decide each line; this skill carries the mechanical rules that follow from it.
 
+## The working tree is the review
+
+You never `git commit` and never `git add` on your own: the unstaged diff is what the [user] reviews, and a commit or a stage collapses it. Only a "commit" in the [user]'s current message authorizes one, for exactly the changes they were looking at. When you feel done, you stop and report; you do not tidy up into commits.
+
 ## Style
 
 1. **Imports at top only.** Never mid-function.
@@ -68,6 +72,16 @@ Rules when adding code:
 4. **No mock libraries.** Hand-rolled fakes beat `mockall` / `jest.mock` / `unittest.mock`: the DSL overhead isn't worth it and macros hide what's tested.
 5. **Each subsystem owns its rig.** No central testing crate; the rig lives alongside the subsystem behind a test-only feature flag.
 6. **Tests at the right layer.** New pure function: layer-1 test. New orchestration path: layer-3 test. Never layer-4 tests for layer-1 bugs, or the reverse.
+
+**Run only what your change can break.** Never `cargo test --workspace`, never
+the whole node-test or database suite, unless the change is genuinely
+workspace-wide (a ctx function, the code generator, a type every crate
+serializes). The default is the narrowest command that covers the edit: one
+test by name while iterating (`cargo test -p <crate> --test <file> <name>`),
+then that crate (`cargo test -p <crate>`), plus each crate that depends on
+what you changed. Same for the runners: `scripts/run-node-tests.sh <package>`,
+`scripts/run-db-tests.sh <crate>`, `scripts/run-e2e.sh <name>`. CI runs
+everything; a full local sweep just burns minutes.
 
 **Flakes are bugs, never noise.** A test that fails 1-in-N is a bug; "just flaky" frames it as the test's fault and trains the eye to ignore it. Reject the frame. Reproduce deterministically first: loop it 20-50 times locally, under parallel load (generate contention if the plain loop doesn't trigger it), widening the load until it triggers. Find the root cause: the usual suspects are notification fired before a waiter is armed (use `notify_one`'s permit semantics), arm-then-check windows, order-dependent assertions under multi-thread, relaxed atomics that should be acquire/release. Fix cleanly in the code under test: never retries, sleeps, longer timeouts, `#[ignore]`, or "try N times" wrappers; those tolerate the race instead of fixing it. And never use flakiness as a permission slip: a failed test failed. Re-running to green is evidence the race is intermittent, not that the failure was spurious; investigate every failure on first observation.
 

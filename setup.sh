@@ -118,10 +118,11 @@
 #                     nothing you have stored is lost while you are still
 #                     deciding the shape. Ask as often as you change the
 #                     table.
-#   --release         With --migration: collapse every draft into one
-#                     released migration, the one that goes in the PR, and
-#                     tell your database it is already in it. Nothing is
-#                     re-run and nothing is lost.
+#   --release         With --migration: write the one released migration,
+#                     the one that goes in the PR, and bring your database
+#                     along: if it ran drafts, it is told the release is
+#                     already in it; if it never saw one, the release runs
+#                     on it now. One command either way, nothing is lost.
 #
 # Removal:
 #   --uninstall   Remove user-facing pieces but preserve work. Stops

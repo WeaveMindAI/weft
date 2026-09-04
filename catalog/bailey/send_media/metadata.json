@@ -1,7 +1,7 @@
 {
   "type": "BaileySendMedia",
   "label": "WhatsApp Send Media (Baileys)",
-  "description": "Send a stored file (image, video, audio, or document) via the project's WhatsApp bridge, with an optional caption. Wire `endpointUrl` from a BaileyBridge and `file` from any node that outputs a file.",
+  "description": "Send a stored file (image, video, audio, or document) via the project's WhatsApp bridge, with an optional caption. Wire `endpointUrl` from a BaileyBridge and `file` from any node that outputs a file. `voiceNote: true` sends an audio file as a voice note (the playable bubble) instead of an audio attachment.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -29,8 +29,22 @@
     {
       "name": "caption",
       "type": "String",
-      "widget": { "kind": "textarea" },
+      "widget": {
+        "kind": "textarea"
+      },
       "required": false
+    },
+    {
+      "name": "voiceNote",
+      "type": "Boolean",
+      "required": false,
+      "exposure": "config",
+      "default": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "label": "Send audio as a voice note",
+      "description": "For audio only: `true` sends it as a voice note (WhatsApp's playable bubble, the shape a spoken reply takes); `false` sends it as an audio file. Ignored for any other media."
     }
   ],
   "outputs": [

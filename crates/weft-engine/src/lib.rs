@@ -35,3 +35,12 @@ pub(crate) fn now_unix() -> u64 {
         .expect("system clock past UNIX_EPOCH")
         .as_secs()
 }
+
+/// The same clock in milliseconds, for a log line: two nodes that
+/// log in the same second still read back in the order they wrote.
+pub(crate) fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock past UNIX_EPOCH")
+        .as_millis() as u64
+}

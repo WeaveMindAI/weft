@@ -654,6 +654,10 @@ struct FakeState {
     buses: Mutex<HashMap<String, crate::bus::BusHandle>>,
     /// In-memory storage, keyed by minted key.
     storage: Mutex<HashMap<String, StoredEntry>>,
+    /// `(scope, identity)` of every identified put, to the key it
+    /// minted: a second put of the same identity answers that key
+    /// and stores nothing, like the real service.
+    identities: Mutex<HashMap<(String, String), String>>,
     /// Mint for storage keys.
     next_storage_key: AtomicU64,
     /// Every `ctx.log` line, in order.
@@ -733,6 +737,7 @@ impl FakeState {
             output_types: Mutex::new(HashMap::new()),
             buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
+            identities: Mutex::new(HashMap::new()),
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
             execution_tags: Mutex::new(Vec::new()),
@@ -1861,7 +1866,8 @@ impl ContextHandle for TestHandle {
 
     async fn storage_put(
         &self,
-        _scope: &crate::storage::StorageScope,
+        scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         data: crate::storage::ByteStream,
         mime_type: &str,
         filename: &str,
@@ -1871,6 +1877,20 @@ impl ContextHandle for TestHandle {
         let bytes = crate::storage::collect_stream(data)
             .await
             .map_err(|e| WeftError::NodeExecution(format!("fake storage put: {e}")))?;
+        let identity_key = identity.map(|i| (format!("{scope:?}"), i.to_string()));
+        if let Some(identity_key) = &identity_key {
+            if let Some(existing) = self.state.identities.lock().unwrap().get(identity_key) {
+                let storage = self.state.storage.lock().unwrap();
+                let entry = storage.get(existing).expect("an identified key is stored");
+                return Ok(crate::storage::StoredFile {
+                    key: entry.meta.key.clone(),
+                    mime_type: entry.meta.mime_type.clone(),
+                    size_bytes: entry.meta.size_bytes,
+                    filename: entry.meta.filename.clone(),
+                }
+                .to_value());
+            }
+        }
         let key = format!(
             "node-test/{}-{filename}",
             self.state.next_storage_key.fetch_add(1, Ordering::SeqCst)
@@ -1891,6 +1911,9 @@ impl ContextHandle for TestHandle {
             size_bytes: bytes.len() as u64,
             filename: filename.to_string(),
         };
+        if let Some(identity_key) = identity_key {
+            self.state.identities.lock().unwrap().insert(identity_key, meta.key.clone());
+        }
         self.state
             .storage
             .lock()
@@ -1902,10 +1925,28 @@ impl ContextHandle for TestHandle {
     async fn storage_put_from_url(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         url: &str,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
+        // An identified fetch the fake already holds costs no request,
+        // like production: the canned route is not even consulted, so
+        // a test can count requests to prove a second ask pulled nothing.
+        if let Some(identity) = identity {
+            let key = (format!("{scope:?}"), identity.to_string());
+            if let Some(existing) = self.state.identities.lock().unwrap().get(&key) {
+                let storage = self.state.storage.lock().unwrap();
+                let entry = storage.get(existing).expect("an identified key is stored");
+                return Ok(crate::storage::StoredFile {
+                    key: entry.meta.key.clone(),
+                    mime_type: entry.meta.mime_type.clone(),
+                    size_bytes: entry.meta.size_bytes,
+                    filename: entry.meta.filename.clone(),
+                }
+                .to_value());
+            }
+        }
         // Answered from the SAME canned routes every other fake call
         // uses, so a fetch stays offline: declare the URL's route with
         // `rig.respond*` and the "download" lands in fake storage.
@@ -1928,15 +1969,24 @@ impl ContextHandle for TestHandle {
         let mime = crate::storage::normalize_content_type(
             resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
         );
+        // The caller's name, then the one the canned route serves in
+        // its Content-Disposition, then the URL: the same order as
+        // production, so a test sees the name a node would.
         let name = filename
             .filter(|f| !f.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                resp.headers()
+                    .get("content-disposition")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(crate::storage::filename_from_disposition)
+            })
             .unwrap_or_else(|| crate::storage::filename_from_url(url));
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| WeftError::NodeExecution(format!("fake put_from_url body: {e}")))?;
-        self.storage_put(scope, crate::storage::bytes_stream(bytes), &mime, &name, keep, None)
+        self.storage_put(scope, identity, crate::storage::bytes_stream(bytes), &mime, &name, keep, None)
             .await
     }
 
@@ -2238,6 +2288,7 @@ impl LiveRig {
         handle
             .storage_put(
                 &crate::storage::StorageScope::Execution,
+                None,
                 crate::storage::bytes_stream(bytes::Bytes::from(bytes.into())),
                 mime_type,
                 filename,
@@ -2455,6 +2506,7 @@ impl ContextHandle for CapturingHandle {
     async fn storage_put(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         data: crate::storage::ByteStream,
         mime_type: &str,
         filename: &str,
@@ -2462,18 +2514,19 @@ impl ContextHandle for CapturingHandle {
         declared_size: Option<u64>,
     ) -> WeftResult<Value> {
         self.inner
-            .storage_put(scope, data, mime_type, filename, keep, declared_size)
+            .storage_put(scope, identity, data, mime_type, filename, keep, declared_size)
             .await
     }
 
     async fn storage_put_from_url(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         url: &str,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
-        self.inner.storage_put_from_url(scope, url, filename, keep).await
+        self.inner.storage_put_from_url(scope, identity, url, filename, keep).await
     }
 
     async fn storage_get(
