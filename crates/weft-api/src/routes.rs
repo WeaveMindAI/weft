@@ -656,6 +656,16 @@ pub async fn unregister_project_triggers(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<String>,
 ) -> StatusCode {
+    match stop_project_triggers(&state, &project_id).await {
+        Ok(()) => StatusCode::OK,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Stop and unregister every live trigger of a project, so nothing fires for
+/// it again until someone activates it. Used by the deactivate route and by
+/// the trigger loop when a project can no longer be run.
+pub async fn stop_project_triggers(state: &AppState, project_id: &str) -> Result<(), String> {
     tracing::info!("Unregistering all triggers for project {}", project_id);
 
     let pool = &state.db_pool;
@@ -667,7 +677,7 @@ pub async fn unregister_project_triggers(
             .collect::<Vec<_>>(),
         Err(e) => {
             tracing::error!("Failed to list triggers for project {}: {}", project_id, e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            return Err(e.to_string());
         }
     };
 
@@ -702,7 +712,7 @@ pub async fn unregister_project_triggers(
         }
         Err(e) => {
             tracing::error!("Failed to stop triggers for project {}: {}", project_id, e);
-            return StatusCode::INTERNAL_SERVER_ERROR;
+            return Err(e.to_string());
         }
     };
     
@@ -723,7 +733,7 @@ pub async fn unregister_project_triggers(
         if let Err(e) = trigger_store::clear_trigger_pending_action(pool, &t.id).await { tracing::warn!("Trigger DB update failed: {}", e); }
     }
     
-    StatusCode::OK
+    Ok(())
 }
 
 // =============================================================================

@@ -321,6 +321,22 @@ fn start_trigger_event_listener(state: Arc<AppState>) {
                             "Failed to start project from trigger {} (execution {}): {} - {}",
                             event.triggerId, execution_id, status, body
                         );
+                        // Out of credits. The trigger would fire again on its
+                        // next tick and be refused again, forever, so the
+                        // project is deactivated: nothing of it fires until
+                        // the user adds credits and activates it again.
+                        if status == reqwest::StatusCode::PAYMENT_REQUIRED {
+                            match routes::stop_project_triggers(&state, &event.projectId).await {
+                                Ok(()) => tracing::warn!(
+                                    "Deactivated project {} (user {}): out of credits. It stays off until the user adds credits and activates it again.",
+                                    event.projectId, user_id
+                                ),
+                                Err(e) => tracing::error!(
+                                    "Project {} is out of credits and could not be deactivated ({}). Its triggers will keep firing and being refused.",
+                                    event.projectId, e
+                                ),
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::error!(
