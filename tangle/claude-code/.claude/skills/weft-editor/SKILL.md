@@ -140,7 +140,7 @@ is how nodes are added by hand.
   read-only (you can still move, expand, and collapse).".
 
 Keyboard: Ctrl+P palette, **Ctrl+Enter run**, Ctrl+Z/Y undo/redo, Ctrl+A
-select, Ctrl+D duplicate, Del delete, Esc cancels. Zoom is Ctrl/Cmd+wheel
+select, Ctrl+D duplicate, Del delete, Esc closes the palette and drops a wire you are dragging. Zoom is Ctrl/Cmd+wheel
 (5% to 200%); the bottom-left controls carry zoom, fit, and lock.
 
 ## Running and watching

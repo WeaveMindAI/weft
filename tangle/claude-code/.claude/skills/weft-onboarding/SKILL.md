@@ -76,7 +76,9 @@ never a lecture about what is not.
    walks that trigger's path.
 8. **The program's own services.** If the project has infra: "Start Infra"
    in the action bar, the status pill on the node, "Stop" (keeps the data)
-   versus "Terminate" (destroys it) on right-click.
+   versus "Terminate" (destroys it) on right-click, and the amber "Upgrade
+   Infra" that appears when they changed a service's settings after it was
+   started.
 9. **Attaching an account.** Any "Connect <Service>..." button: the
    doors (shared one-click, or their own), the identity chip after, and
    the fact that no credential ever lands in the code. An unpicked

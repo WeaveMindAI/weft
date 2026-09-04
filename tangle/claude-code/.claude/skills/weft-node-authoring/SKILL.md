@@ -5,7 +5,7 @@ description: The node authoring manual and the dispatch protocol. Read before di
 
 # Writing a custom node
 
-This file has two readers. Tangle reads the dispatch protocol and [the review] checklist; the `node-smith` subagent reads the manual below as its bible. An expert taking the hand reads the manual too. One file, one truth about how nodes are built.
+This file has three readers: Tangle reads the dispatch protocol and [the review] checklist, the `node-smith` subagent reads the manual below as its instructions, and an expert taking the hand reads the manual too.
 
 ## The dispatch protocol (Tangle)
 
@@ -43,7 +43,7 @@ You never trust a report you can re-verify for the cost of one command, and ever
 - **no closure test**: nothing covers an optional input arriving closed.
 - **weakened assertions**: the test checks that an output exists, not that it holds the expected value.
 - **swallowed in the test**: patterns like `if let Err(_) = ... {}` that pass on failure.
-- **coverage gap against the contract**: a port behavior in the contract with no test that would fail if it broke. Count the tests against the ports; the count should make sense.
+- **coverage gap against the contract**: a port behavior in the contract with no test that would fail if it broke. Count the tests against the ports: every port in the contract needs a test that fails if its behavior breaks, and a port with none is the finding.
 - **live tests missing or hollow**: the contract names a service but there is no `NodeTest::live` entry for it, or the entry declares no service and no fixtures.
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and the report did not say so.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) is a patch on the symptom and fails the review on both counts.
@@ -63,8 +63,10 @@ acknowledgement protocols, subscriptions, retry bookkeeping are the
 language's). A real node body is usually under a hundred lines.
 
 When the catalog lacks a capability, the node goes in this project's `nodes/`
-folder and is immediately usable by its `type` name. Nothing outside the
-project folder is reached; the build compiles the node's Rust directly.
+folder and is immediately usable by its `type` name. A node's body may only
+`use` the `weft` crate, the crates its package declares in `deps.toml`, and
+code inside its own package; a sibling package's code is never on its path.
+The build compiles the node's Rust directly.
 
 ## Anatomy
 
@@ -95,8 +97,9 @@ function from a stdlib helper, copy it into your package's own shared file
 and say so in the report. If you need a whole capability, report it as a ctx
 feature the language is missing.
 
-`weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow`, `tracing`,
-`uuid` are always available without declaring them.
+`weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow` and `tracing`
+are always available without declaring them; anything else, `uuid` included,
+goes in `deps.toml`.
 
 ## metadata.json
 
@@ -128,7 +131,7 @@ A minimal, real example (the catalog's `Text`):
 {
   "type": "Text",
   "label": "Text",
-  "description": "Emit a literal string.",
+  "description": "Emit a literal string. Useful for prompts, labels, and config values.",
   "tags": ["literal", "string"],
   "icon": "Type",
   "color": "#64748b",
@@ -261,7 +264,7 @@ declare any fixtures the test cannot self-provide; the user runs them, with
 consent, through `/weft-live-test`). A test name states its assertion
 ("a_matching_case_takes_its_branch", not "test_switch"). Run the local tiers
 with `weft test-node <type-or-package>`; the `live` tier spends money and
-asks first. Write tests for a node the same change you write the node.
+asks first. Write a node's tests in the same change that writes the node.
 
 ## After writing the node
 

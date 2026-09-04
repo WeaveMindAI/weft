@@ -69,6 +69,7 @@ stack of lines each starting with the same name:
 
 ````weft
 reply = TelegramSendMedia {
+  account: telegram.access
   kind: "photo"
   chatId: ask.chatId          # same as `reply.chatId = ask.chatId`
   file: picture.image
@@ -97,8 +98,8 @@ step = ExecPython -> (out: String) {
 
 Created ports keep written order, which is what `FirstInOrder` reads: its
 first input that carried a value is the one it emits. Reordering its lines
-changes which branch wins, and it is the only place where line order means
-anything.
+changes which branch wins. This is the only place in the language where line
+order changes behavior.
 
 ### Literals on a connection line
 
@@ -192,7 +193,7 @@ and id live in `weft.toml`, never in a source header.
 
 ````weft
 lookup = SlackFindUser {
-  @require_one_of(email, phone)
+  @require_one_of(email, id)
 }
 ````
 
@@ -461,7 +462,7 @@ Shape: `graph-cycle` (iterate with a Loop, exchange feedback over a Bus),
 Triggers: `trigger-in-loop`, `trigger-into-trigger`, `trigger-into-infra`,
 `duplicate-port`, `config-ports-not-a-list`, `config-entry-not-an-object`,
 `unknown-config-entry-kind`, `config-entry-without-a-port`,
-`unknown-config-entry-key`, `config-entry-bad-test`, `duplicate-catch-all`,
+`unknown-config-entry-key`, `config-entry-bad-value`, `config-entry-missing-value`, `duplicate-catch-all`,
 `catch-all-not-last`.
 
 Loops: `loop-unbounded-no-termination`, `parallel-with-carry`,
@@ -485,17 +486,16 @@ wireable inputs optional, add `@require_one_of`), `rule-structural`,
 `rule-runtime` (a node's own declarative validation; the message is the node
 author's).
 
-Where these run, in tiers: [the edit tier] is the strict parse plus the
-structural rules, fast and local (this is what the agent's edit loop and
-the PostToolUse hook enforce, and what keeps the graph rendering);
-[the runtime tier] (`rule-runtime`) is things only the running program can
-know, chiefly a connection not picked on an access node (that rule is
-synthesized by the compiler from the node's `service` declaration; node
-authors never write it, and `connection_optional: true` in the service
-block opts a genuinely-unconnected node out): a build
-deliberately skips them (a half-wired program still compiles), they fire
-at execution as loud node failures, and `weft validate` reports them
-early, which is the editor's Problems panel mode (structural plus
-runtime); [the build tier] is `weft build`, structural errors plus
-the cargo and image build. The slug names the rule, the message names the
-fix.
+Where these run, in tiers: [the edit tier] is the strict parse plus
+the structural rules, fast and local, enforced by the agent's edit loop and the
+PostToolUse hook, and what keeps the graph rendering. [the runtime tier]
+(`rule-runtime`) is what only a running program can know, chiefly a
+connection not picked on an access node (the compiler synthesizes that rule
+from the node's `service` declaration; `connection_optional: true` in the
+service block is the opt-out, for a node that can run with no connection
+picked). `weft build` deliberately skips it, so a half-wired program still
+compiles, and the rules fire at execution as loud node failures. `weft
+validate` reports them early, and so does the editor's pre-flight gate on
+Run, Activate and Resync; the Problems panel is structural only and never
+shows them. [the build tier] is `weft build`: structural errors plus the
+cargo and image build. The slug names the rule, the message names the fix.

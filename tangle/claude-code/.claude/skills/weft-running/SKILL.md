@@ -27,23 +27,24 @@ happens in it is journaled, node by node, with the values on the wires.
 | `weft ps` | every registered project |
 | `weft executions [--limit N] [--project <id>] [--phase fire]` | past executions, newest first (see Reading a run) |
 | `weft events <color> [--node <id>] [--kind <kind>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run) |
-| `weft logs [color]` | a run's log (no argument: the latest execution; see Reading a run) |
+| `weft logs [color]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run) |
 | `weft follow <project>` | live events for a project |
-| `weft activate` / `weft deactivate` | turn triggers on / off (deactivate default wipes; `--mode hibernate` or `park` preserves in-flight human work) |
+| `weft activate` / `weft deactivate` | turn triggers on / off. `weft deactivate` defaults to `--mode wipe`, which cancels every run waiting on a person or a timer; `--mode hibernate` or `--mode park` keeps them alive |
 | `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph |
-| `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` | the project's long-running infra (Postgres, bridges); the verbs are explained below |
+| `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` | the project's long-running infra (Postgres, bridges) |
+| `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension |
 | `weft daemon start` / `status` / `logs` | the local runtime |
 | `weft catalog update` | re-sync `nodes/base_catalog/` to the installed weft's stdlib |
 | `weft describe-nodes --list` | one line per node type, which is how you find one |
 | `weft describe-nodes --node <Type> --compact` | one node's wiring view, which is what you read before wiring it. With no flags you get the whole catalog as JSON, which is large |
 | `weft test-node <target>` | run node self-tests (`--tier live` spends money, asks first) |
-| `weft connect` | the editor's Connect panel as a CLI verb: `--list` access nodes, pick a stored connection (`--node`, `--grant`), connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect` |
+| `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect` |
 | `weft rm [--all] [--force]` | unregister the project, terminate infra, reclaim data |
 | `weft clean` | journal and image cleanup |
 
-A manual run starts from every output node and walks upstream; `--target`
-narrows it (targets must be output nodes). A trigger only fires on its event
-once the project is activated.
+How a run picks which nodes execute is in the `weft-language` skill. A
+trigger only fires on its event once the project is activated. `--json` is a
+global flag: every command prints machine-readable output under it.
 
 When you wait on something long (a build, the daemon coming up, a run
 settling), wait on the condition, never a timer: loop on the actual check
@@ -60,15 +61,15 @@ host), then fires. Compile failures print `compile failed:` then
 message verbatim.
 
 The compiler's tiers on this path: `weft build` refuses structural errors
-and deliberately skips the runtime rules, so a program still being wired
-up (a connection not yet picked) still builds, and a CLI-started run
-starts too: the runtime tier fires at execution, the node failing loudly
-in the journal (e.g. a provider node's "no connection picked; pick one on
-the node"). The editor's Run, Activate, and Resync buttons gate on the
-runtime rules before sending (the bar's banner lists every finding); the
-CLI path does not, so the cheap moment when you drive is before the run:
-`weft validate` reports the `rule-runtime` findings in seconds. The fix is
-a picked connection, never a hand edit: pick a stored one yourself with
+and deliberately skips the runtime rules, so a half-wired program (a
+connection not yet picked) still builds and a CLI-started run still starts;
+the runtime rules fire at execution and the node fails loudly in the journal
+(a provider node's "no connection picked; pick one on the node"). The
+editor's Run, Activate and Resync buttons check the runtime rules before
+sending (the bar's banner lists every finding), and the CLI does not. So
+when you are the one running it, check first: `weft validate` reports the
+`rule-runtime` findings in seconds. The fix is a picked connection, never a
+source edit: pick a stored one yourself with
 `weft connect --node <id> --grant <grant>`, or send the user to the node's
 Connect button in the editor or `weft connect` in their terminal (the
 `weft-connections` skill).
@@ -113,11 +114,6 @@ depends on what you want to keep:
 endpoint is. A run that touches infra is refused until that infra is
 running, both from the CLI and from the editor's Run button.
 
-Suspended executions are alive and cost nothing: a `HumanQuery` waiting on a
-person parks, the worker exits, and the answer resumes it. The browser
-extension (built with `./setup.sh --browser --no-sign`) is where people
-answer.
-
 ## Reading a run
 
 Each verb below prints one compact line per run or per event and has a flag
@@ -138,8 +134,9 @@ failing node and the wrong value.
   iteration it was in, `llm#3:`); a line about the run itself (the run
   failing, a cancel) names none:
   `[2026-09-02 21:36:47] error llm: node failed: the service answered 401 ...`. It is
-  the last 1000 lines (`--limit` raises that) and says so when a run wrote more. For most
-  failures this is enough, and you never open the events. `(no logs: ...)`
+  the last 1000 lines and says so when the run wrote more; `--limit` raises
+  that up to 20000, and anything higher is refused. For most failures this
+  is enough, and you never open the events. `(no logs: ...)`
   means the run wrote nothing and recorded no failure. It did not fail, so
   check its status to see what it did.
 - **If you want the values on the wires**: `weft events <color>`. One line
@@ -154,9 +151,12 @@ failing node and the wrong value.
   uncut, once you know which line you want; `--json` prints the replay rows
   for `grep` or `jq`.
 - **If a node did not run**: its `node_skipped` line carries the reason.
-  `did_not_flow` means the node's `_should_flow` said no. `flow_closed` or
-  `required_input_closed` means whatever should have fed it never fired, so
-  walk to that node's line. `outside_this_run` means this run was aimed at
+  `did_not_flow` means the node's `_should_flow` said no. `flow_closed` means
+  nothing ever answered its `_should_flow`, so walk to whatever drives that
+  wire. `required_input_closed` names the input that arrived closed, so walk
+  to that node's line. `every_input_closed` and `one_of_group_closed` are the
+  same story for a node with no required inputs and for a `@require_one_of`
+  group. `outside_this_run` means this run was aimed at
   some output nodes and none of them depends on this node; usually that is a
   missing `_is_output`.
 - **If a `Debug` shows `output=` empty**: that is correct, because a
@@ -164,8 +164,9 @@ failing node and the wrong value.
   `input=`, or `weft events <color> --node <debug id>`.
 - In VS Code with the weft extension: the Executions view, "View in Graph"
   replays the run in the graph, values on every wire; `Debug` nodes render
-  their latest value inline. The full editor surface (inspector, action
-  bar, targets, everything clickable) is in the `weft-editor` skill.
+  their latest value inline. For the full editor surface (inspector,
+  action bar, targets, everything clickable), go and read the `weft-editor`
+  skill.
 
 ## The debugging playbook
 
@@ -177,26 +178,27 @@ failing node and the wrong value.
    weft: run `weft catalog update`, then re-check, before anything else.
 2. **A run failed.** `weft logs <color>` names the node and the error. If
    the error alone does not say enough, `weft events <color> --node <that
-   node>` shows the values that reached it, on its `node_started` line. The
-   slug
-   catalogue is in the `weft-language` skill; node errors are the node
-   author's message. A node error like "no connection picked; pick one on
+   node>` shows the values that reached it, on its `node_started` line. For the
+   compiler error slugs, go and read the `weft-language` skill. A node's own
+   error text is written by the node's author. A node error like "no connection picked; pick one on
    the node" is the runtime tier firing at execution, not a source bug:
    pick a stored connection yourself (`weft connect --node <id> --grant
    <grant>`) or send the user to the node's Connect button / `weft
    connect` in their terminal, then run again.
-3. **A value is wrong, not failed.** The same motion backwards: open the run,
+3. **A value is wrong, not failed.** Work upstream from the output: open the run,
    look at the top-level groups, find the first whose output is already
    wrong, descend, repeat. You are hunting the concrete failing case; when
    you have it, iterate on that one step (build, run, look) and feed the
    earlier stages' passing examples through again.
-4. **Suspended.** Expected for human-in-the-loop: nothing is wrong. The
-   person answers in the extension and the run resumes. If nobody should have
-   been asked, the bug is the `_should_flow` that routed into the person.
+4. **Suspended.** Expected for human-in-the-loop: nothing is wrong. A
+   suspended run is alive and costs nothing: the `HumanQuery` parks, the
+   worker exits, and the answer resumes it. The person answers in the browser
+   extension (built with `./setup.sh --browser --no-sign`). If nobody should
+   have been asked, the bug is the `_should_flow` that routed into the person.
 5. **Cancelled.** Read the reason on `execution_cancelled`. `Cancelled by
    user` is a person: the Stop button, `weft stop`, a project deactivate or
    wipe, or a cancel through a signal token. `Stopped by execution <color>
-   (tag <tag>)` is a sibling run's `ctx.stop_tagged`: look at **that** run for
+   (tag <tag>)` is a sibling run's `StopTagged`: look at **that** run for
    the answer, and if no sibling was supposed to stop this one, the bug is
    in whichever node tagged and stopped it (`weft executions` shows each
    run's tags, so you can see which runs shared the tag). `Caller
@@ -204,18 +206,22 @@ failing node and the wrong value.
    connection. Anything else is the runtime's own reason, printed as words
    (a worker pod shutting down, a build superseding a queued run's image).
 6. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
-   bug (usually a wire the compiler could not catch), and the message names
-   the nodes waiting on each other.
+   bug (usually a wire the compiler could not catch). The `execution_failed`
+   line names every firing left holding a pulse and the wired ports it never
+   received (`theirs has value, still waiting on go`): walk to whatever
+   should have driven the missing port.
 7. **Nothing ran.** A branch wired to no output never executes: check
    `_is_output` on the deliverable, and check that the trigger that should
    have fired is activated.
 8. **Dispatcher unreachable.** `weft daemon start` (idempotent reconcile),
    then `weft daemon logs --tail 50` if it still refuses.
 
-## Triggers and identity
+## Triggers and public reachability
 
-Polling triggers (Telegram, email, sheets, notion, airtable, RSS, cron)
-checkpoint across restarts and start from activation time; history never
-replays. Push triggers (webhooks, socket mode, the live nodes) need a public
+Polling triggers (Telegram, Gmail, sheets, notion, airtable, RSS) checkpoint
+across restarts and start from activation time; history never replays. A
+held-connection trigger (`ReceiveEmail` over IMAP IDLE) and a scheduled one
+(`Cron`) keep no cursor: cron recomputes its next tick from now on every
+fire. Push triggers (webhooks, socket mode, the live nodes) need a public
 address: `weft daemon start --public-url` tunnels it. Signal tokens
 (`weft token mint`) scope external listeners like the browser extension.

@@ -17,6 +17,9 @@ else under `nodes/` is this project's own nodes and packages.
 
 ## Discovering nodes
 
+- `weft describe-nodes --list` prints one line per type (type, tags, one-line
+  description). That is the cheap first sweep; `--compact` is the next read
+  once you have candidates.
 - `weft describe-nodes --compact` prints the project catalog as the
   wiring view: resolved ports, exposure, types, features, and config-derived
   port shapes, with labels, icons, connect recipes, and other authoring
@@ -63,9 +66,9 @@ file types), `config` (design-time setting, takes no wire), `wire` (only a
 wire, e.g. an LLM's `provider`, `params`, `history`, `tools`). Exactly one
 driver per port.
 
-`widget` is the editor's control (`select`, `textarea`, `code`, `number`,
-`checkbox`, `datetime`, `text_list`, `entry_list`, `password`, `access`, `file_drop`,
-`remote_select`). A select widget's `options` are the accepted literals.
+`widget` is the editor's control (`text`, `textarea`, `code`, `number`,
+`checkbox`, `datetime`, `select`, `multiselect`, `text_list`, `entry_list`,
+`password`, `access`, `file_drop`, `remote_select`). A select widget's `options` are the accepted literals.
 
 `features`: `isTrigger` (starts executions from outside), `isOutputDefault`
 (firing is the deliverable; overridable with `_is_output`), `canAddInputPorts`
@@ -83,8 +86,8 @@ URL, identity, event delivery). Declaring a `service` block is what makes a
 node an access node, and the compiler synthesizes the runtime "no connection
 picked" rule from it automatically: no author writes that rule by hand.
 `"connection_optional": true` inside the service block is the one opt-out,
-for a node that genuinely runs unconnected (an endpoint that may be public,
-like `CustomProvider`). The user picks the connection on the node in the
+for a node that can run with no connection picked (an endpoint that may be
+public, like `CustomProvider`). The user picks the connection on the node in the
 editor or with `weft connect` in the terminal (the `weft-connections`
 skill), and what flows on wires is a sealed `Access` handle, never a key.
 
@@ -94,7 +97,12 @@ Orientation, not inventory. The inventory is on disk and grows.
 
 - **basic**: `Text` (literal string), `Debug` (inspect a value, isOutputDefault),
   `Cast`, `Range` (number generator for loops), `ExecPython` (author-declared
-  ports, Python body).
+  ports, Python body), `Format` (a `template` with `{{name}}` holes, filled
+  from the input ports you declare inline, emits `text`), and the two timers
+  `Wait` (`seconds`) and `WaitUntil` (`when`, a date and time). A timer parks
+  the run on a listener clock at no cost, then emits `wokeAt` and passes its
+  optional `value` through, so it sits in the middle of a chain: never sleep
+  inside `ExecPython`, which holds a worker for the whole wait.
 - **ai/llm**: `LlmInference` (buffered completion; `provider` required and
   wire-only; `params`, `history`, `media`, `tools`, `toolCalls`;
   `parseJson: true` plus added output ports extracts JSON keys),

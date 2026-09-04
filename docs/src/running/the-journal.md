@@ -40,11 +40,16 @@ are suspended, and where each loop got to, and carries on.
 If you want to see what a run actually did:
 
 ```bash
-weft events <color>        # every event for one execution, in order
-weft logs <color>          # what the run's nodes wrote, plus every failure
-weft executions            # recent executions
-weft follow <project>      # live, as they happen
+weft executions --phase fire   # recent runs, without the setup runs an activate makes
+weft logs <color>              # what the run's nodes wrote, plus every failure it recorded
+weft events <color>            # every event for one execution, in order, one line each
+weft follow <project>          # live, as they happen
 ```
+
+If a run failed, `weft logs` names the node and the error, and that is usually
+all you need. If you want the values on the wires, `weft events` prints one
+line per event and takes `--node`, `--kind` and `--full` to open only the part
+you want; the flags are in [the CLI](cli.md).
 
 The editor's execution view is the same data rendered as a graph: click a node
 and you see the values that firing actually received and emitted.

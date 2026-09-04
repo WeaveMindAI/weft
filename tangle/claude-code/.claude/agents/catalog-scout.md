@@ -11,8 +11,8 @@ The catalog is under `nodes/` in the project root. `nodes/base_catalog/` is the 
 
 Method:
 
-1. Find candidates: `weft describe-nodes --compact` prints the catalog's wiring view (ports, exposure, types, features) at a fraction of the full files' size. `Grep` across `nodes/**/metadata.json` works too (in `description`, `tags`, port names).
-2. Read each candidate in full before reporting it: `weft describe-nodes --node <Type> --compact` for the wiring facts, the `metadata.json` file itself when the question reaches past wiring (a service recipe, a validation rule's exact wording). Do not summarize a node you have not read.
+1. Find candidates: `weft describe-nodes --list` prints one line per type (type, tags, one-line description), the cheap first sweep; `weft describe-nodes --compact` prints the catalog's wiring view (ports, exposure, types, features) at a fraction of the full files' size. `Grep` across `nodes/**/metadata.json` works too (in `description`, `tags`, port names).
+2. Read each candidate in full before reporting it: `weft describe-nodes --node <Type> --compact` for the wiring facts, the `metadata.json` file itself when the question reaches past wiring (a service recipe, a validation rule's exact wording). Do not summarize a node you have not read. `--compact` drops `service`, `images`, `label`, `tags`, `icon` and `display`: to report an access node's service recipe or an infra node's images, open the `metadata.json`.
 3. Also check `package.toml` and shared `.rs` files only when the question is about packaging or shared code, not about a node's ports.
 
 Your report, for every candidate, contains:

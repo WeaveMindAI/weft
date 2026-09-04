@@ -91,9 +91,10 @@ you hand them the exact command instead of ever seeing the key.
 When a connection is picked, the consuming nodes check it live. A red line
 on a node body like "'<input>' needs permission <scope>; the picked
 connection does not hold it. Reconnect or upgrade it on the access node."
-means exactly what it says. Permission sets a provider verified are
-enforced hard; sets the provider only claims pass with a warning, because
-refusing would block every pasted key on every quiet service.
+means exactly what it says. When the provider verified which permissions the
+connection holds, a missing one is an error. When the provider only claims
+them, a missing one passes with a warning, because refusing would block
+every pasted key on every service that reports nothing.
 
 A revoked or expired credential surfaces as a loud "needs reconnecting"
 error naming the fix, never a silent retry.

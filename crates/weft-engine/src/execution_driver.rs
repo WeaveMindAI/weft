@@ -99,8 +99,10 @@ pub enum ExecutionOutcome {
     /// will resume by re-folding the journal.
     Stalled,
     /// Scheduler ran to quiescence but pulses remain pending and
-    /// nothing is waiting. Treat as a graph-shape bug.
-    Stuck,
+    /// nothing is waiting. Treat as a graph-shape bug. The report
+    /// names every firing left holding pulses and the wired ports it
+    /// never received, which is what the terminal row prints.
+    Stuck { report: weft_core::exec::StuckReport },
     /// The journal already held a terminal event when the worker
     /// booted: the color was cancelled, or ran to its end, before this
     /// task was claimed (a dispatcher re-run enqueued a second execute
@@ -334,7 +336,7 @@ pub async fn run_one_execution(
             event_count_before,
         )
         .await?;
-        if !matches!(outcome, ExecutionOutcome::Stalled | ExecutionOutcome::Stuck) {
+        if !matches!(outcome, ExecutionOutcome::Stalled | ExecutionOutcome::Stuck { .. }) {
             break;
         }
         // The worker has stalled: every branch is parked or done. THIS is
@@ -461,7 +463,7 @@ pub async fn run_one_execution(
             journal_node_cancellations(journal.as_ref(), color, &pod_name, cause).await;
             journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
         }
-        ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck => {
+        ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck { .. } => {
             journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
             // No worker-side storage cleanup here: the dispatcher's durable
             // terminate sweep owns the run's un-kept exec files. It reaps
@@ -1944,7 +1946,7 @@ async fn drive(
 
         // No progress from draining. Check: is anything still in flight?
         if in_flight.is_empty() {
-            return terminate(pulses, executions, &waiting).await;
+            return terminate(project, edge_idx, pulses, executions, &waiting).await;
         }
 
         // Stuck-check: we drained twice without progress, with at least
@@ -5025,6 +5027,8 @@ fn mark_waiting(
 }
 
 async fn terminate(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
     pulses: &PulseTable,
     executions: &mut NodeExecutionTable,
     waiting: &HashMap<String, FiringLocation>,
@@ -5056,12 +5060,9 @@ async fn terminate(
                 );
                 return Ok(ExecutionOutcome::Stalled);
             }
-            tracing::warn!(
-                target: "weft_engine",
-                pulses = pulses.len(),
-                "execution stuck: pending pulses with no ready nodes and no suspensions"
-            );
-            Ok(ExecutionOutcome::Stuck)
+            let report = weft_core::exec::stuck_report(project, edge_idx, pulses);
+            tracing::warn!(target: "weft_engine", %report, "no ready nodes and no suspensions");
+            Ok(ExecutionOutcome::Stuck { report })
         }
     }
 }
@@ -5423,9 +5424,9 @@ async fn journal_terminal(
             error: error.clone(),
             at_unix,
         },
-        ExecutionOutcome::Stuck => weft_journal::ExecEvent::ExecutionFailed {
+        ExecutionOutcome::Stuck { report } => weft_journal::ExecEvent::ExecutionFailed {
             color,
-            error: "execution stuck".to_string(),
+            error: report.to_string(),
             at_unix,
         },
         ExecutionOutcome::Stalled => {

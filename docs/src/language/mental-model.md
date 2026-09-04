@@ -253,7 +253,8 @@ Two ends that are not completion:
   worker exits. The execution is alive and costs nothing.
 - **Stuck.** The engine can prove no remaining node can ever proceed, because
   every one of them is waiting on one of the others. That is a graph-shape bug
-  and it fails loudly rather than hanging.
+  and it fails loudly rather than hanging: the failure names each node left
+  holding a value and the wired inputs it never received.
 
 And one end that is a decision: **cancelled**. A person pressed Stop, or
 another run of the same project stopped this one. A run can tag itself, and

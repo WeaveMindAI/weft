@@ -391,7 +391,12 @@
             CancellationFlag::new_arc(),
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Stuck), "{outcome:?}");
+        // The terminal names the firing that can never complete and the
+        // wired port it never got, so the reader sees the leak without
+        // opening the replay.
+        let ExecutionOutcome::Stuck { report } = outcome else { panic!("{outcome:?}") };
+        let text = report.to_string();
+        assert!(text.contains("theirs has value, still waiting on go"), "{text}");
     }
 
     /// A color whose journal already holds a terminal when the worker

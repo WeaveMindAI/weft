@@ -623,9 +623,7 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
                 Err(e) => Some(format!("execution failed: {e}")),
                 Ok(ExecutionOutcome::Failed { error }) => Some(format!("execution failed: {error}")),
                 Ok(ExecutionOutcome::Cancelled { cause }) => Some(format!("execution cancelled: {cause}")),
-                Ok(ExecutionOutcome::Stuck) => {
-                    Some("execution stuck: no node could proceed".to_string())
-                }
+                Ok(ExecutionOutcome::Stuck { report }) => Some(report.to_string()),
                 Ok(ExecutionOutcome::AlreadySettled) => Some(
                     "execution already ended before this worker claimed it".to_string(),
                 ),

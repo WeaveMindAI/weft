@@ -5,13 +5,13 @@ description: Updating the weft installation itself. Read when the user asks to u
 
 # Updating weft
 
-Weft is a git checkout somewhere on the user's machine plus what `./setup.sh` installed from it. Updating is two steps in that checkout: `git pull`, then `./setup.sh`. Nothing in the user's projects is edited by an update; the per-project follow-up is one command, covered below.
+Weft is a git checkout somewhere on the user's machine plus what `./setup.sh` installed from it. Updating is two steps in that checkout: `git pull`, then `./setup.sh`. An update never edits a file inside the user's projects; the per-project follow-up is one command, covered below.
 
 Projects created with `weft new <name> --assistant claude-code` (shorthand `cc`; the choice is remembered, so plain `weft new` installs it too once picked) have their Tangle persona (`CLAUDE.md` and `.claude/`) symlinked from the checkout, so the prompt update half is automatic: the `git pull` itself refreshes Tangle in every such project at once. Projects where Tangle was copied in by hand do not follow; re-copy the template into each of them after an update.
 
 ## Finding the checkout
 
-Every project's `nodes/base_catalog` is a symlink into the checkout's `catalog/` directory, so `readlink -f nodes/base_catalog` names it; the checkout root is two levels up from there. `weft --version` prints the running version, and `git -C <checkout> log --oneline -1` shows which commit is installed.
+The install records the checkout: `cat ~/.local/share/weft/repo-root`. In a project that has Tangle, `readlink -f CLAUDE.md` also names it (the checkout root is three levels up from that file, `<checkout>/tangle/claude-code/CLAUDE.md`). `weft --version` prints the running version, and `git -C <checkout> log --oneline -1` shows which commit is installed.
 
 ## The walk
 

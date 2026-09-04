@@ -230,7 +230,6 @@ mod tests {
     /// not exist. The bare zone would drop both days.
     #[test]
     fn a_schedule_in_the_changed_hour_fires_once_either_way() {
-        use chrono::TimeZone;
         let paris = parse_timezone("Europe/Paris").unwrap();
         let schedule = cron::Schedule::from_str("0 30 2 * * *").unwrap();
         // Compared as instants (the listener carries them as UTC):
