@@ -95,6 +95,12 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/journal/has_terminal",
             post(handlers::journal_has_terminal),
         )
+        // Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`)
+        .route("/v1/execution/tag", post(handlers::execution_tag))
+        .route(
+            "/v1/execution/stop_tagged",
+            post(handlers::execution_stop_tagged),
+        )
         // Tasks
         .route("/v1/task/enqueue_dedup", post(handlers::task_enqueue_dedup))
         .route(

@@ -563,6 +563,62 @@ impl BrokerAccessClient {
     }
 }
 
+// ---------- Execution steering (worker tags/stops runs) ----------
+
+/// The worker's door to steering executions: tag its own run, stop
+/// its siblings by tag. Two endpoints, both worker-only and pod-bound
+/// on the broker side (`/v1/execution/tag`, `/v1/execution/stop_tagged`).
+pub struct BrokerExecutionClient {
+    http: HttpCore,
+}
+
+impl BrokerExecutionClient {
+    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
+        Arc::new(Self {
+            http: HttpCore::new(base_url, token),
+        })
+    }
+
+    /// Tag `color` with `tags`. Synchronous: on return the tag rows
+    /// exist (or the call failed), which is what lets a following
+    /// `stop_tagged` anchor on them.
+    pub async fn tag_execution(
+        &self,
+        color: Color,
+        tags: Vec<String>,
+        pod_name: &str,
+    ) -> Result<()> {
+        let req = ExecutionTagRequest {
+            color: color.to_string(),
+            tags,
+            pod_name: pod_name.to_string(),
+        };
+        let _: ExecutionTagResponse = self.http.post("/v1/execution/tag", &req).await?;
+        Ok(())
+    }
+
+    /// Ask that every live execution of `color`'s project carrying
+    /// `tag` be stopped. Returns once the stop is durably queued; the
+    /// dispatcher carries it out.
+    pub async fn stop_tagged(
+        &self,
+        color: Color,
+        tag: String,
+        stop_self: weft_core::StopSelf,
+        pod_name: &str,
+    ) -> Result<()> {
+        let req = ExecutionStopTaggedRequest {
+            color: color.to_string(),
+            tag,
+            stop_self,
+            pod_name: pod_name.to_string(),
+        };
+        let _: ExecutionStopTaggedResponse =
+            self.http.post("/v1/execution/stop_tagged", &req).await?;
+        Ok(())
+    }
+}
+
 // ---------- Project (worker fetches own definition) ----------
 
 /// Worker-side client for `/v1/project/fetch_definition`. Used at

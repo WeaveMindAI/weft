@@ -1,6 +1,10 @@
-//! Tag validation. Tags are user-supplied strings used for token-
-//! scoped signal enumeration: a token with `allowed_tags = ["t1"]`
-//! sees only signals tagged `t1`.
+//! Tag validation. Tags are user-supplied strings, and the same string
+//! rule serves two things that are otherwise unrelated: a NODE's tags
+//! (`_tags` in its config, a compile-time label used for token-scoped
+//! signal enumeration: a token with `allowed_tags = ["t1"]` sees only
+//! signals tagged `t1`) and an EXECUTION's tags (`ctx.tag_execution`, a
+//! run-time label a sibling run can `ctx.stop_tagged` on). One
+//! validator, two homes; nothing else is shared.
 //!
 //! Charset is intentionally narrow: `[A-Za-z0-9_-]{1,64}`. Reasons:
 //!   - URL-safe: tags appear in query params on listing routes.
@@ -10,11 +14,30 @@
 //!   - Predictable: matches the AWS / GCP / Kubernetes label-value
 //!     convention so users get the same constraints they expect.
 
+use serde::{Deserialize, Serialize};
+
 /// The reserved config key that carries a node's tags. The ONE definition; the
 /// compiler (validation + reserved-key allow-list) and the runtime tag reader
 /// reference this instead of re-spelling the literal.
 /// SYNC: TAGS_CONFIG_KEY <-> packages/weft-graph/src/webview/lib/node-tags.ts (TAGS_CONFIG_KEY)
 pub const TAGS_CONFIG_KEY: &str = "_tags";
+
+/// Whether `ctx.stop_tagged` counts the calling execution among the
+/// ones it stops. A named choice rather than a bare boolean, because
+/// `stop_tagged("x", true)` at a call site says nothing about which way
+/// `true` points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopSelf {
+    /// Stop the others and keep running. The debounce shape: a run tags
+    /// itself with a sender's id, then stops every EARLIER run carrying
+    /// it, so only the latest message is answered.
+    Keep,
+    /// Stop every run carrying the tag, this one included. The "we are
+    /// all busted" shape: one run of an experiment finds the experiment
+    /// is broken and takes the whole batch down with it.
+    Include,
+}
 
 const MAX_LEN: usize = 64;
 

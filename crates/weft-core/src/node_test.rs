@@ -658,6 +658,14 @@ struct FakeState {
     next_storage_key: AtomicU64,
     /// Every `ctx.log` line, in order.
     logs: Mutex<Vec<(LogLevel, String)>>,
+    /// Every tag the node put on its execution, in call order, one
+    /// entry per `ctx.tag_execution` call.
+    execution_tags: Mutex<Vec<Vec<String>>>,
+    /// Every `ctx.stop_tagged` the node asked for, in order. The fake
+    /// stops nothing (there are no sibling runs here); it records the
+    /// ask so a test can assert the node steered the right tag the
+    /// right way.
+    stops: Mutex<Vec<(String, crate::tag::StopSelf)>>,
     /// The infra endpoints this node's own infrastructure answers on,
     /// by endpoint name. Declared by `endpoint`; an undeclared name
     /// fails the way an unprovisioned one does in a real run.
@@ -727,6 +735,8 @@ impl FakeState {
             storage: Mutex::new(HashMap::new()),
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
+            execution_tags: Mutex::new(Vec::new()),
+            stops: Mutex::new(Vec::new()),
             endpoints: Mutex::new(BTreeMap::new()),
             endpoint_answers: Mutex::new(BTreeMap::new()),
             endpoint_calls: Mutex::new(Vec::new()),
@@ -1173,6 +1183,19 @@ impl FakeRig {
     /// Every `ctx.log` line, in order.
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.state.logs.lock().unwrap().clone()
+    }
+
+    /// Every tag the node put on its execution, one list per
+    /// `ctx.tag_execution` call, in call order.
+    pub fn execution_tags(&self) -> Vec<Vec<String>> {
+        self.state.execution_tags.lock().unwrap().clone()
+    }
+
+    /// Every `ctx.stop_tagged` the node asked for, in order: the tag
+    /// and whether it kept itself. Nothing was actually stopped (a
+    /// fake run has no siblings); this is the record of the ask.
+    pub fn stops(&self) -> Vec<(String, crate::tag::StopSelf)> {
+        self.state.stops.lock().unwrap().clone()
     }
 }
 
@@ -1767,6 +1790,16 @@ impl ContextHandle for TestHandle {
 
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()> {
         self.state.logs.lock().unwrap().push((level, message));
+        Ok(())
+    }
+
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.state.execution_tags.lock().unwrap().push(tags);
+        Ok(())
+    }
+
+    async fn stop_tagged(&self, tag: String, stop_self: crate::tag::StopSelf) -> WeftResult<()> {
+        self.state.stops.lock().unwrap().push((tag, stop_self));
         Ok(())
     }
 
@@ -2378,6 +2411,14 @@ impl ContextHandle for CapturingHandle {
         self.inner.log(level, message).await
     }
 
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.inner.tag_execution(tags).await
+    }
+
+    async fn stop_tagged(&self, tag: String, stop_self: crate::tag::StopSelf) -> WeftResult<()> {
+        self.inner.stop_tagged(tag, stop_self).await
+    }
+
     fn cancellation(&self) -> Arc<CancellationFlag> {
         self.inner.cancellation()
     }
@@ -2570,6 +2611,56 @@ mod tests {
             sent[0].body.as_ref().expect("json body"),
             &json!({"text": "default-text"}),
             "the manifest default filled the absent input"
+        );
+    }
+
+    /// A node that steers its siblings: the fake records the tags it put
+    /// on the run and every stop it asked for (with the self choice),
+    /// stops nothing (there are no siblings here), and refuses a bad tag
+    /// before recording anything.
+    struct SteeringNode;
+    impl crate::node::NodeManifest for SteeringNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for SteeringNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let text: String = ctx.inputs.get("text")?;
+            ctx.tag_execution([text.as_str(), "batch_a"]).await?;
+            ctx.stop_tagged(text.as_str(), crate::tag::StopSelf::Keep).await?;
+            ctx.stop_tagged("batch_a", crate::tag::StopSelf::Include).await?;
+            // A tag outside the grammar is refused at the ctx, before
+            // the handle sees it. So is an empty tag list: "at least
+            // one tag" is part of the ctx contract, not only the
+            // broker's.
+            let bad = ctx.tag_execution(["has space"]).await;
+            assert!(matches!(bad, Err(WeftError::Input(_))), "{bad:?}");
+            let empty = ctx.tag_execution(Vec::<String>::new()).await;
+            assert!(matches!(empty, Err(WeftError::Input(_))), "{empty:?}");
+            ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_rig_records_tags_and_stops() {
+        let rig = FakeRig::new();
+        rig.run(&SteeringNode, json!({"text": "user_7"}))
+            .await
+            .ok()
+            .expect("steering run succeeds");
+        assert_eq!(
+            rig.execution_tags(),
+            vec![vec!["user_7".to_string(), "batch_a".to_string()]],
+            "the refused tag was never recorded"
+        );
+        assert_eq!(
+            rig.stops(),
+            vec![
+                ("user_7".to_string(), crate::tag::StopSelf::Keep),
+                ("batch_a".to_string(), crate::tag::StopSelf::Include),
+            ]
         );
     }
 

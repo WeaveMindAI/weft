@@ -53,6 +53,14 @@ pub enum TaskKind {
     /// (via broker), same trust seam as `FireSignal`: the listener
     /// never opens an HTTP connection to the dispatcher.
     UpdateSignalKindState,
+    /// Dispatcher: stop every live execution of a project carrying a
+    /// tag, on behalf of one of its executions (`ctx.stop_tagged`).
+    /// Producer = the broker's `/v1/execution/stop_tagged` handler,
+    /// which resolves the ordering anchor at enqueue time; consumer =
+    /// the dispatcher's executor, which cancels each match through the
+    /// one cancel path. Rides the task table so the stop survives the
+    /// asking worker dying right after it asked.
+    StopTagged,
 }
 
 // This enum holds only the kinds the dispatcher itself ships. A runtime that
@@ -72,6 +80,7 @@ impl TaskKind {
             Self::RecordCost => "record_cost",
             Self::RecordLog => "record_log",
             Self::UpdateSignalKindState => "update_signal_kind_state",
+            Self::StopTagged => "stop_tagged",
         }
     }
 }
@@ -137,6 +146,31 @@ pub struct UpdateSignalKindStatePayload {
 pub struct CancelExecutionPayload {
     pub project_id: String,
     pub color: String,
+    /// Why the run is being cancelled. The owning worker flips the
+    /// color's flag WITH this cause, so the terminal event it writes
+    /// (when it beats the dispatcher's own write to the journal) names
+    /// the same cause the dispatcher would have.
+    pub cause: weft_core::exec::CancelCause,
+}
+
+/// Payload for `TaskKind::StopTagged`: "stop every live execution of
+/// `project_id` carrying `tag`, asked by execution `by`". The broker
+/// builds it when the worker calls `ctx.stop_tagged`, resolving
+/// `before_seq` THEN (synchronously with the node's call), so a stop
+/// that executes late can never reach a sibling that tagged itself
+/// after the ask.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopTaggedPayload {
+    pub project_id: String,
+    pub tag: String,
+    /// The execution that asked. Excluded from the targets under
+    /// `StopSelf::Keep`, named as the canceller on every stopped run.
+    pub by: String,
+    /// Only executions whose tag row has a sequence below this are
+    /// stopped. `None` means every live execution carrying the tag
+    /// (the `Include` shape: no ordering, the whole batch goes).
+    pub before_seq: Option<i64>,
+    pub stop_self: weft_core::StopSelf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,6 +214,39 @@ pub struct RecordLogPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two steering payloads are the broker->dispatcher (`stop_tagged`)
+    /// and dispatcher->worker (`cancel_execution`) contracts for a tag
+    /// stop: both anchor shapes and both self choices round-trip, and the
+    /// cancel carries its structured cause.
+    #[test]
+    fn steering_payloads_round_trip() {
+        for (before_seq, stop_self) in
+            [(Some(17), weft_core::StopSelf::Keep), (None, weft_core::StopSelf::Include)]
+        {
+            let payload = StopTaggedPayload {
+                project_id: "p1".into(),
+                tag: "user_7".into(),
+                by: "c1".into(),
+                before_seq,
+                stop_self,
+            };
+            let json = serde_json::to_value(&payload).unwrap();
+            let back: StopTaggedPayload = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back.before_seq, before_seq, "{json}");
+            assert_eq!(back.stop_self, stop_self, "{json}");
+            assert_eq!(back.tag, "user_7");
+        }
+        let cancel = CancelExecutionPayload {
+            project_id: "p1".into(),
+            color: "c2".into(),
+            cause: weft_core::exec::CancelCause::Execution { by: uuid::Uuid::nil(), tag: "user_7".into() },
+        };
+        let json = serde_json::to_value(&cancel).unwrap();
+        let back: CancelExecutionPayload = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.cause, cancel.cause, "{json}");
+        assert_eq!(TaskKind::StopTagged.as_str(), "stop_tagged");
+    }
 
     /// `RecordCostPayload` is the whole worker->dispatcher cost contract, so
     /// its wire shape is pinned here: both the resolved and the

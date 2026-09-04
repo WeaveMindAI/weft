@@ -37,32 +37,50 @@ const NOTIFY_CHANNEL: &str = "weft_dispatcher_events";
 /// An event the dispatcher publishes about some piece of runtime
 /// state changing. Tagged enum so SSE serialization matches the
 /// spec in the design doc.
+// Every event projected from a journal row carries that row's `at_unix`
+// (the journal's own stamp), so a replay renders when each thing happened
+// rather than when it was read.
 // SYNC: DispatcherEvent <-> extension-vscode/src/execFollower.ts DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DispatcherEvent {
-    ExecutionStarted { color: Color, entry_node: String, project_id: String },
-    ExecutionCompleted { color: Color, project_id: String, outputs: serde_json::Value },
-    ExecutionFailed { color: Color, project_id: String, error: String },
-    ExecutionCancelled { color: Color, project_id: String, reason: String },
-    NodeStarted { color: Color, node: String, frames: LoopFrames, input: serde_json::Value, closed_ports: Vec<String>, project_id: String },
-    NodeSuspended { color: Color, node: String, frames: LoopFrames, token: String, project_id: String },
-    NodeResumed { color: Color, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, project_id: String },
-    NodeCancelled { color: Color, node: String, frames: LoopFrames, reason: String, project_id: String },
-    NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, project_id: String },
-    NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, project_id: String },
+    ExecutionStarted { color: Color, entry_node: String, project_id: String, at_unix: u64 },
+    ExecutionCompleted { color: Color, project_id: String, outputs: serde_json::Value, at_unix: u64 },
+    ExecutionFailed { color: Color, project_id: String, error: String, at_unix: u64 },
+    /// `cause` is the structured who-or-what behind the cancel (`reason`
+    /// is its text). `None` only for a journal row written before the
+    /// cause existed; skipped on the wire when absent so the TS peers'
+    /// optional (`cause?`) types match reality instead of decoding null.
+    ExecutionCancelled {
+        color: Color,
+        project_id: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<weft_core::exec::CancelCause>,
+        at_unix: u64,
+    },
+    /// The run tagged itself (`ctx.tag_execution`); the inspector shows
+    /// the tags on the run. `tags` is this call's list, not the run's
+    /// cumulative set.
+    ExecutionTagged { color: Color, project_id: String, tags: Vec<String>, at_unix: u64 },
+    NodeStarted { color: Color, node: String, frames: LoopFrames, input: serde_json::Value, closed_ports: Vec<String>, project_id: String, at_unix: u64 },
+    NodeSuspended { color: Color, node: String, frames: LoopFrames, token: String, project_id: String, at_unix: u64 },
+    NodeResumed { color: Color, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, project_id: String, at_unix: u64 },
+    NodeCancelled { color: Color, node: String, frames: LoopFrames, reason: String, project_id: String, at_unix: u64 },
+    NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, project_id: String, at_unix: u64 },
+    NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, project_id: String, at_unix: u64 },
     /// `reason` says WHY: the author's `_should_flow` said no, or an
     /// input the node needed never arrived. A decision and a consequence
     /// look identical on the graph without it.
     /// `None` only for a journal row written before the field existed
     /// (the UI renders "reason not recorded"); every live writer sends
     /// `Some`.
-    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, project_id: String },
+    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, project_id: String, at_unix: u64 },
     /// A node emitted a value whose type is incompatible with the
     /// declared (possibly narrowed) type of `port`. The engine refused
     /// the value and closed the port (downstream sees null); the node did
     /// NOT fail. The extension renders this as a per-port warning.
-    PortTypeMismatch { color: Color, node: String, frames: LoopFrames, port: String, expected: String, actual: String, project_id: String },
+    PortTypeMismatch { color: Color, node: String, frames: LoopFrames, port: String, expected: String, actual: String, project_id: String, at_unix: u64 },
     /// A loop instance was created at `parent_frames`. The inspector
     /// uses this to render a "Loop opened" marker at the loop's box.
     // SYNC: LoopInstantiated <-> extension-vscode/src/execFollower.ts loop_instantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
@@ -76,6 +94,7 @@ pub enum DispatcherEvent {
         /// whose iteration count is unknowable up front.
         iter_cap: Option<u32>,
         parallel: bool,
+        at_unix: u64,
     },
     /// An iteration of the loop launched. Inspector renders an
     /// iteration marker at body_frames.
@@ -85,6 +104,7 @@ pub enum DispatcherEvent {
         group_id: String,
         parent_frames: LoopFrames,
         index: u32,
+        at_unix: u64,
     },
     /// LoopOut fired for iteration `index`. The per-port gather /
     /// carry writes ride on the journal but are NOT mirrored to the
@@ -98,6 +118,7 @@ pub enum DispatcherEvent {
         parent_frames: LoopFrames,
         index: u32,
         done_vote: Option<bool>,
+        at_unix: u64,
     },
     /// The loop terminated outward and emitted its outer outputs.
     LoopTerminated {
@@ -106,6 +127,7 @@ pub enum DispatcherEvent {
         group_id: String,
         parent_frames: LoopFrames,
         reason: weft_core::primitive::LoopTerminationReason,
+        at_unix: u64,
     },
     /// One metered call's cost record landed on the journal, attributed to
     /// the exact firing (`node_id` + `frames`). `amount_usd` `None` = the
@@ -123,6 +145,7 @@ pub enum DispatcherEvent {
         /// Whose credential the call spent (`their-own` or `ours`), so a
         /// client can say whose account a figure landed on.
         origin: weft_core::CredentialOwner,
+        at_unix: u64,
     },
     TriggerUrlChanged { project_id: String, node_id: String, url: String },
     ProjectRegistered { project_id: String, name: String },
@@ -286,6 +309,7 @@ impl DispatcherEvent {
             | Self::ExecutionCompleted { project_id, .. }
             | Self::ExecutionFailed { project_id, .. }
             | Self::ExecutionCancelled { project_id, .. }
+            | Self::ExecutionTagged { project_id, .. }
             | Self::NodeStarted { project_id, .. }
             | Self::NodeSuspended { project_id, .. }
             | Self::NodeResumed { project_id, .. }
@@ -329,6 +353,7 @@ impl DispatcherEvent {
             | Self::ExecutionCompleted { color, .. }
             | Self::ExecutionFailed { color, .. }
             | Self::ExecutionCancelled { color, .. }
+            | Self::ExecutionTagged { color, .. }
             | Self::NodeStarted { color, .. }
             | Self::NodeSuspended { color, .. }
             | Self::NodeResumed { color, .. }
@@ -594,3 +619,4 @@ async fn run_listener(pool: PgPool, bus: EventBus) -> anyhow::Result<()> {
         }
     }
 }
+

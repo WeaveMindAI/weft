@@ -1,0 +1,43 @@
+{
+  "type": "TestSseTrigger",
+  "label": "Test SSE Trigger",
+  "description": "A project-local custom trigger that subscribes to a Server-Sent-Events feed at a configured URL and fires per matching event. Used by the e2e rig to exercise the reach-out (system-dials-out) signal path against a fake SSE server. Emits the event's `value` field downstream.",
+  "tags": [
+    "trigger",
+    "sse",
+    "e2e"
+  ],
+  "icon": "Rss",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "url",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "SSE URL"
+    },
+    {
+      "name": "event_name",
+      "type": "String",
+      "required": true,
+      "exposure": "config",
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Event name"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "value",
+      "type": "String"
+    }
+  ],
+  "features": {
+    "isTrigger": true
+  }
+}

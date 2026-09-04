@@ -55,7 +55,7 @@ fn format_event(raw: &str) -> String {
             short(value.get("color")),
             value.get("entry_node").and_then(|v| v.as_str()).unwrap_or("?")
         ),
-        "execution_suspended" => format!(
+        "node_suspended" => format!(
             "… suspended at {} token={}",
             value.get("node").and_then(|v| v.as_str()).unwrap_or("?"),
             short(value.get("token"))
@@ -65,6 +65,13 @@ fn format_event(raw: &str) -> String {
             "✗ failed color={}: {}",
             short(value.get("color")),
             value.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
+        // The reason says who stopped it: a person, or a sibling run's
+        // `ctx.stop_tagged` naming the run and the tag.
+        "execution_cancelled" => format!(
+            "■ cancelled color={}: {}",
+            short(value.get("color")),
+            value.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         "cost_reported" => format!(
             "$ {} +{:.4}",

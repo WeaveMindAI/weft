@@ -255,6 +255,12 @@ Two ends that are not completion:
   every one of them is waiting on one of the others. That is a graph-shape bug
   and it fails loudly rather than hanging.
 
+And one end that is a decision: **cancelled**. A person pressed Stop, or
+another run of the same project stopped this one. A run can tag itself, and
+any sibling carrying that tag can be stopped, even one parked on a person or
+a timer. The journal records who did it. For how a node asks for that, go
+and read [Stopping other runs](../nodes/steering-executions.md).
+
 ## The journal, and why waiting is free
 
 Everything above happens in a worker process, in RAM: pulses are values in

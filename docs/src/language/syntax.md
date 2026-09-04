@@ -70,7 +70,8 @@ outside, on their own lines, by a wire or by a value.
 
 #### A key that CREATES a port
 
-On a node type that accepts extra inputs (`ExecPython`, `FirstInOrder`), a key
+On a node type that accepts extra inputs (`ExecPython`, `FirstInOrder`,
+`TagRun`, `StopTagged`), a key
 naming no declared port creates one. A wire gives it the type of whatever feeds
 it, a literal gives it the literal's own type, and a `null` literal is an error
 because it says nothing about the type.

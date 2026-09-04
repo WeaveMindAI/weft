@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::client::Dispatcher;
+use crate::client::{poll_until_describing, Dispatcher};
 
 /// Metadata for one stored file (the fields the rig asserts on). Thin accessor
 /// over the JSON; SYNC by name with StoredFileMeta (camelCase on the wire).
@@ -106,44 +106,54 @@ pub async fn download(disp: &Dispatcher, project_id: &Uuid, key: &str) -> Result
         .with_context(|| format!("download handshake for {key} missing `url`: {resp}"))?
         .to_string();
 
-    // Poll the (single) URL through the box's cold-wake window. A bespoke loop
-    // (not `poll_until`) so a timeout surfaces the LAST observation, turning a
-    // genuinely-down box from a vague "timed out" into an actionable error.
+    // Poll the (single) URL through the box's cold-wake window; a timeout
+    // names the LAST observation, turning a genuinely-down box from a vague
+    // "timed out" into an actionable error.
     //
     // Two flavors of "not ready yet" both retry: (a) an HTTP 502/503/504 (nginx
     // is up but has no healthy box upstream registered), and (b) a TRANSPORT
     // error (connection refused / reset: nginx itself isn't accepting yet,
     // earlier in the cold wake). Both are transient wake states, not download
-    // failures, so the loop rides them out. Only a definitive HTTP response
+    // failures, so the poll rides them out. Only a definitive HTTP response
     // (403 denied, 404 gone) fails fast.
-    let start = std::time::Instant::now();
-    loop {
-        // What this attempt observed, for the timeout diagnostic.
-        let last = match disp.get_abs_raw(&url).await {
-            Ok((status, bytes)) => {
-                if status.is_success() {
-                    return Ok(bytes);
-                }
-                if !NOT_READY.contains(&status.as_u16()) {
-                    bail!(
-                        "download GET {url} -> HTTP {status}: {}",
-                        String::from_utf8_lossy(&bytes)
-                    );
-                }
-                format!("HTTP {status}")
+    let last = std::sync::Mutex::new(String::new());
+    poll_until_describing(
+        &format!("the storage box to serve the download for {key}"),
+        deadline,
+        interval,
+        || {
+            let url = &url;
+            let last = &last;
+            async move {
+                let observed = match disp.get_abs_raw(url).await {
+                    Ok((status, bytes)) => {
+                        if status.is_success() {
+                            return Ok(Some(bytes));
+                        }
+                        if !NOT_READY.contains(&status.as_u16()) {
+                            bail!(
+                                "download GET {url} -> HTTP {status}: {}",
+                                String::from_utf8_lossy(&bytes)
+                            );
+                        }
+                        format!("HTTP {status}")
+                    }
+                    // Transport error: nginx not accepting connections yet. Retry.
+                    Err(e) => format!("transport error: {e}"),
+                };
+                *last.lock().unwrap() = observed;
+                Ok(None)
             }
-            // Transport error: nginx not accepting connections yet. Retry.
-            Err(e) => format!("transport error: {e}"),
-        };
-        if start.elapsed() >= deadline {
-            bail!(
-                "storage box did not serve the download for {key} within {deadline:?}; \
-                 last observation was [{last}] from {url} (box never became routable: \
-                 is it stuck waking, or genuinely down?)"
-            );
-        }
-        tokio::time::sleep(interval).await;
-    }
+        },
+        || {
+            format!(
+                "last observation was [{}] from {url}; the box never became routable: is it \
+                 stuck waking, or genuinely down?",
+                last.lock().unwrap()
+            )
+        },
+    )
+    .await
 }
 
 /// Assert a file exists under `prefix` whose bytes equal `expected`. Returns the

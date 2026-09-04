@@ -122,8 +122,28 @@ pub trait Journal: Send + Sync {
     async fn cancel_never_claimed_execution(
         &self,
         color: Color,
-        reason: &str,
+        cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome>;
+
+    /// THE dispatcher-side cancel of an execution, in ONE transaction:
+    /// strip the color's wake signals (the parked form, the timer, the
+    /// webhook, so nothing can revive it), journal its cancel terminals
+    /// (`NodeCancelled` per non-terminal node + `ExecutionCancelled`,
+    /// skipped when a terminal already exists), and queue the
+    /// `cancel_execution` task for the pod driving it (skipped when no
+    /// alive pod owns it). Atomic so a failure leaves the run exactly as
+    /// it was and the next attempt succeeds; the old three-step shape
+    /// could strip the signals and then fail, leaving a run that could
+    /// neither wake nor finish. A color with no `execution_color` row
+    /// (never started) has its signals stripped and nothing else.
+    ///
+    /// The listener still holds the stripped signals in RAM: the caller
+    /// unregisters them there after the commit (`CancelWrite::removed`).
+    async fn cancel_execution(
+        &self,
+        color: Color,
+        cause: &weft_core::exec::CancelCause,
+    ) -> anyhow::Result<CancelWrite>;
 
     /// Drop the signal row for a single-use resume token. Called
     /// when a suspension's fire is consumed (the engine has handed
@@ -209,12 +229,15 @@ pub trait Journal: Send + Sync {
     ) -> anyhow::Result<Option<ExecutionSummary>>;
 
     /// Every color belonging to `project_id` whose journal has no
-    /// terminal event yet. Used by wipe / cancel_running to enumerate
-    /// what needs cancelling without the limit-truncation problem of
+    /// terminal event yet, narrowed to one `phase` when given (the
+    /// activation sweep wants only the trigger-setup runs). Used by
+    /// wipe / cancel_running / the activation sweep to enumerate what
+    /// needs cancelling without the limit-truncation problem of
     /// `list_executions`. Single SQL roundtrip, no per-color fold.
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
+        phase: Option<weft_core::context::Phase>,
     ) -> anyhow::Result<Vec<Color>>;
 
     /// Every color belonging to `project_id` whose journal HAS a
@@ -227,6 +250,17 @@ pub trait Journal: Send + Sync {
         &self,
         project_id: &str,
     ) -> anyhow::Result<std::collections::HashSet<Color>>;
+
+    /// Every live (non-terminal, project-kind) execution of `project_id`
+    /// carrying `tag`, with the sequence its tag row got, oldest tag
+    /// first. The read behind `ctx.stop_tagged`; the ordering and
+    /// self rules are applied on top by the pure
+    /// `weft_journal::tags::select_stop_targets`.
+    async fn live_tagged_executions(
+        &self,
+        project_id: &str,
+        tag: &str,
+    ) -> anyhow::Result<Vec<weft_journal::tags::TaggedExecution>>;
 
     // ----- Signal registry (durable replacement for in-RAM tracker) ----
 
@@ -426,6 +460,19 @@ impl SignalRegistration {
 /// project row it cannot be deleted out from under the execution. The
 /// project id rides along for attribution (which project's event stream
 /// a replay belongs on) and may name a project that no longer exists.
+/// What `Journal::cancel_execution` committed.
+#[derive(Debug, Default)]
+pub struct CancelWrite {
+    /// The wake signals stripped, for the listener's in-RAM unregister.
+    pub removed: Vec<SignalRegistration>,
+    /// Whether a `cancel_execution` task was queued for an alive owner
+    /// pod (false: no pod is driving this color, nothing to flag).
+    pub task_enqueued: bool,
+    /// Per-node cancel rows written; `None` when the journal already
+    /// held a terminal and nothing was written.
+    pub node_cancellations: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionOwner {
     pub project_id: String,
@@ -446,6 +493,9 @@ pub struct ExecutionSummary {
     pub status: String,
     pub started_at: u64,
     pub completed_at: Option<u64>,
+    /// The tags the run put on itself (`ctx.tag_execution`), in the
+    /// order it claimed them. Empty for a run that never tagged.
+    pub tags: Vec<String>,
 }
 
 /// The query for a page of a tenant's executions: pagination plus optional

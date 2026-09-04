@@ -1,24 +1,24 @@
 ---
 name: weft-node-authoring
-description: The node authoring manual and the dispatch protocol. Read before dispatching a node-smith (writing the brief, reviewing the report) and when an expert writes a node by hand. The node-smith subagent reads this same file as its manual.
+description: The node authoring manual and the dispatch protocol. Read before dispatching a node-smith (writing [the brief], running [the review]) and when an expert writes a node by hand. The node-smith subagent reads this same file as its manual.
 ---
 
 # Writing a custom node
 
-This file has two readers. Tangle reads the dispatch protocol and the review checklist; the `node-smith` subagent reads the manual below as its bible. An expert taking the hand reads the manual too. One file, one truth about how nodes are built.
+This file has two readers. Tangle reads the dispatch protocol and [the review] checklist; the `node-smith` subagent reads the manual below as its bible. An expert taking the hand reads the manual too. One file, one truth about how nodes are built.
 
 ## The dispatch protocol (Tangle)
 
 A node is missing only after the catalog says so (a direct `metadata.json` read or a `catalog-scout` sweep). Then:
 
 1. **Design the contract yourself.** One job, in a sentence. Every input port (name, type, required or optional, exposure) and every output port (name, type). The service it wraps, if any. Anything the surrounding program depends on (a form schema, a trigger registration, infra). The contract is the interface other wires will attach to; it is never the specialist's to invent.
-2. **Dispatch one node-smith per node.** The brief is the contract plus the project context the specialist cannot see (what stage this node feeds, what the upstream types are). Several missing nodes go out in parallel, one specialist each; nodes that depend on each other's types go out in sequence.
-3. **Review the report** against the checklist below. A failed review is a new dispatch whose brief carries the previous attempt's folder, the critique, and what to keep; you never fix the specialist's node yourself unless the fix is one line and obvious, because the next dispatch will need to know the pattern anyway.
+2. **Dispatch one node-smith per node.** [the brief] is the contract plus the project context the specialist cannot see (what [stage] this node feeds, what the upstream types are). Several missing nodes go out in parallel, one specialist each; nodes that depend on each other's types go out in sequence.
+3. **Run [the review]** on the report against the checklist below. A report that fails it goes back as a new dispatch; [the brief] for the redispatch carries the previous attempt's folder, the critique, and what to keep. You never fix the specialist's node yourself unless the fix is one line and obvious, because the next dispatch will need to know the pattern anyway.
 4. **Wire it.** With the node green and in the catalog, it is a normal node type: read its `metadata.json` one more time as delivered, and write the weft code.
 
 The short-circuit: if the catalog already holds a node that does the job, no specialist is dispatched; you go straight to the weft code.
 
-### The review checklist
+### [the review] checklist
 
 You never trust a report you can re-verify for the cost of one command, and everything important here can be re-verified.
 
@@ -183,6 +183,20 @@ user-added output ports use `ctx.fan_declared(...)`. Long external work runs
 under `tokio::select!` against `ctx.cancellation().cancelled_err()` so a
 cancelled execution stops mid-flight. Work that must not happen twice across
 a restart goes through `ctx.run(...)`, which replays the recorded result.
+
+Stopping other runs, the move behind the `TagRun` and `StopTagged` catalog
+nodes, from inside your own node: `ctx.tag_execution([tag, ...]).await?`
+puts tags on this run; `ctx.stop_tagged(tag, StopSelf::Keep).await?` stops
+every older run of the project carrying the tag, waiting ones included (a
+run parked on a person or a timer never wakes); `StopSelf::Include` stops
+this run too. Tag first, then stop: a stop only reaches runs that put the
+tag on before this one did, so when two runs race, the later one survives.
+Both calls are safe to re-run after a crash (a repeated tag keeps its place
+in the order, a repeated stop finds its targets already ended), so neither
+goes through `ctx.run`. A tag is `[A-Za-z0-9_-]{1,64}`; the ctx refuses
+anything else before writing. In the fake tier nothing is stopped;
+`rig.execution_tags()` and `rig.stops()` record what the node asked for,
+so assert on those.
 
 ## The special shapes
 

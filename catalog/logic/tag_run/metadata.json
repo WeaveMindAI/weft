@@ -1,0 +1,41 @@
+{
+  "type": "TagRun",
+  "label": "Tag run",
+  "description": "Put tags on this run so a later run can stop it. Every input wired onto the node is a tag, and a `tags` list works too; the two add up. A tag is letters, digits, `_` and `-`, at most 64 characters. Pair with `StopTagged` when a new event should stop the work already in flight.",
+  "tags": [
+    "flow",
+    "tag",
+    "steer",
+    "debounce",
+    "cancel"
+  ],
+  "icon": "Tag",
+  "color": "#6366f1",
+  "inputs": [
+    {
+      "name": "tags",
+      "type": "List[String]",
+      "required": false,
+      "description": "Tags as one list, for when they come from a node that already built the list. Wired inputs of your own are tags too; the two add up."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "tags",
+      "type": "List[String]",
+      "required": false,
+      "description": "Every tag this node put on the run, for chaining."
+    },
+    {
+      "name": "done",
+      "type": "Boolean",
+      "required": false,
+      "description": "True once the tags are on the run. Wire it into the `_should_flow` of what must happen only after tagging, `StopTagged` first."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true,
+    "customInputType": "String"
+  },
+  "requires_infra": false
+}

@@ -634,7 +634,7 @@ pub async fn run(
     // hash from the journal's ExecutionStarted, NOT from the project
     // row, so a suspended execution is always resumed against the
     // shape it was started on.
-    start_queued_execution(
+    let started_at = start_queued_execution(
         &state,
         color,
         &id.to_string(),
@@ -666,6 +666,9 @@ pub async fn run(
             // construction (node ids are user-authored).
             entry_node: weft_core::truncate_user_string(&entry_node_for_journal, 4096),
             project_id: id.to_string(),
+            // The same stamp the journal row carries, so the live event
+            // and its replay agree on when the run started.
+            at_unix: started_at,
         })
         .await;
 
@@ -913,7 +916,7 @@ async fn start_queued_execution(
     // `None` for the setup phases (they compute their scope engine-side)
     // and for anything that runs the whole graph.
     subgraph: Option<&HashSet<String>>,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<u64, (StatusCode, String)> {
     let now = crate::lease::now_unix() as u64;
     let tenant = state
         .tenant_router
@@ -939,7 +942,7 @@ async fn start_queued_execution(
         .start_execution(&start, &kick_events, task)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start execution: {e}")))?;
-    Ok(())
+    Ok(now)
 }
 
 /// The two event shapes that give an execution its identity: the one
@@ -2240,10 +2243,10 @@ enum ActivateRollback {
     /// before trigger-setup never touched them; wiping would nuke the
     /// project's prior suspended/parked work on a transient error).
     UnstickOnly,
-    /// Full cleanup: cancel the TS color, sweep orphan TS colors, drop
-    /// all signal rows, CAS Activating→Inactive. Used once trigger-
-    /// setup started (signals are in flux).
-    WipeSignals { ts_color: Option<weft_core::Color> },
+    /// Full cleanup: CAS Activating→Inactive, cancel the setup run the
+    /// row recorded, sweep superseded setup runs, drop all signal rows.
+    /// Used once trigger-setup started (signals are in flux).
+    WipeSignals,
 }
 
 struct ActivateWindowError {
@@ -2298,16 +2301,16 @@ async fn activate_trigger_setup_window(
     // Sweep any prior TriggerSetup colors that leaked from a failed
     // previous activate. Safe because we won `try_begin_activating`:
     // no sibling activate is in flight, so every non-terminal
-    // trigger_setup color here is an orphan from a dead prior
+    // trigger_setup color here is a leftover from a dead prior
     // activate, never a concurrent one.
-    sweep_orphan_trigger_setup_colors(state, project_id)
+    sweep_superseded_trigger_setup_colors(state, project_id)
         .await
         .map_err(|e| {
-            unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("sweep orphan ts colors: {e}")))
+            unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("sweep superseded ts colors: {e}")))
         })?;
 
     // Run TriggerSetup. From here on signals are in flux, so a failure
-    // wipes (carrying the TS color so the rollback cancels it). Its
+    // wipes (the rollback cancels the setup run the row recorded). Its
     // register_signal tasks UPSERT entry rows on (project_id,
     // node_id), so existing rows from before a deactivate get
     // spec/mount/auth refreshed in place; the token survives, so
@@ -2315,21 +2318,21 @@ async fn activate_trigger_setup_window(
     let kicks = compute_trigger_setup_kicks(project);
     if !kicks.is_empty() {
         run_trigger_setup(state, id, kicks, definition_hash).await.map_err(
-            |(status, msg, ts_color)| ActivateWindowError {
+            |(status, msg)| ActivateWindowError {
                 status,
                 msg,
-                rollback: ActivateRollback::WipeSignals { ts_color },
+                rollback: ActivateRollback::WipeSignals,
             },
         )?;
     }
 
     // From here trigger-setup succeeded but signals are registered, so
-    // any failure still wipes (ts_color is None: setup's own color is
-    // already terminal, the rollback sweeps remaining orphans).
+    // any failure still wipes (setup's own color is already terminal;
+    // the rollback sweeps remaining leftovers).
     let wipe = |(status, msg): (StatusCode, String)| ActivateWindowError {
         status,
         msg,
-        rollback: ActivateRollback::WipeSignals { ts_color: None },
+        rollback: ActivateRollback::WipeSignals,
     };
 
     // Drop orphan entry rows: nodes that previously had triggers but
@@ -2354,15 +2357,15 @@ async fn activate_trigger_setup_window(
     // cancel already wiped our signals, so we surrender with no
     // further rollback (UnstickOnly: status is already Inactive, the
     // inner CAS no-ops).
+    // The setup run this activation recorded is terminal by now
+    // (`run_trigger_setup` returned on its terminal), so the color the
+    // flip hands back is only bookkeeping being cleared.
     let cas_ok = state
         .projects
-        .cas_lifecycle(
-            id,
-            crate::project_store::ProjectStatus::Activating,
-            &crate::project_store::ProjectLifecycle::active(),
-        )
+        .end_activating(id, &crate::project_store::ProjectLifecycle::active())
         .await
-        .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("cas_lifecycle: {e}"))))?;
+        .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("end_activating: {e}"))))?
+        .is_some();
     if !cas_ok {
         return Err(ActivateWindowError {
             status: StatusCode::CONFLICT,
@@ -2530,9 +2533,42 @@ pub async fn activate_inner(
         // Both are idempotent and safe if a concurrent cancel/success
         // already moved us out of Activating (the inner CAS no-ops).
         let rb = match rollback {
-            ActivateRollback::UnstickOnly => unstick_activating(state, id).await.map(|_| ()),
-            ActivateRollback::WipeSignals { ts_color } => {
-                wipe_activating_state(state, id, &project_id, ts_color).await
+            ActivateRollback::UnstickOnly => match unstick_activating(state, id).await {
+                // An un-stick-only rollback runs before setup started, so
+                // the row can hold no setup color. One coming back means a
+                // step after `run_trigger_setup` was mapped to the wrong
+                // rollback: say so, and still never leave the run live.
+                Ok(Some(Some(color))) => {
+                    tracing::error!(
+                        target: "weft_dispatcher::activate",
+                        project_id = %id, %color,
+                        "unstick-only rollback found a recorded setup run; cancelling it \
+                         (a post-setup failure must roll back with WipeSignals)"
+                    );
+                    crate::api::execution::cancel_color(
+                        state,
+                        color,
+                        &weft_core::exec::CancelCause::Runtime {
+                            detail: "the activation failed and rolled back its setup run".into(),
+                        },
+                    )
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))
+                }
+                Ok(_) => Ok(()),
+                Err(e) => Err(e),
+            },
+            ActivateRollback::WipeSignals => {
+                // The activation failed on its own; the setup run it
+                // spawned is cancelled by that failure, not by anyone's
+                // decision.
+                wipe_activating_state(
+                    state, id, &project_id,
+                    &weft_core::exec::CancelCause::Runtime {
+                        detail: "the activation failed and rolled back its setup run".into(),
+                    },
+                )
+                .await
             }
         };
         if let Err((rb_status, rb_msg)) = rb {
@@ -2949,53 +2985,41 @@ pub(crate) async fn drain_one_token(
     outcome
 }
 
-/// Cancel every non-terminal TriggerSetup color for `project_id`.
-/// Called at the top of activate so a previous activate's leaked
-/// trigger-setup color (cancel_color failed during rollback) gets
-/// cleaned up before we spawn a new one. Having won the exclusive
-/// Activating transition (`try_begin_activating`) guarantees no
-/// in-flight TriggerSetup runs concurrently for this project, so
-/// anything we find here is by definition orphaned.
-async fn sweep_orphan_trigger_setup_colors(
+/// Cancel every non-terminal TriggerSetup run of `project_id` that
+/// nobody is driving any more, every one attempted before any error
+/// is reported. The current activation's own run is never among them:
+/// its color is on the project row (`activating_ts_color`), and the
+/// caller cancels it first with the cause it knows. Everything found
+/// here is a leftover of an older activation whose driver died before
+/// it could cancel its run, and the one truth the sweep can vouch for
+/// about such a run is that a newer activation superseded it. A row
+/// this table cannot parse is schema drift: the journal read fails
+/// loud rather than skipping a run the sweep exists to catch.
+async fn sweep_superseded_trigger_setup_colors(
     state: &DispatcherState,
     project_id: &str,
 ) -> anyhow::Result<()> {
-    use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT ec.color FROM execution_color ec \
-         WHERE ec.project_id = $1 AND ec.phase = 'trigger_setup' \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM exec_event e \
-             WHERE e.color = ec.color \
-               AND e.kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
-           )",
-    )
-    .bind(project_id)
-    .fetch_all(&state.pg_pool)
-    .await?;
-    if rows.is_empty() {
+    let colors = state
+        .journal
+        .list_non_terminal_colors_for_project(
+            project_id,
+            Some(weft_core::context::Phase::TriggerSetup),
+        )
+        .await?;
+    if colors.is_empty() {
         return Ok(());
     }
-    for row in rows {
-        let color_str: String = row.try_get("color")?;
-        let color: weft_core::Color = match color_str.parse() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    target: "weft_dispatcher::activate",
-                    project_id, %color_str, error = %e,
-                    "skipping orphan TS color with bad uuid"
-                );
-                continue;
-            }
-        };
-        tracing::info!(
-            target: "weft_dispatcher::activate",
-            project_id, %color,
-            "cancelling orphan trigger_setup color from prior activate"
-        );
-        crate::api::execution::cancel_color(state, color).await?;
-    }
+    tracing::info!(
+        target: "weft_dispatcher::activate",
+        project_id, ?colors,
+        "cancelling trigger_setup runs left by older activations"
+    );
+    let superseded = weft_core::exec::CancelCause::Runtime {
+        detail: "a newer activation superseded this trigger setup run".into(),
+    };
+    let targets: Vec<(weft_core::Color, &weft_core::exec::CancelCause)> =
+        colors.iter().map(|c| (*c, &superseded)).collect();
+    crate::api::execution::cancel_colors(state, &targets).await?;
     Ok(())
 }
 
@@ -3064,19 +3088,18 @@ async fn apply_reactivate_choice(
 /// the correct undo for a failure BEFORE trigger-setup ran (the
 /// project returns to Inactive with its prior suspended/parked
 /// signals intact; the next activate retries cleanly).
+///
+/// Returns the setup color the activation had recorded when the CAS
+/// wins (`Some(None)` if setup never started), `None` when it lost.
 async fn unstick_activating(
     state: &DispatcherState,
     id: uuid::Uuid,
-) -> Result<bool, (StatusCode, String)> {
+) -> Result<Option<Option<weft_core::Color>>, (StatusCode, String)> {
     state
         .projects
-        .cas_lifecycle(
-            id,
-            crate::project_store::ProjectStatus::Activating,
-            &crate::project_store::ProjectLifecycle::wiped(),
-        )
+        .end_activating(id, &crate::project_store::ProjectLifecycle::wiped())
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cas_lifecycle: {e}")))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("end_activating: {e}")))
 }
 
 /// Cancel-activate / TriggerSetup-failure cleanup: un-stick the
@@ -3087,30 +3110,37 @@ async fn unstick_activating(
 /// if the un-stick CAS loses (a concurrent activate-success/cancel
 /// already left Activating) it returns early WITHOUT wiping.
 ///
-/// `ts_color` is the TriggerSetup color the in-flight activate
-/// spawned (Some when called from the rollback path inside
-/// `run_trigger_setup`'s error branch). When called from
-/// cancel_activate the helper looks up the orphan TS color via
-/// the same mechanism `sweep_orphan_trigger_setup_colors` uses.
+/// The current activation's setup run comes off the project row, where
+/// the activation recorded it before starting the run, and it comes out
+/// of the un-stick itself (one atomic step, so a driver racing this
+/// cannot slip a run in between). `cause` names why THAT run is being
+/// cancelled, and the three callers each carry a different truth: the
+/// failed activate's rollback (runtime), a person's cancel-activate
+/// (user), the reaper's stuck-activation wipe (the activation's driver
+/// died). The journal repeats it verbatim, so it must be the caller's
+/// truth, never a guess made here. Setup runs left by OLDER activations
+/// are not this activation's story; the sweep journals them as
+/// superseded.
 pub(crate) async fn wipe_activating_state(
     state: &DispatcherState,
     id: uuid::Uuid,
     project_id: &str,
-    ts_color: Option<weft_core::Color>,
+    cause: &weft_core::exec::CancelCause,
 ) -> Result<(), (StatusCode, String)> {
-    // Un-stick FIRST. If we lose the CAS, activate already finished
-    // cleanly (or a sibling cancel did the wipe); do not touch signals.
-    if !unstick_activating(state, id).await? {
+    // Un-stick FIRST, and take the setup color out of the same step. If
+    // we lose the CAS, activate already finished cleanly (or a sibling
+    // cancel did the wipe); do not touch signals.
+    let Some(ts_color) = unstick_activating(state, id).await? else {
         return Ok(());
-    }
+    };
     if let Some(c) = ts_color {
-        crate::api::execution::cancel_color(state, c)
+        crate::api::execution::cancel_color(state, c, cause)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
     }
-    // Sweep any other in-flight TS colors (orphans from prior
-    // attempts, plus the in-flight one if `ts_color` was None).
-    sweep_orphan_trigger_setup_colors(state, project_id)
+    // Everything else still running setup belongs to an older, dead
+    // activation.
+    sweep_superseded_trigger_setup_colors(state, project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("sweep ts: {e}")))?;
     // Drop every signal row + unregister from the listener via the
@@ -3129,14 +3159,18 @@ async fn wipe_project_signals(
 ) -> Result<(), (StatusCode, String)> {
     let colors = state
         .journal
-        .list_non_terminal_colors_for_project(project_id)
+        .list_non_terminal_colors_for_project(project_id, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list colors: {e}")))?;
-    for color in colors {
-        crate::api::execution::cancel_color(state, color)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
-    }
+    // Every run is attempted before any error is reported: one failing
+    // cancel must not leave the runs after it live with their wakes
+    // registered on a project being wiped.
+    let user = weft_core::exec::CancelCause::User;
+    let targets: Vec<(weft_core::Color, &weft_core::exec::CancelCause)> =
+        colors.iter().map(|c| (*c, &user)).collect();
+    crate::api::execution::cancel_colors(state, &targets)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
     crate::api::signal::delete_signals_for_project(state, project_id).await
 }
 
@@ -3913,9 +3947,10 @@ pub async fn cancel_build(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// Cancel an in-flight `activate` (status=Activating). Wipes every
-/// signal row registered so far, cancels the TriggerSetup color via
-/// the orphan sweep, and CAS-flips status Activating → Inactive.
+/// Cancel an in-flight `activate` (status=Activating). CAS-flips status
+/// Activating → Inactive, cancels the setup run the row recorded,
+/// sweeps setup runs left by older activations, and wipes every signal
+/// row registered so far.
 ///
 /// 412 if status isn't Activating: the user (or stale UI) clicked
 /// cancel against an already-active or already-inactive project.
@@ -3945,11 +3980,9 @@ pub async fn cancel_activate(
             ),
         ));
     }
-    // ts_color = None tells the helper to discover the in-flight TS
-    // color via sweep_orphan_trigger_setup_colors (the running
-    // activate's color shows up there because it has no terminal
-    // event yet).
-    wipe_activating_state(&state, id, &project_id, None).await?;
+    // The in-flight setup run's color comes off the project row inside
+    // the helper. The cause is the person's: they pressed Cancel.
+    wipe_activating_state(&state, id, &project_id, &weft_core::exec::CancelCause::User).await?;
     state
         .events
         .publish(DispatcherEvent::ProjectDeactivated { project_id })
@@ -3993,25 +4026,32 @@ pub(crate) async fn cancel_running_non_suspended(
     };
     let colors = state
         .journal
-        .list_non_terminal_colors_for_project(project_id)
+        .list_non_terminal_colors_for_project(project_id, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list colors: {e}")))?;
-    for color in colors {
-        if suspended_colors.contains(&color) {
-            continue;
-        }
-        if let Some(owned) = &owned {
-            // Un-owned colors (a task not yet claimed) are also skipped:
-            // their hash-stamped task can only ever be claimed by a
-            // correct-image pod, so they are not the doomed pods' work.
-            if !owned.contains(&color) {
-                continue;
-            }
-        }
-        crate::api::execution::cancel_color(state, color)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
-    }
+    // A pod-scoped sweep is the runtime replacing a sick pod; a
+    // whole-project sweep is a verb a person invoked.
+    let cause = match owned_by {
+        Some(_) => weft_core::exec::CancelCause::Runtime {
+            detail: "the worker pod hosting this run was replaced by health recovery".into(),
+        },
+        None => weft_core::exec::CancelCause::User,
+    };
+    let targets: Vec<(weft_core::Color, &weft_core::exec::CancelCause)> = colors
+        .iter()
+        .filter(|color| !suspended_colors.contains(color))
+        // Un-owned colors (a task not yet claimed) are also skipped on a
+        // pod-scoped sweep: their hash-stamped task can only ever be
+        // claimed by a correct-image pod, so they are not the doomed
+        // pods' work.
+        .filter(|color| owned.as_ref().is_none_or(|o| o.contains(color)))
+        .map(|c| (*c, &cause))
+        .collect();
+    // Every run is attempted before any error is reported, so one
+    // failing cancel never leaves the runs after it live.
+    crate::api::execution::cancel_colors(state, &targets)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
     Ok(())
 }
 
@@ -4054,7 +4094,7 @@ pub(crate) async fn running_count(
     let suspended_colors = suspended_color_set(state, project_id).await?;
     let colors = state
         .journal
-        .list_non_terminal_colors_for_project(project_id)
+        .list_non_terminal_colors_for_project(project_id, None)
         .await?;
     // Colors the journal already records as finished. A task row must
     // NEVER resurrect one of these: a completed/failed/cancelled
@@ -4102,9 +4142,10 @@ pub(crate) async fn running_count(
 }
 
 /// Spawn a worker for the TriggerSetup sub-execution and block
-/// until it settles. On error returns the trigger-setup color so
-/// the caller can scope cleanup to it (cancel just THIS execution,
-/// don't touch suspended/running work from prior cycles).
+/// until it settles. The run's color is recorded on the project row
+/// before it starts, so a rollback (or a cancel-activate, or the
+/// reaper) cancels just THIS execution and never touches
+/// suspended/running work from prior cycles.
 async fn run_trigger_setup(
     state: &DispatcherState,
     project_id_uuid: uuid::Uuid,
@@ -4114,7 +4155,7 @@ async fn run_trigger_setup(
     // row's hash here instead would race a concurrent re-register:
     // kicks from shape A journaled under hash B.
     definition_hash: &str,
-) -> Result<(), (StatusCode, String, Option<weft_core::Color>)> {
+) -> Result<(), (StatusCode, String)> {
     let project_id = project_id_uuid.to_string();
     let color = uuid::Uuid::new_v4();
 
@@ -4122,10 +4163,29 @@ async fn run_trigger_setup(
     // the completion event.
     let mut events = state.events.subscribe_project(&project_id).await;
 
-    // The birth is one transaction, so a start failure leaves NOTHING (no
-    // journal rows, no task): a failure here returns `ts_color: None` (nothing
-    // for the caller's rollback to cancel). Only a WAIT-phase failure below
-    // still carries `Some(color)`, because there the color is live.
+    // Record the color on the project row BEFORE the run exists, so an
+    // activation that dies between the two leaves nothing unaccounted
+    // for (a recorded color with no run is cancelled as a no-op, and
+    // the re-check after the start below covers the run that arrives
+    // later). The write is guarded on the status: a refusal means
+    // cancel-activate or the reaper already ended this activation
+    // under us, and the run must not start.
+    let recorded = state
+        .projects
+        .set_activating_ts_color(project_id_uuid, color)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("record ts color: {e}")))?;
+    if !recorded {
+        return Err((
+            StatusCode::CONFLICT,
+            "the activation was cancelled before trigger setup started".into(),
+        ));
+    }
+
+    // The birth is one transaction, so a start failure leaves no journal
+    // rows and no task; the color the row recorded above then names a
+    // run that never existed, which the rollback's cancel finds ownerless
+    // and skips.
     start_queued_execution(
         state,
         color,
@@ -4136,8 +4196,38 @@ async fn run_trigger_setup(
         definition_hash,
         None,
     )
-    .await
-    .map_err(|(status, msg)| (status, msg, None))?;
+    .await?;
+
+    // The birth has no status guard of its own, so re-check AFTER it:
+    // if the activation ended between the record above and the start
+    // (cancel-activate or the reaper un-stuck the row and found only a
+    // color with no run to cancel), the run now exists and is ours to
+    // end. Whichever side saw the run last cancels it; both cancels are
+    // idempotent, so a run never survives its activation.
+    let still_ours = state
+        .projects
+        .lifecycle(project_id_uuid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lifecycle: {e}")))?
+        .is_some_and(|l| {
+            l.status == crate::project_store::ProjectStatus::Activating
+                && l.activating_ts_color == Some(color)
+        });
+    if !still_ours {
+        crate::api::execution::cancel_color(
+            state,
+            color,
+            &weft_core::exec::CancelCause::Runtime {
+                detail: "the activation ended before this trigger setup run started".into(),
+            },
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
+        return Err((
+            StatusCode::CONFLICT,
+            "the activation was cancelled as trigger setup started".into(),
+        ));
+    }
 
     // No backend-imposed deadline. Trigger setup spans worker pod
     // spawn + image pull + fold + run + bridge wakeup; on a cold
@@ -4158,7 +4248,6 @@ async fn run_trigger_setup(
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("trigger setup failed: {error}"),
-                    Some(color),
                 ));
             }
             Ok(crate::events::DispatcherEvent::ExecutionCancelled { color: c, reason, .. })
@@ -4167,7 +4256,6 @@ async fn run_trigger_setup(
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("trigger setup cancelled: {reason}"),
-                    Some(color),
                 ));
             }
             Ok(_) => continue,
@@ -4181,14 +4269,12 @@ async fn run_trigger_setup(
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "trigger setup failed".into(),
-                            Some(color),
                         ))
                     }
                     Ok(Some(crate::api::execution::TerminalOutcome::Cancelled)) => {
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "trigger setup cancelled".into(),
-                            Some(color),
                         ))
                     }
                     Ok(None) => continue, // still in flight; keep waiting
@@ -4196,7 +4282,6 @@ async fn run_trigger_setup(
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             format!("trigger setup terminal lookup: {e}"),
-                            Some(color),
                         ))
                     }
                 }
@@ -4205,7 +4290,6 @@ async fn run_trigger_setup(
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "trigger setup event stream closed".into(),
-                    Some(color),
                 ));
             }
         }

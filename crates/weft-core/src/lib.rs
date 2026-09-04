@@ -176,6 +176,8 @@ pub use project::{
 };
 pub use pulse::Pulse;
 pub use running_policy::RunningPolicy;
+pub use exec::CancelCause;
+pub use tag::StopSelf;
 #[cfg(feature = "runtime")]
 pub use storage::{ByteRange, ByteStream, KeepTtl, StorageScope, StoredFileMeta, StoredFile};
 pub use weft_type::{WeftPrimitive, WeftType};

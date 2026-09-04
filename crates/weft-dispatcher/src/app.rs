@@ -385,6 +385,7 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
             TaskKind::UpdateSignalKindState,
             Arc::new(crate::task_kinds::UpdateSignalKindStateExecutor),
         )
+        .register(TaskKind::StopTagged, Arc::new(crate::task_kinds::StopTaggedExecutor))
         .register_str(
             crate::task_kinds::run_node_test::RUN_NODE_TEST_KIND,
             Arc::new(crate::task_kinds::RunNodeTestExecutor),

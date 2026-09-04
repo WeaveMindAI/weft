@@ -26,7 +26,10 @@ use crate::state::DispatcherState;
 const PUBLIC_FIRE_BODY_LIMIT: usize = 256 * 1024;
 
 pub mod project;
-pub(crate) mod execution;
+// `pub` (not `pub(crate)`) like `project` above: `cancel_terminal_events`
+// is exercised by the db-test rig in `tests/db_tags.rs` against a real
+// Postgres.
+pub mod execution;
 mod events;
 mod provider_events;
 mod signal_token;

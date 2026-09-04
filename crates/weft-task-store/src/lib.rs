@@ -32,7 +32,7 @@ pub use executor::{
 };
 pub use kinds::{
     CancelExecutionPayload, ExecutionPayload, FireSignalPayload, RecordCostPayload,
-    RecordLogPayload, SpawnPodPayload, TaskKind, UpdateSignalKindStatePayload,
+    RecordLogPayload, SpawnPodPayload, StopTaggedPayload, TaskKind, UpdateSignalKindStatePayload,
 };
 pub use tasks::{
     claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,

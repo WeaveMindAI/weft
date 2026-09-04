@@ -22,7 +22,7 @@ CLI.
 
 | Command | What it does |
 |---|---|
-| `weft executions [--limit N]` | recent executions |
+| `weft executions [--limit N]` | recent executions, with the tags each run put on itself ([stopping other runs](../nodes/steering-executions.md)) |
 | `weft events <color>` | every journal event for one execution, in order |
 | `weft logs [color]` | log lines |
 | `weft clean [color]` | purge journal data. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images` (reclaim worker images nothing runs any more, scoped to the current project's images; a global sweep of dangling untagged build leftovers rides along. With `--all`: every project's, the kind node's copies, stale `weft-infra-*` tags, and old builder-base images; whatever the dispatcher's referenced set covers survives) and `--build-cache`. `setup.sh` runs `--images --all` after every daemon refresh. |

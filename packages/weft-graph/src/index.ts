@@ -57,6 +57,8 @@ export type {
   HostMessage,
   WebviewMessage,
   CatalogEntry,
+  CancelCause,
+  SkipReason,
 } from './protocol';
 
 // The editor's view of a project + execution state, for consumers that build

@@ -40,23 +40,43 @@ pub async fn journal_record(
         return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
     }
     let color = req.event.color();
-    scope::require_color_scope(&state.scope_cache, &state.pool, &caller, &color.to_string())
-        .await?;
-    // Pod-name binding: the caller can only journal under its own
-    // bound pod. Without this check, a worker could stamp a sibling's
-    // pod_name and either bypass fencing (if the sibling is alive) or
-    // poison attribution. The kubelet stamps `caller.pod_name` into
-    // the projected SA token; it's unforgeable from inside the pod.
-    let claimed_pod = req.pod_name.as_str();
-    require_pod_name_matches(&caller, claimed_pod)?;
-    // Cross-color sabotage gate: the color's owning pod (stamped at
-    // first task_claim_one) must match the caller's bound pod. A
-    // compromised tenant pod can journal-write only under colors it
-    // legitimately owns, not arbitrary sibling colors in the same
-    // tenant. `owner_pod_name IS NULL` means the color has not been
-    // claimed yet (e.g. dispatcher-orchestrated phase still in
-    // flight); workers shouldn't be writing in that state anyway,
-    // so we refuse.
+    require_worker_owns_color(&state, &caller, color, &req.pod_name).await?;
+    state
+        .journal
+        .record_event(&req.event, Some(req.pod_name.as_str()))
+        .await
+        .map_err(internal)?;
+    Ok(Json(JournalRecordResponse {}))
+}
+
+/// The gate every write a worker makes ABOUT a color passes: the color
+/// is in the caller's scope, the caller is the pod it claims to be, and
+/// that pod is the color's current owner. Returns the color's scope
+/// (tenant + project) so the handler can act inside it.
+///
+/// Pod-name binding: the caller can only act under its own bound pod.
+/// Without this check, a worker could stamp a sibling's pod_name and
+/// either bypass fencing (if the sibling is alive) or poison
+/// attribution. The kubelet stamps `caller.pod_name` into the projected
+/// SA token; it's unforgeable from inside the pod.
+///
+/// Cross-color sabotage gate: the color's owning pod (stamped at first
+/// task_claim_one) must match the caller's bound pod. A compromised
+/// tenant pod can act only on colors it legitimately owns, not
+/// arbitrary sibling colors in the same tenant. `owner_pod_name IS
+/// NULL` means the color has not been claimed yet (e.g. a
+/// dispatcher-orchestrated phase still in flight); workers shouldn't be
+/// writing in that state anyway, so we refuse.
+async fn require_worker_owns_color(
+    state: &BrokerState,
+    caller: &CallerIdentity,
+    color: weft_core::Color,
+    claimed_pod: &str,
+) -> Result<scope::ProjectScope, (StatusCode, String)> {
+    let color_scope =
+        scope::require_color_scope(&state.scope_cache, &state.pool, caller, &color.to_string())
+            .await?;
+    require_pod_name_matches(caller, claimed_pod)?;
     let owner: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT owner_pod_name FROM execution_color WHERE color = $1",
     )
@@ -66,7 +86,7 @@ pub async fn journal_record(
     .map_err(internal)?;
     let owner_pod = owner.and_then(|(p,)| p).ok_or((
         StatusCode::FORBIDDEN,
-        "color has no owning pod yet; worker may not journal under it".into(),
+        "color has no owning pod yet; worker may not act on it".into(),
     ))?;
     if owner_pod != claimed_pod {
         tracing::warn!(
@@ -75,19 +95,124 @@ pub async fn journal_record(
             caller_pod = %claimed_pod,
             color = %color,
             owner_pod = %owner_pod,
-            "broker rejected cross-color journal write"
+            "broker rejected cross-color worker write"
         );
         return Err((
             StatusCode::FORBIDDEN,
             "color owned by a different worker pod".into(),
         ));
     }
-    state
-        .journal
-        .record_event(&req.event, Some(claimed_pod))
+    Ok(color_scope)
+}
+
+// ---------- Execution steering ----------
+
+/// `ctx.tag_execution`: journal `ExecutionTagged` and write the
+/// `execution_tag` rows in ONE transaction, synchronously, so the tag
+/// rows exist by the time the node's call returns (a following
+/// `stop_tagged` anchors on them). Same gate as `journal_record`: the
+/// worker may only tag the color it owns.
+pub async fn execution_tag(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<ExecutionTagRequest>,
+) -> Resp<ExecutionTagResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "only workers tag executions".into()));
+    }
+    let color: weft_core::Color = req
+        .color
+        .parse()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad color: {e}")))?;
+    if req.tags.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tag_execution needs at least one tag".into()));
+    }
+    // The ctx validated already; the broker trusts no pod, so again.
+    weft_core::tag::validate_tags(&req.tags)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    require_worker_owns_color(&state, &caller, color, &req.pod_name).await?;
+    let at_unix = unix_now_secs();
+    let mut tx = state.pool.begin().await.map_err(internal)?;
+    weft_journal::tags::tag_execution_in(&mut tx, color, &req.tags, at_unix, Some(&req.pod_name))
         .await
         .map_err(internal)?;
-    Ok(Json(JournalRecordResponse {}))
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(ExecutionTagResponse {}))
+}
+
+/// `ctx.stop_tagged`: queue a `stop_tagged` task for the dispatcher,
+/// with the ordering anchor resolved NOW. The project the stop runs in
+/// is the asking color's own (from its `execution_color` row); the
+/// request never names a project, so a stop cannot cross one.
+///
+/// The anchor rule, THE place it is decided:
+///   - `Keep`: the asker's own `seq` for the tag, or, if it never
+///     carried the tag, one past the newest row anywhere. Only rows
+///     below it are stopped, so a sibling that tags itself after this
+///     instant is out of reach however late the dispatcher runs the
+///     task, and two concurrent "stop the others" calls leave the
+///     later one alive.
+///   - `Include`: no anchor; every live run carrying the tag, the
+///     asker too.
+pub async fn execution_stop_tagged(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<ExecutionStopTaggedRequest>,
+) -> Resp<ExecutionStopTaggedResponse> {
+    if caller.role != Role::Worker {
+        return Err((StatusCode::FORBIDDEN, "only workers stop executions by tag".into()));
+    }
+    let color: weft_core::Color = req
+        .color
+        .parse()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad color: {e}")))?;
+    weft_core::tag::validate_tag(&req.tag)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let color_scope = require_worker_owns_color(&state, &caller, color, &req.pod_name).await?;
+    let before_seq = match req.stop_self {
+        weft_core::StopSelf::Include => None,
+        weft_core::StopSelf::Keep => Some(
+            match weft_journal::tags::tag_seq(&state.pool, color, &req.tag)
+                .await
+                .map_err(internal)?
+            {
+                Some(own) => own,
+                None => weft_journal::tags::max_tag_seq(&state.pool).await.map_err(internal)? + 1,
+            },
+        ),
+    };
+    let payload = weft_task_store::StopTaggedPayload {
+        project_id: color_scope.project.clone(),
+        tag: req.tag,
+        by: color.to_string(),
+        before_seq,
+        stop_self: req.stop_self,
+    };
+    // Every ask is its own task: a second stop for the same tag from
+    // the same run is a new decision with a new anchor, never a
+    // duplicate to collapse, so the dedup key is fresh per call.
+    let task = weft_task_store::tasks::NewTask {
+        kind: TaskKind::StopTagged.into(),
+        target: TaskTarget::Dispatcher,
+        project_id: Some(color_scope.project),
+        dedup_key: Some(format!("stop_tagged:{}", uuid::Uuid::new_v4())),
+        color: Some(color.to_string()),
+        tenant_id: Some(color_scope.tenant),
+        target_pod_name: None,
+        binary_hash: None,
+        payload: serde_json::to_value(&payload).map_err(internal)?,
+    };
+    state.tasks.enqueue_dedup(task).await.map_err(internal)?;
+    Ok(Json(ExecutionStopTaggedResponse {}))
+}
+
+/// Seconds since the unix epoch, the stamp every broker-side write
+/// puts on a journal row.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs()
 }
 
 pub async fn journal_fetch(

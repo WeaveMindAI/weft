@@ -539,7 +539,7 @@ pub async fn cancel(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup colors: {e}")))?;
     let had_setup = !colors.is_empty();
     for color in colors {
-        crate::api::execution::cancel_color(&state, color)
+        crate::api::execution::cancel_color(&state, color, &weft_core::exec::CancelCause::User)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
     }

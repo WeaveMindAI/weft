@@ -12,8 +12,13 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use weft_core::Color;
 
 use weft_journal::{decode_event, ExecEvent};
+// The tag column every summary read selects, in claim order. The SQL
+// itself lives with the table's every other read and write, in
+// `weft_journal::tags`; it is spliced into the two summary queries,
+// which both have the color in scope as `execution_color ec`.
+use weft_journal::tags::TAGS_LATERAL;
 use crate::journal::{
-    SignalToken, ColorLookup, ExecutionOwner, ExecutionPage, ExecutionQuery, ExecutionSummary,
+    CancelWrite, SignalToken, ColorLookup, ExecutionOwner, ExecutionPage, ExecutionQuery, ExecutionSummary,
     Journal, LogEntry, SignalRegistration,
 };
 
@@ -33,6 +38,7 @@ fn summary_from_payloads(
     color: Color,
     started_payload: &str,
     terminal_payload: Option<String>,
+    tags: Vec<String>,
 ) -> anyhow::Result<ExecutionSummary> {
     let started = decode_event(color, started_payload).map_err(anyhow::Error::msg)?;
     let ExecEvent::ExecutionStarted {
@@ -70,7 +76,38 @@ fn summary_from_payloads(
         status,
         started_at: at_unix,
         completed_at,
+        tags,
     })
+}
+
+/// Write the dispatcher-side cancel terminals for `color` on the
+/// caller's transaction: `NodeCancelled` per non-terminal node, then
+/// `ExecutionCancelled`, from the ONE shared definition of that list
+/// (`cancel_terminal_events`), so every transactional cancel writer
+/// emits identical rows. Skips entirely (`None`) when the journal
+/// already holds a terminal, so a worker's own terminal is never
+/// contradicted. Per-node cancels land BEFORE the terminal: a
+/// terminal-first partial write would make a retry skip the per-node
+/// rows forever. A payload that fails to decode fails the whole read,
+/// matching `events_log`. Returns the per-node count written.
+async fn cancel_terminals_in(
+    tx: &mut sqlx::PgConnection,
+    color: Color,
+    cause: &weft_core::exec::CancelCause,
+) -> anyhow::Result<Option<usize>> {
+    let events = decode_all(color, payload_rows(&mut *tx, color).await?)?;
+    if events.iter().any(ExecEvent::is_execution_terminal) {
+        return Ok(None);
+    }
+    let now = crate::lease::now_unix() as u64;
+    let writes = crate::api::execution::cancel_terminal_events(color, &events, cause, now);
+    let node_cancellations = writes.len() - 1;
+    for (event, dedup) in writes {
+        weft_journal::record_event_in(&mut *tx, &event, None, Some(&dedup))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(Some(node_cancellations))
 }
 
 /// Every payload for `color`, in write order, undecoded. Takes the
@@ -277,7 +314,7 @@ impl PostgresJournal {
 /// boot's one `apply_core_schema` pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "exec_event",
-    tables: &["exec_event", "signal_token", "signal", "execution_color"],
+    tables: &["exec_event", "signal_token", "signal", "execution_color", "execution_tag"],
     ddl: &[
         // exec_event: append-only journal. `dedup_key` is the
         // idempotency knob writers that may retry (dispatcher tasks
@@ -470,6 +507,27 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_tenant ON execution_color(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_project ON execution_color(project_id)"#,
+        // execution_tag: the selectable copy of `ctx.tag_execution`, one
+        // row per (color, tag), written by the broker on the worker's
+        // behalf in the same transaction as the `ExecutionTagged`
+        // event. `ctx.stop_tagged` selects on it: "every live execution
+        // of this project carrying tag T" is one indexed read joined to
+        // `execution_color` instead of a fold over every open journal.
+        // `seq` is the order tags were written, gap-tolerant and never
+        // tied, which is what the last-one-wins rule compares (unix
+        // seconds would tie two runs of the same user inside one
+        // second). The (color, tag) uniqueness is what makes a body
+        // re-run after a crash land on the same row instead of moving
+        // the run's place in the order. Rows go with the color's
+        // journal on `weft clean`.
+        r#"CREATE TABLE IF NOT EXISTS execution_tag (
+            seq BIGSERIAL PRIMARY KEY,
+            color TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            tagged_at_unix BIGINT NOT NULL,
+            UNIQUE (color, tag)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_execution_tag_tag ON execution_tag(tag)"#,
     ],
     seed: &[],
 };
@@ -552,7 +610,7 @@ impl Journal for PostgresJournal {
     async fn cancel_never_claimed_execution(
         &self,
         color: Color,
-        reason: &str,
+        cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome> {
         use weft_task_store::tasks::SetupFailureOutcome;
         let mut tx = self.pool.begin().await?;
@@ -565,29 +623,51 @@ impl Journal for PostgresJournal {
         }
         // No worker will ever run this color: journal the cancel terminals in
         // the SAME transaction as the task delete, so "task deleted" and
-        // "cancel journaled" can never disagree. Per-node cancels land BEFORE
-        // ExecutionCancelled (same ordering rule as the dispatcher's cancel
-        // catch-up writer: a terminal-first partial write would make a retry
-        // skip the per-node rows forever). A payload that fails to decode
-        // fails the whole read, matching `events_log`.
-        let events = decode_all(color, payload_rows(&mut *tx, color).await?)?;
-        let has_terminal = events.iter().any(ExecEvent::is_execution_terminal);
-        if !has_terminal {
-            // The write list comes from the ONE shared definition of a
-            // dispatcher-side cancel (`cancel_terminal_events`), so this
-            // transactional writer and the retrying trait-based writer
-            // (`journal_cancel_terminals`) can never drift.
-            let now = crate::lease::now_unix() as u64;
-            for (event, dedup) in
-                crate::api::execution::cancel_terminal_events(color, &events, reason, now)
-            {
-                weft_journal::record_event_in(&mut *tx, &event, None, Some(&dedup))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-        }
+        // "cancel journaled" can never disagree.
+        cancel_terminals_in(&mut tx, color, cause).await?;
         tx.commit().await?;
         Ok(SetupFailureOutcome::NoWorkerWillRun)
+    }
+
+    async fn cancel_execution(
+        &self,
+        color: Color,
+        cause: &weft_core::exec::CancelCause,
+    ) -> anyhow::Result<CancelWrite> {
+        let mut tx = self.pool.begin().await?;
+        // 1. The wake signals go first in the write order for the same
+        //    reason they went first when these were separate statements:
+        //    a fire that resolves its signal row after this commits finds
+        //    nothing, and one that resolved it before enqueues a resume
+        //    the worker refuses on the terminal below.
+        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_COLOR_RETURNING)
+            .bind(color.to_string())
+            .fetch_all(&mut *tx)
+            .await?;
+        let removed: Vec<SignalRegistration> =
+            rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
+        // 2 + 3. Only a started color has a journal to close and a pod to
+        //    flag; its project and tenant were stamped on this row in the
+        //    birth transaction, so no other lookup is needed.
+        let owner: Option<(String, String)> =
+            sqlx::query_as("SELECT project_id, tenant_id FROM execution_color WHERE color = $1")
+                .bind(color.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let mut write = CancelWrite { removed, ..CancelWrite::default() };
+        if let Some((project_id, tenant_id)) = owner {
+            write.node_cancellations = cancel_terminals_in(&mut tx, color, cause).await?;
+            write.task_enqueued = crate::task_kinds::execute::enqueue_cancel_in(
+                &mut tx,
+                &project_id,
+                color,
+                Some(tenant_id.as_str()),
+                cause,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(write)
     }
 
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool> {
@@ -769,9 +849,9 @@ impl Journal for PostgresJournal {
         .fetch_one(&self.pool)
         .await?;
 
-        let rows: Vec<(String, String, i64, String, Option<String>)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String, i64, String, Option<String>, Vec<String>)> = sqlx::query_as(&format!(
             "SELECT ec.color, ec.project_id, ec.started_at_unix, \
-                    s.payload_json, t.payload_json \
+                    s.payload_json, t.payload_json, {TAGS_LATERAL} \
              FROM execution_color ec \
              JOIN LATERAL ( \
                  SELECT payload_json FROM exec_event \
@@ -797,7 +877,7 @@ impl Journal for PostgresJournal {
         .await?;
 
         let mut executions = Vec::with_capacity(rows.len());
-        for (color_text, project_id, started_at, started_payload, terminal_payload) in rows {
+        for (color_text, project_id, started_at, started_payload, terminal_payload, tags) in rows {
             let color: Color = color_text.parse().map_err(|e| {
                 anyhow::anyhow!("execution_color row holds a non-uuid color '{color_text}': {e}")
             })?;
@@ -806,7 +886,7 @@ impl Journal for PostgresJournal {
             // exactly this state), and it must not vanish either: the
             // count includes it, so the page renders it as a broken
             // row (inspectable via replay, deletable).
-            match summary_from_payloads(color, &started_payload, terminal_payload) {
+            match summary_from_payloads(color, &started_payload, terminal_payload, tags) {
                 Ok(summary) => executions.push(summary),
                 Err(e) => {
                     tracing::error!(
@@ -821,6 +901,7 @@ impl Journal for PostgresJournal {
                         status: "corrupt".to_string(),
                         started_at: started_at as u64,
                         completed_at: None,
+                        tags: Vec::new(),
                     });
                 }
             }
@@ -835,9 +916,10 @@ impl Journal for PostgresJournal {
         // Direct point-lookup by color: the started row plus its latest terminal
         // event, no windowed list scan. Returns None when the color has no
         // `execution_started` row.
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT s.payload_json, t.payload_json \
+        let row: Option<(String, Option<String>, Vec<String>)> = sqlx::query_as(&format!(
+            "SELECT s.payload_json, t.payload_json, {TAGS_LATERAL} \
              FROM exec_event s \
+             JOIN execution_color ec ON ec.color = s.color \
              LEFT JOIN LATERAL ( \
                  SELECT payload_json FROM exec_event \
                  WHERE color = s.color \
@@ -845,16 +927,16 @@ impl Journal for PostgresJournal {
                  ORDER BY id DESC LIMIT 1 \
              ) t ON TRUE \
              WHERE s.kind = 'execution_started' AND s.color = $1 \
-             ORDER BY s.id ASC LIMIT 1",
-        )
+             ORDER BY s.id ASC LIMIT 1"
+        ))
         .bind(color.to_string())
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
             None => Ok(None),
-            Some((started_payload, terminal_payload)) => {
-                summary_from_payloads(color, &started_payload, terminal_payload).map(Some)
+            Some((started_payload, terminal_payload, tags)) => {
+                summary_from_payloads(color, &started_payload, terminal_payload, tags).map(Some)
             }
         }
     }
@@ -862,6 +944,7 @@ impl Journal for PostgresJournal {
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
+        phase: Option<weft_core::context::Phase>,
     ) -> anyhow::Result<Vec<Color>> {
         // A color is "non-terminal" iff it belongs to this project
         // AND has no terminal event in the journal. `execution_color`
@@ -873,10 +956,13 @@ impl Journal for PostgresJournal {
         // read behind the cancel/wipe sweeps and the drain count, and
         // a node-test color's lifecycle is owned by its task, never by
         // the project's.
+        // `$2 IS NULL OR ec.phase = $2`: one query for both the
+        // whole-project read and the per-phase one.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT ec.color FROM execution_color ec \
              WHERE ec.project_id = $1 \
                AND ec.kind = 'execution' \
+               AND ($2::text IS NULL OR ec.phase = $2) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM exec_event t \
                    WHERE t.color = ec.color \
@@ -886,6 +972,7 @@ impl Journal for PostgresJournal {
                )",
         )
         .bind(project_id)
+        .bind(phase.map(|p| p.as_str()))
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -896,6 +983,14 @@ impl Journal for PostgresJournal {
             out.push(color);
         }
         Ok(out)
+    }
+
+    async fn live_tagged_executions(
+        &self,
+        project_id: &str,
+        tag: &str,
+    ) -> anyhow::Result<Vec<weft_journal::tags::TaggedExecution>> {
+        Ok(weft_journal::tags::live_tagged_executions(&self.pool, project_id, tag).await?)
     }
 
     async fn list_terminal_colors_for_project(
@@ -930,17 +1025,25 @@ impl Journal for PostgresJournal {
     }
 
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
-        let s = color.to_string();
+        // One transaction for the whole footprint: the journal, the tag
+        // rows, the resume tokens, and the color index must die
+        // together. Half-applied (four autocommit deletes), a crash in
+        // the window leaves tag + execution_color rows whose journal is
+        // empty, which is exactly the row set the live tag read selects
+        // for, and a later stop writes fresh cancel rows into a deleted
+        // journal, resurrecting a ghost run.
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM exec_event WHERE color = $1")
-            .bind(&s)
-            .execute(&self.pool)
+            .bind(color.to_string())
+            .execute(&mut *tx)
             .await?;
+        weft_journal::tags::delete_for_color(&mut tx, color).await?;
         // Resume tokens for this color: signal rows with is_resume=true.
         sqlx::query(
             "DELETE FROM signal WHERE color = $1 AND is_resume = TRUE",
         )
-        .bind(&s)
-        .execute(&self.pool)
+        .bind(color.to_string())
+        .execute(&mut *tx)
         .await?;
         // execution_color is the denormalized (color, project_id,
         // tenant_id) index seeded at ExecutionStarted time. Without
@@ -950,9 +1053,10 @@ impl Journal for PostgresJournal {
         // terminal-event check passes vacuously when all events are
         // gone). Wipe / cancel_running then re-sweep a ghost.
         sqlx::query("DELETE FROM execution_color WHERE color = $1")
-            .bind(&s)
-            .execute(&self.pool)
+            .bind(color.to_string())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 

@@ -116,6 +116,16 @@
         async fn complete(&self, _t: uuid::Uuid, _p: &str, _r: Value) -> anyhow::Result<()> { Ok(()) }
         async fn fail(&self, _t: uuid::Uuid, _p: &str, _e: String) -> anyhow::Result<()> { Ok(()) }
     }
+    pub(super) struct NoopSteering;
+    #[async_trait]
+    impl crate::context::ExecutionSteeringClient for NoopSteering {
+        async fn tag_execution(&self, _c: Color, _t: Vec<String>, _p: &str) -> anyhow::Result<()> {
+            unreachable!("rig tests steer no executions")
+        }
+        async fn stop_tagged(&self, _c: Color, _t: String, _s: weft_core::StopSelf, _p: &str) -> anyhow::Result<()> {
+            unreachable!("rig tests steer no executions")
+        }
+    }
     pub(super) struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
@@ -272,6 +282,7 @@
                     &ExecEvent::ExecutionCancelled {
                         color,
                         reason: "cancelled in the route window".into(),
+                        cause: Some(weft_core::exec::CancelCause::User),
                         at_unix: 0,
                     },
                     None,
@@ -289,6 +300,7 @@
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),

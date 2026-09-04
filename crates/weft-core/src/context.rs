@@ -9,6 +9,7 @@ use crate::cancellation::CancellationFlag;
 use crate::error::{WeftError, WeftResult};
 use crate::frames::LoopFrames;
 use crate::primitive::SignalSpec;
+use crate::tag::StopSelf;
 use crate::weft_type::WeftType;
 use crate::Color;
 
@@ -535,6 +536,61 @@ impl ExecutionContext {
     /// the commit point.
     pub async fn log(&self, level: LogLevel, message: impl Into<String>) -> WeftResult<()> {
         self.handle.log(level, message.into()).await
+    }
+
+    // ----- Steering other executions ---------------------------------
+
+    /// Tag THIS execution. Additive: the tags join whatever the run
+    /// already carries, and tagging twice with the same tag is a
+    /// no-op, so a body re-run after a crash lands on the same state.
+    /// Any node can call it, at any point. The tags are what a sibling
+    /// run's [`Self::stop_tagged`] selects on, and they show on the
+    /// run in the inspector.
+    ///
+    /// Tag grammar is [`crate::tag`]'s: `[A-Za-z0-9_-]{1,64}`. A bad
+    /// tag fails here, before anything is written, naming the character.
+    pub async fn tag_execution<I, S>(&self, tags: I) -> WeftResult<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let tags: Vec<String> = tags.into_iter().map(Into::into).collect();
+        if tags.is_empty() {
+            return Err(WeftError::Input("tag_execution needs at least one tag".into()));
+        }
+        crate::tag::validate_tags(&tags).map_err(|e| WeftError::Input(e.to_string()))?;
+        self.handle.tag_execution(tags).await
+    }
+
+    /// Stop every live execution of this project carrying `tag`, right
+    /// now: the ones running, the ones parked on a signal or a timer
+    /// (their wake is erased, so they never resume), and the ones whose
+    /// wake is already in flight (it finds the run dead and does
+    /// nothing). Each stopped run is journaled `ExecutionCancelled`
+    /// naming this execution and the tag, so it reads as exactly that
+    /// in the inspector, never as a failure.
+    ///
+    /// `stop_self` says whether this run is one of them. With
+    /// [`StopSelf::Keep`] the call only reaches executions that tagged
+    /// themselves BEFORE this one did (or, if this run never carried
+    /// the tag, everything carrying it now): two runs that both say
+    /// "stop the others, keep me" a few milliseconds apart therefore
+    /// leave the LATER one alive instead of killing each other. With
+    /// [`StopSelf::Include`] every live run carrying the tag goes,
+    /// this one too: its current await returns cancelled at the next
+    /// cancellation point, exactly as `weft stop` would end it.
+    ///
+    /// The stop is asynchronous: this call returns once the request is
+    /// durably queued, and the runtime carries it out. A node that
+    /// needs the siblings gone before its next step has no such
+    /// guarantee and should not be written to depend on one.
+    ///
+    /// Never crosses a project: a tag is scoped to the project the
+    /// caller runs in, and the broker refuses anything else.
+    pub async fn stop_tagged(&self, tag: impl Into<String>, stop_self: StopSelf) -> WeftResult<()> {
+        let tag = tag.into();
+        crate::tag::validate_tag(&tag).map_err(|e| WeftError::Input(e.to_string()))?;
+        self.handle.stop_tagged(tag, stop_self).await
     }
 
     // ----- Read helpers ----------------------------------------------
@@ -1719,6 +1775,12 @@ pub trait ContextHandle: Send + Sync {
     /// Backs [`ExecutionContext::published_access`].
     async fn published_access(&self) -> WeftResult<Option<crate::access::Access>>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
+    /// Backs [`ExecutionContext::tag_execution`]. `tags` are already
+    /// validated and non-empty.
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()>;
+    /// Backs [`ExecutionContext::stop_tagged`]. `tag` is already
+    /// validated.
+    async fn stop_tagged(&self, tag: String, stop_self: StopSelf) -> WeftResult<()>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 
     /// The output port names this node declares in its metadata.
@@ -2034,6 +2096,8 @@ mod value_bag_tests {
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
+        async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
+        async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
@@ -2072,6 +2136,8 @@ mod value_bag_tests {
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
+        async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
+        async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }

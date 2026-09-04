@@ -745,3 +745,82 @@
         assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["fixed".to_string()]);
     }
+
+    /// Ends its own run the way a `cancel_execution` task does: flips the
+    /// execution's flag WITH a cause, then parks instead of returning.
+    /// Returning in the same instant the flag flips would race the
+    /// driver's idle `select!` (the terminal arm can win and journal
+    /// NodeFailed, leaving the cancel walk nothing to catch up on);
+    /// parked, only the cancellation arm is ever ready, so this record
+    /// is provably non-terminal when the walk runs. Every production
+    /// canceller flips the flag from a separate task, so the ordering
+    /// here only needs to hold for the self-stop shape this node exists
+    /// to exercise.
+    struct SelfStopper {
+        cause: weft_core::exec::CancelCause,
+    }
+    test_manifest!(SelfStopper, "SelfStopper");
+    #[async_trait]
+    impl Node for SelfStopper {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let flag = ctx.cancellation();
+            flag.cancel_because(self.cause.clone());
+            // Park until the teardown aborts this body.
+            let () = std::future::pending().await;
+            unreachable!("the run's teardown aborts this body first")
+        }
+    }
+
+    /// The cause a canceller records on the flag is what the worker's
+    /// terminal names: `ExecutionCancelled` carries it structured AND as
+    /// text, and the catch-up `NodeCancelled` rows use the same text, so
+    /// a run stopped by a sibling reads as exactly that whichever side
+    /// wrote its terminal first.
+    #[tokio::test]
+    async fn worker_terminal_names_the_recorded_cancel_cause() {
+        let by = weft_core::Color::new_v4();
+        let cause = weft_core::exec::CancelCause::Execution { by, tag: "user_7".into() };
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [{
+                "id": "stopper", "nodeType": "SelfStopper", "label": null,
+                "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [],
+                "outputs": [{ "name": "value", "portType": "String", "required": false }],
+                "features": {}, "scope": [], "groupBoundary": null,
+                "requiresInfra": false, "images": []
+            }],
+            "edges": []
+        }))
+        .expect("one-node project");
+        let cat = catalog(vec![("SelfStopper", Box::new(SelfStopper { cause: cause.clone() }))]);
+        let (outcome, events) = drive(project, cat, &["stopper"]).await;
+
+        assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }), "{outcome:?}");
+        let terminal = events
+            .iter()
+            .find_map(|e| match e {
+                ExecEvent::ExecutionCancelled { reason, cause, .. } => Some((reason.clone(), cause.clone())),
+                _ => None,
+            })
+            .expect("a cancelled run journals ExecutionCancelled");
+        assert_eq!(terminal, (cause.to_string(), Some(cause.clone())), "{events:?}");
+        assert_eq!(
+            terminal.0,
+            format!("Stopped by execution {by} (tag user_7)"),
+            "the text a person reads names the run and the tag"
+        );
+        // The parked body is what the cancel walk exists to catch: its
+        // record must be non-terminal when the walk runs, so exactly one
+        // NodeCancelled lands, naming the same cause. A walk that wrote
+        // nothing would otherwise pass this loop vacuously.
+        let node_cancels: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                ExecEvent::NodeCancelled { node_id, reason, .. } if node_id == "stopper" => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(node_cancels.len(), 1, "the parked node gets one cancel row: {events:?}");
+        assert_eq!(node_cancels[0], &cause.to_string(), "per-node cancel rows carry the same cause");
+    }

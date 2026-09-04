@@ -1394,7 +1394,7 @@
             let stream = ctx.inputs.get::<Generator<i64>>("in")?;
             let first = stream.next().await?;
             log(&self.log, format!("took {first:?}"));
-            self.flag.cancel();
+            self.flag.cancel_because(weft_core::exec::CancelCause::User);
             // Keep pulling: the poison/teardown resolves this pull, or
             // the task is aborted by the cancel walk; either is fine.
             let _ = stream.next().await;
@@ -1416,7 +1416,7 @@
             let (outcome, _) =
                 drive_with_cancel(stream_project(), cat, &["producer"], flag).await;
             assert!(
-                matches!(outcome, ExecutionOutcome::Cancelled),
+                matches!(outcome, ExecutionOutcome::Cancelled { .. }),
                 "a mid-stream cancel resolves the run as Cancelled, got {outcome:?}"
             );
         }

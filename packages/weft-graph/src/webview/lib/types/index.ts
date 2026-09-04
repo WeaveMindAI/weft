@@ -415,7 +415,6 @@ export interface NodeExecution {
 	id: string;
 	nodeId: string;
 	status: NodeExecutionStatus;
-	pulseIdsAbsorbed: string[];
 	pulseId: string;
 	error?: string;
 	callbackId?: string;
@@ -473,6 +472,15 @@ export interface PortWarning {
 /** Node executions keyed by node ID. */
 export type NodeExecutionTable = Record<string, NodeExecution[]>;
 
+/** How the run ended, once it has: the state plus, for a cancel, the
+ *  text and structured cause (a sibling run stopping it names the run
+ *  and the tag). Undefined while the run is live. */
+export interface ExecutionTerminal {
+	state: 'completed' | 'failed' | 'cancelled';
+	reason?: string;
+	cause?: import('../../../protocol').CancelCause;
+}
+
 /** Live execution state the webview maintains from the extension
  *  host's SSE stream. Single source of truth: lifted here so
  *  `App.svelte` (which owns the state) and the editor components
@@ -482,6 +490,11 @@ export type NodeExecutionTable = Record<string, NodeExecution[]>;
  */
 export interface ExecutionState {
 	isRunning: boolean;
+	/** The tags the run put on itself (`ctx.tag_execution`), in claim
+	 *  order, deduplicated. The handle a sibling's `ctx.stop_tagged`
+	 *  selects on; shown on the run in the inspector. */
+	tags: string[];
+	terminal?: ExecutionTerminal;
 	nodeOutputs: Record<string, unknown>;
 	nodeExecutions: NodeExecutionTable;
 	/** Full bus log per `busId` (in arrival order). The inspector

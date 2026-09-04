@@ -89,6 +89,13 @@
 				site: CorruptionSite;
 				reason: string;
 			}>;
+			/// The run's own tags (`ctx.tag_execution`), the same on
+			/// every node; the inspector footer shows them.
+			executionTags?: string[];
+			/// How the run ended, the same on every node; the inspector
+			/// footer names a cancel's cause from it, and the cancel card
+			/// falls back to it when the node's own row carries no reason.
+			runTerminal?: import('../../types').ExecutionTerminal;
 			/// Body-panel feed for this node, set ONLY for infra
 			/// (infra /live) and trigger (listener /display) nodes.
 			/// Other nodes get undefined and render no body panel
@@ -148,6 +155,8 @@
 	// that never touched a bus.
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
+	const executionTags = $derived(data.executionTags ?? []);
+	const runTerminal = $derived(data.runTerminal);
 
 	const entryKinds: PortSpec[] = $derived(typeConfig.portsFromConfig?.specs ?? []);
 	const entryKindByName: Record<string, PortSpec> = $derived(buildSpecMap(entryKinds));
@@ -1509,7 +1518,7 @@
 			{#if displayedStatus}
 				<span class="text-xs leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
 			{/if}
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} label={data.label || typeConfig.label} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeConfig.label} />
 		</div>
 		<!-- Bare node: the content column is fixed to the square's inner width (the
 		     square side minus the 8px padding each side) so the node measures as a
@@ -1635,7 +1644,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} label={data.label || typeConfig.label} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeConfig.label} />
 		{#if isInclude}
 			<button
 				class="px-1.5 h-5 flex items-center gap-1 rounded hover:bg-violet-100 cursor-pointer transition-colors text-violet-600 text-[10px] font-medium nodrag nopan"
@@ -2124,7 +2133,11 @@
 				{:else if displayedStatus === 'cancelled'}
 					<div class="debug-placeholder completed" style="color: #71717a;">
 						<span>■</span>
-						<span>{latestExecution?.error || 'Cancelled by user'}</span>
+						<span>
+							{latestExecution?.error
+								|| (runTerminal?.state === 'cancelled' ? runTerminal.reason : undefined)
+								|| 'Cancelled'}
+						</span>
 					</div>
 				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
 					<div class="debug-placeholder running">

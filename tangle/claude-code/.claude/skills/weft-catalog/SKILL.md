@@ -110,7 +110,12 @@ Orientation, not inventory. The inventory is on disk and grows.
 - **logic**: `Switch` (cases: `equals`, `in`, `contains`, `matches`,
   `gt`/`gte`/`lt`/`lte`, `between`, `otherwise`; each case names the port it
   opens, `otherwise` last and unique), `FirstInOrder` (its written input
-  order decides which branch wins).
+  order decides which branch wins), `TagRun` and `StopTagged` (stopping
+  older runs: every input wired onto either node is a tag, `TagRun` puts
+  the tags on this run, `StopTagged` stops every older run carrying one,
+  `includeSelf: true` stops this run too). Reach for the pair when a new
+  event makes work in flight pointless; the wiring is in the
+  `weft-language` skill.
 - **live**: `ApiEndpoint` (HTTP), `LiveSocket` (WebSocket). Triggers; a fresh
   execution per request or connection.
 - **triggers**: `Cron` (`cron` expression, standard five-field).

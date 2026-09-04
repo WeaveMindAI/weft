@@ -147,7 +147,7 @@ The complete set, `hidden` aside, which only catalog nodes use:
 | `isOutputDefault` | this node's firing is the deliverable |
 | `isTrigger` | this node starts executions from outside |
 | `optionalCustomInputs` | ports created by a wire on this node are optional by default |
-| `customInputType` | the type every created port takes; a shared variable (`T`) makes them one type |
+| `customInputType` | the type every WIRED created port takes; a shared variable (`T`) makes them one type. A port created by a config literal takes the literal's own inferred type instead, so a non-string literal on a `String`-typed node is caught at run time by the node, loudly |
 | `liveEndpoint` | names the endpoint serving `/live` for an infra node |
 | `canAddInputPorts` | the `.weft` author may add input ports to this node, by declaring them or by wiring a config key that names no declared port. Without it, an extra port is a compile error. |
 | `canAddOutputPorts` | the same for outputs |

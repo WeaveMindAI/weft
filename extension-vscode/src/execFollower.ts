@@ -20,6 +20,7 @@ import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import type {
   WirePayload,
+  CancelCause,
   CorruptionSite,
   HostMessage,
   LoopIteration,
@@ -30,18 +31,19 @@ import type {
 
 // SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 export type DispatcherEvent =
-  | { kind: 'execution_started'; color: string; entry_node: string; project_id: string }
-  | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; project_id: string }
-  | { kind: 'node_suspended'; color: string; node: string; frames: LoopIteration[]; token: string; project_id: string }
-  | { kind: 'node_resumed'; color: string; node: string; frames: LoopIteration[]; token: string | null; value: unknown; project_id: string }
-  | { kind: 'node_cancelled'; color: string; node: string; frames: LoopIteration[]; reason: string; project_id: string }
-  | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; project_id: string }
-  | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; project_id: string }
-  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; reason: SkipReason; project_id: string }
-  | { kind: 'port_type_mismatch'; color: string; node: string; frames: LoopIteration[]; port: string; expected: string; actual: string; project_id: string }
-  | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown }
-  | { kind: 'execution_failed'; color: string; project_id: string; error: string }
-  | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string }
+  | { kind: 'execution_started'; color: string; entry_node: string; project_id: string; at_unix: number }
+  | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; project_id: string; at_unix: number }
+  | { kind: 'node_suspended'; color: string; node: string; frames: LoopIteration[]; token: string; project_id: string; at_unix: number }
+  | { kind: 'node_resumed'; color: string; node: string; frames: LoopIteration[]; token: string | null; value: unknown; project_id: string; at_unix: number }
+  | { kind: 'node_cancelled'; color: string; node: string; frames: LoopIteration[]; reason: string; project_id: string; at_unix: number }
+  | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; project_id: string; at_unix: number }
+  | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; project_id: string; at_unix: number }
+  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; reason: SkipReason; project_id: string; at_unix: number }
+  | { kind: 'port_type_mismatch'; color: string; node: string; frames: LoopIteration[]; port: string; expected: string; actual: string; project_id: string; at_unix: number }
+  | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown; at_unix: number }
+  | { kind: 'execution_failed'; color: string; project_id: string; error: string; at_unix: number }
+  | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string; cause?: CancelCause; at_unix: number }
+  | { kind: 'execution_tagged'; color: string; project_id: string; tags: string[]; at_unix: number }
   // Infra lifecycle. Emitted by the dispatcher's infra_event_bridge
   // from supervisor-written rows; drive action-bar refresh so
   // transient `stopping` / `terminating` states show up in the UI.
@@ -69,7 +71,7 @@ export type DispatcherEvent =
   // to the exact firing. amount_usd null = the meter could not resolve the
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
-  | { kind: 'cost_reported'; color: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours' }
+  | { kind: 'cost_reported'; color: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -101,10 +103,10 @@ export type DispatcherEvent =
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
   // SYNC: loop_instantiated <-> crates/weft-dispatcher/src/events.rs LoopInstantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
-  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; iter_cap: number | null; parallel: boolean }
-  | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number }
-  | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; done_vote?: boolean | null }
-  | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; reason: LoopTerminationReason }
+  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; iter_cap: number | null; parallel: boolean; at_unix: number }
+  | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; at_unix: number }
+  | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; done_vote?: boolean | null; at_unix: number }
+  | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; reason: LoopTerminationReason; at_unix: number }
   // Graph-level participation: a node is wired to a bus. Derived
   // dispatcher-side from PulseEmitted events carrying a bus marker,
   // so source AND target nodes get one BusParticipant edge each.
@@ -231,6 +233,7 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'node_started': {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
+          atUnix: e.at_unix,
           state: 'running',
           frames: e.frames,
           input: e.input,
@@ -246,6 +249,7 @@ export class ExecutionFollower implements vscode.Disposable {
         // vs waiting_for_input-via-fold).
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
+          atUnix: e.at_unix,
           state: 'waiting_for_input',
           frames: e.frames,
         };
@@ -261,6 +265,7 @@ export class ExecutionFollower implements vscode.Disposable {
         // carries no resume payload.
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
+          atUnix: e.at_unix,
           state: 'running',
           resumed: true,
           frames: e.frames,
@@ -271,6 +276,7 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'node_cancelled': {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
+          atUnix: e.at_unix,
           state: 'cancelled',
           frames: e.frames,
           error: e.reason,
@@ -281,6 +287,7 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'node_completed': {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
+          atUnix: e.at_unix,
           state: 'completed',
           frames: e.frames,
           output: e.output,
@@ -291,6 +298,7 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'node_failed': {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
+          atUnix: e.at_unix,
           state: 'failed',
           frames: e.frames,
           error: e.error,
@@ -301,6 +309,7 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'node_skipped': {
         const execEvent: NodeExecEvent = {
           nodeId: e.node,
+          atUnix: e.at_unix,
           state: 'skipped',
           frames: e.frames,
           closedPorts: e.closed_ports,
@@ -325,17 +334,28 @@ export class ExecutionFollower implements vscode.Disposable {
       }
       case 'execution_completed':
       case 'execution_failed':
-      case 'execution_cancelled':
         this.post({
           kind: 'execTerminal',
           color: e.color,
-          state:
-            e.kind === 'execution_completed'
-              ? 'completed'
-              : e.kind === 'execution_cancelled'
-                ? 'cancelled'
-                : 'failed',
+          state: e.kind === 'execution_completed' ? 'completed' : 'failed',
+          atUnix: e.at_unix,
         });
+        break;
+      case 'execution_cancelled':
+        // A cancel carries why: the text and, on every row written since
+        // the cause existed, the structured value (a sibling run's stop
+        // names the run and the tag).
+        this.post({
+          kind: 'execTerminal',
+          color: e.color,
+          state: 'cancelled',
+          reason: e.reason,
+          cause: e.cause,
+          atUnix: e.at_unix,
+        });
+        break;
+      case 'execution_tagged':
+        this.post({ kind: 'execTags', color: e.color, tags: e.tags });
         break;
       case 'bus_joined':
         // Forward `offset` on every bus event so the inspector can

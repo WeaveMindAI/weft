@@ -1602,6 +1602,13 @@
 		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
 		loopEventsByGroup: Record<string, import('../../../../protocol').LoopInspectorEvent[]>;
 		journalCorruptions: Array<{ site: import('../../../../protocol').CorruptionSite; reason: string }>;
+		/// The run's own tags (`ctx.tag_execution`), painted onto every
+		/// node so any node's inspector can show them.
+		executionTags: string[];
+		/// How the run ended (state plus, for a cancel, why), painted
+		/// onto every node so a node card or inspector can name who
+		/// stopped the run.
+		runTerminal: import('../../types').ExecutionTerminal | undefined;
 		infraNodes: typeof infraNodes;
 		fileContents: typeof fileContents;
 		infraFeedByNode: typeof infraFeedByNode;
@@ -1644,6 +1651,8 @@
 			busMetaByBus: state?.busMetaByBus ?? {},
 			loopEventsByGroup: state?.loopEventsByGroup ?? {},
 			journalCorruptions: state?.journalCorruptions ?? [],
+			executionTags: state?.tags ?? [],
+			runTerminal: state?.terminal,
 			infraNodes,
 			fileContents,
 			infraFeedByNode,
@@ -1670,7 +1679,7 @@
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
 			nodeOutputs, nodeExecutions, busLogByBus, busesByNode, busMetaByBus,
-			loopEventsByGroup, journalCorruptions,
+			loopEventsByGroup, journalCorruptions, executionTags, runTerminal,
 		} = ctx;
 		// Subgraph highlight classes are computed over the CURRENT arrays so
 		// highlighted/dimmed always reflects what is on screen.
@@ -1776,7 +1785,6 @@
 								id: `${groupId}-synth-${inExec.framesKey}`,
 								nodeId: groupId,
 								status,
-								pulseIdsAbsorbed: inExec.pulseIdsAbsorbed,
 								pulseId: inExec.pulseId,
 								error: outExec?.error ?? inExec.error,
 								startedAt: inExec.startedAt,
@@ -1877,6 +1885,8 @@
 							busLogs,
 							loopEvents,
 							journalCorruptions,
+							executionTags,
+							runTerminal,
 							fileContents: ctx.fileContents,
 							bodyFeed,
 							infraNodeStatus: backendNode?.status,

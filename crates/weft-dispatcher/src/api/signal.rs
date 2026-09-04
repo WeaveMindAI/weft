@@ -1009,12 +1009,12 @@ pub async fn cancel_signal(
     }
 
     if let Some(color) = row.color {
-        // cancel_color strips wake signals for the color and
-        // enqueues a cancel_execution task. The worker fires the
-        // per-color Notify, journals NodeCancelled per non-terminal
-        // node + ExecutionFailed, and the journal bridge publishes
-        // each event onto the project SSE bus.
-        crate::api::execution::cancel_color(&state, color)
+        // cancel_color, in one transaction, strips the color's wake
+        // signals, journals NodeCancelled per non-terminal node plus
+        // ExecutionCancelled, and queues the cancel task for the pod
+        // driving it (which flips the run's CancellationFlag); the
+        // journal bridge publishes each row onto the project SSE bus.
+        crate::api::execution::cancel_color(&state, color, &weft_core::exec::CancelCause::User)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
     } else {
@@ -1143,7 +1143,9 @@ pub async fn clear_all_signals(
 /// the whole clear-all. (The handler exists for the admin "drop
 /// everything" verb where best-effort is the contract.)
 async fn cancel_color_logged(state: &DispatcherState, color: weft_core::Color) {
-    if let Err(e) = crate::api::execution::cancel_color(state, color).await {
+    if let Err(e) =
+        crate::api::execution::cancel_color(state, color, &weft_core::exec::CancelCause::User).await
+    {
         tracing::warn!(
             target: "weft_dispatcher::signal",
             %color, error = %e,
@@ -1936,7 +1938,9 @@ async fn teardown_unclaimed_live_execution(state: &DispatcherState, color: uuid:
         .journal
         .cancel_never_claimed_execution(
             color,
-            "live-connection setup failed; no worker run was created",
+            &weft_core::exec::CancelCause::Runtime {
+                detail: "live-connection setup failed; no worker run was created".into(),
+            },
         )
         .await
     {

@@ -40,7 +40,7 @@ pub async fn list(ctx: Ctx, limit: u32) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<38} {:<38} {:<12} {:<20} entry_node",
+        "{:<38} {:<38} {:<12} {:<20} entry_node  tags",
         "color", "project_id", "status", "started_at"
     );
     for row in &arr {
@@ -49,7 +49,15 @@ pub async fn list(ctx: Ctx, limit: u32) -> anyhow::Result<()> {
         let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("?");
         let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
         let entry = row.get("entry_node").and_then(|v| v.as_str()).unwrap_or("?");
-        println!("{color:<38} {project:<38} {status:<12} {started:<20} {entry}");
+        // The tags the run put on itself (`ctx.tag_execution`), the
+        // handle a sibling's `ctx.stop_tagged` selects on.
+        let tags: Vec<&str> = row
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
+            .unwrap_or_default();
+        let tags = if tags.is_empty() { String::new() } else { format!("  {}", tags.join(",")) };
+        println!("{color:<38} {project:<38} {status:<12} {started:<20} {entry}{tags}");
     }
     // The server clamps the page size, so a big --limit can come back
     // short; say so rather than letting the page read as the total.
@@ -70,11 +78,31 @@ pub async fn events(ctx: Ctx, color: String) -> anyhow::Result<()> {
     };
     for row in arr {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-        let node = row.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
-        let at = row.get("at_unix").and_then(|v| v.as_u64()).unwrap_or(0);
-        print!("[{at}] {kind:>9} {node}");
+        // The replay rows are `DispatcherEvent`s: a node event names its
+        // node under `node`; an execution-level event (started, tagged,
+        // completed, cancelled) has none. Every row projected from a
+        // journal row carries the journal's `at_unix`; the derived rows
+        // (a bus participant sniffed off a pulse, a corruption the
+        // replay found) have none and get a blank of the same width.
+        // The kind column is padded to the longest kind
+        // (`loop_iteration_launched`) so the node column lines up too.
+        let node = row.get("node").and_then(|v| v.as_str()).unwrap_or("");
+        let at = match row.get("at_unix").and_then(|v| v.as_u64()) {
+            Some(at) => format!("[{at}]"),
+            None => " ".repeat(12),
+        };
+        print!("{at} {kind:<23} {node}");
         if let Some(err) = row.get("error").and_then(|v| v.as_str()) {
             print!("  error={err}");
+        }
+        // A cancel's reason says who stopped the run: a person, or a
+        // sibling run's `ctx.stop_tagged` naming the run and the tag.
+        if let Some(reason) = row.get("reason").and_then(|v| v.as_str()) {
+            print!("  reason={reason}");
+        }
+        if let Some(tags) = row.get("tags").and_then(|v| v.as_array()) {
+            let tags: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
+            print!("  tags={}", tags.join(","));
         }
         if let Some(output) = row.get("output") {
             if !output.is_null() {

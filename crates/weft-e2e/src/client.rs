@@ -317,7 +317,28 @@ pub async fn poll_until<T, F, Fut>(
     what: &str,
     deadline: Duration,
     interval: Duration,
+    f: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>>>,
+{
+    poll_until_describing(what, deadline, interval, f, String::new).await
+}
+
+/// [`poll_until`] whose TIMEOUT message ends with `last_seen()`: what the
+/// poll last observed (a status, a count), so a timeout says how far the
+/// system got instead of leaving the reader to guess. Only the timeout
+/// gets it: an `Err` from the closure (an HTTP failure, a run settling
+/// wrong) propagates untouched, since decorating it with a "last seen"
+/// would restate the error or, on a first-poll failure, invent an
+/// observation that never happened.
+pub async fn poll_until_describing<T, F, Fut>(
+    what: &str,
+    deadline: Duration,
+    interval: Duration,
     mut f: F,
+    last_seen: impl Fn() -> String,
 ) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -329,10 +350,9 @@ where
             return Ok(v);
         }
         if start.elapsed() >= deadline {
-            bail!(
-                "timed out after {:?} waiting for: {what}",
-                deadline
-            );
+            let seen = last_seen();
+            let seen = if seen.is_empty() { seen } else { format!(" ({seen})") };
+            bail!("timed out after {deadline:?} waiting for: {what}{seen}");
         }
         tokio::time::sleep(interval).await;
     }

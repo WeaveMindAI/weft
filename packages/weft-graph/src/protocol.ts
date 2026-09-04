@@ -1060,6 +1060,18 @@ export type SkipReason =
   | { kind: 'one_of_group_closed'; ports: string[] }
   | { kind: 'outside_this_run' };
 
+/// Why an execution was cancelled: a person, a sibling run's
+/// `ctx.stop_tagged` (naming the run and the tag), the live caller
+/// dropping, or the runtime itself. Rides the `execution_cancelled`
+/// event beside its text `reason`; absent only on a journal row written
+/// before the field existed.
+// SYNC: CancelCause <-> crates/weft-core/src/exec/cancel.rs CancelCause
+export type CancelCause =
+  | { kind: 'user' }
+  | { kind: 'execution'; by: string; tag: string }
+  | { kind: 'caller_gone' }
+  | { kind: 'runtime'; detail: string };
+
 /// The port every node carries, deciding whether it runs at all.
 // SYNC: SHOULD_FLOW_PORT <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
 // docs/src/language/syntax.md (reserved keys),
@@ -1098,6 +1110,10 @@ export type CredentialOwner = 'their-own' | 'ours';
 export interface NodeExecEvent {
   nodeId: string;
   state: NodeExecutionStatus;
+  /// The journal's stamp for this transition (unix seconds), so a
+  /// replay renders when the firing started and ended rather than
+  /// when it was read.
+  atUnix: number;
   /// This `running` transition is a RESUME of the same firing (a
   /// crash re-dispatch or a suspension waking), not a fresh attempt.
   /// Per-firing state accumulated before the resume (port warnings)
@@ -1693,7 +1709,13 @@ export type HostMessage =
   /// `c.inner.`), prepended to node ids when looking up execution values so
   /// the journal's qualified keys match the sub-graph's bare node ids.
   | { kind: 'navState'; depth: number; fileName: string; execPrefix: string }
-  | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled' }
+  /// The run reached a terminal. A cancel carries WHY (`reason` is the
+  /// text, `cause` the structured value), so a run stopped by a sibling
+  /// through `ctx.stop_tagged` reads as that, never as a bare failure.
+  | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled'; reason?: string; cause?: CancelCause; atUnix: number }
+  /// The run tagged itself (`ctx.tag_execution`). `tags` is one call's
+  /// list; the webview accumulates the run's set.
+  | { kind: 'execTags'; color: string; tags: string[] }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   /// The node catalog (full set, from `weft describe-nodes`) failed to
   /// load, or loaded with soft warnings. Distinct from `parseError`:

@@ -320,6 +320,45 @@ pub struct JournalRecordRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecordResponse {}
 
+// ---------- Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`) ----------
+
+/// `POST /v1/execution/tag`: the worker tags the execution it is
+/// driving. Worker-only, pod-bound exactly like `journal_record`: the
+/// broker journals `ExecutionTagged` and writes the `execution_tag`
+/// rows in one transaction, synchronously, so by the time the node's
+/// call returns its tag row exists and a following `stop_tagged` can
+/// anchor on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionTagRequest {
+    pub color: String,
+    /// Already validated by the ctx (`weft_core::tag`); the broker
+    /// validates again, because it trusts no pod.
+    pub tags: Vec<String>,
+    pub pod_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionTagResponse {}
+
+/// `POST /v1/execution/stop_tagged`: the worker asks that every live
+/// execution of ITS project carrying `tag` be stopped. The broker
+/// resolves the ordering anchor at this moment (the asker's own tag
+/// seq, or one past the newest row) and enqueues the dispatcher's
+/// `stop_tagged` task with it, so a stop that runs late can never reach
+/// a sibling that tagged itself after the ask. The project is the
+/// color's, read from `execution_color`; the request never names one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStopTaggedRequest {
+    /// The asking execution.
+    pub color: String,
+    pub tag: String,
+    pub stop_self: weft_core::StopSelf,
+    pub pod_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStopTaggedResponse {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalFetchRequest {
     pub color: String,

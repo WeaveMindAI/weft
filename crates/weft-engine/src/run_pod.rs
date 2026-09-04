@@ -268,7 +268,9 @@ pub async fn run_pod(
         g.values().cloned().collect()
     };
     for f in flags {
-        f.cancel();
+        f.cancel_because(weft_core::exec::CancelCause::Runtime {
+            detail: "the worker pod running this execution was shutting down".into(),
+        });
     }
     shutdown.store(true, Ordering::Relaxed);
     // Money bookkeeping outlives the executions: wait for every in-flight
@@ -501,7 +503,7 @@ impl crate::caller_conn::ExecutionCanceller for RegistryCanceller {
         let reg = self.cancel_registry.clone();
         tokio::spawn(async move {
             if let Some(flag) = reg.lock().await.get(&color).cloned() {
-                flag.cancel();
+                flag.cancel_because(weft_core::exec::CancelCause::CallerGone);
             }
         });
     }
@@ -620,7 +622,7 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             let why = match &outcome {
                 Err(e) => Some(format!("execution failed: {e}")),
                 Ok(ExecutionOutcome::Failed { error }) => Some(format!("execution failed: {error}")),
-                Ok(ExecutionOutcome::Cancelled) => Some("execution cancelled".to_string()),
+                Ok(ExecutionOutcome::Cancelled { cause }) => Some(format!("execution cancelled: {cause}")),
                 Ok(ExecutionOutcome::Stuck) => {
                     Some("execution stuck: no node could proceed".to_string())
                 }
@@ -771,9 +773,10 @@ impl WorkerTaskKind<WorkerCtx> for CancelExecutionKind {
                 tracing::info!(
                     target: "weft_engine::run_pod",
                     color = %color,
+                    cause = %payload.cause,
                     "firing per-color cancel flag"
                 );
-                f.cancel();
+                f.cancel_because(payload.cause);
             }
             None => {
                 // Race: execution finished naturally between the

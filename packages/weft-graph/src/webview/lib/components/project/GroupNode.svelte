@@ -57,6 +57,12 @@
 				site: import('../../../../protocol').CorruptionSite;
 				reason: string;
 			}>;
+			/// The run's own tags (`ctx.tag_execution`), the same on
+			/// every node; the inspector footer shows them.
+			executionTags?: string[];
+			/// How the run ended, the same on every node; the inspector
+			/// footer names a cancel's cause from it.
+			runTerminal?: import('../../types').ExecutionTerminal;
 			/// Loop-specific inspector events for this loop group.
 			/// Empty for ordinary groups.
 			loopEvents?: import('../../../../protocol').LoopInspectorEvent[];
@@ -111,6 +117,8 @@
 	// group's inspector shows the combined IRC view per bus.
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
+	const executionTags = $derived(data.executionTags ?? []);
+	const runTerminal = $derived(data.runTerminal);
 	const loopEvents = $derived(data.loopEvents ?? []);
 
 	const isLoop = $derived(isLoopNodeType(data.nodeType));
@@ -562,7 +570,7 @@
 			<span class="header-label" ondblclick={startEditLabel} title="Double-click to rename">{data.label || 'Group'}</span>
 		{/if}
 		<div class="flex items-center gap-0.5" style="margin-left: auto;">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {loopEvents} label={data.label || 'Group'} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 			<button class="expand-toggle" onclick={toggleExpand} title="Collapse group">
 				<Minimize2 size={12} />
 			</button>
@@ -838,7 +846,7 @@
 <div class="simplified-node rounded-lg select-none" class:selected
 	style="width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: {SIMPLIFIED_SQUARE_PAD_PX}px; background: rgba(255,255,255,0.95); border: 1px solid {selected ? containerColor : 'rgba(0,0,0,0.08)'}; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);">
 	<div class="absolute top-1 right-1 flex items-center gap-0.5 nodrag nopan">
-		<ExecutionInspector {executions} {busLogs} {journalCorruptions} {loopEvents} label={data.label || 'Group'} />
+		<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 		<button class="expand-toggle" onclick={toggleExpand} title="Expand group"><Maximize2 size={12} /></button>
 	</div>
 	<!-- Fixed-width content column so a collapsed container measures as a uniform
@@ -876,7 +884,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {loopEvents} label={data.label || 'Group'} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 			<button class="expand-toggle" onclick={toggleExpand} title="Expand group">
 				<Maximize2 size={12} />
 			</button>

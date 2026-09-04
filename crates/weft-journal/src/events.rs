@@ -419,6 +419,17 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
+    /// A node tagged its own execution (`ctx.tag_execution`). The
+    /// record of the act, for the inspector; the SELECTABLE copy a
+    /// sibling's `ctx.stop_tagged` reads lives beside the execution row
+    /// (`execution_tag`), written in the same transaction as this event.
+    /// Not folded: tags are not execution state a resume rebuilds.
+    ExecutionTagged {
+        color: Color,
+        tags: Vec<String>,
+        at_unix: u64,
+    },
+
     /// A node tried to emit a value on `port` whose inferred type is not
     /// compatible with the port's declared type. The engine refused the
     /// value and closed the port instead (downstream sees null). This is
@@ -449,7 +460,15 @@ pub enum ExecEvent {
 
     ExecutionCancelled {
         color: Color,
+        /// The cause in words, what a person reads (`cause.to_string()`
+        /// when `cause` is set). Kept as its own field because rows
+        /// written before `cause` existed carry only this.
         reason: String,
+        /// The structured cause: who or what stopped the run. `None`
+        /// only on a row written before the field existed (the UI then
+        /// has only `reason`); every live writer sets it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<weft_core::exec::CancelCause>,
         at_unix: u64,
     },
 
@@ -600,7 +619,7 @@ impl ExecEvent {
     /// SQL that filters on it lives in
     /// `weft-dispatcher/src/api/execution.rs` (`terminal_outcome`) and
     /// carries a marker back here.
-    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-dispatcher/src/api/execution.rs terminal_outcome (SQL kind list), crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list)
+    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-dispatcher/src/api/execution.rs terminal_outcome (SQL kind list), crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list), crates/weft-journal/src/tags.rs live_tagged_executions (SQL kind list)
     pub fn is_execution_terminal(&self) -> bool {
         matches!(
             self,
@@ -633,6 +652,7 @@ impl ExecEvent {
             | Self::RunOutput { color, .. }
             | Self::CostReported { color, .. }
             | Self::LogLine { color, .. }
+            | Self::ExecutionTagged { color, .. }
             | Self::PortTypeMismatch { color, .. }
             | Self::ExecutionCompleted { color, .. }
             | Self::ExecutionFailed { color, .. }
@@ -672,6 +692,7 @@ impl ExecEvent {
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
             Self::LogLine { .. } => "log_line",
+            Self::ExecutionTagged { .. } => "execution_tagged",
             Self::PortTypeMismatch { .. } => "port_type_mismatch",
             Self::ExecutionCompleted { .. } => "execution_completed",
             Self::ExecutionFailed { .. } => "execution_failed",
@@ -1393,6 +1414,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
             // design (a live connection dies with its worker), so they
             // never contribute to a resumed run's state.
             ExecEvent::LogLine { .. }
+            | ExecEvent::ExecutionTagged { .. }
             | ExecEvent::ExecutionCompleted { .. }
             | ExecEvent::ExecutionFailed { .. }
             | ExecEvent::ExecutionCancelled { .. }
@@ -2530,6 +2552,62 @@ mod caller_event_wire_tests {
             serde_json::to_value(&back).unwrap(),
             "round-trip changed the shape: {json}"
         );
+    }
+
+    /// A cancel carries WHO: the structured cause rides the wire beside
+    /// the text, and a row written before the field existed (text only)
+    /// still decodes with `cause: None`, so old journals stay readable.
+    #[test]
+    fn execution_cancelled_round_trips_its_cause_and_reads_old_rows() {
+        let color = Color::new_v4();
+        let by = Color::new_v4();
+        round_trip(ExecEvent::ExecutionCancelled {
+            color,
+            reason: "Stopped by execution".into(),
+            cause: Some(weft_core::exec::CancelCause::Execution { by, tag: "user_1".into() }),
+            at_unix: 7,
+        });
+        let old_row = serde_json::json!({
+            "kind": "execution_cancelled",
+            "color": color,
+            "reason": "Cancelled by user",
+            "at_unix": 7
+        });
+        let decoded: ExecEvent = serde_json::from_value(old_row).expect("old row decodes");
+        match decoded {
+            ExecEvent::ExecutionCancelled { cause, reason, .. } => {
+                assert_eq!(cause, None);
+                assert_eq!(reason, "Cancelled by user");
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        // A cause-less row does not grow a `cause: null` on the wire.
+        let json = serde_json::to_value(ExecEvent::ExecutionCancelled {
+            color,
+            reason: "x".into(),
+            cause: None,
+            at_unix: 1,
+        })
+        .unwrap();
+        assert!(json.get("cause").is_none(), "{json}");
+    }
+
+    /// Tagging is a journaled act with its own kind, and it is NOT
+    /// execution state: the fold ignores it.
+    #[test]
+    fn execution_tagged_round_trips_and_does_not_fold() {
+        let color = Color::new_v4();
+        let ev = ExecEvent::ExecutionTagged {
+            color,
+            tags: vec!["user_1".into(), "exp_7".into()],
+            at_unix: 3,
+        };
+        assert_eq!(ev.kind_str(), "execution_tagged");
+        assert_eq!(ev.color(), color);
+        round_trip(ev.clone());
+        let snapshot = fold_to_snapshot(color, &[ev]);
+        assert!(snapshot.executions.is_empty());
+        assert!(snapshot.corruptions.is_empty());
     }
 
     /// A skip carries WHY, and the reason survives the wire with its

@@ -112,6 +112,7 @@ whole run.
 | `rig.run_setup_trigger(node, inputs)` | the trigger registration body |
 | `rig.requests()` / `rig.assert_sent(method, path)` | the request log |
 | `rig.registered_signals()` / `rig.logs()` | what registration and `ctx.log` recorded |
+| `rig.execution_tags()` / `rig.stops()` | what `ctx.tag_execution` and `ctx.stop_tagged` asked for (nothing is stopped: a fake run has no siblings) |
 | `rig.store_file(filename, mime, bytes)` | seed a stored file, get its value for a file input |
 | `rig.output_type(port, type)` | declare a port's resolved type, for ports whose type the compiler normally works out from the `.weft` source |
 | `rig.bus(&outcome.outputs["port"])` | the live bus behind an emitted marker |

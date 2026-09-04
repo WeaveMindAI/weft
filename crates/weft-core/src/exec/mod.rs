@@ -9,7 +9,9 @@ pub mod ready;
 pub mod postprocess;
 pub mod skip;
 pub mod completion;
+pub mod cancel;
 
+pub use cancel::CancelCause;
 pub use execution::{NodeExecution, NodeExecutionStatus, NodeExecutionTable, PortWarning};
 pub use emission::PulseEmission;
 pub use ready::{find_ready_nodes, ReadyGroup};

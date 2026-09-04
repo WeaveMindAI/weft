@@ -90,7 +90,10 @@ pub enum ExecutionOutcome {
     /// to the type system and decoded by string equality at the
     /// terminal-match and journal sites, so a reworded sentinel at one
     /// producer would silently flip a cancel into a generic failure.
-    Cancelled,
+    /// `cause` is what the canceller recorded on the flag, read at the
+    /// moment the driver gives up (`recorded_cancel_cause`), so every
+    /// terminal row written for the run names the same thing.
+    Cancelled { cause: weft_core::exec::CancelCause },
     /// Worker stalled: at least one firing is waiting for a signal.
     /// Worker should exit; the next fire's `register_signal` task
     /// will resume by re-folding the journal.
@@ -176,7 +179,7 @@ pub async fn run_one_execution(
             tokio::select! {
                 _ = clients.clock.sleep(std::time::Duration::from_millis(200)) => {}
                 _ = cancellation.cancelled() => {
-                    return Ok(ExecutionOutcome::Cancelled);
+                    return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) });
                 }
             }
             let evs = fetch_events(journal.as_ref(), color).await?;
@@ -376,8 +379,12 @@ pub async fn run_one_execution(
                     "caller-tied run held past its hold time with no resolving signal; \
                      cancelling (a tied run cannot degrade into a background job)"
                 );
-                cancellation.cancel();
-                outcome = ExecutionOutcome::Cancelled;
+                cancellation.cancel_because(weft_core::exec::CancelCause::Runtime {
+                    detail: "the run was tied to a live caller and held past its hold time \
+                             with no resolving signal"
+                        .into(),
+                });
+                outcome = ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) };
                 break;
             }
             // Suspendable (or no caller): a Stalled drive that ran out of
@@ -446,8 +453,12 @@ pub async fn run_one_execution(
         // worker knows which nodes are non-terminal AT the moment
         // we exit, so this can't live in the dispatcher's cancel
         // path.
-        ExecutionOutcome::Cancelled => {
-            journal_node_cancellations(journal.as_ref(), color, &pod_name).await;
+        ExecutionOutcome::Cancelled { cause } => {
+            // The outcome carries WHY (read off the flag when the driver
+            // gave up); every row written here names that cause, so the
+            // run reads the same whichever side (this worker or the
+            // dispatcher) wrote its terminal first.
+            journal_node_cancellations(journal.as_ref(), color, &pod_name, cause).await;
             journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
         }
         ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck => {
@@ -1039,7 +1050,7 @@ async fn drive(
                 &mut stream_rt,
             )
             .await;
-            return Ok(ExecutionOutcome::Cancelled);
+            return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
         }
 
         // At Fire, wires INTO a trigger are inert: a trigger's ports
@@ -2246,7 +2257,7 @@ async fn drive(
                 tracing::info!(
                     target: "weft_engine::execution_driver",
                     color = %color,
-                    "cancellation observed at idle wait; exiting Failed(cancelled)"
+                    "cancellation observed at idle wait; exiting Cancelled"
                 );
                 cancel_cleanup(
                     &mut in_flight,
@@ -2264,7 +2275,7 @@ async fn drive(
                     &mut stream_rt,
                 )
                 .await;
-                return Ok(ExecutionOutcome::Cancelled);
+                return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
             }
         }
         // We just unblocked from the idle-wait. The next no-progress
@@ -5281,6 +5292,17 @@ async fn fetch_events(
     journal.events_for_color(color).await
 }
 
+/// The cause the canceller recorded on the flag. Read only once the
+/// flag is tripped, and `cancel_because` is the flag's only door (it
+/// stores the cause before it trips), so a tripped flag always carries
+/// one.
+fn recorded_cancel_cause(cancellation: &CancellationFlag) -> weft_core::exec::CancelCause {
+    debug_assert!(cancellation.is_cancelled(), "read the cause only off a tripped flag");
+    cancellation
+        .cause()
+        .expect("a tripped flag carries its cause: cancel_because is the only door")
+}
+
 /// Walk the journal, find every (node, frames) that's currently
 /// non-terminal, and journal a NodeCancelled for each so the UI
 /// flips them out of "running". Called when the loop driver exits
@@ -5299,6 +5321,7 @@ async fn journal_node_cancellations(
     journal: &dyn JournalClient,
     color: Color,
     pod_name: &str,
+    cause: &weft_core::exec::CancelCause,
 ) {
     let events = match fetch_events(journal, color).await {
         Ok(e) => e,
@@ -5313,7 +5336,7 @@ async fn journal_node_cancellations(
     };
     let snapshot = weft_journal::fold_to_snapshot(color, &events);
     let now = now_unix();
-    let reason = "Cancelled by user".to_string();
+    let reason = cause.to_string();
     for (node_id, execs) in snapshot.executions.iter() {
         for e in execs {
             if e.status.is_terminal() {
@@ -5389,13 +5412,12 @@ async fn journal_terminal(
         },
         // A cancel maps to the proper ExecutionCancelled terminal so the
         // UI renders the cancel affordance instead of a generic failure.
-        ExecutionOutcome::Cancelled => {
-            weft_journal::ExecEvent::ExecutionCancelled {
-                color,
-                reason: "Cancelled by user".to_string(),
-                at_unix,
-            }
-        }
+        ExecutionOutcome::Cancelled { cause } => weft_journal::ExecEvent::ExecutionCancelled {
+            color,
+            reason: cause.to_string(),
+            cause: Some(cause.clone()),
+            at_unix,
+        },
         ExecutionOutcome::Failed { error } => weft_journal::ExecEvent::ExecutionFailed {
             color,
             error: error.clone(),

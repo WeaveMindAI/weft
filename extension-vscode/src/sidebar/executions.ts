@@ -22,6 +22,9 @@ export interface ExecutionSummary {
   status: string;
   started_at: number;
   completed_at?: number | null;
+  /** The tags the run put on itself (`ctx.tag_execution`), in claim
+   *  order; the handle a sibling's `ctx.stop_tagged` selects on. */
+  tags: string[];
 }
 
 export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
@@ -277,13 +280,16 @@ export class ExecutionNode extends vscode.TreeItem {
     const name = summary.status === 'corrupt' ? '(corrupt journal)' : summary.entry_node;
     super(`${statusIcon} ${name} (${started})`, vscode.TreeItemCollapsibleState.None);
     this.id = summary.color;
-    this.description = `${summary.status}${pinned ? '' : '  ·  other project'}`;
+    const tags = summary.tags;
+    const tagged = tags.length > 0 ? `  ·  ${tags.join(', ')}` : '';
+    this.description = `${summary.status}${tagged}${pinned ? '' : '  ·  other project'}`;
     this.tooltip = new vscode.MarkdownString(
       [
         `**exec** ${summary.color}`,
         `**project** ${summary.project_id}`,
         `**entry** ${summary.entry_node}`,
         `**status** ${summary.status}`,
+        ...(tags.length > 0 ? [`**tags** ${tags.join(', ')}`] : []),
         `**started** ${started}`,
       ].join('\n\n'),
     );

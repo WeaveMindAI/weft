@@ -78,7 +78,7 @@ pub mod storage;
 // another harness share ONE definition of the policy via this guard.
 pub mod teardown;
 
-pub use client::{cli, cli_ok, poll_until, tail, Dispatcher};
+pub use client::{cli, cli_ok, poll_until, poll_until_describing, tail, Dispatcher};
 #[cfg(feature = "e2e")]
 pub use platform::Platform;
 pub use ensure::up;

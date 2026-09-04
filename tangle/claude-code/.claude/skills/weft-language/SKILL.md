@@ -30,7 +30,11 @@ target.input_port = source.output_port
 
 Right to left: the value flows from `source.output_port` into
 `target.input_port`, types must be compatible. Every required input gets a
-wire or a literal; an optional one (`port?`) may be left alone.
+wire or a literal; an optional one (`port?`) may be left alone. This line is
+the longhand; the same wire in the target's braces is [the shorthand] (next
+section), and the standalone line survives where the language leaves no
+choice: a group's or an include's boundary ports, and a port whose `exposure`
+is `assignment`.
 
 ## Config values
 
@@ -50,7 +54,9 @@ same. `null` is never a literal: omit the field instead (`config-null-literal`).
 ### Wires in the braces
 
 A field whose value is `source.port` is a wire, the same edge as a connection
-line, written inside the node it feeds:
+line, written inside the node it feeds. This is [the shorthand]: a node's
+wires sit next to its settings, one block for its whole life, instead of a
+stack of lines each starting with the same name:
 
 ````weft
 reply = TelegramSendMedia {
@@ -61,11 +67,13 @@ reply = TelegramSendMedia {
 ````
 
 A `Group` is the exception: its braces hold its children, so the only field it
-reads there is `_should_flow`.
+reads there is `_should_flow`, and its boundary ports are wired from outside
+on their own lines.
 
 ### A key that CREATES a port
 
-On types that accept extra inputs (`ExecPython`, `FirstInOrder`), a key naming
+On types that accept extra inputs (`ExecPython`, `FirstInOrder`, `TagRun`,
+`StopTagged`), a key naming
 no declared port creates one. A wire types it from the source, a literal from
 its own type, `null` is an error. `key?:` makes the created port optional.
 
@@ -241,25 +249,93 @@ side-effect node missing `_is_output: true`, so fix the wiring, never the
 runtime.
 
 Ends: completed (no pulse in flight), suspended (every live firing parked on
-an external wait: a person, a timer; costs nothing), or stuck (provably
-deadlocked, fails loudly). Everything is journaled; a run is readable node by
-node with the values on the wires.
+an external wait: a person, a timer; costs nothing), stuck (provably
+deadlocked, fails loudly), or cancelled (a person pressed Stop, or a sibling
+run stopped it). Everything is journaled; a run is readable node by node with
+the values on the wires.
+
+## Stopping other runs
+
+When something new makes the work already in flight pointless, stop the
+old runs instead of working around them: a person sends a second message
+before the first answer is finished, a new upload replaces a file still
+being processed, one run of a batch finds the batch broken and the whole
+batch should go down. Never build this with a loop, a flag, a Python
+node, or a table: code inside a node cannot stop a run that is already
+waiting on a person or a timer, and two events arriving together will
+race. A run can put tags on itself, and a new run can stop every older
+run carrying a tag. Two catalog nodes do it, wired at the top of the
+program, right after the trigger and before any work:
+
+```weft
+telegram = TelegramAccess
+
+ask = TelegramReceiveMessage { account: telegram.access }
+
+claim = TagRun { sender: ask.chatId }
+
+stop = StopTagged {
+  _should_flow: claim.done
+  sender: ask.chatId
+}
+
+draft = LlmInference {
+  _should_flow: stop.done
+  ...
+}
+```
+
+Every input you wire onto `TagRun` is a tag the run puts on itself; here
+the sender, so one person's runs all carry the same tag. `StopTagged`
+reads its tags the same way and stops every older run carrying one,
+waiting runs included: a run parked on a person or a timer is stopped and
+never resumes, its form and its timer are gone, and answering the old
+form does nothing. Two messages arriving a moment apart do not kill each
+other, because a stop only reaches runs that put the tag on before this
+one did: **the newer run survives, the older ones die**. The two
+`_should_flow` wires set the order that makes that true: tag first, then
+stop, then the work.
+
+`includeSelf: true` on `StopTagged` stops this run too, with the rest:
+the shape for one broken run taking its whole batch down. And a
+`StopTagged` whose run never put the tag on itself (a supervisor run
+clearing one user's whole backlog) has no place in the order, so it
+reaches every run carrying the tag.
+
+A stopped run ends cancelled, and its journal names who did it:
+`Stopped by execution <color> (tag <tag>)`. A tag is letters, digits,
+`_` and `-`, at most 64 characters. A Telegram chat id or a Slack user
+id works as it is; a WhatsApp address (`49151@s.whatsapp.net`) or a
+phone number with a `+` or a space does not, so clean it up before
+tagging with it. Inside your own node the same two moves are
+`ctx.tag_execution` and `ctx.stop_tagged`; for those, go and read
+`weft-node-authoring`.
 
 ## Groups
+
+A group is the unit of readable size, the thing [the level rule] asks for:
+every level of the graph, the file and
+the inside of every group, holds at most about six items, nodes or groups;
+when a level grows past that, the nodes cooperating on one job become a group
+of their own, and because groups nest, depth absorbs size. There is almost
+always a way to group: a pipeline stage, one step of the program's story, the
+nodes serving one external service. A level that truly cannot shrink stays
+flat, but that answer comes last. Keep the boundary small too: a group with a
+dozen ports is two groups, or the wrong split.
 
 ````weft
 preprocessor = Group(raw: String) -> (result: String) {
   # Cleans and transforms text
 
-  clean = ExecPython(text: String) -> (out: String) {
+  clean = ExecPython -> (out: String) {
     code: "return {'out': text.strip()}"
+    text: self.raw
   }
-  clean.text = self.raw
   self.result = clean.out
 }
 
+# a group's boundary ports: wired from outside, on their own lines
 preprocessor.raw = input.value
-output.data = preprocessor.result
 ````
 
 `self` is the boundary: read `self.<input>` for what the group received,
@@ -279,10 +355,10 @@ doubler = Loop(values: List[Number]) -> (results: List[Number | Null]) {
   parallel: false
   over: ["values"]
 
-  step = ExecPython(n: Number) -> (out: Number) {
+  step = ExecPython -> (out: Number) {
     code: "return {'out': n * 2}"
+    n: self.values
   }
-  step.n = self.values
   self.results = step.out
 }
 ````
@@ -368,10 +444,10 @@ wireable inputs optional, add `@require_one_of`), `rule-structural`,
 `rule-runtime` (a node's own declarative validation; the message is the node
 author's).
 
-Where these run, in tiers: the **edit tier** is the strict parse plus the
+Where these run, in tiers: [the edit tier] is the strict parse plus the
 structural rules, fast and local (this is what the agent's edit loop and
 the PostToolUse hook enforce, and what keeps the graph rendering);
-**runtime rules** (`rule-runtime`) are things only the running program can
+[the runtime tier] (`rule-runtime`) is things only the running program can
 know, chiefly a connection not picked on an access node (that rule is
 synthesized by the compiler from the node's `service` declaration; node
 authors never write it, and `connection_optional: true` in the service
@@ -379,6 +455,6 @@ block opts a genuinely-unconnected node out): a build
 deliberately skips them (a half-wired program still compiles), they fire
 at execution as loud node failures, and `weft validate` reports them
 early, which is the editor's Problems panel mode (structural plus
-runtime); **full compilation** is `weft build`, structural errors plus
+runtime); [the build tier] is `weft build`, structural errors plus
 the cargo and image build. The slug names the rule, the message names the
 fix.

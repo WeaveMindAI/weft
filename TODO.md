@@ -613,51 +613,28 @@ boolean out) would cover it and compose anywhere a boolean goes.
 Decide whether that node is worth adding, or whether "emit nothing on
 the branch you do not want" is the one way it should be said.
 
-## Executions steering each other by tag
+## Killing tagged NODES inside one execution
 
-Two `ctx` functions, and the pair is what makes the feature.
-
-The first lets a node tag its own execution: one tag or several, added to
-whatever that execution already carries. Any node can call it, at any
-point.
-
-The second lets a node act on OTHER executions through those tags:
-"stop every execution carrying this tag, right now, including the ones
-parked waiting for a signal, and stop that waiting too."
-
-What it buys, in one shape everybody has hit: somebody fires three
-messages at an assistant in a row. Each message starts an execution
-whose first node tags it with the sender's id and whose second node
-waits ten seconds before answering. Each new execution begins by killing
-everything already carrying that id, so only the last message is
-answered, with all three in view. No queue, no debounce service, no
-state anywhere.
-
-The open parts: what a stopped execution looks like in the journal
-(cancelled by whom, on whose behalf), whether the caller may stop
-executions outside its own project (no), what happens to an execution
-that is mid-call in a node when the stop lands, and whether "stop"
-should have a sibling that only stops the waiting and lets the rest run
-on.
+The execution-level half of this idea shipped. For the mechanism, go and
+read `docs/src/nodes/steering-executions.md`.
 
 **The same verb, one scope down.** Tags name nodes too (`_tags`), so the
 same idea points INSIDE one execution: "stop every node tagged `pathB`".
 Where it pays is a fork whose two branches race, one short and one long:
 the moment the short one wins, the long one is dead weight, and killing
 it saves the model calls and the compute it was about to spend rather
-than discarding its answer at the end. That is the difference between
-ignoring a branch and never paying for it.
+than discarding its answer at the end.
 
 Whether that is the same function with a scope, or two functions, is
 part of the decision. What a killed branch leaves behind is the harder
 half: its nodes have to close their outputs so whatever was waiting on
-them skips cleanly rather than hanging, and a node that is mid-call when
-the kill lands is the same in-flight problem as above, one layer down.
-This one pairs with [fire-on-arrival](#fire-on-arrival-should-a-node-be-able-to-run-before-all-its-inputs-are-in),
-which is what makes the race expressible in the first place.
+them skips cleanly instead of hanging. A node that is mid-call when the
+kill lands is the same in-flight problem the execution-level stop already
+answers: the flag flips, the node stops at its next await. For how a race
+between branches becomes possible at all, go and read
+[fire-on-arrival](#fire-on-arrival-should-a-node-be-able-to-run-before-all-its-inputs-are-in).
 
-Not doing it now. Writing it down because it turns a weft program from
-something that runs into something that can manage its own kind.
+Not doing it now: without fire-on-arrival there is no race to lose.
 
 ## Nothing tests the editor: a rig that drives the real webview
 
@@ -753,6 +730,6 @@ the journal (durable, replayable, another thing on the write path).
   there any case where it should be otherwise?
 - Cost. A node that fired four times bills as what.
 
-It pairs with [tags stopping work](#executions-steering-each-other-by-tag):
+It pairs with [tags stopping work](#killing-tagged-nodes-inside-one-execution):
 fire-on-arrival is what makes a race expressible, and cancelling the
 losing branch by tag is what stops it costing money.

@@ -89,6 +89,9 @@ pub struct EngineClients {
     /// The connection surface (`ctx.open` resolve/release). Production:
     /// the broker-backed client; tests inject a fake.
     pub access_broker: Arc<dyn AccessBroker>,
+    /// Steering other runs (`ctx.tag_execution` / `ctx.stop_tagged`).
+    /// Production: the broker-backed client; tests inject a fake.
+    pub steering: Arc<dyn ExecutionSteeringClient>,
     /// Cost resolutions still in flight (a metered call's figure being
     /// resolved + recorded after its response ended). The pod's exit paths
     /// refuse to die while this is non-zero, so money is never dropped by
@@ -134,10 +137,63 @@ impl EngineClients {
             ),
             access_broker: weft_broker_client::BrokerAccessClient::new(
                 broker_url.to_string(),
+                token.clone(),
+            ),
+            steering: weft_broker_client::BrokerExecutionClient::new(
+                broker_url.to_string(),
                 token,
             ),
             pending_costs: crate::metering::PendingCostRecords::new(),
         }
+    }
+}
+
+/// Trait surface over `BrokerExecutionClient` so tests can inject a
+/// recording fake. Production has one impl: the broker-backed HTTP
+/// client. Both calls are worker-only and pod-bound on the broker
+/// side, so the pod name rides along.
+#[async_trait]
+pub trait ExecutionSteeringClient: Send + Sync {
+    /// Tag `color` with `tags`, synchronously (the rows exist on
+    /// return).
+    async fn tag_execution(
+        &self,
+        color: Color,
+        tags: Vec<String>,
+        pod_name: &str,
+    ) -> anyhow::Result<()>;
+    /// Queue a stop of every live sibling of `color` carrying `tag`.
+    async fn stop_tagged(
+        &self,
+        color: Color,
+        tag: String,
+        stop_self: weft_core::StopSelf,
+        pod_name: &str,
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl ExecutionSteeringClient for weft_broker_client::BrokerExecutionClient {
+    async fn tag_execution(
+        &self,
+        color: Color,
+        tags: Vec<String>,
+        pod_name: &str,
+    ) -> anyhow::Result<()> {
+        <weft_broker_client::BrokerExecutionClient>::tag_execution(self, color, tags, pod_name)
+            .await
+    }
+    async fn stop_tagged(
+        &self,
+        color: Color,
+        tag: String,
+        stop_self: weft_core::StopSelf,
+        pod_name: &str,
+    ) -> anyhow::Result<()> {
+        <weft_broker_client::BrokerExecutionClient>::stop_tagged(
+            self, color, tag, stop_self, pod_name,
+        )
+        .await
     }
 }
 
@@ -2495,6 +2551,29 @@ impl ContextHandle for RunnerHandle {
         .await
     }
 
+    /// Synchronous through the broker (the tag rows exist on return),
+    /// and safe to re-run: the broker's insert keeps an existing
+    /// (color, tag) row, so a body replayed after a crash re-tags onto
+    /// the same state. Not journaled through `ctx.run` for that reason.
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.clients
+            .steering
+            .tag_execution(self.color, tags, &self.pod_name)
+            .await
+            .map_err(|e| WeftError::Config(format!("tag_execution: {e}")))
+    }
+
+    /// Queues the stop through the broker, which anchors the ordering
+    /// at this instant. Re-running it after a crash asks again for the
+    /// same set (anything it already stopped is terminal and skipped).
+    async fn stop_tagged(&self, tag: String, stop_self: weft_core::StopSelf) -> WeftResult<()> {
+        self.clients
+            .steering
+            .stop_tagged(self.color, tag, stop_self, &self.pod_name)
+            .await
+            .map_err(|e| WeftError::Config(format!("stop_tagged: {e}")))
+    }
+
     fn cancellation(&self) -> Arc<CancellationFlag> {
         self.cancellation.clone()
     }
@@ -2981,6 +3060,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
             "exec-1".into(),
@@ -3015,6 +3095,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker,
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
             "exec-1".into(),
@@ -3276,6 +3357,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: worker_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         let color = uuid::Uuid::from_u128(0xC0);
         let worker_handle = Arc::new(RunnerHandle::new(
@@ -3311,6 +3393,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: test_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         let runner = crate::test_rig::LiveTestRunner::new(
             test_clients,
@@ -3414,6 +3497,23 @@ mod replay_tests {
     }
 
     use weft_journal::NoopJournal;
+
+    struct NoopSteering;
+    #[async_trait]
+    impl ExecutionSteeringClient for NoopSteering {
+        async fn tag_execution(&self, _: Color, _: Vec<String>, _: &str) -> anyhow::Result<()> {
+            unreachable!("these tests steer no executions")
+        }
+        async fn stop_tagged(
+            &self,
+            _: Color,
+            _: String,
+            _: weft_core::StopSelf,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            unreachable!("these tests steer no executions")
+        }
+    }
 
     struct NoopTaskStore;
     #[async_trait]
@@ -4477,7 +4577,7 @@ mod endpoint_tests {
             |_| {
                 // Cancelled while the very first attempt is in flight,
                 // exactly as `weft stop` would.
-                armed.cancel();
+                armed.cancel_because(weft_core::exec::CancelCause::User);
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async { Err("connection refused".to_string()) }
             },

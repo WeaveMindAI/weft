@@ -7,6 +7,7 @@
 //! write live here.
 
 pub mod events;
+pub mod tags;
 pub mod traits;
 pub mod write;
 

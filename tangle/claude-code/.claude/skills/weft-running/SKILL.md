@@ -117,13 +117,23 @@ answer.
 4. **Suspended.** Expected for human-in-the-loop: nothing is wrong. The
    person answers in the extension and the run resumes. If nobody should have
    been asked, the bug is the `_should_flow` that routed into the person.
-5. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
+5. **Cancelled.** Read the reason on `execution_cancelled`. `Cancelled by
+   user` is a person: the Stop button, `weft stop`, a project deactivate or
+   wipe, or a cancel through a signal token. `Stopped by execution <color>
+   (tag <tag>)` is a sibling run's `ctx.stop_tagged`: look at **that** run for
+   the answer, and if no sibling was supposed to stop this one, the bug is
+   in whichever node tagged and stopped it (`weft executions` shows each
+   run's tags, so you can see which runs shared the tag). `Caller
+   disconnected` means the live caller this run was answering dropped its
+   connection. Anything else is the runtime's own reason, printed as words
+   (a worker pod shutting down, a build superseding a queued run's image).
+6. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
    bug (usually a wire the compiler could not catch), and the message names
    the nodes waiting on each other.
-6. **Nothing ran.** A branch wired to no output never executes: check
+7. **Nothing ran.** A branch wired to no output never executes: check
    `_is_output` on the deliverable, and check that the trigger that should
    have fired is activated.
-7. **Dispatcher unreachable.** `weft daemon start` (idempotent reconcile),
+8. **Dispatcher unreachable.** `weft daemon start` (idempotent reconcile),
    then `weft daemon logs --tail 50` if it still refuses.
 
 ## Triggers and identity

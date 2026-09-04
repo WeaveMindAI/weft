@@ -19,3 +19,6 @@ The language is generic: compiler/dispatcher/engine/shared infra never contain n
 
 ## Don't timeout user-facing long operations
 Real workflows (LLM pipelines, infra builds, human-in-the-loop, executions) can run hours/days. No deadlines on user-controlled waits (build/deploy/infra/execution/drain/user node code); make stuck-state legible (periodic breadcrumb + a documented recovery like Ctrl+C / `weft stop`). Deadlines only on internal service-to-service waits the user can't control.
+
+## Never run setup.sh or the e2e yourself
+`./setup.sh` (any flag) and the e2e (`cargo test -p weft-e2e --features e2e`, `scripts/run-e2e.sh`) redeploy the daemon and rebuild the extension while the [user] works in parallel, and they take a long time. Unit tests, `scripts/run-db-tests.sh`, clippy, `svelte-check` and `pnpm run compile` are yours to run. When the code is done and green on those, stop and ask the [user] to install and run the e2e, naming exactly which test files and why.

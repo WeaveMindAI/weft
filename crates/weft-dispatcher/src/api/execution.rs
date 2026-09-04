@@ -8,6 +8,7 @@ use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use weft_core::exec::CancelCause;
 use weft_core::Color;
 
 use crate::authenticator::{authorize_execution, authorize_project, CallerTenant};
@@ -24,164 +25,105 @@ pub async fn cancel(
         .parse()
         .map_err(|e: uuid::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
     authorize_execution(&*state.journal, &caller.0, color).await?;
-    cancel_color(&state, color).await.map_err(|e| {
+    cancel_color(&state, color, &CancelCause::User).await.map_err(|e| {
         tracing::error!(target: "weft_dispatcher::cancel", color = %color, error = %e, "cancel_color failed");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Cancel a single execution.
-///
-/// Two paths converge to a single observable outcome (the journal
-/// reaches `ExecutionCancelled`):
-///
-///   - When a worker Pod is alive for this project, it might be
-///     actively running this color's loop driver. We enqueue a
-///     `cancel_execution` task; the worker fires the per-color
-///     `CancellationFlag`, the loop driver exits, the worker would
-///     try to journal terminals (idempotent: skips if already done).
-///   - In every case, the dispatcher writes the terminal events
-///     itself (NodeCancelled per non-terminal node + ExecutionCancelled).
-///     This handles the suspended-execution case (no Pod alive, the
-///     worker exited cleanly when it stalled) and races where the
-///     worker is alive but not running this color.
-///
-/// Order matters:
-///   1. Strip wake signals so webhooks / timers / forms can no
-///      longer revive the execution.
-///   2. Enqueue the cancel task IF a live worker exists. We don't
-///      want orphan tasks accumulating for projects with no worker
-///      (the queue would leak).
-///   3. Journal NodeCancelled for non-terminal nodes (the worker's
-///      same code path is idempotent on `has_terminal_event` so it
-///      won't double-write).
-///   4. Journal ExecutionCancelled.
-///   5. The journal bridge polls these new rows and publishes them
-///      onto the project's SSE bus so the frontend exits the
-///      "Cancelling..." pending state.
-pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Result<()> {
-    tracing::info!(
-        target: "weft_dispatcher::cancel",
-        color = %color,
-        "cancel_color start"
-    );
-
-    // 1. Strip wake-signal registrations. Must be first: if we
-    //    journaled terminals first, a webhook could fire in the
-    //    gap and resume a dead execution. A DB failure here MUST
-    //    abort the cancel: continuing past it leaves the wake
-    //    signals registered, so the next webhook revives a
-    //    "cancelled" execution.
-    let removed = state
-        .journal
-        .signal_remove_for_color(color)
-        .await?;
-    tracing::info!(
-        target: "weft_dispatcher::cancel",
-        color = %color,
-        signals_removed = removed.len(),
-        "wake signals stripped"
-    );
-    state
-        .listeners
-        .unregister_many(&state.pg_pool, &removed)
-        .await;
-
-    let Some(project_id) = state.journal.execution_owner(color).await?.map(|o| o.project_id)
-    else {
-        tracing::warn!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            "no project_id for color; nothing to do"
-        );
-        return Ok(());
-    };
-
-    // 2. Always enqueue cancel_execution. If a worker is alive AND
-    //    is currently running this color, the task fires the
-    //    per-color CancellationFlag fast (~50ms), the loop driver
-    //    exits, and the worker stops emitting node events. If no
-    //    worker is running this color (suspended, or no worker at
-    //    all), the task is a harmless no-op when claimed (or
-    //    eventually reaped). The dispatcher's terminal-journal
-    //    write below still runs in every case, so the frontend's
-    //    "Cancelling..." state always exits.
-    let tenant = state.tenant_router.tenant_for_project(&project_id).await?;
-    let enqueued = crate::task_kinds::execute::enqueue_cancel(
-        &state.pg_pool,
-        &project_id,
-        color,
-        Some(tenant.as_str()),
-    )
-    .await?;
-    if enqueued {
-        tracing::info!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            project = %project_id,
-            "cancel task enqueued"
-        );
-    } else {
-        tracing::debug!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            project = %project_id,
-            "no live worker pod; cancel is a no-op (execution already terminal)"
+/// Cancel every color in `targets`, each with its own cause, attempting
+/// ALL of them before reporting. One failing color must not strand the
+/// ones after it (they would stay live with their wakes registered), and
+/// a failure must not disappear either: if any cancel failed, the
+/// result is an error naming every failed color and why, so a task
+/// built on this is recorded failed with the real errors, never
+/// completed with a count nobody reads. Returns the colors cancelled.
+pub async fn cancel_colors(
+    state: &DispatcherState,
+    targets: &[(Color, &CancelCause)],
+) -> anyhow::Result<Vec<Color>> {
+    let mut cancelled = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (color, cause) in targets {
+        match cancel_color(state, *color, cause).await {
+            Ok(()) => cancelled.push(*color),
+            Err(e) => failures.push(format!("{color}: {e:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        // Name both sides: whoever repairs this by hand needs to know
+        // which runs are terminal now and which are still live.
+        let succeeded: Vec<String> = cancelled.iter().map(|c| c.to_string()).collect();
+        anyhow::bail!(
+            "{} of {} cancel(s) failed: {}; cancelled: [{}]",
+            failures.len(),
+            failures.len() + cancelled.len(),
+            failures.join("; "),
+            succeeded.join(", ")
         );
     }
-
-    // 3 + 4. Journal terminal events directly. Done in every path
-    // (live worker or not). The worker's own terminal-write path
-    // is idempotent and skips if these rows already exist.
-    journal_cancel_terminals(state, color, "Cancelled by user").await?;
-
-    Ok(())
+    Ok(cancelled)
 }
 
-/// Write NodeCancelled per non-terminal node + ExecutionCancelled
-/// directly from the dispatcher. Used when
-/// the worker isn't going to do it (suspended execution, no live
-/// worker, race window). Idempotent: skips entirely if the journal
-/// already shows a terminal for this color, so it never stacks a second
-/// terminal on a color a worker may have already finished (the canonical
-/// dispatcher-side terminal writer; other call sites must route through it
-/// rather than recording `ExecutionCancelled` directly).
-pub(crate) async fn journal_cancel_terminals(
+/// Cancel a single execution, for `cause`. THE cancel: every caller
+/// (`weft stop`, the sweeps, a sibling run's `stop_tagged`) goes
+/// through here and says why, and the cause lands on every terminal
+/// row this writes AND on the `cancel_execution` task, so the owning
+/// worker's own write (if it gets there first) names the same cause.
+///
+/// The durable part is ONE transaction (`Journal::cancel_execution`):
+/// strip the wake signals, journal the terminals, queue the cancel
+/// task for the alive owner pod. Either all of it lands or none does,
+/// so a database failure mid-cancel leaves the run exactly as it was
+/// and the next attempt succeeds; nothing can strip a run's wakes and
+/// then fail to end it. Two paths then converge on the one observable
+/// outcome (the journal reads `ExecutionCancelled`):
+///
+///   - When a worker Pod is alive and driving this color, the task
+///     fires the per-color `CancellationFlag` (~50ms), the loop driver
+///     exits, and the worker's own terminal write finds the rows
+///     already there and skips (idempotent).
+///   - With no worker driving it (a suspended run, no pod at all), the
+///     rows written here ARE the terminal.
+///
+/// After the commit the listener forgets the stripped signals in RAM
+/// (the durable row is already gone, so a late fire finds nothing),
+/// and the journal bridge publishes the new rows onto the project's
+/// SSE bus so the frontend exits "Cancelling...".
+pub async fn cancel_color(
     state: &DispatcherState,
     color: Color,
-    reason: &str,
+    cause: &CancelCause,
 ) -> anyhow::Result<()> {
-    if has_terminal_event(&state.pg_pool, color).await? {
-        tracing::info!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            "terminal already journaled; skipping dispatcher-side write"
-        );
-        return Ok(());
-    }
-    let now = crate::lease::now_unix() as u64;
-    let events = state.journal.events_log(color).await?;
-    let writes = cancel_terminal_events(color, &events, reason, now);
-    let node_cancellations = writes.len() - 1;
-    for (event, dedup) in &writes {
-        state.journal.record_event_dedup(event, dedup).await?;
-    }
     tracing::info!(
         target: "weft_dispatcher::cancel",
         color = %color,
-        node_cancellations,
-        "journaled ExecutionCancelled"
+        %cause,
+        "cancel_color start"
+    );
+    let write = state.journal.cancel_execution(color, cause).await?;
+    state
+        .listeners
+        .unregister_many(&state.pg_pool, &write.removed)
+        .await;
+    tracing::info!(
+        target: "weft_dispatcher::cancel",
+        color = %color,
+        signals_removed = write.removed.len(),
+        task_enqueued = write.task_enqueued,
+        node_cancellations = ?write.node_cancellations,
+        "cancel committed"
     );
     Ok(())
 }
 
 /// THE definition of a dispatcher-side cancel write: the ordered
-/// `(event, dedup_key)` list that flips a color terminal. Pure, so BOTH
-/// cancel writers (`journal_cancel_terminals`, retrying via the trait's
-/// dedup'd appends, and `Journal::cancel_never_claimed_execution`, writing on
-/// its own transaction) emit IDENTICAL rows and can never drift on the
-/// ordering rule, the dedup-key format, or the closure-emission policy.
+/// `(event, dedup_key)` list that flips a color terminal. Pure, so the
+/// transactional cancel writers (`Journal::cancel_execution` and
+/// `Journal::cancel_never_claimed_execution`) emit IDENTICAL rows and
+/// can never drift on the ordering rule, the dedup-key format, or the
+/// closure-emission policy.
 ///
 /// Per-node cancellations come BEFORE `ExecutionCancelled` (always the last
 /// entry). Otherwise a partial run that journaled the terminal event first
@@ -192,13 +134,14 @@ pub(crate) async fn journal_cancel_terminals(
 /// stacking a duplicate NodeCancelled row (which would also republish a
 /// duplicate UI event); the terminal's key makes the row-level write safe even
 /// if two cancels for the same color race past their has-terminal checks.
-pub(crate) fn cancel_terminal_events(
+pub fn cancel_terminal_events(
     color: Color,
     events: &[weft_journal::ExecEvent],
-    reason: &str,
+    cause: &CancelCause,
     now: u64,
 ) -> Vec<(weft_journal::ExecEvent, String)> {
     use weft_journal::ExecEvent;
+    let reason = cause.to_string();
     let snapshot = weft_journal::fold_to_snapshot(color, events);
     // `snapshot.corruptions` is intentionally not consumed here. The
     // cancel writers only need the executions map to know which
@@ -218,7 +161,7 @@ pub(crate) fn cancel_terminal_events(
                     color,
                     node_id: node_id.clone(),
                     frames: e.frames.clone(),
-                    reason: reason.to_string(),
+                    reason: reason.clone(),
                     // Dispatcher-side catch-up cancel only flips records
                     // terminal; the closure cascade is the worker/cleanup's
                     // job, so no per-node closures ride here.
@@ -230,7 +173,7 @@ pub(crate) fn cancel_terminal_events(
         }
     }
     writes.push((
-        ExecEvent::ExecutionCancelled { color, reason: reason.to_string(), at_unix: now },
+        ExecEvent::ExecutionCancelled { color, reason, cause: Some(cause.clone()), at_unix: now },
         format!("execution_cancelled:{color}"),
     ));
     writes
@@ -336,6 +279,7 @@ pub async fn get(
         "status": summary.status,
         "started_at": summary.started_at,
         "completed_at": summary.completed_at,
+        "tags": summary.tags,
     })))
 }
 
