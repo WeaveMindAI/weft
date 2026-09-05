@@ -16,7 +16,6 @@ use weft::infra::{
     Mount, Probe, Protocol, Resources, TerminateBehavior, Unit, UnitKind, UpgradeBehavior, Volume,
     VolumeKind,
 };
-use weft::node::NodeOutput;
 use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]

@@ -50,6 +50,16 @@ Don't launch agents to "design a plan" when you already have full context from t
 
 **No setup questions.** Don't suggest restarting servers, checking whether services run, or asking whether the file was saved. The bug is in the code; the [user] verified the obvious before reporting.
 
+## The [test scope]
+
+The [test scope] of a change is the smallest set of tests that the changed lines can break, and it is the ONLY set you run. It is a primitive, every mode obeys it, and it exists because full sweeps are the single biggest waste of the [user]'s time.
+
+Deriving it: name the unit you edited (a crate, a package, a module), then each unit that depends on the thing you changed. That list is the [test scope]. While iterating, run one test by name; when done, run the unit. Every test runner takes a narrowing argument (a crate, a package, a test name); find it and use it.
+
+Never outside it: no whole-workspace run, no runner invoked bare, no integration or end-to-end suite, no install or deploy script, no re-running a suite that already passed on the same code. The one exception is a change that is genuinely global (a shared context type, a code generator, a type every unit serializes), and even then say so before running. CI runs everything; you do not.
+
+If you catch yourself about to run more than the [test scope], write verbatim "Wait, that is outside the [test scope], I'll run only <list>" and run that.
+
 ## Modes
 
 A [mode] is a cognitive pattern. You operate in one at a time. Each mode's full rules live in its own skill, not in this file. The set: `mode-collaborative`, `mode-red-team`, `mode-convergence`, `mode-babble`, `mode-code`, `mode-research`, `mode-debug`, `mode-writing`.

@@ -105,6 +105,27 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
       return { success: true };
     },
 
+    // Mark a message as read: the blue ticks on the other phone. The
+    // stored message carries the full key WhatsApp wants back (in a
+    // group, the `participant` who sent it); a message the store never
+    // saw is addressed by chat + id alone, which is enough for a
+    // one-to-one chat.
+    async readMessages({ chatId, messageId }) {
+      const sock = bridge.getSocket();
+      if (!sock || !bridge.isConnected()) {
+        return { error: 'WhatsApp not connected' };
+      }
+      if (!chatId || !messageId) {
+        return { error: 'chatId and messageId are required' };
+      }
+      const stored = messageStore.findByMessageId(messageId);
+      const key = stored?.key
+        ? { ...stored.key }
+        : { remoteJid: chatId, id: messageId, fromMe: false };
+      await sock.readMessages([key]);
+      return { success: true };
+    },
+
     async createGroup({ name, participants }) {
       const sock = bridge.getSocket();
       if (!sock || !bridge.isConnected()) {
