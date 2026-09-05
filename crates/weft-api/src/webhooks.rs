@@ -103,10 +103,20 @@ pub async fn handle_webhook(
         })
     });
 
-    // Validate API key if configured (simple header-based auth)
+    // Validate API key if configured. Callers may send it either as an
+    // `x-api-key` header or as `Authorization: Bearer <key>`; both are common
+    // and a caller who picks the other one should not be locked out.
     if let Some(expected_key) = trigger.config.get("apiKey").and_then(|s| s.as_str()) {
         if !expected_key.is_empty() {
-            let provided = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+            let provided = headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .or_else(|| {
+                    headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.strip_prefix("Bearer "))
+                });
             match provided {
                 Some(key) if subtle::ConstantTimeEq::ct_eq(key.as_bytes(), expected_key.as_bytes()).into() => {}
                 _ => {

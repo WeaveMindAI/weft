@@ -11,7 +11,7 @@ export const ApiPostNode: NodeTemplate = {
 	category: 'Triggers',
 	tags: ['trigger', 'api', 'webhook', 'http', 'post', 'endpoint'],
 	fields: [
-		{ key: 'apiKey', label: 'API Key (optional)', type: 'password', placeholder: 'Leave empty for no authentication' },
+		{ key: 'apiKey', label: 'API Key (optional)', type: 'password', placeholder: 'Leave empty for no authentication', description: 'Callers send it as an x-api-key header, or as Authorization: Bearer <key>.' },
 	],
 	defaultInputs: [],
 	defaultOutputs: [
