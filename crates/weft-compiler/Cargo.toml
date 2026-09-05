@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "weft-codex-consult"
+path = "src/bin/weft_codex_consult.rs"
+
 [dependencies]
 # weft-core's `runtime` feature is enabled ONLY by our `build` feature (which
 # needs the runtime `Node`/`NodeCatalog` types for codegen). The parse/validate
@@ -38,6 +42,7 @@ regex = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+clap = { workspace = true }
 # Native-only; used by the codegen mtime-preservation path. Gated behind `build`.
 filetime = { workspace = true, optional = true }
 # Temp dir for `seed_catalog_into_upload` (server-side create: materialize the

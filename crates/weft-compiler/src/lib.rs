@@ -27,6 +27,7 @@ pub mod file_reader;
 pub mod file_ref;
 pub mod enrich;
 pub mod validate;
+pub mod codex_consultation;
 // Project source / drift hashing. `compute_definition_hash` /
 // `compute_source_hash` are pure (no filesystem) and always available
 // (the browser WASM build computes `definition_hash` for live preview);
