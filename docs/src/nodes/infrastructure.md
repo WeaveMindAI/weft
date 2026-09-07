@@ -175,12 +175,13 @@ each by name.
 | Route | Method | Called by | Contract |
 |---|---|---|---|
 | `/health`, or any path | GET | the readiness probe | return 2xx when ready. Wire it with `Probe::http("/health", port)`. |
-| `/live` | GET | the dispatcher, which proxies the editor's poll | return `{ "items": [{ "type": ..., "label": "...", "data": "..." }] }`, where the type is `text`, `image`, `progress` or `secret`, and an item may carry an optional `action`. The editor asks every three seconds while the graph is open. |
+| `/live` | GET | the dispatcher, which proxies the editor's poll | return `{ "items": [{ "type": ..., "label": "...", "data": "..." }] }`, where the type is `text`, `image`, `progress` or `secret`. The editor asks every three seconds while the graph is open. An item may carry a button: `"action": { "label": "Disconnect phone", "actionKind": "unpair", "confirm": "..." }`, and `payload` if the press carries data. |
+| `/action` | POST | the dispatcher, when a `/live` button is pressed | the same envelope sibling nodes use: `{ "action": "<actionKind>", "payload": {...} }` in, `{ "result": {...} }` out. A `result.error` string is your refusal, shown to the user as it is. The dispatcher re-polls `/live` right after, so whatever the press changed (a fresh QR code) shows at once. |
 | `/outputs` | GET | the declaring node's own `run` | return a flat JSON object; the node folds each key into an output port |
 | `/action`, `/events`, ... | any | sibling nodes, through the wired URL | your own convention |
 
-`/live` is special because the **dispatcher** calls it, so it has to know which
-endpoint serves it:
+`/live` and its buttons' `/action` are special because the **dispatcher**
+calls them, so it has to know which endpoint serves them:
 
 ```json
 "features": { "liveEndpoint": "api" }
@@ -246,6 +247,51 @@ drop capabilities, default seccomp. Your image has to cooperate by running as
 the chosen user and tolerating a read-only filesystem, and if it cannot, leave
 the security context off. Without limits a runaway container can starve its own
 node.
+
+## Every state has a way out from the graph
+
+A service reaches states only its operator can leave: a phone whose pairing
+died half way, a password that was handed over once and lost, a session a
+provider revoked. If the only way out is `weft infra terminate`, the user
+loses the disk to fix a login, and that is a dead end the node put them in.
+
+So for every state your container can sit in, name the action that leaves
+it, and put that action on the node's card as a button on a `/live` item
+(the contract is in the routes table above). The WhatsApp bridge offers
+**Disconnect phone** in every state, which drops the pairing and shows a
+fresh QR code; the Postgres node offers **Reset password**, which mints a
+new one over the database's own socket and makes it readable again. A
+button works whether the service is healthy, stuck, or half way through
+something, because the stuck state is the one that needs it. The test:
+walk your container's states and ask, for each, what a user does from the
+graph to leave it. If the answer is "restart the infra" or "delete the
+disk", that state needs a button.
+
+## Nothing fails quietly
+
+Your container is a service other nodes lean on, and its pod log is the only
+place anyone can read what it did. Two rules, and they are what makes a
+problem inside your image findable at all.
+
+**Every failure writes a line.** Anything that goes wrong writes one line to
+the container's stdout or stderr, with the cause, so `weft infra logs <node>`
+shows it. A library logger set to silent is the same as no log: set it to
+warn or up. A dependency that is optional at install time is a failure
+waiting to be silent (a step that quietly skips when the package is
+missing), so pin it in the image.
+
+**A success is earned or it is an error.** Answer the node that asked with an
+error whenever the thing it asked for did not fully happen, and let the node
+fail on it. A message id for a message the recipient will never see, a
+partial result with no mention of what is missing, a step that could not run
+and was skipped: each of those is an error to the caller, however the
+underlying library reports it. When the library reports it only through its
+own logger, check the outcome yourself before answering.
+
+The WhatsApp bridge is the example that fixed the rule: a voice note went out
+stamped with a mime WhatsApp accepts and never shows, the bridge's Baileys
+logger was silent, and the node got a message id for a message that never
+arrived. Nothing anywhere said so.
 
 ## Two behaviors to know
 

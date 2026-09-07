@@ -57,7 +57,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -68,24 +67,7 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The Exa access: wire it into Web Search."
-    }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "ExaAccess '{id}' has no connected account; connect one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
     }
   ]
 }

@@ -142,7 +142,6 @@ fn duplicate_service_is_hard_error() {
             format!(
                 r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "",
                       "inputs": [{{ "name": "account", "type": "Access",
-                                    "exposure": "config",
                                     "widget": {{ "kind": "access" }} }}],
                       "outputs": [],
                       "service": {{ "service": "{service}",
@@ -352,8 +351,7 @@ fn write_derived_ports_node(dir: &Path, node_type: &str, body: &str) {
         dir.join("metadata.json"),
         format!(
             r#"{{ "type": "{node_type}", "label": "{node_type}", "description": "",
-                  "inputs": [{{ "name": "fields", "type": "List[JsonDict]",
-                               "exposure": "config" }}],
+                  "inputs": [{{ "name": "fields", "type": "List[JsonDict]" }}],
                   "outputs": []{body} }}"#
         ),
     )

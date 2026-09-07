@@ -1,0 +1,16 @@
+# Format fills a template from its own input ports; Wait parks the branch on a
+# durable timer and passes its value through when the timer fires.
+who = Text { value: "quentin" }
+count = Text { value: "3" }
+
+line = Format(user: String, count: String) {
+  template: "Hi {{user}}, you have {{count}} left"
+}
+line.user = who.value
+line.count = count.value
+
+hold = Wait { seconds: 5 }
+hold.value = line.text
+
+out = Debug
+out.data = hold.value

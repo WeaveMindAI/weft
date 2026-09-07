@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "data.records:write"
@@ -89,7 +89,6 @@
     {
       "name": "typecast",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -101,17 +100,12 @@
   "outputs": [
     {
       "name": "recordId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "record",
       "type": "JsonDict",
-      "required": false,
       "description": "The created record (id, createdTime, fields)."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

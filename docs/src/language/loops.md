@@ -186,6 +186,14 @@ flowchart LR
 A loop takes `_should_flow` and written port values exactly like a group
 does. For both, go and read [Groups](groups.md).
 
+A loop also stops when a port it iterates or carries arrives closed: with no
+list to walk, or no seed to carry, there is no iteration to launch, so the
+loop skips and its outputs close. Any other input arriving closed reaches
+each iteration as a closure, and the body node that reads it skips there.
+
+A body node that no wire feeds fires once per iteration, at that iteration's
+frame, so a loop body can hold its own source.
+
 ## Failure and nesting
 
 A failing body branch cascades only through that branch:

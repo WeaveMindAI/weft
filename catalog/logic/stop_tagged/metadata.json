@@ -1,0 +1,46 @@
+{
+  "type": "StopTagged",
+  "label": "Stop tagged runs",
+  "description": "Stop every run of this project carrying a tag, waiting runs included: a run parked on a person or a timer never resumes. Every input wired onto the node is a tag to stop, read exactly the way `TagRun` reads its own (any string; unsafe characters replaced and a short fingerprint added, so two different values never share a tag). `includeSelf` stops this run too. Put a `TagRun` first: a stop only reaches runs tagged before this one, so runs arriving together do not stop each other.",
+  "tags": [
+    "flow",
+    "tag",
+    "steer",
+    "debounce",
+    "cancel",
+    "stop"
+  ],
+  "icon": "OctagonX",
+  "color": "#6366f1",
+  "inputs": [
+    {
+      "name": "tags",
+      "type": "List[String]",
+      "required": false,
+      "description": "Tags to stop, as one list. Wired inputs of your own are tags too; the two add up."
+    },
+    {
+      "name": "includeSelf",
+      "type": "Boolean",
+      "required": false,
+      "widget": {
+        "kind": "checkbox"
+      },
+      "default": false,
+      "label": "Stop this run too",
+      "description": "Off: stop the other runs carrying the tag and keep this one. On: stop every run carrying the tag, this one included; this run ends cancelled the same way `weft stop` ends one."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the stop is queued. Wire it into the `_should_flow` of the work that follows."
+    }
+  ],
+  "features": {
+    "canAddInputPorts": true,
+    "customInputType": "String"
+  },
+  "requires_infra": false
+}

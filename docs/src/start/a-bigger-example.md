@@ -10,21 +10,17 @@ fal = FalAccess
 
 ask = TelegramReceiveMessage { account: telegram.access }
 
-credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String?) {
-  # Take one credit off this telegram account, or say why we cannot
-  who = ExecPython(user: String) -> (params: List[String]) {
-    code: @file("scripts/lookup_params.py")
-    user: self.telegramUser
-  }
-
-  debit = PostgresExecuteQuery {
+credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal?: String) {
+  # Take one credit off this telegram account, or say why we cannot.
+  # The query reads the sender's id as `$telegram_id`.
+  debit = PostgresExecuteQuery(telegram_id: String) {
     query: @file("sql/spend_credit.sql")
     account: self.db
-    params: who.params
+    telegram_id: self.telegramUser
   }
 
   # `refusal` says nothing when the credit was taken
-  read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal: String?) {
+  read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal?: String) {
     code: @file("scripts/outcome.py")
     rows: debit.rows
   }
@@ -36,7 +32,6 @@ credit.db = db.access
 credit.telegramUser = ask.user
 
 sorry = TelegramSendMessage {
-  _is_output: true
   account: telegram.access
   chatId: ask.chatId
   text: credit.refusal
@@ -62,7 +57,6 @@ picture = FalGenerateImage {
 }
 
 reply = TelegramSendMedia {
-  _is_output: true
   kind: "photo"
   account: telegram.access
   chatId: ask.chatId
@@ -76,25 +70,26 @@ one, a model turns their message into an image brief, fal draws it, and the
 picture goes back to the chat. No credits, or no account at all, and they get
 told so instead.
 
-Four files sit beside it, none of them weft:
+Three files sit beside it, none of them weft:
 
 | File | What it holds |
 |---|---|
 | `sql/spend_credit.sql` | one statement that takes a credit and reports what happened |
-| `scripts/lookup_params.py` | wraps the sender's id as the query's parameter list |
 | `scripts/outcome.py` | turns the query's row into `paid` and, when it failed, a sentence |
 | `prompts/image_brief.md` | the system prompt that turns a message into an image brief |
 
 `@file` pulls each one in as that field's value, so the SQL lives in a real
 `.sql` file your editor can highlight while still being the node's config.
-`lookup_params.py` is there because `PostgresExecuteQuery` wants its parameters
-as a list and `ask.user` is a single string. For what else `@file` can do, and
-its read-only sibling, go and read [Files and reuse](../language/files-and-reuse.md).
+The query's parameter is a port the node declares for itself,
+`PostgresExecuteQuery(telegram_id: String)`, and the SQL reads it as
+`$telegram_id`. For what
+else `@file` can do, and its read-only sibling, go and read
+[Files and reuse](../language/files-and-reuse.md).
 
 ## The credit group
 
 ```weft
-credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String?)
+credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal?: String)
 ```
 
 A group is a node with a graph inside it. Its children can only reach each
@@ -136,15 +131,12 @@ instead.
 For the whole rule, go and read
 [How a weft program runs](../language/mental-model.md#the-closed-pulse).
 
-## Why both endings say `_is_output`
+## Why nothing marks the endings
 
-The picture and the apology are the two things this program is for, so both say
-`_is_output: true`. A run walks back from every output node and executes what
-feeds it. Take it off `sorry` and nothing asks for the apology any more, so it
-never runs.
-
-For how a run picks its nodes, and how a trigger fire narrows that, go and read
-[How a weft program runs](../language/mental-model.md).
+The picture and the apology are the two things this program is for, and
+neither says so: a fire of `ask` runs everything it reaches, and each ending
+runs or skips on its own `_should_flow`. For how a run picks its nodes, go and
+read [How a weft program runs](../language/mental-model.md#what-actually-runs).
 
 ## Where to go next
 

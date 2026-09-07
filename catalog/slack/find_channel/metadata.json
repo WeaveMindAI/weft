@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "channels:read"
@@ -31,19 +31,16 @@
     {
       "name": "id",
       "type": "String",
-      "required": false,
       "description": "The channel's id (C...)."
     },
     {
       "name": "name",
       "type": "String",
-      "required": false,
       "description": "The matched name, # stripped."
     },
     {
       "name": "private",
       "type": "Boolean",
-      "required": false,
       "description": "Whether the matched channel is private."
     }
   ]

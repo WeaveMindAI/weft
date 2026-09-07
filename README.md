@@ -24,6 +24,7 @@ Weft is a high-level language and a low-level Rust framework made to effortlessl
 - **Durable.** A program can put itself in hibernation and wait for any kind of signal at virtually 0 computational cost, then resume from exactly where it stopped. Every run is written down as it happens, so you can open any of them and see what happened, or is happening, interactively through the graph.
 - **Infrastructure included.** Write `pg = PostgresDatabase` and the program gets a Postgres of its own. The node says which container it needs; the runtime starts that container with a disk that survives restarts, and the rest of the program reaches it through one output, `pg.access`. The WhatsApp bridge in the program below is an infrastructure node too: it puts its login QR code in the graph view, so you connect the bot by scanning it. Anything that runs in a container can be an infrastructure node; if you want to write your own, go and read [infrastructure nodes](https://weavemindai.github.io/weft/nodes/infrastructure.html).
 - **Dynamic vocabulary.** A node is two files and a few dozen lines of Rust, because weft has already taken on every piece of plumbing you would have to do manually. It is opinionated on purpose: there is one way a file is stored and one way a credential is held, and you get every parameter but never the mechanism, so each piece is hardened once instead of half-written again in every node. That makes a node cost a fraction of the tokens it would in another framework, and come out with far less to go wrong. Where weft's job stops and yours begins is written down in [the commandments of plumbing](https://weavemindai.github.io/weft/thinking/plumbing.html).
+- **Built by talking.** The AI assistant that writes weft with you is part of the language, not a plugin you wire up: `weft new hello --assistant kilo-code` (shorthand `kc`; Claude Code is also available as `claude-code`/`cc`) installs Tangle and opening the project in that assistant loads it automatically. Tangle knows the whole catalog, builds one stage at a time, runs it, reads the journal, and writes the nodes that are missing.
 
 ## Your first weft program
 
@@ -68,7 +69,6 @@ allowed = FirstInOrder {
 }
 
 reply = BaileySend {
-  _is_output: true
   _should_flow: allowed.value
   endpointUrl: whatsapp.endpointUrl
   to: ask.chatId
@@ -109,8 +109,8 @@ later, only what changed is redone.
 
 ```bash
 git clone https://github.com/WeaveMindAI/weft.git && cd weft
-./setup.sh                               # the runtime, the CLI, the VS Code ext
-weft new hello && cd hello && weft run   # scaffold, compile, fire an execution
+./setup.sh                                                     # the runtime, the CLI, the VS Code ext
+weft new hello --assistant kilo-code && cd hello && weft run    # scaffold (with the Tangle AI persona), compile, fire an execution
 ```
 
 If `weft` is not found, `setup.sh` printed the `export PATH=...` line to add to
@@ -122,6 +122,13 @@ run from a VS Code terminal. Either way, open the `hello` folder in VS Code and
 you get your program as a graph, lighting up node by node as it runs, with a
 "Source" button that puts the text back beside it. If it went into a window you
 already had open, run CTRL+Shift+P `Developer: Reload Window` once first.
+
+The `--assistant kilo-code` in the quickstart did the other half: open the
+same `hello` folder in Kilo Code and Tangle is already there, the AI builder
+that knows the language and the whole node catalog. `claude-code` (`cc`) is
+also available. You describe what you want, it builds, runs, and shows you
+what happened. From now on `weft new` remembers your assistant and installs
+it without the flag; `--assistant none` opts back out.
 
 When a program hits a "HumanQuery" or a "HumanTrigger", the question turns up in the
 weft browser extension, which the default install does not build. If you want

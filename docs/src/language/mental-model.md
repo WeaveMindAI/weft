@@ -151,88 +151,63 @@ is one graph, and pulses that know which iteration they belong to.
 
 ## What actually runs
 
-A weft program has no `main`, and nothing declares an entry point. The runtime
-works out what to run by starting from what was asked for and walking
-**backwards**.
+A weft program has no `main`, and nothing declares an entry point. Every
+node the run reaches runs. What differs between the kinds of run is where
+the first pulses are put.
 
-What was asked for is the **output nodes**: the ones whose firing is the
-deliverable. Sending the message, generating the image, writing the row,
-showing the result. A node's author declares it with
-`features.isOutputDefault`, and a project can override it per instance with
-`_is_output`.
+**A manual run** kicks every root: a node at the top level that no wire
+feeds. From there pulses go wherever the wiring takes them, and a node runs
+the moment its inputs are settled. A branch nobody reaches stays blank.
 
-**A manual run** takes every output node, walks upstream from each, and
-executes the union. Whatever no output depends on does not run.
-
-You can narrow that set:
+You can start narrower:
 
 ```bash
 weft run --target daily_report --target alert
 ```
 
-which runs those two and everything they need, and nothing else in the project.
-It is the same walk given a smaller starting set, which is why it costs nothing
-to have. A target has to be an output node; aiming a run at a middle node is
-refused, with the fix named. In the graph, right-click an output node to
-target it; the Run button then says how many targets it is aimed at.
+which runs those two nodes and what they need, and nothing else: the run
+is held to the targets' upstream, so a root they share with another branch
+(a database the whole file reads) never drags that branch in, and nothing
+past a target runs either. Several targets run the union of what each
+needs, independent branches side by side. Any node can be a target. A
+target inside a group brings the whole group, and whatever feeds the
+group's inputs runs first, the same as when the group starts in a full
+run. In the graph, right-click a node and choose **Set as target**; the
+Run button then says how many targets it is aimed at.
 
-The boundary is visible and it holds. A node just outside the aimed set that
-still receives a value from inside it shows as skipped with "it is outside the
-part of the graph this execution runs", once, and everything past it stays
-blank rather than painting the rest of the project skipped. The boundary is
-written into the run itself, so resuming a suspended aimed run keeps it.
+An aimed run answers to what it would execute, reading "what it would
+execute" as the joined upstream walk from every target at once:
 
-An aimed run answers to its own subgraph, not to the whole project. Two
-consequences, both reading "its subgraph" as the joined upstream walk from
-every target at once:
-
-- **If no trigger sits anywhere in that subgraph**, the run is an ordinary
+- **If no trigger sits anywhere in that walk**, the run is an ordinary
   one-shot, so the Run button appears next to Activate / Deactivate even in a
-  project full of triggers. This is how a maintenance branch works: an output
+  project full of triggers. This is how a maintenance branch works: a chain
   the triggers cannot reach, fired by hand whenever you need it, for example
   the enrollment door in the
   [telegram example](https://github.com/WeaveMindAI/weft/tree/main/examples/telegram-image-bot).
-- **Only the infra inside that subgraph gates it.** A run cannot start while
+- **Only the infra inside that walk gates it.** A run cannot start while
   an infra node it would touch is not running, the same rule as a plain run;
   but infra elsewhere in the project has no say, since this run never touches
   it. The Run button greys out accordingly, and `weft run --target ...`
   refuses with the same message until you `weft infra start`.
 
-**A trigger fire** narrows that twice. It starts at the trigger that actually
-fired and walks downstream to see which outputs that trigger can reach. Then it
-walks back up from those, and a node is in the run when one of those outputs
-depends on it without passing through another trigger.
+**A trigger fire** runs one program: the trigger that fired, everything
+downstream of it, and everything upstream of that, stopping at other
+triggers on the way up. At fire time a trigger's outputs are the event, not
+a function of its inputs, which were read once at activation, so a node that
+only feeds a trigger has nothing to contribute. Every other trigger in that
+set is kicked with no payload, which closes its outputs, and
+[the skip cascade](#the-closed-pulse) prunes the branches that belong to it.
 
-Both walks are there for a reason.
+A node the fired trigger cannot reach belongs to another program in the same
+file, and a value that spills into it from a shared node (one database feeding
+two programs) is dropped with no row. One file can hold several programs, one
+per trigger, and a middle section both of them need is picked up by whichever
+one fired without you saying so. What that buys you when laying a project out:
+[one file, several programs](../start/reading-the-graph.md#one-file-several-programs).
 
-**Starting from the fired trigger** keeps one entry point out of another's
-work. An output it cannot reach belongs to some other trigger, and re-running
-that on every fire would be wrong.
-
-**Stopping at triggers on the way up** keeps a trigger's own inputs from
-re-running. At fire time a trigger's outputs are the event, not a function of
-its inputs, which were read once at activation. So a node that only feeds a
-trigger has nothing to contribute to a fire. If it also feeds a normal path to
-a targeted output, it runs through that path.
-
-Every other trigger in the subgraph is kicked with no payload, which closes its
-outputs, and [the skip cascade](#the-closed-pulse) prunes the branches that
-belong to it.
-
-Four things follow, and the third is why `isOutputDefault` is worth thinking
-about at all:
-
-- **A branch wired to no output never executes.** A half-built path sitting in
-  the file is not a running path.
-- **One file can hold several programs.** Each trigger pulls its own subgraph,
-  and a middle section both of them need is picked up by whichever one fired
-  without you saying so. What that buys you when laying a project out:
-  [one file, several programs](../start/reading-the-graph.md#one-file-several-programs).
-- **A node that is the deliverable has to say so.** Leave `isOutputDefault`
-  unset on a node that sends the message, and a user who drops it at the end of
-  a chain and hits run gets nothing, because nothing downstream asked for it.
-- **A trigger that reaches no output has nothing to run**, so its fire is a
-  no-op rather than an error.
+A group or a loop is reached as a whole. When a scope's boundary settles, the
+launcher kicks every root inside it at the scope's frames, and a run aimed at
+a node inside a group brings the whole group.
 
 ## When it ends
 
@@ -245,7 +220,14 @@ Two ends that are not completion:
   worker exits. The execution is alive and costs nothing.
 - **Stuck.** The engine can prove no remaining node can ever proceed, because
   every one of them is waiting on one of the others. That is a graph-shape bug
-  and it fails loudly rather than hanging.
+  and it fails loudly rather than hanging: the failure names each node left
+  holding a value and the wired inputs it never received.
+
+And one end that is a decision: **cancelled**. A person pressed Stop, or
+another run of the same project stopped this one. A run can tag itself, and
+any sibling carrying that tag can be stopped, even one parked on a person or
+a timer. The journal records who did it. For how a node asks for that, go
+and read [Stopping other runs](../nodes/steering-executions.md).
 
 ## The journal, and why waiting is free
 

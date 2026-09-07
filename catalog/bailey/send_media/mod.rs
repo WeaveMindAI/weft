@@ -27,13 +27,29 @@ impl Node for BaileySendMediaNode {
         let to: String = ctx.inputs.get("to")?;
         let file: FileHandle = ctx.inputs.get("file")?;
         let caption: Option<String> = ctx.inputs.opt("caption")?;
+        let voice_note: bool = ctx.inputs.get("voiceNote")?;
 
         let media = super::bridge_api::bridge_media(&ctx, &file).await?;
+        // A voice note is an audio message and nothing else. The bridge
+        // picks the media kind from the mime and would quietly drop the
+        // flag on anything else, so a file that is not audio is refused
+        // here, where the mime is known and the message says which file.
+        if voice_note && !media.mime_type.starts_with("audio/") {
+            weft::node_bail!(
+                "`voiceNote` is on, but `{}` is {}, and only audio can be sent as a voice note; \
+                 turn `voiceNote` off, or send an audio file",
+                media.filename,
+                media.mime_type
+            );
+        }
         let mut payload = serde_json::json!({
             "to": to,
             "mediaUrl": media.url,
             "mimetype": media.mime_type,
             "filename": media.filename,
+            // `ptt` (push-to-talk) is WhatsApp's name for a voice note; the
+            // bridge applies it to audio only.
+            "ptt": voice_note,
         });
         if let Some(caption) = caption.filter(|c| !c.is_empty()) {
             payload["caption"] = serde_json::json!(caption);

@@ -1,0 +1,35 @@
+{
+  "type": "Format",
+  "label": "Format",
+  "description": "Fill a text template from the graph. Write the text with `{{name}}` placeholders and declare one input port per placeholder: `Format(user: String, count: Number) { template: \"Hi {{user}}, you have {{count}} left\" }`. A string fills in as is, anything else as its JSON. Every placeholder needs its port and every port its placeholder; either one missing fails the node naming it. Braces that should stay braces are doubled: `{{{{json}}}}` renders as `{{json}}` and needs no port.",
+  "tags": [
+    "format",
+    "template",
+    "text",
+    "prompt",
+    "basic"
+  ],
+  "icon": "Braces",
+  "color": "#64748b",
+  "inputs": [
+    {
+      "name": "template",
+      "type": "String",
+      "required": true,
+      "widget": { "kind": "textarea" },
+      "label": "Template",
+      "description": "The text, with `{{name}}` where an input port's value goes."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "description": "The template with every placeholder filled."
+    }
+  ],
+  "requires_infra": false,
+  "features": {
+    "canAddInputPorts": true
+  }
+}

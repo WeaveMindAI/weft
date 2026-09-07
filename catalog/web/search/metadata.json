@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Exa access (wire an ExaAccess node)."
     },
@@ -24,7 +24,6 @@
     {
       "name": "numResults",
       "type": "Number",
-      "exposure": "config",
       "default": 10,
       "label": "Results",
       "description": "How many results (1-100)."
@@ -32,7 +31,6 @@
     {
       "name": "includeText",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -50,13 +48,11 @@
     {
       "name": "results",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each result: title, url, publishedDate, text."
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

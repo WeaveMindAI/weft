@@ -92,34 +92,6 @@ impl RegistryConfig {
     pub fn node_test_image_ref(&self, test_hash: &str) -> String {
         format!("{}/{}", self.url, weft_compiler::build::node_test_image_tag(test_hash))
     }
-
-    /// Mint the CONTENT-addressed, registry-qualified INFRA image ref for an
-    /// `(image_name, content_hash)`: `<registry>/weft-infra-<name>:<content_hash>`.
-    /// The infra mirror of `worker_image_ref`, sharing the same registry prefix +
-    /// the bare infra-tag suffix (`weft_compiler::image_set::infra_image_tag`) so
-    /// push (the builder) and the supervisor's `Image::Local` resolution agree on
-    /// the tag. The FULL content hash is used (not a short prefix), so identical
-    /// infra image builds dedup across projects / tenants.
-    pub fn infra_image_ref(&self, image_name: &str, content_hash: &str) -> String {
-        format!(
-            "{}/{}",
-            self.url,
-            weft_compiler::image_set::infra_image_tag(image_name, content_hash)
-        )
-    }
-}
-
-/// Registry-qualified image-ref NAMING for the shared build brain (what the
-/// build pushes + the supervisor pulls). Passing the `RegistryConfig`
-/// straight into `weft_compiler::build_plan::plan_build_from` produces the SAME image
-/// set as the CLI, differing only in the tag string form.
-impl weft_compiler::build_plan::TagPolicy for RegistryConfig {
-    fn worker_ref(&self, binary_hash: &str) -> String {
-        self.worker_image_ref(binary_hash)
-    }
-    fn infra_ref(&self, image_name: &str, content_hash: &str) -> String {
-        self.infra_image_ref(image_name, content_hash)
-    }
 }
 
 #[cfg(test)]

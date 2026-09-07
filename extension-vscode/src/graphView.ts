@@ -16,7 +16,7 @@ import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
@@ -50,6 +50,8 @@ export class GraphViewController {
   /// Rebound whenever the panel follows a .weft file in a different
   /// project (its `nodes/` dir moves with it).
   private nodesWatcher: vscode.Disposable | undefined;
+  /// Watches the watched `.weft` file ITSELF on disk (see watchSelfFile).
+  private selfWatcher: vscode.Disposable | undefined;
   /// Watches the `@file`/`@include` targets the current view references, so
   /// editing a backing file externally re-parses the graph (file -> graph).
   /// Rebuilt after each parse from the response's fileRefs + include paths.
@@ -67,12 +69,7 @@ export class GraphViewController {
   private runHandler: ((targets: string[]) => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
-  /// Hooks fired when the user triggers an action that spawns an
-  /// execution whose color we don't yet know (activate / infra
-  /// start). Extension.ts uses these to tell AutoFollow "next
-  /// ExecutionStarted on this project, jump to it."
-  private lifecycleStartHandler: (() => void) | undefined;
-  private openSourceHandler: (() => void) | undefined;
+  private openSourceHandler: ((location?: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
   /// process or POST /executions/{color}/cancel.
@@ -103,6 +100,17 @@ export class GraphViewController {
   // Keyed by nodeId. Cleared on parseResult and dispose. Posts
   // `infraLive` messages to the webview.
   private liveTimers: Map<string, NodeJS.Timeout> = new Map();
+  /// The infra nodes whose container serves `/live` (and `/action`), as
+  /// of the last parse: a press on one of their buttons goes to the
+  /// container, every other button to the listener holding a signal.
+  /// Every infra node of the parsed project. This is what says WHERE a
+  /// body-panel button goes (the container behind `/infra`, or the
+  /// listener holding a signal), which is a fact of the node.
+  private infraNodeIds: Set<string> = new Set();
+  /// The subset whose container serves `/live`, so only those are
+  /// polled. Never used for routing: whether a poller runs is not the
+  /// same question as what kind of node this is.
+  private infraLiveNodeIds: Set<string> = new Set();
   // Same shape, for trigger nodes' signal display info (mount URL,
   // freshly-minted api keys, etc). Keyed by nodeId. Polls
   // `/projects/{id}/signals/{node_id}/display` and posts
@@ -130,10 +138,7 @@ export class GraphViewController {
   setRunHandler(fn: (targets: string[]) => void): void { this.runHandler = fn; }
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
-  setLifecycleStartHandler(fn: () => void): void {
-    this.lifecycleStartHandler = fn;
-  }
-  setOpenSourceHandler(fn: () => void): void { this.openSourceHandler = fn; }
+  setOpenSourceHandler(fn: (location?: SourceLocation) => void): void { this.openSourceHandler = fn; }
   /// Stop / Cancel pressed on the action bar. Extension dispatches
   /// based on whether the bar is in cli_running (kill CLI) or
   /// execution_running (POST /cancel) state.
@@ -236,6 +241,8 @@ export class GraphViewController {
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Active);
       this.watchedDoc = doc;
+      this.watchNodesDir(doc);
+      this.watchSelfFile(doc);
       await this.triggerParse();
       return;
     }
@@ -328,6 +335,7 @@ export class GraphViewController {
           const newId = readProjectIdFromToml(ed.document.uri.fsPath);
           this.watchedProjectId = newId ?? undefined;
           this.watchNodesDir(ed.document);
+          this.watchSelfFile(ed.document);
           // Switching to a different graph is a fresh mount: rebuild from the
           // new project + its saved layout, not the in-place edit-reconcile
           // path (which would diff the new graph against the old one's
@@ -359,8 +367,47 @@ export class GraphViewController {
       vscode.window.tabGroups.onDidChangeTabs(() => this.pushSourceState()),
     );
     this.watchNodesDir(doc);
+    this.watchSelfFile(doc);
     // Initial state push.
     this.pushSourceState();
+  }
+
+  /// Watch the watched `.weft` file on disk. `onDidChangeTextDocument`
+  /// only reports edits to a TextDocument VS Code still holds; once the
+  /// source tab is closed, VS Code detaches that document at a moment
+  /// nothing here controls, and a detached document's text is frozen. An
+  /// agent writing `main.weft` while only the graph is open then changes
+  /// nothing the change event can see, and the graph shows the old program
+  /// until the source tab is opened by hand. This watcher is the other ear:
+  /// a write on disk re-latches a live document (liveDoc re-opens the file
+  /// when the held one is detached) and reparses through the same debounce
+  /// and the same "skip if the render is current" gate as a typed edit, so
+  /// the extension's own writes, which land on disk too, are not reparsed
+  /// twice: their text already matches the render by the time this fires.
+  ///
+  /// Rebound when the panel follows a .weft in a different project, like
+  /// the nodes-dir watcher.
+  private watchSelfFile(doc: vscode.TextDocument): void {
+    this.selfWatcher?.dispose();
+    const watcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(nodePath.dirname(doc.uri.fsPath), nodePath.basename(doc.uri.fsPath)),
+    );
+    const onDiskChange = () => {
+      void (async () => {
+        if (!this.watchedDoc || this.watchedDoc.uri.fsPath !== doc.uri.fsPath) return;
+        await this.liveDoc(this.watchedDoc);
+        if (this.isRenderCurrent()) return;
+        // An external process wrote the file: the same auto-lock a text-tab
+        // edit engages, and never for our own writes (see selfWriteDepth).
+        if (this.selfWriteDepth === 0) this.post({ kind: 'codeEditTouched' });
+        this.scheduleParse('watched-text');
+      })();
+    };
+    this.selfWatcher = vscode.Disposable.from(
+      watcher,
+      watcher.onDidChange(onDiskChange),
+      watcher.onDidCreate(onDiskChange),
+    );
   }
 
   /// Watch the project's `nodes/` directory. Editing a node's
@@ -663,23 +710,30 @@ export class GraphViewController {
     const projectId = response.project.id;
     if (!projectId) {
       this.stopAllLivePollers();
+      // Nothing is parsed any more, so neither set describes anything.
+      // Leaving them behind would route this project's buttons by the
+      // last project's answers.
+      this.infraNodeIds = new Set();
+      this.infraLiveNodeIds = new Set();
       return;
     }
+    const isInfraNode = (n: ParseResponse['project']['nodes'][number]): boolean =>
+      n.requiresInfra ?? response.catalog[n.nodeType]?.requires_infra ?? false;
+    this.infraNodeIds = new Set(response.project.nodes.filter(isInfraNode).map((n) => n.id));
     // Only poll /live for infra nodes whose catalog metadata names a
     // `features.liveEndpoint`. TCP-only infra (Postgres, Redis) leaves
     // it unset and would otherwise return 502 on every tick.
     const infraNodeIds = new Set(
       response.project.nodes
         .filter((n) => {
-          const entry = response.catalog[n.nodeType];
-          const isInfra = n.requiresInfra ?? entry?.requires_infra ?? false;
-          if (!isInfra) return false;
-          const liveEndpoint = entry?.features?.liveEndpoint
+          if (!isInfraNode(n)) return false;
+          const liveEndpoint = response.catalog[n.nodeType]?.features?.liveEndpoint
             ?? n.features?.liveEndpoint;
           return liveEndpoint != null;
         })
         .map((n) => n.id),
     );
+    this.infraLiveNodeIds = infraNodeIds;
 
     // Stop pollers for nodes no longer in the project (or no longer
     // requires_infra).
@@ -830,20 +884,35 @@ export class GraphViewController {
       );
       if (!choice || !choice.value) return;
     }
+    // The button came off one of two feeds: an infra node's press goes
+    // to the container behind `/live`, a trigger's to the listener
+    // holding its signal. Which one is a fact of the parsed node, not
+    // of whether a poller happens to be running for it.
+    const isInfra = this.infraNodeIds.has(nodeId);
     try {
       await this.client.post(
-        `/projects/${projectId}/signals/${nodeId}/action`,
+        isInfra
+          ? `/projects/${projectId}/infra/nodes/${nodeId}/action`
+          : `/projects/${projectId}/signals/${nodeId}/action`,
         { kind: actionKind, payload: payload ?? null },
       );
-      // Force-refresh the display poller for this node so the new
-      // plaintext key (etc) shows up immediately.
-      const timer = this.signalDisplayTimers.get(nodeId);
-      if (timer) {
-        clearInterval(timer);
-        this.signalDisplayTimers.set(
-          nodeId,
-          this.startSignalDisplayPoller(projectId, nodeId),
-        );
+      // Force-refresh the node's poller so what the press changed (a
+      // new plaintext key, a fresh QR code) shows up immediately.
+      if (isInfra) {
+        const timer = this.liveTimers.get(nodeId);
+        if (timer) {
+          clearInterval(timer);
+          this.liveTimers.set(nodeId, this.startLivePoller(projectId, nodeId));
+        }
+      } else {
+        const timer = this.signalDisplayTimers.get(nodeId);
+        if (timer) {
+          clearInterval(timer);
+          this.signalDisplayTimers.set(
+            nodeId,
+            this.startSignalDisplayPoller(projectId, nodeId),
+          );
+        }
       }
     } catch (err) {
       // 409 means the signal's queue already has the maximum
@@ -857,7 +926,7 @@ export class GraphViewController {
         );
       } else {
         void vscode.window.showErrorMessage(
-          `Signal action '${actionKind}' failed: ${err instanceof Error ? err.message : String(err)}`,
+          `Action '${actionKind}' failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
@@ -937,13 +1006,10 @@ export class GraphViewController {
   }
 
   private async dispatchVerb(verb: string, args: string[]): Promise<void> {
-    if (
-      verb === 'activate'
-      || verb === 'resync'
-      || (verb === 'infra' && (args[0] === 'start' || args[0] === 'upgrade'))
-    ) {
-      this.lifecycleStartHandler?.();
-    }
+    // Follow-latest for the lifecycle verbs is armed by the host, past
+    // every refusal (the in-flight guard, the pre-flight gate): an
+    // aborted click must not reset the user's pinned execution view.
+    //
     // Errors flow through the host's CLI runner: the spawned `weft
     // <verb> --json` emits an `error` phase event; the host's
     // ActionBarStore picks it up and renders an error banner.
@@ -1100,7 +1166,7 @@ export class GraphViewController {
         this.followCatchUpHandler?.();
         break;
       case 'openSource':
-        this.openSourceHandler?.();
+        this.openSourceHandler?.(msg.location);
         break;
       case 'stopAction':
         this.stopActionHandler?.();
@@ -1881,6 +1947,8 @@ export class GraphViewController {
     if (this.catalogRefreshTimer) clearTimeout(this.catalogRefreshTimer);
     this.nodesWatcher?.dispose();
     this.nodesWatcher = undefined;
+    this.selfWatcher?.dispose();
+    this.selfWatcher = undefined;
     this.refWatcher?.dispose();
     this.refWatcher = undefined;
     this.stopAllLivePollers();

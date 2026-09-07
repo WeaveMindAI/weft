@@ -25,6 +25,6 @@ impl Node for CustomProviderNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        provider::emit(&ctx, "custom", false).await
+        provider::emit(&ctx, "custom").await
     }
 }

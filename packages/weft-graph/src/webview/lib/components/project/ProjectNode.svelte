@@ -3,7 +3,7 @@
 	import { Handle, Position, useEdges, useNodes, NodeResizer, type ResizeParams } from "@xyflow/svelte";
 	import { NODE_TYPE_CONFIG, specForService, type NodeType } from "../../nodes";
 	import type { PortDefinition, PortType, NodeDataUpdates, FieldDefinition, NodeFeatures, NodeExecution, LiveDataItem, NodeExecutionStatus } from "../../types";
-	import { declaredHomeValue, inputExposure, ownValue, storedValueOf } from "../../types";
+	import { declaredHomeValue, acceptsWire, ownValue, storedValueOf } from "../../types";
 	import { PORT_TYPE_COLORS, getPortTypeColor } from "../../constants/colors";
 	import type { Edge } from "@xyflow/svelte";
 	import CodeEditor from "../CodeEditor.svelte";
@@ -16,9 +16,10 @@
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
-	import { createPortContextMenu, buildPortMenuItems } from "../../utils/port-context-menu";
+	import { openPortMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
-	import { fieldForInput, fieldForSpecField, inputRendersField, nextPortLiterals, shouldFlowField } from "../../utils/input-field";
+	import { portDeleteAction } from "../../projection/header-ports";
+	import { fieldForInput, fieldForSpecField, inputRendersField, inputsOf, nextPortLiterals, outputsOf, shouldFlowField } from "../../utils/input-field";
 	import ExecutionInspector from './ExecutionInspector.svelte';
 	import { SIMPLIFIED_IN_HANDLE, SIMPLIFIED_OUT_HANDLE, SIMPLIFIED_CONTENT_W_PX, SIMPLIFIED_SQUARE_PAD_PX, SIMPLIFIED_CARD_MAX_W_PX, simplifiedDotStyle } from "../../constants/simplified-view";
 	import FieldStrip from './FieldStrip.svelte';
@@ -54,6 +55,9 @@
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
 			features?: NodeFeatures;
+			/// The unconnected-access pin (view state from buildNodes,
+			/// never a config key): drawn open, collapse disabled.
+			pinnedOpen?: boolean;
 			// Resolved state of @file targets, keyed by the marker's relative
 			// path (content or read error). A config field whose value is a
 			// `@file(...)` tag displays fileContents[path]; config itself never
@@ -85,6 +89,13 @@
 				site: CorruptionSite;
 				reason: string;
 			}>;
+			/// The run's own tags (`ctx.tag_execution`), the same on
+			/// every node; the inspector footer shows them.
+			executionTags?: string[];
+			/// How the run ended, the same on every node; the inspector
+			/// footer names a cancel's cause from it, and the cancel card
+			/// falls back to it when the node's own row carries no reason.
+			runTerminal?: import('../../types').ExecutionTerminal;
 			/// Body-panel feed for this node, set ONLY for infra
 			/// (infra /live) and trigger (listener /display) nodes.
 			/// Other nodes get undefined and render no body panel
@@ -144,6 +155,8 @@
 	// that never touched a bus.
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
+	const executionTags = $derived(data.executionTags ?? []);
+	const runTerminal = $derived(data.runTerminal);
 
 	const entryKinds: PortSpec[] = $derived(typeConfig.portsFromConfig?.specs ?? []);
 	const entryKindByName: Record<string, PortSpec> = $derived(buildSpecMap(entryKinds));
@@ -179,13 +192,12 @@
 
 	/** Fields rendered in the expanded view: the node's INPUTS are the
 	 *  field list, one field per input, flattened from each input's
-	 *  RESOLVED widget (the editor derives nothing). Rendering rules by
-	 *  exposure: 'wire' inputs never get a field; a wired input shows no
-	 *  field (the edge is the driver); 'config' inputs edit the config
-	 *  home; 'all'/'assignment' inputs edit the port-literal home
-	 *  (portDriven), with 'assignment' locked to the statement form. */
+	 *  RESOLVED widget (the editor derives nothing). An input that takes
+	 *  no written value (`accepts: ["wire"]`) never gets a field; a wired
+	 *  input shows no field (the edge is the driver); every other input
+	 *  edits its port literal, in whichever spelling the source uses. */
 	const displayedFields: FieldDefinition[] = $derived.by(() => {
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		const result: FieldDefinition[] = [];
 		for (const input of inputList) {
 			const rendered = inputRendersField(input, {
@@ -200,21 +212,13 @@
 		return result;
 	});
 
-	/** The written form of a port-driven field's value ('inline' = braces,
-	 *  'connection' = statement). A value not yet in source defaults to
-	 *  the braces form on its first write, except on an assignment-only
-	 *  input, where the statement form is the only legal one. */
+	/** The written form of a port field's value ('inline' = braces,
+	 *  'connection' = statement). Spelling is never gated: a value not
+	 *  yet in source takes the braces form on its first write, and the
+	 *  toggle flips it. */
 	function portFieldForm(key: string): 'inline' | 'connection' {
 		const span = ownValue(portLiteralSpans, key) as ConfigFieldSpan | undefined;
-		return span?.origin ?? (portFieldLocked(key) ? 'connection' : 'inline');
-	}
-
-	/** An assignment-only input's field is locked to the statement form:
-	 *  the braces form cannot drive it, so the toggle is disabled. */
-	function portFieldLocked(key: string): boolean {
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
-		const input = inputList.find((p) => p.name === key);
-		return input !== undefined && inputExposure(input) === 'assignment';
+		return span?.origin ?? 'inline';
 	}
 
 
@@ -243,7 +247,7 @@
 
 	// Check if node has expandable content (fields, run location option, debug preview, etc.)
 	const hasExpandableContent = $derived.by(() => {
-		// Has input fields (config/all/assignment inputs not currently wired)
+		// Has input fields (inputs not currently wired)
 		if (displayedFields.length > 0) return true;
 		// Has debug preview (Debug node)
 		if (typeConfig.features?.showDebugPreview) return true;
@@ -271,8 +275,16 @@
 	// instead of a bare square.
 	const hasLiveDisplay = $derived(showBodyFeed || showDebugDisplay || showFileDisplay);
 
-	// Get expanded state from config (persisted), default collapsed for regular nodes
-	const expanded = $derived((data.config?.expanded as boolean) ?? false);
+	// An access field with no connection picked pins the node open (the
+	// Connect button lives in the expanded body). The pin arrives as
+	// node DATA from buildNodes (view state, never a config key): it
+	// forces the drawn state open below and disables the collapse
+	// control, and it unlocks the moment a connection is picked.
+	const unconnectedAccess = $derived(!!data.pinnedOpen);
+
+	// Drawn state: the pin wins; otherwise config (persisted), default
+	// collapsed for regular nodes.
+	const expanded = $derived(unconnectedAccess || ((data.config?.expanded as boolean) ?? false));
 	
 	// Resize end: save the new dimensions (width/height only; `expanded` is
 	// unchanged so we don't resend it). The host classifies resize vs collapse
@@ -323,46 +335,48 @@
 		}
 	}
 
-	function togglePortRequired(portName: string, side: 'input' | 'output') {
-		if (side === 'input') {
-			const newInputs = inputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ inputs: newInputs });
-		} else {
-			const newOutputs = outputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ outputs: newOutputs });
-		}
+	// Inputs only: requiredness has no runtime meaning on an output, and
+	// the menu offers the row on inputs alone.
+	function setInputPortRequired(portName: string, required: boolean) {
+		const newInputs = inputs.map((p: PortDefinition) =>
+			p.name === portName ? { ...p, required } : { ...p }
+		);
+		data.onUpdate?.({ inputs: newInputs });
 	}
 	
-	// Port context menu rendered on document.body to avoid CSS transform positioning issues
+	// Port context menu rendered on document.body to avoid CSS transform
+	// positioning issues. This effect tracks ONLY `portContextMenu`
+	// (open/close); openPortMenu builds the items untracked, as a
+	// snapshot of the gesture (see its doc).
 	$effect(() => {
 		if (!portContextMenu) return;
 		const { portName, side, x, y } = portContextMenu;
-		const port = side === 'input'
-			? inputs.find((p) => p.name === portName)
-			: outputs.find((p) => p.name === portName);
-		if (!port) return;
-
-		const defaultPorts = side === 'input' ? typeConfig.defaultInputs : typeConfig.defaultOutputs;
-		const isCustom = !defaultPorts.some((p) => p.name === portName);
-		const canAddPorts = (side === 'input'
-			? typeConfig.features?.canAddInputPorts
-			: typeConfig.features?.canAddOutputPorts) ?? false;
-
-		const items = buildPortMenuItems({
-			port,
-			side,
-			isCustom,
-			canAddPorts,
-			onToggleRequired: () => togglePortRequired(portName, side),
-			onSetType: (newType) => setPortType(portName, side, newType),
-			onRemove: () => { if (side === 'input') removeInputPort(portName); else removeOutputPort(portName); },
-		});
-
-		return createPortContextMenu(x, y, items, () => { portContextMenu = null; });
+		return openPortMenu({ x, y }, () => {
+			const port = side === 'input'
+				? inputs.find((p) => p.name === portName)
+				: outputs.find((p) => p.name === portName);
+			if (!port) return null;
+			const provided = side === 'input' ? providedInputs : providedOutputs;
+			const derivedNames = side === 'input' ? derivedPortLists.ins : derivedPortLists.outs;
+			const canAddPorts = (side === 'input'
+				? typeConfig.features?.canAddInputPorts
+				: typeConfig.features?.canAddOutputPorts) ?? false;
+			return buildPortMenuItems({
+				port,
+				...(side === 'input'
+					? { side, onSetRequired: (required: boolean) => setInputPortRequired(portName, required) }
+					: { side }),
+				deleteAction: portDeleteAction(port, provided, canAddPorts),
+				// Derived-ness is per PORT (only the ports the config list
+				// creates; a switch's `value` stays editable), and a DECLARED
+				// shadow line over a derived name round-trips like any
+				// declaration, so it keeps its edits too.
+				configDerived: derivedNames.some((d) => d.name === port.name)
+					&& port.declaredType === undefined,
+				onSetType: (newType) => setPortType(portName, side, newType),
+				onRemove: () => { if (side === 'input') removeInputPort(portName); else removeOutputPort(portName); },
+			});
+		}, () => { portContextMenu = null; });
 	});
 
 
@@ -399,15 +413,16 @@
 		return getPortTypeColor(portType);
 	}
 
-	const inputs = $derived(data.inputs || typeConfig.defaultInputs);
-	/** Inputs that render a PORT DOCK. A `config`-exposure input is a
-	 *  design-time setting the graph never wires, so it gets a field in
-	 *  the body but no handle on the edge rail. `inputs` stays the
-	 *  COMPLETE list (edits round-trip the full set). */
+	const inputs = $derived(inputsOf(data.inputs));
+	/** Inputs that render a PORT DOCK: every input a wire may drive. A
+	 *  literal-only input (a compiler-read list, the access picker, an
+	 *  author-narrowed setting) gets a field in the body but no handle
+	 *  on the edge rail. `inputs` stays the COMPLETE list (edits
+	 *  round-trip the full set). */
 	const wireableInputs = $derived(inputs.filter(
-		(p: PortDefinition) => inputExposure(p) !== 'config' && p.name !== SHOULD_FLOW_PORT
+		(p: PortDefinition) => acceptsWire(p) && p.name !== SHOULD_FLOW_PORT
 	));
-	const outputs = $derived(data.outputs || typeConfig.defaultOutputs);
+	const outputs = $derived(outputsOf(data.outputs));
 
 	// Dynamic min resize height: header + ports + fixed buffer for at least one config line
 	// Accent bar (2) + header row (32) + content padding (16) + label (24) + ports gap (8) + port rows + buffer (100)
@@ -419,6 +434,29 @@
 	// Check if node allows adding ports based on its features
 	const canAddInputPorts = $derived(typeConfig.features?.canAddInputPorts ?? false);
 	const canAddOutputPorts = $derived(typeConfig.features?.canAddOutputPorts ?? false);
+
+	// The ports each side is PROVIDED (the header aside): catalog
+	// defaults plus the ports the config entry list derives. The one
+	// input to every delete surface (see portDeleteAction) and to the
+	// menu's derived-port explainer. Reads the render mirror's config,
+	// which can lag the projection by one flush; that is tolerable here
+	// because the DESTRUCTIVE routing (remove vs revert) happens in the
+	// emitter against the projection's own derivation, so a stale
+	// window can only mislabel the button or menu item, never change
+	// what the gesture does. A future portsFromConfig type that also
+	// accepts custom ports should still derive this from the projection
+	// so the labels cannot lie either.
+	const derivedPortLists = $derived.by(() => {
+		const pfc = typeConfig.portsFromConfig;
+		if (!pfc) return { ins: [] as PortDefinition[], outs: [] as PortDefinition[] };
+		const entries = (ownValue(portLiterals, pfc.field) as PortEntryDef[] | undefined) ?? [];
+		return {
+			ins: deriveInputsFromEntries(entries, entryKindByName),
+			outs: deriveOutputsFromEntries(entries, entryKindByName),
+		};
+	});
+	const providedInputs = $derived([...typeConfig.defaultInputs, ...derivedPortLists.ins]);
+	const providedOutputs = $derived([...typeConfig.defaultOutputs, ...derivedPortLists.outs]);
 	const oneOfRequiredGroups: string[][] = $derived(
 		[...(typeConfig.features?.oneOfRequired ?? []), ...(data.features?.oneOfRequired ?? [])]
 	);
@@ -466,24 +504,28 @@
 		}
 	}
 
-	/** If `config[key]` is a `@file`/`@asset` marker whose CONTENT is text the
-	 *  host ships (both markers with text types), its ref. The per-field test
-	 *  for "this field displays a referenced file's text". A file-typed
-	 *  `@asset` is NOT: the marker itself is the field's value (the file-drop
-	 *  field sets/clears it); nothing text-shaped exists to display, and
-	 *  routing its edits into a file write would clobber the media file. */
+	/** If the port literal for `key` is a `@file`/`@asset` marker whose
+	 *  CONTENT is text the host ships (both markers with text types), its
+	 *  ref. The per-field test for "this field displays a referenced
+	 *  file's text". A file-typed `@asset` is NOT: the marker itself is
+	 *  the field's value (the file-drop field sets/clears it); nothing
+	 *  text-shaped exists to display, and routing its edits into a file
+	 *  write would clobber the media file. The host bridge puts every
+	 *  marker into the port literal, the one home a port's value has. */
 	function fileRefOf(key: string): { path: string; type: string; marker: 'file' | 'asset' } | null {
-		// CONFIG home only, and that is the whole story: the host bridge
-		// puts every `@file`/`@asset` marker into config (never into a
-		// port literal), and every consumer of this chain is config-
-		// scoped too (FieldStrip asks only for non-port-driven fields,
-		// `updateConfig` writes config, the chip renders in the config
-		// branch). Reading the port literal first would let a
-		// same-named port literal impose its marker on the config
-		// field that legitimately shares its name.
-		const v = ownValue(data.config as Record<string, unknown> | undefined, key);
+		const v = ownValue(portLiterals, key);
 		if (!isFileRefValue(v)) return null;
 		return typeReferencesFile(v.__weftFileRef.type) ? null : v.__weftFileRef;
+	}
+
+	/** A text `@asset` whose source is a URL or a stored-file key has no
+	 *  file on disk for the host to read: the build fetches it. The graph
+	 *  shows the source itself, read-only. */
+	function remoteTextSource(key: string): string | null {
+		const ref = fileRefOf(key);
+		if (!ref || ref.marker !== 'asset') return null;
+		const remote = /^https?:\/\//.test(ref.path) || /^(exec|project|shared|asset)\/[^/]+\/[^/]+$/.test(ref.path);
+		return remote ? ref.path : null;
 	}
 
 	/** Resolved state of a file-backed field, from the host's fileContents
@@ -492,6 +534,9 @@
 	function fileFieldState(key: string): { path: string; marker: 'file' | 'asset'; content?: string; error?: string; loading: boolean } | null {
 		const ref = fileRefOf(key);
 		if (!ref) return null;
+		// Fetched at build, never by the host: the source is the display.
+		const remote = remoteTextSource(key);
+		if (remote !== null) return { path: ref.path, marker: 'asset', content: remote, loading: false };
 		const entry = ownValue(data.fileContents, ref.path) as FileContent | undefined;
 		// Undefined (not delivered) OR an explicit `{loading}` (bytes still being
 		// fetched lazily) both render the non-interactive loading state.
@@ -564,18 +609,27 @@
 	}
 
 	/// Flip a text-file-backed field between `@file` (editable, writes back)
-	/// and `@asset` (pull-only). A DIRECT config write, deliberately not
-	/// `updateConfig` (which routes a `@file` field's edit into the
+	/// and `@asset` (pull-only). A DIRECT port-literal write, deliberately
+	/// not `updateFieldValue` (which routes a `@file` field's edit into the
 	/// referenced file's content); switching the marker edits the marker.
+	/// A remote text source (a URL, a stored key) has nothing to write
+	/// back to, so it stays `@asset`.
 	function switchFileMarker(key: string) {
-		const v = ownValue(data.config as Record<string, unknown> | undefined, key);
+		const v = ownValue(portLiterals, key);
 		if (!isFileRefValue(v)) return;
+		if (remoteTextSource(key) !== null) {
+			toast.error(`@asset(${v.__weftFileRef.path}) is fetched at build; a URL or a stored file has no file to edit back, so it stays @asset.`);
+			return;
+		}
 		const r = v.__weftFileRef;
 		const flipped = { __weftFileRef: { ...r, marker: r.marker === 'file' ? 'asset' as const : 'file' as const } };
-		data.onUpdate?.({ config: { ...data.config, [key]: flipped } });
+		data.onUpdate?.({ portLiterals: { ...portLiterals, [key]: flipped } });
 	}
 
-	function updateConfig(key: string, value: string | string[] | number | boolean | PortEntryDef[] | Record<string, unknown> | WeftFileRefValue | WeftFileRefValue[] | null) {
+	// `extra`: additional config keys committed IN THE SAME update as the
+	// field's value (an access pick persisting `expanded: true` so the
+	// pinned-open node doesn't snap shut). One write, one undo step.
+	function updateConfig(key: string, value: string | string[] | number | boolean | PortEntryDef[] | Record<string, unknown> | WeftFileRefValue | WeftFileRefValue[] | null, extra?: Record<string, unknown>) {
 		// File-backed field: the edit goes to the referenced file, never to the
 		// weft source. The `@file(...)` marker in config (and source) is left
 		// untouched; only the file's content changes.
@@ -608,20 +662,7 @@
 			return;
 		}
 		if (data.onUpdate) {
-			// config holds the `@file(...)` tag for file-backed fields (never the
-			// resolved content), so serializing the whole config re-emits the
-			// marker. No special handling needed for sibling file-backed fields.
-			const newConfig = { ...data.config, [key]: value };
-			if (typeConfig.portsFromConfig && key === typeConfig.portsFromConfig.field) {
-				const fields = value as PortEntryDef[];
-				data.onUpdate({
-					config: newConfig,
-					inputs: deriveInputsFromEntries(fields, entryKindByName),
-					outputs: deriveOutputsFromEntries(fields, entryKindByName),
-				});
-			} else {
-				data.onUpdate({ config: newConfig });
-			}
+			data.onUpdate({ config: { ...data.config, [key]: value, ...(extra ?? {}) } });
 		}
 	}
 
@@ -632,40 +673,77 @@
 	// <700ms of typing. $effect's cleanup unregisters on destroy.
 	$effect(() => fieldEditorRegistry?.register(fieldEditor.flush));
 
-	/** Write a PORT-DRIVEN field's value: the port's body literal, kept
-	 *  apart from config (one home per name). An emptied control clears
-	 *  the literal (the port goes back to unset/wireable): null is what
-	 *  the strip's and the code editor's cleared boxes save, and an
-	 *  empty string is accepted as cleared too so no control can ever
-	 *  store a phantom "" literal. */
-	function updatePortLiteral(key: string, value: unknown) {
+	/** Write a port field's value: the port's literal, the one home a
+	 *  port's constant has. An emptied control clears the literal (the
+	 *  port goes back to unset/wireable): null is what the strip's and
+	 *  the code editor's cleared boxes save, and an empty string is
+	 *  accepted as cleared too so no control can ever store a phantom ""
+	 *  literal. `extra` carries view-state config keys committed IN THE
+	 *  SAME update (an access pick persisting `expanded: true` so the
+	 *  pinned-open node doesn't snap shut): one write, one undo step.
+	 *  When the key is the list a node's ports come from, the update
+	 *  also carries the node's FULL next port surface. */
+	function updatePortLiteral(key: string, value: unknown, extra?: Record<string, unknown>) {
 		if (!data.onUpdate) return;
-		data.onUpdate({ portLiterals: nextPortLiterals(portLiterals, key, value) });
+		const updates: NodeDataUpdates = { portLiterals: nextPortLiterals(portLiterals, key, value) };
+		if (extra) updates.config = { ...data.config, ...extra };
+		if (typeConfig.portsFromConfig && key === typeConfig.portsFromConfig.field) {
+			const fields = (value as PortEntryDef[] | null) ?? [];
+			// The update's port lists are the node's FULL next surface
+			// (the emitter diffs surfaces): every current port that is
+			// not derived from the OLD entry list, plus the NEW list's
+			// derived ports. Sending only the derived ports would read
+			// as "every other port was deleted" and wipe the header's
+			// real declarations.
+			const prevFields = getEntries();
+			const prevDerived = new Set([
+				...deriveInputsFromEntries(prevFields, entryKindByName),
+				...deriveOutputsFromEntries(prevFields, entryKindByName),
+			].map((p) => p.name));
+			// A DECLARED port survives even when its name is derived (a
+			// hand-authored shadow line over a derived port round-trips
+			// like any declaration); only bare derived ports are swapped
+			// for the new list's derivation.
+			const keptIn = inputs.filter((p: PortDefinition) =>
+				!prevDerived.has(p.name) || p.declaredType !== undefined);
+			const keptOut = outputs.filter((p: PortDefinition) =>
+				!prevDerived.has(p.name) || p.declaredType !== undefined);
+			updates.inputs = [
+				...keptIn,
+				...deriveInputsFromEntries(fields, entryKindByName)
+					.filter((d) => !keptIn.some((p: PortDefinition) => p.name === d.name)),
+			];
+			updates.outputs = [
+				...keptOut,
+				...deriveOutputsFromEntries(fields, entryKindByName)
+					.filter((d) => !keptOut.some((p: PortDefinition) => p.name === d.name)),
+			];
+		}
+		data.onUpdate(updates);
 	}
 
 	/** Route a field edit. FILE-BACKING WINS over the value's home, and
-	 *  that ordering is the whole rule: a `@file`/`@asset` marker always
-	 *  lives in config, but the resolved CONTENT may have been moved
-	 *  into the port literal (enrich does that for an `all`-exposure
-	 *  input written in the body). Saving such an edit to the port
-	 *  literal would rewrite the source line with the entire file and
-	 *  destroy the reference, so a file-backed field always routes to
-	 *  the file write; only a plain field goes to its declared home
-	 *  (port literal vs config). THE one routing rule; every control
-	 *  calls this. */
-	function updateFieldValue(key: string, value: unknown, portDriven?: boolean) {
-		if (fileFieldState(key)) updateConfig(key, value as Parameters<typeof updateConfig>[1]);
-		else if (portDriven) updatePortLiteral(key, value);
-		else updateConfig(key, value as Parameters<typeof updateConfig>[1]);
-	}
-
-	/** Flip a port-driven field's WRITTEN form (braces `key: value` vs
-	 *  statement `node.key = value`); the host rewrites the source. */
-	function togglePortValueForm(key: string) {
-		if (portFieldLocked(key)) {
-			toast.error(`'${key}' takes a literal only as an assignment: ${id}.${key} = ... is the one written form.`);
+	 *  that ordering is the whole rule: a file-backed field's port
+	 *  literal holds the `@file`/`@asset` marker while the host shows the
+	 *  resolved CONTENT; saving such an edit to the port literal would
+	 *  rewrite the source line with the entire file and destroy the
+	 *  reference, so a file-backed field always routes to the file
+	 *  write. A plain port field goes to the port literal; a value that
+	 *  is not a port's (a loop knob, view state) goes to config. THE one
+	 *  routing rule; every control calls this. */
+	function updateFieldValue(key: string, value: unknown, portDriven?: boolean, extra?: Record<string, unknown>) {
+		if (extra && fileFieldState(key)) {
+			toast.error(`field '${key}': extra config keys cannot ride a file-backed write`);
 			return;
 		}
+		if (fileFieldState(key)) updateConfig(key, value as Parameters<typeof updateConfig>[1]);
+		else if (portDriven) updatePortLiteral(key, value, extra);
+		else updateConfig(key, value as Parameters<typeof updateConfig>[1], extra);
+	}
+
+	/** Flip a port field's WRITTEN form (braces `key: value` vs statement
+	 *  `node.key = value`); the host rewrites the source. */
+	function togglePortValueForm(key: string) {
 		const next = portFieldForm(key) === 'inline' ? 'connection' : 'inline';
 		data.onUpdate?.({ portValueForm: { key, form: next } });
 	}
@@ -680,19 +758,20 @@
 	/** Resolve a remote_select's authenticating access STRUCTURALLY.
 	 *  Two homes, checked in order: the named input may be an access
 	 *  widget on THIS node (the grant handle sits in this node's own
-	 *  config, no edge exists), or an Access-typed port wired back to a
-	 *  feeding access node whose config holds the handle. Either way we
+	 *  port literals, no edge exists), or an Access-typed port wired
+	 *  back to a feeding access node whose port literals hold the
+	 *  handle. Either way we
 	 *  read the grant id persisted when the user clicked Connect, plus
 	 *  the service off the owning template's recipe. There is no data
 	 *  flow between nodes at edit time; this structural read is what
 	 *  makes the dropdown live with nothing running. */
 	/** Whether the named access input is an access WIDGET on this node
-	 *  (the connection is picked in this node's own config) rather than
+	 *  (the connection is picked on this node itself) rather than
 	 *  an Access-typed port fed by a wire. Drives both the trace below
 	 *  and the dropdown's connect-first wording (pick here vs wire in). */
 	function accessInputIsOwnWidget(accessInput: string | undefined): boolean {
 		if (!accessInput) return false;
-		const ownInputs = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const ownInputs = inputsOf(data.inputs);
 		return ownInputs.some((i) => i.name === accessInput && i.widget?.kind === 'access');
 	}
 
@@ -700,7 +779,7 @@
 		if (accessInputIsOwnWidget(accessInput)) {
 			const service = typeConfig.service?.service;
 			if (!service) return null;
-			const handle = ownValue(data.config as Record<string, unknown> | undefined, accessInput);
+			const handle = ownValue(portLiterals, accessInput);
 			const grantId =
 				handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 			return typeof grantId === 'string' ? { accessId: grantId, service } : null;
@@ -713,16 +792,16 @@
 		if (!src) return null;
 		const srcData = src.data as {
 			nodeType?: string;
-			config?: Record<string, unknown>;
+			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 		};
 		const tpl = NODE_TYPE_CONFIG[srcData.nodeType as NodeType];
 		const service = tpl?.service?.service;
 		if (!service) return null;
-		const srcInputs = (srcData.inputs ?? tpl?.defaultInputs ?? []) as PortDefinition[];
+		const srcInputs = inputsOf(srcData.inputs);
 		const connectInput = srcInputs.find((i) => i.widget?.kind === 'access');
 		if (!connectInput) return null;
-		const handle = ownValue(srcData.config as Record<string, unknown> | undefined, connectInput.name);
+		const handle = ownValue(srcData.portLiterals, connectInput.name);
 		const grantId =
 			handle && typeof handle === 'object' ? (handle as { id?: unknown }).id : undefined;
 		return typeof grantId === 'string' ? { accessId: grantId, service } : null;
@@ -750,7 +829,7 @@
 	/// authenticating input (its sources filter on the granted set).
 	const watchedAccessInputs = $derived.by(() => {
 		const names = new Set<string>();
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			if (i.requiresScopes && i.requiresScopes.length > 0) names.add(i.name);
 			if (i.requiresValues && i.requiresValues.length > 0) names.add(i.name);
@@ -831,7 +910,7 @@
 	/// sets never mark (nobody actually knows what they hold).
 	const permissionShortfalls = $derived.by(() => {
 		const out: string[] = [];
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			const required = i.requiresScopes ?? [];
 			if (required.length === 0) continue;
@@ -854,7 +933,7 @@
 	/// refusal is the backstop.
 	const ownAccountShortfalls = $derived.by(() => {
 		const out: { text: string; link?: string }[] = [];
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			const required = i.requiresScopes ?? [];
 			if (required.length === 0) continue;
@@ -879,7 +958,7 @@
 	/// this marks whenever the grant was read.
 	const valueShortfalls = $derived.by(() => {
 		const out: string[] = [];
-		const inputList = (data.inputs || typeConfig.defaultInputs || []) as PortDefinition[];
+		const inputList = inputsOf(data.inputs);
 		for (const i of inputList) {
 			const required = i.requiresValues ?? [];
 			if (required.length === 0) continue;
@@ -974,11 +1053,11 @@
 	const entryListKey = $derived(typeConfig.portsFromConfig?.field ?? '');
 
 	function getEntries(): PortEntryDef[] {
-		return ((data.config as Record<string, unknown>)?.[entryListKey] as PortEntryDef[]) ?? [];
+		return (ownValue(portLiterals, entryListKey) as PortEntryDef[] | undefined) ?? [];
 	}
 
 	function removeEntry(index: number) {
-		updateConfig(entryListKey, getEntries().filter((_, i) => i !== index));
+		updatePortLiteral(entryListKey, getEntries().filter((_, i) => i !== index));
 	}
 
 	function startAddingEntry() {
@@ -1021,13 +1100,28 @@
 		// is not a conflict with itself.
 		const existing = getEntries();
 		const others = replacing === null ? existing : existing.filter((_, i) => i !== replacing);
-		const collisions = entryPortCollisions(entry, others, entryKindByName);
+		// Reserved on each side: the node type's own ports AND the ports
+		// this instance's header declares, EXCEPT a header line that
+		// shadows a port the current entry list already derives (the
+		// enricher merges such a shadow by name, so it is legal source,
+		// and reserving it would refuse every edit of its own entry).
+		// Per SIDE: an input-side derivation must not un-reserve a
+		// declared OUTPUT of the same name (the two are separate name
+		// spaces, and a spec can derive the bare `{key}` on either).
+		const derivedIns = new Set(deriveInputsFromEntries(existing, entryKindByName).map((p) => p.name));
+		const derivedOuts = new Set(deriveOutputsFromEntries(existing, entryKindByName).map((p) => p.name));
+		const declaredNames = (ports: PortDefinition[], derived: Set<string>) =>
+			ports.filter((p) => p.declaredType !== undefined && !derived.has(p.name)).map((p) => p.name);
+		const collisions = entryPortCollisions(entry, others, entryKindByName, {
+			inputs: [...typeConfig.defaultInputs.map((p) => p.name), ...declaredNames(inputs, derivedIns)],
+			outputs: [...typeConfig.defaultOutputs.map((p) => p.name), ...declaredNames(outputs, derivedOuts)],
+		});
 		if (collisions.length > 0) {
 			toast.error(`Port name conflict: "${collisions.join('", "')}" already exists. Choose a different name.`);
 			return false;
 		}
 
-		updateConfig(
+		updatePortLiteral(
 			entryListKey,
 			replacing === null
 				? [...existing, entry]
@@ -1108,7 +1202,7 @@
 		const newPort: PortDefinition = {
 			name,
 			portType: 'MustOverride',
-			required: false,
+			required: true,
 		};
 		const newOutputs = [...outputs, newPort];
 		if (data.onUpdate) {
@@ -1148,7 +1242,7 @@
 	}
 
 	function toggleExpand(e: MouseEvent) {
-		if (!hasExpandableContent) return;
+		if (!hasExpandableContent || unconnectedAccess) return;
 		
 		const currentExpanded = (data.config?.expanded as boolean) ?? false;
 		if (data.onUpdate) {
@@ -1415,7 +1509,7 @@
 			{#if displayedStatus}
 				<span class="text-xs leading-none {displayedStatus === 'running' ? 'animate-pulse' : ''}" style="color: {getStatusBadgeColor(displayedStatus) ?? typeConfig.color};">{getStatusIcon(displayedStatus)}</span>
 			{/if}
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} label={data.label || typeConfig.label} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeConfig.label} />
 		</div>
 		<!-- Bare node: the content column is fixed to the square's inner width (the
 		     square side minus the 8px padding each side) so the node measures as a
@@ -1541,7 +1635,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} label={data.label || typeConfig.label} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} label={data.label || typeConfig.label} />
 		{#if isInclude}
 			<button
 				class="px-1.5 h-5 flex items-center gap-1 rounded hover:bg-violet-100 cursor-pointer transition-colors text-violet-600 text-[10px] font-medium nodrag nopan"
@@ -1553,9 +1647,10 @@
 		{/if}
 		{#if hasExpandableContent}
 			<button
-				class="w-5 h-5 flex items-center justify-center rounded hover:bg-black/5 cursor-pointer transition-colors text-zinc-400"
+				class="w-5 h-5 flex items-center justify-center rounded transition-colors text-zinc-400 {unconnectedAccess ? 'opacity-40 cursor-not-allowed' : 'hover:bg-black/5 cursor-pointer'}"
 				onclick={toggleExpand}
-				title={expanded ? 'Collapse' : 'Expand'}
+				disabled={unconnectedAccess}
+				title={unconnectedAccess ? 'Pick a connection first' : expanded ? 'Collapse' : 'Expand'}
 			>
 				{#if expanded}
 					<Minimize2 size={12} />
@@ -1603,6 +1698,7 @@
 			<div class="space-y-1 min-w-0 flex-1">
 				{#each wireableInputs as input}
 					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortColor(input.portType), 'input')}
+					{@const inputDeleteAction = portDeleteAction(input, providedInputs, canAddInputPorts)}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						class="relative flex items-center gap-1 group pl-3"
@@ -1622,11 +1718,11 @@
 							oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
 						/>
 						<span class="truncate">{input.name}</span>
-						{#if canAddInputPorts}
-							<button 
+						{#if inputDeleteAction}
+							<button
 								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 ml-auto text-xs leading-none"
 								onclick={(e) => { e.stopPropagation(); removeInputPort(input.name); }}
-								title="Remove port"
+								title={inputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 							>×</button>
 						{/if}
 					</div>
@@ -1660,6 +1756,7 @@
 			<div class="space-y-1 text-right flex flex-col items-end min-w-0 flex-1">
 				{#each outputs as output}
 				{@const oMarker = portMarkerStyle(output, oneOfRequiredPorts, literalFilledPorts, getPortColor(output.portType), 'output')}
+				{@const outputDeleteAction = portDeleteAction(output, providedOutputs, canAddOutputPorts)}
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<div
 					class="relative flex items-center gap-1 justify-end group pr-3"
@@ -1677,11 +1774,11 @@
 						class={oMarker.class}
 						oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: output.name, side: 'output', x: e.clientX, y: e.clientY }; }}
 					/>
-					{#if canAddOutputPorts}
-						<button 
+					{#if outputDeleteAction}
+						<button
 							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 mr-auto text-xs leading-none"
 							onclick={(e) => { e.stopPropagation(); removeOutputPort(output.name); }}
-							title="Remove port"
+							title={outputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 						>×</button>
 					{/if}
 					<span class="truncate" title={output.name}>{output.name}</span>
@@ -1792,48 +1889,47 @@
 				/>
 
 				{#snippet headerBadge(field: FieldDefinition)}
-					{#if field.portDriven}
-						{@const locked = portFieldLocked(field.key)}
-						{@const form = portFieldForm(field.key)}
-						{@const hasLiteral = isFilledIn(ownValue(portLiterals, field.key))}
-						<!-- The form-toggle marker: which SOURCE FORM this port's
-						     value is written in. Braces `{ }` vs statement `=`;
-						     a wired-only port is locked to the statement form.
-						     Its presence is also what distinguishes a port-driven
-						     field from a plain config field at a glance. -->
+					{#if fileRefOf(field.key)}
+						{@const ref = fileRefOf(field.key)}
+						{@const remote = remoteTextSource(field.key) !== null}
+						<!-- The chip doubles as the marker toggle: @file (editable,
+						     edits save to the file) <-> @asset (pull-only). Only
+						     text-backed refs reach here (fileRefOf is null for
+						     file-typed assets, which the file-drop field owns). A
+						     remote source (a URL, a stored file) is fetched at
+						     build and cannot flip: nothing to write back to. -->
 						<button
 							type="button"
 							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag transition-colors
-								{locked ? 'bg-muted text-muted-foreground/60 cursor-default' : 'bg-muted text-muted-foreground hover:bg-accent'}"
-							title={locked
-								? `Wired-only port: only the statement form (${id}.${field.key} = ...) can set it.`
-								: form === 'inline'
-									? `Written inside the node body ({ ${field.key}: ... }). Click to move it to a statement line (${id}.${field.key} = ...).`
-									: `Written as a statement (${id}.${field.key} = ...). Click to move it into the node body.`}
+								{ref?.marker === 'asset' ? 'bg-amber-100 text-amber-800 hover:bg-amber-200' : 'bg-muted text-muted-foreground hover:bg-accent'}"
+							title={remote
+								? `@asset(${ref?.path}): fetched at build, shown as its source.`
+								: ref?.marker === 'asset'
+									? `@asset(${ref?.path}): pull-only, not editable here. Click to switch to @file (editable).`
+									: `@file(${ref?.path}): edits save to this file. Click to switch to @asset (pull-only).`}
+							aria-label={ref?.marker === 'asset'
+								? `Switch ${ref?.path} to editable @file`
+								: `Switch ${ref?.path} to pull-only @asset`}
+							onclick={(e) => { e.stopPropagation(); switchFileMarker(field.key); }}
+						><span aria-hidden="true">{ref?.marker === 'asset' ? '🔒' : '📄'}</span> {ref?.path}</button>
+					{:else if field.portDriven}
+						{@const form = portFieldForm(field.key)}
+						{@const hasLiteral = isFilledIn(ownValue(portLiterals, field.key))}
+						<!-- The form-toggle marker: which SOURCE FORM this port's
+						     value is written in, braces `{ }` vs statement `=`.
+						     Spelling is never gated, so it always flips. -->
+						<button
+							type="button"
+							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag transition-colors bg-muted text-muted-foreground hover:bg-accent"
+							title={form === 'inline'
+								? `Written inside the node body ({ ${field.key}: ... }). Click to move it to a statement line (${id}.${field.key} = ...).`
+								: `Written as a statement (${id}.${field.key} = ...). Click to move it into the node body.`}
 							aria-label={`Toggle source form for ${field.key}`}
 							disabled={!hasLiteral}
 							onclick={(e) => { e.stopPropagation(); if (hasLiteral) togglePortValueForm(field.key); }}
 						><span aria-hidden="true">{form === 'inline' ? '{ }' : '='}</span></button>
 						<!-- The clear (×) button for checkbox/select port fields
 						     is FieldStrip's own, via onClear. -->
-					{:else if fileRefOf(field.key)}
-						{@const ref = fileRefOf(field.key)}
-						<!-- The chip doubles as the marker toggle: @file (editable,
-						     edits save to the file) <-> @asset (pull-only). Only
-						     text-backed refs reach here (fileRefOf is null for
-						     file-typed assets, which the file-drop field owns). -->
-						<button
-							type="button"
-							class="text-[9px] font-mono px-1 py-0.5 rounded nodrag transition-colors
-								{ref?.marker === 'asset' ? 'bg-amber-100 text-amber-800 hover:bg-amber-200' : 'bg-muted text-muted-foreground hover:bg-accent'}"
-							title={ref?.marker === 'asset'
-								? `@asset(${ref?.path}): pull-only, not editable here. Click to switch to @file (editable).`
-								: `@file(${ref?.path}): edits save to this file. Click to switch to @asset (pull-only).`}
-							aria-label={ref?.marker === 'asset'
-								? `Switch ${ref?.path} to editable @file`
-								: `Switch ${ref?.path} to pull-only @asset`}
-							onclick={(e) => { e.stopPropagation(); switchFileMarker(field.key); }}
-						><span aria-hidden="true">{ref?.marker === 'asset' ? '🔒' : '📄'}</span> {ref?.path}</button>
 					{/if}
 				{/snippet}
 
@@ -1889,7 +1985,13 @@
 									projectApp={typeConfig.accessApps?.[typeConfig.service.service]}
 									nodeType={data.nodeType}
 									value={declaredValue(field) as { id: string; identity?: string } | undefined}
-									onUpdate={(v) => updateFieldValue(field.key, v, field.portDriven)}
+									onUpdate={(v) =>
+										// Picking a connection unlocks the pin; persist the node
+										// as expanded IN THE SAME update so it doesn't snap shut
+										// the instant the pick lands. The pin lives on node data,
+										// never in config, so this `expanded: true` travels the
+										// ordinary layout path and sticks.
+										updateFieldValue(field.key, v, field.portDriven, v != null ? { expanded: true } : undefined)}
 								/>
 							{:else}
 								<div class="text-[10px] text-red-500">
@@ -1911,11 +2013,11 @@
 								onUpdate={(v) => updateFieldValue(field.key, v, field.portDriven)}
 							/>
 						{:else if field.type === "file_drop"}
-							<!-- Writes an `@asset("<path-or-url>", <Type>)` ref into
-							     config; the pre-build asset sync publishes the file and the
-							     compile substitutes the stored-file value the runtime folds
-							     onto the same-named input port (or the node reads from
-							     config). Source never holds storage keys. -->
+							<!-- Writes an `@asset("<path-or-url>", <Type>)` ref as the
+							     port's literal; the pre-build asset sync publishes the
+							     file and the compile substitutes the stored-file value
+							     the runtime delivers on the port. Source never holds
+							     storage keys. -->
 							<FileDropField
 								value={declaredValue(field)}
 								accept={field.accept}
@@ -2021,7 +2123,11 @@
 				{:else if displayedStatus === 'cancelled'}
 					<div class="debug-placeholder completed" style="color: #71717a;">
 						<span>■</span>
-						<span>{latestExecution?.error || 'Cancelled by user'}</span>
+						<span>
+							{latestExecution?.error
+								|| (runTerminal?.state === 'cancelled' ? runTerminal.reason : undefined)
+								|| 'Cancelled'}
+						</span>
 					</div>
 				{:else if displayedStatus === 'running' || displayedStatus === 'waiting_for_input'}
 					<div class="debug-placeholder running">

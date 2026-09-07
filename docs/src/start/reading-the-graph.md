@@ -34,6 +34,11 @@ Node positions are the exception. They live in a `layouts/` tree at the project
 root that mirrors your source paths, rather than in the `.weft` file, because
 where a box sits on a canvas is not part of what the program does.
 
+A dotted wire with a label like `.stats.wpm` at its end is a wire that reads
+one key off the value it carries, the graph form of
+`speed.wpm = reader.profile.stats.wpm`. Right-click a wire to pick a key, one
+level at a time, or to go back to reading the whole value.
+
 ## The square in the top-left corner
 
 Every box, node or group, has a small square on its top-left edge, apart from
@@ -123,25 +128,25 @@ It is also why debugging scales, and why groups cost nothing at run time:
 
 ## One file, several programs
 
-A `.weft` file is not one program. Nothing in it declares an entry point, and
-what runs is worked out per run by starting from the outputs and walking
-backwards, so a file holding six triggers and nine outputs holds however many
-programs those add up to. A fire pulls its own path through and leaves the rest
-alone.
+A `.weft` file is not one program. Nothing in it declares an entry point:
+a run starts from where its first pulses are put (every root, for a manual
+run; the fired trigger, for a fire), so a file holding six triggers holds
+six programs. A fire runs its own program and leaves the rest alone.
 
 That changes how you lay one out. Every process a team has can sit on one
-canvas where you see them together, instead of split across files because the
-runtime would otherwise run all of it at once. A branch you are half way
-through building sits there costing nothing, because nothing pulls on it.
+canvas where you see them together, instead of split across files, because
+fires stay inside their own programs. A branch you are half way through
+building costs nothing on a fire (no trigger reaches it); a plain manual
+run kicks every root in the file, so aim it at what you mean to run.
 
 It also makes something worth keeping: a cluster of nodes you reach for often,
 parked off to one side and wired to nothing. Copy it into a new path when you
 need it, wire it up, and only that path fires.
 
 And when you want one result out of a busy canvas, aim the run at it. Right
-click an output node, **Set as target**, and it starts breathing in its own
-colour while the Run button becomes "Run 1 target". Target a few and it counts
-them. Right click again to unset.
+click a node, **Set as target**, and it starts breathing in its own colour
+while the Run button becomes "Run 1 target". Target a few and it counts them.
+Right click again to unset.
 
 From the terminal it is the same thing:
 
@@ -149,10 +154,9 @@ From the terminal it is the same thing:
 weft run --target daily_report
 ```
 
-Either way it is the same walk given a smaller starting set:
-[What actually runs](../language/mental-model.md#what-actually-runs). Only
-output nodes can be targets, because a run aimed at a middle node would produce
-something nothing collects.
+Either way it is the same run from a smaller set of first pulses, and any
+node can be the target:
+[What actually runs](../language/mental-model.md#what-actually-runs).
 
 An aimed run also answers only to what it would execute. If the targets'
 joined subgraph reaches no trigger, the Run button shows up even in a project

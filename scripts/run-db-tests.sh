@@ -50,7 +50,7 @@ if [ -z "${DATABASE_URL:-}" ]; then
   # Trap installed BEFORE the start: the helper exports the container
   # name before running it, so a Ctrl-C during the pull or the
   # readiness wait still removes it.
-  trap 'docker rm -f "${THROWAWAY_PG_CONTAINER:-}" >/dev/null 2>&1 || true' EXIT
+  trap 'docker rm -f -v "${THROWAWAY_PG_CONTAINER:-}" >/dev/null 2>&1 || true' EXIT
   start_throwaway_postgres weft-db-tests || exit 1
   export DATABASE_URL="$THROWAWAY_DATABASE_URL"
 fi

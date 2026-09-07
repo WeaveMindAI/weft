@@ -31,6 +31,6 @@ async fn emits_provider(rig: FakeRig) -> WeftResult<()> {
 async fn refuses_without_connection(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&AnthropicProviderNode, json!({ "model": "claude-sonnet-4-5" })).await;
     let err = outcome.result.expect_err("no connection must refuse").to_string();
-    assert!(err.contains("no connection picked"), "{err}");
+    assert!(err.contains("no anthropic connection picked"), "{err}");
     Ok(())
 }

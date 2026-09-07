@@ -6,7 +6,7 @@
 	import type { NodeDataUpdates, PortDefinition, NodeExecution, FieldDefinition } from "../../types";
 	import { getPortTypeColor } from "../../constants/colors";
 	import { GROUP_PORTS_TOP_PX, CONFIG_STRIP_BAR_PX, configStripOpenPx } from "../../constants/container-layout";
-	import { createPortContextMenu, buildPortMenuItems } from '../../utils/port-context-menu';
+	import { openPortMenu, buildPortMenuItems } from '../../utils/port-context-menu';
 	import { classifyInputPort, classifyOutputPort, removeFromOverAndCarry } from '../../utils/loop-port-roles';
 	import { toast } from 'svelte-sonner';
 	import { portMarkerStyle } from '../../utils/port-marker';
@@ -38,7 +38,6 @@
 			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
-			features?: { oneOfRequired?: string[][] };
 			onUpdate?: (updates: NodeDataUpdates) => void;
 			executions?: NodeExecution[];
 			executionCount?: number;
@@ -57,6 +56,12 @@
 				site: import('../../../../protocol').CorruptionSite;
 				reason: string;
 			}>;
+			/// The run's own tags (`ctx.tag_execution`), the same on
+			/// every node; the inspector footer shows them.
+			executionTags?: string[];
+			/// How the run ended, the same on every node; the inspector
+			/// footer names a cancel's cause from it.
+			runTerminal?: import('../../types').ExecutionTerminal;
 			/// Loop-specific inspector events for this loop group.
 			/// Empty for ordinary groups.
 			loopEvents?: import('../../../../protocol').LoopInspectorEvent[];
@@ -97,11 +102,9 @@
 			: []
 	));
 
-	// One-of-required groups on the group's interface ports: parsed from
-	// `@require_one_of(a, b)` directives in the group signature. Same shape
-	// as regular node features.oneOfRequired.
-	const oneOfRequiredGroups: string[][] = $derived(data.features?.oneOfRequired ?? []);
-	const oneOfRequiredPorts: Set<string> = $derived(new Set(oneOfRequiredGroups.flat()));
+	// A container takes no `@require_one_of` (the directive lives on the
+	// node inside that needs the ports), so no port here is one-of-required.
+	const oneOfRequiredPorts: Set<string> = new Set();
 	const isExpanded = $derived((data.config?.expanded as boolean) ?? true);
 	const groupDescription = $derived((data.config?.description as string) ?? '');
 	let descExpanded = $state(false);
@@ -111,6 +114,8 @@
 	// group's inspector shows the combined IRC view per bus.
 	const busLogs = $derived(data.busLogs ?? []);
 	const journalCorruptions = $derived(data.journalCorruptions ?? []);
+	const executionTags = $derived(data.executionTags ?? []);
+	const runTerminal = $derived(data.runTerminal);
 	const loopEvents = $derived(data.loopEvents ?? []);
 
 	const isLoop = $derived(isLoopNodeType(data.nodeType));
@@ -266,18 +271,13 @@
 	let newOutputName = $state('');
 	let portContextMenu = $state<{ portName: string; side: 'input' | 'output'; x: number; y: number } | null>(null);
 
-	function togglePortRequired(portName: string, side: 'input' | 'output') {
-		if (side === 'input') {
-			const newInputs = inputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ inputs: newInputs });
-		} else {
-			const newOutputs = outputs.map((p: PortDefinition) =>
-				p.name === portName ? { ...p, required: !p.required } : { ...p }
-			);
-			data.onUpdate?.({ outputs: newOutputs });
-		}
+	// Inputs only: requiredness has no runtime meaning on an output, and
+	// the menu offers the row on inputs alone.
+	function setInputPortRequired(portName: string, required: boolean) {
+		const newInputs = inputs.map((p: PortDefinition) =>
+			p.name === portName ? { ...p, required } : { ...p }
+		);
+		data.onUpdate?.({ inputs: newInputs });
 	}
 
 	function setPortType(portName: string, side: 'input' | 'output', newType: string) {
@@ -340,49 +340,52 @@
 		}
 	}
 
-	// Port context menu rendered on document.body to avoid CSS transform positioning issues.
-	// Group interface ports are always user-added and always support custom
-	// add/remove, so isCustom=true and canAddPorts=true for every port.
+	// Port context menu rendered on document.body to avoid CSS transform
+	// positioning issues. This effect tracks ONLY `portContextMenu`
+	// (open/close); openPortMenu builds the items untracked, as a
+	// snapshot of the gesture (see its doc). Group interface ports are
+	// always user-added and always support custom add/remove, so every
+	// port's delete action is a true removal.
 	$effect(() => {
 		if (!portContextMenu) return;
 		const { portName, side, x, y } = portContextMenu;
-		const port = side === 'input'
-			? inputs.find((p: PortDefinition) => p.name === portName)
-			: outputs.find((p: PortDefinition) => p.name === portName);
-		if (!port) return;
+		return openPortMenu({ x, y }, () => {
+			const port = side === 'input'
+				? inputs.find((p: PortDefinition) => p.name === portName)
+				: outputs.find((p: PortDefinition) => p.name === portName);
+			if (!port) return null;
 
-		const loopRole = isLoop
-			? (side === 'input'
-				? (() => {
-					const c = classifyInputPort(port, (data.config as Record<string, unknown>) ?? {});
-					return {
-						currentRole: c.role,
-						conflictReason: c.conflictReason,
-						onToggleRole: () => cycleLoopRole(portName, side),
-					};
-				})()
-				: (() => {
-					const c = classifyOutputPort(port, (data.config as Record<string, unknown>) ?? {}, inputs);
-					return {
-						currentRole: c.role,
-						conflictReason: c.conflictReason,
-						onToggleRole: () => cycleLoopRole(portName, side),
-					};
-				})())
-			: undefined;
+			const loopRole = isLoop
+				? (side === 'input'
+					? (() => {
+						const c = classifyInputPort(port, (data.config as Record<string, unknown>) ?? {});
+						return {
+							currentRole: c.role,
+							conflictReason: c.conflictReason,
+							onToggleRole: () => cycleLoopRole(portName, side),
+						};
+					})()
+					: (() => {
+						const c = classifyOutputPort(port, (data.config as Record<string, unknown>) ?? {}, inputs);
+						return {
+							currentRole: c.role,
+							conflictReason: c.conflictReason,
+							onToggleRole: () => cycleLoopRole(portName, side),
+						};
+					})())
+				: undefined;
 
-		const items = buildPortMenuItems({
-			port,
-			side,
-			isCustom: true,
-			canAddPorts: true,
-			onToggleRequired: () => togglePortRequired(portName, side),
-			onSetType: (newType) => setPortType(portName, side, newType),
-			onRemove: () => removePort(side, portName),
-			loopRole,
-		});
-
-		return createPortContextMenu(x, y, items, () => { portContextMenu = null; });
+			return buildPortMenuItems({
+				port,
+				...(side === 'input'
+					? { side, onSetRequired: (required: boolean) => setInputPortRequired(portName, required) }
+					: { side }),
+				deleteAction: 'remove',
+				onSetType: (newType) => setPortType(portName, side, newType),
+				onRemove: () => removePort(side, portName),
+				loopRole,
+			});
+		}, () => { portContextMenu = null; });
 	});
 
 	function computeMinHeightFor(numInputs: number, numOutputs: number, collapsed: boolean): number {
@@ -445,7 +448,7 @@
 				toast.error(`Output port "${trimmed}" already exists.`);
 				return;
 			}
-			currentOutputs.push({ name: trimmed, portType: 'MustOverride', required: false });
+			currentOutputs.push({ name: trimmed, portType: 'MustOverride', required: true });
 		}
 		// Send the port change alone. If the extra port grows the group past its
 		// current height, the min-height `$effect` above fires right after this
@@ -564,7 +567,7 @@
 			<span class="header-label" ondblclick={startEditLabel} title="Double-click to rename">{data.label || 'Group'}</span>
 		{/if}
 		<div class="flex items-center gap-0.5" style="margin-left: auto;">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {loopEvents} label={data.label || 'Group'} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 			<button class="expand-toggle" onclick={toggleExpand} title="Collapse group">
 				<Minimize2 size={12} />
 			</button>
@@ -656,7 +659,7 @@
 						type="target"
 						position={Position.Left}
 						id={input.name}
-						title={!input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
+						title={input.name}
 						style={pMarker.style}
 						class={pMarker.class}
 						oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
@@ -840,7 +843,7 @@
 <div class="simplified-node rounded-lg select-none" class:selected
 	style="width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: {SIMPLIFIED_SQUARE_PAD_PX}px; background: rgba(255,255,255,0.95); border: 1px solid {selected ? containerColor : 'rgba(0,0,0,0.08)'}; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);">
 	<div class="absolute top-1 right-1 flex items-center gap-0.5 nodrag nopan">
-		<ExecutionInspector {executions} {busLogs} {journalCorruptions} {loopEvents} label={data.label || 'Group'} />
+		<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 		<button class="expand-toggle" onclick={toggleExpand} title="Expand group"><Maximize2 size={12} /></button>
 	</div>
 	<!-- Fixed-width content column so a collapsed container measures as a uniform
@@ -878,7 +881,7 @@
 			{/if}
 		</div>
 		<div class="flex items-center gap-0.5">
-			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {loopEvents} label={data.label || 'Group'} />
+			<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
 			<button class="expand-toggle" onclick={toggleExpand} title="Expand group">
 				<Maximize2 size={12} />
 			</button>
@@ -939,7 +942,7 @@
 							type="target"
 							position={Position.Left}
 							id={input.name}
-							title={!input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
+							title={input.name}
 							style="top: 50%; {pMarker.style}"
 							class={pMarker.class}
 							oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
@@ -1038,6 +1041,15 @@
 	   rules restate the hex. The config strip takes its colour from the
 	   container instead, through the `--strip-color` property set inline. */
 	/* ═══════════════ EXPANDED MODE ═══════════════ */
+	/* The expanded group draws ABOVE the wires (ProjectEditorInner puts the
+	   wrapper at z-index 3, edges at 1) so its header, and the collapse
+	   button on it, win the click in a crowded graph. The price is paid
+	   here: the body is see-through and lets the pointer through, so a wire
+	   crossing it is still visible and still the thing you click; only the
+	   parts that mean something catch the pointer (header, config strip,
+	   side ports, the flow dock, the resize handles). The wrapper itself is
+	   `pointer-events: none` (set globally on `.svelte-flow__node-group`),
+	   so the group is dragged by its header. */
 	.expanded-container {
 		width: 100%;
 		height: 100%;
@@ -1047,6 +1059,16 @@
 		min-width: 250px;
 		min-height: 200px;
 		position: relative;
+		pointer-events: none;
+	}
+	.expanded-header,
+	.config-strip,
+	.expanded-side-ports {
+		pointer-events: auto;
+	}
+	:global(.svelte-flow__node-group .svelte-flow__resize-control),
+	:global(.svelte-flow__node-group .svelte-flow__handle) {
+		pointer-events: auto;
 	}
 
 	.expanded-container.selected {

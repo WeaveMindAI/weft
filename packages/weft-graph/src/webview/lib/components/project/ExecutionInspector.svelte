@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Search } from '@lucide/svelte';
-	import type { NodeExecution } from '../../types';
+	import type { ExecutionTerminal, NodeExecution } from '../../types';
 	import type { BusInspectorEvent, BusMeta, CorruptionSite, LoopInspectorEvent, LoopIteration } from '../../../../protocol';
 	import { parseFileValue } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
@@ -13,12 +13,24 @@
 		executions = [],
 		busLogs = [],
 		journalCorruptions = [],
+		executionTags = [],
+		runTerminal = undefined,
 		loopEvents = [],
 		label = 'Node',
 	}: {
 		executions: NodeExecution[];
 		busLogs?: Array<{ busId: string; events: BusInspectorEvent[]; meta?: BusMeta }>;
 		journalCorruptions?: Array<{ site: CorruptionSite; reason: string }>;
+		/// The tags the RUN put on itself (`ctx.tag_execution`), the
+		/// same for every node of the run. Shown in the footer so a
+		/// person can see what a sibling's `ctx.stop_tagged` would
+		/// select this run by.
+		executionTags?: string[];
+		/// How the RUN ended, the same for every node of the run. The
+		/// footer names a cancel's cause from it: a sibling's stop by
+		/// tag shows the run and the tag (the structured cause), any
+		/// other cancel shows its reason text.
+		runTerminal?: ExecutionTerminal;
 		/// Loop lifecycle events for the loop group this inspector
 		/// belongs to. Empty for non-loop nodes (ordinary groups and
 		/// catalog nodes). The inspector renders a per-instance card
@@ -187,12 +199,14 @@
 	}
 	const selected = $derived(executions[selectedIndex]);
 
+	// The stamps are the journal's, in whole seconds, so the readout
+	// claims no finer resolution than the data has.
 	function formatDuration(startMs: number, endMs?: number): string {
 		if (!endMs) return 'running...';
-		const ms = endMs - startMs;
-		if (ms < 1000) return `${ms}ms`;
-		if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
-		return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+		const secs = Math.round((endMs - startMs) / 1000);
+		if (secs < 1) return '<1s';
+		if (secs < 60) return `${secs}s`;
+		return `${Math.floor(secs / 60)}m ${secs % 60}s`;
 	}
 
 	function formatCost(usd: number): string {
@@ -504,6 +518,20 @@
 				<span class="font-mono">{costLabel(selected)}</span>
 			{/if}
 			<span>{new Date(selected.startedAt).toLocaleString()}</span>
+			{#if executionTags.length > 0}
+				<span class="font-mono" title="Tags the run put on itself (ctx.tag_execution)">tags: {executionTags.join(', ')}</span>
+			{/if}
+			{#if runTerminal?.state === 'cancelled'}
+				{#if runTerminal.cause?.kind === 'execution'}
+					<!-- The structured cause: the run that asked is a color a
+					     person can look up, the tag is what it matched on. -->
+					<span title="Stopped by execution {runTerminal.cause.by} (a sibling run's stop_tagged)">
+						stopped by run <span class="font-mono">{runTerminal.cause.by.slice(0, 8)}</span> on tag <span class="font-mono">{runTerminal.cause.tag}</span>
+					</span>
+				{:else if runTerminal.reason}
+					<span title="How this run ended (the cancel's cause)">ended: {runTerminal.reason}</span>
+				{/if}
+			{/if}
 		</div>
 	</Dialog.Content>
 </Dialog.Root>

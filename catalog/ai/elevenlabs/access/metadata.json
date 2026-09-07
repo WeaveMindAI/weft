@@ -92,7 +92,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -103,24 +102,7 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The ElevenLabs access: wire it into an ElevenLabs node's account input."
-    }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "ElevenLabsAccess '{id}' has no connection picked; pick one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
     }
   ],
   "requires_infra": false

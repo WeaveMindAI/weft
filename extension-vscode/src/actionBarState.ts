@@ -34,6 +34,7 @@ import type {
   ActionErrorDiagnostic,
   ActionVerb,
   BackendSnapshot,
+  BarPhase,
   CliEvent,
   ErrorVerb,
 } from '../../packages/weft-graph/src/protocol';
@@ -50,7 +51,7 @@ interface Slot {
   follow: FollowState;
   cli: {
     verb: ActionVerb;
-    phase: CliEvent['phase'];
+    phase: BarPhase;
     detail?: Record<string, unknown>;
   } | undefined;
   /// HTTP-driven verb awaiting confirmation. Currently only used
@@ -219,10 +220,13 @@ export class ActionBarStore {
     this.notifyIfPinned(projectId);
   }
 
-  cliStart(projectId: string, verb: ActionVerb): void {
+  /// A verb is in flight from the moment of the CLICK: the gated verbs
+  /// start in the extension-side 'preflight' phase (the saved-state
+  /// check before any CLI spawn), everything else at 'build_start'.
+  cliStart(projectId: string, verb: ActionVerb, phase: BarPhase = 'build_start'): void {
     const slot = this.ensureSlot(projectId);
     slot.error = undefined;
-    slot.cli = { verb, phase: 'build_start' };
+    slot.cli = { verb, phase };
     this.notifyIfPinned(projectId);
   }
 

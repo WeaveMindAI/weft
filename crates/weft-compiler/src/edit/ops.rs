@@ -25,7 +25,7 @@ use rowan::NodeOrToken;
 
 use super::{EditError, PortSig};
 use crate::cst::kind::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
-use crate::cst::nodes::{Body, Decl, FileView, InlineExpr, Resolution, WeftFile};
+use crate::cst::nodes::{Body, Decl, Endpoint, FileView, InlineExpr, Resolution, WeftFile};
 use crate::cst::parse;
 
 /// Apply one op to the mutable CST `view` (the file root + its source identity,
@@ -55,8 +55,8 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
             add_decl(view, parent_group.as_deref(), id, &format!("{id} = {node_type} {{}}"))
         }
         RemoveNode { node } => remove_node(view, node),
-        AddEdge { source, source_port, target, target_port, scope_group } => {
-            add_edge(view, scope_group.as_deref(), source, source_port, target, target_port)
+        AddEdge { source, source_port, target, target_port, scope_group, path } => {
+            add_edge(view, scope_group.as_deref(), source, source_port, target, target_port, path)
         }
         RemoveEdge { source, source_port, target, target_port, scope_group } => {
             remove_edge(view, scope_group.as_deref(), source, source_port, target, target_port)
@@ -68,8 +68,10 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         RenameGroup { group, new_label } => rename_container(view, group, new_label, ContainerKind::Group),
         MoveNodeScope { node, target_group } => move_scope(view, node, target_group.as_deref(), ContainerKind::Node),
         MoveGroupScope { group, target_group } => move_scope(view, group, target_group.as_deref(), ContainerKind::Group),
-        UpdateNodePorts { node, inputs, outputs } => update_ports(view, node, inputs, outputs, ContainerKind::Node),
-        UpdateGroupPorts { group, inputs, outputs } => update_ports(view, group, inputs, outputs, ContainerKind::Group),
+        UpdateNodePorts { node, inputs, outputs, removed_inputs, removed_outputs } => {
+            update_node_ports(view, node, inputs, outputs, removed_inputs, removed_outputs)
+        }
+        UpdateGroupPorts { group, inputs, outputs } => update_container_ports(view, group, inputs, outputs, ContainerKind::Group),
         SetGroupDescription { group, description } => {
             set_group_description(view, group, description.as_deref())
         }
@@ -81,7 +83,7 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         RemoveLoop { loop_id } => remove_loop(view, loop_id),
         RenameLoop { loop_id, new_label } => rename_container(view, loop_id, new_label, ContainerKind::Loop),
         MoveLoopScope { loop_id, target_group } => move_scope(view, loop_id, target_group.as_deref(), ContainerKind::Loop),
-        UpdateLoopPorts { loop_id, inputs, outputs } => update_ports(view, loop_id, inputs, outputs, ContainerKind::Loop),
+        UpdateLoopPorts { loop_id, inputs, outputs } => update_container_ports(view, loop_id, inputs, outputs, ContainerKind::Loop),
         SetValueForm { node, key, form } => set_value_form(view, node, key, *form),
         SetLoopConfig { loop_id, key, value } => set_loop_config(view, loop_id, key, value),
         RemoveLoopConfig { loop_id, key } => remove_loop_config(view, loop_id, key),
@@ -158,10 +160,61 @@ fn validate_ident(what: &str, s: &str) -> Result<(), EditError> {
 /// heredoc that closes on a later fence in the user's own source would reparse
 /// that source as a value). Only "does this parse as a type" rejects those.
 fn validate_port_type(what: &str, ty: &str) -> Result<(), EditError> {
+    // The STRUCTURAL gate runs on every spelling, parseable or not: a
+    // legal weft type can still be one the header lexer cannot carry
+    // (it nests on `[...]` and `{...}` only, so a parenthesized union
+    // splits into phantom ports on reparse, verified against the real
+    // parser). Parseability decides nothing about that.
+    structurally_header_safe(what, ty)?;
     if weft_core::WeftType::parse(ty).is_some() {
         return Ok(());
     }
-    Err(EditError::InvalidArgument(format!("{what} {ty:?} is not a valid type")))
+    // The parser deliberately KEEPS an unknown type in a header (as a
+    // recoverable `MustOverride` with a squiggle naming it), so a declared
+    // spelling that does not parse must round-trip through here unchanged:
+    // refusing it would block every ports gesture on a node whose header
+    // holds a typo, and dropping it would erase the author's text. Only a
+    // string the header cannot carry is refused, and that was checked
+    // above. A colon or a `?` INSIDE the spelling round-trips (the port
+    // parser splits on the first colon), so they are allowed; a
+    // TRAILING `?` is refused because the port parser refuses the
+    // `name: Type?` spelling outright (`?` sits on the name), so the
+    // header could never be read back.
+    if ty.trim_end().ends_with('?') {
+        return Err(EditError::InvalidArgument(format!("{what} {ty:?} is not a valid type")));
+    }
+    Ok(())
+}
+
+/// What the HEADER lexer can carry as one port's type, regardless of
+/// whether it parses as a type. It nests on `[...]` and `{...}`: outside
+/// them a comma or a paren ends the port (a parenthesized union splits
+/// into phantom ports on reparse, verified against the real parser), so
+/// a record with any number of fields is one port. A newline, a comment
+/// marker, a quote or a backtick would end or swallow the header. An `=`
+/// is fine: `Name=Body` is the alias form the catalog itself spells, and
+/// the header parser reads it as one type.
+fn structurally_header_safe(what: &str, ty: &str) -> Result<(), EditError> {
+    let refuse = || Err(EditError::InvalidArgument(format!("{what} {ty:?} is not a valid type")));
+    // A stack, not a counter: `[` must close with `]` and `{` with `}`, or
+    // the header lexer's balanced scan for the other bracket runs to end
+    // of file.
+    let mut open: Vec<char> = Vec::new();
+    for c in ty.chars() {
+        match c {
+            '[' | '{' => open.push(c),
+            ']' if open.pop() != Some('[') => return refuse(),
+            '}' if open.pop() != Some('{') => return refuse(),
+            ']' | '}' => {}
+            ',' | '(' | ')' if open.is_empty() => return refuse(),
+            '\n' | '\r' | '#' | '"' | '`' => return refuse(),
+            _ => {}
+        }
+    }
+    if !open.is_empty() || ty.trim().is_empty() {
+        return refuse();
+    }
+    Ok(())
 }
 
 /// A caller-supplied LOCAL ID (a node/group/loop id, a rename target): it must
@@ -454,9 +507,19 @@ fn body_owner_indent(body: &Body) -> String {
 }
 
 /// Append `elements` at the end of the file root (after the last child).
+/// Append `elements` as new lines at the end of the file. A file whose
+/// last byte is not a newline (`}` on the final line, no trailing
+/// newline) gets one first, so the appended statement never fuses onto
+/// that line (`}out.data = ...`).
 fn append_to_file(file: &WeftFile, elements: Vec<SyntaxElement>) {
     let count = file.syntax().children_with_tokens().count();
-    file.syntax().splice_children(count..count, elements);
+    let text = file.syntax().text().to_string();
+    let mut all = Vec::with_capacity(elements.len() + 1);
+    if !text.is_empty() && !text.ends_with('\n') {
+        all.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, "\n")]));
+    }
+    all.extend(elements);
+    file.syntax().splice_children(count..count, all);
 }
 
 /// Detach a node and the contiguous whitespace token that immediately precedes
@@ -470,6 +533,19 @@ fn detach_with_leading_ws(node: &SyntaxNode) {
         if t.kind() == SyntaxKind::WHITESPACE {
             t.detach();
         }
+    }
+}
+
+/// Detach a body member by its kind: a CONFIG_FIELD may sit in a
+/// comma-separated one-line body and takes its separator with it; any
+/// other member (a connection line, a whole decl) has no comma and only
+/// carries its leading whitespace. Every removal of something that can
+/// be a config field goes through here, so no caller can strand a comma.
+fn detach_body_member(node: &SyntaxNode) {
+    if node.kind() == SyntaxKind::CONFIG_FIELD {
+        detach_field_with_separator(node);
+    } else {
+        detach_with_leading_ws(node);
     }
 }
 
@@ -631,7 +707,7 @@ fn extract_inline(
         };
         replace_value_after(&holder, sep, &format!("{local}.{out_port}"))?;
     } else {
-        detach_with_leading_ws(&holder);
+        detach_body_member(&holder);
     }
     Ok((local, scoped))
 }
@@ -777,7 +853,7 @@ fn remove_node(view: &FileView, node_id: &str) -> Result<(), EditError> {
             }
         }
         let holder = inline_holder(inline)?;
-        detach_with_leading_ws(&holder);
+        detach_body_member(&holder);
         return Ok(());
     }
     // A named node: its inline DRIVERS are neighbor nodes too. Extract
@@ -796,7 +872,7 @@ fn remove_node(view: &FileView, node_id: &str) -> Result<(), EditError> {
     // into it. Detached first, the reference simply never appears in
     // the extracted declaration.
     for f in endpoint_fields {
-        detach_with_leading_ws(&f);
+        detach_body_member(&f);
     }
     for child in body_children {
         extract_inline(view, &child, false)?;
@@ -817,13 +893,6 @@ fn remove_node(view: &FileView, node_id: &str) -> Result<(), EditError> {
     }
     detach_with_leading_ws(decl.syntax());
     Ok(())
-}
-
-/// True if a CONNECTION node has an endpoint whose id equals `local`.
-fn connection_touches_local(conn: &SyntaxNode, local: &str) -> bool {
-    conn.children()
-        .filter(|n| n.kind() == SyntaxKind::ENDPOINT)
-        .any(|ep| ep_parts(&ep).0.as_deref() == Some(local))
 }
 
 /// (id, port) of an ENDPOINT node, via the typed view's single extractor.
@@ -851,9 +920,35 @@ fn remove_loop(view: &FileView, loop_id: &str) -> Result<(), EditError> {
 }
 
 fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditError> {
-    let local = decl.local_id().unwrap_or_default();
+    let before = source_meaning(view);
+    let scoped = view.scoped_id_of(&decl).ok_or_else(|| EditError::ContainerNotFound(id.into()))?;
     let body = decl.body().ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
     let decl_syntax = decl.syntax();
+
+    // Reuse the scope-aware references for every spelling and every scope.
+    // The container's own `self` bindings disappear as well, including ones
+    // in a child's braces. Nested containers keep their own `self`.
+    let boundary_refs = decl_syntax.descendants().filter(|node| {
+        matches!(node.kind(), SyntaxKind::CONNECTION | SyntaxKind::CONFIG_FIELD)
+            && connection_is_boundary(node)
+            && node.ancestors().find(|ancestor| matches!(ancestor.kind(), SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL))
+                .is_some_and(|owner| owner == *decl_syntax)
+    });
+    let mut references: Vec<_> = view.connections_referencing(&decl).into_iter()
+        .chain(view.endpoint_fields_referencing(&decl)).chain(boundary_refs).collect();
+    let mut seen = std::collections::HashSet::new();
+    references.retain(|reference| seen.insert(reference.clone()));
+    // Clear inner references before an enclosing inline is serialized into
+    // a named orphan, so serialization cannot revive a deleted wire.
+    references.sort_by_key(|reference| std::cmp::Reverse(reference.ancestors().count()));
+    for reference in references {
+        if reference.parent().is_none() { continue; }
+        if let Some(inline) = reference.children().find_map(InlineExpr::cast) {
+            extract_inline(view, &inline, false)?;
+        } else {
+            detach_body_member(&reference);
+        }
+    }
 
     let group_indent = leading_indent(decl_syntax);
     let inner_indent = format!("{group_indent}  ");
@@ -861,7 +956,7 @@ fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditErr
     let mut moved_src = String::new();
     for child in body.syntax().children() {
         match child.kind() {
-            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL | SyntaxKind::INCLUDE_DECL => {
+            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL | SyntaxKind::INCLUDE_DECL | SyntaxKind::TYPE_DECL => {
                 moved_src.push_str(&dedent_block(&child.to_string(), &inner_indent));
                 moved_src.push('\n');
             }
@@ -877,13 +972,6 @@ fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditErr
         }
     }
     let parent = decl_syntax.parent().unwrap_or_else(|| view.file().syntax().clone());
-    let external: Vec<SyntaxNode> = parent
-        .children()
-        .filter(|n| n.kind() == SyntaxKind::CONNECTION && connection_touches_local(n, &local))
-        .collect();
-    for c in external {
-        detach_with_leading_ws(&c);
-    }
     // Replace the group with the ungrouped children, in the SLOT the group
     // occupied (children stay where the group was, not appended at the end like
     // `move_scope` does, so order relative to siblings is preserved). The children
@@ -908,14 +996,13 @@ fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditErr
     if !moved_src.is_empty() {
         parent.splice_children(start..start, snippet_elements(&format!("{lead_breaks}{moved_src}")));
     }
-    Ok(())
+    check_scope_meaning(view, &before, &scoped, None)
 }
 
 /// True if a connection INSIDE the group body is boundary wiring, i.e. it has a
 /// `self` endpoint (`self.x = ...` / `... = self.x`). A connection is the only
-/// internal boundary form; the EXTERNAL legs (parent-scope connections that name
-/// the group's port) are detached separately by the caller via
-/// `connection_touches_local`. We must NOT also drop an inner connection that
+/// internal boundary form; external legs are found by the scope-aware
+/// FileView reference queries. We must NOT also drop an inner connection that
 /// merely names the group's local id: inside the body that id resolves to a
 /// CHILD of the same name (Weft's same-scope rule), so a real wire between two
 /// children where one shadows the group name would be wrongly discarded.
@@ -1225,7 +1312,7 @@ fn set_or_insert_field(decl: &Decl, key: &str, value: &str) -> Result<(), EditEr
         // (e.g. a batched op sequence) or after a hand edit. Collapse them here so
         // the tree is self-healing.
         for dup in existing.iter().skip(1) {
-            detach_with_leading_ws(dup);
+            detach_body_member(dup);
         }
         return Ok(());
     }
@@ -1331,8 +1418,254 @@ fn decl_header_text(decl: &Decl) -> String {
 /// occurrences so accumulated duplicates are cleaned by a single RemoveConfig.
 fn remove_field(decl: &Decl, key: &str) {
     for field in find_fields(decl, key) {
-        detach_with_leading_ws(&field);
+        detach_body_member(&field);
     }
+}
+
+/// Remove a field together with its LIST SEPARATOR. In a one-line body
+/// (`{ a: 1, b: 2 }`) fields are comma-separated, and detaching only the
+/// field strands the comma (`{ a: 1,}`, `{ a: 1,, c: 3 }`, `{, b: 2 }`
+/// depending on position). Which comma goes: the one before the field,
+/// except when a surviving trailing comment sits between them and a
+/// comma follows the field, where the one after goes instead (so no
+/// separator strands after the comment); a removed FIRST field has no
+/// comma before, so the one after goes; and when the removed field was
+/// the LAST one, whichever comma remains would dangle before the brace
+/// and goes too. In a newline-separated body no comma flanks the field,
+/// so only the field and its leading trivia go.
+fn detach_field_with_separator(field: &SyntaxNode) {
+    // Walk back over the field's leading trivia, deciding what leaves
+    // with the field. Whitespace goes; a comment ALONE ON ITS LINE goes
+    // too (it describes this field and would orphan onto the next one).
+    // A comment trailing a content line (`a: 1 # note`) SURVIVES, and
+    // once one survives nothing further is taken: the whitespace run
+    // after it holds the newline that terminates it (deleting that
+    // newline swallows everything up to `}` into the comment), and the
+    // whitespace before it separates it from the value it annotates.
+    // The walk still continues past a surviving comment so the
+    // separating comma is found wherever it sits.
+    let mut taken: Vec<SyntaxToken> = Vec::new();
+    let mut pending_ws: Vec<SyntaxToken> = Vec::new();
+    let mut comment_survives = false;
+    let mut cur = field.prev_sibling_or_token();
+    loop {
+        match &cur.clone() {
+            Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::WHITESPACE => {
+                pending_ws.push(t.clone());
+                cur = t.prev_sibling_or_token();
+            }
+            Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::COMMENT => {
+                let newline_after = pending_ws.last().is_some_and(|w| w.text().contains('\n'));
+                let newline_before = matches!(
+                    t.prev_sibling_or_token(),
+                    Some(NodeOrToken::Token(w))
+                        if w.kind() == SyntaxKind::WHITESPACE && w.text().contains('\n')
+                );
+                if newline_after && newline_before && !comment_survives {
+                    taken.append(&mut pending_ws);
+                    taken.push(t.clone());
+                } else {
+                    pending_ws.clear();
+                    comment_survives = true;
+                }
+                cur = t.prev_sibling_or_token();
+            }
+            _ => break,
+        }
+    }
+    if !comment_survives {
+        taken.append(&mut pending_ws);
+    }
+    // The separating comma is a sibling token, or (the parser is not
+    // consistent here) the LAST token inside the previous field node.
+    let comma_before = match &cur {
+        Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::COMMA => Some(t.clone()),
+        Some(NodeOrToken::Node(n)) => n
+            .last_child_or_token()
+            .and_then(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::COMMA),
+        _ => None,
+    };
+    // The comma AFTER the field, when one exists (with the whitespace
+    // between them). The separator to take when there is none before
+    // (the first field), and PREFERRED when a surviving comment sits
+    // between the comma before and the field: taking that comma would
+    // strand it alone after the comment.
+    let mut ws_after: Vec<SyntaxToken> = Vec::new();
+    let mut after = field.next_sibling_or_token();
+    while let Some(NodeOrToken::Token(t)) = &after {
+        if t.kind() != SyntaxKind::WHITESPACE {
+            break;
+        }
+        ws_after.push(t.clone());
+        after = t.next_sibling_or_token();
+    }
+    let comma_after = match &after {
+        Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::COMMA => Some(t.clone()),
+        _ => None,
+    };
+
+    match (comma_before, &comma_after) {
+        (Some(comma), after) if !(comment_survives && after.is_some()) => {
+            for w in taken {
+                w.detach();
+            }
+            // Same-line whitespace hugging the comma from its left goes with
+            // it (`{ a: 1 , b }` minus `b` must not leave a double space),
+            // unless a surviving comment sits between comma and field: that
+            // whitespace then separates the previous value from the comment.
+            if !comment_survives {
+                if let Some(NodeOrToken::Token(w)) = comma.prev_sibling_or_token() {
+                    if w.kind() == SyntaxKind::WHITESPACE && !w.text().contains('\n') {
+                        w.detach();
+                    }
+                }
+            }
+            // A trailing comma that would dangle once this LAST field leaves
+            // (`{ a, b, }` minus `b`) goes too, with the space before it.
+            detach_dangling_trailing_comma(field);
+            comma.detach();
+            detach_field_leaving_brace_ws(field);
+        }
+        (before, Some(comma)) => {
+            // Take the comma after (the first field, or the surviving-
+            // comment preference above): `{ a: 1, b: 2 }` minus `a`
+            // leaves `{ b: 2 }`. A plain detach: the whitespace after
+            // the taken comma becomes the next field's lead, so no
+            // brace-space splice applies (splicing here doubled the
+            // space when the field carried its own trailing run).
+            //
+            // When the removed field was the LAST one, the comma taken
+            // here was the body's dangling trailing comma, and the
+            // separator BEFORE the field (kept for the surviving
+            // comment's sake) would now dangle in its place; it must
+            // go too. Decided before anything detaches.
+            let field_was_last = {
+                let mut nxt = comma.next_sibling_or_token();
+                loop {
+                    match &nxt {
+                        Some(NodeOrToken::Token(t))
+                            if matches!(t.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT) =>
+                        {
+                            nxt = t.next_sibling_or_token();
+                        }
+                        Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::R_BRACE => break true,
+                        None => break true,
+                        _ => break false,
+                    }
+                }
+            };
+            for w in ws_after {
+                w.detach();
+            }
+            // When the field's own leading run STAYS (a surviving
+            // comment kept it), the same-line whitespace on the comma's
+            // far side would double against it, so it leaves too.
+            if comment_survives {
+                if let Some(NodeOrToken::Token(w)) = comma.next_sibling_or_token() {
+                    if w.kind() == SyntaxKind::WHITESPACE && !w.text().contains('\n') {
+                        w.detach();
+                    }
+                }
+            }
+            comma.detach();
+            for t in taken {
+                t.detach();
+            }
+            if field_was_last {
+                if let Some(before) = before {
+                    // The same-line whitespace hugging the now-dangling
+                    // separator goes with it (`"x" ,` must not become
+                    // `"x" ` with a double space against what follows).
+                    if let Some(NodeOrToken::Token(w)) = before.prev_sibling_or_token() {
+                        if w.kind() == SyntaxKind::WHITESPACE && !w.text().contains('\n') {
+                            w.detach();
+                        }
+                    }
+                    before.detach();
+                }
+            }
+            field.detach();
+        }
+        _ => {
+            // No comma either side: a newline-separated or single-field
+            // body; the field leaves with its leading trivia only.
+            for t in taken {
+                t.detach();
+            }
+            detach_field_leaving_brace_ws(field);
+        }
+    }
+}
+
+/// Detach `field`, leaving behind the whitespace it carried before the
+/// closing brace. The LAST field of a one-line body holds `}`'s layout
+/// space INSIDE itself (`size: 3 ` in `{ a: 1, size: 3 }`), so a plain
+/// detach would glue the previous value onto the brace. Skipped when
+/// what now precedes the field already ends in whitespace (`{ a: 1 , b }`:
+/// the space lives inside the previous field), where the splice would
+/// double it.
+fn detach_field_leaving_brace_ws(field: &SyntaxNode) {
+    let prev_ends_in_ws = match field.prev_sibling_or_token() {
+        Some(NodeOrToken::Token(t)) => t.kind() == SyntaxKind::WHITESPACE,
+        Some(NodeOrToken::Node(n)) => n
+            .last_child_or_token()
+            .and_then(|e| e.into_token())
+            .is_some_and(|t| t.kind() == SyntaxKind::WHITESPACE),
+        None => false,
+    };
+    let trailing_ws = field
+        .last_child_or_token()
+        .and_then(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::WHITESPACE)
+        .filter(|_| !prev_ends_in_ws)
+        .map(|t| t.text().to_string());
+    match (trailing_ws, field.parent()) {
+        (Some(ws), Some(parent)) => {
+            let idx = field.index();
+            parent
+                .splice_children(idx..idx + 1, raw_token_elements(&[(SyntaxKind::WHITESPACE, &ws)]));
+        }
+        _ => field.detach(),
+    }
+}
+
+/// Detach the comma AFTER `field` when nothing but the closing brace
+/// follows it: once the field leaves, that trailing comma separates
+/// nothing (`{ a, b, }` minus `b` must end `{ a }`, not `{ a, }`).
+/// Same-line whitespace between field and comma goes with it.
+fn detach_dangling_trailing_comma(field: &SyntaxNode) {
+    let mut cur = field.next_sibling_or_token();
+    let mut ws: Vec<SyntaxToken> = Vec::new();
+    while let Some(NodeOrToken::Token(t)) = &cur {
+        if t.kind() != SyntaxKind::WHITESPACE {
+            break;
+        }
+        ws.push(t.clone());
+        cur = t.next_sibling_or_token();
+    }
+    let Some(NodeOrToken::Token(comma)) = cur else { return };
+    if comma.kind() != SyntaxKind::COMMA {
+        return;
+    }
+    // Only when the brace is all that follows: a comma with another
+    // field after it is that field's own separator.
+    let mut after = comma.next_sibling_or_token();
+    while let Some(NodeOrToken::Token(t)) = &after {
+        if t.kind() != SyntaxKind::WHITESPACE {
+            break;
+        }
+        after = t.next_sibling_or_token();
+    }
+    match after {
+        Some(NodeOrToken::Token(t)) if t.kind() == SyntaxKind::R_BRACE => {}
+        None => {}
+        _ => return,
+    }
+    for w in ws {
+        w.detach();
+    }
+    comma.detach();
 }
 
 /// The verbatim VALUE text of a field/connection node: the token run
@@ -1527,6 +1860,7 @@ fn add_edge(
     source_port: &str,
     target: &str,
     target_port: &str,
+    path: &[String],
 ) -> Result<(), EditError> {
     // An endpoint naming an INLINE node (fan-out from its output, a wire
     // into one of its inputs) de-inlines it first, keeping its existing
@@ -1534,6 +1868,8 @@ fn add_edge(
     let source = deinline_endpoint(view, scope_group, source)?;
     let target = deinline_endpoint(view, scope_group, target)?;
     let (source, target) = (source.as_str(), target.as_str());
+    // Validate the scope even when an in-place rewire needs no insertion.
+    let insertion_target = target_body(view, scope_group)?;
     // Both endpoints must exist (or be `self`). Refs are SCOPE-LOCAL: `x`
     // inside scope `G` means `G.x`, not a file-wide `x`.
     require_endpoint(view, scope_group, source)?;
@@ -1543,10 +1879,48 @@ fn add_edge(
     // would carry structure into the connection line and inject source.
     validate_ident("source port", source_port)?;
     validate_ident("target port", target_port)?;
+    for key in path {
+        validate_ident("path key", key)?;
+    }
+    let mut rhs = format!("{source}.{source_port}");
+    for key in path {
+        rhs.push('.');
+        rhs.push_str(key);
+    }
+    // A port already driven by a plain wire keeps the spelling it was
+    // written in: the statement's right-hand side, or the braces
+    // field's value, is swapped in place (a rewire, a key read off the
+    // same source). Anything else (an inline driver, an unwired port)
+    // clears the driver and writes a fresh statement.
+    let is_plain_wire = |n: &SyntaxNode| {
+        n.children().any(|c| c.kind() == SyntaxKind::ENDPOINT)
+            && !n.children().any(|c| c.kind() == SyntaxKind::INLINE_EXPR)
+    };
+    let literal_driver_error = || EditError::InvalidArgument(format!(
+        "cannot wire '{target}.{target_port}': it has an explicit literal; clear the value first"
+    ));
+    if let Ok(conn) = find_connection(view, scope_group, target, target_port, None, None) {
+        if crate::cst::nodes::connection_is_config_origin(&conn, None, None) {
+            return Err(literal_driver_error());
+        }
+        if is_plain_wire(&conn) {
+            return replace_connection_rhs(&conn, &rhs);
+        }
+    }
+    if let Some(decl) = resolve_in_scope(view, scope_group, target) {
+        for field in find_fields(&decl, target_port) {
+            if is_plain_wire(&field) {
+                return replace_value_after(&field, SyntaxKind::COLON, &rhs);
+            }
+            if !field.children().any(|child| child.kind() == SyntaxKind::INLINE_EXPR) {
+                return Err(literal_driver_error());
+            }
+        }
+    }
     // Remove the existing driver of this target port in the same scope.
     remove_driver(view, scope_group, target, target_port)?;
-    let conn = format!("{target}.{target_port} = {source}.{source_port}");
-    match target_body(view, scope_group)? {
+    let conn = format!("{target}.{target_port} = {rhs}");
+    match insertion_target {
         InsertTarget::FileRoot(f) => {
             append_to_file(&f, snippet_elements(&format!("{conn}\n")));
             Ok(())
@@ -1569,7 +1943,8 @@ fn add_edge(
 /// in an UNRELATED scope; the two-probe rule is scope-local, immediate match
 /// winning.
 /// SYNC: require_endpoint <-> crates/weft-compiler/src/weft_compiler.rs
-/// rescope_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to
+/// rescope_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to,
+/// packages/weft-graph/src/webview/lib/projection/apply.ts resolveEndpoint
 fn require_endpoint(view: &FileView, scope_group: Option<&str>, id: &str) -> Result<(), EditError> {
     // An anon inline-node id (`host__key`; `__` is reserved in source
     // identifiers, so nothing else carries it) cannot be an endpoint:
@@ -1638,15 +2013,29 @@ fn remove_driver(
         return Ok(());
     }
     let Some(decl) = resolve_in_scope(view, scope_group, target) else { return Ok(()) };
-    let Some(field) = find_fields(&decl, target_port).into_iter().next() else { return Ok(()) };
-    if let Some(inline) = field
-        .children()
-        .find(|n| n.kind() == SyntaxKind::INLINE_EXPR)
-        .and_then(InlineExpr::cast)
-    {
-        extract_inline(view, &inline, false)?;
-    } else if field.children().any(|n| n.kind() == SyntaxKind::ENDPOINT) {
-        detach_with_leading_ws(&field);
+    detach_body_driver(view, &decl, target_port)
+}
+
+/// Detach the BODY field driving `key` on `decl`, if it is a wire: an
+/// inline-expression driver is extracted to a named decl (node kept, wire
+/// dropped), an endpoint driver's line is removed. A LITERAL fill is not a
+/// wire and is left alone. Shared by the driver removal and the node
+/// port-removal sweep.
+fn detach_body_driver(view: &FileView, decl: &Decl, key: &str) -> Result<(), EditError> {
+    // ALL same-key fields, not just the first: duplicates accumulate (a
+    // batched op sequence, a hand edit; `set_or_insert_field` heals them
+    // on write, `remove_field` sweeps them all), and a surviving second
+    // driver re-creates the port on the next parse.
+    for field in find_fields(decl, key) {
+        if let Some(inline) = field
+            .children()
+            .find(|n| n.kind() == SyntaxKind::INLINE_EXPR)
+            .and_then(InlineExpr::cast)
+        {
+            extract_inline(view, &inline, false)?;
+        } else if field.children().any(|n| n.kind() == SyntaxKind::ENDPOINT) {
+            detach_body_member(&field);
+        }
     }
     Ok(())
 }
@@ -1692,7 +2081,7 @@ fn remove_edge(
                     id.as_deref() == Some(source_local) && port.as_deref() == Some(source_port)
                 });
             if endpoint_matches {
-                detach_with_leading_ws(&field);
+                detach_body_member(&field);
                 return Ok(());
             }
         }
@@ -1853,7 +2242,8 @@ fn rename_container(
     // "references this decl" means). An endpoint resolving to the container
     // has its head IDENT (the old LOCAL label) replaced. Collect the
     // connection handles first (resolve-then-mutate), then rewrite.
-    let refs = view.connections_referencing(&decl);
+    let refs: Vec<_> = view.connections_referencing(&decl).into_iter()
+        .chain(view.endpoint_fields_referencing(&decl)).collect();
     replace_token_text(&id_tok, new_label);
     for c in refs {
         for ep in c.children().filter(|n| n.kind() == SyntaxKind::ENDPOINT) {
@@ -2016,8 +2406,97 @@ fn value_elements(value: &str) -> Result<Vec<SyntaxElement>, EditError> {
     Ok(raw_token_elements(&pairs))
 }
 
+/// Use the compiler's actual name/type resolution for scope edits. No file I/O
+/// is needed; unresolved external files remain the same diagnostics on both
+/// sides. Reimplementing an alias resolver in the editor would drift.
+fn source_meaning(view: &FileView) -> (weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::CompileError>) {
+    crate::weft_compiler::compile_lenient(
+        &view.file().syntax().to_string(), uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::none(), crate::weft_compiler::IncludeMode::Full,
+        Some(view.source_id()),
+    )
+}
+
+fn check_scope_meaning(
+    view: &FileView,
+    before: &(weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::CompileError>),
+    from: &str,
+    to: Option<&str>,
+) -> Result<(), EditError> {
+    let after = source_meaning(view);
+    let mut prior_errors = std::collections::HashMap::<&str, usize>::new();
+    for error in &before.1 { *prior_errors.entry(&error.message).or_default() += 1; }
+    for error in &after.1 {
+        if let Some(count) = prior_errors.get_mut(error.message.as_str()) {
+            if *count > 0 { *count -= 1; continue; }
+        }
+        return Err(EditError::InvalidArgument(format!(
+            "scope change would make the source invalid: {}", error.message
+        )));
+    }
+    let after_nodes: std::collections::HashMap<_, _> = after.0.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let parent = from.rsplit_once('.').map(|(parent, _)| parent).unwrap_or("");
+    for node in &before.0.nodes {
+        let next_id = match node.id.strip_prefix(from) {
+            Some(suffix) if suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with("__") => {
+                match to {
+                    Some(target) => format!("{target}{suffix}"),
+                    None if suffix.starts_with('.') => {
+                        if parent.is_empty() { suffix[1..].to_string() } else { format!("{parent}{suffix}") }
+                    }
+                    None => continue, // the removed container's own boundary nodes
+                }
+            }
+            _ => node.id.clone(),
+        };
+        let Some(next) = after_nodes.get(next_id.as_str()) else {
+            // Extracting an anonymous inline changes its generated identity.
+            // Named children must survive a move or an ungroup unchanged.
+            if node.id.contains("__") { continue; }
+            return Err(EditError::InvalidArgument(format!("scope change would lose node '{}'", node.id)));
+        };
+        let next_ports: std::collections::HashMap<_, _> = port_contracts(next)
+            .map(|(side, port)| ((side, port.name.as_str()), port)).collect();
+        for (side, port) in port_contracts(node) {
+                if port.port_type == weft_core::WeftType::MustOverride { continue; }
+                if !next_ports.get(&(side, port.name.as_str()))
+                    .is_some_and(|new| new.port_type == port.port_type && new.required == port.required) {
+                    return Err(EditError::InvalidArgument(format!(
+                        "scope change would change {side} '{}.{}' ({}); keep its type declaration in scope",
+                        node.id, port.name, port.port_type.wire_string(),
+                    )));
+                }
+        }
+        let marker_counts = |definition: &weft_core::project::NodeDefinition| {
+            let mut counts = std::collections::HashMap::<String, usize>::new();
+            for value in definition.config.as_object().into_iter().flat_map(|map| map.values())
+                .chain(definition.port_literals.values()) {
+                for reference in crate::file_ref::refs_in_value(value) {
+                    *counts.entry(reference.resolution_key()).or_default() += 1;
+                }
+            }
+            counts
+        };
+        let next_refs = marker_counts(next);
+        for (reference, count) in marker_counts(node) {
+            if next_refs.get(&reference).copied().unwrap_or(0) < count {
+                return Err(EditError::InvalidArgument(format!(
+                    "scope change would change a file reference's declared type on '{}'; keep its type declaration in scope", node.id,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn port_contracts(node: &weft_core::project::NodeDefinition)
+    -> impl Iterator<Item = (&'static str, &weft_core::project::PortDefinition)> {
+    node.inputs.iter().map(|input| ("input", &input.port))
+        .chain(node.outputs.iter().map(|output| ("output", output)))
+}
+
 /// Move a node/group into a target scope (None = file root). Detach the decl's
-/// subtree (as text, re-indented) and re-insert it in the target.
+/// subtree (as text, re-indented) and re-insert it without changing its bindings.
 fn move_scope(
     view: &FileView,
     id: &str,
@@ -2074,6 +2553,10 @@ fn move_scope(
     // (would make two same-id decls), before mutating anything.
     reject_if_taken(view, target_group, &local)?;
 
+    let before = source_meaning(view);
+    let previous_id = scoped.as_deref().ok_or_else(|| EditError::NodeNotFound(id.into()))?;
+    let next_id = target_group.map(|parent| format!("{parent}.{local}")).unwrap_or_else(|| local.clone());
+
     // The node's connection-origin config fields (`x.style = "v"`, separate
     // CONNECTION lines in the CURRENT scope) belong to the node and travel with
     // it; collect them first.
@@ -2089,11 +2572,23 @@ fn move_scope(
     let blocking: Vec<SyntaxNode> = view.connections_referencing(&decl)
         .into_iter()
         .filter(|c| !origin_fields.iter().any(|o| o == c))
+        .chain(view.endpoint_fields_referencing(&decl))
         .collect();
-    if !blocking.is_empty() {
+    // A plain node also owns implicit-target wires in its braces (including
+    // nested inline nodes). Containers carry their body wiring with them.
+    let incoming = if matches!(decl, Decl::Node(_)) {
+        decl.body().map(|body| body.syntax().descendants().filter(|node| {
+            match node.kind() {
+                SyntaxKind::CONFIG_FIELD => node.children().any(|n| n.kind() == SyntaxKind::ENDPOINT),
+                SyntaxKind::CONNECTION => node.children().filter(|n| n.kind() == SyntaxKind::ENDPOINT).count() > 1,
+                _ => false,
+            }
+        }).count()).unwrap_or(0)
+    } else { 0 };
+    if !blocking.is_empty() || incoming != 0 {
         return Err(EditError::InvalidArgument(format!(
             "cannot move '{id}': it is wired by {} connection(s) that would cross the scope boundary; disconnect them first",
-            blocking.len()
+            blocking.len() + incoming
         )));
     }
     // Each origin field's text owns its leading newline trivia; trim block edges
@@ -2109,7 +2604,7 @@ fn move_scope(
     let block = dedent_block(&decl.syntax().to_string(), &old_indent).trim().to_string();
     detach_with_leading_ws(decl.syntax());
     for f in &origin_fields {
-        detach_with_leading_ws(f);
+        detach_body_member(f);
     }
 
     // Re-insert the decl + its origin fields at the target, one per line.
@@ -2121,13 +2616,13 @@ fn move_scope(
     match target_body(view, target_group)? {
         InsertTarget::FileRoot(f) => {
             append_to_file(&f, snippet_elements(&format!("\n{combined}\n")));
-            Ok(())
         }
         InsertTarget::GroupBody { body, indent } => {
             let reindented = indent_block(&combined, &indent);
-            insert_before_close(&body, snippet_elements(&format!("{reindented}\n")))
+            insert_before_close(&body, snippet_elements(&format!("{reindented}\n")))?;
         }
     }
+    check_scope_meaning(view, &before, previous_id, Some(&next_id))
 }
 
 /// The connection-origin config fields (`{local}.key = value` CONNECTION lines)
@@ -2178,35 +2673,23 @@ fn map_lines_outside_heredoc(block: &str, f: impl Fn(&str) -> String) -> String 
     out.join("\n")
 }
 
-/// Rewrite a node/group's COMPLETE port signature: rebuild the decl with
+/// Rewrite a GROUP/LOOP's COMPLETE port signature: rebuild the decl with
 /// `id = Type` + the new signature as its header, preserving the body
-/// verbatim. The new signature is the single source of the decl's ports, so
-/// connections bound to ports that left the signature are detached first:
-/// leaving them would fail validation on the next build (the editor's
-/// delete-port gesture relies on the wire dying with the port).
-fn update_ports(
+/// verbatim. For a container the signature is the single source of its
+/// ports, so connections bound to ports that left the signature are
+/// detached first: leaving them would fail validation on the next build
+/// (the editor's delete-port gesture relies on the wire dying with the
+/// port). Nodes go through [`update_node_ports`], where the header is
+/// NOT the whole surface.
+fn update_container_ports(
     view: &FileView,
     id: &str,
     inputs: &[PortSig],
     outputs: &[PortSig],
     expected: ContainerKind,
 ) -> Result<(), EditError> {
-    // Both halves of every port sig are written into the decl's HEADER, which is
-    // then reparsed, so both are validated at the door: the NAME must be a
-    // single identifier, and the TYPE must actually parse as a type.
-    for p in inputs.iter().chain(outputs.iter()) {
-        validate_ident("port name", &p.name)?;
-        if let Some(ty) = p.port_type.as_deref() {
-            validate_port_type("port type", ty)?;
-        }
-    }
+    validate_port_sigs(inputs, outputs)?;
     let decl = resolve(view, id)?;
-    // Editing an INLINE node's port signature: de-inline (wire kept)
-    // and rewrite the named decl's header (an inline has none).
-    if let (ContainerKind::Node, Decl::InlineNode(inline)) = (expected, &decl) {
-        let (_, scoped) = extract_inline(view, inline, true)?;
-        return update_ports(view, &scoped, inputs, outputs, expected);
-    }
     if !expected.matches(&decl) {
         return Err(kind_mismatch(
             &format!("Update{}Ports", expected.op_name()),
@@ -2220,11 +2703,138 @@ fn update_ports(
     // can't be named by any parent leg, so the parent-scope sweep is skipped;
     // its `self.<port>` body wiring is still swept.
     detach_dangling_port_connections(&decl, decl.local_id().as_deref(), inputs, outputs);
-    let header = decl_header_text(&decl);
+    rewrite_port_header(&decl, inputs, outputs)
+}
+
+/// Rewrite a NODE's DECLARED port surface (see `EditOp::UpdateNodePorts`):
+/// the header lists only the custom/overridden ports; the catalog provides
+/// the node type's own ports at enrich, which this edit layer cannot see.
+/// So no signature diff can say which ports are gone: only the ports the
+/// gesture explicitly REMOVED lose their wires (a port merely absent from
+/// the header may be a catalog port with live wires). Removal TRUSTS
+/// its producer: whether a name may be removed at all is catalog
+/// knowledge, which only the editor holds (it hides the gesture for a
+/// port the node type provides and routes an override's deletion
+/// through a revert instead), so this layer sweeps what it is told to
+/// and a name with nothing to sweep is an idempotent no-op.
+fn update_node_ports(
+    view: &FileView,
+    id: &str,
+    inputs: &[PortSig],
+    outputs: &[PortSig],
+    removed_inputs: &[String],
+    removed_outputs: &[String],
+) -> Result<(), EditError> {
+    validate_port_sigs(inputs, outputs)?;
+    let decl = resolve(view, id)?;
+    // Editing an INLINE node's port signature: de-inline (wire kept)
+    // and rewrite the named decl's header (an inline has none).
+    if let Decl::InlineNode(inline) = &decl {
+        let (_, scoped) = extract_inline(view, inline, true)?;
+        return update_node_ports(view, &scoped, inputs, outputs, removed_inputs, removed_outputs);
+    }
+    if !ContainerKind::Node.matches(&decl) {
+        return Err(kind_mismatch("UpdateNodePorts", id, "Node", &decl));
+    }
+    let removed_ins: std::collections::HashSet<&str> =
+        removed_inputs.iter().map(String::as_str).collect();
+    let removed_outs: std::collections::HashSet<&str> =
+        removed_outputs.iter().map(String::as_str).collect();
+    if let Some(local) = decl.local_id() {
+        detach_parent_connections(&decl, |conn| {
+            // A literal config fill (`n.key = value`) is never a wire; see
+            // detach_dangling_port_connections for why it must survive.
+            if crate::cst::nodes::connection_is_config_origin(conn, None, None) {
+                return false;
+            }
+            let (t_id, t_port) = endpoint_parts(conn, 0);
+            let (s_id, s_port) = endpoint_parts(conn, 1);
+            (t_id.as_deref() == Some(local.as_str())
+                && removed_ins.contains(t_port.as_deref().unwrap_or("")))
+                || (s_id.as_deref() == Some(local.as_str())
+                    && removed_outs.contains(s_port.as_deref().unwrap_or("")))
+        });
+    }
+    // A wire can also be written INSIDE the node's own braces
+    // (`n = Custom { b: src.value }`); the parent-scope sweep never sees
+    // it, and left behind it re-creates the port (via a config key on a
+    // node that accepts custom inputs) or fails the next build. A literal
+    // fill is not a wire and survives here; the editor removes it through
+    // RemoveConfig, since only it can tell a port literal from a config
+    // value. Outputs cannot be driven from a body, so only inputs sweep.
+    // The ORDERED list drives the walk (an inline driver's extraction
+    // appends a decl per name, and set order would make the emitted
+    // source, and its undo TextEdit, nondeterministic).
+    for name in removed_inputs {
+        detach_body_driver(view, &decl, name)?;
+    }
+    // Another node's BODY can read a removed OUTPUT (`d = Debug { data:
+    // n.custom }`); the parent-scope sweep only sees statement lines, so
+    // the braces-endpoint references get walked too and the ones bound
+    // to a removed output die with it (leaving one keeps a wire the
+    // canvas already dropped, and the next parse resurrects it).
+    if !removed_outputs.is_empty() {
+        for field in view.endpoint_fields_referencing(&decl) {
+            let port = field
+                .children()
+                .find(|n| n.kind() == SyntaxKind::ENDPOINT)
+                .and_then(Endpoint::cast)
+                .and_then(|e| e.parts().1);
+            if port.as_deref().is_some_and(|p| removed_outs.contains(p)) {
+                detach_body_member(&field);
+            }
+        }
+    }
+    rewrite_port_header(&decl, inputs, outputs)
+}
+
+/// Both halves of every port sig are written into the decl's HEADER, which is
+/// then reparsed, so both are validated at the door: the NAME must be a
+/// single identifier, and the TYPE must actually parse as a type.
+fn validate_port_sigs(inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), EditError> {
+    for (side, ports) in [("input", inputs), ("output", outputs)] {
+        let mut names = std::collections::HashSet::new();
+        for p in ports {
+            validate_ident("port name", &p.name)?;
+            validate_port_type("port type", &p.port_type)?;
+            if !names.insert(&p.name) {
+                return Err(EditError::InvalidArgument(format!("duplicate {side} port '{}'", p.name)));
+            }
+        }
+    }
+    // An output has no optionality, so the header never carries `?` on
+    // one; a sig asking for it would author a line the parser refuses.
+    if let Some(p) = outputs.iter().find(|p| !p.required) {
+        return Err(EditError::InvalidArgument(format!(
+            "output port {:?} cannot be optional: an output carries no `?`",
+            p.name
+        )));
+    }
+    Ok(())
+}
+
+/// Rebuild the decl with `id = Type` + the new signature as its header,
+/// preserving the body verbatim.
+fn rewrite_port_header(decl: &Decl, inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), EditError> {
+    let header = decl_header_text(decl);
     // head = `id = Type` (everything up to the first `(` or `->`).
     let (head, _) = split_header_head(&header);
     let new_header = format!("{}{}", head.trim_end(), build_signature(inputs, outputs));
-    rebuild_decl(&decl, &new_header)
+    rebuild_decl(decl, &new_header)
+}
+
+/// Detach the parent-scope CONNECTION lines around `decl` that `doomed`
+/// condemns. Shared by the two port-surface sweeps (a group's signature
+/// diff, a node's removed list).
+fn detach_parent_connections(decl: &Decl, doomed: impl Fn(&SyntaxNode) -> bool) {
+    let Some(parent) = decl.syntax().parent() else { return };
+    let victims: Vec<SyntaxNode> = parent
+        .children()
+        .filter(|n| n.kind() == SyntaxKind::CONNECTION && doomed(n))
+        .collect();
+    for c in victims {
+        detach_with_leading_ws(&c);
+    }
 }
 
 /// Detach connections bound to ports outside the NEW signature, in the two
@@ -2288,15 +2898,7 @@ fn detach_dangling_port_connections(decl: &Decl, id: Option<&str>, inputs: &[Por
     // Parent-scope sweep: only when the decl has a local name a parent leg
     // could reference. An anonymous root group (id None) has no parent legs.
     if id.is_some() {
-        if let Some(parent) = decl.syntax().parent() {
-            let doomed: Vec<SyntaxNode> = parent
-                .children()
-                .filter(|n| n.kind() == SyntaxKind::CONNECTION && dangling(n, false))
-                .collect();
-            for c in doomed {
-                detach_with_leading_ws(&c);
-            }
-        }
+        detach_parent_connections(decl, |n| dangling(n, false));
     }
     if let Some(body) = decl.body() {
         // Only `self` endpoints: a body child that SHADOWS the container's
@@ -2418,9 +3020,9 @@ fn split_header_head(header: &str) -> (String, String) {
 /// Build a `(in) -> (out)` signature string from port sigs.
 fn build_signature(inputs: &[PortSig], outputs: &[PortSig]) -> String {
     let fmt = |p: &PortSig| {
-        let ty = p.port_type.as_deref().unwrap_or("MustOverride");
+        let ty = p.port_type.as_str();
         let opt = if p.required { "" } else { "?" };
-        format!("{}: {ty}{opt}", p.name)
+        format!("{}{opt}: {ty}", p.name)
     };
     let ins: Vec<String> = inputs.iter().map(fmt).collect();
     let outs: Vec<String> = outputs.iter().map(fmt).collect();

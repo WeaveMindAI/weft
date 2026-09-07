@@ -14,7 +14,7 @@
 	// switch and no second tab.
 	import { accessCall, openExternalUrl } from '../../../host';
 	import type { AccessSpecWire, AppRegistration, Door, GrantSummary } from '../../../../protocol';
-	import { defaultPermissions, guideSteps, ownFields, tickablePermissions } from './own-fields';
+	import { defaultPermissions, guideLink, guideSteps, ownFields, tickablePermissions } from './own-fields';
 	import { grantsForService, invalidateGrants } from './grants-cache.svelte';
 	import PermissionPicker from './PermissionPicker.svelte';
 
@@ -39,7 +39,9 @@
 		onUpdate: (v: { id: string; identity?: string } | null) => void;
 	} = $props();
 
+	// SYNC: label <-> crates/weft-core/src/access/spec.rs AccessSpec::display_label
 	const label = $derived(spec.label ?? spec.service);
+	// SYNC: isConsent <-> crates/weft-core/src/access/spec.rs AccessSpec::needs_browser_consent
 	const isConsent = $derived(
 		spec.acquisition.kind === 'oauth2' &&
 			spec.acquisition.grant?.kind === 'authorization_code',
@@ -56,11 +58,11 @@
 	/// One registered app the shared door offers as its own option:
 	/// its label and its FIXED permission set. The user picks an
 	/// option; they never tick permissions on the shared door.
-	// SYNC: SharedAppChoice <-> crates/weft-access-store/src/lib.rs SharedAppChoice
+	// SYNC: SharedAppChoice <-> crates/weft-core/src/access/wire.rs SharedAppChoice
 	type SharedAppChoice = { label: string; covers: string[] };
 	/// The doors probe's answer: the shared-door options (DoorsAnswer,
 	/// flattened) plus the consent surface facts.
-	// SYNC: DoorsStatus <-> crates/weft-dispatcher/src/api/access.rs DoorsStatus, crates/weft-access-store/src/lib.rs DoorsAnswer (its flattened core)
+	// SYNC: DoorsStatus <-> crates/weft-core/src/access/wire.rs DoorsStatus, crates/weft-core/src/access/wire.rs DoorsAnswer (its flattened core)
 	type DoorsStatus = {
 		shared_apps: SharedAppChoice[];
 		shared_credential: boolean;
@@ -81,6 +83,8 @@
 	/// connects stay available, every consent button hides.
 	let consentBlocked = $state<string | null>(null);
 	let ticked = $state<string[]>([]);
+	/// The own-page guide link with the ticked permission ids interpolated.
+	const providerGuideLink = $derived(guideLink(spec, ticked));
 	let formValues = $state<Record<string, string>>({});
 	/// The paste-a-credential section's own values, separate from the
 	/// app fields: the two sections submit independently.
@@ -121,6 +125,7 @@
 		busy = true;
 		try {
 			connections = await grantsForService(spec.service);
+			// SYNC: the doors request body <-> crates/weft-core/src/access/wire.rs DoorsRequest
 			const doors = await accessCall<DoorsStatus>('POST', 'doors', { spec });
 			sharedApps = doors.shared_apps;
 			sharedCredential = doors.shared_credential;
@@ -566,8 +571,8 @@
 					</button>
 					{#if guideOpen}
 						<div class="text-[10px] text-muted-foreground bg-blue-50 rounded px-2 py-1.5 space-y-1">
-							{#if spec.own_page.guide.link}
-								<button type="button" class="text-blue-500 hover:underline" onclick={(e) => { e.stopPropagation(); openExternalUrl(spec.own_page!.guide!.link!); }}>Open the provider's page</button>
+							{#if providerGuideLink}
+								<button type="button" class="text-blue-500 hover:underline" onclick={(e) => { e.stopPropagation(); openExternalUrl(providerGuideLink); }}>Open the provider's page</button>
 							{/if}
 							{#each guideSteps(spec, ticked) as step, i}
 								<p>{i + 1}. {step}</p>

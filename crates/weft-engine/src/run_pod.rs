@@ -33,7 +33,7 @@ use weft_task_store::{
 };
 
 use crate::context::EngineClients;
-use crate::execution_driver::run_one_execution;
+use crate::execution_driver::{run_one_execution, ExecutionOutcome};
 
 /// How long the worker picker sits idle (no claimable work) before
 /// attempting its guarded self-exit. The grace this gives a burst
@@ -268,7 +268,9 @@ pub async fn run_pod(
         g.values().cloned().collect()
     };
     for f in flags {
-        f.cancel();
+        f.cancel_because(weft_core::exec::CancelCause::Runtime {
+            detail: "the worker pod running this execution was shutting down".into(),
+        });
     }
     shutdown.store(true, Ordering::Relaxed);
     // Money bookkeeping outlives the executions: wait for every in-flight
@@ -501,7 +503,7 @@ impl crate::caller_conn::ExecutionCanceller for RegistryCanceller {
         let reg = self.cancel_registry.clone();
         tokio::spawn(async move {
             if let Some(flag) = reg.lock().await.get(&color).cloned() {
-                flag.cancel();
+                flag.cancel_because(weft_core::exec::CancelCause::CallerGone);
             }
         });
     }
@@ -608,10 +610,28 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
         )
         .await;
 
-        // If the run failed while a caller is attached, tell the caller why
-        // (per the error mode) instead of leaving a silently dropped socket.
-        if let (Some(conn), Err(e)) = (&caller_for_error, &outcome) {
-            conn.surface_error(&format!("execution failed: {e}")).await;
+        // A caller is attached and the run did not complete: tell it why
+        // (per the error mode) instead of leaving a silently dropped
+        // socket. A driver error, a failed node, a cancel, a stuck graph,
+        // and a color that was already settled before this task claimed
+        // it all end the same way for the caller: no answer is coming.
+        // Safe after the run returned: the outbound queue drops a push
+        // once the caller was answered or closed, so a run that already
+        // spoke its last word is not double-messaged.
+        if let Some(conn) = &caller_for_error {
+            let why = match &outcome {
+                Err(e) => Some(format!("execution failed: {e}")),
+                Ok(ExecutionOutcome::Failed { error }) => Some(format!("execution failed: {error}")),
+                Ok(ExecutionOutcome::Cancelled { cause }) => Some(format!("execution cancelled: {cause}")),
+                Ok(ExecutionOutcome::Stuck { report }) => Some(report.to_string()),
+                Ok(ExecutionOutcome::AlreadySettled) => Some(
+                    "execution already ended before this worker claimed it".to_string(),
+                ),
+                Ok(ExecutionOutcome::Completed { .. }) | Ok(ExecutionOutcome::Stalled) => None,
+            };
+            if let Some(why) = why {
+                conn.surface_error(&why).await;
+            }
         }
 
         ctx.cancel_registry.lock().await.remove(&color);
@@ -751,9 +771,10 @@ impl WorkerTaskKind<WorkerCtx> for CancelExecutionKind {
                 tracing::info!(
                     target: "weft_engine::run_pod",
                     color = %color,
+                    cause = %payload.cause,
                     "firing per-color cancel flag"
                 );
-                f.cancel();
+                f.cancel_because(payload.cause);
             }
             None => {
                 // Race: execution finished naturally between the

@@ -13,13 +13,11 @@
   "outputs": [
     {
       "name": "channel",
-      "type": "Bus",
-      "required": false
+      "type": "Bus"
     },
     {
       "name": "done",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     }
   ],
   "requires_infra": false

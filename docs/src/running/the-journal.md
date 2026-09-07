@@ -40,11 +40,16 @@ are suspended, and where each loop got to, and carries on.
 If you want to see what a run actually did:
 
 ```bash
-weft events <color>        # every event for one execution, in order
-weft logs <color>          # just the log lines
-weft executions            # recent executions
-weft follow <project>      # live, as they happen
+weft executions --phase fire   # recent runs, without the setup runs an activate makes
+weft logs <color>              # what the run's nodes wrote, plus every failure it recorded
+weft events <color>            # every event for one execution, in order, one line each
+weft follow <project>          # live, as they happen
 ```
+
+If a run failed, `weft logs` names the node and the error, and that is usually
+all you need. If you want the values on the wires, `weft events` prints one
+line per event and takes `--node`, `--kind` and `--full` to open only the part
+you want; the flags are in [the CLI](cli.md).
 
 The editor's execution view is the same data rendered as a graph: click a node
 and you see the values that firing actually received and emitted.
@@ -88,33 +93,38 @@ weft clean                       # purge, keeping the last 30 days
 weft clean <color>               # one execution
 weft clean --all                 # everything
 weft clean --keep-days 7
-weft clean --images              # also reclaim unreferenced worker images
-                                 # (with --all: every project's, plus old
-                                 # builder-base images; the next build
-                                 # re-makes the base)
-weft clean --build-cache
 ```
+
+The same verb also reclaims build output, and those forms touch no
+journal rows at all: `weft clean --images` (worker images nothing runs
+any more; with `--all`, every project's, the kind node's copies, stale
+`weft-infra-*` tags and old builder bases) and `weft clean
+--build-cache`. For what each one removes, go and read the `weft clean`
+row in [the CLI page](cli.md).
 
 During a run the journal is append-only, and the dispatcher never edits a row.
 
 ## Holes
 
-A journal write can fail: Postgres refuses it, or a fencing trigger rejects it
-because this pod is no longer the live one. The running execution carries on,
-and what is left behind is a **hole**, a missing row.
+A lifecycle write can fail because the database is unavailable or the worker
+has lost permission to write. The worker stops driving that execution at its
+next check. It does not deliberately continue with unsaved state. Bus-history
+write failures are reported separately on the affected bus.
 
-A hole costs nothing while the execution is still in memory. It bites only if
-that execution later has to be rebuilt from the journal, and then the rebuild
-fails rather than quietly reconstructing the wrong state.
+The failed write is logged in `weft daemon logs`. A replacement worker can only
+recover what was saved, so work done after the last saved result may repeat.
 
-The failed write is logged, so `weft daemon logs` is where you see it happen.
-If an execution then refuses to resume, run it again: a re-run mints a new
-color and reads nothing from the damaged one, and `weft clean <color>` removes
-the old rows.
+An unreadable saved event prevents the worker from loading the execution.
+Some events can be decoded but contain invalid details, such as a malformed
+pulse identifier. Those details are currently skipped during reconstruction
+and reported in the execution view. The worker does not yet distinguish
+damage to old, finished work from damage to values needed to resume.
 
-A row can also be present but unreadable, handled today by a separate
-mechanism. Folding both into one idea is designed and tracked in the
-repository's `TODO.md`.
+Treating missing and damaged entries consistently, and refusing unsafe
+resumes, is design work tracked in `TODO.md`; it is not implemented.
+Inspect failures with `weft logs <color>` and `weft events <color>` before
+starting a new run. A new run has its own history and can repeat external
+actions. `weft clean <color>` removes the old history when no longer needed.
 
 ## The execution guarantee
 
@@ -124,7 +134,8 @@ A worker that dies mid-execution is replaced, and the replacement folds the
 journal. A node that had finished but whose completion row was lost gets
 re-run.
 
-For most nodes that is harmless. For one that charges money or sends a message
-it is not, and [`ctx.run`](../nodes/durable-execution.md) is the fix: it wraps
-the side effect so a replay returns the recorded result instead of doing it
-again.
+For an action that charges money or sends a message, repeating it can matter.
+[`ctx.run`](../nodes/durable-execution.md) reuses a result once it has been
+saved. If the action succeeded but saving its result failed, the action can
+still repeat. Preventing a duplicate requires the receiving service to
+recognize repeated requests, using the same request identifier each time.

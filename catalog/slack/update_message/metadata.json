@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "chat:write"
@@ -52,11 +52,7 @@
     {
       "name": "ts",
       "type": "String",
-      "required": false,
       "description": "The updated message's timestamp id."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

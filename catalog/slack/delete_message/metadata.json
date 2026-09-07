@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "chat:write"
@@ -38,11 +38,7 @@
     {
       "name": "done",
       "type": "Boolean",
-      "required": false,
       "description": "True once the message is gone."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

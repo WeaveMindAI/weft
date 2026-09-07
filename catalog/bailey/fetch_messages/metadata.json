@@ -1,7 +1,7 @@
 {
   "type": "BaileyFetchMessages",
   "label": "WhatsApp Fetch History (Baileys)",
-  "description": "Fetch the most recent messages of a chat via the project's bridge (the bridge syncs history on demand). Each entry carries `from`, `pushName`, `content`, `messageType`, `messageId`, `timestamp`, and `fromMe`.",
+  "description": "Fetch the most recent messages of a chat via the project's bridge (the bridge syncs history on demand). Each entry carries `from`, `pushName`, `content`, `messageType`, `messageId`, `timestamp`, and `fromMe`. A media message (`messageType` audio, image, video, document, sticker) has its caption or null as `content`; its bytes come from BaileyFetchMedia given the entry's `messageId`.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -24,7 +24,6 @@
     {
       "name": "count",
       "type": "Number",
-      "exposure": "config",
       "default": 20,
       "description": "How many recent messages to fetch."
     }
@@ -32,17 +31,12 @@
   "outputs": [
     {
       "name": "messages",
-      "type": "List[JsonDict]",
-      "required": false
+      "type": "List[JsonDict]"
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ],
-  "requires_infra": false,
-  "features": {
-    "isOutputDefault": true
-  }
+  "requires_infra": false
 }

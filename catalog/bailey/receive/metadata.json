@@ -21,48 +21,39 @@
   "outputs": [
     {
       "name": "content",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "from",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "pushName",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "messageId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "timestamp",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     },
     {
       "name": "isGroup",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     },
     {
       "name": "chatId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "messageType",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "file",
       "type": "File",
-      "required": false,
       "description": "Stored-file reference for image/video/audio/document/sticker messages; absent for text."
     }
   ],

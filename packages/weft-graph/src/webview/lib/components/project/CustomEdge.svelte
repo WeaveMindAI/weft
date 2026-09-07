@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { BaseEdge, EdgeReconnectAnchor, getBezierPath, type EdgeProps } from '@xyflow/svelte';
+	import { BaseEdge, EdgeLabel, EdgeReconnectAnchor, getBezierPath, type EdgeProps } from '@xyflow/svelte';
 	
 	let { 
 		id,
@@ -19,6 +19,12 @@
 	// non-interactive (no reconnect grab zone). Editing one would be ambiguous.
 	const simplified = $derived(!!(data as { simplified?: boolean } | undefined)?.simplified);
 
+	// A wire that reads keys off its value (`t.n = s.out.profile.wpm`) is
+	// drawn dotted, with the path written at the end where the value lands.
+	const path = $derived((data as { path?: string[] } | undefined)?.path ?? []);
+	const dotted = $derived(path.length > 0);
+	const pathLabel = $derived(path.length > 0 ? '.' + path.join('.') : '');
+
 	// Track reconnection state - hide edge while reconnecting
 	let reconnecting = $state(false);
 
@@ -28,8 +34,18 @@
 
 <!-- Hide edge while reconnecting -->
 {#if !reconnecting}
-	<!-- All edges: straight lines, no arrowheads -->
-	<BaseEdge {id} path={edgePath} {style} />
+	<!-- All edges: straight lines, no arrowheads; a dereferencing wire is dotted -->
+	<BaseEdge {id} path={edgePath} style={dotted ? `${style ?? ''} stroke-dasharray: 4 4;` : style} />
+{/if}
+
+{#if dotted}
+	<EdgeLabel x={targetX - 14} y={targetY - 14} transparent>
+		<span
+			class="rounded px-1 text-[10px] font-mono bg-popover border text-muted-foreground whitespace-nowrap"
+			style="transform: translate(-100%, -100%); display: inline-block;"
+			title="reads {pathLabel} off the value"
+		>{pathLabel}</span>
+	</EdgeLabel>
 {/if}
 
 <!-- EdgeReconnectAnchor at target end - larger grab zone overlapping the handle.

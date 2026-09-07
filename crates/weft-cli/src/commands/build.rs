@@ -4,8 +4,6 @@
 //! projects share one image. The build itself runs in a multi-stage
 //! `docker build` so the host needs only docker + kind + kubectl.
 
-use std::env;
-
 use anyhow::Result;
 use tokio::process::Command;
 
@@ -13,14 +11,14 @@ use super::Ctx;
 use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::images;
 use crate::progress::{ActionVerb, Progress};
-use weft_compiler::project::Project;
 
 pub async fn run(ctx: Ctx) -> Result<()> {
     let client = ctx.client();
+    // Ctx's cached discovery: one walk per invocation, one wording for
+    // every verb's "no project here". Cloned so the async closure can
+    // own it.
+    let project = ctx.project()?.clone();
     ctx.with_progress(ActionVerb::Build, |progress| async move {
-        let cwd = env::current_dir()?;
-        let project = Project::discover(&cwd)
-            .map_err(|e| anyhow::anyhow!("locate project: {e}"))?;
         // Compile first, then resolve `@asset` refs into the definition BEFORE
         // the plan validates + hashes it (`plan_build_from`): the hashes must
         // cover the resolved values, so a changed asset re-hashes and
@@ -43,9 +41,10 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
         let worker = worker_planned_image(&plan)?;
         // What must survive the post-ensure GC beyond the fresh tag
-        // (idle projects' current images, draining pods). Unreachable
-        // daemon = no answer = the GC is skipped, never guessed.
-        let referenced = crate::images::referenced_image_hashes(&client).await.ok();
+        // (idle projects' current images, draining pods): the keep-set
+        // via `referenced_set_for_gc` (None + a warning when the answer
+        // is unlearnable -> the GC is skipped, never guessed).
+        let referenced = crate::images::referenced_set_for_gc(&client).await;
         ensure_worker_image_with_progress(
             &progress,
             &project.id().to_string(),
@@ -150,7 +149,7 @@ pub async fn ensure_worker_image_with_progress(
     project_id: &str,
     image_tag: &str,
     worker_context_dir: &std::path::Path,
-    referenced: Option<&std::collections::BTreeSet<String>>,
+    referenced: Option<&crate::images::ReferencedImages>,
 ) -> Result<()> {
     if crate::images::image_present(image_tag).await? {
         progress.build_skip(image_tag, "hash_match");
@@ -165,8 +164,7 @@ pub async fn ensure_worker_image_with_progress(
             ClusterBackend::K8s => return Err(bail_k8s_push_needed(image_tag)),
         }
         gc_stale_images(
-            weft_compiler::build::WORKER_IMAGE_REPO,
-            image_tag,
+            &[image_tag.to_string()],
             &[format!("weft.dev/project={project_id}")],
             referenced,
         )
@@ -239,7 +237,7 @@ async fn docker_build_and_kind_load(
     tag: &str,
     project_id: &str,
     context_dir: &std::path::Path,
-    referenced: Option<&std::collections::BTreeSet<String>>,
+    referenced: Option<&crate::images::ReferencedImages>,
 ) -> Result<()> {
     build_worker_image(tag, context_dir, project_id).await?;
     let cfg = cluster_config();
@@ -265,8 +263,7 @@ async fn docker_build_and_kind_load(
     // Cargo build cache (the heavy part) lives in the baked base +
     // BuildKit and survives this.
     gc_stale_images(
-        weft_compiler::build::WORKER_IMAGE_REPO,
-        tag,
+        &[tag.to_string()],
         &[format!("weft.dev/project={project_id}")],
         referenced,
     )
@@ -293,25 +290,36 @@ async fn build_worker_image(
 /// image per source version and nothing ever untags the old ones, so
 /// each successful ensure ends here or the pile grows without bound.
 ///
+/// `fresh` is every ref of ONE repo this build just ensured, bare or
+/// registry-qualified (the repo and the kept tags are derived from it
+/// through the one ref split, so no caller hand-rolls either): a plan
+/// can hold several images of one repo (two node types shipping an
+/// image directory of the same name mint the same repo under two
+/// content hashes), and a GC keyed on a single fresh tag would delete
+/// the sibling it built a moment ago. Refs of mixed repos are a
+/// programming error and skip the GC, the safe answer.
+///
 /// `referenced` is the dispatcher's answer for what must SURVIVE
-/// beyond the fresh tag (an idle project's current image, a draining
-/// pod's image; see `images::referenced_image_hashes`). `None` means
-/// the answer could not be learned, and the whole GC is skipped: an
-/// unbounded pile is a disk problem, a deleted live image is a broken
-/// cluster. Repos whose images only ever back live-tracked containers
-/// (infra, node tests) pass an empty set: their old tags are condemned
-/// by construction, and one still in use refuses its node-side remove.
+/// beyond the fresh tags (an idle project's current image, a draining
+/// pod's image, another project's infra unit running the same
+/// content-addressed tag; see `images::referenced_images`). `None`
+/// means the answer could not be learned, and the whole GC is skipped:
+/// an unbounded pile is a disk problem, a deleted live image is a
+/// broken cluster. Node-test images alone pass an empty set: test pods
+/// are short-lived and never restart from an old tag, so beyond the
+/// fresh tag nothing is referenced by construction, and one still in
+/// use refuses its node-side remove.
 ///
 /// Best effort throughout (a transient docker error never fails a
 /// build), and the shared BuildKit layer cache is untouched, so
 /// rebuilding a dropped tag stays warm.
 pub async fn gc_stale_images(
-    repo: &str,
-    fresh: &str,
+    fresh: &[String],
     labels: &[String],
-    referenced: Option<&std::collections::BTreeSet<String>>,
+    referenced: Option<&crate::images::ReferencedImages>,
 ) {
     let Some(referenced) = referenced else { return };
+    let Some((repo, keep)) = fresh_repo_and_tags(fresh) else { return };
     let filters: Vec<String> = labels.iter().map(|l| format!("label={l}")).collect();
     let mut list = images::docker();
     list.arg("images");
@@ -323,16 +331,9 @@ pub async fn gc_stale_images(
     if !out.status.success() {
         return;
     }
-    // `fresh` is a well-formed content ref by construction; a split
-    // failure here would be a programming error, and skipping the GC
-    // is the safe answer to it.
-    let Ok(stale) = images::host_images_condemned(
-        fresh,
-        &String::from_utf8_lossy(&out.stdout),
-        |hash| !referenced.contains(hash),
-    ) else {
-        return;
-    };
+    let stale = images::host_images_matching(&String::from_utf8_lossy(&out.stdout), |r, t| {
+        r == repo && !keep.contains(t) && !referenced.is_referenced(r, t)
+    });
     if stale.is_empty() {
         return;
     }
@@ -351,14 +352,16 @@ pub async fn gc_stale_images(
     // this sweep never condemns the group. `weft clean --images`
     // reclaims it, since it condemns against the dispatcher's
     // referenced set instead of the host-stale set.
-    let stale_hashes: std::collections::BTreeSet<&str> =
-        stale.iter().filter_map(|s| s.rsplit_once(':').map(|(_, h)| h)).collect();
+    let stale_tags: std::collections::BTreeSet<&str> = stale
+        .iter()
+        .filter_map(|s| images::ref_repo_tag(s).ok().map(|(_, t)| t))
+        .collect();
     let cfg = cluster_config();
     if cfg.backend == ClusterBackend::Kind && kind_available(&cfg.cluster_name).await {
         if let Ok(groups) = images::kind_node_image_tag_groups(&cfg.cluster_name).await {
             let node = format!("{}-control-plane", cfg.cluster_name);
             let node_stale =
-                images::node_images_condemned(repo, &groups, |h| stale_hashes.contains(h));
+                images::node_images_matching(&groups, |r, t| r == repo && stale_tags.contains(t));
             if !node_stale.is_empty() {
                 let _ = images::docker()
                     .args(["exec", &node, "crictl", "rmi"])
@@ -374,6 +377,31 @@ pub async fn gc_stale_images(
         prune.args(["--filter", f]);
     }
     let _ = prune.status().await;
+}
+
+/// The one repo `fresh` names plus its bare tags, or `None` (with a
+/// warning) when the refs do not all parse to the same repo: every
+/// weft ref carries a content tag by construction, so a failure here
+/// is a programming error and the GC skips rather than guesses.
+fn fresh_repo_and_tags(fresh: &[String]) -> Option<(&str, std::collections::BTreeSet<&str>)> {
+    let mut repo: Option<&str> = None;
+    let mut tags = std::collections::BTreeSet::new();
+    for r in fresh {
+        match images::ref_repo_tag(r) {
+            Ok((rp, t)) if repo.is_none() || repo == Some(rp) => {
+                repo = Some(rp);
+                tags.insert(t);
+            }
+            _ => {
+                tracing::warn!(
+                    target: "weft_cli::images",
+                    "skipping the stale-image GC: fresh refs {fresh:?} do not name one repo"
+                );
+                return None;
+            }
+        }
+    }
+    repo.map(|rp| (rp, tags))
 }
 
 pub async fn kind_available(cluster_name: &str) -> bool {

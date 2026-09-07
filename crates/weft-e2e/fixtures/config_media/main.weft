@@ -1,7 +1,7 @@
 # Proves the `@asset` config path end to end. FileSize (a project-local
 # custom node under nodes/file_size/) takes a `File` media input filled from
 # CONFIG. The node starts with NO `file` set; each test writes ONE
-# `@asset("assets/data.bin", File)` (or `@asset("<url>", File)`) source line,
+# `@asset("assets/data.bin", Blob)` (or `@asset("<url>", Blob)`) source line,
 # exactly what a dev types by hand or the editor's file field writes. The
 # pre-build asset sync publishes the referenced local file (a URL uploads
 # nothing), the compile substitutes the resolved file value, and at run time

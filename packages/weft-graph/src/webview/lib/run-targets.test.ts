@@ -1,24 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isOutputNode, runLabel, pruneTargets, runTargetFacts } from './run-targets';
-
-describe('isOutputNode', () => {
-  it('reads the node type default', () => {
-    expect(isOutputNode({}, { isOutputDefault: true })).toBe(true);
-    expect(isOutputNode({}, { isOutputDefault: false })).toBe(false);
-    expect(isOutputNode({}, {})).toBe(false);
-    expect(isOutputNode(undefined, undefined)).toBe(false);
-  });
-
-  it('lets the project override it either way', () => {
-    expect(isOutputNode({ _is_output: true }, { isOutputDefault: false })).toBe(true);
-    expect(isOutputNode({ _is_output: false }, { isOutputDefault: true })).toBe(false);
-  });
-
-  it('ignores a non-boolean override rather than guessing', () => {
-    expect(isOutputNode({ _is_output: 'yes' }, { isOutputDefault: true })).toBe(true);
-    expect(isOutputNode({ _is_output: 'yes' }, { isOutputDefault: false })).toBe(false);
-  });
-});
+import { runLabel, pruneTargets, runTargetFacts } from './run-targets';
 
 describe('runLabel', () => {
   it('stays plain until the user aims the run', () => {
@@ -32,22 +13,14 @@ describe('runLabel', () => {
 });
 
 describe('pruneTargets', () => {
-  const nodes = [
-    { id: 'out', data: { config: {}, features: { isOutputDefault: true } } },
-    { id: 'mid', data: { config: {}, features: { isOutputDefault: false } } },
-    { id: 'promoted', data: { config: { _is_output: true }, features: {} } },
-  ];
+  const nodes = [{ id: 'out' }, { id: 'mid' }];
 
-  it('keeps output nodes', () => {
-    expect(pruneTargets(['out', 'promoted'], nodes)).toEqual(new Set(['out', 'promoted']));
+  it('keeps any node the graph still holds', () => {
+    expect(pruneTargets(['out', 'mid'], nodes)).toEqual(new Set(['out', 'mid']));
   });
 
   it('drops a node that was deleted', () => {
     expect(pruneTargets(['out', 'gone'], nodes)).toEqual(new Set(['out']));
-  });
-
-  it('drops a node that stopped being an output', () => {
-    expect(pruneTargets(['out', 'mid'], nodes)).toEqual(new Set(['out']));
   });
 });
 
@@ -92,5 +65,42 @@ describe('runTargetFacts', () => {
   it('does not walk through a trigger to infra above it', () => {
     const edges2 = [...edges, { source: 'bridge', target: 'trigger' }];
     expect(runTargetFacts(['out'], nodes, edges2).infraIds).toEqual([]);
+  });
+
+  it('a target inside a group brings the group, its inputs, and its siblings', () => {
+    // feed -> grp ; grp contains inner (the target) and db (infra) ; trigger -> feed
+    const scoped = [
+      { id: 'trigger', isTrigger: true, isInfra: false },
+      { id: 'feed', isTrigger: false, isInfra: false },
+      { id: 'grp', isTrigger: false, isInfra: false },
+      { id: 'inner', isTrigger: false, isInfra: false, parentId: 'grp' },
+      { id: 'db', isTrigger: false, isInfra: true, parentId: 'grp' },
+    ];
+    const scopedEdges = [
+      { source: 'trigger', target: 'feed' },
+      { source: 'feed', target: 'grp' },
+    ];
+    const facts = runTargetFacts(['inner'], scoped, scopedEdges);
+    expect(facts.infraIds).toEqual(['db']);
+    expect(facts.avoidsTriggers).toBe(false);
+  });
+
+  it('reaches infra nested two containers deep', () => {
+    // grp contains inner (the target) and sub ; sub contains db (infra)
+    const scoped = [
+      { id: 'grp', isTrigger: false, isInfra: false },
+      { id: 'inner', isTrigger: false, isInfra: false, parentId: 'grp' },
+      { id: 'sub', isTrigger: false, isInfra: false, parentId: 'grp' },
+      { id: 'db', isTrigger: false, isInfra: true, parentId: 'sub' },
+    ];
+    expect(runTargetFacts(['inner'], scoped, []).infraIds).toEqual(['db']);
+  });
+
+  it('a container target brings what is inside it', () => {
+    const scoped = [
+      { id: 'grp', isTrigger: false, isInfra: false },
+      { id: 'db', isTrigger: false, isInfra: true, parentId: 'grp' },
+    ];
+    expect(runTargetFacts(['grp'], scoped, []).infraIds).toEqual(['db']);
   });
 });

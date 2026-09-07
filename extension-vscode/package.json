@@ -2,12 +2,16 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, AI streaming edits.",
-  "version": "0.2.237",
+  "version": "0.2.238",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
     "url": "https://github.com/WeaveMindAI/weft"
+  },
+  "homepage": "https://weavemindai.github.io/weft/",
+  "bugs": {
+    "url": "https://github.com/WeaveMindAI/weft/issues"
   },
   "packageManager": "pnpm@10.32.1",
   "engines": {
@@ -219,7 +223,7 @@
   },
   "scripts": {
     "vscode:prepublish": "pnpm run compile && pnpm run bundle:webview && pnpm run bundle:markdown-preview",
-    "compile": "tsc -p ./ && pnpm run check:webview",
+    "compile": "node -e \"fs.rmSync('out',{recursive:true,force:true})\" && tsc -p ./ && pnpm run check:webview",
     "check:webview": "svelte-check --tsconfig ./tsconfig.webview.json",
     "test": "vitest run",
     "watch": "tsc -watch -p ./",

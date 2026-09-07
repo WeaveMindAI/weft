@@ -10,7 +10,7 @@
     //! works end to end through the engine.
 
     use super::*;
-    use super::engine_test_rig::{test_manifest, MemJournal, NoopInfra, NoopInfraState, NoopProject, NoopTasks};
+    use super::engine_test_rig::{test_manifest, MemJournal, NoopInfra, NoopInfraState, NoopProject, NoopSteering, NoopTasks};
     use std::sync::Mutex as StdMutex;
     use async_trait::async_trait;
     use serde_json::json;
@@ -192,6 +192,7 @@
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
 
         let outcome = run_one_execution(
@@ -338,6 +339,7 @@
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         let cancel = CancellationFlag::new_arc();
 
@@ -349,7 +351,7 @@
         ));
         // Let the waiter reach its cursor wait, then cancel.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        cancel.cancel();
+        cancel.cancel_because(weft_core::exec::CancelCause::User);
 
         // Must finish (not hang). Bound it so a regression fails the
         // test instead of hanging the suite. The Waiter is a lone node
@@ -364,7 +366,7 @@
             .expect("join ok")
             .expect("run ok");
         match outcome {
-            ExecutionOutcome::Cancelled => {} // cancel won the race
+            ExecutionOutcome::Cancelled { .. } => {} // cancel won the race
             ExecutionOutcome::Completed { .. } => {} // dead-end closed the bus, Waiter exited cleanly
             other => panic!("expected Cancelled or Completed via dead-end, got {other:?}"),
         }
@@ -602,6 +604,7 @@
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1112,6 +1115,7 @@
                 storage: crate::storage::FakeWorkerStorage::new(),
                 access_broker: fake_access_broker.clone(),
                 pending_costs: crate::metering::PendingCostRecords::new(),
+                steering: Arc::new(NoopSteering),
             };
             let cancel = CancellationFlag::new_arc();
             let run = tokio::spawn(run_one_execution(
@@ -1121,14 +1125,14 @@
                 None,
             ));
             ready_rx.await.expect("payer must reach its opened-access state");
-            cancel.cancel();
+            cancel.cancel_because(weft_core::exec::CancelCause::User);
             let outcome = tokio::time::timeout(std::time::Duration::from_secs(8), run)
                 .await
                 .expect("cancel must terminate promptly")
                 .expect("join ok")
                 .expect("run ok");
             assert!(
-                matches!(outcome, ExecutionOutcome::Cancelled),
+                matches!(outcome, ExecutionOutcome::Cancelled { .. }),
                 "cancelled execution reports Cancelled; got {outcome:?}"
             );
             // The close is drop-spawned on abort, so it may land a beat
@@ -1379,6 +1383,7 @@
                 storage: crate::storage::FakeWorkerStorage::new(),
                 access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
             };
             run_one_execution(
                 Arc::new(project),
@@ -2167,6 +2172,7 @@
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         run_one_execution(
             Arc::new(project),
@@ -2531,7 +2537,7 @@
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(
-            matches!(outcome, ExecutionOutcome::Cancelled | ExecutionOutcome::Failed { .. }),
+            matches!(outcome, ExecutionOutcome::Cancelled { .. } | ExecutionOutcome::Failed { .. }),
             "a caller-tied run whose send hits a gone caller must not Complete; got {outcome:?}"
         );
     }
@@ -2623,7 +2629,7 @@
             Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
         ).await;
         assert!(
-            matches!(outcome, ExecutionOutcome::Cancelled),
+            matches!(outcome, ExecutionOutcome::Cancelled { .. }),
             "a caller-tied run at a durable wait with no fire must be killed, not suspended; got {outcome:?}"
         );
         // Non-durability: the terminal journal event is a cancellation, NOT

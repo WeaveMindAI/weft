@@ -48,7 +48,7 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
             &signal.project_id,
             &signal.tenant_id,
             payload.payload,
-            Some(&nonce),
+            Some(crate::api::signal::ParkedRef { id: &nonce, attempts: 0 }),
         )
         .await
         .map_err(|(code, msg)| anyhow::anyhow!("dispatch_listener_outcome {code}: {msg}"))?;

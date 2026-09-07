@@ -1,7 +1,8 @@
 <script lang="ts">
 	/// Renders a list of FieldDefinition entries as inline form controls
 	/// against a `config` record. Handles the primitive field types:
-	/// text, textarea, select, multiselect, checkbox, number, password.
+	/// text, textarea, select, multiselect, checkbox, number, datetime,
+	/// password.
 	/// Exotic types (access, entry_list, code) are left to the
 	/// parent: pass a `customFieldKeys` set so the strip skips those
 	/// keys, and supply a `renderCustom` snippet that draws them inline
@@ -15,6 +16,7 @@
 	import { useFieldEditorRegistry } from './field-editor-registry';
 	import { clampToRange } from '../../utils/input-field';
 	import { emptyToUnset } from '../../value-format';
+	import { fromPickerLocal, toPickerLocal } from '../../utils/datetime-field';
 
 	let {
 		fields,
@@ -179,6 +181,14 @@
 		const n = Number(raw);
 		if (!Number.isFinite(n)) return;
 		onUpdate(field.key, clampToRange(n, field.min, field.max), field.portDriven);
+	}
+
+	/// Save a datetime field: the picker's local reading becomes an
+	/// ISO-8601 moment carrying this machine's zone offset, so the
+	/// source says which eleven o'clock was meant; an emptied picker
+	/// unsets, like every other control.
+	function saveDatetime(field: FieldDefinition, raw: string) {
+		onUpdate(field.key, raw === '' ? null : fromPickerLocal(raw), field.portDriven);
 	}
 
 	/// Observe a textarea's manual resize and report the new height so the
@@ -374,6 +384,23 @@
 					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
 					onpaste={() => readonlyPasteDrop(field.key, ro)}
 					ondrop={() => readonlyPasteDrop(field.key, ro)}
+				/>
+			{:else if field.type === 'datetime'}
+				<!-- The stored value is a zoned ISO-8601 string; the picker
+				     shows it on this machine's clock and writes it back
+				     with this machine's offset. A stored value that is not
+				     one (prose, a bare date) shows as empty, and the source
+				     keeps it until a pick replaces it. -->
+				<input
+					id={domId(field)}
+					type="datetime-local"
+					step="1"
+					readonly={ro}
+					class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
+					value={toPickerLocal(effectiveValue(field))}
+					onchange={(e) => saveDatetime(field, e.currentTarget.value)}
+					onclick={(e) => e.stopPropagation()}
+					onkeydown={(e) => readonlyKeydown(e, field.key, ro)}
 				/>
 			{:else if field.type === 'password'}
 				<input

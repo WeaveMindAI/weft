@@ -332,7 +332,7 @@ pub fn fixture_spec(name: &str, label: &str, description: &str) -> InputSpec {
         name: name.to_string(),
         input_type: WeftType::Primitive(crate::weft_type::WeftPrimitive::String),
         required: true,
-        exposure: None,
+        accepts: None,
         widget: None,
         default: None,
         label: Some(label.to_string()),
@@ -654,10 +654,22 @@ struct FakeState {
     buses: Mutex<HashMap<String, crate::bus::BusHandle>>,
     /// In-memory storage, keyed by minted key.
     storage: Mutex<HashMap<String, StoredEntry>>,
+    /// `(scope, identity)` of every identified put, to the key it
+    /// minted: a second put of the same identity answers that key
+    /// and stores nothing, like the real service.
+    identities: Mutex<HashMap<(String, String), String>>,
     /// Mint for storage keys.
     next_storage_key: AtomicU64,
     /// Every `ctx.log` line, in order.
     logs: Mutex<Vec<(LogLevel, String)>>,
+    /// Every tag the node put on its execution, in call order, one
+    /// entry per `ctx.tag_execution` call.
+    execution_tags: Mutex<Vec<Vec<String>>>,
+    /// Every `ctx.stop_tagged` the node asked for, in order. The fake
+    /// stops nothing (there are no sibling runs here); it records the
+    /// ask so a test can assert the node steered the right tag the
+    /// right way.
+    stops: Mutex<Vec<(String, crate::tag::StopSelf)>>,
     /// The infra endpoints this node's own infrastructure answers on,
     /// by endpoint name. Declared by `endpoint`; an undeclared name
     /// fails the way an unprovisioned one does in a real run.
@@ -725,8 +737,11 @@ impl FakeState {
             output_types: Mutex::new(HashMap::new()),
             buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
+            identities: Mutex::new(HashMap::new()),
             next_storage_key: AtomicU64::new(0),
             logs: Mutex::new(Vec::new()),
+            execution_tags: Mutex::new(Vec::new()),
+            stops: Mutex::new(Vec::new()),
             endpoints: Mutex::new(BTreeMap::new()),
             endpoint_answers: Mutex::new(BTreeMap::new()),
             endpoint_calls: Mutex::new(Vec::new()),
@@ -1174,6 +1189,19 @@ impl FakeRig {
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.state.logs.lock().unwrap().clone()
     }
+
+    /// Every tag the node put on its execution, one list per
+    /// `ctx.tag_execution` call, in call order.
+    pub fn execution_tags(&self) -> Vec<Vec<String>> {
+        self.state.execution_tags.lock().unwrap().clone()
+    }
+
+    /// Every `ctx.stop_tagged` the node asked for, in order: the tag
+    /// and whether it kept itself. Nothing was actually stopped (a
+    /// fake run has no siblings); this is the record of the ask.
+    pub fn stops(&self) -> Vec<(String, crate::tag::StopSelf)> {
+        self.state.stops.lock().unwrap().clone()
+    }
 }
 
 impl Default for FakeRig {
@@ -1258,7 +1286,17 @@ fn manifest_input_bag(
             order.push(name.clone());
         }
     }
-    Ok((ValueBag::inputs(delivered, spec_names, order), feeds))
+    let mut bag = ValueBag::inputs(delivered, spec_names, order);
+    // The production bag reads the picker off the enrich-stamped widget;
+    // a rig run has no enrich pass, so fill the same facts straight from
+    // the manifest's recipe (the stamp's source).
+    if let Some(spec) = &manifest.service {
+        if let Some(input) = manifest.access_input() {
+            bag.access_ports
+                .insert(input.name.clone(), crate::context::AccessPort::from_recipe(spec));
+        }
+    }
+    Ok((bag, feeds))
 }
 
 /// The generator-feed registrations one rig run installed. OWNS the
@@ -1288,7 +1326,7 @@ fn declared_output_map(manifest: &NodeMetadata, config: &Value) -> HashMap<Strin
         .map(|o| (o.name.clone(), o.port_type.clone()))
         .collect();
     if let Some(ports_from_config) = &manifest.ports_from_config {
-        let (_, outputs) = crate::node::derive_config_ports(config, ports_from_config);
+        let (_, outputs) = crate::node::derive_config_ports(config.get(&ports_from_config.field), ports_from_config);
         for port in outputs {
             declared.insert(port.name, port.port_type);
         }
@@ -1760,6 +1798,16 @@ impl ContextHandle for TestHandle {
         Ok(())
     }
 
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.state.execution_tags.lock().unwrap().push(tags);
+        Ok(())
+    }
+
+    async fn stop_tagged(&self, tag: String, stop_self: crate::tag::StopSelf) -> WeftResult<()> {
+        self.state.stops.lock().unwrap().push((tag, stop_self));
+        Ok(())
+    }
+
     fn cancellation(&self) -> Arc<CancellationFlag> {
         self.state.cancellation.clone()
     }
@@ -1818,7 +1866,8 @@ impl ContextHandle for TestHandle {
 
     async fn storage_put(
         &self,
-        _scope: &crate::storage::StorageScope,
+        scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         data: crate::storage::ByteStream,
         mime_type: &str,
         filename: &str,
@@ -1828,6 +1877,20 @@ impl ContextHandle for TestHandle {
         let bytes = crate::storage::collect_stream(data)
             .await
             .map_err(|e| WeftError::NodeExecution(format!("fake storage put: {e}")))?;
+        let identity_key = identity.map(|i| (format!("{scope:?}"), i.to_string()));
+        if let Some(identity_key) = &identity_key {
+            if let Some(existing) = self.state.identities.lock().unwrap().get(identity_key) {
+                let storage = self.state.storage.lock().unwrap();
+                let entry = storage.get(existing).expect("an identified key is stored");
+                return Ok(crate::storage::StoredFile {
+                    key: entry.meta.key.clone(),
+                    mime_type: entry.meta.mime_type.clone(),
+                    size_bytes: entry.meta.size_bytes,
+                    filename: entry.meta.filename.clone(),
+                }
+                .to_value());
+            }
+        }
         let key = format!(
             "node-test/{}-{filename}",
             self.state.next_storage_key.fetch_add(1, Ordering::SeqCst)
@@ -1848,6 +1911,9 @@ impl ContextHandle for TestHandle {
             size_bytes: bytes.len() as u64,
             filename: filename.to_string(),
         };
+        if let Some(identity_key) = identity_key {
+            self.state.identities.lock().unwrap().insert(identity_key, meta.key.clone());
+        }
         self.state
             .storage
             .lock()
@@ -1859,10 +1925,28 @@ impl ContextHandle for TestHandle {
     async fn storage_put_from_url(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         url: &str,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
+        // An identified fetch the fake already holds costs no request,
+        // like production: the canned route is not even consulted, so
+        // a test can count requests to prove a second ask pulled nothing.
+        if let Some(identity) = identity {
+            let key = (format!("{scope:?}"), identity.to_string());
+            if let Some(existing) = self.state.identities.lock().unwrap().get(&key) {
+                let storage = self.state.storage.lock().unwrap();
+                let entry = storage.get(existing).expect("an identified key is stored");
+                return Ok(crate::storage::StoredFile {
+                    key: entry.meta.key.clone(),
+                    mime_type: entry.meta.mime_type.clone(),
+                    size_bytes: entry.meta.size_bytes,
+                    filename: entry.meta.filename.clone(),
+                }
+                .to_value());
+            }
+        }
         // Answered from the SAME canned routes every other fake call
         // uses, so a fetch stays offline: declare the URL's route with
         // `rig.respond*` and the "download" lands in fake storage.
@@ -1885,15 +1969,24 @@ impl ContextHandle for TestHandle {
         let mime = crate::storage::normalize_content_type(
             resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
         );
+        // The caller's name, then the one the canned route serves in
+        // its Content-Disposition, then the URL: the same order as
+        // production, so a test sees the name a node would.
         let name = filename
             .filter(|f| !f.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                resp.headers()
+                    .get("content-disposition")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(crate::storage::filename_from_disposition)
+            })
             .unwrap_or_else(|| crate::storage::filename_from_url(url));
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| WeftError::NodeExecution(format!("fake put_from_url body: {e}")))?;
-        self.storage_put(scope, crate::storage::bytes_stream(bytes), &mime, &name, keep, None)
+        self.storage_put(scope, identity, crate::storage::bytes_stream(bytes), &mime, &name, keep, None)
             .await
     }
 
@@ -2195,6 +2288,7 @@ impl LiveRig {
         handle
             .storage_put(
                 &crate::storage::StorageScope::Execution,
+                None,
                 crate::storage::bytes_stream(bytes::Bytes::from(bytes.into())),
                 mime_type,
                 filename,
@@ -2368,6 +2462,14 @@ impl ContextHandle for CapturingHandle {
         self.inner.log(level, message).await
     }
 
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.inner.tag_execution(tags).await
+    }
+
+    async fn stop_tagged(&self, tag: String, stop_self: crate::tag::StopSelf) -> WeftResult<()> {
+        self.inner.stop_tagged(tag, stop_self).await
+    }
+
     fn cancellation(&self) -> Arc<CancellationFlag> {
         self.inner.cancellation()
     }
@@ -2404,6 +2506,7 @@ impl ContextHandle for CapturingHandle {
     async fn storage_put(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         data: crate::storage::ByteStream,
         mime_type: &str,
         filename: &str,
@@ -2411,18 +2514,19 @@ impl ContextHandle for CapturingHandle {
         declared_size: Option<u64>,
     ) -> WeftResult<Value> {
         self.inner
-            .storage_put(scope, data, mime_type, filename, keep, declared_size)
+            .storage_put(scope, identity, data, mime_type, filename, keep, declared_size)
             .await
     }
 
     async fn storage_put_from_url(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         url: &str,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
-        self.inner.storage_put_from_url(scope, url, filename, keep).await
+        self.inner.storage_put_from_url(scope, identity, url, filename, keep).await
     }
 
     async fn storage_get(
@@ -2560,6 +2664,56 @@ mod tests {
             sent[0].body.as_ref().expect("json body"),
             &json!({"text": "default-text"}),
             "the manifest default filled the absent input"
+        );
+    }
+
+    /// A node that steers its siblings: the fake records the tags it put
+    /// on the run and every stop it asked for (with the self choice),
+    /// stops nothing (there are no siblings here), and refuses a bad tag
+    /// before recording anything.
+    struct SteeringNode;
+    impl crate::node::NodeManifest for SteeringNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            manifest()
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for SteeringNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let text: String = ctx.inputs.get("text")?;
+            ctx.tag_execution([text.as_str(), "batch_a"]).await?;
+            ctx.stop_tagged(text.as_str(), crate::tag::StopSelf::Keep).await?;
+            ctx.stop_tagged("batch_a", crate::tag::StopSelf::Include).await?;
+            // A tag outside the grammar is refused at the ctx, before
+            // the handle sees it. So is an empty tag list: "at least
+            // one tag" is part of the ctx contract, not only the
+            // broker's.
+            let bad = ctx.tag_execution(["has space"]).await;
+            assert!(matches!(bad, Err(WeftError::Input(_))), "{bad:?}");
+            let empty = ctx.tag_execution(Vec::<String>::new()).await;
+            assert!(matches!(empty, Err(WeftError::Input(_))), "{empty:?}");
+            ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_rig_records_tags_and_stops() {
+        let rig = FakeRig::new();
+        rig.run(&SteeringNode, json!({"text": "user_7"}))
+            .await
+            .ok()
+            .expect("steering run succeeds");
+        assert_eq!(
+            rig.execution_tags(),
+            vec![vec!["user_7".to_string(), "batch_a".to_string()]],
+            "the refused tag was never recorded"
+        );
+        assert_eq!(
+            rig.stops(),
+            vec![
+                ("user_7".to_string(), crate::tag::StopSelf::Keep),
+                ("batch_a".to_string(), crate::tag::StopSelf::Include),
+            ]
         );
     }
 

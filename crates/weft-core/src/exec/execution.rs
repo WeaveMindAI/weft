@@ -94,6 +94,24 @@ pub struct PortWarning {
     pub actual: String,
 }
 
+impl NodeExecution {
+    /// Record what this firing handed out. A bag with nothing in it
+    /// (a sink like `Debug`, a loop boundary, a firing that closed every
+    /// port) leaves `output` at `None`: the live run never writes a
+    /// record for an empty emission, and the fold has to land on the
+    /// same shape, so "nothing" is spelled one way. This is the ONLY
+    /// setter; the engine's live path and the journal fold both go
+    /// through it.
+    pub fn set_output(&mut self, bag: &Value) {
+        let empty = match bag {
+            Value::Null => true,
+            Value::Object(map) => map.is_empty(),
+            _ => false,
+        };
+        self.output = if empty { None } else { Some(bag.clone()) };
+    }
+}
+
 /// One entry per node, growing as each dispatch records its lifecycle.
 pub type NodeExecutionTable = BTreeMap<String, Vec<NodeExecution>>;
 
@@ -133,4 +151,59 @@ pub fn summarize_status(executions: &[NodeExecution]) -> String {
     if skipped > 0 { parts.push(format!("{skipped} skipped")); }
     if cancelled > 0 { parts.push(format!("{cancelled} cancelled")); }
     format!("{base} ({total} executions: {})", parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record() -> NodeExecution {
+        NodeExecution {
+            id: uuid::Uuid::nil(),
+            node_id: "n".into(),
+            status: NodeExecutionStatus::Running,
+            pulses_absorbed: vec![],
+            dispatch_pulse: uuid::Uuid::nil(),
+            error: None,
+            callback_id: None,
+            started_at: 0,
+            completed_at: None,
+            input: None,
+            output: None,
+            cost_usd: 0.0,
+            logs: vec![],
+            port_warnings: vec![],
+            color: uuid::Uuid::nil(),
+            frames: vec![],
+        }
+    }
+
+    #[test]
+    fn an_empty_bag_is_no_output_whichever_way_it_is_spelled() {
+        // Null (a sink that emits nothing) and `{}` (a boundary that
+        // forwarded nothing) both mean "handed out nothing".
+        let mut rec = record();
+        rec.set_output(&Value::Null);
+        assert_eq!(rec.output, None);
+        rec.set_output(&json!({}));
+        assert_eq!(rec.output, None);
+    }
+
+    #[test]
+    fn a_bag_with_values_is_kept_whole() {
+        let mut rec = record();
+        rec.set_output(&json!({"answer": "yes", "score": 3}));
+        assert_eq!(rec.output, Some(json!({"answer": "yes", "score": 3})));
+    }
+
+    #[test]
+    fn an_empty_bag_clears_an_earlier_value() {
+        // The setter is the one door, so a later empty write lands on
+        // the same shape a never-written record has.
+        let mut rec = record();
+        rec.set_output(&json!({"a": 1}));
+        rec.set_output(&Value::Null);
+        assert_eq!(rec.output, None);
+    }
 }

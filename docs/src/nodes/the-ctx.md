@@ -140,6 +140,20 @@ Ordinary async Rust is cancellable with no code at all. You need these only
 for subprocesses, blocking CPU work, and resources needing explicit cleanup.
 [Cancellation](cancellation.md).
 
+## Steering other runs
+
+```rust
+ctx.tag_execution(["user_7"]).await?;                 // label this run
+ctx.stop_tagged("user_7", StopSelf::Keep).await?;     // stop the others carrying it
+ctx.stop_tagged("exp_3", StopSelf::Include).await?;   // stop them all, me too
+```
+
+A run can label itself and stop every other run of the project carrying a
+label, including runs parked on a person or a timer. This is how three
+messages from one sender end with only the latest one answered. For the
+ordering rule and what the journal says afterwards, go and read
+[Stopping other runs](steering-executions.md).
+
 ## Logging and errors
 
 ```rust

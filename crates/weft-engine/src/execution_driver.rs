@@ -43,7 +43,7 @@ use weft_core::generator::{StreamEnd, DEFAULT_MAX_BUFFERED_ITEMS};
 use weft_core::liveness::FiringLocation;
 use weft_core::node::NodeOutput;
 use weft_core::primitive::ExecutionSnapshot;
-use weft_core::project::EdgeIndex;
+use weft_core::project::{infra_ids, scope_body_roots, scope_members, trigger_ids, EdgeIndex};
 use weft_core::pulse::{PulseStatus, PulseTable};
 use weft_core::cancellation::CancellationFlag;
 use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
@@ -90,14 +90,26 @@ pub enum ExecutionOutcome {
     /// to the type system and decoded by string equality at the
     /// terminal-match and journal sites, so a reworded sentinel at one
     /// producer would silently flip a cancel into a generic failure.
-    Cancelled,
+    /// `cause` is what the canceller recorded on the flag, read at the
+    /// moment the driver gives up (`recorded_cancel_cause`), so every
+    /// terminal row written for the run names the same thing.
+    Cancelled { cause: weft_core::exec::CancelCause },
     /// Worker stalled: at least one firing is waiting for a signal.
     /// Worker should exit; the next fire's `register_signal` task
     /// will resume by re-folding the journal.
     Stalled,
     /// Scheduler ran to quiescence but pulses remain pending and
-    /// nothing is waiting. Treat as a graph-shape bug.
-    Stuck,
+    /// nothing is waiting. Treat as a graph-shape bug. The report
+    /// names every firing left holding pulses and the wired ports it
+    /// never received, which is what the terminal row prints.
+    Stuck { report: weft_core::exec::StuckReport },
+    /// The journal already held a terminal event when the worker
+    /// booted: the color was cancelled, or ran to its end, before this
+    /// task was claimed (a dispatcher re-run enqueued a second execute
+    /// for it, or a cancel landed in the route window). Nothing was
+    /// driven and nothing is journaled; running the bodies again would
+    /// repeat their side effects.
+    AlreadySettled,
 }
 
 /// Run one execution to a terminal state or a stall. Each call folds
@@ -131,12 +143,14 @@ pub async fn run_one_execution(
     let edge_idx = EdgeIndex::build(project);
     let mut pulses: PulseTable = Default::default();
     let mut executions: NodeExecutionTable = Default::default();
-    // Kicked roots (entry points of the active execution: firing
-    // trigger, manual-run roots, infra-setup roots). Folded from
-    // `ExecEvent::NodeKicked`. The scheduler dispatches each not-yet-
-    // dispatched kick once at frames=[]; the payload for the firing
-    // trigger threads through to the `ctx.wake` bag.
-    let mut kicked: HashMap<String, weft_core::primitive::KickedNode> = HashMap::new();
+    // Kicked nodes (the execution's entry points: the firing trigger,
+    // manual-run roots, infra-setup roots, at frames `[]`; and every
+    // scope body's own roots, at the scope's frames). Folded from
+    // `ExecEvent::NodeKicked`, `ScopeLaunched` and
+    // `LoopIterationLaunched::roots`. The scheduler dispatches each
+    // not-yet-dispatched kick once at its own frames; the payload for
+    // the firing trigger threads through to the `ctx.wake` bag.
+    let mut kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode> = HashMap::new();
     // Per-(node, frames) ordered list of past `await_signal` calls.
     // Pre-loaded from the journal fold; consumed by the body's
     // `await_signal` calls in call_index order. Replaces the
@@ -169,7 +183,7 @@ pub async fn run_one_execution(
             tokio::select! {
                 _ = clients.clock.sleep(std::time::Duration::from_millis(200)) => {}
                 _ = cancellation.cancelled() => {
-                    return Ok(ExecutionOutcome::Cancelled);
+                    return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) });
                 }
             }
             let evs = fetch_events(journal.as_ref(), color).await?;
@@ -191,6 +205,22 @@ pub async fn run_one_execution(
              arrived within 6s; the dispatcher contract is broken"
         );
     }
+    // A terminal already in the journal means this color is finished:
+    // cancelled during the dispatcher's route window, or run to its end
+    // by an earlier task. Refuse to drive it. This is the worker-side
+    // half of the guard the dispatcher applies before it enqueues: the
+    // enqueue can race a cancel, and an execute task's dedup key frees
+    // once the first task completes, so a late re-run can enqueue a
+    // second execute for a color that already ran. Driving it would
+    // repeat every node body's side effects.
+    if events.iter().any(weft_journal::ExecEvent::is_execution_terminal) {
+        tracing::info!(
+            target: "weft_engine::execution_driver",
+            color = %color,
+            "journal already holds a terminal for this color; not driving it"
+        );
+        return Ok(ExecutionOutcome::AlreadySettled);
+    }
     // Phase derives from the ExecutionStarted event we now have. No
     // unwrap_or fallback: if events is non-empty but contains no
     // ExecutionStarted, the journal is malformed and we fail loud.
@@ -206,8 +236,9 @@ pub async fn run_one_execution(
             "color {color} has journal events but no ExecutionStarted; \
              journal is malformed"
         ))?;
-    // A manual run journaled the subgraph it set out to execute;
-    // resumes rebuild the same boundary from the same row.
+    // The subgraph the run set out to execute (a trigger fire, or a
+    // manual run aimed at targets); resumes rebuild the same boundary
+    // from the same row.
     let run_subgraph: Option<std::collections::HashSet<String>> =
         run_subgraph.map(|v| v.into_iter().collect());
     let snap = weft_journal::fold_to_snapshot(color, &events);
@@ -304,7 +335,7 @@ pub async fn run_one_execution(
             event_count_before,
         )
         .await?;
-        if !matches!(outcome, ExecutionOutcome::Stalled | ExecutionOutcome::Stuck) {
+        if !matches!(outcome, ExecutionOutcome::Stalled | ExecutionOutcome::Stuck { .. }) {
             break;
         }
         // The worker has stalled: every branch is parked or done. THIS is
@@ -349,8 +380,12 @@ pub async fn run_one_execution(
                     "caller-tied run held past its hold time with no resolving signal; \
                      cancelling (a tied run cannot degrade into a background job)"
                 );
-                cancellation.cancel();
-                outcome = ExecutionOutcome::Cancelled;
+                cancellation.cancel_because(weft_core::exec::CancelCause::Runtime {
+                    detail: "the run was tied to a live caller and held past its hold time \
+                             with no resolving signal"
+                        .into(),
+                });
+                outcome = ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) };
                 break;
             }
             // Suspendable (or no caller): a Stalled drive that ran out of
@@ -419,11 +454,15 @@ pub async fn run_one_execution(
         // worker knows which nodes are non-terminal AT the moment
         // we exit, so this can't live in the dispatcher's cancel
         // path.
-        ExecutionOutcome::Cancelled => {
-            journal_node_cancellations(journal.as_ref(), color, &pod_name).await;
+        ExecutionOutcome::Cancelled { cause } => {
+            // The outcome carries WHY (read off the flag when the driver
+            // gave up); every row written here names that cause, so the
+            // run reads the same whichever side (this worker or the
+            // dispatcher) wrote its terminal first.
+            journal_node_cancellations(journal.as_ref(), color, &pod_name, cause).await;
             journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
         }
-        ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck => {
+        ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck { .. } => {
             journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
             // No worker-side storage cleanup here: the dispatcher's durable
             // terminate sweep owns the run's un-kept exec files. It reaps
@@ -431,6 +470,10 @@ pub async fn run_one_execution(
             // linger (so the user can still download a run's output), then
             // the broker's expiry sweep deletes them. A worker-side eager
             // delete would defeat that linger.
+        }
+        ExecutionOutcome::AlreadySettled => {
+            // Returned before the drive loop; unreachable here, and there
+            // is nothing to journal for it anyway.
         }
         ExecutionOutcome::Stalled => {
             // Worker exits cleanly without writing a terminal event.
@@ -610,12 +653,10 @@ fn redispatch_locations(
     to_un_absorb: &std::collections::HashSet<FiringLocation>,
     pulses: &mut PulseTable,
     executions: &NodeExecutionTable,
-    kicked: &mut HashMap<String, weft_core::primitive::KickedNode>,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) {
-    for (node_id, info) in kicked.iter_mut() {
-        if info.dispatched
-            && to_un_absorb.contains(&FiringLocation::new(node_id.clone(), Vec::new()))
-        {
+    for (loc, info) in kicked.iter_mut() {
+        if info.dispatched && to_un_absorb.contains(loc) {
             info.dispatched = false;
         }
     }
@@ -654,7 +695,7 @@ fn apply_snapshot(
     snap: ExecutionSnapshot,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
-    kicked: &mut HashMap<String, weft_core::primitive::KickedNode>,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
 ) -> Vec<FiringLocation> {
     *pulses = snap.pulses;
@@ -778,7 +819,7 @@ fn resume_resolved_suspensions_in_place(
     events: &[weft_journal::ExecEvent],
     executions: &NodeExecutionTable,
     pulses: &mut PulseTable,
-    kicked: &mut HashMap<String, weft_core::primitive::KickedNode>,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
 ) -> usize {
     let snap = weft_journal::fold_to_snapshot(color, events);
@@ -832,12 +873,13 @@ async fn drive(
     caller: Option<&Arc<dyn weft_core::caller::CallerConnection>>,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
-    kicked: &mut HashMap<String, weft_core::primitive::KickedNode>,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     phase: weft_core::context::Phase,
-    // A manual run's journaled subgraph: in Phase::Fire, only these
-    // nodes dispatch and everything else skips. None = whole graph.
+    // The journaled subgraph (a trigger fire's program): in Phase::Fire,
+    // only these nodes dispatch; a pulse into anything else (another
+    // program's node) is absorbed silently. None = whole graph.
     run_subgraph: Option<&std::collections::HashSet<String>>,
     // Number of journal events the caller already folded into the
     // snapshot it handed us. The bus-held resume poll compares against
@@ -885,32 +927,32 @@ async fn drive(
     let mut waiting: HashMap<String, FiringLocation> = HashMap::new();
 
     // The set of nodes this execution may dispatch. In TriggerSetup
-    // only the triggers (features.is_trigger) and their upstream
-    // closure run; in InfraSetup only infra nodes (requires_infra) and
-    // theirs. A node outside the set skips the moment a pulse lands on
+    // only the run subgraph of the triggers (features.is_trigger) runs;
+    // in InfraSetup only that of the infra nodes (requires_infra). The
+    // dispatcher kicked the roots of the same subgraph, so the two
+    // never disagree. A node outside the set skips the moment a pulse lands on
     // it, otherwise downstream nodes would block forever on inputs the
     // setup phase never produces (the ready pass owns that decision;
     // the dispatch loop decides whether the skip is journaled or
     // silent).
     //
-    // Phase::Fire is bounded for every manual run (the dispatcher
-    // journaled the computed subgraph); a trigger-fired execution
-    // carries none and reaches everything via pulses.
+    // Phase::Fire is bounded when the dispatcher journaled a subgraph:
+    // every trigger fire and targeted manual run carries its allowed
+    // nodes. Untargeted manual runs carry none and dispatch every pulse.
     let dispatchable: Option<std::collections::HashSet<String>> =
         match phase {
             weft_core::context::Phase::TriggerSetup => {
-                Some(compute_trigger_setup_scope(project, edge_idx))
+                Some(weft_core::project::run_subgraph(project, edge_idx, &trigger_ids(project), &Default::default()))
             }
             weft_core::context::Phase::InfraSetup => {
-                Some(compute_infra_setup_scope(project, edge_idx))
+                Some(weft_core::project::run_subgraph(project, edge_idx, &infra_ids(project), &Default::default()))
             }
             weft_core::context::Phase::Fire => run_subgraph.cloned(),
         };
-    // A pulse landing on a node outside the scope is NOT pruned: the
-    // readiness pass turns it into a real NodeSkipped (reason: outside
-    // this run), whose cascade closes its downstream. Silent deletion
-    // was how out-of-scope nodes vanished from the inspector with no
-    // row at all.
+    // A pulse landing on a node outside the scope is absorbed silently
+    // in the dispatch loop (`out_of_scope`): a setup phase's scope is
+    // engine plumbing the user never chose, and on a fire the node is
+    // another program's, so neither is this run's business to paint.
 
     // Rehydrate sweep: a resumed stream-driven loop whose durable
     // `stream_end` is already recorded has no close pulse left (it was
@@ -1003,7 +1045,7 @@ async fn drive(
                 &mut stream_rt,
             )
             .await;
-            return Ok(ExecutionOutcome::Cancelled);
+            return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
         }
 
         // At Fire, wires INTO a trigger are inert: a trigger's ports
@@ -1041,7 +1083,7 @@ async fn drive(
         // exactly like any first pulse does.
         let acted = route_stream_pulses(
             color, project, edge_idx, pulses, executions, journal, pod_name,
-            &mut stream_rt, loop_runtime, &mut emitted_ports,
+            &mut stream_rt, loop_runtime, &mut emitted_ports, kicked,
         )
         .await;
         if acted > 0 {
@@ -1107,68 +1149,82 @@ async fn drive(
         //    the same key), flip `dispatched=true` so the next tick
         //    doesn't double-fire.
         let mut kick_payloads: HashMap<FiringLocation, Value> = HashMap::new();
-        for (node_id, info) in kicked.iter_mut() {
+        for (loc, info) in kicked.iter_mut() {
             // The FIRING trigger always gets a wake delivery, even when
             // the fire's body was empty (a bare ping journals `null`);
             // a non-firing kick only carries one when a manual-run mock
             // set a real payload on a plain root.
             if info.firing {
-                kick_payloads.insert(
-                    FiringLocation::new(node_id.clone(), Vec::new()),
-                    info.payload.clone().unwrap_or(Value::Null),
-                );
+                kick_payloads.insert(loc.clone(), info.payload.clone().unwrap_or(Value::Null));
             } else if let Some(payload) = info.payload.clone() {
-                kick_payloads.insert(FiringLocation::new(node_id.clone(), Vec::new()), payload);
+                kick_payloads.insert(loc.clone(), payload);
             }
             if info.dispatched {
                 continue;
             }
-            // Not yet dispatched. If a pulse-driven ReadyGroup at
-            // frames=[] already covers this node (unusual: the entry
-            // node also received a regular pulse, possible in test
-            // setups), let the pulse-driven dispatch run; we just
-            // flip `dispatched`. Either way, the payload is in
+            // Not yet dispatched. If a pulse-driven ReadyGroup at this
+            // location already covers the node (unusual: the entry node
+            // also received a regular pulse, possible in test setups),
+            // let the pulse-driven dispatch run; we just flip
+            // `dispatched`. Either way, the payload is in
             // `kick_payloads` so the dispatch sees it.
             let already_in_ready = ready
                 .iter()
-                .any(|(rid, g)| rid == node_id && g.frames.is_empty());
+                .any(|(rid, g)| *rid == loc.node_id && g.frames == loc.frames);
             if !already_in_ready {
-                // Synthesize a ReadyGroup at frames=[] with input
-                // populated from the node's config. Configurable input
-                // ports (`Range.to: 10`, etc.) reach the firing as
-                // input values; without this the kick path saw an empty
-                // bag and the node failed with
-                // `missing input on port: <name>` despite the source
-                // setting the value.
+                // Synthesize a ReadyGroup at the kick's frames with
+                // input populated from the node's written constants.
+                // Configurable input ports (`Range.to: 10`, etc.) reach
+                // the firing as input values; without this the kick path
+                // saw an empty bag and the node failed with `missing
+                // input on port: <name>` despite the source setting the
+                // value.
                 // A kicked entry node still answers to `_should_flow`:
                 // a `false` literal in its braces (no pulses exist on a
                 // kick, so only the literal branch can fire) turns it
-                // off, same as any other node.
-                let (input, skip) = match project.nodes.iter().find(|n| n.id == *node_id) {
-                    Some(def) => (
-                        weft_core::exec::ready::build_kicked_input(
+                // off, same as any other node. A kick from a scope that
+                // was gated off is dispatched straight into its skip.
+                let (input, input_errors, skip) = match project.nodes.iter().find(|n| n.id == loc.node_id) {
+                    Some(def) => {
+                        let (input, input_errors) = weft_core::exec::ready::build_kicked_input(
                             def,
                             info.port_snapshot.as_ref(),
-                        ),
-                        weft_core::exec::skip::check_flow_permission(
-                            def,
-                            &[],
-                            &Vec::new(),
-                            color,
-                        ),
-                    ),
-                    None => (Value::Object(serde_json::Map::new()), None),
+                        );
+                        (
+                        input,
+                        input_errors,
+                        match &info.scope_skipped {
+                            Some(scope) => Some(weft_core::exec::skip::SkipReason::ScopeSkipped {
+                                scope: scope.clone(),
+                            }),
+                            None => weft_core::exec::skip::check_flow_permission(
+                                def,
+                                &[],
+                                &loc.frames,
+                                color,
+                            ),
+                        },
+                        )
+                    }
+                    None => (Value::Object(serde_json::Map::new()), Vec::new(), None),
                 };
                 ready.push((
-                    node_id.clone(),
+                    loc.node_id.clone(),
                     weft_core::exec::ready::ReadyGroup {
-                        frames: Vec::new(),
+                        frames: loc.frames.clone(),
                         color,
                         input,
                         closed_ports: Vec::new(),
                         skip,
                         pulse_ids: Vec::new(),
-                        error: None,
+                        // A kicked node whose own ports refuse their
+                        // values fails the same way a pulsed one does.
+                        error: if input_errors.is_empty() {
+                            None
+                        } else {
+                            Some(input_errors.join("; "))
+                        },
+                        out_of_scope: false,
                     },
                 ));
             }
@@ -1210,50 +1266,32 @@ async fn drive(
                      project definition; corrupt compiled project shape"
                 ));
             };
-            // Scope is decided inside `find_ready_nodes` (an
-            // out-of-scope node arrives here already carrying its skip
-            // reason and forms a group on ANY pulse). Two cases absorb
-            // SILENTLY, journaling nothing:
-            //  - a location already terminally skipped: scope is a
-            //    per-run constant, so once skipped, a later pulse batch
-            //    (a second parent closing a tick later) must not open a
-            //    second lifecycle pair;
-            //  - a setup phase: its scope is engine plumbing the user
-            //    never chose, so an activation must not paint the
-            //    business graph "skipped".
-            // Both settle any delivery gate through the same
-            // skip-absorb path a journaled skip uses.
-            if matches!(
-                group.skip,
-                Some(weft_core::exec::skip::SkipReason::OutsideThisRun)
-            ) {
-                let already_skipped = executions.get(&node_id).is_some_and(|v| {
-                    v.iter().any(|e| {
-                        e.color == group.color
-                            && e.frames == group.frames
-                            && e.status.is_terminal()
-                    })
-                });
-                let setup_phase = !matches!(phase, weft_core::context::Phase::Fire);
-                if already_skipped || setup_phase {
-                    if let Some(bucket) = pulses.get_mut(&node_id) {
-                        for p in bucket.iter_mut() {
-                            if group.pulse_ids.contains(&p.id)
-                                && p.status == weft_core::pulse::PulseStatus::Pending
-                            {
-                                p.absorb();
-                            }
+            // Scope is decided inside `find_ready_nodes`: an out-of-scope
+            // node forms a group on ANY pulse and arrives here flagged.
+            // It absorbs SILENTLY, journaling nothing: a setup phase's
+            // scope is engine plumbing the user never chose, so an
+            // activation must not paint the business graph "skipped",
+            // and on a trigger fire the node is another program's (a
+            // shared upstream node emits down every wire it has), not
+            // this run's business to paint. Any delivery gate settles
+            // through the same skip-absorb path a journaled skip uses.
+            if group.out_of_scope {
+                if let Some(bucket) = pulses.get_mut(&node_id) {
+                    for p in bucket.iter_mut() {
+                        if group.pulse_ids.contains(&p.id)
+                            && p.status == weft_core::pulse::PulseStatus::Pending
+                        {
+                            p.absorb();
                         }
                     }
-                    let msg = format!(
-                        "the consumer '{node_id}' skipped (it is outside the part of \
-                         the graph this execution runs), so the awaited delivery can \
-                         never happen"
-                    );
-                    stream_rt
-                        .on_pulses_absorbed(&group.pulse_ids, AbsorbKind::Skipped { reason: &msg });
-                    continue;
                 }
+                let msg = format!(
+                    "the consumer '{node_id}' is outside the part of the graph this \
+                     execution runs, so the awaited delivery can never happen"
+                );
+                stream_rt
+                    .on_pulses_absorbed(&group.pulse_ids, AbsorbKind::Skipped { reason: &msg });
+                continue;
             }
             // Absorb input pulses for this dispatch, EXCEPT pulses on
             // generator-typed input ports of a dispatch that will RUN:
@@ -1432,7 +1470,7 @@ async fn drive(
             if let Some(reason) = &group.skip {
                 handle_node_skip(
                     &node_id, group.color, &group.frames, &group.closed_ports, reason,
-                    project, edge_idx, pulses, executions, journal, pod_name,
+                    project, edge_idx, pulses, executions, kicked, journal, pod_name,
                 )
                 .await;
                 continue;
@@ -1460,7 +1498,13 @@ async fn drive(
             // closes their same-named outputs and skips cascade
             // through (and out of) the group.
             if node_def.node_type == "Passthrough" {
-                let forwarded = group.input.clone();
+                // The scope's gate is consumed here, never forwarded:
+                // the In boundary has no `_should_flow` output, and the
+                // children take the scope's decision as a whole.
+                let mut forwarded = group.input.clone();
+                if let Some(obj) = forwarded.as_object_mut() {
+                    obj.remove(weft_core::exec::skip::SHOULD_FLOW_PORT);
+                }
                 let mut emissions = Vec::new();
                 match weft_core::exec::postprocess_output(
                     &node_id, &forwarded, color, &group.frames,
@@ -1483,7 +1527,30 @@ async fn drive(
                             project, edge_idx, pulses, None,
                         ));
                         mark_completed(executions, &node_id, color, &group.frames);
+                        // A boundary forwards synchronously, so it never
+                        // goes through the emission merge above; record
+                        // what it forwarded here, or the live record and
+                        // the folded one disagree on this firing.
+                        if let Some(rec) = executions.get_mut(&node_id).and_then(|v| {
+                            v.iter_mut().rev().find(|e| e.color == color && e.frames == group.frames)
+                        }) {
+                            rec.set_output(&forwarded);
+                        }
                         ship_node_completed(journal, pod_name, color, &node_id, &group.frames, &forwarded, all_emissions).await;
+                        // The scope has started: everything inside it
+                        // runs now, wired to its edges or not. Its own
+                        // roots are kicked at the scope's frames.
+                        if let Some(gb) = node_def
+                            .group_boundary
+                            .as_ref()
+                            .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
+                        {
+                            launch_scope(
+                                project, edge_idx, journal, pod_name, color, &gb.group_id,
+                                &group.frames, None, kicked,
+                            )
+                            .await;
+                        }
                     }
                     Err(e) => {
                         let mentioned = std::collections::HashSet::new();
@@ -1516,6 +1583,7 @@ async fn drive(
                     pod_name,
                     loop_runtime,
                     &mut stream_rt,
+                    kicked,
                 )
                 .await;
                 match outcome {
@@ -1703,7 +1771,7 @@ async fn drive(
             // run-time dispatch built above, so provision bodies read
             // the same view a `run` body would.
             let provision_input = inputs.clone();
-            let ctx = ExecutionContext::new(
+            let mut ctx = ExecutionContext::new(
                 exec_id.to_string(),
                 project.id.to_string(),
                 node_id.clone(),
@@ -1714,6 +1782,31 @@ async fn drive(
                 inputs,
                 handle,
             );
+            // Every stored file among the inputs gets a link the body
+            // can fetch, minted for this firing (see
+            // `ExecutionContext::link_file_inputs`). The journal row
+            // for this start was written from the delivered values
+            // above, so it never carries one. A link that cannot be
+            // minted fails the firing loudly, like a bag it cannot read.
+            if let Err(err) = ctx
+                .link_file_inputs(node_def.inputs.iter().map(|p| (p.name.as_str(), &p.port_type)))
+                .await
+            {
+                if !generator_ports.is_empty() {
+                    let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
+                    retire_consumer_streams(
+                        &loc, group.color, pulses, journal, pod_name, &mut stream_rt,
+                    )
+                    .await;
+                }
+                let mentioned = std::collections::HashSet::new();
+                handle_node_failure(
+                    &node_id, &mentioned, group.color, &group.frames, &err.to_string(),
+                    project, edge_idx, pulses, executions, journal, pod_name,
+                )
+                .await;
+                continue;
+            }
 
             // The lifecycle event (NodeStarted or NodeResumed) was
             // already shipped earlier in this loop body, before
@@ -1894,7 +1987,7 @@ async fn drive(
 
         // No progress from draining. Check: is anything still in flight?
         if in_flight.is_empty() {
-            return terminate(pulses, executions, &waiting).await;
+            return terminate(project, edge_idx, pulses, executions, &waiting).await;
         }
 
         // Stuck-check: we drained twice without progress, with at least
@@ -2207,7 +2300,7 @@ async fn drive(
                 tracing::info!(
                     target: "weft_engine::execution_driver",
                     color = %color,
-                    "cancellation observed at idle wait; exiting Failed(cancelled)"
+                    "cancellation observed at idle wait; exiting Cancelled"
                 );
                 cancel_cleanup(
                     &mut in_flight,
@@ -2225,7 +2318,7 @@ async fn drive(
                     &mut stream_rt,
                 )
                 .await;
-                return Ok(ExecutionOutcome::Cancelled);
+                return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
             }
         }
         // We just unblocked from the idle-wait. The next no-progress
@@ -2342,6 +2435,7 @@ pub(crate) async fn handle_loop_boundary_firing(
     pod_name: &str,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     stream_rt: &mut StreamRuntime,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> Result<(), String> {
     use crate::loop_runtime::{LoopAdvance, LoopConfig, LoopItemSource};
     use weft_core::primitive::{LoopInstanceKey, LoopTerminationReason};
@@ -2360,6 +2454,9 @@ pub(crate) async fn handle_loop_boundary_firing(
         color: group.color,
     };
     let mut input_obj = group.input.as_object().cloned().unwrap_or_default();
+    // The loop's gate is consumed at the boundary, never broadcast into
+    // the body (the LoopIn has no `_should_flow` inside output).
+    input_obj.remove(weft_core::exec::skip::SHOULD_FLOW_PORT);
 
     // A boundary firing over an instance that already terminated FAILED
     // must route to the FAILURE path, not the idle-complete path:
@@ -2590,6 +2687,7 @@ pub(crate) async fn handle_loop_boundary_firing(
                     &input_obj,
                     &inst_carry,
                     None,
+                    kicked,
                 )
                 .await?;
                 loop_runtime.record_launched(&key, index);
@@ -2726,7 +2824,7 @@ pub(crate) async fn handle_loop_boundary_firing(
                 let loop_in_id = weft_core::project::boundary_in_id(&group_id);
                 launch_stream_iteration(
                     project, edge_idx, pulses, journal, pod_name, group.color,
-                    &key, &loop_in_id, next, item, loop_runtime, stream_rt,
+                    &key, &loop_in_id, next, item, loop_runtime, stream_rt, kicked,
                 )
                 .await
             }
@@ -2759,6 +2857,7 @@ pub(crate) async fn handle_loop_boundary_firing(
                     &loop_in_input,
                     &inst_carry,
                     None,
+                    kicked,
                 )
                 .await?;
                 loop_runtime.record_launched(&key, next);
@@ -2926,6 +3025,7 @@ pub(crate) async fn launch_iteration(
     // (`stream_pulse`), so the take and the launch are one atomic
     // write. `None` for list-driven and done-driven launches.
     stream_item: Option<(String, uuid::Uuid, serde_json::Value)>,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> Result<(), String> {
     use crate::loop_runtime::iteration_frames;
 
@@ -3011,6 +3111,11 @@ pub(crate) async fn launch_iteration(
     // body pulses are in the folded table, so `record_loop_out`'s
     // already-launched guard correctly returns Idle instead of
     // double-launching.
+    // The body's own roots (members no wire feeds) start with the
+    // iteration, at its frames: everything inside a loop runs once per
+    // iteration, wired to the loop's edges or not. They ride the same
+    // atomic row as the pulses.
+    let roots = scope_body_roots(project, edge_idx, group_id);
     crate::context::record_from_pod(
         journal,
         weft_journal::ExecEvent::LoopIterationLaunched {
@@ -3019,13 +3124,79 @@ pub(crate) async fn launch_iteration(
             parent_frames: parent_frames.clone(),
             index,
             body_emissions: emissions.into_iter().map(Into::into).collect(),
+            roots: roots.clone(),
             stream_pulse: stream_item.as_ref().map(|(_, id, _)| id.to_string()),
             at_unix: now_unix(),
         },
         pod_name,
     )
     .await;
+    register_scope_kicks(kicked, &roots, &body_frames, None);
     Ok(())
+}
+
+/// Journal the kick every scope body root gets at `frames` and hand the
+/// kicks to the scheduler: the group launcher, the one-iteration case
+/// of a loop's launch (which rides `LoopIterationLaunched::roots`
+/// instead of this row, so the launch stays one atomic fact). With
+/// `skipped_by`, the scope was gated off: every member (nested scopes
+/// included) is kicked straight into a `ScopeSkipped` skip, so the
+/// journal says of each that its scope did not run.
+#[allow(clippy::too_many_arguments)]
+async fn launch_scope(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    color: Color,
+    group_id: &str,
+    frames: &weft_core::frames::LoopFrames,
+    skipped_by: Option<&str>,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+) {
+    let roots: Vec<String> = match skipped_by {
+        None => scope_body_roots(project, edge_idx, group_id),
+        Some(_) => scope_members(project, group_id).into_iter().map(|n| n.id.clone()).collect(),
+    };
+    if roots.is_empty() {
+        return;
+    }
+    crate::context::record_from_pod(
+        journal,
+        weft_journal::ExecEvent::ScopeLaunched {
+            color,
+            group_id: group_id.to_string(),
+            frames: frames.clone(),
+            roots: roots.clone(),
+            skipped_by: skipped_by.map(str::to_string),
+            at_unix: now_unix(),
+        },
+        pod_name,
+    )
+    .await;
+    register_scope_kicks(kicked, &roots, frames, skipped_by);
+}
+
+/// The RAM twin of what the journal row just recorded (the fold builds
+/// the same entries from `ScopeLaunched` / `LoopIterationLaunched`):
+/// one kick per root at `frames`, first launch wins.
+fn register_scope_kicks(
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    roots: &[String],
+    frames: &weft_core::frames::LoopFrames,
+    skipped_by: Option<&str>,
+) {
+    for root in roots {
+        kicked
+            .entry(FiringLocation::new(root.clone(), frames.clone()))
+            .or_insert_with(|| weft_core::primitive::KickedNode {
+                firing: false,
+                payload: None,
+                port_snapshot: None,
+                dispatched: false,
+                scope_skipped: skipped_by.map(str::to_string),
+            });
+    }
 }
 
 /// Ship a terminated loop's outward payload: postprocess the assembled
@@ -3084,7 +3255,7 @@ pub(crate) async fn emit_loop_outward(
         }
         // Closures carried in the terminal row (atomic), same reason as
         // the success path above.
-        let closures = build_loop_outward_closures(
+        let closures = build_scope_outward_closures(
             project, edge_idx, pulses, color, group_id, parent_frames,
         );
         crate::context::record_from_pod(
@@ -3133,31 +3304,35 @@ pub(crate) async fn emit_loop_outward(
 /// there is no standalone-ship path. A missing `__out` node (impossible
 /// unless the compiled project shape is corrupt) is logged at error level
 /// rather than returned, since teardown paths cannot propagate.
-fn build_loop_outward_closures(
+/// The closures a scope that never runs owes the outside: one per
+/// outward port of its Out boundary, at the scope's own frames. A
+/// group's and a loop's alike; the outward surface is the Out node's
+/// outputs either way.
+fn build_scope_outward_closures(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     color: weft_core::Color,
     group_id: &str,
-    parent_frames: &weft_core::frames::LoopFrames,
+    frames: &weft_core::frames::LoopFrames,
 ) -> Vec<weft_core::exec::PulseEmission> {
-    let loop_out_id = weft_core::project::boundary_out_id(group_id);
-    let Some(loop_out_node) = project.nodes.iter().find(|n| n.id == loop_out_id) else {
+    let out_id = weft_core::project::boundary_out_id(group_id);
+    let Some(out_node) = project.nodes.iter().find(|n| n.id == out_id) else {
         tracing::error!(
             target: "weft_engine::loop_runtime",
             group_id = %group_id,
-            "loop teardown: project has no '{loop_out_id}' node; outward consumers \
+            "scope teardown: project has no '{out_id}' node; outward consumers \
              will not receive closures (corrupt compiled project shape)"
         );
         return Vec::new();
     };
     let mut emissions = Vec::new();
-    for port in &loop_out_node.outputs {
+    for port in &out_node.outputs {
         // Unreachable by construction (we iterate the node's own
         // declared outputs), but teardown cannot propagate, so log
         // loud rather than unwrap.
         if let Err(e) = weft_core::exec::postprocess::emit_port_closure(
-            &loop_out_id, &port.name, color, parent_frames,
+            &out_id, &port.name, color, frames,
             project, pulses, edge_idx, &mut emissions,
         ) {
             tracing::error!(
@@ -3165,7 +3340,7 @@ fn build_loop_outward_closures(
                 group_id = %group_id,
                 port = %port.name,
                 error = %e,
-                "loop teardown closure failed"
+                "scope teardown closure failed"
             );
         }
     }
@@ -3263,7 +3438,7 @@ async fn handle_loop_boundary_failure(
             inst.terminated = Some(LoopTerminationReason::Failed);
         }
         let closures =
-            build_loop_outward_closures(project, edge_idx, pulses, color, &group_id, &parent_frames);
+            build_scope_outward_closures(project, edge_idx, pulses, color, &group_id, &parent_frames);
         crate::context::record_from_pod(
             journal,
             weft_journal::ExecEvent::LoopTerminated {
@@ -3283,7 +3458,7 @@ async fn handle_loop_boundary_failure(
     } else {
         // No instance: NodeFailed is the only terminal row, so it carries
         // the closures.
-        build_loop_outward_closures(project, edge_idx, pulses, color, &group_id, &parent_frames)
+        build_scope_outward_closures(project, edge_idx, pulses, color, &group_id, &parent_frames)
     };
 
     // Boundary firings never emit through the task channel, so the
@@ -3412,49 +3587,50 @@ async fn handle_node_skip(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     journal: &dyn JournalClient,
     pod_name: &str,
 ) {
     mark_skipped(executions, node_id, color, frames);
-    // An out-of-scope skip carries NO closures: everything downstream
-    // of an out-of-scope node is itself outside the scope (scopes are
-    // upstream closures), so a cascade would only manufacture pulses
-    // for nodes that are absorbed anyway; each out-of-scope node
-    // adjacent to the in-scope region gets its own skip row from the
-    // pulses in-scope producers send it directly.
-    if matches!(reason, weft_core::exec::skip::SkipReason::OutsideThisRun) {
+    // A node inside a gated scope carries NO closures: every member of
+    // that scope gets its own `ScopeSkipped` row from the scope's
+    // sweep (nested scopes included), and the scope's outward closures
+    // rode its In boundary's skip row. A cascade here would only
+    // manufacture a second firing for nodes the sweep already settled.
+    if matches!(reason, weft_core::exec::skip::SkipReason::ScopeSkipped { .. }) {
         ship_node_skipped(
             journal, pod_name, color, node_id, frames, closed_ports, reason, Vec::new(),
         )
         .await;
         return;
     }
-    // A skipped LOOP In-boundary needs its own teardown: the generic
-    // sweep below deliberately no-ops for loop boundary nodes
+    // A skipped scope (its In boundary said no) needs its own teardown:
+    // the generic sweep below deliberately no-ops for loop boundaries
     // (per-iteration firings must not auto-close the outward ports),
-    // which would swallow this skip entirely: the loop never
-    // instantiates, nothing ever fires its outward ports, and the
-    // consumers neither fire nor skip (the execution lands Stuck or
-    // silently Completed with the whole subtree missing). The loop's
-    // skip surface is its outward ports at the group's own frames.
-    let skipped_loop_group = project
+    // and a group's inside outputs must not cascade either, since every
+    // member is settled by the sweep instead. The scope's skip surface
+    // is its outward ports at the scope's own frames; the outward
+    // closures ride INSIDE the NodeSkipped row, same atomic discipline
+    // as everywhere else: a crash between a bare NodeSkipped and a
+    // separate closure write would leave the scope dead but its
+    // consumers never closed (refold Stuck). Then every member logs
+    // that its scope did not run.
+    let skipped_scope = project
         .nodes
         .iter()
         .find(|n| n.id == node_id)
-        .filter(|n| n.node_type == "LoopIn")
         .and_then(|n| n.group_boundary.as_ref())
+        .filter(|gb| gb.role == weft_core::project::GroupBoundaryRole::In)
         .map(|gb| gb.group_id.clone());
-    if let Some(group_id) = skipped_loop_group {
-        // A skipped loop's outward closures ride INSIDE the NodeSkipped
-        // row, same atomic discipline as everywhere else: a crash between
-        // a bare NodeSkipped and a separate closure write would leave the
-        // loop dead but its consumers never closed (refold Stuck). The
-        // generic sweep no-ops for loop boundaries, so we build the
-        // loop's outward closures explicitly here.
-        let closures = build_loop_outward_closures(
+    if let Some(group_id) = skipped_scope {
+        let closures = build_scope_outward_closures(
             project, edge_idx, pulses, color, &group_id, frames,
         );
         ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, reason, closures).await;
+        launch_scope(
+            project, edge_idx, journal, pod_name, color, &group_id, frames, Some(&group_id), kicked,
+        )
+        .await;
         return;
     }
     // A skipped node's body never runs, so it never emitted on ANY
@@ -3648,7 +3824,7 @@ pub(crate) async fn cancel_loop_instances(
         // the engine drives it again. Folding the closures into the same
         // row means a crash can't leave the closures pending with the
         // instance still live (which would re-emit them).
-        let closures = build_loop_outward_closures(
+        let closures = build_scope_outward_closures(
             project, edge_idx, pulses, color, &group_id, &parent_frames,
         );
         crate::context::record_from_pod(
@@ -3713,6 +3889,7 @@ async fn route_stream_pulses(
     stream_rt: &mut StreamRuntime,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> usize {
     use crate::loop_runtime::{LoopAdvance, LoopStreamItem};
 
@@ -3926,7 +4103,7 @@ async fn route_stream_pulses(
                         // takes; it must not kill the whole drive.
                         if let Err(e) = launch_stream_iteration(
                             project, edge_idx, pulses, journal, pod_name, color,
-                            &key, &loop_in, index, item, loop_runtime, stream_rt,
+                            &key, &loop_in, index, item, loop_runtime, stream_rt, kicked,
                         )
                         .await
                         {
@@ -4184,6 +4361,7 @@ async fn launch_stream_iteration(
     item: crate::loop_runtime::LoopStreamItem,
     loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     stream_rt: &mut StreamRuntime,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> Result<(), String> {
     let (config, port, inst_carry, outer_input) = {
         let inst = loop_runtime.get(key).ok_or_else(|| {
@@ -4216,6 +4394,7 @@ async fn launch_stream_iteration(
         &outer_input,
         &inst_carry,
         Some((port, item.pulse, item.value)),
+        kicked,
     )
     .await?;
     loop_runtime.record_launched(key, index);
@@ -4598,7 +4777,7 @@ async fn apply_one_emission(
                             }
                             _ => output_value.clone(),
                         };
-                        rec.output = Some(merged);
+                        rec.set_output(&merged);
                     }
                     set
                 }
@@ -4975,6 +5154,8 @@ fn mark_waiting(
 }
 
 async fn terminate(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
     pulses: &PulseTable,
     executions: &mut NodeExecutionTable,
     waiting: &HashMap<String, FiringLocation>,
@@ -5006,12 +5187,9 @@ async fn terminate(
                 );
                 return Ok(ExecutionOutcome::Stalled);
             }
-            tracing::warn!(
-                target: "weft_engine",
-                pulses = pulses.len(),
-                "execution stuck: pending pulses with no ready nodes and no suspensions"
-            );
-            Ok(ExecutionOutcome::Stuck)
+            let report = weft_core::exec::stuck_report(project, edge_idx, pulses);
+            tracing::warn!(target: "weft_engine", %report, "no ready nodes and no suspensions");
+            Ok(ExecutionOutcome::Stuck { report })
         }
     }
 }
@@ -5145,69 +5323,22 @@ fn node_body_for(
     }
 }
 
-/// Compute the node-id set that a `Phase::TriggerSetup` run should
-/// execute: every trigger node plus its upstream closure. Any node
-/// outside this set will receive pulses (bridge output fans out to
-/// its downstream), but we auto-skip them so the loop terminates
-/// instead of blocking on inputs that will never arrive (e.g. the
-/// reply node of an echo bot).
-fn compute_trigger_setup_scope(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-) -> std::collections::HashSet<String> {
-    let triggers: Vec<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.features.is_trigger)
-        .map(|n| n.id.clone())
-        .collect();
-    upstream_closure(project, edge_idx, triggers)
-}
-
-/// Compute the node-id set that a `Phase::InfraSetup` run should
-/// execute: every `requires_infra` node plus its upstream closure.
-/// This is what unblocks "programmatic infra" (a text-field node
-/// feeding into an infra node): the upstream nodes execute first so
-/// their values are available as `provision_infra`-time inputs.
-fn compute_infra_setup_scope(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-) -> std::collections::HashSet<String> {
-    let infra: Vec<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.requires_infra)
-        .map(|n| n.id.clone())
-        .collect();
-    upstream_closure(project, edge_idx, infra)
-}
-
-fn upstream_closure(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    seeds: Vec<String>,
-) -> std::collections::HashSet<String> {
-    let mut scope: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut frontier: Vec<String> = seeds;
-    while let Some(id) = frontier.pop() {
-        if !scope.insert(id.clone()) {
-            continue;
-        }
-        for edge in edge_idx.get_incoming(project, &id) {
-            if !scope.contains(&edge.source) {
-                frontier.push(edge.source.clone());
-            }
-        }
-    }
-    scope
-}
-
-
 async fn fetch_events(
     journal: &dyn JournalClient,
     color: Color,
 ) -> anyhow::Result<Vec<weft_journal::ExecEvent>> {
     journal.events_for_color(color).await
+}
+
+/// The cause the canceller recorded on the flag. Read only once the
+/// flag is tripped, and `cancel_because` is the flag's only door (it
+/// stores the cause before it trips), so a tripped flag always carries
+/// one.
+fn recorded_cancel_cause(cancellation: &CancellationFlag) -> weft_core::exec::CancelCause {
+    debug_assert!(cancellation.is_cancelled(), "read the cause only off a tripped flag");
+    cancellation
+        .cause()
+        .expect("a tripped flag carries its cause: cancel_because is the only door")
 }
 
 /// Walk the journal, find every (node, frames) that's currently
@@ -5228,6 +5359,7 @@ async fn journal_node_cancellations(
     journal: &dyn JournalClient,
     color: Color,
     pod_name: &str,
+    cause: &weft_core::exec::CancelCause,
 ) {
     let events = match fetch_events(journal, color).await {
         Ok(e) => e,
@@ -5242,7 +5374,7 @@ async fn journal_node_cancellations(
     };
     let snapshot = weft_journal::fold_to_snapshot(color, &events);
     let now = now_unix();
-    let reason = "Cancelled by user".to_string();
+    let reason = cause.to_string();
     for (node_id, execs) in snapshot.executions.iter() {
         for e in execs {
             if e.status.is_terminal() {
@@ -5308,6 +5440,9 @@ async fn journal_terminal(
     }
     let at_unix = now_unix();
     let event = match outcome {
+        // Returned before anything ran; there is no terminal of ours to
+        // write, the journal already holds one.
+        ExecutionOutcome::AlreadySettled => return,
         ExecutionOutcome::Completed { outputs } => weft_journal::ExecEvent::ExecutionCompleted {
             color,
             outputs: outputs.clone(),
@@ -5315,21 +5450,20 @@ async fn journal_terminal(
         },
         // A cancel maps to the proper ExecutionCancelled terminal so the
         // UI renders the cancel affordance instead of a generic failure.
-        ExecutionOutcome::Cancelled => {
-            weft_journal::ExecEvent::ExecutionCancelled {
-                color,
-                reason: "Cancelled by user".to_string(),
-                at_unix,
-            }
-        }
+        ExecutionOutcome::Cancelled { cause } => weft_journal::ExecEvent::ExecutionCancelled {
+            color,
+            reason: cause.to_string(),
+            cause: Some(cause.clone()),
+            at_unix,
+        },
         ExecutionOutcome::Failed { error } => weft_journal::ExecEvent::ExecutionFailed {
             color,
             error: error.clone(),
             at_unix,
         },
-        ExecutionOutcome::Stuck => weft_journal::ExecEvent::ExecutionFailed {
+        ExecutionOutcome::Stuck { report } => weft_journal::ExecEvent::ExecutionFailed {
             color,
-            error: "execution stuck".to_string(),
+            error: report.to_string(),
             at_unix,
         },
         ExecutionOutcome::Stalled => {
@@ -5379,10 +5513,6 @@ async fn journal_terminal(
 #[cfg(test)]
 #[path = "execution_driver_tests/resume.rs"]
 mod resume_tests;
-
-#[cfg(test)]
-#[path = "execution_driver_tests/scope.rs"]
-mod scope_tests;
 
 /// Shared layer-3 rig for tests that drive `run_one_execution` with real
 /// inline nodes: an in-memory recording journal plus Noop fakes for every

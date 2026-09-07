@@ -190,7 +190,12 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
              old-image pod remains); its execution is cancelled"
         );
         if let Some(color) = color.and_then(|c| c.parse::<weft_core::Color>().ok()) {
-            if let Err(e) = crate::api::execution::cancel_color(state, color).await {
+            let cause = weft_core::exec::CancelCause::Runtime {
+                detail: "the project was rebuilt before a worker claimed this run, and no \
+                         worker of the old build remains to run it"
+                    .into(),
+            };
+            if let Err(e) = crate::api::execution::cancel_color(state, color, &cause).await {
                 tracing::warn!(
                     target: "weft_dispatcher::cold_start",
                     color = %color,

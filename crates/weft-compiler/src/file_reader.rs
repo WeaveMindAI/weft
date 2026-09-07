@@ -44,6 +44,12 @@ pub struct ResolvedFile {
 /// message pointed at a source line.
 pub trait FileReader {
     fn resolve_and_read(&self, base: &Path, relative: &Path) -> Result<ResolvedFile, String>;
+
+    /// The identity `resolve_and_read` would give `path` (the disk backing
+    /// canonicalizes, the map backing normalizes lexically), so a caller can
+    /// express one identity relative to another: an included file's
+    /// `@file("x")` becomes `components/x` under the project root.
+    fn identity(&self, path: &Path) -> Result<PathBuf, String>;
 }
 
 /// The on-disk backing: today's behavior. Joins `relative` onto `base`,
@@ -60,11 +66,9 @@ pub struct DiskFileReader;
 
 impl FileReader for DiskFileReader {
     fn resolve_and_read(&self, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
-        let joined = base.join(relative);
-        let canonical_base = base
-            .canonicalize()
-            .map_err(|e| format!("project root {base:?} is unreadable: {e}"))?;
-        let identity = joined
+        let canonical_base = self.identity(base)?;
+        let identity = base
+            .join(relative)
             .canonicalize()
             .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
         if !identity.starts_with(&canonical_base) {
@@ -73,6 +77,11 @@ impl FileReader for DiskFileReader {
         let content = std::fs::read_to_string(&identity)
             .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
         Ok(ResolvedFile { identity, content })
+    }
+
+    fn identity(&self, path: &Path) -> Result<PathBuf, String> {
+        path.canonicalize()
+            .map_err(|e| format!("project root {path:?} is unreadable: {e}"))
     }
 }
 
@@ -107,7 +116,7 @@ impl FileReader for MapFileReader {
         // survives the per-path climb check yet leaves the base, so checking
         // "climbs above its own root" is not enough: the normalized join must
         // still sit under the normalized base.
-        let canonical_base = normalize_lexical(base).ok_or_else(escapes)?;
+        let canonical_base = self.identity(base)?;
         let identity = normalize_lexical(&base.join(relative)).ok_or_else(escapes)?;
         if !identity.starts_with(&canonical_base) {
             return Err(escapes());
@@ -120,6 +129,10 @@ impl FileReader for MapFileReader {
             None => Err(format!("path {relative:?} not found")),
         }
     }
+
+    fn identity(&self, path: &Path) -> Result<PathBuf, String> {
+        normalize_lexical(path).ok_or_else(|| format!("path {path:?} escapes the project root"))
+    }
 }
 
 /// Lexically normalize a path: collapse `.` and resolve `..` against the
@@ -127,7 +140,7 @@ impl FileReader for MapFileReader {
 /// `..` would climb above the path's root (the lexical equivalent of escaping
 /// the containment root), so a virtual backing rejects the same escapes the disk
 /// backing's canonicalize-then-prefix-check rejects.
-fn normalize_lexical(path: &Path) -> Option<PathBuf> {
+pub(crate) fn normalize_lexical(path: &Path) -> Option<PathBuf> {
     let mut out: Vec<Component> = Vec::new();
     for comp in path.components() {
         match comp {

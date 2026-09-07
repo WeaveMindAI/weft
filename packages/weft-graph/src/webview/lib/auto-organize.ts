@@ -5,7 +5,7 @@
 
 import ELK from 'elkjs/lib/elk.bundled.js';
 import type { NodeInstance, Edge } from './types';
-import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, inputExposure } from './types';
+import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, acceptsLiteral } from './types';
 import { CONFIG_STRIP_BAR_PX, configStripOpenPx } from './constants/container-layout';
 import { LOOP_CONFIG_FIELDS } from './utils/input-field';
 import { SHOULD_FLOW_PORT } from '../../protocol';
@@ -172,7 +172,7 @@ export async function autoOrganize(
 	function isHookupEdge(e: Edge): boolean {
 		const input = nodeById.get(e.target)?.inputs?.find(i => i.name === e.targetHandle);
 		if (!input) return false;
-		return String(input.portType) === 'Access' || inputExposure(input) === 'wire';
+		return String(input.portType) === 'Access' || !acceptsLiteral(input);
 	}
 	/** Cached path split of one scope's children (plumbing-blind, the
 	 *  same split the banding uses). */
@@ -396,6 +396,10 @@ export async function autoOrganize(
 			});
 		}
 		inputs.forEach((name, i) => {
+			// The dock is declared once, above. A node's declared inputs
+			// carry `_should_flow` too (the parser lists it on every node),
+			// which used to declare the same port id twice.
+			if (name === SHOULD_FLOW_PORT) return;
 			const id = `${nodeId}__in__${name}`;
 			if (!usedPortIds.has(id)) return;
 			ports.push({
@@ -421,11 +425,16 @@ export async function autoOrganize(
 	}
 
 	// --- Shared ELK layout options ---
-	// We rely on model order (the order of children in the input array) to
-	// pin siblings left-to-right the way the user wrote them in weft source.
-	// `considerModelOrder` + `crossingCounterNodeInfluence > 0` makes ELK treat
-	// source order as a strong tiebreaker during crossing minimization, and
-	// `nodePromotion.strategy` + tighter spacing keep layers compact.
+	// Children are still fed in weft source order (see layoutScope), but
+	// ELK's model-order options (`considerModelOrder`,
+	// `forceNodeModelOrder`) are deliberately NOT set. Two reasons, both
+	// measured on the layout corpus (`layout-corpus/corpus.test.ts`):
+	// with `hierarchyHandling: INCLUDE_CHILDREN` (which the moon clusters
+	// need) elkjs 0.12 throws inside crossing minimization on an ordinary
+	// group of seven nodes, so every organize of a project with a group
+	// silently did nothing; and where it did run, forcing source order
+	// roughly doubled the edge crossings on every fixture. Source order
+	// still decides ties through the child order itself.
 	const elkLayoutOptions: Record<string, string> = {
 		'elk.algorithm': 'layered',
 		'elk.direction': 'RIGHT',
@@ -436,10 +445,6 @@ export async function autoOrganize(
 		'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
 		'elk.layered.crossingMinimization.greedySwitch.type': 'TWO_SIDED',
 		'elk.layered.crossingMinimization.thoroughness': '100',
-		'elk.layered.considerModelOrder.strategy': 'NODES_AND_EDGES',
-		'elk.layered.considerModelOrder.crossingCounterNodeInfluence': '0.5',
-		'elk.layered.considerModelOrder.crossingCounterPortInfluence': '0.5',
-		'elk.layered.crossingMinimization.forceNodeModelOrder': 'true',
 		'elk.layered.nodePromotion.strategy': 'DUMMYNODE_PERCENTAGE',
 		'elk.separateConnectedComponents': 'true',
 		'elk.layered.compaction.connectedComponents': 'true',
@@ -834,38 +839,34 @@ export async function autoOrganize(
 		groupsByDepth.get(depth)!.push(groupId);
 	}
 
-	try {
-		// 2. Layout from deepest groups up to shallowest
-		for (let depth = 0; depth <= maxDepth; depth++) {
-			const groups = groupsByDepth.get(depth) ?? [];
-			for (const groupId of groups) {
-				const children = (childrenOf.get(groupId) ?? []).filter(c => elkVisibleNodeIds.has(c.id));
-				if (children.length === 0) continue;
+	// ELK failing is a real bug (a malformed graph we fed it, a bad size, an
+	// unsupported option), never an expected outcome, and it is the CALLER's
+	// to show. This used to catch, log to the console and hand back an empty
+	// map, which the caller applied as "nothing moved": the user pressed
+	// Auto Organize and nothing happened, with the reason in a devtools
+	// console nobody had open. It throws now, and the caller says so on
+	// screen.
 
-				const padding = paddingForGroup(groupId);
-				// One run: with the plumbing withheld from the edge set,
-				// ELK's own `separateConnectedComponents` splits and packs
-				// the group's independent pieces itself.
-				await layoutScope(groupId, children, padding);
-			}
+	// 2. Layout from deepest groups up to shallowest
+	for (let depth = 0; depth <= maxDepth; depth++) {
+		const groups = groupsByDepth.get(depth) ?? [];
+		for (const groupId of groups) {
+			const children = (childrenOf.get(groupId) ?? []).filter(c => elkVisibleNodeIds.has(c.id));
+			if (children.length === 0) continue;
+
+			const padding = paddingForGroup(groupId);
+			// One run: with the plumbing withheld from the edge set,
+			// ELK's own `separateConnectedComponents` splits and packs
+			// the group's independent pieces itself.
+			await layoutScope(groupId, children, padding);
 		}
-
-		// 3. Layout the root scope, groups now at their final sizes. One
-		// run here too: the paths (plumbing-blind components) are
-		// separated and packed by ELK, not by hand.
-		const rootPadding = `[top=${GROUP_PADDING},left=${GROUP_PADDING},bottom=${GROUP_PADDING},right=${GROUP_PADDING}]`;
-		await layoutScope('root', topLevelNodes, rootPadding);
-	} catch (e) {
-		// ELK failing is a real bug (a malformed graph we fed it, a bad size, an
-		// unsupported option), not an expected outcome. Scattering nodes into a fixed
-		// grid here USED to hide that: it produced a plausible-looking layout that
-		// masked the input problem and destroyed the user's existing arrangement.
-		// Surface it loudly and return an empty positions map instead: the caller
-		// applies positions only where present, so every node keeps its current
-		// position and the broken layout is visible rather than silently papered over.
-		console.error('[autoOrganize] ELK layout failed; leaving node positions untouched:', e);
-		positions.clear();
 	}
+
+	// 3. Layout the root scope, groups now at their final sizes. One
+	// run here too: the paths (plumbing-blind components) are
+	// separated and packed by ELK, not by hand.
+	const rootPadding = `[top=${GROUP_PADDING},left=${GROUP_PADDING},bottom=${GROUP_PADDING},right=${GROUP_PADDING}]`;
+	await layoutScope('root', topLevelNodes, rootPadding);
 
 	return { positions, groupSizes };
 }

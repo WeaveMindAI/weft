@@ -1,0 +1,45 @@
+{
+  "type": "Wait",
+  "label": "Wait",
+  "description": "Pause this branch for a number of seconds, at no cost: the run parks on a timer and resumes when it fires. Whatever arrives on `value` comes out unchanged afterwards, so the node sits in the middle of a chain; `wokeAt` is when it resumed. To wait for a date instead, use WaitUntil.",
+  "tags": [
+    "wait",
+    "delay",
+    "sleep",
+    "timer",
+    "basic"
+  ],
+  "icon": "Hourglass",
+  "color": "#64748b",
+  "inputs": [
+    {
+      "name": "seconds",
+      "type": "Number",
+      "required": true,
+      "label": "Seconds",
+      "description": "How long to wait, in seconds (fractions allowed). Must be more than zero.",
+      "widget": { "kind": "number", "min": 0 }
+    },
+    {
+      "name": "value",
+      "type": "T",
+      "required": false,
+      "accepts": ["wire"],
+      "label": "Value",
+      "description": "Passed through unchanged once the wait is over. Optional: the node also works as a pure delay on `_should_flow`."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "value",
+      "type": "T",
+      "description": "The `value` that came in, emitted once the wait is over."
+    },
+    {
+      "name": "wokeAt",
+      "type": "String",
+      "description": "ISO-8601 time the wait ended."
+    }
+  ],
+  "requires_infra": false
+}

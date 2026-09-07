@@ -46,8 +46,10 @@ pub enum EditOp {
     /// Remove a node and every connection referencing it.
     RemoveNode { node: String },
     /// Add `target.port = source.port`, replacing any existing driver of the
-    /// same target port (input ports are single-driver).
-    AddEdge { source: String, source_port: String, target: String, target_port: String, scope_group: Option<String> },
+    /// same target port (input ports are single-driver). `path` reads keys
+    /// off the source value on the way (`target.port = source.port.a.b`);
+    /// empty for a plain wire.
+    AddEdge { source: String, source_port: String, target: String, target_port: String, scope_group: Option<String>, #[serde(default, skip_serializing_if = "Vec::is_empty")] path: Vec<String> },
     /// Remove a connection line. `scope_group` is the group whose body the
     /// connection lives in (None = top level), symmetric with `AddEdge`.
     RemoveEdge { source: String, source_port: String, target: String, target_port: String, scope_group: Option<String> },
@@ -62,8 +64,28 @@ pub enum EditOp {
     MoveNodeScope { node: String, target_group: Option<String> },
     /// Move a group into another group (top level when None).
     MoveGroupScope { group: String, target_group: Option<String> },
-    /// Rewrite a node's port signature.
-    UpdateNodePorts { node: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
+    /// Rewrite a node's declared port surface. `inputs`/`outputs` are the
+    /// header's ports ONLY: custom additions, plus a catalog port whose type
+    /// or requiredness the author overrides (filling a MustOverride output).
+    /// The catalog provides the node type's own ports at enrich, so restating
+    /// them here would freeze the whole signature into source. A port the
+    /// gesture DELETED is named in `removed_inputs`/`removed_outputs`, and
+    /// only THOSE ports lose their wires: a port merely absent from the
+    /// header may be a catalog port with live wires. The removed lists
+    /// are REQUIRED on the wire (empty when nothing was deleted): a
+    /// missing list is refused at deserialization rather than read as
+    /// "sweep nothing", which would leave a deleted port's wires in
+    /// source silently. The editor's op additionally carries
+    /// projection-only `revertedInputs`/`revertedOutputs` members, which
+    /// serde ignores here by design.
+    // SYNC: UpdateNodePorts <-> packages/weft-graph/src/protocol.ts EditOp updateNodePorts
+    UpdateNodePorts {
+        node: String,
+        inputs: Vec<PortSig>,
+        outputs: Vec<PortSig>,
+        removed_inputs: Vec<String>,
+        removed_outputs: Vec<String>,
+    },
     /// Rewrite a group's port signature.
     UpdateGroupPorts { group: String, inputs: Vec<PortSig>, outputs: Vec<PortSig> },
     /// Set (or clear) a group's description: the plain `# ...` comment that is
@@ -112,19 +134,23 @@ pub enum ValueForm {
     Connection,
 }
 
-/// A port in a signature rewrite. `required: false` renders `name: Type?`.
+/// A port in a signature rewrite. `required: false` renders `name?: Type`
+/// (inputs only: an output has no optionality and a sig asking for one is
+/// refused). The editor's sig additionally carries a projection-only
+/// `rendered` member, which serde ignores here by design.
+// SYNC: PortSig <-> packages/weft-graph/src/protocol.ts EditPortSig
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortSig {
     pub name: String,
-    #[serde(default = "default_true")]
+    /// Required on the wire (the editor always writes it): a missing
+    /// flag is refused rather than defaulted, since a default here
+    /// would rewrite an author's `name?: Type` as `name: Type`.
     pub required: bool,
-    #[serde(default)]
-    pub port_type: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
+    /// Required on the wire for the same reason: a default here would
+    /// write the `MustOverride` placeholder over the author's declared
+    /// type. Where a placeholder is meant, the editor spells it out.
+    pub port_type: String,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]

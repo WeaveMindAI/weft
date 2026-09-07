@@ -20,7 +20,6 @@
   "outputs": [],
   "requires_infra": false,
   "features": {
-    "showDebugPreview": true,
-    "isOutputDefault": true
+    "showDebugPreview": true
   }
 }

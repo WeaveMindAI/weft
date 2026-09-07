@@ -117,9 +117,9 @@ pub fn inject_hash_fields_opt(
 /// everything enqueued after this register lands on fresh
 /// current-image pods. Nothing here parks, drains, or prompts.
 pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<ProjectHandle> {
-    let cwd = std::env::current_dir().context("cwd")?;
-    let project = weft_compiler::project::Project::discover(&cwd)
-        .map_err(|e| anyhow::anyhow!("discover project: {e}"))?;
+    // Ctx's cached discovery: one walk per invocation, one wording for
+    // every verb's "no project here".
+    let project = ctx.project()?;
 
     // Compile + enrich once; both hashes are scoped to the referenced
     // / infra-closure nodes, so they need the definition + catalog.
@@ -128,7 +128,7 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
     // can fire a structured progress error (the editor's action-bar
     // modal renders per-diagnostic info) instead of a single
     // flattened string.
-    let (mut definition, catalog) = match weft_compiler::hash::load_enriched_project_with_diagnostics(&project) {
+    let (mut definition, catalog) = match weft_compiler::hash::load_enriched_project_with_diagnostics(project) {
         Ok(pair) => pair,
         Err(weft_compiler::hash::CompileLoadError::Read(msg)) => {
             anyhow::bail!("{msg}");
@@ -141,8 +141,11 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
                 .unwrap_or_else(|| "compile failed".to_string());
             // The editor's action-bar modal renders one entry per
             // diagnostic from this structured event; the location's
-            // `file` is the SOURCE FILE (main.weft), not the project
-            // directory, so a click jumps to the right buffer.
+            // `file` is the diagnostic's own source file (an @include's
+            // nodes keep their file's coordinates), falling back to
+            // main.weft, so a click jumps to the right buffer.
+            // SYNC: diagnostic -> ActionErrorDiagnostic mapping <->
+            //       extension-vscode/src/preflight.ts preflightBlock
             let main_weft = project.main_weft();
             let json_diags: Vec<serde_json::Value> = diags
                 .iter()
@@ -158,7 +161,7 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
                         "code": d.code,
                         "message": d.message,
                         "location": {
-                            "file": main_weft.to_string_lossy(),
+                            "file": d.file.clone().unwrap_or_else(|| main_weft.to_string_lossy().into_owned()),
                             "line": d.line,
                             "column": d.column,
                         },
@@ -197,7 +200,7 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
     // FROMs it.
     let builder_base_ref = crate::images::ensure_worker_builder_base().await?;
     let plan = weft_compiler::build_plan::plan_build_from(
-        &project,
+        project,
         &definition,
         &catalog,
         &builder_base_ref,
@@ -220,9 +223,10 @@ pub async fn ensure_registered(ctx: &Ctx, progress: &Progress) -> Result<Project
     // rebuilt or hit the cache.
     let worker = crate::commands::build::worker_planned_image(&plan)?;
     // What must survive the post-ensure GC beyond the fresh tag (idle
-    // projects' current images, draining pods). Unreachable daemon =
-    // no answer = the GC is skipped, never guessed.
-    let referenced = crate::images::referenced_image_hashes(&client).await.ok();
+    // projects' current images, draining pods): the keep-set via
+    // `referenced_set_for_gc` (None + a warning when the answer is
+    // unlearnable -> the GC is skipped, never guessed).
+    let referenced = crate::images::referenced_set_for_gc(&client).await;
     crate::commands::build::ensure_worker_image_with_progress(
         progress,
         &project.id().to_string(),

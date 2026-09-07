@@ -110,7 +110,8 @@ fn parse_only_inner(
         source_name,
     );
     for e in parse_errors {
-        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "parse", e.message));
+        diagnostics
+            .push(Diagnostic::at(e.span, Severity::Error, "parse", e.message).in_file(e.file.as_deref()));
     }
 
     // Stage 3: enrich (lenient). Unknown types / catalog misses become
@@ -119,7 +120,7 @@ fn parse_only_inner(
     // authoring errors the build would reject, so surface each as an ERROR
     // diagnostic at the offending node's line, not a single span-less warning.
     for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Lenient) {
-        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message));
+        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message).in_file(e.file.as_deref()));
     }
 
     // Surface unknown node types as warnings so the IDE can paint a
@@ -149,8 +150,8 @@ fn parse_only_inner(
     }
 
     // Structural validate so the IDE gets inline feedback for
-    // graph-shape problems (no-output-node, unreachable-from-output,
-    // duplicate ids, etc.) directly from /parse. Runtime-only rules
+    // graph-shape problems (graph-cycle, scope-reachability, duplicate
+    // ids, etc.) directly from /parse. Runtime-only rules
     // still only fire from the dedicated /validate endpoint.
     diagnostics.extend(validate::validate_with_mode(
         &project,
@@ -276,7 +277,8 @@ fn compile_and_enrich_inner(
         Ok(p) => p,
         Err(errors) => {
             for e in errors {
-                diagnostics.push(Diagnostic::at(e.span, Severity::Error, "parse", e.message));
+                diagnostics
+                    .push(Diagnostic::at(e.span, Severity::Error, "parse", e.message).in_file(e.file.as_deref()));
             }
             return (empty_project(project_id), diagnostics);
         }
@@ -284,7 +286,7 @@ fn compile_and_enrich_inner(
     // Strict enrich: one Error diagnostic PER failure, at the offending node's
     // span (so the editor squiggles the exact line), not a single span-less blob.
     for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Strict) {
-        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message));
+        diagnostics.push(Diagnostic::at(e.span, Severity::Error, "enrich", e.message).in_file(e.file.as_deref()));
     }
     (project, diagnostics)
 }
@@ -300,7 +302,12 @@ pub fn render_diagnostics(diagnostics: &[Diagnostic]) -> String {
         diagnostics
             .iter()
             .filter(|d| !only_errors || matches!(d.severity, Severity::Error))
-            .map(|d| format!("{}:{} {}", d.line, d.column, d.message))
+            // A finding in an @include's file names that file; without
+            // the prefix its line number reads as the compiled source's.
+            .map(|d| {
+                let file = d.file.as_deref().map(|f| format!("{f}:")).unwrap_or_default();
+                format!("{file}{}:{} {}", d.line, d.column, d.message)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };

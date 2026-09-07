@@ -11,12 +11,16 @@
 	import ActionBar from "./ActionBar.svelte";
 	import NodeTagsEditor from "./NodeTagsEditor.svelte";
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
-	import { isOutputNode, pruneTargets, runTargetFacts } from "../../run-targets";
+	import { pruneTargets, runTargetFacts } from "../../run-targets";
+	import { containerStatus } from "../../utils/container-status";
+	import { derefKeys, derefType } from '../../utils/deref-menu';
 	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
+	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
-	import type { EditOp, TextEdit } from "../../../../protocol";
+	import type { LoopIteration } from "../../../../protocol";
+	import { isContainerNodeType, isLoopNodeType, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import type { EditOp, SourceLocation, TextEdit } from "../../../../protocol";
 	import { SHOULD_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
@@ -26,7 +30,10 @@
 	import { formatConfigValue } from "../../value-format";
 	import { measureTextWidth, nodeLabelFont } from "../../utils/measure-text";
 	import { foldOps } from "../../projection/apply";
-	import { diffConfigOps, diffPortLiteralOps, sameConfigValue, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
+	import { diffPortLiteralOps, VIEW_KEYS, NON_SOURCE_KEYS } from "../../projection/config-diff";
+	import { classifyUpdate } from "../../projection/update-classify";
+	import { copiedPortSigs, headerPortSigs, headerWorthy, partitionRemovals, portRequired, removedPortNames, type HeaderPortLike } from "../../projection/header-ports";
+	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, type PortEntryDef } from "../../utils/port-specs";
 	import { ProjectionEngine } from "../../projection/engine.svelte";
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
@@ -44,6 +51,7 @@
 		onRun,
 		onStop,
 		onDismissError,
+		onOpenLocation,
 		onActivate,
 		onCancelActivate,
 		onCancelBuild,
@@ -100,11 +108,12 @@
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		// Action-bar verb callbacks. The webview emits these; the
 		// host translates each into a CLI shell-out.
-		/// Targets are the output nodes the user aimed the run at, empty for
-		/// the ordinary run.
+		/// Targets are the nodes the user aimed the run at, empty for the
+		/// ordinary run.
 		onRun?: (targets: string[]) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
+		onOpenLocation: (location: SourceLocation) => void;
 		onActivate?: () => void;
 		onCancelActivate?: () => void;
 		onCancelBuild?: () => void;
@@ -559,19 +568,23 @@
 
 	function createNodeUpdateHandler(nodeId: string) {
 		return (updates: NodeDataUpdates) => {
-			// A collapse/expand TOGGLE is `expanded` actually CHANGING value, not
-			// merely present. Resize senders spread the whole config (which always
-			// carries the node's current `expanded`), so a key-presence test would
-			// classify every resize as a toggle and run the heavy collapse path
-			// (visibility + viewport pin). Compare against the live value instead:
-			// a resize spreads the unchanged flag (not a toggle => falls to resize),
-			// a real toggle flips it.
-			const priorExpanded = (nodes.find(n => n.id === nodeId)?.data.config as Record<string, boolean> | undefined)?.expanded;
-			const nextExpanded = (updates.config as Record<string, boolean> | undefined)?.expanded;
-			const isExpandToggle = nextExpanded !== undefined && nextExpanded !== priorExpanded;
+			const liveNode = nodes.find(n => n.id === nodeId);
+
+			// A Loop's config fields route to the loop op family (the Rust
+			// dispatch rejects a generic SetConfig on a Loop decl).
+			const isLoopConfig = containerKindOf(liveNode?.data?.nodeType) === 'Loop';
+			// The pure classifier decides: the config source ops, and
+			// whether this is a PURE collapse/expand toggle (a bundled
+			// gesture like the connection pick commits below as one
+			// recordEdit instead of running the heavy toggle path).
+			const { configOps, isExpandToggle } = classifyUpdate(
+				nodeId, updates,
+				liveNode?.data.config as Record<string, unknown> | undefined,
+				isLoopConfig,
+			);
 
 			// Capture old group label BEFORE updating (for rename in weft code)
-			const oldGroupLabel = ('label' in updates) ? nodes.find(n => n.id === nodeId)?.data.label as string | undefined : undefined;
+			const oldGroupLabel = ('label' in updates) ? liveNode?.data.label as string | undefined : undefined;
 
 			// Capture old dimensions BEFORE updating, for anchor-point fix and neighbor shift
 			let oldWidth = 0;
@@ -642,12 +655,18 @@
 					const directParent = nodeById.get(rawParentId);
 					const directParentExpanded = directParent ? ((directParent.data.config as Record<string, boolean>)?.expanded ?? true) : false;
 					const xyParentId = directParentExpanded && !hidden ? rawParentId : undefined;
+					// Hidden through xyflow's own flag, never through a display:none
+					// style: a node styled away keeps its last measured size (the
+					// library ignores zero-size measurements), so the Controls
+					// fit-view button, which uses the library's fitView, kept fitting
+					// the phantom boxes of collapsed children at their parent-
+					// relative positions and missed the real graph.
 					if (hidden) {
-						return { ...n, parentId: undefined, style: 'display: none;' };
+						return { ...n, parentId: undefined, hidden: true };
 					}
 					// Visible: restyle through the one sizing ladder, then layer the
 					// xyflow parentId (collapsed-parent children detach to top level).
-					return { ...applyNodeSizing(n, n.data as Record<string, unknown>), parentId: xyParentId };
+					return { ...applyNodeSizing(n, n.data as Record<string, unknown>), parentId: xyParentId, hidden: false };
 				});
 
 				// Hide/show edges touching hidden nodes
@@ -697,7 +716,7 @@
 								}
 
 								// Keep edges touching collapsed-group-hidden nodes hidden.
-								const currentHidden = new Set(nodes.filter(n => n.style === 'display: none;').map(n => n.id));
+								const currentHidden = new Set(nodes.filter(n => n.hidden).map(n => n.id));
 								if (currentHidden.size > 0) {
 									edges = edges.map(e => {
 										const touchesHidden = currentHidden.has(e.source) || currentHidden.has(e.target);
@@ -771,18 +790,12 @@
 				// frame after a drag reparents a node, and keying off `nodeId` there would
 				// miss the entry (read undefined -> every dim looks "changed" -> a spurious
 				// layout write + history churn on a keystroke).
-				const liveNode = nodes.find(n => n.id === nodeId);
 				const layoutEntry = liveNode ? parseLayoutCode(layoutCode, layoutVerb)[getLayoutKey(liveNode)] : undefined;
 				const persistedDim = (key: string): unknown =>
 					key === 'width' ? layoutEntry?.w
 						: key === 'height' ? layoutEntry?.h
 						: key === 'configCollapsed' ? layoutEntry?.configCollapsed
 						: layoutEntry?.expanded;
-				// A Loop's config fields (`parallel`, `over`, `carry`, ...) live in the
-				// loop config block, not a node config block, so they route to the
-				// loop-specific ops; the Rust dispatch rejects a generic SetConfig /
-				// RemoveConfig against a Loop decl. Both carry the SCOPED id (`nodeId`).
-				const isLoopConfig = containerKindOf(liveNode?.data?.nodeType) === 'Loop';
 				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
 					if (['width', 'height', 'expanded', 'configCollapsed'].includes(key)) {
@@ -794,16 +807,11 @@
 						if (value !== persistedDim(key)) needsLayout = true;
 					}
 				}
-				// Source ops: only the keys whose value actually CHANGED vs the
-				// node's projected config. Update senders spread the full config,
-				// and emitting unchanged keys would turn a pure layout gesture
-				// (expand/collapse spreads config too) into phantom source ops
-				// whose round-trip races the layout persist and reverts the toggle.
-				ops.push(...diffConfigOps(
-					nodeId, cfg as Record<string, unknown>,
-					(liveNode?.data.config as Record<string, unknown> | undefined) ?? {},
-					isLoopConfig,
-				));
+				// Source ops were diffed up front (the toggle classifier needs
+				// them); the diff ran against the pre-merge config, which is
+				// equivalent here because the live merge only touches VIEW_KEYS
+				// and the diff skips every NON_SOURCE_KEY.
+				ops.push(...configOps);
 				if (needsLayout) {
 					// The node in `nodes` was already updated (merged config + new
 					// dims) by the synchronous map above, so persist its live state
@@ -827,7 +835,6 @@
 					updates.portLiterals,
 					(foldNode?.portLiterals as Record<string, unknown> | undefined) ?? {},
 					foldNode?.portLiteralSpans ?? {},
-					foldNode?.inputs ?? [],
 				));
 			}
 			if ('portValueForm' in updates && updates.portValueForm) {
@@ -835,46 +842,137 @@
 				ops.push({ op: 'setValueForm', node: nodeId, key, form });
 			}
 			if ('inputs' in updates || 'outputs' in updates) {
-				const node = nodes.find(n => n.id === nodeId);
-				// The ports of a node that derives them from a config list (a
-				// form's `fields`, a switch's `cases`) are re-materialized by the
-				// enricher on every parse, so they must NEVER be written into the
-				// source signature. Emitting them makes the `.weft` declare
-				// `-> (test_approved: Boolean?, ...)` on a node type with
-				// `canAddOutputPorts: false`, which strict enrich (the build path)
-				// rejects as "custom output port on a node that does not support
-				// custom ports". That config list, written by the config ops above,
-				// is the single source of truth; the ports round-trip through it,
-				// not through the header.
-				const derivesPorts = (node?.data as { portsFromConfig?: unknown } | undefined)
-					?.portsFromConfig !== undefined;
-				if (node?.data && !derivesPorts) {
-					// Carry-synthesized ghost inputs are DERIVED from the loop's carry
-					// list (by the compiler on parse, by the projection on apply);
-					// writing one into the source signature would turn it into a real
-					// declared port that no longer dies with its carry. Strip them
-					// from every signature we emit.
-					// `config`-exposure inputs are metadata-derived settings,
-					// never source-declared ports: writing one into the header
-					// signature would collide with the compiler's config-input
-					// rule. Strip them, like the carry-synthesized ghosts.
-					const inputs = toPortSigs(((updates.inputs ?? node.data.inputs) as PortDefinition[])
-						.filter(p => !p.synthesizedFromCarry && inputExposure(p) !== 'config'));
-					const outputs = toPortSigs((updates.outputs ?? node.data.outputs) as PortLike[]);
-					const isContainer = node.type === 'group' || node.type === 'groupCollapsed';
-					if (isContainer) {
+				// Everything the emit READS comes from the PROJECTION (the
+				// same truth the portLiteral differ above reads): the local
+				// `nodes` mirror is rebuilt in a reactive effect, so between
+				// a pending gesture and that rebuild it is stale, and a
+				// stale read here writes wrong headers (a just-typed literal
+				// missed, a just-added port re-emitted with its rendered
+				// type) or drops the gesture entirely.
+				const foldPorts = fold.project.nodes.find((n) => n.id === nodeId);
+				if (!foldPorts) {
+					// A ports gesture on a node the projection does not know
+					// cannot be applied truthfully; swallowing it would lose
+					// the user's edit with no trace.
+					toast.error(`Cannot edit ports: '${nodeId}' is not in the current project state`);
+				} else {
+					// headerWorthy: carry ghosts never (see its doc in
+					// projection/header-ports).
+					const nextInputs = ((updates.inputs as PortDefinition[] | undefined) ?? foldPorts.inputs)
+						.filter(headerWorthy);
+					const nextOutputs = (updates.outputs as HeaderPortLike[] | undefined) ?? foldPorts.outputs;
+					const kind = containerKindOf(foldPorts.nodeType);
+					if (kind !== null) {
 						// Group and Loop have distinct port-update ops (the Rust dispatch
 						// validates the decl kind matches the op). Both carry the SCOPED id
 						// (`nodeId`), not the bare label, so ports resolve unambiguously
 						// even when two containers share a local label in different scopes.
-						const kind = containerKindOf(node.data.nodeType);
+						// A container's signature IS its whole surface, so the full
+						// list is written.
+						const inputs = toPortSigs(nextInputs);
+						const outputs = toPortSigs(nextOutputs);
 						if (kind === 'Loop') {
 							ops.push({ op: 'updateLoopPorts', loopId: nodeId, inputs, outputs });
 						} else {
 							ops.push({ op: 'updateGroupPorts', group: nodeId, inputs, outputs });
 						}
 					} else {
-						ops.push({ op: 'updateNodePorts', node: nodeId, inputs, outputs });
+						// A NODE's header declares only the custom/overridden
+						// ports (the catalog provides the rest, and the header
+						// is round-tripped from each port's DECLARED type);
+						// deletions are named explicitly so only their wires
+						// die. The previous lists are filtered the same way as
+						// the next, or a carry ghost (never in a signature)
+						// would read as "removed".
+						const defaults = NODE_TYPE_CONFIG[foldPorts.nodeType as NodeType];
+						const prevInputs = foldPorts.inputs.filter(headerWorthy);
+						const prevOutputs: HeaderPortLike[] = foldPorts.outputs;
+						// What each side is PROVIDED (the header aside): the
+						// catalog defaults plus the ports the config list derives
+						// (a form's `fields`, a switch's `cases`), re-derived
+						// here exactly as the enricher does. The list is a port's
+						// written value, read from the projection's port
+						// literals overlaid with the gesture's own write so a
+						// case edit is judged against the list it just wrote.
+						const pfc = defaults?.portsFromConfig;
+						const entrySpecs = pfc ? buildSpecMap(pfc.specs ?? []) : {};
+						const entryList = pfc
+							? (({ ...((foldPorts.portLiterals as Record<string, unknown> | undefined) ?? {}), ...(('portLiterals' in updates ? updates.portLiterals : undefined) ?? {}) })[pfc.field] as PortEntryDef[] | undefined) ?? []
+							: [];
+						const derivedInPorts = deriveInputsFromEntries(entryList, entrySpecs);
+						const derivedOutPorts = deriveOutputsFromEntries(entryList, entrySpecs);
+						const providedIns = [...(defaults?.defaultInputs ?? []), ...derivedInPorts];
+						const providedOuts = [...(defaults?.defaultOutputs ?? []), ...derivedOutPorts];
+						// headerPortSigs gets the CATALOG defaults alone: its
+						// restates-the-default gate un-declares a redundant line,
+						// which is right for a catalog port (it exists regardless)
+						// and wrong for a derived one (a hand-authored shadow line
+						// restating the derived shape is the author's only record
+						// of the declaration, and must round-trip).
+						const ins = headerPortSigs(prevInputs, nextInputs, defaults?.defaultInputs);
+						const outs = headerPortSigs(prevOutputs, nextOutputs, defaults?.defaultOutputs);
+						// A derived port must not be WRITTEN into the header
+						// unless the source already declares it (a hand-authored
+						// shadow line, which merges cleanly at enrich and must
+						// round-trip like any declaration): an UNBACKED derived
+						// sig (a just-added case) would declare a custom port on
+						// a type that forbids them, and the build rejects it. The
+						// same rule prunes the restates-default reverts, whose
+						// names must exist on the projection's node.
+						const derivedIns = new Set(derivedInPorts.map(p => p.name));
+						const derivedOuts = new Set(derivedOutPorts.map(p => p.name));
+						const unbackedDerived = (
+							derived: Set<string>,
+							next: HeaderPortLike[],
+						) => (s: { name: string }) =>
+							derived.has(s.name) && next.find(p => p.name === s.name)?.declaredType === undefined;
+						const sigInputs = ins.sigs.filter(s => !unbackedDerived(derivedIns, nextInputs)(s));
+						const sigOutputs = outs.sigs.filter(s => !unbackedDerived(derivedOuts, nextOutputs)(s));
+						const gateRevertedIns = ins.reverted.filter(s => !unbackedDerived(derivedIns, nextInputs)(s));
+						const gateRevertedOuts = outs.reverted.filter(s => !unbackedDerived(derivedOuts, nextOutputs)(s));
+						// Deleting a PROVIDED port (an override's ×, a shadow
+						// line over a derived port) is a REVERT, never a
+						// removal: the next parse re-creates the port, so a
+						// removal would only kill its wires. Only this side
+						// holds the catalog and the config list, so it routes.
+						const remIns = partitionRemovals(
+							removedPortNames(prevInputs, nextInputs), providedIns);
+						const remOuts = partitionRemovals(
+							removedPortNames(prevOutputs, nextOutputs), providedOuts);
+						// A truly removed port's typed-in value (its port literal)
+						// dies with it: left in source it re-creates the port
+						// through its config key, or fails the next build. Only
+						// this side can tell a port literal from a config value,
+						// so it sends the removal explicitly (before the ports op,
+						// so the projection still sees the input for value homing).
+						const literals = foldPorts.portLiterals;
+						const spans = foldPorts.portLiteralSpans;
+						for (const name of remIns.removed) {
+							if (literals && name in literals) {
+								ops.push({ op: 'removeConfig', node: nodeId, key: name, form: spans?.[name]?.origin });
+							}
+						}
+						const revertedInputs = [...gateRevertedIns, ...remIns.reverted];
+						const revertedOutputs = [...gateRevertedOuts, ...remOuts.reverted];
+						// An op that carries nothing is not sent: `updateNodePorts`
+						// de-inlines an inline node and rewrites its header before
+						// it looks at the payload, so an empty op is not a no-op
+						// on the Rust side (a config-list tweak on an inline
+						// Switch would extract it into a named decl).
+						if (sigInputs.length || sigOutputs.length
+							|| remIns.removed.length || remOuts.removed.length
+							|| revertedInputs.length || revertedOutputs.length) {
+							ops.push({
+								op: 'updateNodePorts',
+								node: nodeId,
+								inputs: sigInputs,
+								outputs: sigOutputs,
+								removedInputs: remIns.removed,
+								removedOutputs: remOuts.removed,
+								revertedInputs,
+								revertedOutputs,
+							});
+						}
 					}
 				}
 			}
@@ -902,10 +1000,13 @@
 			const isPureConfigTyping = 'config' in updates && ops.length > 0 && !hasLayout
 				&& !('inputs' in updates) && !('outputs' in updates) && !('label' in updates);
 			if (isExpandToggle) {
-				// Collapse/expand: the ELK pass below records layout incl. the toggled
-				// flag. Record any source ops that rode along (rare: a config typed in
-				// the same frame as a toggle).
-				if (ops.length > 0) recordEdit(ops);
+				// Pure collapse/expand: the ELK pass above records the layout
+				// including the toggled flag; nothing to record here. A toggle
+				// bundled with ops (the connection pick sends its handle +
+				// `expanded: true` as one gesture) never reaches this branch
+				// (the classifier requires no other work) and commits below as
+				// one recordEdit(ops, mutateLayout): one write, one undo step,
+				// no whole-graph reflow.
 			} else if (isResize) {
 				// User resize: a new footprint means neighbours reflow, so re-run ELK
 				// (no viewport pin); runAutoOrganize records the layout.
@@ -980,6 +1081,40 @@
 				return { ...n, config: cfg };
 			}) as typeof projectNodes;
 		}
+		// An access node with no connection picked is pinned open: the
+		// Connect button lives in the expanded body. The pin is VIEW
+		// state only, computed here and carried on node DATA, never in
+		// `config`: an update payload, the layout writer, and the
+		// typing-debounce classifier all see the authored `expanded`,
+		// so the pin cannot leak into the layout file or turn every
+		// keystroke into a layout write. The drawn state is
+		// `pinned || expanded` at each read below and in ProjectNode.
+		// Skipped entirely in simplified view, which has no expanded
+		// body and sizes leaves by their measured square.
+		const pinnedIds = new Set<string>();
+		if (!simplified) {
+			const wiredByNode = new Map<string, Set<string>>();
+			for (const e of projectEdges) {
+				if (!e.targetHandle) continue;
+				let s = wiredByNode.get(e.target);
+				if (!s) {
+					s = new Set();
+					wiredByNode.set(e.target, s);
+				}
+				s.add(e.targetHandle);
+			}
+			const noWires = new Set<string>();
+			for (const n of projectNodes) {
+				const pinned = hasUnpickedAccess(
+					// The one input fallback (shared with the renderer), so
+					// the two callers of the predicate can never disagree.
+					inputsOf(n.inputs),
+					n.portLiterals as Record<string, unknown> | undefined,
+					wiredByNode.get(n.id) ?? noWires,
+				);
+				if (pinned) pinnedIds.add(n.id);
+			}
+		}
 		// Unknown node types are already handled by the parser as opaque blocks
 		// (they never reach project.nodes), so we only need to filter for known types.
 		const validNodes = projectNodes.filter(n =>
@@ -1018,14 +1153,17 @@
 			const e = layoutMap?.[n.id];
 			if (e) nextFreeY = Math.max(nextFreeY, e.y + (e.h ?? 120) + 40);
 		}
-		// Fallback placements chosen this pass, persisted below as REAL layout
-		// entries (no undo slot: not user-authored). Anchoring the guess makes
-		// it a one-time commitment: without it, "below everything else" is
-		// recomputed on every rebuild, so a node typed into the code tab
-		// drifted downward every time an unrelated node was dragged further
-		// down. Persisting re-derives the layout once more; the second pass
-		// finds the entries and places nothing, so this reaches a fixpoint.
-		const placedAnchors: Array<[string, { x: number; y: number }]> = [];
+		// Visible nodes with no saved position in the active view, with the
+		// fallback position this pass gave them. Nobody placed these: they were
+		// typed into the source tab, written by an agent, or the view is being
+		// shown for the first time (a fresh file, or the simplified view of a
+		// project only ever laid out in the builder). Every graph gesture that
+		// creates a node writes its layout entry in the same edit, so a node
+		// the user placed by hand never lands here. One rule follows, in
+		// `organizeUnplaced`: any unplaced node organizes the whole active
+		// view once, automatically, after which every visible node holds an
+		// entry and the next rebuild places nothing (a fixpoint).
+		const unplaced: Array<[string, { x: number; y: number }]> = [];
 
 		// Containment floors: an expanded container's drawn box grows to enclose
 		// its children, recursively, so a container child (a Loop inside a
@@ -1048,26 +1186,60 @@
 				// saved expanded dims in config (restored on re-expand) but draws as a
 				// min-width chip; feeding the saved dims here would floor the parent at
 				// the node's pre-collapse footprint, so the parent never shrinks.
+				const pinned = pinnedIds.has(n.id);
 				const drawsAtConfigDims = n.nodeType === 'Annotation'
-					|| ((cfg?.expanded as boolean | undefined) ?? isContainer) !== false;
+					|| drawnExpanded(pinned, cfg, isContainer);
 				// Simplified leaf: prefer the MEASURED size (real drawn footprint of the
 				// square or the live-display card), falling back to the base square as a
 				// lower bound before the DOM is measured. NEVER the builder min-width
 				// (>= 200px), which inflated the group's right edge on the rightmost
 				// node (the lopsided-gap bug). Builder leaf keeps its min-width.
 				const measured = simplified ? measuredOf(n.id) : undefined;
+				// The DRAWN footprint, branch order mirroring computeSizing
+				// exactly (simplified leaf first, then annotation/container
+				// saved dims, then expanded, then collapsed), so the floor
+				// can never disagree with what is drawn.
+				let w: number | undefined;
+				let h: number | undefined;
+				if (!isContainer && n.nodeType !== 'Annotation' && simplified) {
+					// Simplified view draws EVERY leaf as the square/card
+					// before any expanded check, so the floor reports the
+					// measured footprint, never config dims or the builder
+					// min-width (which inflated the group's right edge, the
+					// lopsided-gap bug).
+					w = Math.max(SIMPLIFIED_SQUARE_PX, measured?.w ?? 0);
+					h = Math.max(SIMPLIFIED_SQUARE_PX, measured?.h ?? 0);
+				} else if (drawsAtConfigDims) {
+					if (isContainer || n.nodeType === 'Annotation') {
+						w = cfg?.width as number | undefined;
+						h = cfg?.height as number | undefined;
+					} else {
+						// A saved width below the port minimum draws floored
+						// at that minimum; a width without a height is
+						// ignored (auto); dims absent means the expanded
+						// fallback. All one rule with computeSizing, so the
+						// parent can never size below what the child draws.
+						w = expandedProjectWidth(
+							cfg?.width as number | undefined,
+							cfg?.height as number | undefined,
+							n.inputs, n.outputs,
+						);
+						h = cfg?.width && cfg?.height ? cfg.height as number : undefined;
+					}
+				} else {
+					// Collapsed: the min-width chip (or, for a collapsed
+					// group in simplified view, the square).
+					w = simplified ? Math.max(SIMPLIFIED_SQUARE_PX, measured?.w ?? 0) : computeMinNodeWidth(n.inputs, n.outputs);
+					h = simplified ? Math.max(SIMPLIFIED_SQUARE_PX, measured?.h ?? 0) : undefined;
+				}
 				return {
 					id: n.id,
 					parentId: cfg?.parentId as string | undefined,
-					container: isContainer && (cfg?.expanded as boolean ?? true) !== false,
+					container: isContainer && drawnExpanded(pinned, cfg, true),
 					x: entry?.x ?? n.position.x,
 					y: entry?.y ?? n.position.y,
-					w: drawsAtConfigDims
-						? cfg?.width as number | undefined
-						: (simplified ? Math.max(SIMPLIFIED_SQUARE_PX, measured?.w ?? 0) : computeMinNodeWidth(n.inputs, n.outputs)),
-					h: drawsAtConfigDims
-						? cfg?.height as number | undefined
-						: (simplified ? Math.max(SIMPLIFIED_SQUARE_PX, measured?.h ?? 0) : undefined),
+					w,
+					h,
 				};
 			}),
 			{ w: 280, h: 120 },
@@ -1083,13 +1255,15 @@
 			let parentGroupExpanded = true;
 			if (rawParentId) {
 				const directParent = projectNodes.find(g => g.id === rawParentId);
-				parentGroupExpanded = directParent ? ((directParent.config as Record<string, boolean>)?.expanded ?? true) : false;
+				parentGroupExpanded = directParent
+					? drawnExpanded(pinnedIds.has(directParent.id), directParent.config as Record<string, unknown>, true)
+					: false;
 				// Check full ancestor chain
 				let pid: string | undefined = rawParentId;
 				while (pid) {
 					const ancestor = projectNodes.find(g => g.id === pid);
 					if (!ancestor) break;
-					if ((ancestor.config as Record<string, boolean>)?.expanded === false) {
+					if (!drawnExpanded(pinnedIds.has(ancestor.id), ancestor.config as Record<string, unknown>, true)) {
 						hiddenByCollapsedGroup = true;
 						break;
 					}
@@ -1100,7 +1274,8 @@
 
 			const configWidth = (n.config as Record<string, number>)?.width;
 			const configHeight = (n.config as Record<string, number>)?.height;
-			const isExpanded = (n.config as Record<string, boolean>)?.expanded ?? (isGroup ? true : false);
+			const isExpanded =
+				drawnExpanded(pinnedIds.has(n.id), n.config as Record<string, unknown>, isGroup);
 
 			// Nesting depth so child groups render above parent groups.
 			let nestingDepth = 0;
@@ -1132,20 +1307,23 @@
 			});
 
 			// Position is layout's job: the merge places a node at its saved layout
-			// entry when present. A node with NO entry (just typed, fresh file) is
-			// placed below existing laid-out content (top-level) so it's visible, not
-			// stacked at the origin; a child with no entry keeps its parent-relative
-			// position. This single placement rule lives here so mount and re-render
-			// agree. (`n.position` is the structural parse's 0,0.)
+			// entry when present. A node with NO entry is placed somewhere visible
+			// for the moment (top-level: below existing laid-out content; a child:
+			// its parent-relative position) and reported as unplaced, which
+			// organizes the view (see `unplaced` above). Hidden nodes are not
+			// reported: an organize never writes them, so they would ask forever.
+			// This single placement rule lives here so mount and re-render agree.
+			// (`n.position` is the structural parse's 0,0.)
 			let position: { x: number; y: number };
 			if (layoutEntry) {
 				position = { x: layoutEntry.x, y: layoutEntry.y };
 			} else if (!rawParentId) {
 				position = { x: 0, y: nextFreeY };
 				nextFreeY += 140;
-				placedAnchors.push([n.id, position]);
+				if (!hiddenByCollapsedGroup) unplaced.push([n.id, position]);
 			} else {
 				position = n.position;
+				if (!hiddenByCollapsedGroup) unplaced.push([n.id, position]);
 			}
 
 			return {
@@ -1178,31 +1356,66 @@
 					portLiterals: (n as typeof n & { portLiterals?: Record<string, unknown> }).portLiterals,
 					portLiteralSpans: n.portLiteralSpans,
 					features: n.features,
+					// The unconnected-access pin (view state, never config):
+					// ProjectNode draws the body open and disables collapse.
+					pinnedOpen: pinnedIds.has(n.id),
 					includePath: (n as typeof n & { includePath?: string }).includePath,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
 					onSaveFileRef: saveFileRef,
 					onOpenInclude: openInclude,
 				},
-				...(hiddenByCollapsedGroup
-					? { style: 'display: none;' }
-					: { style: sizing.style }),
+				style: sizing.style,
+				hidden: hiddenByCollapsedGroup,
 				parentId,
 			};
 		});
-		if (placedAnchors.length > 0) {
-			// Deferred: buildNodes runs inside reactive derivations, and a
-			// synchronous layout write would mutate engine state mid-derive.
+		if (unplaced.length > 0) {
+			// Deferred: buildNodes runs inside reactive derivations, and the
+			// organize writes layout, which would mutate engine state mid-derive.
 			const verb = layoutVerb;
 			queueMicrotask(() => {
 				if (destroyed) return;
-				persistLayoutEdit((layout) => placedAnchors.reduce(
-					(l, [id, p]) => updateLayoutEntry(l, id, p.x, p.y, undefined, undefined, undefined, undefined, verb),
-					layout,
-				));
+				organizeUnplaced(verb, unplaced);
 			});
 		}
 		return built;
+	}
+
+	// The one automatic organize: fired by a rebuild that found unplaced
+	// nodes (see buildNodes). Runs at most one ELK pass at a time; a rebuild
+	// landing mid-run (live data, another external edit) queues one re-check
+	// instead of racing a second `nodes =` write. After a run that APPLIED,
+	// every visible node has an entry, so the re-check finds nothing and stops
+	// (the fixpoint). After a run that FAILED (ELK refused the graph; the user
+	// saw the toast), the fallback placements are persisted as real entries
+	// so the rebuild stops asking. 'view-changed' leaves the new view to its
+	// own rebuild, which is exactly what the queued re-check is.
+	let organizeInFlight: Promise<OrganizeOutcome> | null = null;
+	let organizeRecheck = false;
+	function organizeUnplaced(verb: LayoutVerb, fallback: Array<[string, { x: number; y: number }]>): void {
+		if (organizeInFlight) { organizeRecheck = true; return; }
+		organizeInFlight = runAutoOrganize(true, false);
+		void organizeInFlight.then((outcome) => {
+			if (outcome === 'failed') {
+				persistLayoutEdit((layout) => fallback.reduce(
+					(l, [id, p]) => updateLayoutEntry(l, id, p.x, p.y, undefined, undefined, undefined, undefined, verb),
+					layout,
+				));
+			}
+			if (outcome !== 'destroyed') canvasReady = true;
+		}).finally(() => {
+			organizeInFlight = null;
+			if (!organizeRecheck || destroyed) return;
+			organizeRecheck = false;
+			// Re-derive against the ACTIVE view: an entry-less visible node
+			// means the mid-run rebuild (or a view switch) still needs a pass.
+			const entries = parseLayoutCode(layoutCode, layoutVerb);
+			const still: Array<[string, { x: number; y: number }]> = nodes
+				.filter(n => !n.hidden && !entries[n.id])
+				.map(n => [n.id, n.position]);
+			if (still.length > 0) organizeUnplaced(layoutVerb, still);
+		});
 	}
 
 	// The INITIAL graph snapshot, seeded ONCE from the props. The live
@@ -1219,9 +1432,14 @@
 		// Resolve a node's ports / kind against the PROJECTED nodes being rendered,
 		// not the live `nodes` (still the previous render at rebuild time).
 		const nodeOf = (id: string) => projectNodes.find(n => n.id === id);
-		const outputsOf = (id: string) =>
+		// Named portsOut/portsIn, not inputsOf: these take a node ID
+		// and resolve it against the projection (undefined when no
+		// such node), while `inputsOf` takes an already-resolved list
+		// and throws on a non-array. Distinct names so neither can
+		// shadow the other.
+		const portsOut = (id: string) =>
 			nodeOf(id)?.outputs as Array<{ name: string; portType: string }> | undefined;
-		const inputsOf = (id: string) =>
+		const portsIn = (id: string) =>
 			nodeOf(id)?.inputs as Array<{ name: string; portType: string }> | undefined;
 		const isLoopNode = (id: string) => isLoopNodeType(nodeOf(id)?.nodeType ?? '');
 
@@ -1278,7 +1496,7 @@
 				// returned undefined -> every inner-source edge fell back to 'Any'.
 				const isInnerSrc = e.sourceHandle?.endsWith('__inner') ?? false;
 				const cleanHandle = isInnerSrc ? e.sourceHandle!.slice(0, -'__inner'.length) : e.sourceHandle;
-				const port = (isInnerSrc ? inputsOf(e.source) : outputsOf(e.source))?.find(p => p.name === cleanHandle);
+				const port = (isInnerSrc ? portsIn(e.source) : portsOut(e.source))?.find(p => p.name === cleanHandle);
 				entry.types.add(port?.portType ?? 'Any');
 			}
 			return Array.from(byPair.values()).map(({ source, target, sh, th, types }) => {
@@ -1321,7 +1539,7 @@
 		const deduplicatedEdges = Array.from(seenTargets.values());
 
 		return deduplicatedEdges.map((e) => {
-			const edgeColor = getEdgeColor(e.source, e.sourceHandle, outputsOf);
+			const edgeColor = getEdgeColor(e.source, e.sourceHandle, portsOut);
 
 			// Group interface port handles: __inner suffix is set by the parser for self-references
 			// (in.port -> __inner source handle, out.port -> __inner target handle)
@@ -1337,6 +1555,7 @@
 				type: 'custom',
 				animated: false,
 				zIndex: 5,
+				data: { path: e.path ?? [] },
 				style: `stroke-width: 2px; stroke: ${edgeColor};`,
 				markerEnd: {
 					type: MarkerType.ArrowClosed,
@@ -1390,6 +1609,13 @@
 		busMetaByBus: Record<string, import('../../../../protocol').BusMeta>;
 		loopEventsByGroup: Record<string, import('../../../../protocol').LoopInspectorEvent[]>;
 		journalCorruptions: Array<{ site: import('../../../../protocol').CorruptionSite; reason: string }>;
+		/// The run's own tags (`ctx.tag_execution`), painted onto every
+		/// node so any node's inspector can show them.
+		executionTags: string[];
+		/// How the run ended (state plus, for a cancel, why), painted
+		/// onto every node so a node card or inspector can name who
+		/// stopped the run.
+		runTerminal: import('../../types').ExecutionTerminal | undefined;
 		infraNodes: typeof infraNodes;
 		fileContents: typeof fileContents;
 		infraFeedByNode: typeof infraFeedByNode;
@@ -1432,6 +1658,8 @@
 			busMetaByBus: state?.busMetaByBus ?? {},
 			loopEventsByGroup: state?.loopEventsByGroup ?? {},
 			journalCorruptions: state?.journalCorruptions ?? [],
+			executionTags: state?.tags ?? [],
+			runTerminal: state?.terminal,
 			infraNodes,
 			fileContents,
 			infraFeedByNode,
@@ -1455,10 +1683,17 @@
 	 *  Pure: spreads each node, never reorders or repositions. Used by BOTH
 	 *  the structural rebuild and the overlay-tick refresh, so the two render
 	 *  paths cannot drift. */
+	/// Is a row at `frames` inside the iteration at `iteration`: the same
+	/// frame stack, or one that extends it (a nested loop's own frames).
+	function withinFrames(frames: LoopIteration[], iteration: LoopIteration[]): boolean {
+		return frames.length >= iteration.length
+			&& iteration.every((f, i) => frames[i].index === f.index);
+	}
+
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
 			nodeOutputs, nodeExecutions, busLogByBus, busesByNode, busMetaByBus,
-			loopEventsByGroup, journalCorruptions,
+			loopEventsByGroup, journalCorruptions, executionTags, runTerminal,
 		} = ctx;
 		// Subgraph highlight classes are computed over the CURRENT arrays so
 		// highlighted/dimmed always reflects what is on screen.
@@ -1545,17 +1780,14 @@
 						// Build synthetic execution: one per __in execution
 						executions = inExecs.map((inExec) => {
 							const outExec = outByFrames.get(inExec.framesKey);
-							// Derive status from all children + in/out
-							const allRelated = [...internalExecs, ...inExecs, ...outExecs];
-							const hasRunning = allRelated.some(e => e.status === 'running' || e.status === 'waiting_for_input');
-							const hasFailed = allRelated.some(e => e.status === 'failed');
-							const allTerminal = allRelated.length > 0 && allRelated.every(e =>
-								e.status === 'completed' || e.status === 'skipped' || e.status === 'failed' || e.status === 'cancelled'
-							);
-							const status: import('../../types').NodeExecutionStatus = hasRunning ? 'running'
-								: hasFailed ? 'failed'
-								: allTerminal ? 'completed'
-								: inExec.status;
+							// Derive status and cost from THIS iteration's rows only:
+							// the boundary pair at its frames and every internal
+							// row at those frames or deeper (a nested loop's
+							// iterations). A parallel loop's other iterations are
+							// sibling cards, not this one's children.
+							const allRelated = [...internalExecs, ...inExecs, ...outExecs]
+								.filter((e) => withinFrames(e.frames, inExec.frames));
+							const status = containerStatus(inExec.status, allRelated);
 
 							return {
 								// Frame-stack-keyed id so an iteration's card keeps
@@ -1564,7 +1796,6 @@
 								id: `${groupId}-synth-${inExec.framesKey}`,
 								nodeId: groupId,
 								status,
-								pulseIdsAbsorbed: inExec.pulseIdsAbsorbed,
 								pulseId: inExec.pulseId,
 								error: outExec?.error ?? inExec.error,
 								startedAt: inExec.startedAt,
@@ -1665,6 +1896,8 @@
 							busLogs,
 							loopEvents,
 							journalCorruptions,
+							executionTags,
+							runTerminal,
 							fileContents: ctx.fileContents,
 							bodyFeed,
 							infraNodeStatus: backendNode?.status,
@@ -1774,9 +2007,12 @@
 			.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`)
 			.join('|');
 		untrack(() => {
-			// Skip until the active view has had its initial organize (the mount /
-			// view-switch effects own that); only react to LATER resizes.
-			if (!organizedVerbs.has(layoutVerb)) { leafSizeSig = sig; return; }
+			// Skip until the active view is laid out (every visible node placed,
+			// no organize in flight; `organizeUnplaced` owns that); only react
+			// to LATER resizes.
+			const entries = parseLayoutCode(layoutCode, layoutVerb);
+			const laidOut = !organizeInFlight && nodes.every(n => n.hidden || entries[n.id]);
+			if (!laidOut) { leafSizeSig = sig; return; }
 			if (sig === leafSizeSig) return;
 			leafSizeSig = sig;
 			if (resizeReflowTimer) clearTimeout(resizeReflowTimer);
@@ -1790,9 +2026,8 @@
 
 	let contextMenu = $state<{ x: number; y: number; flowX: number; flowY: number; nodeId: string | null } | null>(null);
 
-	/// Targets the graph still holds. A targeted node the user then deleted,
-	/// or demoted out of being an output, is dropped here rather than sent to
-	/// a dispatcher that would refuse it.
+	/// Targets the graph still holds. A targeted node the user then deleted
+	/// is dropped here rather than sent to a dispatcher that would refuse it.
 	const liveRunTargets = $derived([...pruneTargets(runTargets, nodes)]);
 	// And the STATE prunes itself too (the derived view above covers the
 	// same render tick): without this, deleting a targeted node and later
@@ -1806,21 +2041,19 @@
 	/// What the aimed run executes, read off the graph: whether its joined
 	/// subgraph touches any trigger (if not, the action bar offers Run
 	/// beside the trigger lifecycle), and which infra nodes it holds.
+	// Read off the PROJECTION, not the rendered graph: a collapsed
+	// ancestor re-parents (or hides) what it holds for drawing, and the
+	// facts of a run are about the program, not the picture.
 	const runTargetFactsLive = $derived(
 		runTargetFacts(
 			liveRunTargets,
-			nodes.map((n) => ({
+			fold.project.nodes.map((n) => ({
 				id: n.id,
-				isTrigger: nodeIsTrigger({
-					nodeType: (n.data?.nodeType as string) ?? '',
-					features: n.data?.features as { isTrigger?: boolean } | undefined,
-				}),
-				isInfra: nodeRequiresInfra({
-					nodeType: (n.data?.nodeType as string) ?? '',
-					requiresInfra: n.data?.requiresInfra as boolean | undefined,
-				}),
+				isTrigger: nodeIsTrigger({ nodeType: n.nodeType, features: n.features }),
+				isInfra: nodeRequiresInfra({ nodeType: n.nodeType, requiresInfra: undefined }),
+				parentId: n.parentId,
 			})),
-			edges,
+			fold.project.edges,
 		),
 	);
 
@@ -1944,7 +2177,10 @@
 			if (s.isExpanded) {
 				const w = s.configWidth || s.fallbackWidth || 400;
 				const h = s.configHeight || s.fallbackHeight || 300;
-				return { type: 'group', zIndex: -1 + (s.nestingDepth ?? 0), style: `width: ${w}px; height: ${h}px;` };
+				// Above the wires (edges sit at 1) so the header wins the click;
+				// nested groups share the level and paint in DOM order, parent
+				// first. The stylesheet pins the same value on the class.
+				return { type: 'group', zIndex: 3, style: `width: ${w}px; height: ${h}px;` };
 			}
 			if (s.simplified) return simplifiedSizing('groupCollapsed');
 			const minW = computeMinNodeWidth(s.inputs, s.outputs);
@@ -1957,11 +2193,37 @@
 		if (!s.isExpanded) {
 			return { type: 'project', zIndex: 4, style: `width: ${minW}px; height: auto;` };
 		}
+		const w = expandedProjectWidth(s.configWidth, s.configHeight, s.inputs, s.outputs);
 		if (s.configWidth && s.configHeight) {
-			const w = Math.max(s.configWidth, minW);
 			return { type: 'project', zIndex: 4, style: `width: ${w}px; height: ${s.configHeight}px;`, width: w, height: s.configHeight };
 		}
-		return { type: 'project', zIndex: 4, style: `width: ${Math.max(320, minW)}px; height: auto;` };
+		return { type: 'project', zIndex: 4, style: `width: ${w}px; height: auto;` };
+	}
+
+	/// The width an EXPANDED non-container node draws at: the saved
+	/// width floored at the port minimum when BOTH dims are saved (a
+	/// width without a height draws auto at the fallback, so the width
+	/// alone is ignored, matching computeSizing's both-dims gate), else
+	/// max(320, port minimum). The one definition, shared with the
+	/// containment floors, so a parent can never size below what its
+	/// child actually draws.
+	function expandedProjectWidth(
+		configWidth: number | undefined,
+		configHeight: number | undefined,
+		inputs?: PortDefinition[],
+		outputs?: PortDefinition[],
+	): number {
+		const minW = computeMinNodeWidth(inputs, outputs);
+		return configWidth && configHeight ? Math.max(configWidth, minW) : Math.max(320, minW);
+	}
+
+	/// The drawn expanded state: the unconnected-access pin wins, then
+	/// config, then the container default. THE one rule for every sizing
+	/// and containment reader, so no path can draw a pinned node
+	/// collapsed under its open body (ProjectNode's render derived is
+	/// the same expression over `data.pinnedOpen`).
+	function drawnExpanded(pinned: boolean, cfg: Record<string, unknown> | undefined, isGroup: boolean): boolean {
+		return pinned || ((cfg?.expanded as boolean | undefined) ?? (isGroup ? true : false));
 	}
 
 	// Restyle a live xyflow node from its (possibly just-edited) data, via the
@@ -1973,7 +2235,7 @@
 		const sizing = computeSizing({
 			isGroup,
 			isAnnotation: n.type === 'annotation',
-			isExpanded: (cfg?.expanded as boolean) ?? (isGroup ? true : false),
+			isExpanded: drawnExpanded(!!newData.pinnedOpen, cfg, isGroup),
 			configWidth: cfg?.width as number | undefined,
 			configHeight: cfg?.height as number | undefined,
 			fallbackWidth: rect?.width,
@@ -2003,7 +2265,7 @@
 		if (containerW === 0 || containerH === 0) return;
 
 		// Compute bounding box of visible, measured nodes (using absolute positions)
-		const visibleNodes = nodes.filter(n => n.style !== 'display: none;' && n.measured?.width && n.measured?.height);
+		const visibleNodes = nodes.filter(n => !n.hidden && n.measured?.width && n.measured?.height);
 		if (visibleNodes.length === 0) return;
 
 		// For child nodes, compute absolute position by walking up parentId chain
@@ -2101,12 +2363,12 @@
 	// because live-display content arrived) persists without one, so a streaming
 	// execution can't bury the user's real edits under reflow frames.
 	// Outcome of an organize: it APPLIED, or it bailed because the active view
-	// CHANGED mid-run (a later toggle back will re-fire and re-organize), or because
-	// the component was DESTROYED. Callers that claimed a verb in `organizedVerbs`
-	// un-claim ONLY on 'view-changed' (so the toggle-back recovers); 'destroyed'
-	// needs no recovery, and re-inferring the reason at the call site is fragile, so
-	// it's returned explicitly.
-	type OrganizeOutcome = 'applied' | 'view-changed' | 'destroyed';
+	// CHANGED mid-run (the new view's own rebuild organizes it if it needs
+	// it), or because the component was DESTROYED, or ELK FAILED (nothing
+	// moved, the user was told by toast). `organizeUnplaced` persists its
+	// fallback placements only on 'failed', and re-inferring the reason at the
+	// call site is fragile, so it's returned explicitly.
+	type OrganizeOutcome = 'applied' | 'view-changed' | 'destroyed' | 'failed';
 	async function runAutoOrganize(andFitView = false, undoable = true): Promise<OrganizeOutcome> {
 		// The view this organize is FOR. ELK runs across an up-to-2s measure-wait,
 		// during which the user can toggle views or close the editor. The result is
@@ -2135,7 +2397,7 @@
 			let settled = false;
 			while (Date.now() < deadline) {
 				await tick();
-				const allMeasured = nodes.every(n => n.style === 'display: none;' || (n.measured?.width && n.measured?.height));
+				const allMeasured = nodes.every(n => n.hidden || (n.measured?.width && n.measured?.height));
 				const sig = nodes.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`).join('|');
 				if (allMeasured && sig === prevSig) { settled = true; break; }
 				prevSig = sig;
@@ -2156,7 +2418,7 @@
 		// Measure actual port Y positions from the DOM
 		const portPositions = new Map<string, Map<string, number>>();
 		for (const n of nodes) {
-			if (n.style === 'display: none;') continue;
+			if (n.hidden) continue;
 			const portYs = measurePortPositions(n.id);
 			if (portYs.size > 0) {
 				portPositions.set(n.id, portYs);
@@ -2170,8 +2432,8 @@
 			config: (n.data.config as Record<string, unknown>) || {},
 			position: n.position,
 			parentId: (n.data.config as Record<string, string>)?.parentId,
-			inputs: (n.data.inputs as PortDefinition[]) || [],
-			outputs: (n.data.outputs as PortDefinition[]) || [],
+			inputs: inputsOf(n.data.inputs),
+			outputs: outputsOf(n.data.outputs),
 			features: { ...(NODE_TYPE_CONFIG[n.data.nodeType as string]?.features || {}), ...((n.data.features as NodeFeatures) || {}) },
 			sourceLine: n.data.sourceLine as number | undefined,
 		}));
@@ -2219,7 +2481,7 @@
 			const persistAll = (layout: string) => {
 				let next = layout;
 				for (const n of nodes) {
-					if (n.style === 'display: none;') continue;
+					if (n.hidden) continue;
 					next = layoutUpdateAny(n)(next);
 				}
 				return next;
@@ -2228,6 +2490,12 @@
 			else persistLayoutEdit(persistAll);
 			if (andFitView) setTimeout(() => doFitView(), 50);
 			return 'applied';
+		}, (e: unknown) => {
+			// ELK refused the graph. Nothing moved, and the user has to be
+			// told, because from the canvas a failed organize and a no-op
+			// look the same.
+			if (!destroyed) toast.error(`Auto organize failed: ${e instanceof Error ? e.message : String(e)}`, { duration: 8000 });
+			return 'failed';
 		});
 	}
 
@@ -2242,78 +2510,37 @@
 
 	// Fit view to graph on initial load
 	let hasFitView = $state(false);
-	// Hide canvas until initial ELK layout completes to avoid flash of ugly unorganized positions
+	// Hide canvas until the first layout is settled, to avoid a flash of
+	// unorganized positions. Set by the mount effect when every node already
+	// had a saved position, or by the unplaced-node organize otherwise.
 	let canvasReady = $state(false);
-	// The set of view verbs (@layout / @slayout) whose positions have already been
-	// established (saved on disk OR organized-on-first-show), so neither the mount
-	// effect nor the view-switch effect organizes the same view twice. Seeded by
-	// BOTH effects: whichever first handles a verb claims it, so they can't both
-	// fire runAutoOrganize for one view (the double-organize race: two concurrent
-	// recordEdits + racing `nodes=`). A plain Set (not $state) on purpose: it's a
-	// write-only ledger; making it reactive would re-run the effects on their own
-	// mutation. The wait-for-measured + ELK run lives solely in runAutoOrganize, so
-	// both effects just `await runAutoOrganize(true)` (no duplicated wait loop).
-	let organizedVerbs = new Set<LayoutVerb>();
+	// The mount only fits the view. Laying out a view that has no positions
+	// (a fresh file, a view shown for the first time, nodes that arrived from
+	// the source tab or an agent) is not a mount concern: buildNodes reports
+	// every visible node without a saved position and `organizeUnplaced`
+	// organizes the view, on mount and at any later time alike, so there is
+	// exactly one path that decides "this needs a layout".
 	$effect(() => {
-		if (!hasFitView && nodes.length > 0) {
+		if (hasFitView) return;
+		if (nodes.length === 0) {
+			// An empty project's mount is complete; the first node an agent
+			// writes arrives unplaced and organizes, the first node the user
+			// places by hand arrives with its entry and stays where it was put.
 			hasFitView = true;
-			// Auto-organize if the ACTIVE VIEW has no saved positions (the builder
-			// and simplified views keep separate position blocks; a project laid out
-			// in builder has none for simplified, so it must organize on first show).
-			const activeViewHasPositions = Object.keys(parseLayoutCode(layoutCode, layoutVerb)).length > 0;
-			// Claim this verb so the view-switch effect below doesn't ALSO organize it
-			// on this same mount (both would otherwise see empty positions and race).
-			const claimedVerb = layoutVerb;
-			organizedVerbs.add(claimedVerb);
-			if (!activeViewHasPositions || autoOrganizeOnMount) {
-				// No saved layout or explicitly requested: run ELK to compute positions.
-				// runAutoOrganize waits for measured sizes internally (see its body).
-				void (async () => {
-					// Un-claim ONLY on 'view-changed' (the user switched away mid-run): a
-					// toggle BACK then re-fires the view-switch effect, which re-claims and
-					// re-organizes. 'destroyed' needs no recovery (component is gone), so
-					// leave the claim.
-					if (await runAutoOrganize(true) === 'view-changed') organizedVerbs.delete(claimedVerb);
-					canvasReady = true;
-				})();
-			} else {
-				// Saved layout exists: just fit the view, don't reorganize
-				setTimeout(() => { doFitView(); canvasReady = true; }, 100);
-			}
-		} else if (!hasFitView && nodes.length === 0) {
-			// An EMPTY project's mount is complete: claim it fully, exactly like
-			// the populated branch. Leaving `hasFitView` unset would keep this
-			// effect armed, and with the host's organize-on-mount flag set (an
-			// empty project has no saved layout) it would fire the moment the
-			// user creates their first node, yanking it away from where they
-			// placed it. An automatic re-layout is only ever allowed on mount
-			// of an unpositioned view, a user resize, expand/collapse, or the
-			// explicit organize action; "first node created" is none of those.
-			hasFitView = true;
-			organizedVerbs.add(layoutVerb);
 			canvasReady = true;
+			return;
 		}
-	});
-
-	// Switching to a view whose position block is empty (first time the simplified
-	// view is shown for a project laid out only in builder, or vice versa)
-	// organizes it once, then fits. Guarded by `organizedVerbs` so it can't loop,
-	// double-fire with the mount effect, or fight a user who then drags things.
-	$effect(() => {
-		const verb = layoutVerb;
-		void layoutCode;
-		untrack(() => {
-			if (!hasFitView || organizedVerbs.has(verb)) return;
-			if (Object.keys(parseLayoutCode(layoutCode, verb)).length > 0) {
-				organizedVerbs.add(verb);
-				return;
-			}
-			if (nodes.length === 0) return;
-			organizedVerbs.add(verb);
-			// Un-claim ONLY on 'view-changed' (switched away mid-run): a toggle back
-			// re-fires this effect and re-organizes. 'destroyed' needs no recovery.
-			void runAutoOrganize(true).then((outcome) => { if (outcome === 'view-changed') organizedVerbs.delete(verb); });
-		});
+		hasFitView = true;
+		const entries = parseLayoutCode(layoutCode, layoutVerb);
+		const everyNodePlaced = nodes.every(n => n.hidden || entries[n.id]);
+		if (everyNodePlaced && !autoOrganizeOnMount) {
+			setTimeout(() => { doFitView(); canvasReady = true; }, 100);
+		} else if (everyNodePlaced && autoOrganizeOnMount) {
+			// The host asked for a layout on open (no layout file at all).
+			void runAutoOrganize(true).then(() => { canvasReady = true; });
+		}
+		// Otherwise buildNodes already queued the organize, which fits and
+		// reveals the canvas when it lands.
 	});
 
 	// Handle actions from command palette
@@ -2447,9 +2674,23 @@
 		// (the frontend mirror in lib/types). Unresolvable or unparsable
 		// port types pass: the compiler is the authority, this gate only
 		// stops the certainly-wrong wire early.
-		const sourceType = handlePortType(connection.source!, connection.sourceHandle, 'source');
+		const portType = handlePortType(connection.source!, connection.sourceHandle, 'source');
 		const targetType = handlePortType(connection.target!, connection.targetHandle, 'target');
-		if (sourceType === null || targetType === null) return true;
+		if (portType === null || targetType === null) return true;
+		// A dotted wire being reconnected carries what the source READS
+		// off its port (`a.out.name`), so that is the type held to the
+		// new target, not the whole port's.
+		// A path the new source's type does not have is a read that cannot
+		// work, so the wire is refused here rather than becoming a compile
+		// error the user has to go and find. An unparsable type still
+		// passes: the compiler is the authority on those.
+		let sourceType = portType;
+		if (reconnectingPath.length > 0) {
+			const walked = derefType(portType, reconnectingPath);
+			if (walked.kind === 'absent') return false;
+			if (walked.kind === 'unparsed') return true;
+			sourceType = walked.type;
+		}
 		if (parseWeftType(sourceType) === null || parseWeftType(targetType) === null) return true;
 		return isWeftTypeCompatible(sourceType, targetType);
 	}
@@ -2467,11 +2708,15 @@
 
 	// Track if reconnection was successful (dropped on valid handle)
 	let reconnectSuccessful = false;
+	// The dotted path of the wire being reconnected (empty for a plain
+	// wire): the type gate derefs through it, and the rewire keeps it.
+	let reconnectingPath: string[] = [];
 	
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnectStart(event: MouseEvent | TouchEvent, edge: any) {
 		if (simplified) return; // simplified edges are merged + non-interactive
 		reconnectSuccessful = false;
+		reconnectingPath = (edge?.data?.path as string[] | undefined) ?? [];
 		// Set connection line color based on the edge being reconnected
 		if (edge?.source) {
 			currentConnectionColor = getEdgeColor(edge.source, edge.sourceHandle);
@@ -2499,17 +2744,21 @@
 		reconnectSuccessful = true;
 
 		// Remove old edge, add new one: one atomic batch. The projection paints
-		// the swap as soon as the op is appended; no live edge mutation.
+		// the swap as soon as the op is appended; no live edge mutation. A
+		// dotted wire keeps its path: the reconnect moves an end, it does
+		// not change what the wire reads.
+		const path = (oldEdge?.data?.path as string[] | undefined) ?? [];
 		const oldRef = toWeftEdgeRef(oldEdge.source, oldEdge.sourceHandle || 'value', oldEdge.target, oldEdge.targetHandle || 'value');
 		const newRef = toWeftEdgeRef(newConnection.source, newConnection.sourceHandle || 'value', newConnection.target, newConnection.targetHandle || 'value');
 		recordEdit([
 			{ op: 'removeEdge', source: oldRef.srcRef, sourcePort: oldRef.srcPort, target: oldRef.tgtRef, targetPort: oldRef.tgtPort, scopeGroup: oldRef.scopeGroupLabel ?? null },
-			{ op: 'addEdge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null },
+			{ op: 'addEdge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
 		]);
 	}
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnectEnd(event: MouseEvent | TouchEvent, edge: any) {
+		reconnectingPath = [];
 		if (simplified) return; // no wiring edits in simplified view
 		// Reconnect dropped on empty space = remove the edge (the gesture's
 		// meaning, expressed as the same removeEdge op a delete uses).
@@ -2661,7 +2910,7 @@
 				const originType = handlePortType(wire.nodeId, wire.handle, wire.side);
 				if (wire.side === 'source') {
 					const input = (template?.defaultInputs ?? []).find(
-						p => inputExposure(p) !== 'config' && compatible(originType, p.portType),
+						p => acceptsWire(p) && compatible(originType, p.portType),
 					);
 					if (input) {
 						const ref = toWeftEdgeRef(wire.nodeId, wire.handle || 'value', id, input.name);
@@ -2897,6 +3146,48 @@
 		// No-op: kept for SvelteFlow binding
 	}
 
+	// Right-click on a wire: read a key off the value it carries. The menu
+	// lists the fields one level below the wire's current path (a record
+	// type on the source port), and picking one rewrites the wire as
+	// removeEdge + addEdge with the longer path.
+	let edgeMenu = $state<{ x: number; y: number; edgeId: string } | null>(null);
+
+	function onEdgeContextMenu({ edge, event }: { edge: Edge; event: MouseEvent | TouchEvent }) {
+		if (simplified) return;
+		event.preventDefault();
+		event.stopPropagation();
+		const mouse = event as MouseEvent;
+		contextMenu = null;
+		justOpenedContextMenu = true;
+		setTimeout(() => { justOpenedContextMenu = false; }, 100);
+		edgeMenu = { x: mouse.clientX, y: mouse.clientY, edgeId: edge.id };
+	}
+
+	/// What the edge menu shows for one wire: the wire, the keys below its
+	/// path, or null keys when the value has none to read.
+	function edgeMenuFacts(edgeId: string): { edge: import('../../types').Edge; path: string[]; keys: ReturnType<typeof derefKeys> } | null {
+		const edge = fold.project.edges.find((e) => e.id === edgeId);
+		if (!edge) return null;
+		const path = edge.path ?? [];
+		const source = fold.project.nodes.find((n) => n.id === edge.source);
+		const isInnerSrc = edge.sourceHandle?.endsWith('__inner') ?? false;
+		const handle = isInnerSrc ? edge.sourceHandle!.slice(0, -'__inner'.length) : edge.sourceHandle;
+		const ports = (isInnerSrc ? source?.inputs : source?.outputs) as Array<{ name: string; portType: string }> | undefined;
+		const portType = ports?.find((p) => p.name === handle)?.portType;
+		return { edge, path, keys: portType ? derefKeys(portType, path) : null };
+	}
+
+	function rewireWithPath(edge: import('../../types').Edge, path: string[]) {
+		const ref = toWeftEdgeRef(edge.source, edge.sourceHandle || 'value', edge.target, edge.targetHandle || 'value');
+		// One op: addEdge replaces the port's driver in place, so the wire
+		// keeps the spelling it was written in (braces or statement).
+		// A removeEdge first would erase that spelling before the add saw it.
+		recordEdit([
+			{ op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
+		]);
+		edgeMenu = null;
+	}
+
 	function getGroupDimensions(group: Node): { width: number; height: number } {
 		const measured = (group as unknown as { measured?: { width?: number; height?: number } }).measured;
 		if (measured?.width && measured?.height) {
@@ -3039,7 +3330,7 @@
 			if (group.type !== 'group') continue; // expanded groups only (collapsed = 'groupCollapsed')
 			if (group.id === node.id) continue;
 			if (isDescendantOf(group.id, node.id)) continue;
-			if (group.style?.includes('display: none')) continue;
+			if (group.hidden) continue;
 			if (!nodeCentreInGroup(node, group)) continue;
 			const { width: gw, height: gh } = getGroupDimensions(group);
 			const depth = getGroupDepth(group);
@@ -3280,12 +3571,12 @@
 					// Copy the container's boundary SIGNATURE: it is part of the decl,
 					// and a Loop's `over`/`carry` config references its ports, so the
 					// shell must declare them or the next build hard-errors
-					// (loop-over/carry-unknown-port). Carry GHOST inputs are stripped
-					// (they re-derive from the copied carry list on apply). Then copy
-					// the source config AFTER the ports exist. (Children are NOT
-					// deep-copied: the shell duplicates.)
-					const sigInputs = toPortSigs((orig.data.inputs as PortDefinition[]).filter(p => !p.synthesizedFromCarry));
-					const sigOutputs = toPortSigs(orig.data.outputs as PortLike[]);
+					// (loop-over/carry-unknown-port). headerWorthy strips the carry
+					// GHOST inputs (they re-derive from the copied carry list on
+					// apply). Then copy the source config AFTER the ports exist.
+					// (Children are NOT deep-copied: the shell duplicates.)
+					const sigInputs = toPortSigs(inputsOf(orig.data.inputs).filter(headerWorthy));
+					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs));
 					if (sigInputs.length > 0 || sigOutputs.length > 0) {
 						ops.push(isLoop
 							? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
@@ -3297,6 +3588,31 @@
 					const { localId, scopedId } = freshScopedNodeId(nodeType, parentId, taken);
 					newIds.push(scopedId);
 					ops.push({ op: 'addNode', id: localId, nodeType, parentGroup: parentId ?? null });
+					// Copy the DECLARED port surface (custom ports, type
+					// overrides): the config copy below carries the
+					// config-created ports, but header-declared ones live
+					// only in the signature and would silently vanish.
+					// copiedPortSigs copies exactly what the original's
+					// header declares, nothing more, with each port's
+					// rendered type reset to its declared spelling (the
+					// copy has no wires for inference to resolve against).
+					const rendered = inputsOf(orig.data.inputs).filter(headerWorthy);
+					const renderedOut = outputsOf(orig.data.outputs);
+					const nodeDefaults = NODE_TYPE_CONFIG[nodeType as NodeType];
+					const declInputs = copiedPortSigs(rendered, nodeDefaults?.defaultInputs);
+					const declOutputs = copiedPortSigs(renderedOut, nodeDefaults?.defaultOutputs);
+					if (declInputs.length > 0 || declOutputs.length > 0) {
+						ops.push({
+							op: 'updateNodePorts',
+							node: scopedId,
+							inputs: declInputs,
+							outputs: declOutputs,
+							removedInputs: [],
+							removedOutputs: [],
+							revertedInputs: [],
+							revertedOutputs: [],
+						});
+					}
 					layoutWrites.push((layout) => updateLayoutEntry(layout, scopedId, newPos.x, newPos.y));
 					copyConfig(config, scopedId, false);
 					if (orig.data.label) {
@@ -3339,9 +3655,17 @@
 	/// `layoutBase`, NOT the derived `layoutCode` (base + in-flight optimistic
 	/// ops): persisting the optimistic view would write a layout the engine has
 	/// not yet committed, so a rejected/rebased layout op would leak to disk.
-	type PortLike = { name: string; required?: boolean; portType?: string };
-	function toPortSigs(ports: PortLike[]): import('../../../../protocol').EditPortSig[] {
-		return (ports ?? []).map(p => ({ name: p.name, required: p.required !== false, portType: p.portType }));
+	// HeaderPortLike (from header-ports) is the ONE port shape both sig
+	// builders read, so the `declaredType` the node emitter depends on is
+	// visible in the type of everything feeding it (a projection to a
+	// narrower local type once dropped it silently). toPortSigs writes a
+	// CONTAINER signature, which is its whole surface: the rendered type
+	// IS the spelling there, and declaredType deliberately plays no part.
+	function toPortSigs(ports: HeaderPortLike[]): import('../../../../protocol').EditPortSig[] {
+		// portRequired: the ONE missing-value polarity (Rust's serde
+		// default: not required); rendered ports always carry the flag,
+		// so this only matters for a hand-built port object.
+		return (ports ?? []).map(p => ({ name: p.name, required: portRequired(p), portType: p.portType }));
 	}
 
 	/// Flush every pending debounced edit. Called before the host kicks off
@@ -3392,7 +3716,7 @@
 	<div 
 		class="flex flex-1 relative overflow-hidden"
 		oncontextmenu={onContextMenu}
-		onclick={() => { if (!justOpenedContextMenu) { contextMenu = null; pendingConnection = null; tagEditor = null; } }}
+		onclick={() => { if (!justOpenedContextMenu) { contextMenu = null; edgeMenu = null; pendingConnection = null; tagEditor = null; } }}
 	>
 	<!-- Main Canvas (code panel removed for VS Code embedding) -->
 	<div class="flex-1 relative" oncontextmenucapture={(e: MouseEvent) => {
@@ -3458,6 +3782,7 @@
 				onselectiondragstart={(_event, selectedNodes) => { if (selectedNodes.length > 0) onNodeDragStart({ targetNode: selectedNodes[0], event: _event, nodes: selectedNodes }); }}
 				onselectiondragstop={onSelectionDragStop}
 				onedgeclick={onEdgeClick}
+				onedgecontextmenu={onEdgeContextMenu}
 				bind:viewport={currentViewport}
 				minZoom={0.05}
 				maxZoom={2}
@@ -3542,6 +3867,7 @@
 			runTargetCount={liveRunTargets.length}
 			{onStop}
 			{onDismissError}
+			{onOpenLocation}
 			{onActivate}
 			{onCancelActivate}
 			{onCancelBuild}
@@ -3566,6 +3892,55 @@
 			nodeCount={nodes.length}
 		/>
 	</div>
+
+	<!-- Wire menu: read a key off the value a wire carries -->
+	{#if edgeMenu}
+		{@const facts = edgeMenuFacts(edgeMenu.edgeId)}
+		{#if facts}
+			<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+			<div
+				class="fixed bg-popover border rounded-xl shadow-xl py-1 z-50 min-w-[200px] backdrop-blur-sm"
+				style="left: {edgeMenu.x}px; top: {edgeMenu.y}px;"
+				onclick={(e) => e.stopPropagation()}
+			>
+				<div class="px-3 py-1 text-xs text-muted-foreground">
+					{facts.path.length > 0 ? `reads .${facts.path.join('.')}` : 'Dereference a value'}
+				</div>
+				{#if facts.keys && facts.keys.length > 0}
+					{#each facts.keys as key (key.name)}
+						<button
+							class="w-full flex items-center justify-between gap-3 px-3 py-1.5 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+							onclick={() => rewireWithPath(facts.edge, [...facts.path, key.name])}
+						>
+							<span class="font-mono">.{key.name}{key.optional ? '?' : ''}</span>
+							<span class="text-muted-foreground text-xs">{key.type}</span>
+						</button>
+					{/each}
+				{:else}
+					<div class="px-3 py-1.5 text-xs text-muted-foreground max-w-[260px]">
+						This value has no keys to read: declare the shape on the source port, or Cast it first.
+					</div>
+				{/if}
+				{#if facts.path.length > 0}
+					<div class="my-1 mx-2 border-t"></div>
+					<button
+						class="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+						onclick={() => rewireWithPath(facts.edge, facts.path.slice(0, -1))}
+					>
+						<span class="text-muted-foreground text-xs">↑</span>
+						<span>Up one level</span>
+					</button>
+					<button
+						class="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+						onclick={() => rewireWithPath(facts.edge, [])}
+					>
+						<span class="text-muted-foreground text-xs">=</span>
+						<span>Read the whole value</span>
+					</button>
+				{/if}
+			</div>
+		{/if}
+	{/if}
 
 	<!-- Context Menu -->
 	{#if contextMenu}
@@ -3617,16 +3992,13 @@
 								<span>Tags…</span>
 							</button>
 						{/if}
-						{#if isOutputNode(nodeToEdit.data?.config, nodeToEdit.data?.features)}
-							{@const isTarget = runTargets.has(targetNodeId)}
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
-							>
-								<span class="text-muted-foreground text-xs">◎</span>
-								<span>{isTarget ? 'Unset target' : 'Set as target'}</span>
-							</button>
-						{/if}
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+							onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
+						>
+							<span class="text-muted-foreground text-xs">◎</span>
+							<span>{runTargets.has(targetNodeId) ? 'Unset target' : 'Set as target'}</span>
+						</button>
 						{#if hasInfraActions}
 							{#if !simplified}<div class="my-1 mx-2 border-t"></div>{/if}
 							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">
@@ -3722,11 +4094,19 @@
 </div>
 
 <style>
-	/* Z-index order: groups (0) < edge paths (1) < normal nodes (2) < edge labels/anchors (3+) */
+	/* Z-index order: edge paths (1) < expanded groups (3) < normal nodes (4,
+	   set per node in computeSizing) < edge labels/anchors (5+).
+	   An expanded group sits ABOVE the wires, not below them, because its
+	   header carries the collapse button and the wires used to take every
+	   click on it in a crowded graph. Its body is see-through (a 6% tint) so
+	   the wires crossing it stay visible, and it lets pointer events through
+	   (see GroupNode's `.expanded-container`), so a wire behind the body is
+	   still the thing you click; only the header, the config strip, the
+	   ports and the resize handles catch the pointer. */
 	:global(.svelte-flow .svelte-flow__edges) {
 		z-index: 1 !important;
 	}
-	
+
 	:global(.svelte-flow .svelte-flow__node) {
 		z-index: 2;
 	}
@@ -3740,7 +4120,10 @@
 	}
 	
 	:global(.svelte-flow .svelte-flow__node-group) {
-		z-index: 0 !important;
+		z-index: 3 !important;
+		/* The wrapper is transparent to the pointer; GroupNode opts its
+		   interactive parts back in. Dragging a group is by its header. */
+		pointer-events: none !important;
 		background: transparent !important;
 		border: none !important;
 		box-shadow: none !important;

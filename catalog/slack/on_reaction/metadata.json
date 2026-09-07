@@ -15,7 +15,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "reactions:read"
@@ -26,7 +26,6 @@
       "name": "channel",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -54,7 +53,6 @@
       "name": "emoji",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "Emoji",
       "placeholder": "eyes (with or without colons)",
       "description": "Only fire on this emoji. Leave empty for any."
@@ -62,7 +60,6 @@
     {
       "name": "direction",
       "type": "String",
-      "exposure": "config",
       "default": "added",
       "widget": {
         "kind": "select",
@@ -80,37 +77,31 @@
     {
       "name": "emoji",
       "type": "String",
-      "required": false,
       "description": "The reaction's emoji name (no colons)."
     },
     {
       "name": "user",
       "type": "String",
-      "required": false,
       "description": "Who reacted."
     },
     {
       "name": "channel",
       "type": "String",
-      "required": false,
       "description": "The channel the reacted message lives in."
     },
     {
       "name": "ts",
       "type": "String",
-      "required": false,
       "description": "The reacted message's timestamp id."
     },
     {
       "name": "messageUser",
       "type": "String",
-      "required": false,
       "description": "Who wrote the reacted message."
     },
     {
       "name": "type",
       "type": "String",
-      "required": false,
       "description": "reaction_added or reaction_removed."
     }
   ]

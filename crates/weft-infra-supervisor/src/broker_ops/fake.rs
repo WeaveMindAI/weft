@@ -30,6 +30,7 @@ fn unit_runtime(
         stop_behavior: weft_core::StopBehavior::ScaleToZero,
         flaky_after_seconds: 30,
         recovery_after_seconds: 30,
+        image_refs: Default::default(),
     }
 }
 
@@ -311,6 +312,17 @@ impl FakeBroker {
         );
     }
 
+    /// The PVC list a seeded row recorded at its apply (what terminate,
+    /// and a Fresh apply finishing a failed terminate, honor).
+    pub fn set_preserve_pvcs(&self, project_id: &str, node_id: &str, preserve_pvcs: Vec<String>) {
+        let mut inner = self.inner.lock();
+        let node = inner
+            .infra_nodes
+            .get_mut(&(project_id.to_string(), node_id.to_string()))
+            .expect("set_preserve_pvcs on a seeded row");
+        node.preserve_pvcs = preserve_pvcs;
+    }
+
     pub fn set_health_protocols(&self, project_id: &str, protocols: serde_json::Value) {
         self.inner
             .lock()
@@ -572,37 +584,45 @@ impl BrokerSupervisorOps for FakeBroker {
             failure_message: failure_message.map(|s| s.to_string()),
         });
         // Lifecycle-driven writes (command_id=Some) are ownership-gated,
-        // matching the broker. A lost-ownership project returns Raced.
+        // matching the broker. A lost-ownership project is Displaced.
         if command_id.is_some() && !inner.owns(project_id) {
-            return Ok(weft_broker_client::WriteOutcome::Raced);
+            return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
         if let Some(node) = inner
             .infra_nodes
             .get_mut(&(project_id.to_string(), node_id.to_string()))
         {
-            // Mirror prod: per-unit sets that unit then rolls up; node
-            // -wide sets every unit. Then `status` = rollup of units.
+            // Mirror prod: per-unit sets that unit then rolls up the
+            // node status; node-wide sets every unit AND the node
+            // status to the value directly (so a unit-less roster still
+            // takes a Failed / Terminating stamp). A per-unit stamp for
+            // a unit NOT in the roster is Gone, exactly like prod's
+            // fence (`units_json ? $1` matches no row while the pod
+            // still owns the project): the old silent no-op here let a
+            // caller bug pass tests.
             match unit {
                 Some(u) => {
-                    if let Some(ur) = node.units.get_mut(u) {
-                        ur.status = status;
-                    }
+                    let Some(ur) = node.units.get_mut(u) else {
+                        return Ok(weft_broker_client::WriteOutcome::Gone);
+                    };
+                    ur.status = status;
+                    node.status = weft_broker_client::protocol::InfraNodeStatus::rollup(
+                        node.units.values().map(|u| &u.status),
+                    );
                 }
                 None => {
                     for ur in node.units.values_mut() {
                         ur.status = status;
                     }
+                    node.status = status;
                 }
             }
-            node.status = weft_broker_client::protocol::InfraNodeStatus::rollup(
-                node.units.values().map(|u| &u.status),
-            );
             Ok(weft_broker_client::WriteOutcome::Applied(
                 weft_broker_client::protocol::SupervisorSetStatusResponse {},
             ))
         } else {
-            // No row to update; the production broker returns 410.
-            Ok(weft_broker_client::WriteOutcome::Raced)
+            // No row to update while still owning the project: Gone.
+            Ok(weft_broker_client::WriteOutcome::Gone)
         }
     }
 
@@ -618,10 +638,10 @@ impl BrokerSupervisorOps for FakeBroker {
             node_id: node_id.to_string(),
         });
         // Ownership-gated, like the broker: a lost-ownership project
-        // does NOT cascade-delete; it returns Raced so the supervisor
+        // does NOT cascade-delete; it is Displaced so the supervisor
         // aborts and leaves the command for the new owner.
         if !inner.owns(project_id) {
-            return Ok(weft_broker_client::WriteOutcome::Raced);
+            return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
         let removed = inner
             .infra_nodes
@@ -646,12 +666,17 @@ impl BrokerSupervisorOps for FakeBroker {
             cancelled,
         });
         // Ownership-gated, like the broker: if this pod lost ownership of
-        // the command's project, completion is rejected (Raced) and the
-        // command stays uncompleted for the new owner to finish.
+        // the command's project, completion is Displaced and the command
+        // stays uncompleted for the new owner to finish.
         if let Some(project_id) = inner.claimed_command_project.get(&command_id).cloned() {
             if !inner.owns(&project_id) {
-                return Ok(weft_broker_client::WriteOutcome::Raced);
+                return Ok(weft_broker_client::WriteOutcome::Displaced);
             }
+        }
+        // Exactly-once, like the broker's `completed_at_unix IS NULL`:
+        // a second completion is Gone.
+        if inner.completed_commands.iter().any(|(id, _, _)| *id == command_id) {
+            return Ok(weft_broker_client::WriteOutcome::Gone);
         }
         inner
             .completed_commands
@@ -710,17 +735,22 @@ impl BrokerSupervisorOps for FakeBroker {
             preserve_pvcs: preserve_pvcs.clone(),
         });
         if !inner.owns(project_id) {
-            return Ok(weft_broker_client::WriteOutcome::Raced);
+            return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
-        let status = weft_broker_client::protocol::InfraNodeStatus::rollup(
-            units.values().map(|u| &u.status),
-        );
+        // Prod's `write_apply_row` INSERTs from the still-uncompleted
+        // command row: a completed command matches nothing (Gone).
+        if inner.completed_commands.iter().any(|(id, _, _)| *id == command_id) {
+            return Ok(weft_broker_client::WriteOutcome::Gone);
+        }
+        // Mirror prod's `write_apply_row`: the provisioning stamp writes
+        // a flat Provisioning (the node IS mid-apply, whatever a frozen
+        // or carried unit says); set_applied derives from the roster.
         inner.infra_nodes.insert(
             (project_id.to_string(), node_id.to_string()),
             SupervisorInfraNode {
                 node_id: node_id.to_string(),
                 instance_id: instance_id.to_string(),
-                status,
+                status: weft_broker_client::protocol::InfraNodeStatus::Provisioning,
                 applied_spec_hash: None,
                 endpoints: BTreeMap::new(),
                 preserve_pvcs,
@@ -757,9 +787,14 @@ impl BrokerSupervisorOps for FakeBroker {
             preserve_pvcs: preserve_pvcs.clone(),
         });
         if !inner.owns(project_id) {
-            return Ok(weft_broker_client::WriteOutcome::Raced);
+            return Ok(weft_broker_client::WriteOutcome::Displaced);
         }
-        let status = weft_broker_client::protocol::InfraNodeStatus::rollup(
+        // As in set_provisioning: a completed command matches nothing.
+        if inner.completed_commands.iter().any(|(id, _, _)| *id == command_id) {
+            return Ok(weft_broker_client::WriteOutcome::Gone);
+        }
+        // The same roster-derived status prod's set_applied writes.
+        let status = weft_broker_client::protocol::InfraNodeStatus::applied_rollup(
             units.values().map(|u| &u.status),
         );
         inner.infra_nodes.insert(

@@ -8,9 +8,8 @@
 // `editApplied {ok:false}` and rolls back through the same handler.
 
 import type { ProjectDefinition } from '../types';
-import { isContainerNodeType } from '../types';
 import type { EditOp } from '../../../protocol';
-import { applyOpsToProject, type ProjectionCatalog } from './apply';
+import { applyOpsToProject, resolveEndpointId, resolveScopeGroup, type ProjectionCatalog } from './apply';
 import { isLogicLocked, lockReasonText, type LockState } from './types';
 
 export type PreflightResult = { ok: true } | { ok: false; reason: string };
@@ -54,29 +53,21 @@ export function runPreflight(
   return { ok: true };
 }
 
-/** Resolve an addEdge endpoint to (scoped node id, isInner). Returns null when
- *  the ref doesn't resolve; the dry-run apply reports that case with the
+/** The endpoint's (scoped node id, isInner), or null when the ref or its
+ *  scope group doesn't resolve; the dry-run apply reports that case with the
  *  server's wording, so scope/cycle checks just skip it. */
 function endpointId(
   ref: string,
   visible: ProjectDefinition,
   scopeGroup: string | null,
 ): { id: string; inner: boolean } | null {
-  const scope = scopeGroup == null
-    ? undefined
-    : visible.nodes.find((n) => n.id === scopeGroup)
-      ?? visible.nodes.find((n) => isContainerNodeType(n.nodeType) && localOf(n.id) === scopeGroup);
-  if (scopeGroup != null && !scope) return null;
-  if (ref === 'self') {
-    return scope ? { id: scope.id, inner: true } : null;
+  let scope;
+  try {
+    scope = resolveScopeGroup(visible, scopeGroup);
+  } catch {
+    return null;
   }
-  const id = scope ? `${scope.id}.${ref}` : ref;
-  return visible.nodes.some((n) => n.id === id) ? { id, inner: false } : null;
-}
-
-function localOf(id: string): string {
-  const i = id.lastIndexOf('.');
-  return i < 0 ? id : id.slice(i + 1);
+  return resolveEndpointId(visible, ref, scope);
 }
 
 /** Both endpoints of a connection must live in the same scope: a node's scope

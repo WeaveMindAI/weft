@@ -1,0 +1,45 @@
+# One run over a real Telegram bot, built around fetching the same file
+# twice, and touching everything that run carries with it:
+#   - a Cron trigger on its shipped default, so activating the project
+#     proves the six-field expression registers;
+#   - the same URL fetched twice under one identity into PROJECT storage,
+#     so the second fetch is the first file and downloads nothing;
+#   - Format filling a caption from its own declared port;
+#   - Wait parking the branch on a timer and passing the caption through;
+#   - the file sent to the chat, so the bytes are real.
+#
+# __E2E_URL__ is substituted by the test: the bot's own getMe answer,
+# so the only service the run depends on is the one it already needs.
+
+bot = TelegramAccess
+tick = Cron
+
+first = FetchToStorage {
+  url: "__E2E_URL__"
+  filename: "getme.json"
+  scope: "project"
+  identity: "e2e:getme"
+}
+second = FetchToStorage {
+  url: "__E2E_URL__"
+  filename: "getme.json"
+  scope: "project"
+  identity: "e2e:getme"
+}
+second._should_flow = first.file
+
+caption = Format(size: Number) {
+  template: "weft e2e: {{size}} bytes, sent after a short wait"
+}
+caption.size = second.sizeBytes
+
+hold = Wait { seconds: 3 }
+hold.value = caption.text
+
+send = TelegramSendMedia { kind: "document" }
+send.account = bot.access
+send.file = second.file
+send.caption = hold.value
+
+out = Debug
+out.data = send.messageId

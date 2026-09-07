@@ -33,6 +33,8 @@ pub enum InfraAction {
     Cancel,
     NodeStop { node_id: String, force: bool },
     NodeTerminate { node_id: String },
+    /// What the infra containers wrote, read straight off the pods.
+    Logs { node_id: Option<String>, tail: usize, follow: bool },
 }
 
 /// Trigger-deactivation choices for the infra verbs that take triggers
@@ -61,6 +63,9 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     if matches!(action, InfraAction::Status) {
         return infra_status(&ctx).await;
     }
+    if let InfraAction::Logs { node_id, tail, follow } = action {
+        return infra_logs(&ctx, node_id.as_deref(), tail, follow).await;
+    }
     let verb = match &action {
         InfraAction::Start => ActionVerb::InfraStart,
         InfraAction::Upgrade => ActionVerb::InfraUpgrade,
@@ -69,7 +74,7 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
         InfraAction::Cancel => ActionVerb::InfraCancel,
         InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
         InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
-        InfraAction::Status => unreachable!(),
+        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
     };
     let ctx_inner = ctx.clone();
     ctx.with_progress(verb, |progress| async move {
@@ -99,7 +104,7 @@ async fn run_inner(
         InfraAction::Cancel => "infra cancel issued",
         InfraAction::NodeStop { .. } => "infra node stopped",
         InfraAction::NodeTerminate { .. } => "infra node terminated",
-        InfraAction::Status => unreachable!(),
+        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
     };
     match action {
         // Plain Start: just bring DOWN units up (apply skips up units).
@@ -118,7 +123,7 @@ async fn run_inner(
         InfraAction::NodeTerminate { node_id } => {
             infra_node_verb(ctx, progress, &node_id, "terminate", false).await?
         }
-        InfraAction::Status => unreachable!(),
+        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
     }
     progress.complete(summary);
     Ok(())
@@ -176,7 +181,8 @@ async fn infra_sync(
     opts: InfraOpts,
 ) -> Result<()> {
     let handle = super::ensure::ensure_registered(ctx, progress).await?;
-    let image_tags = build_infra_images(progress, &handle.plan, &handle.id).await?;
+    let image_tags =
+        build_infra_images(progress, &handle.plan, &handle.id, &handle.client).await?;
     let verb_label = action_verb_label(&action);
 
     // A START never deactivates: an active project's triggers stay
@@ -252,6 +258,7 @@ fn action_verb_label(a: &InfraAction) -> &'static str {
         InfraAction::Cancel => "cancel",
         InfraAction::NodeStop { .. } => "node-stop",
         InfraAction::NodeTerminate { .. } => "node-terminate",
+        InfraAction::Logs { .. } => "logs",
     }
 }
 
@@ -387,6 +394,59 @@ async fn wait_for_command(
     }
 }
 
+/// `weft infra logs [node]`: the infra containers' own output, which is
+/// where a service says what went wrong when it went wrong. The pods
+/// carry the project and node as labels, so the selector alone finds
+/// them; the project's namespace is read off the first match, because
+/// `kubectl logs` takes no `--all-namespaces`. A node with no pod
+/// (never provisioned, or terminated) is said so by name.
+async fn infra_logs(ctx: &Ctx, node_id: Option<&str>, tail: usize, follow: bool) -> Result<()> {
+    let (_client, project_id, _name) = super::resolve_project(ctx)?;
+    let mut selector = format!("weft.dev/role=infra,weft.dev/project={project_id}");
+    if let Some(node) = node_id {
+        selector.push_str(&format!(",weft.dev/node={node}"));
+    }
+    let found = super::daemon::kubectl(&[
+        "get", "pods", "--all-namespaces", "-l", &selector,
+        "-o", "jsonpath={.items[*].metadata.namespace}",
+    ])
+    .output()
+    .await
+    .context("run kubectl get pods")?;
+    if !found.status.success() {
+        anyhow::bail!(
+            "kubectl get pods exited {}: {}",
+            found.status,
+            String::from_utf8_lossy(&found.stderr).trim()
+        );
+    }
+    let namespaces = String::from_utf8_lossy(&found.stdout);
+    let Some(namespace) = namespaces.split_whitespace().next() else {
+        match node_id {
+            Some(node) => anyhow::bail!(
+                "no pod for infra node `{node}`: it is not provisioned (`weft infra status` \
+                 says where each node stands), or the id is not an infra node"
+            ),
+            None => anyhow::bail!(
+                "no infra pod for this project: nothing is provisioned (`weft infra start`)"
+            ),
+        }
+    };
+    let tail_arg = format!("--tail={tail}");
+    let mut args: Vec<&str> = vec![
+        "-n", namespace, "logs", "-l", &selector,
+        "--all-containers", "--prefix", &tail_arg,
+    ];
+    if follow {
+        args.push("-f");
+    }
+    let status = super::daemon::kubectl(&args).status().await.context("run kubectl logs")?;
+    if !status.success() {
+        anyhow::bail!("kubectl logs exited {status}");
+    }
+    Ok(())
+}
+
 async fn infra_status(ctx: &Ctx) -> Result<()> {
     let (client, id, name) = super::resolve_project(ctx)?;
     let resp: serde_json::Value = client
@@ -433,9 +493,19 @@ async fn build_infra_images(
     progress: &Progress,
     plan: &weft_compiler::build_plan::BuildPlan,
     project_id: &str,
+    client: &crate::client::DispatcherClient,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
     let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut seen_tags: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // What must survive each image's post-ensure GC beyond its fresh
+    // tag. Infra tags are content-addressed with no project in them,
+    // so another project's running unit can be on a tag this project
+    // just moved off; the dispatcher's keep-set (every project's tag
+    // map + every recorded unit ref) is the only thing that knows.
+    // Fetched once for the whole plan; None + a warning when the
+    // answer is unlearnable, and then every GC below is skipped, never
+    // guessed.
+    let referenced = images::referenced_set_for_gc(client).await;
 
     for img in plan.images.iter().filter(|i| i.kind == weft_compiler::build_plan::ImageKind::Infra)
     {
@@ -472,21 +542,29 @@ async fn build_infra_images(
             images::kind_load(&cfg.cluster_name, &tag, false).await?;
             progress.image_push_done(&tag);
         }
-        // Same content-addressed accumulation as worker images: drop
-        // this project's prior tags of this infra repo now that the
-        // fresh one is ensured. Infra pods are long-lived (never
-        // scale-to-zero), so beyond the fresh tag nothing is
-        // referenced by design: an old tag a not-yet-synced pod still
-        // runs refuses its node-side remove and survives.
-        if let Some((repo, _)) = tag.rsplit_once(':') {
-            crate::commands::build::gc_stale_images(
-                repo,
-                &tag,
-                &[format!("weft.dev/project={project_id}")],
-                Some(&std::collections::BTreeSet::new()),
-            )
-            .await;
-        }
+    }
+    // Same content-addressed accumulation as worker images: drop this
+    // project's prior tags of each infra repo now that every fresh one
+    // is ensured, keeping whatever the dispatcher still references
+    // (this project's frozen units, and any other project sharing the
+    // tag: the `weft.dev/project` label names whoever built the image
+    // first, never every user of it). One GC per REPO over the plan's
+    // whole tag set for it, after the loop: two node types shipping an
+    // image directory of the same name mint one repo under two hashes,
+    // and a per-image GC keyed on one fresh tag would delete the
+    // sibling built a moment ago.
+    let mut fresh_by_repo: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for tag in &seen_tags {
+        let (repo, _) = images::ref_repo_tag(tag)?;
+        fresh_by_repo.entry(repo).or_default().push(tag.clone());
+    }
+    for fresh in fresh_by_repo.values() {
+        crate::commands::build::gc_stale_images(
+            fresh,
+            &[format!("weft.dev/project={project_id}")],
+            referenced.as_ref(),
+        )
+        .await;
     }
     Ok(out)
 }

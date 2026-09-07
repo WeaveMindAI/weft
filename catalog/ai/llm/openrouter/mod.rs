@@ -27,6 +27,6 @@ impl Node for OpenRouterProviderNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        provider::emit(&ctx, "openrouter", true).await
+        provider::emit(&ctx, "openrouter").await
     }
 }

@@ -41,6 +41,7 @@ impl Node for ChatHistoryAppendNode {
         let text: Option<String> = ctx.inputs.opt("text")?;
         let media: Vec<Value> = ctx.inputs.list("media")?;
         let tool_call_id: Option<String> = ctx.inputs.opt("toolCallId")?;
+        let cache_breakpoint: bool = ctx.inputs.get_or("cacheBreakpoint", false)?;
 
         if text.is_none() && media.is_empty() {
             node_bail!("a message needs text or media");
@@ -54,12 +55,16 @@ impl Node for ChatHistoryAppendNode {
                 node_bail!("toolCallId only belongs on a 'tool' message, not '{other}'")
             }
         }
-        history.push(chat::stored_message(
+        let mut message = chat::stored_message(
             &role,
             text.as_deref().unwrap_or(""),
             &media,
             tool_call_id.as_deref(),
-        )?);
+        )?;
+        if cache_breakpoint {
+            chat::mark_cache(&mut message);
+        }
+        history.push(message);
         ctx.pulse_downstream(NodeOutput::new().set("history", history)).await
     }
 }

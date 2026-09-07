@@ -5,21 +5,25 @@
 //! file's text content is the value, and editing the field writes back to
 //! the file; it requires a type that `supports_bidirectional_edit`. `@asset`
 //! is pull-only: nothing ever writes back. A file-typed `@asset` (Image,
-//! Audio, ...) defers to the build's asset resolution; a text-typed one is
-//! read + cast at parse exactly like `@file`, just rendered read-only.
-//! `Type` defaults to `String` and is drawn from the existing `WeftType`
-//! vocabulary, so the same type names used for ports work here.
+//! Audio, ...) defers to the build's asset resolution; a text-typed one
+//! from a project file is read + cast at parse exactly like `@file`, just
+//! rendered read-only, and one from a URL or a stored-file key is fetched
+//! at build. `@file`'s type defaults to `String`; `@asset` always names its
+//! type (a value carries exactly one concrete marker, and the compiler
+//! never guesses a kind from a name or from bytes), so it is `Image`,
+//! `Video`, `Audio`, `Blob`, or a text type. Types are drawn from the
+//! existing `WeftType` vocabulary, so the same names used for ports work
+//! here.
 //!
-//! Resolution is a single post-parse pass (`resolve_node_file_refs` per node,
-//! walked over top-level nodes and group descendants) over every
-//! node's config map: the four text-parse sites already store the marker
-//! verbatim as a string, so none of them need to know about this feature.
-//! The pass finds the markers, reads the file relative to the project root,
+//! Type names are resolved when the literal is parsed in its source scope.
+//! File contents resolve once on the flattened graph, where ordinary inputs,
+//! group inputs and include arguments all have an owning node and field span.
+//! The pass reads each file relative to the source that wrote its reference,
 //! casts the bytes via `WeftType::cast_text`, and replaces the value. A bad
 //! path, a malformed marker, or a failed cast becomes a `CompileError`
 //! pointing at the field's source line.
 
-use weft_core::project::{ConfigFieldSpan, FileMarker, FileRef, Span};
+use weft_core::project::{FileMarker, FileRef};
 use weft_core::WeftType;
 
 use crate::file_reader::CompileFs;
@@ -92,13 +96,31 @@ pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
         return Some(Err(format!("{name} path is empty")));
     }
 
-    let ty = match type_part {
-        None => WeftType::Primitive(weft_core::WeftPrimitive::String),
-        Some(t) => match WeftType::parse(t.trim()) {
+    let ty = match (type_part, marker) {
+        (None, FileMarker::File) => WeftType::Primitive(weft_core::WeftPrimitive::String),
+        // No default for an asset: the type is what picks the marker the
+        // value carries, and nothing else may (not the name, not the
+        // bytes).
+        (None, FileMarker::Asset) => {
+            return Some(Err(format!(
+                "@asset({path:?}) needs its type as a second argument, e.g. \
+                 @asset({path:?}, Image); the kind is never guessed from the name. \
+                 Image, Video, Audio, Blob for a file, or a text type such as String"
+            )));
+        }
+        (Some(t), _) => match WeftType::parse(t.trim()) {
             Some(ty) => ty,
             None => return Some(Err(format!("{name}: invalid type {:?}", t.trim()))),
         },
     };
+    // A file type on an asset names ONE kind: `File`/`Media` would leave
+    // the marker to a guess.
+    if marker == FileMarker::Asset && ty.references_file() && ty.concrete_file_kind().is_none() {
+        return Some(Err(format!(
+            "@asset({path:?}, {ty}) must name one kind of file: Image, Video, Audio, or \
+             Blob (a value carries exactly one marker, and {ty} leaves it open)"
+        )));
+    }
 
     Some(Ok(FileRef { path, ty, marker }))
 }
@@ -130,19 +152,50 @@ fn split_path_and_type<'a>(inner: &'a str, name: &str) -> Result<(&'a str, Optio
 }
 
 fn unquote(s: &str) -> Option<String> {
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        Some(s[1..s.len() - 1].to_string())
-    } else {
-        None
-    }
+    serde_json::from_str(s).ok()
 }
 
-/// Does this ref DEFER to the build's asset resolution: an `@asset` whose
-/// type is a stored-file reference, so its bytes never ride the compile.
-/// Every other ref (both markers with text types) reads + casts inline at
-/// parse.
-pub fn is_asset_ref(file_ref: &FileRef) -> bool {
-    file_ref.marker == FileMarker::Asset && file_ref.ty.references_file()
+/// Freeze scoped type names into their portable wire spelling before leaving
+/// the source scope. The source text and its edit spans remain untouched.
+pub(crate) fn resolve_marker_types(value: &mut serde_json::Value) {
+    each_value_mut(value, &mut |leaf| {
+        let Some(raw) = leaf.as_str() else { return };
+        let Some(Ok(file_ref)) = parse_marker(raw) else { return };
+        *leaf = serde_json::Value::String(marker_text(&file_ref));
+    });
+}
+
+fn marker_text(file_ref: &FileRef) -> String {
+    let name = match file_ref.marker { FileMarker::File => "file", FileMarker::Asset => "asset" };
+    format!("@{name}({}, {})", serde_json::to_string(&file_ref.path).expect("a path serializes"), file_ref.ty.wire_string())
+}
+
+/// Does this ref DEFER to the build: an `@asset` whose type is a stored
+/// file (its bytes never ride the compile), or whose source is a URL or a
+/// stored-file key (there is nothing on disk to read at parse, whatever
+/// the type). Every other ref (both markers, text-typed, from a project
+/// file) reads + casts inline at parse.
+pub fn is_deferred_ref(file_ref: &FileRef) -> bool {
+    file_ref.marker == FileMarker::Asset
+        && (file_ref.ty.references_file() || is_url_ref(file_ref) || is_runtime_key_ref(file_ref))
+}
+
+/// The type a written constant has, for the type check and the cast: a
+/// `@file`/`@asset` marker is the type it declares (the value it stands
+/// for, never the marker text), a list is a list of its elements' types,
+/// and anything else is what `WeftType::infer` reads off the JSON.
+pub fn literal_type(value: &serde_json::Value) -> WeftType {
+    match value {
+        serde_json::Value::String(s) => match parse_marker(s) {
+            Some(Ok(file_ref)) => file_ref.ty,
+            _ => WeftType::infer(value),
+        },
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            let elements: Vec<WeftType> = items.iter().map(literal_type).collect();
+            WeftType::List(Box::new(WeftType::unify_types(&elements)))
+        }
+        _ => WeftType::infer(value),
+    }
 }
 
 /// Is this ref's source an external URL (resolved inline to a url-form file
@@ -206,43 +259,78 @@ fn collect_refs(
             .flatten()
             .chain(node.port_literals.values())
         {
-            each_string(value, &mut |raw| {
-                let Some(Ok(file_ref)) = parse_marker(raw) else { return };
-                if is_asset_ref(&file_ref)
+            for file_ref in refs_in_value(value) {
+                if is_deferred_ref(&file_ref)
                     && keep(&file_ref)
-                    && seen.insert(file_ref.path.clone())
+                    && seen.insert(file_ref.resolution_key())
                 {
                     refs.push(file_ref);
                 }
-            });
+            }
         }
     }
     refs
 }
 
-/// Collect every MEDIA ref whose source is a RUNTIME STORAGE KEY (see
+pub(crate) fn refs_in_value(value: &serde_json::Value) -> Vec<FileRef> {
+    let mut refs = Vec::new();
+    each_string(value, &mut |text| {
+        if let Some(Ok(reference)) = parse_marker(text) { refs.push(reference); }
+    });
+    refs
+}
+
+/// Collect every FILE-typed ref whose source is a RUNTIME STORAGE KEY (see
 /// [`is_runtime_key_ref`]), deduplicated. The build driver resolves each
 /// through the storage listing into the same `path -> value` map the sync's
 /// file refs use, so [`apply_asset_resolutions`] treats both identically.
 pub fn collect_runtime_key_refs(
     project: &weft_core::project::ProjectDefinition,
 ) -> Vec<FileRef> {
-    collect_refs(project, is_runtime_key_ref)
+    collect_refs(project, |r| is_runtime_key_ref(r) && r.ty.references_file())
+}
+
+/// Collect every TEXT-typed `@asset` whose source is a URL or a stored-file
+/// key: nothing on disk to read at parse, so the build driver fetches the
+/// bytes, casts them to the declared type through [`resolve_text_bytes`],
+/// and puts the value into the same map. Deduplicated by path.
+pub fn collect_remote_text_refs(
+    project: &weft_core::project::ProjectDefinition,
+) -> Vec<FileRef> {
+    collect_refs(project, |r| !r.ty.references_file())
+}
+
+/// Turn the bytes a build driver fetched for a text-typed remote `@asset`
+/// into the value the program reads: the declared type's own cast of the
+/// text (the same cast a project-file `@file` gets at parse), so `Number`
+/// and JSON shapes work from a URL exactly as from disk. The error names
+/// the source.
+pub fn resolve_text_bytes(file_ref: &FileRef, bytes: &[u8]) -> Result<serde_json::Value, String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| format!("@asset({:?}, {}): the content is not UTF-8 text: {e}", file_ref.path, file_ref.ty))?;
+    file_ref
+        .ty
+        .cast_text(text)
+        .map_err(|e| format!("@asset({:?}, {}): {e}", file_ref.path, file_ref.ty))
 }
 
 /// Resolve runtime-key refs (from [`collect_runtime_key_refs`]) against a
-/// stored-file `listing` into `map` (the same `path -> value` map the
-/// sync's file refs use). The listing's keys are tenant-anchored; each ref
+/// stored-file `listing` into `map` (the same `resolution key -> value`
+/// map the sync's file refs use). The listing's keys are tenant-anchored; each ref
 /// is the tenant-less scope key, so the match strips the tenant segment. A
 /// key with no listed file stays unmapped and fails loud in
-/// [`apply_asset_resolutions`] with the stored-file message. Pure (the
-/// driver supplies the listing), so every build driver resolves
+/// [`apply_asset_resolutions`] with the stored-file message. A listed file
+/// whose stored kind (from the mime the upload recorded) is not the kind
+/// the ref declared is returned as an error naming both, the way the sync
+/// holds a disk file to its declaration; `Blob` accepts anything. Pure
+/// (the driver supplies the listing), so every build driver resolves
 /// identically; only the listing fetch is theirs.
 pub fn resolve_runtime_key_refs(
     refs: &[FileRef],
     listing: &[weft_core::storage::StoredFileMeta],
     map: &mut std::collections::BTreeMap<String, serde_json::Value>,
-) {
+) -> Result<(), Vec<String>> {
+    let mut mismatched = Vec::new();
     for r in refs {
         let Some(meta) = listing
             .iter()
@@ -256,8 +344,23 @@ pub fn resolve_runtime_key_refs(
             size_bytes: meta.size_bytes,
             filename: meta.filename.clone(),
         };
-        map.insert(r.path.clone(), weft_core::storage::typed_file_value(&file, &r.ty));
+        if let Some(declared) = r.ty.concrete_file_kind() {
+            let stored = file.kind();
+            if declared != weft_core::weft_type::FileKind::Blob && stored != declared {
+                mismatched.push(format!(
+                    "@asset({:?}, {}): the stored file is {} ({}), not {}",
+                    r.path,
+                    r.ty,
+                    stored.primitive(),
+                    meta.mime_type,
+                    declared.primitive()
+                ));
+                continue;
+            }
+        }
+        map.insert(r.resolution_key(), weft_core::storage::typed_file_value(&file, &r.ty));
     }
+    if mismatched.is_empty() { Ok(()) } else { Err(mismatched) }
 }
 
 /// What resolving one `@file` marker produced.
@@ -277,19 +380,21 @@ enum Resolved {
 /// declared type; path resolution + the trusted-tree containment guard live in
 /// the reader.
 ///
-/// File-typed `@asset` refs (`Image`, `Audio`, `File`, ...) ALWAYS defer
-/// here: their bytes never ride a compile. Every parse (editor and build
-/// alike) keeps the raw marker string in config and records the ref; a BUILD
-/// then resolves them in one explicit post-pass, [`apply_asset_resolutions`],
-/// after the pre-build asset sync produced the map.
+/// Deferred refs (see [`is_deferred_ref`]: a file-typed `@asset`, or an
+/// `@asset` from a URL or a stored-file key) ALWAYS defer here: their bytes
+/// never ride a compile. Every parse (editor and build alike) keeps the raw
+/// marker string and records the ref; a BUILD then resolves them in one
+/// explicit post-pass, [`apply_asset_resolutions`], after the pre-build
+/// asset sync and the remote fetches produced the map.
 ///
 /// A file-typed `@file` is a hard error: those values cannot be written back
 /// as text, which is `@file`'s whole contract (each type declares its side
-/// via `supports_bidirectional_edit`). A text-typed `@asset` reads inline
-/// like `@file` (the editor renders it read-only), but only from a project
-/// file: a URL or stored-file source has no text to read at parse.
+/// via `supports_bidirectional_edit`). So is a `@file` from a URL: there is
+/// no file to write back to. `@file` paths keep pure disk semantics
+/// otherwise, because a project may legitimately contain a directory named
+/// after a scope tag (`project/...`) and its files must stay readable.
 fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
-    if is_asset_ref(file_ref) {
+    if is_deferred_ref(file_ref) {
         return Ok(Resolved::Deferred);
     }
     if file_ref.marker == FileMarker::File && !file_ref.ty.supports_bidirectional_edit() {
@@ -299,29 +404,11 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
             file_ref.ty, file_ref.path, file_ref.ty
         ));
     }
-    // From here the ref reads text inline (both markers). A URL source only
-    // exists in the deferred file-typed `@asset` form: whichever marker
-    // carries it here, there is no text to read at parse (and no file to
-    // edit back), so name the correct directive instead of failing the disk
-    // read on an `https://...` path.
     if is_url_ref(file_ref) {
         return Err(format!(
-            "a {}-typed {} cannot read from a URL; a URL source needs a \
-             file-typed @asset (Image, Audio, ..., File)",
-            file_ref.ty,
-            file_ref.marker.directive()
-        ));
-    }
-    // A stored-file key is likewise only meaningful as a deferred file-typed
-    // `@asset`. Only `@asset` rejects the key form: `@file` paths keep pure
-    // disk semantics, because a project may legitimately contain a directory
-    // named after a scope tag (`project/...`) and its files must stay
-    // readable through `@file`.
-    if file_ref.marker == FileMarker::Asset && is_runtime_key_ref(file_ref) {
-        return Err(format!(
-            "a {}-typed @asset must reference a project file; a stored \
-             file needs a file type (Image, Audio, ..., File)",
-            file_ref.ty
+            "@file cannot read from a URL (there is no file to write edits back to); \
+             use @asset({:?}, {}), which is fetched at build",
+            file_ref.path, file_ref.ty
         ));
     }
     let Some(base) = fs.base else {
@@ -337,28 +424,89 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
     file_ref.ty.cast_text(&resolved.content).map(Resolved::Value)
 }
 
-/// Resolve every `@file(...)` marker in one node's config map in place.
-/// Errors (malformed marker, unreadable file, failed cast) are collected
-/// against the field's source line (falling back to `node_span`). When `fs` has
-/// no anchor (`base == None`, parsing outside a project), a `@file` marker is an
-/// error: there is no directory to resolve it against (the message comes from
-/// `resolve`). Resolved references are recorded in `file_refs` so the editor
-/// knows the field is file-backed.
+/// Re-anchor a disk ref written in an included file onto the compiled
+/// file's directory (the project root on a build, where the compiled
+/// file is the project's `main.weft`): `@file("x")` inside
+/// `components/box.weft` names `components/x`. Every consumer of a
+/// ref's path (the editor's file watcher and save, the asset sync, the
+/// build's resolution map) resolves against that one anchor, so a ref
+/// only ever leaves the compiler in one spelling whichever file the
+/// text was typed in. A URL or a stored-file key names nothing on disk
+/// and is left alone; so is a ref from the compiled file itself.
 ///
-/// Called per node by the parser's recursive walk (top-level nodes and every
-/// group descendant) so `@file` inside a group body resolves too.
-pub(crate) fn resolve_node_file_refs(
-    config: &mut serde_json::Map<String, serde_json::Value>,
-    config_spans: &std::collections::BTreeMap<String, ConfigFieldSpan>,
-    file_refs: &mut std::collections::BTreeMap<String, FileRef>,
-    node_span: Span,
-    fs: &CompileFs,
+/// A path that lands OUTSIDE the anchor keeps its absolute spelling
+/// rather than being refused: naming a file where it already sits is
+/// allowed (`weft-cli`'s asset source opens an absolute path as given),
+/// and it is allowed identically from the compiled file, where this
+/// function does not run at all. Refusing it here only made the same
+/// text legal or illegal depending on which file it was typed in.
+fn anchor_on_root(
+    mut file_ref: FileRef,
+    source_file: Option<&str>,
+    root: &Result<std::path::PathBuf, String>,
+) -> Result<FileRef, String> {
+    let Some(source_file) = source_file else { return Ok(file_ref) };
+    if is_url_ref(&file_ref) || is_runtime_key_ref(&file_ref) {
+        return Ok(file_ref);
+    }
+    let root = root.as_ref().map_err(|e| e.clone())?;
+    let dir = std::path::Path::new(source_file).parent().unwrap_or(std::path::Path::new(""));
+    let joined = crate::file_reader::normalize_lexical(&dir.join(&file_ref.path)).ok_or_else(|| {
+        format!(
+            "{}({:?}) climbs above the filesystem root",
+            file_ref.marker.directive(),
+            file_ref.path
+        )
+    })?;
+    // A path is text on the wire, and a definition hash is computed over
+    // it, so a lossy conversion would make the same project hash
+    // differently on two machines. Refuse rather than replace bytes.
+    let anchored = match joined.strip_prefix(root) {
+        Ok(relative) => relative,
+        Err(_) => joined.as_path(),
+    };
+    file_ref.path = anchored
+        .to_str()
+        .ok_or_else(|| {
+            format!(
+                "{}({:?}) resolves to a path that is not text",
+                file_ref.marker.directive(),
+                file_ref.path
+            )
+        })?
+        .to_string();
+    Ok(file_ref)
+}
+
+/// Resolve all file-backed values through one pass after includes and groups
+/// have been flattened. A ref written in an included file is first spelled
+/// relative to the project root (see [`anchor_on_root`]), so everything
+/// resolves against one anchor and the ref's path means the same thing to
+/// every consumer.
+pub(crate) fn resolve_project_file_refs(
+    project: &mut weft_core::project::ProjectDefinition,
+    root_fs: &CompileFs,
     errors: &mut Vec<CompileError>,
 ) {
-    for (key, value) in config.iter_mut() {
+    // Computed once: an include-sourced ref needs the root's identity to be
+    // spelled under it. Compiling outside a project (no anchor) only fails
+    // when such a ref actually turns up.
+    let root = match root_fs.base {
+        Some(base) => root_fs.reader.identity(base),
+        None => Err("a file reference cannot be resolved outside a project".into()),
+    };
+    for node in &mut project.nodes {
+      let config_spans = &node.config_spans;
+      let literal_spans = &node.port_literal_spans;
+      for (key, value, field) in node.config.as_object_mut().into_iter().flat_map(|map| map.iter_mut())
+          .map(|(key, value)| (key, value, config_spans.get(key)))
+          .chain(node.port_literals.iter_mut().map(|(key, value)| (key, value, literal_spans.get(key)))) {
         // The culprit is the field that carries the marker; fall back to the
         // node's declaration span only if the field span is missing.
-        let span = config_spans.get(key).map(|s| s.span).unwrap_or(node_span);
+        let span = field.map(|s| s.span).unwrap_or(node.span.unwrap_or_default());
+        // A present field span with no file names the main source, even
+        // when its owner is a group that came from an included file.
+        let source_file = field.map(|s| s.source_file.as_deref()).unwrap_or(node.source_file.as_deref());
         // A marker sits at the top of a field (`systemPrompt: @file(...)`)
         // or inside a list (`attachments: [@asset(...), @asset(...)]`), and
         // every one of them resolves. Only a field that is ONE marker is
@@ -382,42 +530,56 @@ pub(crate) fn resolve_node_file_refs(
                     if !single && !crate::cst::marker::has_abutting_args(raw.trim()) {
                         return;
                     }
-                    errors.push(CompileError::at(span, msg));
+                    errors.push(CompileError::at(span, msg).in_file(source_file));
                     return;
                 }
             };
-            match resolve(&file_ref, fs) {
+            let file_ref = match anchor_on_root(file_ref, source_file, &root) {
+                Ok(fr) => fr,
+                Err(msg) => {
+                    errors.push(CompileError::at(span, msg).in_file(source_file));
+                    return;
+                }
+            };
+            match resolve(&file_ref, root_fs) {
                 Ok(Resolved::Value(resolved)) => {
                     *leaf = resolved;
                     if single {
-                        file_refs.insert(key.clone(), file_ref);
+                        node.file_refs.insert(key.clone(), file_ref);
                     }
                 }
-                // A deferred media ref (editor/lenient parse): the raw
-                // `@file` string stays in config for the UI to render, and
-                // the ref is recorded so the field is known to be
-                // file-backed.
+                // A deferred media ref: the marker stays in config (the
+                // editor renders it, the build resolves it), respelled
+                // under the root so the sync and the resolution map find
+                // the same file, and the ref is recorded so the field is
+                // known to be file-backed.
                 Ok(Resolved::Deferred) => {
+                    *leaf = serde_json::Value::String(marker_text(&file_ref));
                     if single {
-                        file_refs.insert(key.clone(), file_ref);
+                        node.file_refs.insert(key.clone(), file_ref);
                     }
                 }
-                Err(msg) => errors.push(CompileError::at(span, msg)),
+                Err(msg) => errors.push(CompileError::at(span, msg).in_file(source_file)),
             }
         });
+      }
     }
 }
 
 /// Resolve every deferred `@asset` ref in a compiled definition, in
-/// place: URL refs become url-form file values inline; path refs substitute
-/// the pre-build asset sync's stored-file value from `map` (keyed by the raw
-/// path as written). The ONE build-side resolution step, run by every build
-/// driver between the sync and the hash/stage, so the definition that gets
-/// hashed and shipped carries resolved values and never a raw marker.
+/// place: file-typed URL refs become url-form file values inline; every
+/// other deferred ref substitutes the value the driver put in `map` (keyed
+/// by the raw path as written): the pre-build asset sync's stored-file
+/// value for a disk path, the storage listing's for a stored key, the
+/// fetched-and-cast text for a text-typed URL or key. The ONE build-side
+/// resolution step, run by every build driver between the sync and the
+/// hash/stage, so the definition that gets hashed and shipped carries
+/// resolved values and never a raw marker.
 ///
-/// Errors name every unresolved path ref at once ("the sync did not resolve
-/// it": the file vanished between collect and apply, or the driver skipped the
-/// sync). Text refs were already resolved at parse and never appear here.
+/// Errors name every unresolved ref at once ("the sync did not resolve
+/// it": the file vanished between collect and apply, or the driver skipped
+/// a step). Project-file text refs were already resolved at parse and never
+/// appear here.
 pub fn apply_asset_resolutions(
     project: &mut weft_core::project::ProjectDefinition,
     map: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -433,15 +595,19 @@ pub fn apply_asset_resolutions(
     ) {
         let Some(raw) = value.as_str() else { return };
         let Some(Ok(file_ref)) = parse_marker(raw) else { return };
-        if !is_asset_ref(&file_ref) {
+        if !is_deferred_ref(&file_ref) {
             return;
         }
-        if is_url_ref(&file_ref) {
+        if is_url_ref(&file_ref) && file_ref.ty.references_file() {
             *value = weft_core::storage::url_file_value(&file_ref.path, &file_ref.ty);
             return;
         }
-        match map.get(&file_ref.path) {
+        match map.get(&file_ref.resolution_key()) {
             Some(resolved) => *value = resolved.clone(),
+            None if is_url_ref(&file_ref) => missing.push(format!(
+                "@asset({:?}, {}) is a text value from a URL the build did not fetch",
+                file_ref.path, file_ref.ty
+            )),
             None if is_runtime_key_ref(&file_ref) => missing.push(format!(
                 "@asset({:?}, {}) names a stored file that does not exist (deleted, or \
                  picked from another project)",
@@ -472,10 +638,12 @@ pub fn apply_asset_resolutions(
 }
 
 /// Collect every deferred `@asset` ref in a project definition whose source
-/// is a PATH (URL refs resolve inline and never sync). The pre-build asset
-/// sync's input: run over a DEFERRED parse (asset refs still hold their raw
-/// `@asset` strings in config). Deduplicated by path, first declared type
-/// wins (the type only picks the marker kind; the bytes are the identity).
+/// is a DISK PATH (URL and stored-key refs never sync; a text-typed one
+/// from disk resolved at parse). The pre-build asset sync's input: run over
+/// a DEFERRED parse (asset refs still hold their raw `@asset` strings).
+/// Deduplicated by path, first declared type wins (the type only picks the
+/// marker kind; the bytes are the identity, and the sync checks them
+/// against that kind).
 pub fn collect_asset_refs(project: &weft_core::project::ProjectDefinition) -> Vec<FileRef> {
     collect_refs(project, |r| !is_url_ref(r) && !is_runtime_key_ref(r))
 }

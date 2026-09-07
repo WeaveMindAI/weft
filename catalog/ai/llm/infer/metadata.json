@@ -24,7 +24,7 @@
       "name": "history",
       "type": "ChatHistory",
       "required": false,
-      "exposure": "wire",
+      "accepts": ["wire"],
       "description": "The conversation so far (a Chat Message chain or a previous call's history output)."
     },
     {
@@ -37,27 +37,26 @@
       "name": "provider",
       "type": "LlmProvider",
       "required": true,
-      "exposure": "wire",
+      "accepts": ["wire"],
       "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends."
     },
     {
       "name": "params",
       "type": "Dict[String, String | Number | Boolean | List[String]]",
       "required": false,
-      "exposure": "wire",
+      "accepts": ["wire"],
       "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply."
     },
     {
       "name": "tools",
       "type": "JsonDict | List[JsonDict]",
       "required": false,
-      "exposure": "wire",
+      "accepts": ["wire"],
       "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them."
     },
     {
       "name": "toolChoice",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "select",
         "options": ["auto", "required", "none"]
@@ -69,29 +68,33 @@
     {
       "name": "parseJson",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "label": "Parse JSON",
-      "description": "Parse and repair JSON from the response (changes output to Dict)."
+      "description": "Parse and repair JSON from the response (changes output to Dict). With it on, declare output ports named after the JSON's keys (`-> (verdict: String, score: Number)`) and each key comes out as its own port; `response` then only matters when something reads the whole object."
+    },
+    {
+      "name": "autoCache",
+      "type": "Boolean",
+      "widget": { "kind": "checkbox" },
+      "default": true,
+      "label": "Automatic prompt caching",
+      "description": "On: when the wired history carries no cache mark, the request marks the system message and the last history message before this call's new turn, so a chain of calls reuses its stable prefix. The marks live on the request alone: the `history` output carries the conversation as written, so the next call in the chain places its own. A history that already carries marks (Chat Message's `cacheBreakpoint`) is sent as placed."
     }
   ],
   "outputs": [
     {
       "name": "response",
       "type": "MustOverride",
-      "required": false,
-      "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly."
+      "description": "The reply. Declare its type in the source: `String` without parseJson; with parseJson, prefer one output port per JSON key (`-> (verdict: String)`) and read `response` only when something needs the whole object (then `JsonDict` or a record type)."
     },
     {
       "name": "history",
       "type": "ChatHistory",
-      "required": false,
       "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
     },
     {
       "name": "toolCalls",
       "type": "List[ToolCall]",
-      "required": false,
       "description": "The tool calls the model made, if any (each with the raw JSON text of its arguments). Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
     }
   ],

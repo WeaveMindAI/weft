@@ -58,7 +58,6 @@
     {
       "name": "connection",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -68,7 +67,6 @@
       "name": "model",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "remote_select",
         "access": "connection",
@@ -91,25 +89,10 @@
     {
       "name": "provider",
       "type": "LlmProvider",
-      "required": false,
       "description": "The provider value: wire it into an LLM node's provider input."
     }
   ],
   "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "connection"
-        }
-      },
-      "then": {
-        "message": "AnthropicProvider '{id}' has no connection picked; pick one on the node.",
-        "level": "runtime",
-        "field": "connection"
-      }
-    },
     {
       "when": {
         "kind": "not",

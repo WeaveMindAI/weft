@@ -23,7 +23,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use weft_catalog::FsCatalog;
-use weft_core::access::spec::{AccessSpec, Acquisition, CredentialField};
+use weft_core::access::spec::{AccessSpec, Acquisition, CredentialField, Door};
+use weft_core::access::wire::ConnectDirect;
 use weft_core::node::MetadataCatalog;
 use weft_core::node_test::{
     concurrency_limit, report_line, NodeTestsListing, RunAllReport, TestListing, TestReport,
@@ -519,7 +520,7 @@ async fn run_live(
     // one side-effecting step (the ephemeral grant), so a bail during
     // planning can never leave a pasted credential behind.
     enum Planned {
-        Existing(String),
+        Existing(uuid::Uuid),
         NeedsEphemeral,
     }
     let services: std::collections::BTreeSet<String> =
@@ -537,7 +538,7 @@ async fn run_live(
     }
     // `--connection <service>=<id>` pins one service's grant; a bare
     // `<id>` is accepted only when exactly one service is in play.
-    let mut pinned: BTreeMap<String, String> = BTreeMap::new();
+    let mut pinned: BTreeMap<String, uuid::Uuid> = BTreeMap::new();
     for raw in &args.connection {
         let (service, id) = match raw.split_once('=') {
             Some((s, id)) => (s.to_string(), id.to_string()),
@@ -563,6 +564,11 @@ async fn run_live(
                  (an ephemeral pasted key, or the existing connection)"
             );
         }
+        // Typed HERE, where the flag is read: everything downstream
+        // (the plan, the pod requests) carries a real Uuid.
+        let id: uuid::Uuid = id
+            .parse()
+            .with_context(|| format!("--connection {id} is not a connection id (a UUID)"))?;
         if pinned.insert(service.clone(), id).is_some() {
             bail!("--connection names service '{service}' twice");
         }
@@ -575,10 +581,10 @@ async fn run_live(
             // Validate NOW, in the plan phase: a typo'd or
             // wrong-service grant id must fail before any side effect
             // (and before a pod spends money discovering it).
-            require_grant_for_service(ctx, service, conn).await?;
-            Planned::Existing(conn.clone())
+            require_grant_for_service(ctx, service, *conn).await?;
+            Planned::Existing(*conn)
         } else {
-            match pick_grant(ctx, service).await? {
+            match sole_grant_for_service(ctx, service).await? {
                 Some(id) => Planned::Existing(id),
                 // No grant at all: environment-provided key fields
                 // (the scripted stand-in for --key) promote to an
@@ -593,23 +599,6 @@ async fn run_live(
             }
         };
         plan.insert(service.clone(), planned);
-    }
-
-    // The plan resolved fully: NOW create the ephemeral grants, and
-    // from this instant their deletion is unconditional (ok and error
-    // paths alike); a failed delete names the id and the recovery.
-    let mut connections: BTreeMap<String, String> = BTreeMap::new();
-    let mut ephemeral_grants: Vec<String> = Vec::new();
-    for (service, planned) in plan {
-        let id = match planned {
-            Planned::Existing(id) => id,
-            Planned::NeedsEphemeral => {
-                let id = create_ephemeral_grant(ctx, catalog, &service).await?;
-                ephemeral_grants.push(id.clone());
-                id
-            }
-        };
-        connections.insert(service, id);
     }
 
     // Every WEFT_NODE_TEST_* variable rides into the test pod's env as
@@ -636,28 +625,60 @@ async fn run_live(
         })
         .collect();
 
-    // While an ephemeral grant exists, Ctrl+C must not skip its
-    // deletion: the poll breadcrumb documents Ctrl+C as the way to
-    // stop waiting, and that exact path leaking a pasted credential
-    // would betray the plan-then-create promise above. The select
-    // turns the signal into a normal error so the deletes below run
-    // on every exit.
-    let result = if !ephemeral_grants.is_empty() {
+    // ALL prompting happens HERE, before any grant exists and before
+    // any signal handler is armed: the credential prompts keep the
+    // default die-on-Ctrl+C, and a Ctrl+C at any prompt leaks nothing
+    // because nothing has been created yet.
+    let mut connections: BTreeMap<String, uuid::Uuid> = BTreeMap::new();
+    let mut prepared: Vec<(String, PreparedKey)> = Vec::new();
+    for (service, planned) in plan {
+        match planned {
+            Planned::Existing(id) => {
+                connections.insert(service, id);
+            }
+            Planned::NeedsEphemeral => {
+                let key = prepare_ephemeral_key(catalog, &service)?;
+                prepared.push((service, key));
+            }
+        }
+    }
+
+    // The prompts are done: NOW create the grants and run, both inside
+    // one Ctrl+C select, so from the instant the first grant exists no
+    // exit (a later creation failing, the run failing, Ctrl+C at any
+    // point) can skip the cleanup loop below. Every grant whose id
+    // came back is deleted unconditionally, and a failed delete names
+    // the id and the recovery. (The gap: a create interrupted or
+    // unparsed IN FLIGHT may have stored a grant whose id nobody
+    // holds; only `weft connect --list` can find it, and the interrupt
+    // message says to check it.)
+    let mut ephemeral_grants: Vec<uuid::Uuid> = Vec::new();
+    let result = if prepared.is_empty() {
+        run_live_pods(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
+    } else {
+        let create_and_run = async {
+            for (service, key) in prepared {
+                let id = create_ephemeral_grant(ctx, key).await?;
+                ephemeral_grants.push(id);
+                connections.insert(service, id);
+            }
+            run_live_pods(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
+        };
         tokio::select! {
-            r = run_live_pods(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports) => r,
+            r = create_and_run => r,
             _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!(
-                "interrupted (Ctrl+C); any started test pod keeps running"
+                "interrupted (Ctrl+C); any started test pod keeps running, and a \
+                 connection being stored at that moment may have survived: check \
+                 `weft connect --list`"
             )),
         }
-    } else {
-        run_live_pods(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
     };
     for grant_id in ephemeral_grants {
         // Bounded: a hung delete must not keep a finished run (and its
         // WARNING) from ever reaching the terminal.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            client.delete(&format!("/access/grants/{grant_id}")),
+            super::connect::forget_grant(&client, grant_id),
         )
         .await;
         let failure = match outcome {
@@ -668,8 +689,7 @@ async fn run_live(
         if let Some(e) = failure {
             eprintln!(
                 "WARNING: could not delete the ephemeral key grant {grant_id}: {e}\n\
-                 remove it with: DELETE /access/grants/{grant_id} (or from the editor's \
-                 connection list)"
+                 remove it with `weft connect --forget {grant_id} --yes`"
             );
         }
     }
@@ -723,22 +743,13 @@ fn env_component(name: &str) -> String {
 /// the run request would accept any string and fail deep inside the
 /// pod otherwise. Uses the service-scoped list (the API's read
 /// surface for grants), so a wrong-service id fails naming both.
-async fn require_grant_for_service(ctx: &Ctx, service: &str, grant_id: &str) -> Result<()> {
-    let grants = ctx
-        .client()
-        .get_json(&format!("/access/grants?service={service}"))
-        .await
-        .context("list grants")?;
-    let known = grants
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|g| g.get("id").and_then(|v| v.as_str()) == Some(grant_id));
-    if !known {
+async fn require_grant_for_service(ctx: &Ctx, service: &str, grant_id: uuid::Uuid) -> Result<()> {
+    let grants = super::connect::list_grants(&ctx.client(), Some(service)).await?;
+    if !grants.iter().any(|g| g.id == grant_id) {
         bail!(
             "--connection {grant_id} is not a grant for service '{service}'; list the \
-             service's connections in the editor (or run without --connection to pick \
-             the only one automatically)"
+             service's connections with `weft connect --list` (or run without \
+             --connection to pick the only one automatically)"
         );
     }
     Ok(())
@@ -777,35 +788,24 @@ fn ensure_live_consent(args: &TestNodeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Pick the tenant's grant for `service`: exactly one is unambiguous;
-/// zero is `None` (the caller knows the other ways in); several name
-/// the fix.
-async fn pick_grant(ctx: &Ctx, service: &str) -> Result<Option<String>> {
-    let grants = ctx
-        .client()
-        .get_json(&format!("/access/grants?service={service}"))
-        .await
-        .context("list grants")?;
-    let grants = grants.as_array().cloned().unwrap_or_default();
-    match grants.len() {
-        0 => Ok(None),
-        1 => Ok(Some(
-            grants[0]
-                .get("id")
-                .and_then(Value::as_str)
-                .context("grant without id")?
-                .to_string(),
-        )),
-        _ => {
-            let list: Vec<String> = grants
+/// The id of the tenant's sole grant for `service`: exactly one is
+/// unambiguous; zero is `None` (the caller knows the other ways in);
+/// several name the fix.
+async fn sole_grant_for_service(ctx: &Ctx, service: &str) -> Result<Option<uuid::Uuid>> {
+    let grants = super::connect::list_grants(&ctx.client(), Some(service)).await?;
+    match grants.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.id)),
+        many => {
+            let list: Vec<String> = many
                 .iter()
                 .map(|g| {
                     format!(
                         "  {}  {}",
-                        g.get("id").and_then(Value::as_str).unwrap_or("?"),
-                        g.get("identity")
-                            .and_then(Value::as_str)
-                            .or_else(|| g.get("label").and_then(Value::as_str))
+                        g.id,
+                        g.identity
+                            .as_deref()
+                            .or(g.label.as_deref())
                             .unwrap_or("(unlabeled)")
                     )
                 })
@@ -819,11 +819,17 @@ async fn pick_grant(ctx: &Ctx, service: &str) -> Result<Option<String>> {
     }
 }
 
-/// Create a throwaway pasted-key grant for `service` through the
-/// store's own paste flow. Fields are prompted on stdin, NEVER read
-/// from argv (shell history). Returns the grant id; the caller
-/// deletes it after the run.
-async fn create_ephemeral_grant(ctx: &Ctx, catalog: &FsCatalog, service: &str) -> Result<String> {
+/// One service's fully-prompted ephemeral-grant ingredients, resolved
+/// BEFORE any grant exists: the prompting (with its default Ctrl+C
+/// behavior) runs outside the signal-guarded create-and-run window.
+/// Fields are prompted on stdin, NEVER read from argv (shell history).
+struct PreparedKey {
+    spec: AccessSpec,
+    values: BTreeMap<String, String>,
+    paste: bool,
+}
+
+fn prepare_ephemeral_key(catalog: &FsCatalog, service: &str) -> Result<PreparedKey> {
     let spec = catalog
         .all()
         .into_iter()
@@ -854,7 +860,7 @@ async fn create_ephemeral_grant(ctx: &Ctx, catalog: &FsCatalog, service: &str) -
     // variable and an optional gap is skipped, never prompted (a
     // scripted sweep must not stop on stdin).
     let env_driven = env_key_present(service);
-    let mut values = serde_json::Map::new();
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
     for field in &fields {
         let label = field.label.as_deref().unwrap_or(&field.name);
         let hint = if field.optional { " (optional, Enter to skip)" } else { "" };
@@ -887,29 +893,32 @@ async fn create_ephemeral_grant(ctx: &Ctx, catalog: &FsCatalog, service: &str) -
         if value.is_empty() {
             continue;
         }
-        values.insert(field.name.clone(), Value::String(value));
+        values.insert(field.name.clone(), value);
     }
+    Ok(PreparedKey { spec: spec.clone(), values, paste: paste_flag })
+}
 
-    let done = ctx
-        .client()
-        .post_json(
-            "/access/connect/direct",
-            &json!({
-                "spec": spec,
-                "door": "own",
-                "values": values,
-                "label": "weft test-node (ephemeral)",
-                "paste": paste_flag,
-                "project_id": null,
-            }),
-        )
-        .await
-        .context("create the ephemeral key grant")?;
-    done.get("grant")
-        .and_then(|g| g.get("id"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .context("connect answered without a grant id")
+/// The side-effecting half: store the prepared credential as an
+/// ephemeral grant. No prompting in here, so it can run inside the
+/// Ctrl+C select.
+async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uuid> {
+    let grant = super::connect::connect_direct(
+        &ctx.client(),
+        ConnectDirect {
+            spec: key.spec,
+            door: Door::Own,
+            values: key.values,
+            label: Some("weft test-node (ephemeral)".into()),
+            permissions: Vec::new(),
+            registration: None,
+            paste: key.paste,
+            project_id: None,
+        },
+        None,
+    )
+    .await
+    .context("create the ephemeral key grant")?;
+    Ok(grant.id)
 }
 
 async fn run_live_pods(
@@ -917,7 +926,7 @@ async fn run_live_pods(
     catalog: &FsCatalog,
     project_id: &str,
     runs: &[LiveRun],
-    connections: &BTreeMap<String, String>,
+    connections: &BTreeMap<String, uuid::Uuid>,
     fixtures: &BTreeMap<String, String>,
     parallel: Option<usize>,
     reports: &mut Vec<TestReport>,
@@ -996,7 +1005,7 @@ async fn run_live_pods(
                     let outcome = match (image, connection) {
                         (Ok(image), Ok(connection)) => {
                             run_one_live_pod(
-                                client, project_id, run, &image, &connection, fixtures, progress,
+                                client, project_id, run, &image, connection, fixtures, progress,
                             )
                             .await
                         }
@@ -1033,7 +1042,7 @@ async fn run_one_live_pod(
     project_id: &str,
     run: &LiveRun,
     image: &str,
-    connection: &str,
+    connection: uuid::Uuid,
     fixtures: &BTreeMap<String, String>,
     progress: &LiveProgress,
 ) -> Result<TestReport> {
@@ -1157,13 +1166,12 @@ async fn ensure_test_image(
     // nothing is referenced by design: a tag a still-running test pod
     // uses refuses its node-side remove and survives.
     crate::commands::build::gc_stale_images(
-        weft_compiler::build::NODE_TEST_IMAGE_REPO,
-        &tag,
+        std::slice::from_ref(&tag),
         &[
             format!("weft.dev/project={}", project.id()),
             format!("weft.dev/node-test-package={package}"),
         ],
-        Some(&std::collections::BTreeSet::new()),
+        Some(&crate::images::ReferencedImages::default()),
     )
     .await;
     Ok(tag)

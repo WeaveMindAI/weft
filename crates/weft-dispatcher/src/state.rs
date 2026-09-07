@@ -129,6 +129,9 @@ pub struct DispatcherState {
     /// storage-admin requests so the broker resolves it to the control plane.
     pub broker_token_path: std::path::PathBuf,
     /// Shared HTTP client for the broker storage-admin proxy.
+    /// The process's one HTTP client for the broker's admin surface and
+    /// for an infra container's `/live` and `/action`. Follows no
+    /// redirect (see `app.rs`): every peer answers in place.
     pub http: reqwest::Client,
     /// kube client used by the reaper (supervisor scale-down). The
     /// listener and worker backends hold their own clones of the

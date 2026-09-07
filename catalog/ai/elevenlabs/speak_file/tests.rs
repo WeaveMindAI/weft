@@ -5,14 +5,28 @@ use serde_json::json;
 
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
 
+use super::super::elevenlabs::audio_file_type;
 use super::ElevenLabsSpeakFileNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
+        NodeTest::basic("every_declared_output_format_has_a_file_type", file_types),
         NodeTest::fake("speaks_and_stores_the_audio", speaks),
         NodeTest::fake("voice_settings_ride_only_when_set", settings_optional),
         NodeTest::live("one_real_short_speech", "elevenlabs", live_speech),
     ]
+}
+
+/// Every format the metadata offers stores under a real extension and
+/// mime, the opus family as the Ogg Opus a WhatsApp voice note wants;
+/// a family the nodes never declared is refused, never guessed.
+fn file_types() -> WeftResult<()> {
+    assert_eq!(audio_file_type("mp3_44100_128")?, ("mp3", "audio/mpeg"));
+    assert_eq!(audio_file_type("pcm_16000")?, ("pcm", "audio/pcm"));
+    assert_eq!(audio_file_type("ulaw_8000")?, ("ulaw", "audio/basic"));
+    assert_eq!(audio_file_type("opus_48000_64")?, ("ogg", "audio/ogg; codecs=opus"));
+    assert!(audio_file_type("flac_44100").is_err());
+    Ok(())
 }
 
 /// One real short flash TTS: a stock voice speaks one sentence and the

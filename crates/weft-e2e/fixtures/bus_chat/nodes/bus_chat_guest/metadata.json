@@ -19,8 +19,7 @@
   "outputs": [
     {
       "name": "done",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     }
   ],
   "requires_infra": false

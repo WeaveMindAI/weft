@@ -18,7 +18,7 @@ tracing = { workspace = true }
 tempfile = { workspace = true }
 # The chat-types mirror test: the catalog's declared ChatHistory shape
 # must accept what minillmlib actually serializes.
-minillmlib = "0.5.10"
+minillmlib = "0.5.11"
 
 [lints]
 workspace = true

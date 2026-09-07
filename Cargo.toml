@@ -34,6 +34,18 @@ doc_lazy_continuation = "allow"
 doc_overindented_list_items = "allow"
 too_many_arguments = "allow"
 
+# Dev/test binaries carry line tables only, not full variable
+# debuginfo. This workspace's test binaries are enormous with full
+# debuginfo (target/debug alone once grew past 25GB: every crate's
+# test binary re-embeds the whole dependency graph's debuginfo), and
+# the everyday loop (cargo test, backtraces, logs) never reads
+# variable values out of a debugger; line tables keep every backtrace
+# line-accurate. A step-debugging session opts back in per invocation
+# (RUSTFLAGS="-C debuginfo=2" cargo test ...; expect a cold rebuild
+# and big binaries while it is set).
+[profile.dev]
+debug = "line-tables-only"
+
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
@@ -87,10 +99,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # utils
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+# IANA time zones, for a cron schedule that means "nine in Paris".
+chrono-tz = "0.10"
 bytes = "1"
 regex = "1"
 inventory = "0.3"
 url = "2"
+# Hidden-echo terminal input for pasted credentials (`weft connect`).
+rpassword = "7"
+# Open the browser on the OAuth consent URL (`weft connect`).
+open = "5"
 terminal_size = "0.4"
 hmac = "0.12"
 aes-gcm = "0.10"

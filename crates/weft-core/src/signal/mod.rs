@@ -132,6 +132,19 @@ pub trait Signal: Serialize + DeserializeOwned + Sized {
     fn match_predicates(&self) -> &[Predicate] {
         &[]
     }
+
+    /// The stored file this signal shows under `field`, for the
+    /// signal-token files door: a consumer that lists the signal asks
+    /// the door for a fresh link to it. A kind whose consumer payload
+    /// carries files (a form's image field) overrides this to name the
+    /// file its config holds for that field; the stored file itself
+    /// never reaches a consumer. `Ok(None)` when this field holds no
+    /// stored file; `Err` when it holds one the kind cannot read, so a
+    /// broken reference never reads as "there is no file here".
+    /// Default: no kind carries files.
+    fn stored_file(&self, _field: &str) -> Result<Option<crate::storage::StoredFile>, String> {
+        Ok(None)
+    }
 }
 
 /// Project a typed kind into the wire-shape `SignalSpec`. The
@@ -171,6 +184,11 @@ pub struct SignalKindEntry {
     /// [`Signal::requires_access`], reachable from a tag alone so
     /// `validate_spec` can check the spec-level connection.
     pub requires_access: bool,
+    /// Parse `config` as the typed kind and ask [`Signal::stored_file`],
+    /// so the files door can answer for any kind from the wire shape.
+    /// `Err` when the stored config no longer matches the kind's shape,
+    /// which is the same failure the listener reports when it renders.
+    pub stored_file_json: fn(&Value, &str) -> Result<Option<crate::storage::StoredFile>, String>,
 }
 
 #[cfg(feature = "runtime")]
@@ -183,6 +201,17 @@ fn lookup(tag: &str) -> Option<&'static SignalKindEntry> {
     inventory::iter::<SignalKindEntry>
         .into_iter()
         .find(|e| e.tag == tag)
+}
+
+/// The stored file a wire-shape `SignalSpec` shows under `field`, by
+/// its kind's own rule ([`Signal::stored_file`]). `Ok(None)` when the
+/// kind carries no files or this field holds none; `Err` when the kind
+/// is not registered here or its stored config no longer parses, so a
+/// consumer is told what is actually wrong instead of "no such file".
+#[cfg(feature = "runtime")]
+pub fn stored_file(spec: &SignalSpec, field: &str) -> Result<Option<crate::storage::StoredFile>, String> {
+    let entry = lookup(&spec.kind).ok_or_else(|| format!("unknown signal kind '{}'", spec.kind))?;
+    (entry.stored_file_json)(&spec.config, field)
 }
 
 /// Validate a wire-shape `SignalSpec`: the spec-level fields every
@@ -226,6 +255,16 @@ macro_rules! register_signal_kind {
                     <$ty as $crate::signal::Signal>::validate(&typed)
                 },
                 requires_access: <$ty as $crate::signal::Signal>::REQUIRES_ACCESS,
+                stored_file_json: |config: &::serde_json::Value, field: &str| {
+                    let typed: $ty = ::serde_json::from_value(config.clone())
+                        .map_err(|e| format!(
+                            "kind '{}' config does not deserialize: {e} (the stored config \
+                             does not match the current shape; re-register the signal by \
+                             re-running the project)",
+                            <$ty as $crate::signal::Signal>::TAG
+                        ))?;
+                    <$ty as $crate::signal::Signal>::stored_file(&typed, field)
+                },
             }
         }
     };
@@ -240,6 +279,56 @@ mod tests {
     /// surface as a runtime "unknown signal kind" error in production,
     /// so we guard at compile/test time. Update the expected list
     /// when adding a kind.
+    /// The files door asks a kind for the file behind a field through
+    /// the inventory, so it needs no knowledge of any kind.
+    #[test]
+    fn a_kind_names_the_stored_file_behind_a_field() {
+        let spec = to_spec(Form {
+            form_type: "any".into(),
+            schema: FormSchema {
+                fields: vec![FormField {
+                    field_type: "display_image".into(),
+                    key: "pic".into(),
+                    label: String::new(),
+                    render: crate::node::FormFieldRender {
+                        component: "image".into(),
+                        source: None,
+                        multiple: false,
+                        prefilled: false,
+                    },
+                    value: Some(serde_json::json!({ "__weft_image__": {
+                        "key": "t/project/p/cat", "mimeType": "image/png", "sizeBytes": 7, "filename": "cat.png"
+                    } })),
+                    config: Default::default(),
+                }],
+            },
+            title: None,
+            description: None,
+            consumer_kind: None,
+        });
+        assert_eq!(
+            stored_file(&spec, "pic").unwrap().map(|f| f.key),
+            Some("t/project/p/cat".to_string())
+        );
+        assert_eq!(stored_file(&spec, "nope").unwrap(), None, "an unknown field holds no file");
+        let timer = SignalSpec {
+            kind: "timer".into(),
+            config: serde_json::to_value(Timer { spec: TimerSpec::After { duration_ms: 1000 } }).unwrap(),
+            ..spec.clone()
+        };
+        assert_eq!(
+            stored_file(&timer, "pic").unwrap(),
+            None,
+            "a kind with no files answers none"
+        );
+        // A kind nobody registered, and a config that no longer parses,
+        // both say what is wrong instead of "no such file".
+        let unknown = SignalSpec { kind: "nothing".into(), ..spec.clone() };
+        assert!(stored_file(&unknown, "pic").unwrap_err().contains("unknown signal kind"));
+        let stale = SignalSpec { config: serde_json::json!({ "form_type": 7 }), ..spec };
+        assert!(stored_file(&stale, "pic").unwrap_err().contains("does not deserialize"));
+    }
+
     #[test]
     fn every_kind_registers() {
         let mut tags: Vec<&'static str> = inventory::iter::<SignalKindEntry>

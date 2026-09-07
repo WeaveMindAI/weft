@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
         "host",
@@ -39,11 +39,7 @@
     {
       "name": "row",
       "type": "JsonDict",
-      "required": false,
       "description": "The inserted row as the database stored it. The node fails rather than emitting nothing: if the table has a rule or trigger that discards the insert, no row was stored and there is nothing to pass on."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

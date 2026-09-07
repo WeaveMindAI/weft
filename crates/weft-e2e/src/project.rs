@@ -278,9 +278,10 @@ impl Project {
     pub async fn finish(mut self) -> Result<()> {
         if self.teardown.registered() {
             // `weft rm <id>` deactivates then unregisters, exactly as a user
-            // would clean up. Run by id so it is unambiguous.
+            // would clean up. Run by id so it is unambiguous; `--yes`
+            // answers the confirmation a script cannot type.
             let id = self.id.to_string();
-            cli_ok(&self.dir, &["rm", &id])
+            cli_ok(&self.dir, &["rm", &id, "--yes"])
                 .await
                 .with_context(|| format!("teardown: weft rm {id}"))?;
         }

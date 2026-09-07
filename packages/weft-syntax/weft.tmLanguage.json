@@ -100,7 +100,7 @@
       }
     },
     "reserved-key": {
-      "match": "\\b(_label|_tags|_is_output|_should_flow)\\b(?=\\s*:)",
+      "match": "\\b(_label|_tags|_should_flow)\\b(?=\\s*:)",
       "captures": {
         "1": {
           "name": "keyword.other.reserved.weft"
@@ -140,7 +140,7 @@
     },
     "reserved-type": {
       "name": "keyword.control.weft",
-      "match": "\\b(Group|Loop|LoopIn|LoopOut|Passthrough)\\b"
+      "match": "\\b(Group|Loop|LoopIn|LoopOut|Passthrough|type)\\b"
     },
     "builtin-type": {
       "name": "support.type.weft",

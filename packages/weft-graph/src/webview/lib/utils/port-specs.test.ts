@@ -32,31 +32,53 @@ describe('entryPortCollisions', () => {
 	};
 	const specMap = buildSpecMap([approve]);
 	const entry = (key: string): PortEntryDef => ({ kind: 'approve_reject', key });
+	const noReserved = { inputs: [], outputs: [] };
 
 	it('finds nothing when the entry is alone', () => {
-		expect(entryPortCollisions(entry('send'), [], specMap)).toEqual([]);
+		expect(entryPortCollisions(entry('send'), [], specMap, noReserved)).toEqual([]);
 	});
 
 	it('finds nothing when an edit keeps its own name', () => {
 		const list = [entry('send'), entry('escalate')];
 		const others = list.filter((_, i) => i !== 0);
-		expect(entryPortCollisions(entry('send'), others, specMap)).toEqual([]);
+		expect(entryPortCollisions(entry('send'), others, specMap, noReserved)).toEqual([]);
 	});
 
 	it('names every port an edit would take from a neighbour', () => {
 		const list = [entry('send'), entry('escalate')];
 		const others = list.filter((_, i) => i !== 0);
-		expect(entryPortCollisions(entry('escalate'), others, specMap)).toEqual([
+		expect(entryPortCollisions(entry('escalate'), others, specMap, noReserved)).toEqual([
 			'escalate_approved',
 			'escalate_rejected',
 		]);
 	});
 
 	it('catches an added entry taking an existing name', () => {
-		expect(entryPortCollisions(entry('send'), [entry('send')], specMap)).toEqual([
+		expect(entryPortCollisions(entry('send'), [entry('send')], specMap, noReserved)).toEqual([
 			'send_approved',
 			'send_rejected',
 		]);
+	});
+
+	it('refuses a name the node already owns on the SAME side only', () => {
+		// The catalog's own ports and the instance's declared header
+		// ports are reserved per side, matching the compiler's
+		// duplicate-port rule: an input and an output may share a name.
+		const reserved = { inputs: ['send_approved'], outputs: ['send_rejected'] };
+		expect(entryPortCollisions(entry('send'), [], specMap, reserved)).toEqual(['send_rejected']);
+	});
+
+	it('_should_flow is reserved on the input side of every node', () => {
+		const flow: PortSpec = {
+			kind: 'flow',
+			keyField: 'key',
+			label: 'Flow',
+			addsInputs: [port('{key}', 'Boolean')],
+			addsOutputs: [],
+		};
+		const map = buildSpecMap([flow]);
+		const bad: PortEntryDef = { kind: 'flow', key: '_should_flow' };
+		expect(entryPortCollisions(bad, [], map, noReserved)).toEqual(['_should_flow']);
 	});
 });
 

@@ -244,6 +244,20 @@ fn pending<'a>(
     out
 }
 
+/// The released migrations a database records that this build carries no
+/// file for: drafts and the origin are the database's own bookkeeping,
+/// everything else must have a file or the history cannot be replayed.
+fn recorded_without_file(declared: &[&Migration], applied: &HashMap<String, String>) -> Vec<String> {
+    let mut out: Vec<String> = applied
+        .keys()
+        .filter(|id| *id != ORIGIN_ID && !id.starts_with("draft_"))
+        .filter(|id| !declared.iter().any(|m| m.id == id.as_str()))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
 /// A migration file that was edited after it ran somewhere, which would leave
 /// two databases on different shapes with no way to tell.
 fn edited_after_running(
@@ -329,6 +343,25 @@ pub async fn apply_groups_with(
              restore the file and write a new migration for the change you wanted.",
             group.name,
             edited.join(", ")
+        );
+        // A recorded release this build carries no file for is history
+        // this build cannot replay: usually a build older than the
+        // release (the daemon that was running while `--release`
+        // recorded it, a branch checked out from before it), said now
+        // rather than left as a row nothing reads until the two
+        // histories disagree. The rows stay: the DDL they made is in
+        // the database, and a build that carries the file is the one
+        // thing that makes both agree again.
+        let stray = recorded_without_file(&mine, &applied);
+        anyhow::ensure!(
+            stray.is_empty(),
+            "schema group '{}': this database records migration(s) {} that this build has \
+             no file for. Either this build is older than the release (rebuild from the \
+             tree that carries the file with ./setup.sh, or check out the branch that does), \
+             or a release was interrupted before writing its file: `./setup.sh --migration \
+             <name> --release` tells the two apart and says what to do.",
+            group.name,
+            stray.join(", ")
         );
         // The frozen origin is history too. It was recorded when this
         // database first built the group; an edited origin.sql would
@@ -462,7 +495,7 @@ pub async fn apply_groups_with(
                 want.iter().filter(|t| owned_by(st.group, t)).cloned().collect();
             let live_g: Vec<Thing> =
                 live.iter().filter(|t| owned_by(st.group, t)).cloned().collect();
-            match diff_things(&want_g, &live_g) {
+            match diff_things(&want_g, "the code", &live_g, "this database") {
                 Some(diff) => mismatched.push((st.group, diff)),
                 None => {
                     sqlx::query(
@@ -1167,63 +1200,68 @@ pub fn file_per_group(
         .collect()
 }
 
-/// Swap a database's drafts for the released migration they collapsed into.
-///
-/// The database already holds the shape, so nothing runs: the draft rows go
-/// and the released id is recorded as though it had. Without this, the next
-/// boot would try to run the released file and fail on a column that is
-/// already there.
-///
-/// Recording without running is only honest if the database really holds
-/// the shape, so this PROVES it first: `expected` is the canonical
-/// schema's reading (from the generator's throwaway build), and a live
-/// database that differs (it never ran the drafts: another machine's, a
-/// re-created cluster's) is refused with the differences, so it runs the
-/// released file at its next boot instead of forever claiming it did.
-///
-/// Draft rows are cleared for EVERY group in `groups`, not only groups
-/// the release wrote a file for: two drafts that cancel out produce no
-/// released file, and their rows would otherwise be junk nothing cleans.
-/// Refuse unless the live database holds exactly the shape `expected`
-/// describes, comparing only what `groups` own (the live database holds
-/// every crate's tables, and another crate's are not this release's
-/// business).
+/// How a database differs from `expected`, over the things these
+/// groups own; `None` when it holds exactly that shape. Read through
+/// `conn` so a caller mid-transaction sees its own uncommitted DDL.
 #[cfg(feature = "db-tests")]
-async fn assert_live_holds_shape(
-    pool: &PgPool,
+async fn shape_diff(
+    conn: &mut sqlx::PgConnection,
     groups: &[&SchemaGroup],
     expected: &[Thing],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let ours = |t: &&Thing| groups.iter().any(|g| owned_by(g, t));
-    let live_all = read_schema(pool).await?;
+    let live_all = read_things(conn, "public").await?;
     let live: Vec<Thing> = live_all.iter().filter(|t| ours(t)).cloned().collect();
     let expected: Vec<Thing> = expected.iter().filter(|t| ours(t)).cloned().collect();
-    if let Some(diff) = diff_things(&expected, &live) {
-        anyhow::bail!(
-            "the live database does not hold the shape this release describes; it never \
-             ran the drafts, so let it run the released file at its next boot instead of \
-             recording it as done:\n{diff}"
-        );
-    }
-    Ok(())
+    Ok(diff_things(&expected, "the release", &live, "your live database"))
 }
 
+/// One released migration as it settles on the live database: its
+/// group, its id, its SQL, and whether the database still has to RUN
+/// it (it never saw the drafts) or only has it RECORDED (it ran them,
+/// so it already holds the result).
 #[cfg(feature = "db-tests")]
-pub async fn adopt_release(
+pub struct Settling {
+    pub group: String,
+    pub id: String,
+    pub sql: String,
+    pub run: bool,
+}
+
+/// Bring the live database to a release, in ONE transaction under the
+/// migration lock: run what it has to run, record every released
+/// migration, clear the draft rows of EVERY group (two drafts that
+/// cancel out produce no released file, and their rows would
+/// otherwise be junk nothing cleans), then verify it now holds exactly
+/// `expected` over what these groups own before committing. A failure
+/// anywhere rolls all of it back, so the database is never recorded as
+/// holding a migration it does not, and a recorded migration only
+/// ever means "this database holds its result".
+#[cfg(feature = "db-tests")]
+pub async fn settle_release(
     pool: &PgPool,
     groups: &[&SchemaGroup],
     expected: &[Thing],
-    released: &[(String, String, String)],
+    released: &[Settling],
 ) -> anyhow::Result<()> {
-    assert_live_holds_shape(pool, groups, expected).await?;
+    use anyhow::Context;
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:schema-migrate', 0))")
+        .execute(&mut *tx)
+        .await?;
     for group in groups {
         sqlx::query("DELETE FROM weft_migration WHERE group_name = $1 AND id LIKE 'draft\\_%'")
             .bind(group.name)
             .execute(&mut *tx)
             .await?;
     }
-    for (group, id, sql) in released {
+    for m in released {
+        if m.run {
+            sqlx::raw_sql(&m.sql)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("running released migration '{}' of '{}'", m.id, m.group))?;
+        }
         // Never overwrite a recorded checksum: that row is what the
         // edited-history guard compares against. A pre-existing row
         // either already matches (a re-run of the same release) or is
@@ -1231,19 +1269,30 @@ pub async fn adopt_release(
         let existing: Option<(String,)> = sqlx::query_as(
             "SELECT checksum FROM weft_migration WHERE group_name = $1 AND id = $2",
         )
-        .bind(group)
-        .bind(id)
+        .bind(&m.group)
+        .bind(&m.id)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some((stored,)) = existing {
             anyhow::ensure!(
-                stored == checksum(sql),
-                "migration '{id}' of '{group}' is already recorded with different \
-                 content; refusing to rewrite recorded history. Pick a different name."
+                stored == checksum(&m.sql),
+                "migration '{}' of '{}' is already recorded with different \
+                 content; refusing to rewrite recorded history. Pick a different name.",
+                m.id,
+                m.group
             );
             continue;
         }
-        record_migration(&mut tx, group, id, sql).await?;
+        record_migration(&mut tx, &m.group, &m.id, &m.sql).await?;
+    }
+    for group in groups {
+        if let Some(diff) = shape_diff(&mut tx, &[group], expected).await? {
+            anyhow::bail!(
+                "after the release ran, group '{}' on the live database still does not hold \
+                 the shape the code declares, so nothing was recorded:\n{diff}",
+                group.name
+            );
+        }
     }
     tx.commit().await?;
     Ok(())
@@ -1267,8 +1316,10 @@ pub fn draft_files(groups: &[&SchemaGroup]) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// What the second reading has that the first does not, and the reverse.
-/// `None` when the two databases hold the same schema.
+/// What each reading has that the other does not, each side named by
+/// its caller (a fresh install against an upgraded one, the release
+/// against the live database). `None` when the two hold the same
+/// schema.
 ///
 /// One reading is [`read_schema`]'s, so the agreement tests, the
 /// migration planner, and the release verification all look at the
@@ -1276,7 +1327,7 @@ pub fn draft_files(groups: &[&SchemaGroup]) -> Vec<std::path::PathBuf> {
 /// whole-dump, because the useful failure to read is the one column
 /// that differs, and with multiplicity, so a thing present twice on one
 /// side and once on the other is a difference.
-pub fn diff_things(fresh: &[Thing], upgraded: &[Thing]) -> Option<String> {
+pub fn diff_things(a: &[Thing], only_a: &str, b: &[Thing], only_b: &str) -> Option<String> {
     let count = |things: &[Thing]| {
         let mut m: std::collections::BTreeMap<String, usize> = Default::default();
         for t in things {
@@ -1284,17 +1335,17 @@ pub fn diff_things(fresh: &[Thing], upgraded: &[Thing]) -> Option<String> {
         }
         m
     };
-    let a = count(fresh);
-    let b = count(upgraded);
+    let a = count(a);
+    let b = count(b);
     let mut out = String::new();
     for (line, n) in &a {
         if b.get(line).copied().unwrap_or(0) < *n {
-            out.push_str(&format!("  only a fresh install has: {line}\n"));
+            out.push_str(&format!("  only {only_a} has: {line}\n"));
         }
     }
     for (line, n) in &b {
         if a.get(line).copied().unwrap_or(0) < *n {
-            out.push_str(&format!("  only an upgraded install has: {line}\n"));
+            out.push_str(&format!("  only {only_b} has: {line}\n"));
         }
     }
     if out.is_empty() {
@@ -1339,7 +1390,7 @@ pub async fn assert_schema_agrees(pool: &PgPool, groups: &[&SchemaGroup]) {
     replay_from_origin(pool, groups, false).await.expect("replay the history");
     let upgraded = read_schema(pool).await.expect("read the upgraded database");
 
-    if let Some(diff) = diff_things(&fresh, &upgraded) {
+    if let Some(diff) = diff_things(&fresh, "a fresh install", &upgraded, "an upgraded install") {
         panic!(
             "the canonical schema and the migration history disagree:\n{diff}\n\
              Write the migration that makes this change to an existing database \
@@ -1439,48 +1490,135 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // On a release, prove the live database holds the shape BEFORE any
-    // file is written or draft deleted, so a refusal leaves everything
-    // as it was.
-    let live = if release {
+    let written = file_per_group(groups, &plan, &name, !release)?;
+    let released: Vec<(String, String, String)> = written
+        .iter()
+        .map(|(group, path, body)| {
+            let id = path.file_stem().expect("a named file").to_string_lossy().to_string();
+            (group.clone(), id, body.clone())
+        })
+        .collect();
+
+    // On a release, the live database is settled BEFORE any file is
+    // written or draft deleted, so a refusal or a failed run leaves
+    // the tree as it was: a released file on disk with the database
+    // never carried forward would make the re-run answer "nothing
+    // changed" and leave the drafts to break every later draft pass.
+    // Each changed GROUP is decided on its own, since one can have run
+    // its drafts while another never had any: a group that already
+    // holds the new shape has the release RECORDED on it, one sitting
+    // exactly where the last release left it has the file RUN on it
+    // now (one command, instead of a draft pass first), and one that
+    // is somewhere else (half its drafts, a hand edit) nothing here
+    // can make honest, so the whole release is refused naming it. A
+    // group this release writes no file for has to hold the shape the
+    // code declares already (a draft whose change was then reverted
+    // leaves a column the code no longer declares, and no file to
+    // carry that database anywhere). The running and recording then
+    // land in one transaction.
+    if release {
         let live_url = std::env::var("WEFT_LIVE_DATABASE_URL").context(
             "releasing needs WEFT_LIVE_DATABASE_URL, the database you have been \
              working against, so its drafts can be swapped for the released file",
         )?;
-        Some(PgPool::connect(&live_url).await?)
-    } else {
-        None
-    };
-
-    if let Some(live) = &live {
-        // Prove it BEFORE the file is written, so a refusal leaves the
-        // working tree untouched (adopt_release checks again on its
-        // own, for any caller that skips this path).
-        assert_live_holds_shape(live, groups, &after).await?;
+        let live = PgPool::connect(&live_url).await?;
+        let mut conn = live.acquire().await?;
+        // A release records itself on the database and THEN writes
+        // its file; a release cut between the two (Ctrl-C) leaves a
+        // recorded id no tree carries, which the boot refuses and
+        // only this command can tell apart from a build that is
+        // merely older than its file. It is named here with the one
+        // remedy that fits: the row goes, and this release records
+        // its result under the new id.
+        for group in groups {
+            let applied: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+                "SELECT id, checksum FROM weft_migration WHERE group_name = $1",
+            )
+            .bind(group.name)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+            let stray = recorded_without_file(&for_group(MIGRATIONS, group.name), &applied);
+            anyhow::ensure!(
+                stray.is_empty(),
+                "group '{}': your database records migration(s) {} that no file carries. If \
+                 a release was interrupted before writing its file, that is its row; remove \
+                 it (DELETE FROM weft_migration WHERE group_name = '{}' AND id IN ({})) and \
+                 release again. If the file exists on another branch, check that branch out \
+                 instead.",
+                group.name,
+                stray.join(", "),
+                group.name,
+                stray.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")
+            );
+        }
+        let mut settling: Vec<Settling> = Vec::new();
+        for group in groups {
+            if released.iter().any(|(g, ..)| g == group.name) {
+                continue;
+            }
+            if let Some(diff) = shape_diff(&mut conn, &[group], &after).await? {
+                anyhow::bail!(
+                    "group '{}' changes nothing in this release, yet the live database does \
+                     not hold the shape the code declares for it (a draft whose change was \
+                     reverted, a hand edit); nothing was written. Put the group back to what \
+                     the code declares (drop what the draft added; the draft's row and file \
+                     are cleared by the release that then succeeds), or write the migration \
+                     for what it holds:\n{diff}",
+                    group.name
+                );
+            }
+        }
+        for (group_name, id, sql) in &released {
+            let group = *groups
+                .iter()
+                .find(|g| g.name == group_name)
+                .expect("a released file belongs to one of the groups it was planned from");
+            let run = if shape_diff(&mut conn, &[group], &after).await?.is_none() {
+                false
+            } else if shape_diff(&mut conn, &[group], &before).await?.is_none() {
+                true
+            } else {
+                let diff = shape_diff(&mut conn, &[group], &after)
+                    .await?
+                    .expect("a database that differs from both shapes differs from this one");
+                anyhow::bail!(
+                    "for group '{}', the live database holds neither the shape this release \
+                     describes nor the one the last release left, so it cannot be brought \
+                     along; nothing was written. Either put the group back to the shape the \
+                     last release left (drop what the drafts added) and release again, or \
+                     write the migration for what it holds:\n{diff}",
+                    group.name
+                );
+            };
+            settling.push(Settling { group: group_name.clone(), id: id.clone(), sql: sql.clone(), run });
+        }
+        drop(conn);
+        settle_release(&live, groups, &after, &settling).await?;
+        for m in &settling {
+            println!(
+                "your database {} the released migration '{}' of '{}'",
+                if m.run { "ran and records" } else { "records, instead of the drafts," },
+                m.id,
+                m.group
+            );
+        }
     }
 
-    let written = file_per_group(groups, &plan, &name, !release)?;
-    let mut released = Vec::new();
-    for (group, path, body) in &written {
+    for (_, path, body) in &written {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(path, body)?;
         println!("wrote {}", path.display());
-        let id = path.file_stem().expect("a named file").to_string_lossy().to_string();
-        released.push((group.clone(), id, body.clone()));
     }
-
-    if let Some(live) = live {
-        // The live database already holds the shape the released file
-        // describes (verified inside), so it is recorded rather than
-        // run, and the drafts it collapsed are cleared. Draft FILES go
-        // only after the adopt succeeds.
-        adopt_release(&live, groups, &after, &released).await?;
+    if release {
+        // Draft FILES go only after the database is settled and the
+        // released file is on disk.
         for path in draft_files(groups) {
             std::fs::remove_file(&path)?;
         }
-        println!("your database now records the released migration instead of the drafts");
     }
     Ok(())
 }
@@ -1491,7 +1629,7 @@ mod tests {
     // a database still owes.
     use std::collections::HashMap;
 
-    use super::{checksum, edited_after_running, fingerprint, pending, Migration};
+    use super::{checksum, edited_after_running, fingerprint, pending, recorded_without_file, Migration, ORIGIN_ID};
 
     static A: Migration = Migration { group: "g", id: "20260101_a", draft: false, sql: "SELECT 1" };
     static B: Migration = Migration { group: "g", id: "20260202_b", draft: false, sql: "SELECT 2" };
@@ -1575,5 +1713,20 @@ mod tests {
         static A_EDITED: Migration =
             Migration { group: "g", id: "20260101_a", draft: false, sql: "SELECT 999" };
         assert!(edited_after_running(&[&A_EDITED], &HashMap::new()).is_empty());
+    }
+
+    /// A recorded release with no file is named; the origin row and
+    /// drafts are the database's own and never are.
+    #[test]
+    fn a_recorded_release_with_no_file_is_named() {
+        let applied: HashMap<String, String> = [
+            (A.id.to_string(), checksum(A.sql)),
+            ("20990101T000000_lost".to_string(), "x".to_string()),
+            ("draft_20990101T000000_wip".to_string(), "y".to_string()),
+            (ORIGIN_ID.to_string(), "z".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(recorded_without_file(&[&A], &applied), vec!["20990101T000000_lost".to_string()]);
     }
 }

@@ -22,8 +22,10 @@ import { DispatcherClient } from './dispatcher';
 import { GraphViewController } from './graphView';
 import { attachDiagnostics } from './diagnostics';
 import { ParseServer } from './parseServer';
+import { runPreflight, PREFLIGHT_VERBS, type PreflightBlock } from './preflight';
 import { registerStreamingEditApi } from './streamingEdits';
-import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
+import { canonicalPath, weftPositionToVsCode } from './locations';
+import { afterTabModelSettles, isReviewDoc, openTextTabPaths, textTabsForPath } from './tabs';
 import { ActionBarStore } from './actionBarState';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
@@ -220,7 +222,6 @@ export function activate(context: vscode.ExtensionContext) {
   graphView.setRunHandler((targets) => runPinned(targets));
   graphView.setFollowTogglePinHandler(() => autoFollow.togglePin());
   graphView.setFollowCatchUpHandler(() => autoFollow.catchUpToLatest());
-  graphView.setLifecycleStartHandler(() => autoFollow.pinAndFollow(undefined));
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
   graphView.setCliStatusHandler(() => refreshActionBarFromStatus());
   graphView.setStopActionHandler(() => stopAction());
@@ -258,8 +259,9 @@ export function activate(context: vscode.ExtensionContext) {
   /// User clicked Run. Run is just a CLI verb like the others now;
   /// runPinned exists separately only so the keybinding (Ctrl+Enter)
   /// has a stable target name.
-  /// `targets` narrows the run to those output nodes; empty runs every
-  /// output node, which is what the plain Run button does.
+  /// `targets` narrows the run to those nodes and what they need; empty
+  /// kicks every root of the graph, which is what the plain Run button
+  /// does.
   async function runPinned(targets: string[] = []): Promise<void> {
     await runCliVerb('run', targets.flatMap((t) => ['--target', t]));
   }
@@ -284,36 +286,123 @@ export function activate(context: vscode.ExtensionContext) {
       void vscode.window.showInformationMessage('Pin a Weft project first.');
       return;
     }
-    try {
-      await graphView.waitForPendingSave();
-    } catch (err) {
-      // The user's last edit never reached disk: refuse the verb loudly
-      // instead of silently building the pre-edit source.
-      void vscode.window.showErrorMessage(`Weft: ${err instanceof Error ? err.message : String(err)}`);
+    // Bind the WHOLE verb to the project pinned at click time. Every
+    // await below (pending save, pre-flight, the reactivate modal) is a
+    // window where the user can switch pins, and this verb's gate
+    // results, errors, and CLI events all belong to the project they
+    // clicked on, never the new pin.
+    const project = pinnedProject;
+    const projectId = project.id;
+    // One verb at a time per project, held from the click until the CLI
+    // child exits: the awaits before the child exists would otherwise
+    // let a second click race the first (two children fighting over one
+    // tracking slot).
+    if (verbsInFlight.has(projectId)) {
+      void vscode.window.showInformationMessage('Weft: an action is already running for this project.');
       return;
     }
-    // Reactivate-prompt for activate when project is hibernate/park.
-    // The CLI's --json mode skips its own terminal prompt, so the
-    // extension is responsible for showing the modal when there's
-    // preserved state to choose about.
-    if (verb === 'activate') {
-      const choice = await maybePromptReactivateChoice(pinnedProject);
-      if (choice === undefined) {
-        // User cancelled the prompt; abort the activate.
+    verbsInFlight.add(projectId);
+    try {
+      await runCliVerbForProject(project, verb, args);
+    } finally {
+      verbsInFlight.delete(projectId);
+    }
+  }
+
+  /// The verb, with its project already bound at click time (it will
+  /// not be re-read across the awaits below).
+  async function runCliVerbForProject(project: WeftProject, verb: string, args: string[]): Promise<void> {
+    const projectId = project.id;
+    const projectRoot = project.rootPath;
+    const verbTag = verbTagFor(verb, args);
+    const gated = PREFLIGHT_VERBS.has(verb);
+    // The click registered: show the pre-CLI window (save flush + the
+    // pre-flight check) on the bar instead of an idle bar that jumps,
+    // with a working Stop (the abort handle) for its whole duration.
+    // The store keeps each project's slot independent: if the user
+    // switches pins mid-verb, this project's slot still receives all
+    // events and the new pin's slot is unaffected.
+    const abort = new AbortController();
+    if (gated) {
+      preflightAborts.set(projectId, abort);
+      actionBar.cliStart(projectId, verbTag, 'preflight');
+    }
+    try {
+      // True when Stop was pressed during the pre-CLI window, AND the
+      // bar has then been cleared to killed: the caller's only job on
+      // true is to return. Named for the side effect on purpose; a
+      // pure-sounding name here once hid where the bar gets cleared.
+      const stopHandled = (): boolean => {
+        if (!abort.signal.aborted) return false;
+        actionBar.cliKilled(projectId);
+        return true;
+      };
+      try {
+        await graphView.waitForPendingSave();
+      } catch (err) {
+        // The user's last edit never reached disk: refuse the verb loudly
+        // instead of silently building the pre-edit source.
+        actionBar.cliCrashed(projectId, verbTag, err instanceof Error ? err.message : String(err));
         return;
       }
-      if (choice !== null) {
-        args = [...args, '--reactivate-choice', choice];
+      if (stopHandled()) return;
+      // Pre-flight gate (PREFLIGHT_VERBS, the verbs that ship the project
+      // somewhere): a runtime-mode validation of the saved entry file
+      // catches "not ready to run" findings (unpicked connections and the
+      // like) in seconds, before any build. Findings land on the action
+      // bar's error banner and the verb is never sent. A gate that cannot
+      // run refuses the verb too: running unchecked would hide the very
+      // failures the gate exists to catch.
+      if (gated) {
+        let block: PreflightBlock | null;
+        try {
+          // Stop during the check aborts the request itself (the promise
+          // rejects at the click, not at the server's eventual reply),
+          // landing in this catch where stopHandled() clears the bar.
+          block = await runPreflight(parseServer, project.entryPath, abort.signal);
+        } catch (err) {
+          if (stopHandled()) return;
+          const msg = err instanceof Error ? err.message : String(err);
+          actionBar.cliCrashed(projectId, verbTag, `pre-flight check failed: ${msg}`);
+          return;
+        }
+        if (stopHandled()) return;
+        if (block) {
+          actionBar.cliCrashed(projectId, verbTag, block.message, block.details);
+          return;
+        }
       }
+      // Reactivate-prompt for activate when project is hibernate/park.
+      // The CLI's --json mode skips its own terminal prompt, so the
+      // extension is responsible for showing the modal when there's
+      // preserved state to choose about.
+      if (verb === 'activate') {
+        const choice = await maybePromptReactivateChoice(project);
+        if (choice === undefined || stopHandled()) {
+          // User cancelled (the prompt or the bar); drop the in-flight
+          // bar state.
+          actionBar.cliKilled(projectId);
+          return;
+        }
+        if (choice !== null) {
+          args = [...args, '--reactivate-choice', choice];
+        }
+      }
+    } finally {
+      // The pre-CLI window is over (spawned, refused, or stopped);
+      // Stop now targets the CLI child, not this handle.
+      preflightAborts.delete(projectId);
     }
-    const verbTag = verbTagFor(verb, args);
-    // Bind every store mutation to the project that owns the
-    // verb. The store keeps each project's slot independent: if
-    // the user switches pins mid-verb, the original project's
-    // slot still receives all events and the new project's slot
-    // is unaffected.
-    const projectId = pinnedProject.id;
-    const projectRoot = pinnedProject.rootPath;
+    // Arm follow-latest for the verbs that start a lifecycle, HERE, past
+    // every refusal above: an aborted click must not throw away the
+    // execution view the user had pinned.
+    if (
+      verb === 'activate'
+      || verb === 'resync'
+      || (verb === 'infra' && (args[0] === 'start' || args[0] === 'upgrade'))
+    ) {
+      autoFollow.pinAndFollow(undefined);
+    }
     actionBar.cliStart(projectId, verbTag);
     try {
       await runWeftCliJson(projectId, [verb, ...args], projectRoot, (ev) => {
@@ -473,6 +562,15 @@ export function activate(context: vscode.ExtensionContext) {
       // pending state needed.
       killCliFor(projectId);
       actedOn = true;
+    } else {
+      // No CLI child yet: the verb may still be in its pre-CLI window
+      // (the "Checking..." phase); aborting it exits at the next await.
+      const preflight = preflightAborts.get(projectId);
+      if (preflight) {
+        channel.appendLine('> stop pressed during pre-flight; aborting the verb');
+        preflight.abort();
+        actedOn = true;
+      }
     }
     const liveColor = actionBar.watchedLiveColor(projectId);
     if (liveColor) {
@@ -501,6 +599,16 @@ export function activate(context: vscode.ExtensionContext) {
   /// Per-project CLI tracking. Keyed by project_id so concurrent
   /// verbs on different projects don't race each other's
   /// userKilled flag or process handle.
+  /// Projects with a verb anywhere between the click and the CLI
+  /// child's exit; see runCliVerb's guard.
+  const verbsInFlight = new Set<string>();
+
+  /// Per-project abort handle for the pre-CLI window (save flush + the
+  /// pre-flight check): the bar shows "Checking..." with a Stop button
+  /// there, and a button that silently does nothing is worse than no
+  /// button. Present only while that window is open.
+  const preflightAborts = new Map<string, AbortController>();
+
   const cliTracking = new Map<
     string,
     { child: ReturnType<typeof spawn>; userKilled: boolean }
@@ -996,55 +1104,118 @@ export function activate(context: vscode.ExtensionContext) {
   // open the graph in the same column, and close the underlying
   // text tab. The user can summon the text via the graph's
   // "Open source" button when they want it.
-  // The one `.weft` text view the user opened ON PURPOSE (the Source button).
-  // Every other active `.weft` text editor is a click that should drive the
-  // graph instead of showing code. Identified by URI so it's robust to which
-  // column VS Code happens to place tabs in.
-  let sourceViewPath: string | undefined;
-  graphView.setOpenSourceHandler(async () => {
-    // Open the source of the file the graph is CURRENTLY showing, which tracks
-    // include navigation (greeter.weft when navigated in), not the project
-    // entry. Falls back to the pinned entry if nothing is shown yet.
-    const target = graphView.currentFilePath() ?? pinnedProject?.entryPath;
-    if (!target) return;
-    sourceViewPath = target;
-    // Already open somewhere? Reveal the existing tab instead of
-    // creating a new one. Otherwise repeated clicks pile up tabs.
-    const existing = textTabsForPath(target)[0];
-    if (existing) {
-      const column = existing.group.viewColumn;
-      const doc = await vscode.workspace.openTextDocument(target);
-      await vscode.window.showTextDocument(doc, {
-        preview: false,
-        viewColumn: column,
-        preserveFocus: false,
-      });
-      return;
+  // The `.weft` text views the user opened ON PURPOSE (the Source button,
+  // a diagnostic's file:line click). Every other active `.weft` text
+  // editor is a click that should drive the graph instead of showing
+  // code. A SET because the diagnostic path can open a different file
+  // than the Source button did, and opening the second must not silently
+  // demote the first back to a graph-driving click. Identified by URI so
+  // it's robust to which column VS Code happens to place tabs in.
+  const sourceViewPaths = new Set<string>();
+  graphView.setOpenSourceHandler(async (location) => {
+    // With a location (a diagnostic click in the error modal), open THAT
+    // file at the position. Otherwise open the source of the file the graph
+    // is CURRENTLY showing, which tracks include navigation (greeter.weft
+    // when navigated in), falling back to the pinned entry.
+    const rawTarget = location?.file ?? graphView.currentFilePath() ?? pinnedProject?.entryPath;
+    if (!rawTarget) return;
+    // Canonicalized ONCE, used everywhere below (the registration, the
+    // tab lookup, the open): the compiler emits resolved paths while the
+    // workspace may be reached through a symlink, and mixing spellings
+    // would open a second tab of an already-open file or register a
+    // path the active-editor listener then fails to recognize.
+    const target = canonicalPath(rawTarget);
+    // The webview names the file; the host only ever opens files of the
+    // pinned project. Anything else is a message this handler was never
+    // meant to serve, refused loudly.
+    if (location) {
+      if (!pinnedProject) {
+        void vscode.window.showErrorMessage('Weft: pin a project before opening a diagnostic location.');
+        return;
+      }
+      const rel = nodePath.relative(canonicalPath(pinnedProject.rootPath), target);
+      if (rel.startsWith('..') || nodePath.isAbsolute(rel)) {
+        void vscode.window.showErrorMessage(`Weft: ${rawTarget} is outside the pinned project.`);
+        return;
+      }
     }
-    // Source opens in `Beside` (column 2). The graph webview
-    // stays in column 1.
-    //
-    // We tried hard to get source-on-the-LEFT, graph-on-the-
-    // right via `panel.reveal(Two)` then `showTextDocument(One)`,
-    // but moving a webview between columns destroys its iframe
-    // (microsoft/vscode#141001) and the canvas blanks out. There
-    // is also no built-in command to swap editor GROUPS
-    // (microsoft/vscode#85123, closed as backlog). So we settle
-    // for the inverse layout the platform supports: graph on
-    // the left, source on the right.
-    const doc = await vscode.workspace.openTextDocument(target);
-    await vscode.window.showTextDocument(doc, {
-      preview: false,
-      viewColumn: vscode.ViewColumn.Beside,
-    });
+    // Registered BEFORE the open: showTextDocument fires the active-
+    // editor listener below before this handler resumes, and an
+    // unregistered path there would drive the graph instead of showing
+    // the code. A failed open unregisters in the catch, so the path
+    // cannot strand in the set with no tab to ever close it; but only
+    // when THIS call registered it, so a failed re-click (the file
+    // deleted under a still-open tab) cannot demote that live tab back
+    // to a graph-driving click.
+    const wasRegistered = sourceViewPaths.has(target);
+    sourceViewPaths.add(target);
+    try {
+      const position = location
+        ? weftPositionToVsCode(location.line, location.column)
+        : undefined;
+      const selection = position ? new vscode.Range(position, position) : undefined;
+      // Already open somewhere? Reveal the existing tab instead of
+      // creating a new one. Otherwise repeated clicks pile up tabs.
+      const existing = textTabsForPath(target)[0];
+      if (existing) {
+        const column = existing.group.viewColumn;
+        // Open the URI the tab actually holds (possibly the symlinked
+        // workspace spelling), never the canonical one: a different
+        // URI would open a SECOND tab of the same file beside it, the
+        // exact pile-up this branch exists to prevent.
+        const doc = await vscode.workspace.openTextDocument(existing.uri);
+        await vscode.window.showTextDocument(doc, {
+          preview: false,
+          viewColumn: column,
+          preserveFocus: false,
+          ...(selection ? { selection } : {}),
+        });
+      } else {
+        // Source opens in `Beside` (column 2). The graph webview
+        // stays in column 1.
+        //
+        // We tried hard to get source-on-the-LEFT, graph-on-the-
+        // right via `panel.reveal(Two)` then `showTextDocument(One)`,
+        // but moving a webview between columns destroys its iframe
+        // (microsoft/vscode#141001) and the canvas blanks out. There
+        // is also no built-in command to swap editor GROUPS
+        // (microsoft/vscode#85123, closed as backlog). So we settle
+        // for the inverse layout the platform supports: graph on
+        // the left, source on the right.
+        const doc = await vscode.workspace.openTextDocument(target);
+        await vscode.window.showTextDocument(doc, {
+          preview: false,
+          viewColumn: vscode.ViewColumn.Beside,
+          ...(selection ? { selection } : {}),
+        });
+      }
+    } catch (err) {
+      if (!wasRegistered) sourceViewPaths.delete(target);
+      // A diagnostic can outlive its file (deleted, renamed): the click
+      // must say so, not silently do nothing.
+      void vscode.window.showErrorMessage(`Weft: cannot open ${target}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   });
 
-  // When the Source-view tab is closed, forget it: clicking that file again
+  // When a Source-view tab is closed, forget it: clicking that file again
   // should then drive the graph (it's no longer the deliberate code view).
+  // Prune from the CLOSED tabs only: a full re-scan on every tab event
+  // would race the open path (the path is registered before the tab
+  // exists, across two awaits) and silently unregister it.
   context.subscriptions.push(
-    vscode.window.tabGroups.onDidChangeTabs(() => {
-      if (sourceViewPath === undefined) return;
-      if (textTabsForPath(sourceViewPath).length === 0) sourceViewPath = undefined;
+    vscode.window.tabGroups.onDidChangeTabs((e) => {
+      // The set holds canonical paths; a tab may hold the symlinked
+      // workspace spelling. The still-open scan runs ONCE per event
+      // (not per closed tab): closing a group of N tabs would
+      // otherwise pay N full tab-group scans of realpath calls.
+      let stillOpen: Set<string> | undefined;
+      for (const tab of e.closed) {
+        if (!(tab.input instanceof vscode.TabInputText)) continue;
+        const p = canonicalPath(tab.input.uri.fsPath);
+        if (!sourceViewPaths.has(p)) continue;
+        stillOpen ??= openTextTabPaths();
+        if (!stillOpen.has(p)) sourceViewPaths.delete(p);
+      }
     }),
   );
 
@@ -1056,7 +1227,9 @@ export function activate(context: vscode.ExtensionContext) {
       // (entry or nested) drives the graph view. The one exception is the
       // deliberate "Source" view (the Source button), tracked by URI: that
       // editor is intentional code viewing, leave it entirely alone.
-      if (ed.document.uri.fsPath === sourceViewPath) return;
+      // Resolved once; the project lookup below reuses it.
+      const docPath = canonicalPath(ed.document.uri.fsPath);
+      if (sourceViewPaths.has(docPath)) return;
 
       // Reading a diff is reviewing, not editing: popping the graph over it
       // would take away the comparison the reader opened. Wait a tick so
@@ -1074,7 +1247,9 @@ export function activate(context: vscode.ExtensionContext) {
 
       const found = projectsProvider
         .projects()
-        .find((p) => p.entryPath === ed.document.uri.fsPath);
+        // Canonical on both sides: the editor may hold the symlinked
+        // workspace spelling while the project registry holds another.
+        .find((p) => canonicalPath(p.entryPath) === docPath);
 
       // Known project entry whose pin actually CHANGES: pinProject is the
       // ONE pinning routine (event stream repoint, follow reset, action-bar

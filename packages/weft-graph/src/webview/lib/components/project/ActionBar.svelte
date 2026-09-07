@@ -6,7 +6,8 @@
 		ActionVerb,
 		BackendSnapshot,
 		ActionBarOverlay,
-		CliPhase,
+		BarPhase,
+		SourceLocation,
 	} from '../../../../protocol';
 	import ErrorDetailsModal from './ErrorDetailsModal.svelte';
 	import { runLabel } from '../../run-targets';
@@ -31,6 +32,7 @@
 		onUpgradeInfra,
 		onStop,
 		onDismissError,
+		onOpenLocation,
 		onToggleInfraSubgraph,
 		onToggleTriggerSubgraph,
 		showInfraSubgraph = false,
@@ -91,6 +93,9 @@
 		// the host clears the slot's error so the banner stops
 		// rendering until the next failure.
 		onDismissError?: () => void;
+		// A diagnostic's file:line:column in the details modal. Host
+		// opens that file in the source editor at the position.
+		onOpenLocation: (location: SourceLocation) => void;
 		onToggleInfraSubgraph?: () => void;
 		onToggleTriggerSubgraph?: () => void;
 		showInfraSubgraph?: boolean;
@@ -176,6 +181,7 @@
 	// ─── Overlay accessors ───────────────────────────────────────
 	const cliVerb = $derived(overlay.kind === 'cli_running' ? overlay.verb : undefined);
 	const cliPhase = $derived(overlay.kind === 'cli_running' ? overlay.phase : undefined);
+	const cliDetail = $derived(overlay.kind === 'cli_running' ? overlay.detail : undefined);
 	// A `pending` overlay (an HTTP verb in flight) carries its VERB, so it belongs
 	// to the SLOT that owns that verb, exactly like `cli_running`. Routing it to
 	// the right slot is what keeps the button transforming IN PLACE (a pending
@@ -196,13 +202,15 @@
 	/// `verb` is always set whenever `phase` is set (both come from
 	/// the same `cli_running` overlay).
 	function cliPhaseLabel(
-		phase: CliPhase | undefined,
+		phase: BarPhase | undefined,
 		verb: ActionVerb | undefined,
+		detail?: Record<string, unknown>,
 	): string {
 		if (phase === undefined) return '';
 		// Phase-specific overrides for stages that have their own
 		// dedicated user-facing wording.
 		switch (phase) {
+			case 'preflight': return 'Checking...';
 			case 'build_start': return 'Building...';
 			case 'build_skip': return 'Cached, loading...';
 			case 'build_done': return 'Loading...';
@@ -212,6 +220,15 @@
 			case 'infra_provision_done': return 'Provisioning infra...';
 			case 'trigger_register_start':
 			case 'trigger_register_done': return 'Registering triggers...';
+			case 'infra_wait': {
+				// The heartbeat of an unbounded wait (fires for start,
+				// stop, and terminate alike): show which verb waits and
+				// for how long, so a stuck state stays legible.
+				const which = typeof detail?.verb === 'string' ? ` ${detail.verb}` : '';
+				const elapsed =
+					typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
+				return `Waiting for infra${which}${elapsed}...`;
+			}
 		}
 		// Default: derive from the verb. Covers the dispatcher-call
 		// phases and any future phase that doesn't have its own
@@ -256,7 +273,7 @@
 
 	type InfraSlotState =
 		| { kind: 'absent' }
-		| { kind: 'cli_working'; phase: CliPhase }
+		| { kind: 'cli_working'; phase: BarPhase }
 		// An HTTP infra verb POST in flight, before /status catches up.
 		| { kind: 'pending'; message: string }
 		| {
@@ -271,7 +288,7 @@
 
 	type MiddleSlotState =
 		| { kind: 'absent' }
-		| { kind: 'cli_working'; phase: CliPhase }
+		| { kind: 'cli_working'; phase: BarPhase }
 		| { kind: 'building'; cancelling: boolean }
 		| { kind: 'pending'; message: string }
 		| { kind: 'stop_execution' }
@@ -279,7 +296,7 @@
 
 	type TriggerSlotState =
 		| { kind: 'absent' }
-		| { kind: 'cli_working'; phase: CliPhase }
+		| { kind: 'cli_working'; phase: BarPhase }
 		| { kind: 'building'; cancelling: boolean }
 		| { kind: 'active'; canDeactivate: boolean; showDrift: boolean }
 		| { kind: 'activating'; canCancel: boolean }
@@ -518,6 +535,7 @@
 			error={barState.error}
 			bind:open={errorModalOpen}
 			onDismissError={() => onDismissError?.()}
+			{onOpenLocation}
 		/>
 	{/if}
 
@@ -616,7 +634,7 @@
 	{#if slot.kind === 'absent'}
 		<!-- never rendered: outer guard skips the section -->
 	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb), onStop)}
+		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb, cliDetail), onStop)}
 	{:else if slot.kind === 'pending'}
 		{@render workingButton(slot.message)}
 	{:else}
@@ -685,7 +703,7 @@
 	{#if slot.kind === 'absent'}
 		<!-- never rendered: outer guard skips the section -->
 	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb), onStop)}
+		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb, cliDetail), onStop)}
 	{:else if slot.kind === 'building'}
 		{@render workingButton(
 			slot.cancelling ? 'Cancelling build...' : 'Building...',
@@ -717,7 +735,7 @@
 	{#if slot.kind === 'absent'}
 		<!-- never rendered: outer guard skips the section -->
 	{:else if slot.kind === 'cli_working'}
-		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb), onStop)}
+		{@render workingButton(cliPhaseLabel(slot.phase, cliVerb, cliDetail), onStop)}
 	{:else if slot.kind === 'building'}
 		{@render workingButton(
 			slot.cancelling ? 'Cancelling build...' : 'Building...',

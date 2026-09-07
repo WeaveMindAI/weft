@@ -16,9 +16,14 @@ use weft_core::access::spec::{
     lookup_path, Acquisition, CredentialField, Door, GrantCoexistence, OAuthGrant, TestCall,
     VerificationRung,
 };
+// The connect wire shapes live in the core (weft-core `access::wire`),
+// one definition for every client; this crate only executes them.
+use weft_core::access::wire::{
+    BeginOAuth, CompletedConnect, ConnectDirect, GrantSummary, PublishedConnection, StartedOAuth,
+};
 use weft_core::{AccessSpec, AppRegistration, CredentialOwner};
 
-use crate::{door_of, door_str, owner_of, owner_str, scopes_of, AccessError, GrantSummary};
+use crate::{door_of, door_str, owner_of, owner_str, scopes_of, AccessError};
 
 /// How long a pending browser consent may take before its state nonce
 /// goes stale. Generous (the user may read the consent page); short
@@ -125,84 +130,6 @@ pub async fn delete_grant(pool: &PgPool, tenant: &str, id: uuid::Uuid) -> anyhow
 }
 
 // ---------- Direct connects (no browser consent) ----------
-
-/// A connect that completes in one request: `static` (pasted fields),
-/// `mint_jwt` (pasted key, minted + exchanged once to validate),
-/// `oauth2`/`client_credentials` (token requested server-to-server), or
-/// the SHARED door of a key service (nothing pasted; the runtime's
-/// credential source answers per call). A browser-consent acquisition
-/// is refused here; that is [`begin_oauth`] / [`complete_oauth`].
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConnectDirect {
-    pub spec: AccessSpec,
-    /// Which door the user walked through. The SHARED door of a
-    /// non-consent service stores a runtime-owned row; everything else
-    /// is the user's own credential.
-    #[serde(default = "own_door")]
-    pub door: Door,
-    /// The pasted field values, keyed by the spec's declared field
-    /// names. Sent editor -> store directly; never node config.
-    /// Empty for a shared-door connect.
-    #[serde(default)]
-    pub values: BTreeMap<String, String>,
-    /// The name the user gave this connection (the list's middle
-    /// column, standing in where no app label exists). `None` shows
-    /// the service's own label.
-    #[serde(default)]
-    pub label: Option<String>,
-    /// The permissions the user CLAIMS the pasted credential holds
-    /// (ticked on the picker, for key services with a permission
-    /// concept). Recorded claimed unless verification upgrades them.
-    /// On a SHARED-door connect the broker overwrites this with the
-    /// chosen app's fixed `covers`; nothing the client sent survives.
-    #[serde(default)]
-    pub permissions: Vec<String>,
-    /// The app to use, for the acquisitions that need one
-    /// (`client_credentials`). Resolved at the broker before this is
-    /// reached (the user's pasted app for the own door, the registered
-    /// app for the shared door); `None` for a service using no app.
-    #[serde(default)]
-    pub registration: Option<AppRegistration>,
-    /// The user pasted a ready credential through the service's
-    /// `own_page.paste` section instead of going through an app: the
-    /// connect runs on [`AccessSpec::paste_variant`] (a `Static`
-    /// acquisition over the paste fields).
-    #[serde(default)]
-    pub paste: bool,
-    /// The connecting project (grants are per-project by default; an
-    /// exclusive-class OAuth grant ignores it, but direct connects are
-    /// per-paste anyway).
-    pub project_id: Option<String>,
-}
-
-fn own_door() -> Door {
-    Door::Own
-}
-
-/// The "Create it for me" app mint as it travels the wire (editor ->
-/// dispatcher -> broker): the service's spec (whose `own_page.mint`
-/// recipe runs) and the ticked permissions baked into the manifest.
-/// ONE definition so the hops cannot drift.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MintAppRequest {
-    pub spec: AccessSpec,
-    #[serde(default)]
-    pub permissions: Vec<String>,
-}
-
-/// What the mint captured: the fresh app's values, for the editor to
-/// prefill the "Your own" form (the user still names it and connects).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MintAppResponse {
-    pub values: BTreeMap<String, String>,
-}
-
-/// The connect flow's answer: the summary the editor stores on the
-/// node (`{id, identity}`) and shows.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct CompletedConnect {
-    pub grant: GrantSummary,
-}
 
 /// The provider redirect's payload for [`complete_oauth`], as it
 /// travels dispatcher (public callback door) -> broker (which makes
@@ -768,57 +695,6 @@ pub async fn finish_picker(
 }
 
 // ---------- Browser OAuth: begin ----------
-
-/// A connect request as the EDITOR sends it: the store's shape plus
-/// `shared_app`, the label of the registered app a shared-door connect
-/// goes through (each registered app is its own option in the editor).
-/// The label is consumed at the BROKER, which resolves it to the app
-/// and its fixed `covers` before the store flow runs; the flows
-/// themselves never read it. Defined here so the dispatcher's
-/// forwarding and the broker's handling share one wire shape.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SharedDoorPick<T> {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shared_app: Option<String>,
-    #[serde(flatten)]
-    pub inner: T,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BeginOAuth {
-    pub spec: AccessSpec,
-    /// Which door the user walked through. Decides which app the
-    /// broker resolves (the registered app for `shared`, the user's
-    /// own / project app for `own`) and is recorded on the grant.
-    #[serde(default = "own_door")]
-    pub door: Door,
-    /// The resolved app for the consent (client id, and the secret for
-    /// the later code exchange). Resolved AT THE BROKER before this is
-    /// reached; a client-sent app is only ever honored on the own door.
-    #[serde(default)]
-    pub registration: Option<AppRegistration>,
-    /// The permissions the consent asks for (drive the consent URL and
-    /// are recorded on the grant): the user's ticks on the own door,
-    /// the chosen app's fixed `covers` on the shared door (overwritten
-    /// by the broker; nothing the client sent survives there).
-    pub permissions: Vec<String>,
-    pub project_id: Option<String>,
-    /// Upgrade/rotate this existing exclusive-class grant in place
-    /// instead of minting a new row.
-    pub upgrade_grant_id: Option<uuid::Uuid>,
-    /// The callback URL the provider redirects to, derived from the
-    /// dispatcher's public base and filled by it before the forward
-    /// (the editor does not know the dispatcher's public host).
-    #[serde(default)]
-    pub redirect_uri: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StartedOAuth {
-    /// Open this in the user's browser.
-    pub consent_url: String,
-    pub state: String,
-}
 
 /// Park a pending consent and build the consent URL. Requires the
 /// resolved app (`req.registration`) and the callback URL
@@ -1688,25 +1564,17 @@ pub async fn publish_grant(
     .await
 }
 
-/// What a node's published connection IS to everyone downstream: the
-/// reference to open it with, plus the identity that names it in a
-/// list. The same pair the publish answers, so a connection read back
-/// is the same value as the one published.
-pub struct PublishedGrant {
-    pub id: uuid::Uuid,
-    pub identity: Option<String>,
-}
-
 /// The connection this node published for `service`, if it has one.
 /// The node's own read-back path: it republishes with the credential
 /// it stored the first time rather than asking the container again.
-pub async fn published_grant(
+/// Answers the same [`PublishedConnection`] shape the publish did.
+pub async fn published_connection(
     pool: &PgPool,
     tenant: &str,
     project_id: &str,
     node_id: &str,
     service: &str,
-) -> anyhow::Result<Option<PublishedGrant>> {
+) -> anyhow::Result<Option<PublishedConnection>> {
     let row: Option<(uuid::Uuid, Option<String>)> = sqlx::query_as(
         "SELECT id, identity FROM access_grant
          WHERE tenant_id = $1 AND project_id = $2 AND published_by_node = $3
@@ -1718,7 +1586,7 @@ pub async fn published_grant(
     .bind(service)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(id, identity)| PublishedGrant { id, identity }))
+    Ok(row.map(|(id, identity)| PublishedConnection { connection_id: id.to_string(), identity }))
 }
 
 /// Drop every connection a node published. Called when its infra is

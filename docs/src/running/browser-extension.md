@@ -77,6 +77,22 @@ weft token ls
 weft token revoke <id>
 ```
 
+### The doors a token opens
+
+If you are writing your own consumer instead of using the extension, the
+token opens three doors on the dispatcher, the token as bearer on the first
+and the last:
+
+| Door | Set it when |
+|---|---|
+| `GET /signal-token/signals` | you want the tasks this token may see: one entry per parked question or registered trigger, form fields included |
+| `POST /signal/{signal token}` | you are answering one; the per-task token in the listing is the credential, no bearer |
+| `GET /signal-token/signals/{signal token}/files/{field}` | a field carries a stored file and you want to show it. A file arrives in the listing as its facts only (`mimeType`, `sizeBytes`, `filename`, no link); this door answers a fresh link that lives an hour, so ask each time you render. A file that expired answers a 404 saying so; show that in the image's place rather than a broken picture |
+
+The files door is scoped like the listing: a task the token lists, a field
+the form declares, a file that belongs to that task's project or run.
+Anything else is a 404, and the storage key never travels.
+
 ## Try it end to end
 
 Add a `HumanQuery` node to any program and run it with the graph open.

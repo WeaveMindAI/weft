@@ -152,12 +152,13 @@ async fn put_via(
                 keep,
                 declared_size: Some(bytes.len() as u64),
                 content_hash: None,
+                identity: None,
             },
             budget,
         )
         .await?
     else {
-        panic!("a uuid-id begin can never answer already-stored");
+        panic!("an unidentified uuid-id begin never answers already-stored");
     };
     upload_parts(s, bucket, caller, &key, part_size, &bytes, budget).await?;
     s.complete_upload(caller, &key).await
@@ -180,14 +181,14 @@ async fn begin_via(
     match s
         .begin_upload(
             caller,
-            &UploadSpec { scope, mime, filename, keep, declared_size, content_hash: None },
+            &UploadSpec { scope, mime, filename, keep, declared_size, content_hash: None, identity: None },
             budget,
         )
         .await?
     {
         BeginUpload::Ready { key, part_size } => Ok((key, part_size)),
         BeginUpload::AlreadyStored { .. } => {
-            panic!("a uuid-id begin can never answer already-stored")
+            panic!("an unidentified uuid-id begin never answers already-stored")
         }
     }
 }
@@ -244,6 +245,61 @@ async fn put_then_get_round_trips_and_records_metadata(pool: PgPool) {
 
     // per-tenant usage reflects the one file (an ACTIVE row).
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 5));
+}
+
+/// An identified put is idempotent within its scope: the same source
+/// asked for twice is one file and one upload, another project asking
+/// for the same source is its own file, and a begin racing an upload
+/// of the same identity is a conflict rather than a second file.
+#[sqlx::test]
+async fn an_identified_put_stores_one_file_per_scope(pool: PgPool) {
+    let (s, bucket, _clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let spec = |identity: Option<&'static str>| UploadSpec {
+        scope: &StorageScope::Project,
+        mime: "audio/ogg",
+        filename: "voice.ogg",
+        keep: None,
+        declared_size: Some(5),
+        content_hash: None,
+        identity,
+    };
+    let BeginUpload::Ready { key, part_size } =
+        s.begin_upload(&w, &spec(Some("whatsapp:m1")), &big()).await.expect("first begin")
+    else {
+        panic!("nothing stored yet")
+    };
+    // Mid-upload, the same identity is a conflict, not a second file.
+    assert!(matches!(
+        s.begin_upload(&w, &spec(Some("whatsapp:m1")), &big()).await,
+        Err(RuntimeStoreError::Conflict(_))
+    ));
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"hello"), &big()).await.expect("parts");
+    let first = s.complete_upload(&w, &key).await.expect("complete");
+
+    // Stored: the second begin answers the file, and opens no upload.
+    let BeginUpload::AlreadyStored { key: again } =
+        s.begin_upload(&w, &spec(Some("whatsapp:m1")), &big()).await.expect("second begin")
+    else {
+        panic!("the identity is stored")
+    };
+    assert_eq!(again, first.key);
+    assert!(bucket.in_progress_uploads().is_empty(), "no lingering multipart upload");
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 5), "one file");
+
+    // Another project's copy of the same source is its own file.
+    let other = worker("t1", "p2", Some("c2"));
+    assert!(matches!(
+        s.begin_upload(&other, &spec(Some("whatsapp:m1")), &big()).await,
+        Ok(BeginUpload::Ready { .. })
+    ));
+
+    // The asset scope is addressed by content, never by identity.
+    let asset = UploadSpec { scope: &StorageScope::Asset, identity: Some("x"), ..spec(None) };
+    assert!(matches!(
+        s.begin_upload(&w, &asset, &big()).await,
+        Err(RuntimeStoreError::Invalid(_))
+    ));
 }
 
 #[sqlx::test]
@@ -704,6 +760,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
         keep: None,
         declared_size: Some(11),
         content_hash: Some(sha_static),
+        identity: None,
     };
     let sources = vec![("chunks/c1".to_string(), 6u64), ("chunks/c2".to_string(), 5u64)];
     let meta = s.assemble(&w, &spec, &sources, &big()).await.unwrap();
@@ -754,6 +811,7 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
         keep: None,
         declared_size: Some(4),
         content_hash: hash,
+        identity: None,
     };
 
     // A missing or malformed hash is refused loud (assets ARE their hash).
@@ -818,6 +876,132 @@ async fn delete_removes_and_presign_requires_existing(pool: PgPool) {
     s.delete(&parsed).await.unwrap();
     assert!(matches!(s.delete(&parsed).await, Err(RuntimeStoreError::NotFound(_))));
     assert!(matches!(s.presign(&parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
+}
+
+async fn asset_via(
+    s: &RuntimeStore,
+    bucket: &FakeObjectStore,
+    tenant: &str,
+    project: &str,
+    id: u64,
+) -> StoredFileMeta {
+    let caller = worker(tenant, project, None);
+    let hash = format!("{id:064x}");
+    let spec = UploadSpec {
+        scope: &StorageScope::Asset,
+        mime: "image/png",
+        filename: "cat.png",
+        keep: None,
+        declared_size: Some(3),
+        content_hash: Some(&hash),
+        identity: None,
+    };
+    let BeginUpload::Ready { key, part_size } = s.begin_upload(&caller, &spec, &big()).await.unwrap() else {
+        panic!("test asset must be new");
+    };
+    upload_parts(s, bucket, &caller, &key, part_size, &body(b"cat"), &big()).await.unwrap();
+    s.complete_upload(&caller, &key).await.unwrap()
+}
+
+#[sqlx::test]
+async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_access(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let old = asset_via(&s, &bucket, "t1", "p1", 1).await;
+    let current = asset_via(&s, &bucket, "t1", "p1", 2).await;
+    let old_key = weft_core::storage::key::parse_key(&old.key).unwrap();
+    s.set_asset_references("t1", "p1", &[old.key.clone(), current.key.clone()]).await.unwrap();
+    clock.advance(Duration::from_secs(400 * 86400));
+    assert_eq!(s.sweep_expired().await.unwrap(), 0, "current source may be idle for months");
+
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&current.key)).await.unwrap();
+    let deadline = s.meta(&old_key).await.unwrap().expires_at_unix.unwrap();
+    assert_eq!(deadline, clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64);
+    clock.advance(Duration::from_secs(20 * 86400));
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&current.key)).await.unwrap();
+    assert_eq!(s.meta(&old_key).await.unwrap().expires_at_unix, Some(deadline), "sync is not file access");
+
+    get_via(&s, &bucket, &old_key, None).await.unwrap();
+    assert_eq!(s.meta(&old_key).await.unwrap().expires_at_unix, Some(clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64));
+    clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS - 1));
+    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert!(matches!(s.download_url(&old_key, WORKER, None).await, Err(RuntimeStoreError::NotFound(_))));
+    assert!(bucket.get(&object_key(&old.key)).await.unwrap().is_none());
+    assert!(bucket.get(&object_key(&current.key)).await.unwrap().is_some());
+}
+
+#[sqlx::test]
+async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: PgPool) {
+    // The build failed after the transfer: nothing ever referenced the
+    // upload, so it counts down from completion. Publishing clears it.
+    let (s, bucket, clock) = store(&pool).await;
+    let orphan = asset_via(&s, &bucket, "t1", "p1", 1).await;
+    let published = asset_via(&s, &bucket, "t1", "p1", 2).await;
+    let orphan_key = weft_core::storage::key::parse_key(&orphan.key).unwrap();
+    assert_eq!(orphan.expires_at_unix, Some(clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64));
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&published.key)).await.unwrap();
+    let published_key = weft_core::storage::key::parse_key(&published.key).unwrap();
+    assert_eq!(s.meta(&published_key).await.unwrap().expires_at_unix, None, "publishing clears the countdown");
+    assert_eq!(s.meta(&orphan_key).await.unwrap().expires_at_unix, orphan.expires_at_unix, "the orphan's countdown runs on");
+    clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
+    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert!(bucket.get(&object_key(&orphan.key)).await.unwrap().is_none());
+    assert!(bucket.get(&object_key(&published.key)).await.unwrap().is_some());
+}
+
+#[sqlx::test]
+async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_supported(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let file = asset_via(&s, &bucket, "t1", "p1", 1).await;
+    let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
+    s.set_asset_references("t1", "p1", &[]).await.unwrap();
+    assert_eq!(s.meta(&parsed).await.unwrap().keep_ttl_secs, Some(DEFAULT_KEEP_TTL_SECS));
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&file.key)).await.unwrap();
+    let meta = s.meta(&parsed).await.unwrap();
+    assert_eq!(meta.expires_at_unix, None);
+    assert_eq!(meta.keep_ttl_secs, None);
+    // Access must use the current lifetime, not resurrect an old countdown.
+    s.presign(&parsed, None).await.unwrap();
+    clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
+    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+}
+
+#[sqlx::test]
+async fn asset_lifetime_is_walled_and_preserves_node_selected_ttls(pool: PgPool) {
+    let (s, bucket, _) = store(&pool).await;
+    let own = asset_via(&s, &bucket, "t1", "p1", 1).await;
+    let sibling = asset_via(&s, &bucket, "t1", "p2", 1).await;
+    let foreign = asset_via(&s, &bucket, "t2", "p1", 1).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let generated = put_via(&s, &bucket, &w, &StorageScope::Execution, "image/png", "generated.png",
+        Some(KeepTtl::Secs { secs: 60 }), &big(), body(b"png")).await.unwrap();
+    for forbidden in [&sibling.key, &foreign.key, &generated.key] {
+        assert!(matches!(s.set_asset_references("t1", "p1", std::slice::from_ref(forbidden)).await,
+            Err(RuntimeStoreError::Denied(_))));
+    }
+    s.set_asset_references("t1", "p1", &[]).await.unwrap();
+    for unaffected in [&sibling, &foreign, &generated] {
+        let parsed = weft_core::storage::key::parse_key(&unaffected.key).unwrap();
+        let meta = s.meta(&parsed).await.unwrap();
+        assert_eq!(meta.keep_ttl_secs, unaffected.keep_ttl_secs);
+        assert_eq!(meta.expires_at_unix, unaffected.expires_at_unix);
+    }
+    let own = weft_core::storage::key::parse_key(&own.key).unwrap();
+    assert!(s.meta(&own).await.unwrap().expires_at_unix.is_some());
+}
+
+#[sqlx::test]
+async fn asset_lifetime_missing_current_file_does_not_retire_other_files(pool: PgPool) {
+    let (s, bucket, _) = store(&pool).await;
+    let own = asset_via(&s, &bucket, "t1", "p1", 1).await;
+    let missing = format!("t1/asset/p1/{}", "f".repeat(64));
+    assert!(matches!(s.set_asset_references("t1", "p1", &[missing]).await,
+        Err(RuntimeStoreError::NotFound(_))));
+    // The failed publish touched nothing: the upload keeps the countdown
+    // it started with, neither cleared nor restarted.
+    let parsed = weft_core::storage::key::parse_key(&own.key).unwrap();
+    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, own.expires_at_unix);
 }
 
 #[sqlx::test]

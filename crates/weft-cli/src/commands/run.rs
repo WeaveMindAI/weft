@@ -1,11 +1,11 @@
 //! `weft run`: compile + register the cwd project, kick off a fresh
 //! run, stream logs until completion (or `--detach`).
 //!
-//! A run has no entry point of its own: the dispatcher collects the
-//! project's output nodes and walks upstream from them, so what
-//! executes is exactly what some output needs. `--target <node>`,
-//! repeatable, narrows that set, which is how you exercise one branch
-//! of a project without running its siblings.
+//! A run has no entry point of its own: the dispatcher kicks every
+//! root of the graph (a node no wire feeds) and pulses run whatever
+//! they reach. `--target <node>`, repeatable, kicks only the roots the
+//! named nodes need, which is how you exercise one branch of a project
+//! without running its siblings.
 
 use anyhow::Context;
 
@@ -31,9 +31,9 @@ async fn run_inner(
         println!("registered {} ({})", handle.name, handle.id);
     }
 
-    // `targets` narrows the run to those output nodes' upstream
-    // subgraphs; the dispatcher defaults to every output node when the
-    // list is empty, and refuses a target that is not an output.
+    // `targets` narrows the kicks to the roots those nodes need; the
+    // dispatcher kicks every root when the list is empty, and refuses
+    // a target that names no node.
     let body = serde_json::json!({
         "payload": serde_json::Value::Null,
         "targets": targets,

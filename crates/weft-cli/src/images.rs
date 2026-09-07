@@ -648,27 +648,34 @@ pub async fn kind_load(cluster: &str, image_ref: &str, force: bool) -> Result<()
     if !force && kind_node_has_tag(cluster, image_ref).await {
         return Ok(());
     }
-    // A registry-qualified ref is a content-addressed tag whose bytes
-    // are the registry's, so the NODE pulls it straight from there:
-    // streaming a registry-pulled multi-arch image through `kind load`
-    // fails on import ("content digest not found": the saved tar
-    // references manifest-list digests docker never stored). The
-    // docker-stream path below stays for what only exists locally: a
-    // bare (registry-less) build, and a `force` load, whose bytes were
-    // just rebuilt locally under an unchanged tag.
+    // A registry-qualified ref pulls on the NODE first: streaming a
+    // registry-pulled multi-arch image through `kind load` fails on
+    // import ("content digest not found": the saved tar references
+    // manifest-list digests docker never stored), so pulling is the
+    // only load that works for what the registry serves. When the pull
+    // fails, the tag may still exist in the LOCAL docker: the ensure
+    // step builds a service locally whenever its content hash names an
+    // image no registry ever saw (uncommitted changes), and a locally
+    // BUILT image is single-arch, which streams through `kind load`
+    // fine. So: pull for unchanged content, stream the local build for
+    // changed content, and only fail when neither source has the ref.
     if !force && image_ref.contains('/') {
         let node = format!("{cluster}-control-plane");
         let out =
             docker().args(["exec", &node, "crictl", "pull", image_ref]).output().await?;
-        if !out.status.success() {
+        if out.status.success() {
+            return Ok(());
+        }
+        if !image_present(image_ref).await? {
             anyhow::bail!(
-                "the kind node could not pull {image_ref}: {}\n\
+                "the kind node could not pull {image_ref} and the local docker does not \
+                 hold it either: {}\n\
                  Is the registry reachable from this machine and the package public? \
-                 To load a locally built image instead, re-run with --rebuild.",
+                 To build the image locally, re-run with --rebuild.",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        return Ok(());
+        // Fall through to the docker-stream load below.
     }
     let status = quiet_stdout("kind")
         .args(["load", "docker-image", image_ref, "--name", cluster])
@@ -692,7 +699,6 @@ pub async fn gc_stale_system_images(kind_cluster: Option<&str>, current: &System
     // A current ref whose tag cannot be parsed must SKIP its repo, not
     // condemn everything of that repo (`system_image_ref` validates
     // overrides, so this is belt over suspenders).
-    let current_tag = |svc: SystemService| ref_repo_tag(current.get(svc)).ok().map(|(_, t)| t);
     let host = async {
         let out = docker().args(["images", "--format", "{{.Repository}}:{{.Tag}}"]).output().await;
         let out = match out {
@@ -701,10 +707,8 @@ pub async fn gc_stale_system_images(kind_cluster: Option<&str>, current: &System
         };
         let listing = String::from_utf8_lossy(&out.stdout);
         for svc in SystemService::ALL {
-            let Ok(stale) = host_images_condemned(current.get(svc), &listing, |_| true) else {
-                continue;
-            };
-            for stale in stale {
+            let Ok(condemn) = outside_current(current.get(svc)) else { continue };
+            for stale in host_images_matching(&listing, condemn) {
                 remove_image_warn_only(&["rmi", &stale]).await;
             }
         }
@@ -714,8 +718,8 @@ pub async fn gc_stale_system_images(kind_cluster: Option<&str>, current: &System
         let Ok(groups) = kind_node_image_tag_groups(cluster).await else { return };
         let node = format!("{cluster}-control-plane");
         for svc in SystemService::ALL {
-            let Some(tag) = current_tag(svc) else { continue };
-            for image in node_images_condemned(svc.repo(), &groups, |t| t != tag) {
+            let Ok(condemn) = outside_current(current.get(svc)) else { continue };
+            for image in node_images_matching(&groups, condemn) {
                 remove_image_warn_only(&["exec", &node, "crictl", "rmi", &image]).await;
             }
         }
@@ -723,29 +727,32 @@ pub async fn gc_stale_system_images(kind_cluster: Option<&str>, current: &System
     tokio::join!(host, node);
 }
 
-/// Host `docker images` lines (one `repo:tag` per line) that a sweep
-/// may delete: same repo as `current_ref` under any registry prefix,
-/// tag differing from `current_ref`'s, and `condemn_extra(tag)` true
-/// (pass `|_| true` when "not current" is the whole rule). Owning the
-/// ref split here means no caller ever hand-rolls it, and a
-/// `current_ref` that cannot be split is a loud error, never an
-/// everything-condemned sweep. The host-side sibling of
-/// `node_images_condemned`, pure for the same reason: the two matchers
-/// decide what a sweep may delete.
-pub fn host_images_condemned(
-    current_ref: &str,
-    listing: &str,
-    condemn_extra: impl Fn(&str) -> bool,
-) -> Result<Vec<String>> {
+/// The predicate a "current ref" sweep condemns with: every tag of
+/// `current_ref`'s repo except the current one, under any registry
+/// spelling. Owning the ref split here means no caller hand-rolls it,
+/// and a `current_ref` that cannot be split is a loud error, never an
+/// everything-condemned sweep. Compose it with a referenced-set hold
+/// where one applies (`gc_stale_images`).
+pub fn outside_current(current_ref: &str) -> Result<impl Fn(&str, &str) -> bool + '_> {
     let (repo, current) = ref_repo_tag(current_ref)?;
-    Ok(listing
+    Ok(move |r: &str, t: &str| r == repo && t != current)
+}
+
+/// Host `docker images` lines (one `repo:tag` per line) that a sweep
+/// may delete: those whose prefix-stripped `(repo, tag)` parse and
+/// satisfy `condemn`. THE host-side matcher (system images, builder
+/// bases, worker and infra reclaims all pass their own predicate over
+/// the same split), the host sibling of `node_images_matching`, pure
+/// for the same reason: the two matchers decide what a sweep may
+/// delete. Untagged/dangling lines (`<none>:<none>`) parse to a repo no
+/// weft predicate names.
+pub fn host_images_matching(listing: &str, condemn: impl Fn(&str, &str) -> bool) -> Vec<String> {
+    listing
         .lines()
         .map(str::trim)
-        .filter(|full| {
-            ref_repo_tag(full).is_ok_and(|(r, t)| r == repo && t != current && condemn_extra(t))
-        })
+        .filter(|full| ref_repo_tag(full).is_ok_and(|(r, t)| condemn(r, t)))
         .map(str::to_string)
-        .collect())
+        .collect()
 }
 
 /// One best-effort image removal: a busy image (an old pod still
@@ -808,57 +815,127 @@ pub async fn kind_node_image_tag_groups(cluster: &str) -> Result<Vec<Vec<String>
         .collect())
 }
 
-/// The hashes of every image the dispatcher still counts on: running
-/// projects' binary hashes UNION non-terminal worker pods' hashes and
-/// pending/claimed task hashes (a pod draining in-flight work may run
-/// an image its project no longer points at; deleting it would strand
-/// a restart). The ONE fetch every image reclaim subtracts before
-/// deleting anything; a failure is the caller's cue to skip the
-/// reclaim, never to guess "nothing is referenced".
-/// SYNC: response shape (JSON array of bare hash strings) <->
-///       crates/weft-dispatcher/src/api/project.rs referenced_images
-pub async fn referenced_image_hashes(
+/// The dispatcher's answer to "which images does the system still need",
+/// the keep-set every image reclaim subtracts before deleting anything.
+/// `worker_hashes` are bare `weft-worker` tag suffixes; `infra_refs` are
+/// full BARE `weft-infra-<name>:<hash>` refs (the CLI's tag policy never
+/// writes a registry prefix into either list, and the sweep's key
+/// construction below strips prefixes before comparing, so the two
+/// spellings agree by construction). A fetch failure is the caller's
+/// cue to skip the reclaim, never to guess "nothing is referenced".
+// SYNC: response shape <-> crates/weft-dispatcher/src/api/project.rs
+//       (ReferencedImages: {"workerHashes": [...], "infraRefs": [...]})
+#[derive(Debug, Default)]
+pub struct ReferencedImages {
+    pub worker_hashes: std::collections::BTreeSet<String>,
+    pub infra_refs: std::collections::BTreeSet<String>,
+}
+
+impl ReferencedImages {
+    /// Whether the system still needs the image behind a
+    /// prefix-stripped `(repo, tag)`: THE one membership test every
+    /// reclaim composes into its condemn predicate, so no sweep
+    /// hand-rolls which list a repo's keys live in (worker hashes are
+    /// keyed by tag under the worker repo; infra refs by full bare
+    /// `repo:tag`).
+    pub fn is_referenced(&self, repo: &str, tag: &str) -> bool {
+        (repo == weft_compiler::build::WORKER_IMAGE_REPO && self.worker_hashes.contains(tag))
+            || self.infra_refs.contains(&format!("{repo}:{tag}"))
+    }
+}
+
+/// Fetch the referenced keep-set from the dispatcher. Loud error on a
+/// shape the contract does not name: a missing key AND a wrong-typed
+/// element both error, because an unreadable answer must never read as
+/// "nothing is referenced" (a dropped element shrinks the keep-set
+/// below what is running, and the reclaim then deletes a live image).
+pub async fn referenced_images(
     client: &crate::client::DispatcherClient,
-) -> Result<std::collections::BTreeSet<String>> {
+) -> Result<ReferencedImages> {
     let json = client
         .get_json("/images/referenced")
         .await
         .map_err(|e| anyhow::anyhow!("fetch referenced images (is the daemon up?): {e}"))?;
-    Ok(json
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str())
-        .map(str::to_string)
-        .collect())
+    let strings = |key: &str| -> Result<std::collections::BTreeSet<String>> {
+        let arr = json
+            .get(key)
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("/images/referenced returned no `{key}` array: {json}"))?;
+        let mut out = std::collections::BTreeSet::new();
+        for v in arr {
+            let s = v.as_str().ok_or_else(|| {
+                anyhow::anyhow!("/images/referenced `{key}` holds a non-string entry: {v}")
+            })?;
+            out.insert(s.to_string());
+        }
+        Ok(out)
+    };
+    Ok(ReferencedImages {
+        worker_hashes: strings("workerHashes")?,
+        infra_refs: strings("infraRefs")?,
+    })
 }
 
-/// One ref per NODE IMAGE that is safe to `crictl rmi`: every one of
-/// the image's tags is a `repo` tag (ignoring any registry prefix)
-/// satisfying `condemn`. `crictl rmi` removes the whole image behind
-/// a ref, every tag included, so an image carrying even one live tag
-/// (a fresh tag whose content matches a stale one, or another repo's
-/// tag) must survive untouched; condemning per tag once deleted a
-/// freshly loaded test image whose bits matched the stale tag being
-/// dropped. Pure so it is unit-testable; only images made purely of
-/// `repo`'s refs ever leave, which is the guarantee that keeps system
-/// images (listener & co) safe from every node cleanup. Handles bare
-/// (`repo:<tag>`), docker-canonical (`docker.io/library/...`), and
-/// registry-qualified (`host:port/path/repo:<tag>`) spellings.
-pub fn node_images_condemned(
-    repo: &str,
+/// The keep-set for a post-build GC: [`referenced_images`] with the
+/// unlearnable-answer policy the build path needs. `None` (after a
+/// stderr warning) means the answer could not be learned - daemon
+/// unreachable or a contract-broken response - and the caller must skip
+/// the GC, never guess "nothing is referenced" (which would delete live
+/// images). The warning is the breadcrumb: a silent skip would let a
+/// persistent contract break hide behind every `weft build` until
+/// someone happens to run `weft clean --images`.
+pub async fn referenced_set_for_gc(
+    client: &crate::client::DispatcherClient,
+) -> Option<ReferencedImages> {
+    match referenced_images(client).await {
+        Ok(referenced) => Some(referenced),
+        Err(e) => {
+            eprintln!(
+                "warning: could not fetch the referenced-image set, \
+                 skipping the stale-image GC: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// Whether a bare repo (registry prefix stripped) is one of the
+/// per-infra-node image repos `weft clean --images --all` reclaims:
+/// `weft-infra-<name>` for every name EXCEPT the supervisor, which is a
+/// system-service repo owned by `gc_stale_system_images` (an image repo
+/// being system-managed and clean-managed at once would race the two
+/// sweeps against each other).
+/// SYNC: the repo spellings <-> crates/weft-compiler/src/image_set.rs
+///       (infra_image_repo)
+pub fn is_infra_node_repo(repo: &str) -> bool {
+    repo.starts_with("weft-infra-") && repo != SystemService::Supervisor.repo()
+}
+
+/// One ref per NODE IMAGE that a sweep may `crictl rmi`: every tag
+/// group whose refs ALL parse and satisfy `condemn`. Per IMAGE, never
+/// per tag: `crictl rmi` removes the whole image behind a ref (every
+/// tag on it, not just the named one), so an image carrying a live tag
+/// alongside a condemned one (identical content loaded under two tags)
+/// must survive untouched; condemning per tag once deleted a freshly
+/// loaded test image whose bits matched the stale tag being dropped.
+/// Digest-only groups (no parseable `repo:tag`) never match. Only
+/// images made purely of condemned refs ever leave, which is the
+/// guarantee that keeps system images (listener & co) safe from every
+/// node cleanup. Handles bare (`repo:<tag>`), docker-canonical
+/// (`docker.io/library/...`) and registry-qualified
+/// (`host:port/path/repo:<tag>`) spellings through `ref_repo_tag`. THE
+/// node-side matcher, pure so it is unit-testable.
+pub fn node_images_matching(
     image_tag_groups: &[Vec<String>],
-    condemn: impl Fn(&str) -> bool,
+    condemn: impl Fn(&str, &str) -> bool,
 ) -> Vec<String> {
-    let prefix = format!("{repo}:");
     image_tag_groups
         .iter()
         .filter(|group| {
             !group.is_empty()
-                && group.iter().all(|full| {
-                    let repo_tag = full.rsplit_once('/').map_or(full.as_str(), |(_, t)| t);
-                    repo_tag.strip_prefix(&prefix).is_some_and(&condemn)
-                })
+                && group
+                    .iter()
+                    .all(|full| ref_repo_tag(full).is_ok_and(|(r, t)| condemn(r, t)))
         })
         .filter_map(|group| group.first().cloned())
         .collect()
@@ -953,9 +1030,10 @@ weft-infra-supervisor:abc123
 weft-infra-postgres:zzz999
 <none>:<none>
 ";
-        let stale =
-            host_images_condemned("ghcr.io/weavemindai/weft-dispatcher:abc123", listing, |_| true)
-                .expect("well-formed current ref");
+        let stale = host_images_matching(
+            listing,
+            outside_current("ghcr.io/weavemindai/weft-dispatcher:abc123").unwrap(),
+        );
         assert_eq!(
             stale,
             vec![
@@ -963,18 +1041,17 @@ weft-infra-postgres:zzz999
                 "ghcr.io/weavemindai/weft-dispatcher:0ld0ld".to_string(),
             ]
         );
-        let infra = host_images_condemned("weft-infra-supervisor:abc123", listing, |_| true)
-            .expect("well-formed current ref");
+        let infra =
+            host_images_matching(listing, outside_current("weft-infra-supervisor:abc123").unwrap());
         assert!(infra.is_empty(), "{infra:?}");
-        // The extra predicate narrows further (a referenced-set hold):
-        // a non-current tag it protects survives.
-        let held =
-            host_images_condemned("weft-dispatcher:abc123", listing, |t| t != "0ld0ld")
-                .expect("well-formed current ref");
+        // Composed with a referenced-set hold: a non-current tag the
+        // set protects survives.
+        let current = outside_current("weft-dispatcher:abc123").unwrap();
+        let held = host_images_matching(listing, |r, t| current(r, t) && t != "0ld0ld");
         assert_eq!(held, vec!["weft-dispatcher:local".to_string()]);
         // A current ref that cannot be split is a loud error, never an
         // everything-condemned sweep.
-        assert!(host_images_condemned("weft-dispatcher", listing, |_| true).is_err());
+        assert!(outside_current("weft-dispatcher").is_err());
     }
 
     /// The node-side sweep must remove every other tag of a system
@@ -989,12 +1066,130 @@ weft-infra-postgres:zzz999
             one("ghcr.io/weavemindai/weft-dispatcher:0ld0ld"),
             one("docker.io/library/weft-worker:abc123"),
         ];
-        let stale = node_images_condemned("weft-dispatcher", &groups, |tag| tag != "abc123");
+        let stale =
+            node_images_matching(&groups, outside_current("weft-dispatcher:abc123").unwrap());
         assert_eq!(
             stale,
             vec![
                 "docker.io/library/weft-dispatcher:local".to_string(),
                 "ghcr.io/weavemindai/weft-dispatcher:0ld0ld".to_string(),
+            ]
+        );
+    }
+
+    /// The referenced set answers per `(repo, tag)`: worker hashes are
+    /// keyed by tag under the worker repo only, infra refs by their
+    /// full bare `repo:tag`, and nothing else is referenced.
+    #[test]
+    fn referenced_set_membership_is_per_repo_and_tag() {
+        let referenced = ReferencedImages {
+            worker_hashes: ["abc".to_string()].into_iter().collect(),
+            infra_refs: ["weft-infra-bridge:abc".to_string()].into_iter().collect(),
+        };
+        assert!(referenced.is_referenced("weft-worker", "abc"));
+        assert!(!referenced.is_referenced("weft-worker", "0ld"));
+        assert!(referenced.is_referenced("weft-infra-bridge", "abc"));
+        assert!(!referenced.is_referenced("weft-infra-bridge", "0ld"));
+        // A worker hash never vouches for another repo's tag.
+        assert!(!referenced.is_referenced("weft-infra-credential", "abc"));
+        assert!(!referenced.is_referenced("postgres", "abc"));
+    }
+
+    /// The infra host sweep condemns exactly the unreferenced tags of
+    /// the infra-node repos (any registry spelling), keeps every other
+    /// repo (the supervisor system repo, workers, system services,
+    /// foreign images), and skips dangling `<none>` lines.
+    #[test]
+    fn host_sweep_condemns_only_unreferenced_infra() {
+        let listing = "\
+weft-infra-bridge:abc
+weft-infra-bridge:0ld
+ghcr.io/weavemindai/weft-infra-bridge:abc
+weft-infra-credential:keep1
+weft-infra-supervisor:abc
+weft-infra-supervisor:0ld
+weft-worker:abc
+weft-dispatcher:abc
+postgres:18
+<none>:<none>
+";
+        let referenced = ReferencedImages {
+            worker_hashes: Default::default(),
+            infra_refs: ["weft-infra-bridge:abc", "weft-infra-credential:keep1"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        };
+        let stale = host_images_matching(listing, |r, t| {
+            is_infra_node_repo(r) && !referenced.is_referenced(r, t)
+        });
+        assert_eq!(stale, vec!["weft-infra-bridge:0ld".to_string()]);
+    }
+
+    /// Repo selection for the infra sweep: every `weft-infra-<name>` is
+    /// in EXCEPT the supervisor (a system-service repo whose stale tags
+    /// `gc_stale_system_images` owns; two sweeps owning one repo would
+    /// race each other).
+    #[test]
+    fn infra_repo_selection_excludes_the_supervisor() {
+        assert!(is_infra_node_repo("weft-infra-bridge"));
+        assert!(is_infra_node_repo("weft-infra-mini_service"));
+        assert!(!is_infra_node_repo("weft-infra-supervisor"));
+        assert!(!is_infra_node_repo("weft-worker"));
+        assert!(!is_infra_node_repo("postgres"));
+    }
+
+    /// The node sweep over several repos at once condemns exactly the
+    /// all-tags-unreferenced groups of the repos of interest (any
+    /// registry spelling), keeps a group that mixes a referenced and an
+    /// unreferenced tag of the same image whole, skips digest-only
+    /// groups (no parseable `repo:tag`, so never condemned), and never
+    /// touches the supervisor or foreign repos.
+    #[test]
+    fn node_sweep_condemns_only_unreferenced_groups() {
+        let groups = vec![
+            vec!["weft-infra-bridge:0ld".to_string()],
+            vec![
+                "docker.io/library/weft-infra-bridge:new".to_string(),
+                "weft-infra-bridge:new".to_string(),
+            ],
+            // Same image, one referenced + one unreferenced tag:
+            // survives whole.
+            vec![
+                "weft-infra-bridge:new".to_string(),
+                "weft-infra-bridge:0ld".to_string(),
+            ],
+            vec!["ghcr.io/weavemindai/weft-infra-credential:dead".to_string()],
+            vec!["weft-infra-supervisor:0ld".to_string()],
+            vec!["weft-worker:0ld".to_string()],
+            vec!["registry.example.com:5000/weft-images/weft-worker:live".to_string()],
+            // The system images (listener & co) must NEVER be
+            // node-pruned (a blanket prune once stranded on-demand
+            // listener pods in ImagePullBackOff), alone or sharing an
+            // image with a stale worker tag.
+            vec!["docker.io/library/weft-listener:local".to_string()],
+            vec![
+                "docker.io/library/weft-worker:stale2".to_string(),
+                "docker.io/library/weft-listener:local".to_string(),
+            ],
+            vec!["postgres:16".to_string()],
+            // Digest-only: no repo:tag spelling ever matches.
+            vec!["weft-infra-bridge@sha256:0011".to_string()],
+        ];
+        let referenced = ReferencedImages {
+            worker_hashes: ["live".to_string()].into_iter().collect(),
+            infra_refs: ["weft-infra-bridge:new".to_string()].into_iter().collect(),
+        };
+        let stale = node_images_matching(&groups, |r, t| {
+            (r == weft_compiler::build::WORKER_IMAGE_REPO || is_infra_node_repo(r))
+                && !referenced.is_referenced(r, t)
+        });
+        assert_eq!(
+            stale,
+            vec![
+                "weft-infra-bridge:0ld".to_string(),
+                "ghcr.io/weavemindai/weft-infra-credential:dead".to_string(),
+                "weft-worker:0ld".to_string(),
             ]
         );
     }

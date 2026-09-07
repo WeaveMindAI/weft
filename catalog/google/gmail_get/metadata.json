@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.readonly"
@@ -28,7 +28,6 @@
     {
       "name": "includeAttachments",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -39,54 +38,44 @@
   "outputs": [
     {
       "name": "subject",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "from",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "to",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "date",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "body",
       "type": "String",
-      "required": false,
       "description": "The message text (plain when available, else the HTML)."
     },
     {
       "name": "bodyIsHtml",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     },
     {
       "name": "threadId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "snippet",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "labels",
-      "type": "List[String]",
-      "required": false
+      "type": "List[String]"
     },
     {
       "name": "attachments",
-      "type": "List[File]",
-      "required": false
+      "type": "List[File]"
     }
   ]
 }

@@ -28,6 +28,10 @@ fn apply(source: &str, ops: Vec<EditOp>) -> String {
     apply_edits(source, None, "Untitled", &ops).expect("edits apply").0
 }
 
+fn apply_err(source: &str, ops: Vec<EditOp>) -> String {
+    apply_edits(source, None, "Untitled", &ops).expect_err("edits must be refused").to_string()
+}
+
 /// Assert the source re-parses into a well-formed tree: it round-trips (lossless
 /// guarantee), has no ERROR nodes, and no header carries a second `=` (the
 /// signature of a corrupt rewrite like `n = Text(x) = Text {...}` which this
@@ -199,7 +203,7 @@ fn inverse_edit_restores_original_for_each_op() {
     );
     assert_reversible(
         "a = Text { value: \"x\" }\nb = Debug\n",
-        vec![EditOp::AddEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None }],
+        vec![EditOp::AddEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None, path: vec![] }],
     );
     assert_reversible(
         "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value\n",
@@ -223,11 +227,11 @@ fn inverse_edit_restores_original_for_each_op() {
     );
     assert_reversible(
         "n = Text {\n  value: \"x\"\n}\n",
-        vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }], outputs: vec![] }],
+        vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }], outputs: vec![], removed_inputs: vec![], removed_outputs: vec![] }],
     );
     assert_reversible(
         "g = Group() -> () {\n  x = Debug\n}\n",
-        vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }], outputs: vec![PortSig { name: "outp".into(), required: true, port_type: Some("String".into()) }] }],
+        vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }], outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }] }],
     );
     assert_reversible(
         "g = Group() -> () {\n  x = Debug\n}\n",
@@ -487,7 +491,7 @@ fn remove_scoped_node_keeps_same_local_name_edge_in_another_scope() {
 fn add_and_remove_edge() {
     let src = "a = Text {\n  value: \"x\"\n}\nb = Debug\n";
     let added = apply(src, vec![EditOp::AddEdge {
-        source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
+        source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None, path: vec![],
     }]);
     assert!(added.contains("b.data = a.value"), "{added}");
     let removed = apply(&added, vec![EditOp::RemoveEdge {
@@ -529,7 +533,7 @@ fn add_edge_into_group_input_replaces_driver_no_double() {
     // is matched by its as-written endpoints and rewritten in place.
     let src = "a = Text { value: \"x\" }\nc = Text { value: \"y\" }\ngrp = Group(inp: String) -> () {\n  t = Debug\n  t.data = self.inp\n}\ngrp.inp = a.value\n";
     let out = apply(src, vec![EditOp::AddEdge {
-        source: "c".into(), source_port: "value".into(), target: "grp".into(), target_port: "inp".into(), scope_group: None,
+        source: "c".into(), source_port: "value".into(), target: "grp".into(), target_port: "inp".into(), scope_group: None, path: vec![],
     }]);
     assert!(out.contains("grp.inp = c.value"), "new driver present: {out}");
     assert!(!out.contains("grp.inp = a.value"), "old driver replaced (no double): {out}");
@@ -541,7 +545,7 @@ fn add_edge_into_group_input_replaces_driver_no_double() {
 fn add_edge_replaces_existing_driver() {
     let src = "a = Text {\n  value: \"x\"\n}\nc = Text {\n  value: \"y\"\n}\nb = Debug\nb.data = a.value\n";
     let out = apply(src, vec![EditOp::AddEdge {
-        source: "c".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
+        source: "c".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None, path: vec![],
     }]);
     assert!(out.contains("b.data = c.value"), "{out}");
     assert!(!out.contains("b.data = a.value"), "old driver removed: {out}");
@@ -578,7 +582,7 @@ fn update_group_ports_by_scoped_id_disambiguates_same_local_label() {
     let src = "A = Group() -> () {\n  Inner = Group() -> () {\n    d = Debug {}\n  }\n}\nB = Group() -> () {\n  Inner = Group() -> () {\n    e = Debug {}\n  }\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "A.Inner".into(),
-        inputs: vec![PortSig { name: "x".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "x".into(), required: true, port_type: ("String".into()) }],
         outputs: vec![],
     }]);
     parse_ok(&out);
@@ -623,7 +627,7 @@ fn batch_is_atomic_and_sequential() {
     let src = "a = Text {\n  value: \"x\"\n}\nc = Text {\n  value: \"y\"\n}\nb = Debug\nb.data = a.value\n";
     let out = apply(src, vec![
         EditOp::RemoveEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
-        EditOp::AddEdge { source: "c".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
+        EditOp::AddEdge { source: "c".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None, path: vec![] },
     ]);
     assert!(out.contains("b.data = c.value"), "{out}");
 }
@@ -752,8 +756,8 @@ fn update_node_ports_rewrites_signature() {
     let src = "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "g".into(),
-        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }],
-        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }],
     }]);
     assert!(out.contains("g = Group(inp: String) -> (outp: String)"), "{out}");
     parse_ok(&out);
@@ -768,8 +772,10 @@ fn update_node_ports_on_node_with_body_preserves_body() {
     let src = "n = Text {\n  value: \"x\"\n}\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }],
         outputs: vec![],
+        removed_inputs: vec![],
+        removed_outputs: vec![],
     }]);
     assert!(out.contains("n = Text(inp: String)"), "signature rewritten: {out}");
     assert!(out.contains("value: \"x\""), "body preserved: {out}");
@@ -779,16 +785,40 @@ fn update_node_ports_on_node_with_body_preserves_body() {
 
 
 #[test]
+fn update_node_ports_writes_only_the_custom_surface_and_spares_catalog_wires() {
+    // A polluted header (the editor once restated the node type's whole
+    // signature) shrinks to the custom surface on the next port edit, and a
+    // wire to a port that merely LEFT the header survives: the catalog still
+    // provides that port at enrich, and only `removed_*` kills a wire.
+    let src = "n = Text(value: String) -> (value: String)\nd = Debug { }\nd.data = n.value\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![],
+        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
+        removed_inputs: vec![],
+        removed_outputs: vec![],
+    }]);
+    assert!(out.contains("(extra: String)"), "header is the custom surface only: {out}");
+    assert!(!out.contains("value: String)"), "restated catalog ports left the header: {out}");
+    assert!(out.contains("d.data = n.value"), "catalog port's wire survives: {out}");
+    parse_ok(&out);
+}
+
+#[test]
 fn update_node_ports_drops_connections_on_removed_ports() {
-    // Deleting a port must take its wires with it: the new signature is the
-    // single source of the decl's ports, and a leftover `x.y = n.removed`
-    // fails validation on the next build (the exact bug: deleting the python
-    // node's `stop` output left `self.done = exec_python_1.stop` behind).
+    // Deleting a port must take its wires with it: a leftover
+    // `x.y = n.removed` fails validation on the next build (the exact bug:
+    // deleting the python node's `stop` output left
+    // `self.done = exec_python_1.stop` behind). For a NODE the removal is
+    // EXPLICIT (`removed_outputs`): the header is not the whole surface,
+    // so absence from the signature alone must not kill a wire.
     let src = "n = Text() -> (kept: String, removed: String)\nd = Debug { }\nd.data = n.removed\nd2 = Debug { }\nd2.data = n.kept\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![],
-        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: ("String".into()) }],
+        removed_inputs: vec![],
+        removed_outputs: vec!["removed".into()],
     }]);
     assert!(!out.contains("n.removed"), "wire on the removed port must die: {out}");
     assert!(out.contains("d2.data = n.kept"), "wire on the kept port survives: {out}");
@@ -803,7 +833,9 @@ fn update_node_ports_drops_every_fanout_wire_of_a_removed_output() {
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![],
-        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: Some("String".into()) }],
+        outputs: vec![PortSig { name: "kept".into(), required: true, port_type: ("String".into()) }],
+        removed_inputs: vec![],
+        removed_outputs: vec!["removed".into()],
     }]);
     assert!(!out.contains("n.removed"), "all three fan-out wires must die: {out}");
     assert_eq!(out.matches("= n.kept").count(), 2, "both kept-port wires survive: {out}");
@@ -815,8 +847,10 @@ fn update_node_ports_drops_incoming_connection_on_removed_input() {
     let src = "src_1 = Text() -> (value: String)\nn = Text(a: String, b: String)\nn.a = src_1.value\nn.b = src_1.value\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "a".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
         outputs: vec![],
+        removed_inputs: vec!["b".into()],
+        removed_outputs: vec![],
     }]);
     assert!(!out.contains("n.b ="), "incoming wire on the removed input must die: {out}");
     assert!(out.contains("n.a = src_1.value"), "kept input's wire survives: {out}");
@@ -824,14 +858,218 @@ fn update_node_ports_drops_incoming_connection_on_removed_input() {
 }
 
 #[test]
+fn update_node_ports_drops_body_driver_on_removed_input() {
+    // A wire can live INSIDE the node's braces (`b: src.value`); the
+    // parent-scope sweep never sees it, and left behind it re-creates
+    // the port through the config key on the next enrich.
+    let src = "src_1 = Text() -> (value: String)\nn = Text(a: String, b: String) {\n  b: src_1.value\n}\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![],
+        removed_inputs: vec!["b".into()],
+        removed_outputs: vec![],
+    }]);
+    assert!(!out.contains("src_1.value") || !out.contains("b:"), "body driver on the removed input must die: {out}");
+    assert!(!out.contains("b: src_1.value"), "body driver line gone: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_round_trips_an_unparseable_declared_type() {
+    // The parser keeps a typo'd type as recoverable (MustOverride + a
+    // squiggle), so a gesture on such a node round-trips the verbatim
+    // spelling: refusing it would block the whole gesture, rewriting it
+    // would erase the author's text and the diagnostic pointing at it.
+    let src = "n = Debug(data?: Strng)\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "data".into(), required: false, port_type: ("Strng".into()) }],
+        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
+        removed_inputs: vec![],
+        removed_outputs: vec![],
+    }]);
+    assert!(out.contains("data?: Strng"), "the typo survives verbatim: {out}");
+    assert!(out.contains("extra: String"), "the unrelated gesture lands: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_canonicalizes_a_bare_declared_port() {
+    // A declared port with no annotation (`(x)`) parses as the
+    // MustOverride placeholder; a header rewrite spells that out
+    // (`x?: MustOverride`), the deliberate canonicalization the
+    // `ParsedPort::type_text` doc pins: same parse, made explicit,
+    // never dropped as undeclared.
+    let src = "n = Text(x?)\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "x".into(), required: false, port_type: ("MustOverride".into()) }],
+        outputs: vec![PortSig { name: "extra".into(), required: true, port_type: ("String".into()) }],
+        removed_inputs: vec![],
+        removed_outputs: vec![],
+    }]);
+    assert!(out.contains("x?: MustOverride"), "bare port canonicalized, not dropped: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_refuses_a_header_breaking_type() {
+    // Leniency stops where the string would change the HEADER's shape
+    // (an unbracketed comma splits into a second port).
+    let src = "n = Debug(data: String)\n";
+    let err = apply_err(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "data".into(), required: false, port_type: ("String, fake: T".into()) }],
+        outputs: vec![],
+        removed_inputs: vec![],
+        removed_outputs: vec![],
+    }]);
+    assert!(err.contains("not a valid type"), "structure-breaking type refused: {err}");
+    // The header lexer nests on `[...]` and `{...}`, so a comma or a
+    // paren OUTSIDE them splits the port list on reparse whether or not
+    // the spelling is a legal type (`Fn(Int)` reads back as a port
+    // `Int`; a parenthesized union, a legal type, into phantom ports:
+    // verified against the real parser). A bracket closed by the wrong
+    // kind would send the lexer's balanced scan to end of file.
+    for bad in ["Fn(Int)", "(String | Number)", "Dict[String}", "{a: String]"] {
+        let err = apply_err(src, vec![EditOp::UpdateNodePorts {
+            node: "n".into(),
+            inputs: vec![PortSig { name: "data".into(), required: false, port_type: (bad.into()) }],
+            outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
+        }]);
+        assert!(err.contains("not a valid type"), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn update_node_ports_carries_braces_the_header_can_hold() {
+    // Braces nest like brackets (only a comma or a paren outside
+    // `[...]`/`{...}` splits a port), so a record alias, a two-field
+    // record and a brace inside brackets round-trip unchanged; refusing
+    // them would block every gesture on a node whose header already
+    // spells one.
+    for ok in ["Rec={a: String}", "{a: String, b: Number}", "Dict[String, {a: String}]", "Rec{a,b}"] {
+        let src = "n = Debug(data: String, other: String)\n";
+        let out = apply(src, vec![EditOp::UpdateNodePorts {
+            node: "n".into(),
+            inputs: vec![
+                PortSig { name: "data".into(), required: true, port_type: ok.into() },
+                PortSig { name: "other".into(), required: true, port_type: "String".into() },
+            ],
+            outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
+        }]);
+        assert!(out.contains(&format!("data: {ok}")), "{ok} round-trips: {out}");
+        parse_ok(&out);
+    }
+}
+
+#[test]
+fn update_node_ports_wire_shape() {
+    // Cross-process op: pin the camelCase keys, and that the removal
+    // lists are REQUIRED (a missing one is refused, never read as
+    // "sweep nothing", which would strand a deleted port's wires).
+    let op: EditOp = serde_json::from_str(
+        r#"{"op":"updateNodePorts","node":"n","inputs":[],"outputs":[],"removedInputs":["b"],"removedOutputs":[]}"#,
+    ).unwrap();
+    let EditOp::UpdateNodePorts { removed_inputs, removed_outputs, .. } = &op else {
+        panic!("wrong variant");
+    };
+    assert_eq!(removed_inputs, &vec!["b".to_string()]);
+    assert!(removed_outputs.is_empty());
+    let missing = serde_json::from_str::<EditOp>(
+        r#"{"op":"updateNodePorts","node":"n","inputs":[],"outputs":[],"removedInputs":["b"]}"#,
+    );
+    assert!(missing.is_err(), "a missing removal list is refused, not defaulted");
+    let no_required = serde_json::from_str::<EditOp>(
+        r#"{"op":"updateNodePorts","node":"n","inputs":[{"name":"a","portType":"String"}],"outputs":[],"removedInputs":[],"removedOutputs":[]}"#,
+    );
+    assert!(no_required.is_err(), "a sig without `required` is refused, never read as required");
+    let empty = EditOp::UpdateNodePorts {
+        node: "n".into(), inputs: vec![], outputs: vec![],
+        removed_inputs: vec![], removed_outputs: vec![],
+    };
+    let json = serde_json::to_string(&empty).unwrap();
+    assert!(json.contains("\"removedInputs\":[]") && json.contains("\"removedOutputs\":[]"), "empty lists still written: {json}");
+}
+
+#[test]
+fn update_node_ports_sweeps_wires_of_any_removed_name() {
+    // The removal list is TRUSTED: whether a name may be removed at all
+    // is catalog knowledge only the editor holds (it hides the gesture
+    // for catalog ports and reverts overrides instead of removing
+    // them), so this layer sweeps exactly what it is told to.
+    let src = "n = Text() -> (custom: String)\nd = Debug { }\nd.data = n.custom\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![], outputs: vec![],
+        removed_inputs: vec![], removed_outputs: vec!["custom".into()],
+    }]);
+    assert!(!out.contains("n.custom"), "the removed port's wire dies: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_drops_another_nodes_body_read_of_a_removed_output() {
+    // A removed OUTPUT can be read from inside another node's braces;
+    // that reference must die with the port or the next parse
+    // resurrects a wire the canvas already dropped.
+    let src = "n = Text() -> (custom: String)\nd = Debug { data: n.custom }\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![], outputs: vec![],
+        removed_inputs: vec![], removed_outputs: vec!["custom".into()],
+    }]);
+    assert!(!out.contains("n.custom"), "the braces-endpoint read dies: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_removes_a_config_created_port() {
+    // `notes` exists only through its config key (no header entry); the
+    // removal sweeps its wires and is legal, the key's own line dies
+    // through the editor's paired RemoveConfig.
+    let src = "src_1 = Text() -> (value: String)\nn = Text {\n  notes: \"x\"\n}\nd = Debug { }\nd.data = src_1.value\nn.notes = src_1.value\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![], outputs: vec![],
+        removed_inputs: vec!["notes".into()], removed_outputs: vec![],
+    }]);
+    assert!(!out.contains("n.notes = src_1.value"), "the wire dies: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn update_node_ports_ignores_an_unwired_unknown_removed_name() {
+    // Idempotent: nothing declares or wires `ghost`, so there is
+    // nothing to do and the edit succeeds unchanged.
+    let src = "n = Text(a: String)\n";
+    let out = apply(src, vec![EditOp::UpdateNodePorts {
+        node: "n".into(),
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![],
+        removed_inputs: vec!["ghost".into()], removed_outputs: vec![],
+    }]);
+    assert!(out.contains("n = Text(a: String)"), "unchanged: {out}");
+}
+
+#[test]
 fn update_node_ports_keeps_config_origin_lines() {
     // `n.key = "value"` shares the connection SYNTAX but is a config field
     // (one endpoint); the dangling-wire sweep must never eat it.
-    let src = "n = Text(a: String)\nn.value = \"hello\"\n";
+    // The removed name COLLIDES with the config key: without the
+    // config-origin guard the sweep would eat the fill line.
+    let src = "n = Text(value: String)\nn.value = \"hello\"\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
         inputs: vec![],
         outputs: vec![],
+        removed_inputs: vec!["value".into()],
+        removed_outputs: vec![],
     }]);
     assert!(out.contains("n.value = \"hello\""), "config-origin line survives: {out}");
     parse_ok(&out);
@@ -845,8 +1083,8 @@ fn update_group_ports_drops_self_wiring_on_removed_ports() {
     let src = "g = Group(inp: String) -> (outp: String, gone: String) {\n  x = Text(v: String) -> (value: String)\n  x.v = self.inp\n  self.outp = x.value\n  self.gone = x.value\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "g".into(),
-        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: Some("String".into()) }],
-        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "inp".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }],
     }]);
     assert!(!out.contains("self.gone"), "removed output's boundary wiring must die: {out}");
     assert!(out.contains("self.outp = x.value"), "kept output wiring survives: {out}");
@@ -864,8 +1102,8 @@ fn update_loop_ports_keeps_reserved_done_and_index() {
     let src = "l = Loop(items: List[String], extra: String) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  x = Text(v: String, n: Number, e: String) -> (value: String, stop: Boolean)\n  x.v = self.items\n  x.n = self.index\n  x.e = self.extra\n  self.acc = x.value\n  self.done = x.stop\n}\nl2 = Debug { }\nl2.data = l.acc\n";
     let out = apply(src, vec![EditOp::UpdateLoopPorts {
         loop_id: "l".into(),
-        inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[String]".into()) }],
-        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()) }],
+        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("String".into()) }],
     }]);
     assert!(out.contains("self.done = x.stop"), "reserved self.done survives: {out}");
     assert!(out.contains("x.n = self.index"), "reserved self.index survives: {out}");
@@ -886,8 +1124,8 @@ fn carry_to_gather_batch_drops_the_carry_input_and_its_wires() {
         EditOp::SetLoopConfig { loop_id: "l".into(), key: "carry".into(), value: "[]".into() },
         EditOp::UpdateLoopPorts {
             loop_id: "l".into(),
-            inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[Number]".into()) }],
-            outputs: vec![PortSig { name: "acc".into(), required: true, port_type: Some("Number".into()) }],
+            inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[Number]".into()) }],
+            outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("Number".into()) }],
         },
     ]);
     assert!(!out.contains("l.acc = seed.value"), "the carry input's seed wire must die: {out}");
@@ -907,8 +1145,8 @@ fn update_loop_ports_keeps_wires_of_a_surviving_carry() {
     let src = "seed = Text() -> (value: Number)\nl = Loop(items: List[Number]) -> (acc: Number) {\n  over: [\n  \"items\"\n]\n  carry: [\n  \"acc\"\n]\n  x = Text(v: Number, a: Number) -> (acc: Number)\n  x.v = self.items\n  x.a = self.acc\n  self.acc = x.acc\n}\nl.acc = seed.value\n";
     let out = apply(src, vec![EditOp::UpdateLoopPorts {
         loop_id: "l".into(),
-        inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[Number]".into()) }],
-        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: Some("Number".into()) }],
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[Number]".into()) }],
+        outputs: vec![PortSig { name: "acc".into(), required: true, port_type: ("Number".into()) }],
     }]);
     assert!(out.contains("l.acc = seed.value"), "surviving carry's seed wire stays: {out}");
     assert!(out.contains("x.a = self.acc"), "surviving carry's body read stays: {out}");
@@ -924,8 +1162,10 @@ fn update_node_ports_drops_inline_expr_wire_on_removed_input() {
     let src = "n = Debug(a: String, b: String)\nn.a = Upper { text: \"x\" }.out\nn.b = Upper { text: \"y\" }.out\n";
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "n".into(),
-        inputs: vec![PortSig { name: "a".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "a".into(), required: true, port_type: ("String".into()) }],
         outputs: vec![],
+        removed_inputs: vec!["b".into()],
+        removed_outputs: vec![],
     }]);
     assert!(!out.contains("n.b ="), "inline-expr wire on the removed input must die: {out}");
     assert!(out.contains("n.a = Upper { text: \"x\" }.out"), "inline-expr wire on the kept input survives: {out}");
@@ -940,7 +1180,7 @@ fn add_edge_inside_loop_body_replaces_existing_driver() {
     // SECOND driver line (two drivers on one port).
     let src = "l = Loop(items: List[String]) -> (acc: String) {\n  over: [\n  \"items\"\n]\n  a = Text() -> (value: String)\n  b = Text() -> (value: String)\n  x = Text(v: String) -> (value: String)\n  x.v = a.value\n  self.acc = x.value\n}\n";
     let out = apply(src, vec![EditOp::AddEdge {
-        scope_group: Some("l".into()),
+        scope_group: Some("l".into()), path: vec![],
         source: "b".into(), source_port: "value".into(),
         target: "x".into(), target_port: "v".into(),
     }]);
@@ -973,8 +1213,8 @@ fn update_group_ports_on_anonymous_root_sweeps_self_wiring() {
     let src = "Group(raw: String) -> (outp: String, gone: String) {\n  t = Text(v: String) -> (value: String)\n  t.v = self.raw\n  self.outp = t.value\n  self.gone = t.value\n}\n";
     let out = apply(src, vec![EditOp::UpdateGroupPorts {
         group: "Untitled".into(),
-        inputs: vec![PortSig { name: "raw".into(), required: true, port_type: Some("String".into()) }],
-        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: Some("String".into()) }],
+        inputs: vec![PortSig { name: "raw".into(), required: true, port_type: ("String".into()) }],
+        outputs: vec![PortSig { name: "outp".into(), required: true, port_type: ("String".into()) }],
     }]);
     assert!(!out.contains("self.gone"), "removed output's boundary wiring dies on an anon root: {out}");
     assert!(out.contains("self.outp = t.value"), "kept output wiring survives: {out}");
@@ -989,7 +1229,7 @@ fn add_edge_allows_an_outer_ref_from_inside_a_group() {
     // a top-level node with no `g.`-scoped namesake.
     let src = "a = Text() -> (value: String)\ng = Group() -> () {\n  sink = Debug { }\n}\n";
     let out = apply(src, vec![EditOp::AddEdge {
-        scope_group: Some("g".into()),
+        scope_group: Some("g".into()), path: vec![],
         source: "a".into(), source_port: "value".into(),
         target: "sink".into(), target_port: "data".into(),
     }]);
@@ -1004,7 +1244,7 @@ fn add_edge_rejects_a_dotted_endpoint_ref() {
     // edit refuses it loudly instead.
     let src = "g = Group() -> () {\n  inner = Text() -> (value: String)\n}\nsink = Debug { }\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
-        scope_group: None,
+        scope_group: None, path: vec![],
         source: "g.inner".into(), source_port: "value".into(),
         target: "sink".into(), target_port: "data".into(),
     }]);
@@ -1019,7 +1259,7 @@ fn add_edge_rejects_an_intermediate_ancestor_ref() {
     // leave the authored `sink.data = y.value` dangling), so the edit refuses.
     let src = "outer = Group() -> () {\n  y = Text() -> (value: String)\n  inner = Group() -> () {\n    sink = Debug { }\n  }\n}\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
-        scope_group: Some("outer.inner".into()),
+        scope_group: Some("outer.inner".into()), path: vec![],
         source: "y".into(), source_port: "value".into(),
         target: "sink".into(), target_port: "data".into(),
     }]);
@@ -1034,7 +1274,7 @@ fn add_edge_ref_is_scope_local_not_file_wide() {
     // scoped ref as ambiguous because the local name is reused elsewhere.
     let src = "inner = Text() -> (value: String)\ng = Group() -> () {\n  inner = Text() -> (value: String)\n  sink = Debug { }\n}\n";
     let out = apply(src, vec![EditOp::AddEdge {
-        scope_group: Some("g".into()),
+        scope_group: Some("g".into()), path: vec![],
         source: "inner".into(), source_port: "value".into(),
         target: "sink".into(), target_port: "data".into(),
     }]);
@@ -1304,7 +1544,7 @@ fn add_duplicate_id_fails_loud() {
 fn add_edge_to_missing_endpoint_fails_loud() {
     let src = "b = Debug\n";
     let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
-        source: "ghost".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
+        source: "ghost".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None, path: vec![],
     }]).unwrap_err();
     assert!(matches!(err, EditError::NodeNotFound(_)), "{err:?}");
 }
@@ -1408,14 +1648,14 @@ fn every_name_written_into_source_is_guarded() {
             source_port: inject.into(),
             target: "b".into(),
             target_port: "data".into(),
-            scope_group: None,
+            scope_group: None, path: vec![],
         },
         EditOp::AddEdge {
             source: "a".into(),
             source_port: "value".into(),
             target: "b".into(),
             target_port: inject.into(),
-            scope_group: None,
+            scope_group: None, path: vec![],
         },
     ] {
         let err = apply_edits(two, None, "Untitled", &[op]).unwrap_err();
@@ -1439,8 +1679,10 @@ fn every_name_written_into_source_is_guarded() {
         "Untitled",
         &[EditOp::UpdateNodePorts {
             node: "a".into(),
-            inputs: vec![PortSig { name: inject.into(), port_type: None, required: true }],
+            inputs: vec![PortSig { name: inject.into(), port_type: "String".into(), required: true }],
             outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
         }],
     )
     .unwrap_err();
@@ -1454,10 +1696,12 @@ fn every_name_written_into_source_is_guarded() {
             node: "a".into(),
             inputs: vec![PortSig {
                 name: "p".into(),
-                port_type: Some("String) -> ()\nevil = Text {}\nq: (r".into()),
+                port_type: ("String) -> ()\nevil = Text {}\nq: (r".into()),
                 required: true,
             }],
             outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
         }],
     )
     .unwrap_err();
@@ -1538,8 +1782,10 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
             "Untitled",
             &[EditOp::UpdateNodePorts {
                 node: "n".into(),
-                inputs: vec![PortSig { name: "p".into(), port_type: Some(harmful.into()), required: true }],
+                inputs: vec![PortSig { name: "p".into(), port_type: (harmful.into()), required: true }],
                 outputs: vec![],
+                removed_inputs: vec![],
+                removed_outputs: vec![],
             }],
         )
         .unwrap_err();
@@ -1553,8 +1799,10 @@ fn opaque_token_that_would_swallow_the_file_is_refused() {
                 "Untitled",
                 &[EditOp::UpdateNodePorts {
                     node: "n".into(),
-                    inputs: vec![PortSig { name: "p".into(), port_type: Some(ok.into()), required: true }],
+                    inputs: vec![PortSig { name: "p".into(), port_type: (ok.into()), required: true }],
                     outputs: vec![],
+                    removed_inputs: vec![],
+                    removed_outputs: vec![],
                 }],
             )
             .is_ok(),
@@ -1787,7 +2035,7 @@ fn edit_soak_never_corrupts() {
                 2 => EditOp::AddGroup { label: format!("grp{}", next() % 1000), parent_group: None },
                 3 => EditOp::RemoveNode { node: pick(next(), &targets) },
                 4 => EditOp::SetLabel { node: pick(next(), &targets), label: Some(format!("L{}", next() % 100)) },
-                5 => EditOp::AddEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
+                5 => EditOp::AddEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None, path: vec![] },
                 6 => EditOp::RemoveEdge { source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None },
                 7 => EditOp::RemoveConfig { node: pick(next(), &targets), key: "value".into(), form: None },
                 8 => EditOp::RemoveGroup { group: pick(next(), &targets) },
@@ -1795,7 +2043,7 @@ fn edit_soak_never_corrupts() {
                 10 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 11 => EditOp::MoveNodeScope { node: pick(next(), &targets), target_group: None },
                 12 => EditOp::MoveGroupScope { group: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
-                13 => EditOp::UpdateNodePorts { node: pick(next(), &targets), inputs: vec![PortSig { name: "i".into(), required: true, port_type: Some("String".into()) }], outputs: vec![] },
+                13 => EditOp::UpdateNodePorts { node: pick(next(), &targets), inputs: vec![PortSig { name: "i".into(), required: true, port_type: ("String".into()) }], outputs: vec![], removed_inputs: vec![], removed_outputs: vec![] },
                 14 => EditOp::SetGroupDescription { group: pick(next(), &targets), description: Some(format!("d{}", next() % 100)) },
                 // Loop ops. Some will fail kind-mismatch checks (the
                 // Group-targeted RenameGroup at arm 9 etc. already do
@@ -1807,7 +2055,7 @@ fn edit_soak_never_corrupts() {
                 17 => EditOp::RenameLoop { loop_id: pick(next(), &targets), new_label: format!("lr{}", next() % 1000) },
                 18 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: Some(pick(next(), &targets)) },
                 19 => EditOp::MoveLoopScope { loop_id: pick(next(), &targets), target_group: None },
-                20 => EditOp::UpdateLoopPorts { loop_id: pick(next(), &targets), inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[String]".into()) }], outputs: vec![PortSig { name: "results".into(), required: true, port_type: Some("List[String | Null]".into()) }] },
+                20 => EditOp::UpdateLoopPorts { loop_id: pick(next(), &targets), inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()) }], outputs: vec![PortSig { name: "results".into(), required: true, port_type: ("List[String | Null]".into()) }] },
                 21 => EditOp::SetLoopConfig { loop_id: pick(next(), &targets), key: "max_iters".into(), value: format!("{}", next() % 100) },
                 _ => EditOp::RemoveLoopConfig { loop_id: pick(next(), &targets), key: "max_iters".into() },
             };
@@ -1843,7 +2091,7 @@ fn editop_wire_shape_round_trips() {
         json!({"op":"renameGroup","group":"a","newLabel":"b"}),
         json!({"op":"moveNodeScope","node":"n","targetGroup":"g"}),
         json!({"op":"moveGroupScope","group":"g","targetGroup":null}),
-        json!({"op":"updateNodePorts","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[]}),
+        json!({"op":"updateNodePorts","node":"n","inputs":[{"name":"i","required":true,"portType":"String"}],"outputs":[],"removedInputs":[],"removedOutputs":[]}),
         json!({"op":"updateGroupPorts","group":"g","inputs":[],"outputs":[]}),
         json!({"op":"setGroupDescription","group":"g","description":"d"}),
         // Loop ops: same wire-contract guarantee as the Group/Node
@@ -2293,8 +2541,8 @@ fn update_loop_ports_rewrites_signature() {
     let src = "my = Loop() -> () {\n  parallel: true\n}\n";
     let out = apply(src, vec![EditOp::UpdateLoopPorts {
         loop_id: "my".into(),
-        inputs: vec![PortSig { name: "items".into(), required: true, port_type: Some("List[String]".into()) }],
-        outputs: vec![PortSig { name: "results".into(), required: true, port_type: Some("List[String | Null]".into()) }],
+        inputs: vec![PortSig { name: "items".into(), required: true, port_type: ("List[String]".into()) }],
+        outputs: vec![PortSig { name: "results".into(), required: true, port_type: ("List[String | Null]".into()) }],
     }]);
     parse_ok(&out);
     assert!(out.contains("my = Loop(items: List[String]) -> (results: List[String | Null])"), "{out}");
@@ -2427,7 +2675,7 @@ fn move_loop_scope_rejects_group_target() {
 
 #[test]
 fn set_config_multiline_array_replaces_in_place() {
-    let src = "my = Loop(test: MustOverride?) {\n  parallel: true\n  over: []\n  carry: []\n}\n";
+    let src = "my = Loop(test?: MustOverride) {\n  parallel: true\n  over: []\n  carry: []\n}\n";
     let out = apply(src, vec![EditOp::SetLoopConfig {
         loop_id: "my".into(),
         key: "carry".into(),
@@ -2510,7 +2758,7 @@ fn set_config_node_same_key_twice_in_batch() {
 fn end_to_end_recover_broken_loop_file() {
     // The broken file Quentin saw: duplicate over/carry from a pre-fix
     // race. A single setConfig per key collapses its duplicates.
-    let src = "MyLoop = Loop(test: MustOverride?) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
+    let src = "MyLoop = Loop(test?: MustOverride) {\n  parallel: true\n  over: []\n  over: []\n  carry: []\n  carry: [\n  \"test\"\n]\n  carry: [\n  \"test\"\n]\n}\n";
     let out = apply(src, vec![
         EditOp::SetLoopConfig { loop_id: "MyLoop".into(), key: "carry".into(), value: "[\n  \"test\"\n]".into() },
     ]);
@@ -2555,18 +2803,20 @@ fn set_config_does_not_accumulate_blank_lines() {
 fn update_ports_inside_loop_body_keeps_layout() {
     // Editing a port on a decl that lives inside a loop body must not touch
     // the surrounding decls or the loop's config layout.
-    let src = "MyLoop = Loop(numbers: List[Number]?) -> () {\n  carry: []\n  over: [\"numbers\"]\n  exec_python_1 = ExecPython() {}\n}\n\nrange_1 = Range {\n  from: \"0\"\n}\nMyLoop.numbers = range_1.values\n";
+    let src = "MyLoop = Loop(numbers?: List[Number]) -> () {\n  carry: []\n  over: [\"numbers\"]\n  exec_python_1 = ExecPython() {}\n}\n\nrange_1 = Range {\n  from: \"0\"\n}\nMyLoop.numbers = range_1.values\n";
     let out = apply(src, vec![
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "number".into(), required: false, port_type: Some("MustOverride".into()) },
+                crate::edit::PortSig { name: "number".into(), required: false, port_type: ("MustOverride".into()) },
             ],
             outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
         },
     ]);
     parse_ok(&out);
-    assert!(out.contains("\n  exec_python_1 = ExecPython(number: MustOverride?) {}"), "2-space indent preserved: {out}");
+    assert!(out.contains("\n  exec_python_1 = ExecPython(number?: MustOverride) {}"), "2-space indent preserved: {out}");
     assert!(out.ends_with("MyLoop.numbers = range_1.values\n"), "trailing connection intact: {out}");
 }
 
@@ -2583,9 +2833,11 @@ fn update_ports_at_root_does_not_glue_onto_preceding_connection() {
         EditOp::UpdateNodePorts {
             node: "exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: Some("MustOverride".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("MustOverride".into()) },
             ],
             outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
         },
     ]);
     parse_ok(&out);
@@ -2603,9 +2855,11 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "test".into(), required: false, port_type: Some("MustOverride".into()) },
+                crate::edit::PortSig { name: "test".into(), required: false, port_type: ("MustOverride".into()) },
             ],
             outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
         },
     ]);
     parse_ok(&out);
@@ -2617,9 +2871,11 @@ fn update_ports_does_not_double_indent() {
         EditOp::UpdateNodePorts {
             node: "MyLoop.exec_python_1".into(),
             inputs: vec![
-                crate::edit::PortSig { name: "again".into(), required: false, port_type: Some("MustOverride".into()) },
+                crate::edit::PortSig { name: "again".into(), required: false, port_type: ("MustOverride".into()) },
             ],
             outputs: vec![],
+            removed_inputs: vec![],
+            removed_outputs: vec![],
         },
     ]);
     parse_ok(&out2);
@@ -2629,7 +2885,7 @@ fn update_ports_does_not_double_indent() {
 
 #[test]
 fn move_scope_into_loop_uses_body_indent() {
-    let src = "MyLoop = Loop(numbers: List[Number]?) -> () {\n  parallel: true\n}\nexec_python_1 = ExecPython() {}\n";
+    let src = "MyLoop = Loop(numbers?: List[Number]) -> () {\n  parallel: true\n}\nexec_python_1 = ExecPython() {}\n";
     let out = apply(src, vec![
         EditOp::MoveNodeScope {
             node: "exec_python_1".into(),
@@ -2645,7 +2901,7 @@ fn move_scope_into_loop_with_multiline_carry_field() {
     // The body's last child before `}` is a multi-line JSON value. The
     // helper that finds the body's content indent must read the body's
     // first field, not the JSON value's closing line.
-    let src = "MyLoop = Loop(numbers: List[Number]?) -> () {\n  carry: [\n  \"acc\"\n]\n  over: [\n  \"numbers\"\n]\n}\nexec_python_1 = ExecPython() {}\n";
+    let src = "MyLoop = Loop(numbers?: List[Number]) -> () {\n  carry: [\n  \"acc\"\n]\n  over: [\n  \"numbers\"\n]\n}\nexec_python_1 = ExecPython() {}\n";
     let out = apply(src, vec![
         EditOp::MoveNodeScope {
             node: "exec_python_1".into(),
@@ -2836,7 +3092,7 @@ fn wiring_an_inline_node_de_inlines_it_with_the_wire_kept() {
     let src = "a = Debug {\n  data: Text { value: \"hi\" }.value\n}\nc = Sink\n";
     let out = apply(src, vec![EditOp::AddEdge {
         source: "a__data".into(), source_port: "value".into(),
-        target: "c".into(), target_port: "input".into(), scope_group: None,
+        target: "c".into(), target_port: "input".into(), scope_group: None, path: vec![],
     }]);
     parse_ok(&out);
     assert!(out.contains("a_data = Text"), "extracted named node: {out}");
@@ -3054,7 +3310,7 @@ fn replacing_an_inline_driver_with_an_edge_extracts_it_as_an_orphan() {
     let src = "t = Text { value: \"new\" }\na = Debug\na.data = Old { v: \"1\" }.o\n";
     let out = apply(src, vec![EditOp::AddEdge {
         source: "t".into(), source_port: "value".into(),
-        target: "a".into(), target_port: "data".into(), scope_group: None,
+        target: "a".into(), target_port: "data".into(), scope_group: None, path: vec![],
     }]);
     parse_ok(&out);
     assert!(out.contains("a_data = Old"), "old driver survives as an orphan: {out}");
@@ -3068,7 +3324,7 @@ fn replacing_a_braces_endpoint_driver_removes_that_field() {
     let src = "t = Text { value: \"1\" }\nu = Text { value: \"2\" }\na = Debug {\n  data: t.value\n}\n";
     let out = apply(src, vec![EditOp::AddEdge {
         source: "u".into(), source_port: "value".into(),
-        target: "a".into(), target_port: "data".into(), scope_group: None,
+        target: "a".into(), target_port: "data".into(), scope_group: None, path: vec![],
     }]);
     parse_ok(&out);
     let edges = compiled_edges(&out);
@@ -3138,11 +3394,12 @@ fn inserting_into_a_one_line_body_keeps_it_one_line() {
 
 #[test]
 fn set_config_on_a_bodyless_inline_synthesizes_a_body_and_keeps_the_wire() {
-    // `data: Foo.out` parses as a BODYLESS inline expression. Inserting
-    // a field must rebuild `Foo { v: "x" }.out` (type + port intact),
+    // `data: Foo().out` is a bodyless inline expression. Parentheses
+    // distinguish creation from a reference to an uppercase node ID.
+    // Inserting a field must preserve the type, signature and output,
     // never degrade the value into a JSON object literal (which would
     // silently delete the node and its wire).
-    let src = "a = Debug {\n  data: Foo.out\n}\n";
+    let src = "a = Debug {\n  data: Foo().out\n}\n";
     let out = apply(src, vec![EditOp::SetConfig {
         node: "a__data".into(), key: "v".into(), value: "\"x\"".into(), form: None,
     }]);
@@ -3193,11 +3450,13 @@ fn updating_ports_on_an_inline_de_inlines_it() {
     let out = apply(src, vec![EditOp::UpdateNodePorts {
         node: "a__data".into(),
         inputs: vec![],
-        outputs: vec![PortSig { name: "o".into(), required: false, port_type: Some("String".into()) }],
+        outputs: vec![PortSig { name: "o".into(), required: true, port_type: ("String".into()) }],
+        removed_inputs: vec![],
+        removed_outputs: vec![],
     }]);
     parse_ok(&out);
     assert!(out.contains("a_data = Custom"), "{out}");
-    assert!(out.contains("-> (o: String?)") || out.contains("-> (o: String)"), "signature written: {out}");
+    assert!(out.contains("-> (o: String)"), "signature written: {out}");
     assert!(compiled_edges(&out).contains(&("a_data".into(), "a".into())), "wire kept: {out}");
 }
 #[test]
@@ -3317,4 +3576,270 @@ fn set_config_reads_ports_from_the_tree_not_the_header_text() {
         matches!(&err, EditError::InvalidArgument(m) if m.contains("not a port of the group")),
         "a fragment of a type is not a port: {err:?}"
     );
+}
+
+/// Removing a field from a ONE-LINE body takes its list comma with it
+/// (the comma before it, or, for the first field, the one after), and
+/// keeps the space before the closing brace. Without this, every
+/// removal stranded a comma: `{ a: 1,}`, `{ a: 1,, c: 3 }`, `{, b: 2 }`.
+#[test]
+fn remove_config_inline_takes_its_comma() {
+    let src = "t = Text { value: \"x\", style: \"bold\", size: 3 }\n";
+    let mid = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into(), form: None }]);
+    assert_eq!(mid, "t = Text { value: \"x\", size: 3 }\n");
+    parse_ok(&mid);
+    let last = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "size".into(), form: None }]);
+    assert_eq!(last, "t = Text { value: \"x\", style: \"bold\" }\n");
+    parse_ok(&last);
+    let first = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "value".into(), form: None }]);
+    assert_eq!(first, "t = Text { style: \"bold\", size: 3 }\n");
+    parse_ok(&first);
+
+    // A body with a trailing comma: removing the last field takes the
+    // dangling comma too.
+    let trailing = "t = Text { value: \"x\", size: 3, }\n";
+    let out = apply(trailing, vec![EditOp::RemoveConfig { node: "t".into(), key: "size".into(), form: None }]);
+    assert_eq!(out, "t = Text { value: \"x\" }\n");
+    parse_ok(&out);
+
+    // Space before the separating comma: no double space survives.
+    let spaced = "t = Text { value: \"x\" , size: 3 }\n";
+    let out = apply(spaced, vec![EditOp::RemoveConfig { node: "t".into(), key: "size".into(), form: None }]);
+    assert_eq!(out, "t = Text { value: \"x\" }\n");
+    parse_ok(&out);
+
+    // Spaced commas around the FIRST field: still exactly one space
+    // survives (the removed field's own trailing run must not splice
+    // back beside the surviving gap).
+    let spaced_first = "t = Text { value: \"x\" , style: \"b\" , size: 3 }\n";
+    let out = apply(spaced_first, vec![EditOp::RemoveConfig { node: "t".into(), key: "value".into(), form: None }]);
+    assert_eq!(out, "t = Text { style: \"b\" , size: 3 }\n");
+    parse_ok(&out);
+}
+
+/// A comment alone on its line above a field describes that field, so it
+/// leaves with it; a trailing comment on the PREVIOUS line's content
+/// stays where it is.
+#[test]
+fn remove_config_takes_the_fields_own_comment_line() {
+    let src = "t = Text {\n  value: \"x\" # keep me\n  # about style\n  style: \"bold\"\n}\n";
+    let out = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into(), form: None }]);
+    assert_eq!(out, "t = Text {\n  value: \"x\" # keep me\n}\n");
+    parse_ok(&out);
+}
+
+/// A trailing comment on a content line inside the body keeps the
+/// newline that terminates it. Removing the LAST field after such a
+/// comment once deleted that newline, sliding the closing brace up
+/// into the comment and swallowing every declaration after the node.
+#[test]
+fn remove_config_never_feeds_the_brace_to_a_comment() {
+    let src = "t = Text { value: \"x\", # note\n  size: 3 }\nu = Text { value: \"y\" }\n";
+    let out = apply(src, vec![EditOp::RemoveConfig { node: "t".into(), key: "size".into(), form: None }]);
+    assert_eq!(out, "t = Text { value: \"x\" # note\n  }\nu = Text { value: \"y\" }\n");
+    parse_ok(&out);
+    // The declaration after the node is still editable: the brace never
+    // joined the comment.
+    let again = apply(&out, vec![EditOp::SetConfig {
+        node: "u".into(),
+        key: "size".into(),
+        value: "4".into(),
+        form: None,
+    }]);
+    assert!(again.contains("u = Text { value: \"y\""), "u survived: {again}");
+
+    // A comment between the comma and the field: the comma is still
+    // found and taken, the comment stays.
+    let between = "t = Text { value: \"x\",\n  # rationale\n  size: 3 }\n";
+    let out = apply(between, vec![EditOp::RemoveConfig { node: "t".into(), key: "size".into(), form: None }]);
+    assert_eq!(out, "t = Text { value: \"x\" }\n");
+    parse_ok(&out);
+
+    // A surviving trailing comment between the separator and a MIDDLE
+    // field: the comma AFTER the field goes instead, so no separator
+    // strands alone after the comment.
+    let mid = "t = Text { value: \"x\", # c\n  style: \"b\", size: 3 }\n";
+    let out = apply(mid, vec![EditOp::RemoveConfig { node: "t".into(), key: "style".into(), form: None }]);
+    assert_eq!(out, "t = Text { value: \"x\", # c\n  size: 3 }\n");
+    parse_ok(&out);
+
+    // A surviving comment AND a dangling trailing comma after the LAST
+    // field: both the trailing comma and the separator before the field
+    // go, so neither strands (`{ value: "x", }` is the exact shape this
+    // function exists to prevent).
+    let trailing = "t = Text { value: \"x\", # c\n  size: 3, }\n";
+    let out = apply(trailing, vec![EditOp::RemoveConfig { node: "t".into(), key: "size".into(), form: None }]);
+    assert_eq!(out, "t = Text { value: \"x\" # c\n  }\n");
+    parse_ok(&out);
+}
+
+/// Collapsing a duplicate key through SetConfig removes the stale
+/// sibling WITH its comma, same as a RemoveConfig would.
+#[test]
+fn set_config_collapses_duplicates_without_stranding_commas() {
+    let src = "t = Text { value: \"x\", value: \"y\", size: 3 }\n";
+    let out = apply(src, vec![EditOp::SetConfig {
+        node: "t".into(),
+        key: "value".into(),
+        value: "\"z\"".into(),
+        form: None,
+    }]);
+    assert_eq!(out, "t = Text { value: \"z\", size: 3 }\n");
+    parse_ok(&out);
+}
+
+/// Removing a field-form wire (`key: src.port` in a one-line body) is a
+/// field removal too: the comma goes with it.
+#[test]
+fn remove_edge_field_form_takes_its_comma() {
+    let src = "s = Const { value: \"v\" }\nt = Text { value: \"x\", extra: s.out }\n";
+    let out = apply(src, vec![EditOp::RemoveEdge {
+        source: "s".into(),
+        source_port: "out".into(),
+        target: "t".into(),
+        target_port: "extra".into(),
+        scope_group: None,
+    }]);
+    assert_eq!(out, "s = Const { value: \"v\" }\nt = Text { value: \"x\" }\n");
+    parse_ok(&out);
+}
+
+/// The same comma rule inside an INLINE node expression's one-line
+/// body (a connection handle removed off `Provider { ... }.port`):
+/// removing the last field leaves the body exactly as it was before
+/// the field was added, byte for byte.
+#[test]
+fn remove_config_inline_expression_round_trips() {
+    let src = "draft = LlmInference {\n  prompt: \"x\"\n  provider: OpenRouterProvider { model: \"m\", connection: {\"id\":\"g\"} }.provider\n}\n";
+    let out = apply(src, vec![EditOp::RemoveConfig { node: "draft__provider".into(), key: "connection".into(), form: None }]);
+    assert_eq!(out, "draft = LlmInference {\n  prompt: \"x\"\n  provider: OpenRouterProvider { model: \"m\" }.provider\n}\n");
+    parse_ok(&out);
+}
+
+/// An edge with a path writes the keys after the source port, and the
+/// same RemoveEdge (a target port has one driver) takes it back out.
+#[test]
+fn rewiring_a_port_keeps_the_spelling_it_was_written_in() {
+    let add = |path: &[&str]| EditOp::AddEdge {
+        source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(),
+        scope_group: None, path: path.iter().map(|k| k.to_string()).collect(),
+    };
+    // Braces form stays braces form, in place, and nothing lands at the
+    // end of the file.
+    let braces = "a = Text {\n  value: \"x\"\n}\nb = Debug {\n  data: a.value\n}";
+    let out = apply(braces, vec![add(&["skill", "name"])]);
+    assert_eq!(out, "a = Text {\n  value: \"x\"\n}\nb = Debug {\n  data: a.value.skill.name\n}", "{out}");
+    let back = apply(&out, vec![add(&[])]);
+    assert_eq!(back, braces, "{back}");
+    // Statement form stays a statement, on its own line, comment kept.
+    let stmt = "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value # why\n";
+    let out = apply(stmt, vec![add(&["skill"])]);
+    assert_eq!(out, "a = Text { value: \"x\" }\nb = Debug\nb.data = a.value.skill # why\n", "{out}");
+    // A new wire on a file with no trailing newline goes on its own line.
+    let out = apply("a = Text {\n  value: \"x\"\n}\nb = Debug {\n}", vec![add(&["skill"])]);
+    assert_eq!(out, "a = Text {\n  value: \"x\"\n}\nb = Debug {\n}\nb.data = a.value.skill\n", "{out}");
+    // Inside a group body, the braces spelling is kept there too.
+    let grouped = "g = Group() -> () {\n  a = Text { value: \"x\" }\n  b = Debug {\n    data: a.value\n  }\n}\n";
+    let out = apply(grouped, vec![EditOp::AddEdge {
+        source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(),
+        scope_group: Some("g".into()), path: vec!["k".into()],
+    }]);
+    assert_eq!(out, "g = Group() -> () {\n  a = Text { value: \"x\" }\n  b = Debug {\n    data: a.value.k\n  }\n}\n", "{out}");
+}
+
+#[test]
+fn add_edge_with_a_path_writes_the_dotted_source() {
+    let src = "a = Text {\n  value: \"x\"\n}\nb = Debug\n";
+    let added = apply(src, vec![EditOp::AddEdge {
+        source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(),
+        scope_group: None, path: vec!["profile".into(), "wpm".into()],
+    }]);
+    assert!(added.contains("b.data = a.value.profile.wpm"), "{added}");
+    let removed = apply(&added, vec![EditOp::RemoveEdge {
+        source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(), scope_group: None,
+    }]);
+    assert!(!removed.contains("b.data"), "{removed}");
+    let err = apply_edits(src, None, "Untitled", &[EditOp::AddEdge {
+        source: "a".into(), source_port: "value".into(), target: "b".into(), target_port: "data".into(),
+        scope_group: None, path: vec!["bad key".into()],
+    }]).expect_err("a path key is an identifier");
+    assert!(format!("{err}").contains("path key"), "{err}");
+}
+
+#[test]
+fn remove_group_drops_braces_form_external_wires_and_keeps_its_type_decl() {
+    // An outside node may read the group's output in its braces
+    // (`data: grp.outp`) rather than on a statement line; ungrouping
+    // drops that reference like the statement form. A `type` declared
+    // in the group body moves up with the children (it is a member of
+    // the scope, not wiring).
+    let src = "grp = Group() -> (outp: String) {\n  type Local = String\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\nd = Debug { data: grp.outp }\n";
+    let out = apply(src, vec![EditOp::RemoveGroup { group: "grp".into() }]);
+    assert!(!out.contains("grp.outp"), "braces-form reference dropped: {out}");
+    assert!(out.contains("type Local = String"), "type declaration survives the ungroup: {out}");
+    assert!(out.contains("t = Text"), "{out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn rename_group_rewrites_braces_form_references() {
+    let src = "grp = Group() -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = t.value\n}\nd = Debug { data: grp.outp }\n";
+    let out = apply(src, vec![EditOp::RenameGroup { group: "grp".into(), new_label: "proc".into() }]);
+    assert!(out.contains("data: proc.outp"), "braces-form reference renamed: {out}");
+    assert!(!out.contains("grp"), "no stale grp: {out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn move_node_blocks_on_a_braces_form_wire_at_either_end() {
+    let src = "t = Text { value: \"a\" }\nd = Debug { data: t.value }\ngrp = Group() -> () {}\n";
+    // The target of the braces wire carries it inside its own body.
+    let err = apply_err(src, vec![EditOp::MoveNodeScope { node: "d".into(), target_group: Some("grp".into()) }]);
+    assert!(err.contains("cross the scope boundary"), "{err}");
+    // The source is referenced from another node's braces.
+    let err = apply_err(src, vec![EditOp::MoveNodeScope { node: "t".into(), target_group: Some("grp".into()) }]);
+    assert!(err.contains("cross the scope boundary"), "{err}");
+}
+
+#[test]
+fn move_node_out_of_the_scope_declaring_its_port_type_is_refused() {
+    // `Local` is declared inside `grp`; moving the node that names it to the
+    // file root would leave the name unresolvable (or, had a same-named type
+    // existed there, silently change the port's contract).
+    let src = "grp = Group() -> () {\n  type Local = String\n  n = Text(inp: Local)\n}\n";
+    let err = apply_err(src, vec![EditOp::MoveNodeScope { node: "grp.n".into(), target_group: None }]);
+    assert!(err.contains("scope change would"), "{err}");
+    // The same node moves freely when the type is visible at the destination.
+    let src = "type Local = String\ngrp = Group() -> () {\n  n = Text(inp: Local)\n}\n";
+    let out = apply(src, vec![EditOp::MoveNodeScope { node: "grp.n".into(), target_group: None }]);
+    assert!(structure(&out).nodes.iter().any(|n| n.id == "n"), "{out}");
+    parse_ok(&out);
+}
+
+#[test]
+fn add_edge_refuses_a_port_holding_an_explicit_literal_in_either_form() {
+    for src in [
+        "t = Text { value: \"a\" }\nd = Debug { data: \"lit\" }\n",
+        "t = Text { value: \"a\" }\nd = Debug\nd.data = \"lit\"\n",
+    ] {
+        let err = apply_err(src, vec![EditOp::AddEdge {
+            source: "t".into(), source_port: "value".into(),
+            target: "d".into(), target_port: "data".into(),
+            scope_group: None, path: vec![],
+        }]);
+        assert!(err.contains("explicit literal"), "{err}");
+    }
+}
+
+#[test]
+fn port_updates_reject_a_duplicate_port_name_per_side() {
+    let src = "g = Group() -> () {\n  x = Text { value: \"a\" }\n}\nn = Text\n";
+    let dup = vec![
+        PortSig { name: "a".into(), required: true, port_type: "String".into() },
+        PortSig { name: "a".into(), required: true, port_type: "Number".into() },
+    ];
+    let err = apply_err(src, vec![EditOp::UpdateGroupPorts { group: "g".into(), inputs: dup.clone(), outputs: vec![] }]);
+    assert!(err.contains("duplicate input port 'a'"), "{err}");
+    let err = apply_err(src, vec![EditOp::UpdateNodePorts { node: "n".into(), inputs: vec![], outputs: dup, removed_inputs: vec![], removed_outputs: vec![] }]);
+    assert!(err.contains("duplicate output port 'a'"), "{err}");
 }

@@ -153,19 +153,29 @@ async fn poll_handler(State(body): State<Arc<Mutex<String>>>) -> impl IntoRespon
 /// the other fakes (bound on the host, advertised at the kind host-gateway IP).
 pub struct BytesFake {
     base_url: String,
+    served: Arc<std::sync::atomic::AtomicUsize>,
     _server: AbortOnDrop,
+}
+
+/// What the bytes handler holds: the body, and a count of the times it
+/// was fetched (a test's proof of WHO fetched, and when).
+#[derive(Clone)]
+struct BytesState {
+    body: Arc<Vec<u8>>,
+    served: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl BytesFake {
     /// Serve `content` (as `application/octet-stream`) at `<url>()`.
     pub async fn start(content: Vec<u8>) -> Result<Self> {
-        let body = Arc::new(content);
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (gateway, listener, port) = bind_host("bytes").await?;
         let app = Router::new()
             .route("/bytes", get(bytes_handler))
-            .with_state(body);
+            .with_state(BytesState { body: Arc::new(content), served: served.clone() });
         Ok(Self {
             base_url: format!("http://{gateway}:{port}"),
+            served,
             _server: serve_axum(listener, app),
         })
     }
@@ -174,12 +184,18 @@ impl BytesFake {
     pub fn url(&self) -> String {
         format!("{}/bytes", self.base_url)
     }
+
+    /// How many times the bytes were fetched so far.
+    pub fn served(&self) -> usize {
+        self.served.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
-async fn bytes_handler(State(body): State<Arc<Vec<u8>>>) -> impl IntoResponse {
+async fn bytes_handler(State(state): State<BytesState>) -> impl IntoResponse {
+    state.served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     (
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-        (*body).clone(),
+        (*state.body).clone(),
     )
 }
 

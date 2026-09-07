@@ -40,12 +40,21 @@ console.
 
 ## Inputs
 
+Every value a node takes from the graph is an input port, one value per port.
+A node never asks the author to pack several values into one list or dict
+first: `PostgresExecuteQuery` once took its parameters as a `List`, and every
+query with two parameters cost the program a Python node whose whole body was
+`return {'params': [a, b]}`. When the set of values is open-ended (a query's
+parameters, a template's holes, a script's variables), the node declares
+`canAddInputPorts` in `features` and the author declares the ports inline:
+`PostgresExecuteQuery(user_id: String) { query: "... WHERE id = $user_id" }`.
+The body reads them with `ctx.inputs.custom()`.
+
 ```json
 {
   "name": "method",
   "type": "String",
   "required": true,
-  "exposure": "config",
   "widget": { "kind": "select", "options": ["GET", "POST"] },
   "default": "GET",
   "label": "Method",
@@ -54,27 +63,35 @@ console.
 }
 ```
 
-### `exposure`
+### `accepts`
 
-Where a literal for this input may live. Whether a wire may drive it is a
-separate question, answered in the last column.
+Which of the two drivers this input takes. A value written in the source is a
+`literal` (whatever its spelling: in the braces, on its own `n.x = ...` line,
+a `@file` or `@asset` marker); a value another node produces is a `wire` (an
+edge, a dotted value in the braces, an inline node). Leave the key out and the
+input takes both, which is what almost every port wants.
 
-| Value | Braces literal `M { x: 5 }` | Statement literal `n.x = 5` | Wire |
-|---|---|---|---|
-| `all` | yes | yes | yes |
-| `assignment` | no | yes | yes |
-| `config` | yes | no | **no** |
-| `wire` | no | no | yes |
+```json
+"accepts": ["wire"]
+```
 
-`all` is the default for plain data, `assignment` for file types so
-`n.image = @asset("i.png", Image)` reads naturally, and `wire` for `Bus`
-inputs. Declare `config` for a pure design-time setting, what a select or a
-form builder configures, since no type defaults to it. Declare `wire` for an
-input that needs a real node rather than a value, such as an inference node's
-`provider`.
+An input never adds a form; it only removes one, and only for a reason the
+node can name. `["wire"]` refuses every written value, for a port that needs
+a real node rather than a value (an inference node's `provider`, `history`,
+`params`). `["literal"]` refuses wiring. Getting it wrong is
+`input-accepts`, and the message reads the list back: "`params` accepts:
+wire".
 
-An input has exactly one driver. Two is `double-driven-port`, and a wire on a
-`config` input is `input-not-wireable`.
+Two kinds of port carry no list, because their drivers are not yours to pick.
+A `Bus` or `Generator` port is wire-only by nature (a live handle no human can
+write); the loader forces it, and a list naming `literal` there is an error.
+A port the compiler reads to build the node, the list named in
+`portsFromConfig` or the input carrying the access picker, takes an inline
+typed value only: no wire, no `@file`, no `@asset`, so the node's shape is
+readable in the source without following anything. That is a fixed rule
+nobody writes and no `accepts` loosens.
+
+An input has exactly one driver. Two is `double-driven-port`.
 
 ### `widget`
 
@@ -92,10 +109,11 @@ per file.
 
 | Kind | For |
 |---|---|
-| `select` / `multiselect` | a small fixed vocabulary; takes `options` |
+| `select` / `multiselect` | a small fixed vocabulary; takes `options`. A written value outside them is a compile error, a wired one fails the firing |
 | `textarea` | a multi-line box, for a String that holds prose |
 | `code` | a code editor; takes `language` |
-| `number` | takes `min` / `max` / `step`, enforced by both the editor and the compiler |
+| `number` | takes `min` / `max` / `step`; the editor and the compiler hold a written value to them, and the run holds a wired one (a whole-number `step` refuses a fraction) |
+| `datetime` | a calendar-and-clock picker for a String holding one moment; stores ISO-8601 with the picker's zone offset |
 | `password` | a masked field |
 | `file_drop` | narrows the file filter beyond the type; takes `accept` |
 | `text_list` | a list of short text values, added one at a time |
@@ -130,13 +148,16 @@ See [Using a connection](../connections/using-a-connection.md#declaring-what-you
 ## Outputs
 
 ```json
-{ "name": "ts", "type": "String", "required": false,
+{ "name": "ts", "type": "String",
   "description": "The posted message's timestamp." }
 ```
 
-Simpler than inputs: no exposure, no widget, no default. A port not present in
-a firing's output emits no pulse, which closes it and skips what is downstream:
-[the closure rule](../language/mental-model.md#the-closed-pulse).
+Simpler than inputs: no widget, no default, and no `required`. An output has
+no optionality to declare: a port not present in a firing's output emits no
+pulse, which closes it and skips what is downstream, whatever the metadata
+could have said. That is [the closure
+rule](../language/mental-model.md#the-closed-pulse). A `required` key on an
+output is refused at load, naming the removal.
 
 ## `features`
 
@@ -144,35 +165,15 @@ The complete set, `hidden` aside, which only catalog nodes use:
 
 | Flag | Meaning |
 |---|---|
-| `isOutputDefault` | this node's firing is the deliverable |
 | `isTrigger` | this node starts executions from outside |
 | `optionalCustomInputs` | ports created by a wire on this node are optional by default |
-| `customInputType` | the type every created port takes; a shared variable (`T`) makes them one type |
+| `customInputType` | the type every WIRED created port takes; a shared variable (`T`) makes them one type. A port created by a config literal takes the literal's own inferred type instead, so a non-string literal on a `String`-typed node is caught at run time by the node, loudly |
 | `liveEndpoint` | names the endpoint serving `/live` for an infra node |
-| `canAddInputPorts` | the `.weft` author may add input ports to this node, by declaring them or by wiring a config key that names no declared port. Without it, an extra port is a compile error. |
+| `canAddInputPorts` | the `.weft` author may add input ports to this node, by declaring them or by wiring a config key that names no declared port. Without it, an extra port is a compile error. This is how a node takes an open-ended set of values (`ExecPython`, `Format`, `PostgresExecuteQuery`); never a `List` input the author has to assemble. |
 | `canAddOutputPorts` | the same for outputs |
 | `showDebugPreview` | the editor renders the node's latest output inline on its body |
 | `oneOfRequired` | groups of ports where at least one of each group has to arrive, or the node is **skipped**. `[["message", "attachment"]]` means a send needs one or the other. |
 | `castPorts` | this node converts a named input into a named output's declared type, checked against the conversion table at compile time |
-
-### `isOutputDefault`
-
-Decide this one per node; there is no safe default. A run starts from the
-output nodes and walks upstream, so a node nothing downstream asks for does not
-execute at all: this flag is what lets a user drop yours at the end of a chain
-and hit run. See
-[what actually runs](../language/mental-model.md#what-actually-runs).
-
-Set it true if your node's firing **is** the deliverable:
-
-- it generates an artifact: an image, a video, speech,
-- or it performs the outward effect: sends the message, creates the record,
-  uploads the file.
-
-Leave it unset for reads, transforms, lookups, and triggers.
-
-Any project can override it per instance with `_is_output` in the node's
-config.
 
 ## `display`
 

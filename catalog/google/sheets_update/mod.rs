@@ -25,6 +25,10 @@ impl Node for GoogleSheetsUpdateNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        /// Google Sheets tops out at ten million cells per spreadsheet,
+        /// so no addressable row is anywhere near this.
+        const MAX_SHEET_ROW: f64 = 10_000_000.0;
+
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
         let gid: String = ctx.inputs.get("tab")?;
@@ -40,13 +44,15 @@ impl Node for GoogleSheetsUpdateNode {
         let cells = row_to_cells(&row, headers.as_deref())?;
 
         let addr = match (row_number, range) {
+            // The widget holds `rowNumber` to a whole number from 1,
+            // wired or written, and a value outside that fails the node
+            // before this runs. What it does not bound is the top end,
+            // and a sheet has nothing like a billion rows, so an
+            // absurd one is caught here rather than saturating the
+            // cast into a nonsense address.
+            (Some(n), None) if n <= MAX_SHEET_ROW => format!("A{}", n as u64),
             (Some(n), None) => {
-                let n = n as u64;
-                if n == 0 {
-                    weft::node_bail!("rowNumber is 1-based; 0 addresses nothing");
-                }
-                // A whole-row write starting at column A.
-                format!("A{n}")
+                weft::node_bail!("rowNumber {n} is past the last row a sheet can have")
             }
             (None, Some(r)) => r,
             (Some(_), Some(_)) => {

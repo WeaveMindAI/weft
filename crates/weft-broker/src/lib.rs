@@ -14,6 +14,7 @@ pub mod auth;
 pub mod credential;
 pub mod entitlement;
 pub mod handlers;
+pub mod lifecycle_writes;
 pub mod access_admin;
 pub mod app_provider;
 pub mod events;
@@ -93,6 +94,12 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route(
             "/v1/journal/has_terminal",
             post(handlers::journal_has_terminal),
+        )
+        // Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`)
+        .route("/v1/execution/tag", post(handlers::execution_tag))
+        .route(
+            "/v1/execution/stop_tagged",
+            post(handlers::execution_stop_tagged),
         )
         // Tasks
         .route("/v1/task/enqueue_dedup", post(handlers::task_enqueue_dedup))

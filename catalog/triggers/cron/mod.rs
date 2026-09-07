@@ -27,10 +27,11 @@ impl Node for CronNode {
     }
 
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        // `cron` declares a metadata default, so the bag always holds
-        // an expression.
+        // Both inputs declare a metadata default, so the bag always
+        // holds an expression and a zone.
         let expression: String = ctx.inputs.get("cron")?;
-        let spec = TimerSpec::Cron { expression };
+        let timezone: String = ctx.inputs.get("timezone")?;
+        let spec = TimerSpec::Cron { expression, timezone };
         // Registers the signal; setup emits nothing downstream.
         ctx.register_signal(Timer { spec }).await
     }

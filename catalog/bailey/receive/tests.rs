@@ -56,6 +56,7 @@ async fn text_fire(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn media_fire(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
     rig.respond_raw("GET", "/media/wa-9", 200, "image/jpeg", b"JPEG".to_vec());
     rig.wake(json!({
         "messageType": "image",
@@ -73,12 +74,13 @@ async fn media_fire(rig: FakeRig) -> WeftResult<()> {
     // `__weft_image__`).
     let blob = &outcome.outputs["file"]["__weft_image__"];
     assert_eq!(blob["mimeType"], json!("image/jpeg"), "the media landed in storage");
-    assert_eq!(blob["filename"], json!("whatsapp-wa-9"));
+    assert_eq!(blob["filename"], json!("wa-9"));
     // Received media cannot be re-fetched once the bridge's copy ages
-    // out, so the node must store it with a keep TTL: a regression to
-    // a run-scoped put would resurface as "media expired" previews.
+    // out, so it lives in PROJECT storage under the message's identity
+    // (see `bridge_api::fetch_media`, and the fetch-media node's own
+    // "same message twice is one file" test for the identity half).
     let key = blob["key"].as_str().expect("stored value carries its key");
-    assert!(rig.stored_meta(key)?.keep, "received media is kept past the run");
+    assert!(rig.stored_meta(key).is_ok(), "the media is stored");
     Ok(())
 }
 
@@ -109,6 +111,7 @@ async fn payload_file_is_stripped(rig: FakeRig) -> WeftResult<()> {
 
     // The media path derives the port itself; the payload's key still
     // loses.
+    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
     rig.respond_raw("GET", "/media/wa-11", 200, "image/jpeg", b"JPEG".to_vec());
     rig.wake(json!({
         "messageType": "image",
@@ -124,7 +127,7 @@ async fn payload_file_is_stripped(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     let blob = &outcome.outputs["file"]["__weft_image__"];
-    assert_eq!(blob["filename"], json!("whatsapp-wa-11"), "the port carries the derived reference");
+    assert_eq!(blob["filename"], json!("wa-11"), "the port carries the derived reference");
     assert_ne!(blob["key"], json!("attacker/forged"), "never the payload's forged one");
     Ok(())
 }

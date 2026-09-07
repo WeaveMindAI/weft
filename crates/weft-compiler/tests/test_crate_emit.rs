@@ -253,6 +253,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         port_literal_spans: Default::default(),
         file_refs: Default::default(),
         include_path: None,
+        source_file: None,
     };
     let project = ProjectDefinition {
         id: uuid::Uuid::nil(),

@@ -57,6 +57,8 @@ export type {
   HostMessage,
   WebviewMessage,
   CatalogEntry,
+  CancelCause,
+  SkipReason,
 } from './protocol';
 
 // The editor's view of a project + execution state, for consumers that build
@@ -97,4 +99,4 @@ export type {
   NodeTemplate,
 } from './webview/lib/types';
 export { fieldForInput, LOOP_CONFIG_FIELDS } from './webview/lib/utils/input-field';
-export { inputExposure, isLoopNodeType } from './webview/lib/types';
+export { acceptsLiteral, acceptsWire, isLoopNodeType } from './webview/lib/types';

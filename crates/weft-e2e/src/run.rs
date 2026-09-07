@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::client::{poll_until, Dispatcher};
+use crate::client::{poll_until, poll_until_describing, Dispatcher};
 use crate::event::{Replay, TERMINAL_KINDS};
 use crate::project::Project;
 
@@ -50,9 +50,8 @@ pub async fn run_and_settle(project: &mut Project) -> Result<SettledRun> {
 }
 
 /// Fire an AIMED run (`weft run --target <node>` per target) and wait
-/// for it to settle. The dispatcher journals the targets' upstream
-/// closure as the run's boundary; everything a pulse reaches outside it
-/// skips with reason `outside_this_run`.
+/// for it to settle. The dispatcher kicks only the roots the targets
+/// need; pulses then run whatever those roots reach.
 pub async fn run_targeted_and_settle(
     project: &mut Project,
     targets: &[&str],
@@ -143,34 +142,96 @@ pub async fn wait_for_triggered_execution(
     known: &HashSet<Uuid>,
     deadline: Duration,
 ) -> Result<Uuid> {
-    poll_until(
-        &format!("a new triggered execution to appear for project {project_id}"),
+    let mut colors = wait_for_triggered_executions(disp, project_id, known, 1, deadline).await?;
+    Ok(colors.pop().expect("exactly one color"))
+}
+
+/// Wait for exactly `n` NEW executions (not in `known`) to exist for
+/// `project_id`, and return their colors in no particular order. This is
+/// [`wait_for_triggered_execution`] for a burst: `n` events pushed back to
+/// back, each starting its own run. Fewer than `n` = not yet (retry). More
+/// than `n` = the snapshot/fire contract is violated (a stray extra
+/// execution); bail loudly with the set instead of silently picking `n`.
+pub async fn wait_for_triggered_executions(
+    disp: &Dispatcher,
+    project_id: &Uuid,
+    known: &HashSet<Uuid>,
+    n: usize,
+    deadline: Duration,
+) -> Result<Vec<Uuid>> {
+    // The timeout says how many of `n` had appeared ("1 of 2 came"), so
+    // the reader knows whether the push was lost or only half the burst.
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    poll_until_describing(
+        &format!("{n} new triggered execution(s) to appear for project {project_id}"),
         deadline,
         RUN_SETTLE_POLL,
         || {
             let disp = disp.clone();
             let known = known.clone();
+            let seen = &seen;
             async move {
                 let current = execution_colors(&disp, project_id).await?;
-                // The snapshot/fire contract is "exactly one new execution".
-                // Collect ALL colors not in the snapshot rather than pick an
-                // arbitrary one (a HashSet has no order, so `find` would return
-                // a random new color and the test would assert against the wrong
-                // run). Zero new = not yet (retry). More than one new = the
-                // contract is violated (a stray extra execution); bail loudly
-                // with the set instead of silently pinning one.
+                // Collect ALL colors not in the snapshot rather than pick
+                // (a HashSet has no order, so `find` would return a random
+                // new color and the test would assert against the wrong run).
                 let new: Vec<Uuid> = current.difference(&known).copied().collect();
-                match new.as_slice() {
-                    [] => Ok(None),
-                    [color] => Ok(Some(*color)),
-                    many => bail!(
-                        "expected exactly one new execution from the fire for project \
-                         {project_id}, found {}: {many:?}",
-                        many.len()
+                seen.store(new.len(), std::sync::atomic::Ordering::Relaxed);
+                match new.len().cmp(&n) {
+                    std::cmp::Ordering::Less => Ok(None),
+                    std::cmp::Ordering::Equal => Ok(Some(new)),
+                    std::cmp::Ordering::Greater => bail!(
+                        "expected exactly {n} new execution(s) from the fire for project \
+                         {project_id}, found {}: {new:?}",
+                        new.len()
                     ),
                 }
             }
         },
+        || format!("{} of {n} had appeared", seen.load(std::sync::atomic::Ordering::Relaxed)),
+    )
+    .await
+}
+
+/// The current status string of `color` from `/executions/{color}`
+/// (`running`, `waiting_for_input`, `completed`, `failed`, `cancelled`).
+pub async fn status_of(disp: &Dispatcher, color: Uuid) -> Result<String> {
+    let v: Value = disp.get_json(&format!("/executions/{color}")).await?;
+    v.get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("/executions/{color} returned no status: {v}"))
+}
+
+/// Poll until `color` reports `status`. For the NON-terminal states a test
+/// wants to observe a run sitting in (`running` on a held node,
+/// `waiting_for_input` on a form) before acting on it; a terminal state is
+/// what [`SettledRun::observe`] waits for. Bails as soon as the run reaches
+/// a terminal state other than `status`, since it can never come back.
+pub async fn wait_for_status(disp: &Dispatcher, color: Uuid, status: &str) -> Result<()> {
+    // The timeout names the status last observed (parked too early,
+    // still processing, never started).
+    let last = std::sync::Mutex::new(String::new());
+    poll_until_describing(
+        &format!("execution {color} to reach status '{status}'"),
+        RUN_SETTLE_DEADLINE,
+        RUN_SETTLE_POLL,
+        || {
+            let disp = disp.clone();
+            let last = &last;
+            async move {
+                let now = status_of(&disp, color).await?;
+                *last.lock().unwrap() = now.clone();
+                if now == status {
+                    return Ok(Some(()));
+                }
+                if matches!(now.as_str(), "completed" | "failed" | "cancelled") {
+                    bail!("execution {color} settled as '{now}' while waiting for '{status}'");
+                }
+                Ok(None)
+            }
+        },
+        || format!("last status observed: '{}'", last.lock().unwrap()),
     )
     .await
 }

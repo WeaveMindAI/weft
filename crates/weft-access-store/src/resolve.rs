@@ -13,7 +13,7 @@ use sha2::Digest;
 use weft_core::access::client::{authed_client, base_client, resolve_steps, run_connect_call};
 use weft_core::access::events::EventsSpec;
 use weft_core::access::spec::{
-    lookup_path, AccessSpec, Acquisition, AppRegistration, Door, OAuthGrant,
+    lookup_path, percent_encode, AccessSpec, Acquisition, AppRegistration, Door, OAuthGrant,
 };
 use weft_core::node::Lookup;
 
@@ -954,7 +954,10 @@ pub fn lookup_url(
                 ))
             })?
         };
-        url.push_str(&urlencode(value));
+        // RFC 3986 percent-encoding, not form encoding: a substitution
+        // can land in a PATH segment, where form's `+`-for-space reads
+        // as a literal plus. `%20` is right in both positions.
+        url.push_str(&percent_encode(value));
         rest = &after[end + 1..];
     }
     url.push_str(rest);
@@ -1045,10 +1048,6 @@ fn display_of(v: &Value) -> String {
     }
 }
 
-fn urlencode(s: &str) -> String {
-    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1069,7 +1068,7 @@ mod tests {
         assert_eq!(
             lookup_url(&spec("https://x.example/v1/items?q={query}&team={team}"), "a&b", &parents)
                 .unwrap(),
-            "https://x.example/v1/items?q=a%26b&team=T+1%2F2"
+            "https://x.example/v1/items?q=a%26b&team=T%201%2F2"
         );
         assert_eq!(
             lookup_url(&spec("https://x.example/v1/items"), "ignored", &BTreeMap::new()).unwrap(),

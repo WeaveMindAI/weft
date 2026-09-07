@@ -45,6 +45,23 @@ impl DispatcherClient {
         Self::check(resp).await?.json().await.context("parse response")
     }
 
+    /// GET where "no such thing" is an answer, not an error: `None` on
+    /// a 404 carrying the dispatcher's `x-weft-not-found` marker (the
+    /// resource genuinely does not exist for this caller), `Some` on
+    /// success. A headerless 404 (a version-skewed dispatcher missing
+    /// the route) still fails loudly through `check`, so a missing
+    /// route can never read as "not registered yet".
+    pub async fn get_json_if_found(&self, path: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND
+            && resp.headers().contains_key("x-weft-not-found")
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self::check(resp).await?.json().await.context("parse response")?))
+    }
+
     pub async fn post_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let url = format!("{}{}", self.base, path);
         let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;

@@ -16,7 +16,6 @@
     {
       "name": "value",
       "type": "T",
-      "required": false,
       "description": "The first input that spoke, in written order. Closed when none did."
     }
   ],

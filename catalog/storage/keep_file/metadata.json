@@ -20,7 +20,6 @@
     {
       "name": "ttl_days",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": 0
@@ -34,12 +33,8 @@
     {
       "name": "file",
       "type": "File",
-      "required": false,
       "description": "The same reference, now flagged to survive the run."
     }
   ],
-  "requires_infra": false,
-  "features": {
-    "isOutputDefault": true
-  }
+  "requires_infra": false
 }

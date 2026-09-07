@@ -45,6 +45,11 @@ struct MockState {
     /// insert). Append-only record for assertions; `cancel_never_claimed_
     /// execution` removes the matching entry exactly like the real DELETE.
     tasks: Vec<weft_task_store::tasks::NewTask>,
+    /// Mirror of the Postgres `execution_tag` table: (color, tag) ->
+    /// seq, seq handed out in write order like the real BIGSERIAL, an
+    /// existing pair keeping its seq like the real ON CONFLICT.
+    execution_tags: HashMap<(Color, String), i64>,
+    next_tag_seq: i64,
 }
 
 #[derive(Default)]
@@ -63,6 +68,35 @@ impl MockJournal {
         self.inner.lock().unwrap().tasks.clone()
     }
 
+    /// Tag an execution the way the broker's `/v1/execution/tag` does
+    /// against Postgres: the `ExecutionTagged` event plus one
+    /// `execution_tag` row per tag, a re-tag keeping the original seq.
+    /// Returns the seq of the FIRST tag in `tags` (the anchor a `Keep`
+    /// stop by this run would use).
+    pub fn tag_execution(&self, color: Color, tags: &[&str], at_unix: u64) -> i64 {
+        let mut g = self.inner.lock().unwrap();
+        g.events.push(ExecEvent::ExecutionTagged {
+            color,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            at_unix,
+        });
+        let mut first = None;
+        for tag in tags {
+            let key = (color, tag.to_string());
+            let seq = match g.execution_tags.get(&key) {
+                Some(seq) => *seq,
+                None => {
+                    g.next_tag_seq += 1;
+                    let seq = g.next_tag_seq;
+                    g.execution_tags.insert(key, seq);
+                    seq
+                }
+            };
+            first.get_or_insert(seq);
+        }
+        first.expect("tag_execution needs at least one tag")
+    }
+
     /// Build the `ExecutionSummary` for one color from the recorded events (the
     /// started row plus its latest terminal event), or `None` if there is no
     /// `execution_started` for it. Shared by the tenant listing + the by-color
@@ -70,11 +104,11 @@ impl MockJournal {
     /// `summary_from_payloads` helper.
     fn summary_for_color(&self, color: Color) -> Option<ExecutionSummary> {
         let g = self.inner.lock().unwrap();
-        let (project_id, entry_node, started_at) = g.events.iter().find_map(|e| match e {
-            ExecEvent::ExecutionStarted { color: c, project_id, entry_node, at_unix, .. }
+        let (project_id, entry_node, phase, started_at) = g.events.iter().find_map(|e| match e {
+            ExecEvent::ExecutionStarted { color: c, project_id, entry_node, phase, at_unix, .. }
                 if *c == color =>
             {
-                Some((project_id.clone(), entry_node.clone(), *at_unix))
+                Some((project_id.clone(), entry_node.clone(), *phase, *at_unix))
             }
             _ => None,
         })?;
@@ -97,7 +131,15 @@ impl MockJournal {
                 _ => {}
             }
         }
-        Some(ExecutionSummary { color, project_id, entry_node, status, started_at, completed_at })
+        let mut tagged: Vec<(i64, String)> = g
+            .execution_tags
+            .iter()
+            .filter(|((c, _), _)| *c == color)
+            .map(|((_, tag), seq)| (*seq, tag.clone()))
+            .collect();
+        tagged.sort();
+        let tags = tagged.into_iter().map(|(_, tag)| tag).collect();
+        Some(ExecutionSummary { color, project_id, entry_node, status, phase, started_at, completed_at, tags })
     }
 
     /// Every execution summary owned by `tenant` (unordered). Tenant ownership
@@ -164,6 +206,10 @@ struct ExecutionColorRow {
     /// 'execution' | 'node_test', mirroring the Postgres `kind`
     /// column: the lifecycle sweeps read only 'execution'.
     kind: &'static str,
+    /// The run's phase (`fire`, `trigger_setup`, `infra_setup`),
+    /// mirroring the Postgres `phase` column the activation sweep
+    /// narrows on.
+    phase: &'static str,
 }
 
 fn seed_execution_color(
@@ -171,6 +217,7 @@ fn seed_execution_color(
     color: Color,
     project_id: &str,
     node_test: bool,
+    phase: weft_core::context::Phase,
 ) -> anyhow::Result<()> {
     // Already-seeded first, EXACTLY like Postgres: an idempotent
     // re-ExecutionStarted for a seeded color succeeds even if the project row
@@ -192,6 +239,7 @@ fn seed_execution_color(
             project_id: project_id.to_string(),
             tenant_id: tenant,
             kind: if node_test { "node_test" } else { "execution" },
+            phase: phase.as_str(),
         },
     );
     Ok(())
@@ -201,8 +249,8 @@ fn seed_execution_color(
 impl Journal for MockJournal {
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        if let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = event {
-            seed_execution_color(&mut g, *color, project_id, *node_test)?;
+        if let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = event {
+            seed_execution_color(&mut g, *color, project_id, *node_test, *phase)?;
         }
         g.events.push(event.clone());
         Ok(())
@@ -215,8 +263,8 @@ impl Journal for MockJournal {
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         if g.dedup_keys.insert(dedup_key.to_string()) {
-            if let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = event {
-                seed_execution_color(&mut g, *color, project_id, *node_test)?;
+            if let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = event {
+                seed_execution_color(&mut g, *color, project_id, *node_test, *phase)?;
             }
             g.events.push(event.clone());
         }
@@ -230,10 +278,10 @@ impl Journal for MockJournal {
         task: weft_task_store::tasks::NewTask,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
-        let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = start else {
+        let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = start else {
             anyhow::bail!("start_execution requires an ExecutionStarted event");
         };
-        seed_execution_color(&mut g, *color, project_id, *node_test)?;
+        seed_execution_color(&mut g, *color, project_id, *node_test, *phase)?;
         g.events.push(start.clone());
         g.events.extend(kicks.iter().cloned());
         g.tasks.push(task);
@@ -254,10 +302,10 @@ impl Journal for MockJournal {
             namespace: "mock-ns".into(),
         };
         let mut g = self.inner.lock().unwrap();
-        let ExecEvent::ExecutionStarted { color, project_id, node_test, .. } = start else {
+        let ExecEvent::ExecutionStarted { color, project_id, node_test, phase, .. } = start else {
             anyhow::bail!("start_live_execution requires an ExecutionStarted event");
         };
-        seed_execution_color(&mut g, *color, project_id, *node_test)?;
+        seed_execution_color(&mut g, *color, project_id, *node_test, *phase)?;
         g.events.push(start.clone());
         g.events.extend(kicks.iter().cloned());
         task.target_pod_name = Some(pod.pod_name.clone());
@@ -268,7 +316,7 @@ impl Journal for MockJournal {
     async fn cancel_never_claimed_execution(
         &self,
         color: Color,
-        reason: &str,
+        cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome> {
         // Dumb: the mock has no 'claimed' state, so the outcome is always
         // NoWorkerWillRun: drop the recorded task and append the terminal
@@ -277,28 +325,61 @@ impl Journal for MockJournal {
         let color_str = color.to_string();
         g.tasks.retain(|t| t.color.as_deref() != Some(color_str.as_str()));
         let has_terminal = g.events.iter().any(|e| {
-            e.color() == color
-                && matches!(
-                    e,
-                    ExecEvent::ExecutionCompleted { .. }
-                        | ExecEvent::ExecutionFailed { .. }
-                        | ExecEvent::ExecutionCancelled { .. }
-                )
+            e.color() == color && e.is_execution_terminal()
         });
         if !has_terminal {
             g.events.push(ExecEvent::ExecutionCancelled {
                 color,
-                reason: reason.to_string(),
+                reason: cause.to_string(),
+                cause: Some(cause.clone()),
                 at_unix: 0,
             });
         }
         Ok(weft_task_store::tasks::SetupFailureOutcome::NoWorkerWillRun)
     }
 
+    async fn cancel_execution(
+        &self,
+        color: Color,
+        cause: &weft_core::exec::CancelCause,
+    ) -> anyhow::Result<crate::journal::CancelWrite> {
+        let mut g = self.inner.lock().unwrap();
+        // The strip is `signal_remove_for_color`'s predicate: every
+        // signal tied to the color.
+        let keys: Vec<String> = g
+            .signals
+            .iter()
+            .filter(|(_, s)| s.color == Some(color))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let removed: Vec<SignalRegistration> =
+            keys.into_iter().filter_map(|k| g.signals.remove(&k)).collect();
+        let mut write = crate::journal::CancelWrite { removed, ..Default::default() };
+        if g.execution_colors.contains_key(&color) {
+            let has_terminal = g.events.iter().any(|e| {
+                e.color() == color && e.is_execution_terminal()
+            });
+            if !has_terminal {
+                // Same fidelity as `cancel_never_claimed_execution`: the
+                // terminal row, no per-node rows (the mock folds no nodes).
+                g.events.push(ExecEvent::ExecutionCancelled {
+                    color,
+                    reason: cause.to_string(),
+                    cause: Some(cause.clone()),
+                    at_unix: 0,
+                });
+                write.node_cancellations = Some(0);
+            }
+            // The mock has no worker pods, so no color has an alive
+            // owner and no cancel task is ever queued.
+        }
+        Ok(write)
+    }
+
     async fn events_log_lossy(
         &self,
         color: Color,
-    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)> {
+    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)> {
         // In-memory events are typed, so nothing can fail to decode.
         let events = self
             .inner
@@ -307,7 +388,10 @@ impl Journal for MockJournal {
             .events
             .iter()
             .filter(|e| e.color() == color)
-            .cloned()
+            .enumerate()
+            .map(|(index, event)| crate::events::IdentifiedEvent {
+                event_id: format!("mock:{color}:{index}"), event: event.clone(),
+            })
             .collect();
         Ok((events, Vec::new()))
     }
@@ -397,24 +481,20 @@ impl Journal for MockJournal {
             .map_or(ColorLookup::NotFound, ColorLookup::Found))
     }
 
-    async fn logs_for(&self, color: Color, _limit: u32) -> anyhow::Result<Vec<LogEntry>> {
-        Ok(self
+    async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
+        // The same tail as Postgres, through the one `LogEntry::tail`:
+        // the two journals have to answer `weft logs` the same way or
+        // nothing tested here means anything about the real one.
+        let entries: Vec<LogEntry> = self
             .inner
             .lock()
             .unwrap()
             .events
             .iter()
-            .filter_map(|e| match e {
-                ExecEvent::LogLine { color: c, level, message, at_unix } if *c == color => {
-                    Some(LogEntry {
-                        at_unix: *at_unix,
-                        level: level.clone(),
-                        message: message.clone(),
-                    })
-                }
-                _ => None,
-            })
-            .collect())
+            .filter(|e| e.color() == color)
+            .filter_map(LogEntry::from_event)
+            .collect();
+        Ok(LogEntry::tail(entries, limit))
     }
 
     async fn list_executions(
@@ -430,6 +510,7 @@ impl Journal for MockJournal {
             .filter(|s| query.project_id.as_deref().is_none_or(|p| s.project_id == p))
             .filter(|s| query.started_after.is_none_or(|a| s.started_at >= a))
             .filter(|s| query.started_before.is_none_or(|b| s.started_at < b))
+            .filter(|s| query.phase.is_none_or(|p| s.phase == p))
             .collect();
         all.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.color.cmp(&a.color)));
         let total = all.len() as u64;
@@ -448,9 +529,25 @@ impl Journal for MockJournal {
         Ok(self.summary_for_color(color))
     }
 
+    async fn colors_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<Color>> {
+        let g = self.inner.lock().unwrap();
+        let mut out: Vec<Color> = g
+            .execution_colors
+            .iter()
+            .filter(|(c, row)| {
+                row.tenant_id == tenant && row.kind == "execution" && c.to_string().starts_with(prefix)
+            })
+            .map(|(c, _)| *c)
+            .collect();
+        out.sort();
+        out.truncate(2);
+        Ok(out)
+    }
+
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
+        phase: Option<weft_core::context::Phase>,
     ) -> anyhow::Result<Vec<Color>> {
         // Read from `execution_colors` (mirror of Postgres
         // `execution_color`) instead of scanning `events`. Keeps
@@ -466,14 +563,11 @@ impl Journal for MockJournal {
             if row.project_id != project_id || row.kind != "execution" {
                 continue;
             }
+            if phase.is_some_and(|p| row.phase != p.as_str()) {
+                continue;
+            }
             let terminal = g.events.iter().any(|e2| {
-                e2.color() == *color
-                    && matches!(
-                        e2,
-                        ExecEvent::ExecutionCompleted { .. }
-                            | ExecEvent::ExecutionFailed { .. }
-                            | ExecEvent::ExecutionCancelled { .. }
-                    )
+                e2.color() == *color && e2.is_execution_terminal()
             });
             if !terminal {
                 out.push(*color);
@@ -493,13 +587,7 @@ impl Journal for MockJournal {
                 continue;
             }
             let terminal = g.events.iter().any(|e2| {
-                e2.color() == *color
-                    && matches!(
-                        e2,
-                        ExecEvent::ExecutionCompleted { .. }
-                            | ExecEvent::ExecutionFailed { .. }
-                            | ExecEvent::ExecutionCancelled { .. }
-                    )
+                e2.color() == *color && e2.is_execution_terminal()
             });
             if terminal {
                 out.insert(*color);
@@ -513,7 +601,32 @@ impl Journal for MockJournal {
         g.events.retain(|e| e.color() != color);
         g.signals.retain(|_, s| s.color != Some(color));
         g.execution_colors.remove(&color);
+        g.execution_tags.retain(|(c, _), _| *c != color);
         Ok(())
+    }
+
+    async fn live_tagged_executions(
+        &self,
+        project_id: &str,
+        tag: &str,
+    ) -> anyhow::Result<Vec<weft_journal::tags::TaggedExecution>> {
+        let g = self.inner.lock().unwrap();
+        let mut out: Vec<weft_journal::tags::TaggedExecution> = g
+            .execution_tags
+            .iter()
+            .filter(|((_, t), _)| t == tag)
+            .filter(|((color, _), _)| {
+                g.execution_colors
+                    .get(color)
+                    .is_some_and(|row| row.project_id == project_id && row.kind == "execution")
+            })
+            .filter(|((color, _), _)| {
+                !g.events.iter().any(|e| e.color() == *color && e.is_execution_terminal())
+            })
+            .map(|((color, _), seq)| weft_journal::tags::TaggedExecution { color: *color, seq: *seq })
+            .collect();
+        out.sort_by_key(|t| t.seq);
+        Ok(out)
     }
 
     async fn signal_insert(
@@ -629,14 +742,14 @@ impl Journal for MockJournal {
         color: Color,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
         let mut g = self.inner.lock().unwrap();
-        // Mirror the postgres predicate EXACTLY (`color = $1 AND is_resume`):
-        // matching on `color == Some(..)` alone would rely on the unstated
-        // convention that only resume signals carry a color, and diverge from
-        // the real impl the moment an entry signal ever got one.
+        // Mirror the postgres predicate EXACTLY (`DELETE ... WHERE color =
+        // $1`, `SIGNAL_DELETE_BY_COLOR_RETURNING`): every signal tied to
+        // the color goes, whatever its kind, so the mock and the real
+        // store cannot diverge the day an entry signal carries a color.
         let keys: Vec<String> = g
             .signals
             .iter()
-            .filter(|(_, s)| s.color == Some(color) && s.is_resume)
+            .filter(|(_, s)| s.color == Some(color))
             .map(|(k, _)| k.clone())
             .collect();
         Ok(keys
@@ -769,7 +882,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let live = j.list_non_terminal_colors_for_project("p").await.unwrap();
+        let live = j.list_non_terminal_colors_for_project("p", None).await.unwrap();
         assert_eq!(live, vec![run], "the node-test color never counts as a project run");
     }
 
@@ -806,7 +919,7 @@ mod tests {
             .unwrap();
 
         let terminal = j.list_terminal_colors_for_project("p").await.unwrap();
-        let non_terminal = j.list_non_terminal_colors_for_project("p").await.unwrap();
+        let non_terminal = j.list_non_terminal_colors_for_project("p", None).await.unwrap();
 
         assert!(terminal.contains(&done), "completed color is terminal");
         assert!(!terminal.contains(&live), "still-running color is not terminal");
@@ -924,5 +1037,47 @@ mod tests {
         let paget2 = j.list_executions("t2", &qt2).await.unwrap();
         assert_eq!(paget2.total, 1);
         assert_eq!(paget2.executions[0].color, x1);
+    }
+
+    /// The phase filter separates a trigger's real fires from the
+    /// setup runs an activate makes, and the summary carries the phase
+    /// so a listing can say which is which.
+    #[tokio::test]
+    async fn list_executions_filters_by_phase() {
+        let j = MockJournal::new();
+        j.set_project_tenant("p", "t");
+        let fire = weft_core::Color::new_v4();
+        let setup = weft_core::Color::new_v4();
+        j.record_event(&started_at(fire, "p", 10)).await.unwrap();
+        let ExecEvent::ExecutionStarted { color, project_id, entry_node, definition_hash, node_test, subgraph, at_unix, .. } =
+            started_at(setup, "p", 20)
+        else {
+            unreachable!()
+        };
+        j.record_event(&ExecEvent::ExecutionStarted {
+            color,
+            project_id,
+            entry_node,
+            phase: weft_core::context::Phase::TriggerSetup,
+            definition_hash,
+            node_test,
+            subgraph,
+            at_unix,
+        })
+        .await
+        .unwrap();
+
+        let all = j.list_executions("t", &ExecutionQuery { limit: 10, ..Default::default() }).await.unwrap();
+        assert_eq!(all.total, 2);
+        assert_eq!(all.executions[0].phase, weft_core::context::Phase::TriggerSetup, "newest first");
+        let fires = j
+            .list_executions(
+                "t",
+                &ExecutionQuery { limit: 10, phase: Some(weft_core::context::Phase::Fire), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(fires.total, 1);
+        assert_eq!(fires.executions[0].color, fire);
     }
 }

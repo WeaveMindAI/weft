@@ -24,6 +24,10 @@ use axum::response::Html;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use weft_core::access::wire::{
+    BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, DoorsStatus,
+    GrantSummary, MintAppRequest, MintAppResponse, SharedDoorPick, StartedOAuth,
+};
 use weft_core::storage::Tenanted;
 
 use crate::authenticator::CallerTenant;
@@ -82,40 +86,17 @@ fn callback_base<'a>(base: &'a str,
 
 // ---------- Doors (which connect doors are actually open) ----------
 
-/// The door probe, forwarded to the broker (which holds the registered
-/// apps and the runtime-credential probe); the dispatcher adds the
-/// callback URL, since only it knows the public host.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DoorsRequest {
-    pub spec: weft_core::AccessSpec,
-}
-
-// SYNC: DoorsStatus <-> crates/weft-access-store/src/lib.rs DoorsAnswer (flattened in), packages/weft-graph/src/webview/lib/components/project/AccessField.svelte DoorsStatus
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DoorsStatus {
-    /// The broker's probe answer (shared-door options + the
-    /// runtime-credential flag), flattened onto this wire unchanged.
-    #[serde(flatten)]
-    pub doors: weft_access_store::DoorsAnswer,
-    /// The callback URL an author registers on the provider's site,
-    /// shown on the "Your own" page. `None` iff `consent_blocked`.
-    pub redirect_uri: Option<String>,
-    /// Why NO browser consent can run right now (the provider only
-    /// accepts https callback URLs and this weft has none). Paste
-    /// connects need no callback and stay available; the editor hides
-    /// every consent button and shows this instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consent_blocked: Option<String>,
-}
-
 /// POST /access/doors: which shared-door options this weft can offer
-/// for a service.
+/// for a service. The probe is forwarded to the broker (which holds
+/// the registered apps and the runtime-credential probe); the
+/// dispatcher adds the callback URL, since only it knows the public
+/// host.
 pub async fn doors(
     State(state): State<DispatcherState>,
     _caller: CallerTenant,
     Json(req): Json<DoorsRequest>,
 ) -> Result<Json<DoorsStatus>, ApiError> {
-    let doors: weft_access_store::DoorsAnswer =
+    let doors: DoorsAnswer =
         crate::broker_admin::forward_json(&state, "/v1/access/admin/doors", &req).await?;
     // A provider demanding https on a weft with no https address
     // blocks every CONSENT, not the panel: paste connects need no
@@ -134,8 +115,8 @@ pub async fn doors(
 pub async fn mint_app(
     State(state): State<DispatcherState>,
     _caller: CallerTenant,
-    Json(req): Json<weft_access_store::MintAppRequest>,
-) -> Result<Json<weft_access_store::MintAppResponse>, ApiError> {
+    Json(req): Json<MintAppRequest>,
+) -> Result<Json<MintAppResponse>, ApiError> {
     crate::broker_admin::forward_json(&state, "/v1/access/admin/mint-app", &req)
         .await
         .map(Json)
@@ -154,7 +135,7 @@ pub async fn list_grants(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Query(q): Query<ListQuery>,
-) -> Result<Json<Vec<weft_access_store::GrantSummary>>, ApiError> {
+) -> Result<Json<Vec<GrantSummary>>, ApiError> {
     weft_access_store::list_grants(&state.pg_pool, &caller.0 .0, q.service.as_deref())
         .await
         .map(Json)
@@ -182,8 +163,8 @@ pub async fn delete_grant(
 pub async fn connect_direct(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(req): Json<weft_access_store::SharedDoorPick<weft_access_store::ConnectDirect>>,
-) -> Result<Json<weft_access_store::CompletedConnect>, ApiError> {
+    Json(req): Json<SharedDoorPick<ConnectDirect>>,
+) -> Result<Json<CompletedConnect>, ApiError> {
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/connect/direct",
@@ -200,8 +181,8 @@ pub async fn connect_direct(
 pub async fn connect_begin(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(mut req): Json<weft_access_store::SharedDoorPick<weft_access_store::BeginOAuth>>,
-) -> Result<Json<weft_access_store::StartedOAuth>, ApiError> {
+    Json(mut req): Json<SharedDoorPick<BeginOAuth>>,
+) -> Result<Json<StartedOAuth>, ApiError> {
     req.inner.redirect_uri = redirect_uri(&state, &req.inner.spec)?;
     crate::broker_admin::forward_json(
         &state,
@@ -258,7 +239,7 @@ pub async fn oauth_callback(
         (Some(st), Some(code), None) => {
             // Forwarded to the broker, which makes the code-for-token
             // exchange (its egress is locked to the public internet).
-            let fwd: Result<weft_access_store::CompletedConnect, ApiError> =
+            let fwd: Result<CompletedConnect, ApiError> =
                 crate::broker_admin::forward_json(
                     &state,
                     "/v1/access/admin/oauth/complete",

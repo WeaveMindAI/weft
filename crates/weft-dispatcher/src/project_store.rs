@@ -19,8 +19,10 @@ use tokio::sync::RwLock;
 
 /// The complete per-node infra image-tag map: `node_id -> { image_name ->
 /// image_ref }`. Written atomically alongside the running hashes (see
-/// `ProjectStoreOps::set_running_hashes`); the supervisor reads it per node to
-/// resolve `Image::Local { name }`.
+/// `ProjectStoreOps::set_running_hashes`); the supervisor reads it per node
+/// (through the broker) to resolve `Image::Local { name }`. The column's
+/// canonical decode is `weft_broker_client::protocol::decode_infra_image_tags`
+/// (shared with the broker's read so the two cannot drift).
 pub type InfraImageTags =
     std::collections::BTreeMap<String, std::collections::HashMap<String, String>>;
 
@@ -188,18 +190,6 @@ pub trait ProjectStoreOps: Send + Sync {
         to: ProjectStatus,
     ) -> anyhow::Result<bool>;
 
-    /// CAS that swaps every lifecycle field at once when the row's
-    /// current status matches `from`. Used by activate to flip
-    /// Activating → Active (with full lifecycle: accepting=true,
-    /// visible=true) and by cancel-activate to flip Activating →
-    /// Inactive. `Ok(true)` iff the swap landed.
-    async fn cas_lifecycle(
-        &self,
-        id: uuid::Uuid,
-        from: ProjectStatus,
-        to: &ProjectLifecycle,
-    ) -> anyhow::Result<bool>;
-
     /// Single-flight entry into activation. Atomically set the full
     /// `activating()` lifecycle IFF the project is NOT already
     /// `Activating`. `Activating` is the one mutual-exclusion state:
@@ -219,6 +209,31 @@ pub trait ProjectStoreOps: Send + Sync {
     /// can tell a live activation (driver bumping) from an orphaned
     /// one (driver pod died).
     async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+
+    /// Record the TriggerSetup color the CURRENT activation is about
+    /// to start (see `ProjectLifecycle::activating_ts_color`). Guarded
+    /// on `status = activating`: `Ok(false)` means the activation is
+    /// no longer in flight (cancelled or reaped under the driver), and
+    /// the caller must not start the run.
+    async fn set_activating_ts_color(
+        &self,
+        id: uuid::Uuid,
+        color: uuid::Uuid,
+    ) -> anyhow::Result<bool>;
+
+    /// End the activation: CAS `Activating` -> `to` and hand back the
+    /// setup color the activation had recorded, in ONE atomic step, so
+    /// the driver's guarded record and this un-stick cannot interleave
+    /// (the row is locked before it is read, and a record that lands
+    /// after this wins is refused by its status guard). `Ok(None)` when
+    /// the CAS lost (already out of Activating); `Ok(Some(color))` when
+    /// it won, `color` being what the row held (`None` if setup had not
+    /// started).
+    async fn end_activating(
+        &self,
+        id: uuid::Uuid,
+        to: &ProjectLifecycle,
+    ) -> anyhow::Result<Option<Option<uuid::Uuid>>>;
 
     /// Read the project's verb-transition marker (the build axis,
     /// orthogonal to `status`). `Ok(None)` = no such project.
@@ -295,15 +310,10 @@ pub trait ProjectStoreOps: Send + Sync {
     // `set_running_hashes` (atomically alongside the running hashes), never
     // as a standalone per-node write, so a project can never be stamped
     // runnable with its infra tags missing/half-written. See that method.
-
-    /// Read the per-(project, node) image-tag map. Empty map if
-    /// never set. `Err` on DB failure (vs empty-map = "set to
-    /// empty", which is legal if a project has no Local images).
-    async fn infra_image_tags(
-        &self,
-        project_id_str: &str,
-        node_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>>;
+    // The map has no per-node reader on the store: the supervisor reads it
+    // through the broker, and the referenced-images keep-set reads the
+    // whole column (api/project.rs), both via the canonical decode in
+    // weft-broker-client.
 
     /// Persist the project's HealthProtocols override (JSON shape
     /// per supervisor `HealthProtocols`). `None` payload = use weft
@@ -353,6 +363,16 @@ pub struct ProjectLifecycle {
     /// false; only `deactivate_project_with_mode(by_health=true)`
     /// (the claimer's health-park path) sets it true.
     pub deactivated_by_health: bool,
+    /// While `status = Activating`: the color of the TriggerSetup run
+    /// this activation started, recorded BEFORE the run is started so
+    /// a driver that dies in between leaves nothing unaccounted for.
+    /// Whoever ends the activation from outside (a person's
+    /// cancel-activate, the reaper repairing a dead driver) reads it
+    /// to cancel that exact run with the true cause; any other
+    /// non-terminal setup run of the project is a leftover from an
+    /// older, dead activation. `None` before setup starts and in every
+    /// other status (every lifecycle write outside Activating clears it).
+    pub activating_ts_color: Option<uuid::Uuid>,
 }
 
 impl ProjectLifecycle {
@@ -365,6 +385,7 @@ impl ProjectLifecycle {
             fires_deadline_unix: None,
             deactivated_by_health: false,
             drain_deadline_unix: None,
+            activating_ts_color: None,
         }
     }
 
@@ -382,6 +403,7 @@ impl ProjectLifecycle {
             fires_deadline_unix: None,
             deactivated_by_health: false,
             drain_deadline_unix: None,
+            activating_ts_color: None,
         }
     }
 
@@ -395,6 +417,7 @@ impl ProjectLifecycle {
             fires_deadline_unix: None,
             deactivated_by_health: false,
             drain_deadline_unix: None,
+            activating_ts_color: None,
         }
     }
 
@@ -408,6 +431,7 @@ impl ProjectLifecycle {
             fires_deadline_unix: Some(deadline_unix),
             deactivated_by_health: false,
             drain_deadline_unix: None,
+            activating_ts_color: None,
         }
     }
 
@@ -421,6 +445,7 @@ impl ProjectLifecycle {
             fires_deadline_unix: None,
             deactivated_by_health: false,
             drain_deadline_unix: None,
+            activating_ts_color: None,
         }
     }
 
@@ -442,6 +467,7 @@ impl ProjectLifecycle {
             // Set by the deactivate path from the user's drain cap
             // (this constructor doesn't know it).
             drain_deadline_unix: None,
+            activating_ts_color: None,
         }
     }
 
@@ -657,6 +683,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- user-initiated stop/deactivate. Cleared by every
                 -- non-health lifecycle write.
                 deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
+                -- The TriggerSetup color the CURRENT activation started,
+                -- recorded before the run starts; NULL outside Activating.
+                -- Cancel-activate and the reaper cancel exactly this run
+                -- with the true cause, and treat any other non-terminal
+                -- setup run as a leftover of an older, dead activation.
+                activating_ts_color UUID,
                 tenant_id TEXT NOT NULL DEFAULT 'local',
                 -- Whether this project DECLARES infrastructure (any node
                 -- with requires_infra). Derived from the definition and
@@ -1057,15 +1089,16 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn lifecycle(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectLifecycle>> {
-        let row: Option<(String, bool, bool, Option<i64>, bool, Option<i64>)> = sqlx::query_as(
-            "SELECT status, accepting_fires, fires_visible_to_consumers, fires_deadline_unix, \
-                    deactivated_by_health, drain_deadline_unix \
-             FROM project WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|(status, accepting, visible, deadline, by_health, drain_deadline)| {
+        let row: Option<(String, bool, bool, Option<i64>, bool, Option<i64>, Option<uuid::Uuid>)> =
+            sqlx::query_as(
+                "SELECT status, accepting_fires, fires_visible_to_consumers, fires_deadline_unix, \
+                        deactivated_by_health, drain_deadline_unix, activating_ts_color \
+                 FROM project WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|(status, accepting, visible, deadline, by_health, drain_deadline, ts_color)| {
             Ok(ProjectLifecycle {
                 status: project_status_from_str(&status)?,
                 accepting_fires: accepting,
@@ -1073,6 +1106,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                 fires_deadline_unix: deadline,
                 deactivated_by_health: by_health,
                 drain_deadline_unix: drain_deadline,
+                activating_ts_color: ts_color,
             })
         })
         .transpose()
@@ -1091,8 +1125,9 @@ impl ProjectStoreOps for PostgresProjectStore {
                  fires_deadline_unix = $4, \
                  deactivated_by_health = $5, \
                  drain_deadline_unix = $6, \
-                 updated_at = $7 \
-             WHERE id = $8 \
+                 activating_ts_color = $7, \
+                 updated_at = $8 \
+             WHERE id = $9 \
                AND status <> 'activating' \
                AND transition = 'none'",
         )
@@ -1102,6 +1137,7 @@ impl ProjectStoreOps for PostgresProjectStore {
         .bind(lifecycle.fires_deadline_unix)
         .bind(lifecycle.deactivated_by_health)
         .bind(lifecycle.drain_deadline_unix)
+        .bind(lifecycle.activating_ts_color)
         .bind(crate::lease::now_unix())
         .bind(id)
         .execute(&self.pool)
@@ -1145,37 +1181,6 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn cas_lifecycle(
-        &self,
-        id: uuid::Uuid,
-        from: ProjectStatus,
-        to: &ProjectLifecycle,
-    ) -> anyhow::Result<bool> {
-        let res = sqlx::query(
-            "UPDATE project \
-             SET status = $1, \
-                 accepting_fires = $2, \
-                 fires_visible_to_consumers = $3, \
-                 fires_deadline_unix = $4, \
-                 deactivated_by_health = $5, \
-                 drain_deadline_unix = $6, \
-                 updated_at = $7 \
-             WHERE id = $8 AND status = $9",
-        )
-        .bind(to.status.as_str())
-        .bind(to.accepting_fires)
-        .bind(to.fires_visible_to_consumers)
-        .bind(to.fires_deadline_unix)
-        .bind(to.deactivated_by_health)
-        .bind(to.drain_deadline_unix)
-        .bind(crate::lease::now_unix())
-        .bind(id)
-        .bind(from.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
     async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let activating = ProjectLifecycle::activating();
         let now = crate::lease::now_unix();
@@ -1187,6 +1192,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                  fires_deadline_unix = $4, \
                  deactivated_by_health = $5, \
                  drain_deadline_unix = NULL, \
+                 activating_ts_color = NULL, \
                  updated_at = $6, \
                  transition_heartbeat_unix = $6 \
              WHERE id = $7 AND status <> 'activating' AND transition = 'none'",
@@ -1201,6 +1207,62 @@ impl ProjectStoreOps for PostgresProjectStore {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn set_activating_ts_color(
+        &self,
+        id: uuid::Uuid,
+        color: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE project SET activating_ts_color = $1 WHERE id = $2 AND status = 'activating'",
+        )
+        .bind(color)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn end_activating(
+        &self,
+        id: uuid::Uuid,
+        to: &ProjectLifecycle,
+    ) -> anyhow::Result<Option<Option<uuid::Uuid>>> {
+        // `FOR UPDATE` in the CTE locks the row BEFORE its color is read,
+        // so a concurrent `set_activating_ts_color` either committed
+        // first (and is returned here) or waits on the lock and is then
+        // refused by its own status guard. The UPDATE re-checks the
+        // status on the locked row: a lost CAS returns no row.
+        let row: Option<(Option<uuid::Uuid>,)> = sqlx::query_as(
+            "WITH prev AS ( \
+                 SELECT id, activating_ts_color FROM project \
+                 WHERE id = $8 AND status = 'activating' FOR UPDATE \
+             ) \
+             UPDATE project \
+             SET status = $1, \
+                 accepting_fires = $2, \
+                 fires_visible_to_consumers = $3, \
+                 fires_deadline_unix = $4, \
+                 deactivated_by_health = $5, \
+                 drain_deadline_unix = $6, \
+                 activating_ts_color = NULL, \
+                 updated_at = $7 \
+             FROM prev \
+             WHERE project.id = prev.id AND project.status = 'activating' \
+             RETURNING prev.activating_ts_color",
+        )
+        .bind(to.status.as_str())
+        .bind(to.accepting_fires)
+        .bind(to.fires_visible_to_consumers)
+        .bind(to.fires_deadline_unix)
+        .bind(to.deactivated_by_health)
+        .bind(to.drain_deadline_unix)
+        .bind(crate::lease::now_unix())
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(color,)| color))
     }
 
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
@@ -1355,44 +1417,6 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(())
     }
 
-
-    async fn infra_image_tags(
-        &self,
-        project_id_str: &str,
-        node_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        use sqlx::Row;
-        let id = project_id_str
-            .parse::<uuid::Uuid>()
-            .map_err(|e| anyhow::anyhow!("bad project_id '{project_id_str}': {e}"))?;
-        let row = sqlx::query("SELECT infra_image_tags_json FROM project WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(r) = row else {
-            return Ok(Default::default());
-        };
-        let value: serde_json::Value = r
-            .try_get("infra_image_tags_json")
-            .map_err(|e| anyhow::anyhow!("decode infra_image_tags_json: {e}"))?;
-        // Typed decode through the canonical shape:
-        // `{ "<node_id>": { "<image_name>": "<tag>" } }`. Shape
-        // drift is a 500-level bug; silently returning empty would
-        // mask schema corruption as "no images registered."
-        let by_node: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, String>,
-        > = serde_json::from_value(value).map_err(|e| {
-            anyhow::anyhow!(
-                "infra_image_tags_json for project={project_id_str} has wrong shape \
-                 (expected {{node: {{image: tag}}}}): {e}"
-            )
-        })?;
-        // Missing this node IS a legitimate empty (the project's
-        // image-tag map exists but this node hasn't been written).
-        Ok(by_node.get(node_id).cloned().unwrap_or_default())
-    }
-
     async fn set_health_protocols(
         &self,
         id: uuid::Uuid,
@@ -1496,7 +1520,10 @@ impl ProjectStoreOps for MockProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
-        // The mock does not model infra image tags (its reader returns empty).
+        // The mock does not model the infra image-tag column (the real
+        // readers are SQL-direct: the broker handler and the
+        // referenced-images keep-set); accepted to satisfy the trait,
+        // ignored.
         _infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
@@ -1544,6 +1571,7 @@ impl ProjectStoreOps for MockProjectStore {
                 fires_deadline_unix: None,
                 deactivated_by_health: false,
                 drain_deadline_unix: None,
+                activating_ts_color: None,
             });
         }
         self.tenants.write().await.insert(id, tenant_id.to_string());
@@ -1651,8 +1679,10 @@ impl ProjectStoreOps for MockProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
-        // The mock does not model infra image tags (its `infra_image_tags`
-        // reader returns empty); accepted to satisfy the trait, ignored.
+        // The mock does not model the infra image-tag column (the real
+        // readers are SQL-direct: the broker handler and the
+        // referenced-images keep-set); accepted to satisfy the trait,
+        // ignored.
         _infra_image_tags: Option<&InfraImageTags>,
     ) -> anyhow::Result<()> {
         if !self.inner.read().await.contains_key(&id) {
@@ -1732,6 +1762,7 @@ impl ProjectStoreOps for MockProjectStore {
                     fires_deadline_unix: None,
                     deactivated_by_health: false,
                     drain_deadline_unix: None,
+                    activating_ts_color: None,
                 }),
         ))
     }
@@ -1802,27 +1833,6 @@ impl ProjectStoreOps for MockProjectStore {
         Ok(true)
     }
 
-    async fn cas_lifecycle(
-        &self,
-        id: uuid::Uuid,
-        from: ProjectStatus,
-        to: &ProjectLifecycle,
-    ) -> anyhow::Result<bool> {
-        let mut lifecycles = self.lifecycles.write().await;
-        let mut inner = self.inner.write().await;
-        let Some(lifecycle) = lifecycles.get_mut(&id) else {
-            return Ok(false);
-        };
-        if lifecycle.status != from {
-            return Ok(false);
-        }
-        *lifecycle = to.clone();
-        if let Some(entry) = inner.get_mut(&id) {
-            entry.1 = to.status;
-        }
-        Ok(true)
-    }
-
     async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let mut lifecycles = self.lifecycles.write().await;
         let mut inner = self.inner.write().await;
@@ -1849,6 +1859,43 @@ impl ProjectStoreOps for MockProjectStore {
             .or_insert((ProjectTransition::None, 0))
             .1 = crate::lease::now_unix();
         Ok(true)
+    }
+
+    async fn set_activating_ts_color(
+        &self,
+        id: uuid::Uuid,
+        color: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        let mut lifecycles = self.lifecycles.write().await;
+        let Some(lifecycle) = lifecycles.get_mut(&id) else {
+            return Ok(false);
+        };
+        if lifecycle.status != ProjectStatus::Activating {
+            return Ok(false);
+        }
+        lifecycle.activating_ts_color = Some(color);
+        Ok(true)
+    }
+
+    async fn end_activating(
+        &self,
+        id: uuid::Uuid,
+        to: &ProjectLifecycle,
+    ) -> anyhow::Result<Option<Option<uuid::Uuid>>> {
+        let mut lifecycles = self.lifecycles.write().await;
+        let mut inner = self.inner.write().await;
+        let Some(lifecycle) = lifecycles.get_mut(&id) else {
+            return Ok(None);
+        };
+        if lifecycle.status != ProjectStatus::Activating {
+            return Ok(None);
+        }
+        let prev = lifecycle.activating_ts_color;
+        *lifecycle = to.clone();
+        if let Some(entry) = inner.get_mut(&id) {
+            entry.1 = to.status;
+        }
+        Ok(Some(prev))
     }
 
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
@@ -1984,14 +2031,6 @@ impl ProjectStoreOps for MockProjectStore {
     async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()> {
         self.namespaces.write().await.insert(id, String::new());
         Ok(())
-    }
-
-    async fn infra_image_tags(
-        &self,
-        _project_id_str: &str,
-        _node_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        Ok(std::collections::HashMap::new())
     }
 
     async fn set_health_protocols(

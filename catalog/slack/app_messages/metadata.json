@@ -15,7 +15,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "channels:history"
@@ -29,7 +29,6 @@
       "name": "keyword",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "Contains",
       "placeholder": "Only fire when the text contains this",
       "description": "Only fire on messages whose text contains this. Leave empty for every message."
@@ -37,7 +36,6 @@
     {
       "name": "includeBots",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -49,33 +47,27 @@
   "outputs": [
     {
       "name": "text",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "user",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "channel",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "workspace",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "ts",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "thread",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ]
 }

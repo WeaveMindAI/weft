@@ -33,6 +33,24 @@ export function guideSteps(spec: AccessSpecWire, ticked: string[]): string[] {
 	return steps.map((s) => s.replaceAll('{permissions}', labels));
 }
 
+// The guide's link with `{permissions}` replaced by the ticked
+// permission IDS, urlencoded and comma-joined (a provider console
+// wants machine ids where the steps' prose wants labels), mirroring
+// the Rust generation.
+// SYNC: guideLink <-> crates/weft-core/src/access/spec.rs AccessSpec::guide_link
+export function guideLink(spec: AccessSpecWire, ticked: string[]): string | undefined {
+	const link = spec.own_page?.guide?.link;
+	if (!link) return undefined;
+	// encodeURIComponent leaves !'()* bare; the Rust side encodes
+	// everything outside RFC 3986 unreserved. Encode them too so the
+	// two produce byte-identical URLs for every id.
+	const encoded = encodeURIComponent(ticked.join(',')).replace(
+		/[!'()*]/g,
+		(c) => '%' + c.charCodeAt(0).toString(16).toUpperCase(),
+	);
+	return link.replaceAll('{permissions}', encoded);
+}
+
 // The catalogue entries that start ticked. Own-account-only entries
 // are capability declarations, never consent asks, so they are never
 // ticked.

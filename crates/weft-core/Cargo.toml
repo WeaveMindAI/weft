@@ -36,6 +36,8 @@ tokio = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 cron = { version = "0.12", optional = true }
+# The zone a cron timer counts in, validated where the signal is written.
+chrono-tz = { workspace = true, optional = true }
 # Signed routing-token mint/verify (`caller_token`): the dispatcher signs
 # a (color, project, pod) token at the control handshake; the worker
 # verifies it before accepting a live connection. HMAC-SHA256 over a
@@ -80,6 +82,7 @@ runtime = [
     "dep:futures",
     "dep:bytes",
     "dep:cron",
+    "dep:chrono-tz",
     "dep:hmac",
     "dep:base64",
     "dep:sha1",

@@ -2692,7 +2692,7 @@ async fn wait_for_dispatcher_health(url: &str) -> Result<()> {
 
 /// Build a kubectl Command pinned to the configured context so
 /// the user's current-context never interferes.
-fn kubectl(args: &[&str]) -> Command {
+pub(crate) fn kubectl(args: &[&str]) -> Command {
     let cfg = cluster_config();
     let mut cmd = Command::new("kubectl");
     cmd.arg("--context").arg(&cfg.kube_context);

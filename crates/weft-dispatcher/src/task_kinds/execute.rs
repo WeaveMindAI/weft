@@ -97,8 +97,8 @@ pub async fn enqueue_resume(
 /// claim trigger and fence the real owner, which is exactly why both go
 /// through this one owner lookup rather than picking an arbitrary alive
 /// pod for the project.
-async fn alive_color_owner(
-    pool: &sqlx::PgPool,
+async fn alive_color_owner<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     color: weft_core::Color,
 ) -> Result<Option<String>> {
     let row: Option<(String,)> = sqlx::query_as(
@@ -110,7 +110,7 @@ async fn alive_color_owner(
              AND wp.status IN ('spawning', 'alive')"#,
     )
     .bind(color.to_string())
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.map(|(p,)| p))
 }
@@ -205,25 +205,36 @@ async fn enqueue_execution(
 /// the sibling and fenced the real owner mid-run. The
 /// `task.target_pod_name` claim filter ensures only the owner claims it.
 ///
+/// `cause` rides in the payload so the owning worker flips the color's
+/// flag WITH it: when the worker's terminal write beats the
+/// dispatcher's, the journal still names the same cause.
+///
 /// Returns `Ok(false)` if the color has no live owner (the execution is
 /// already terminal or its worker is gone; nothing to cancel).
-pub async fn enqueue_cancel(
-    pool: &sqlx::PgPool,
+///
+/// Runs on the caller's connection so the journal's cancel write can
+/// commit it in the same transaction as the terminal rows and the
+/// wake-signal strip (`Journal::cancel_execution`): a cancel either
+/// lands whole or not at all.
+pub async fn enqueue_cancel_in(
+    conn: &mut sqlx::PgConnection,
     project_id: &str,
     color: weft_core::Color,
     tenant_id: Option<&str>,
+    cause: &weft_core::exec::CancelCause,
 ) -> Result<bool> {
-    let Some(pod_name) = alive_color_owner(pool, color).await? else {
+    let Some(pod_name) = alive_color_owner(&mut *conn, color).await? else {
         return Ok(false);
     };
     let color_str = color.to_string();
     let payload = CancelExecutionPayload {
         project_id: project_id.to_string(),
         color: color_str.clone(),
+        cause: cause.clone(),
     };
     let dedup = format!("{color_str}:cancel");
-    enqueue_dedup(
-        pool,
+    weft_task_store::tasks::enqueue_dedup_in(
+        conn,
         NewTask {
             kind: TaskKind::CancelExecution.into(),
             target: TaskTarget::Worker,

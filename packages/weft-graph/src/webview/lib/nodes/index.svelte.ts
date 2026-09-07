@@ -22,10 +22,10 @@ export type { NodeTemplate } from '../types';
 // module consumes it directly (no local re-declaration) and transforms it into
 // the webview's render types (`NodeTemplate` / `PortDefinition`): the wire
 // names a port's type `type`, while the components read flat `portType`.
-// Inputs arrive RESOLVED (exposure + widget always filled by the CLI), so the
+// Inputs arrive RESOLVED (accepts + widget always filled by the CLI), so the
 // template carries them verbatim; the editor derives nothing.
 
-/// Wire input (`{ name, type, exposure, widget, ... }`) -> render port.
+/// Wire input (`{ name, type, accepts, widget, ... }`) -> render port.
 /// A generic spread: ONLY the `type` -> `portType` rename and the
 /// `required` default are applied; every other wire field rides through
 /// untouched, so adding a field to `InputSpec` propagates with no
@@ -37,9 +37,10 @@ function toInputPort({ type, required, ...rest }: InputSpec): PortDefinition {
 }
 
 /// Wire output (`{ name, type, ... }`) -> render port. Same generic
-/// spread discipline as `toInputPort`.
-function toOutputPort({ type, required, ...rest }: OutputSpec): PortDefinition {
-	return { ...rest, portType: type, required: required ?? false };
+/// spread discipline as `toInputPort`. An output carries no optionality:
+/// `required` is the constant the render port expects for one.
+function toOutputPort({ type, ...rest }: OutputSpec): PortDefinition {
+	return { ...rest, portType: type, required: true };
 }
 
 function toTemplate(entry: CatalogEntry): NodeTemplate {

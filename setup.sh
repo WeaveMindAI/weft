@@ -21,6 +21,29 @@
 # at all, tracked or not, takes the build path for everything (the
 # published artifacts are keyed to one exact commit).
 #
+# Disk hygiene (every install that touches docker, not just --purge):
+#   - orphaned anonymous docker volumes are reaped (postgres:18
+#     declares a VOLUME, so a throwaway test database whose container
+#     was removed without -v strands one forever; named volumes are
+#     never touched),
+#   - a --cli install (the default includes it) bounds the two local
+#     build caches: the BuildKit cache to 20GB (LRU) and the workspace
+#     target/ (WEFT_TARGET_CAP_GB, default 40G; under the cap the
+#     incremental cache is untouched),
+#   - after the daemon refresh, `weft clean --images --all` reclaims
+#     every weft image nothing runs any more (unreferenced worker
+#     images, stale weft-infra-* tags, old builder bases, on host
+#     docker and the kind node). KEEP set = the dispatcher's
+#     referenced set (running projects' worker hashes, live pods',
+#     live tasks', every project's infra image tags, every live infra
+#     unit's recorded refs), so a running project's current worker
+#     image and a live project's infra images survive the update
+#     untouched; the user resyncs a project when they want it on the
+#     new engine, and that project's old image goes on a LATER
+#     install's reclaim once nothing points at it. Stale
+#     dispatcher/listener/broker/supervisor images are reclaimed by
+#     the daemon refresh itself.
+#
 # Component flags pick a subset (multiple combine):
 #   --cli         build CLI only
 #   --daemon      refresh daemon only
@@ -95,10 +118,11 @@
 #                     nothing you have stored is lost while you are still
 #                     deciding the shape. Ask as often as you change the
 #                     table.
-#   --release         With --migration: collapse every draft into one
-#                     released migration, the one that goes in the PR, and
-#                     tell your database it is already in it. Nothing is
-#                     re-run and nothing is lost.
+#   --release         With --migration: write the one released migration,
+#                     the one that goes in the PR, and bring your database
+#                     along: if it ran drafts, it is told the release is
+#                     already in it; if it never saw one, the release runs
+#                     on it now. One command either way, nothing is lost.
 #
 # Removal:
 #   --uninstall   Remove user-facing pieces but preserve work. Stops
@@ -298,9 +322,31 @@ weft_image_ids() {
     | awk -v re="$1" '{repo=$1; sub(/^.*\//,"",repo); if (repo ~ re) print $2}' \
     | sort -u
 }
-# The images an ENGINE change strands (workers + builder base + the
-# node-test image bake the engine in).
-build_plane_repos_re='^(weft-worker|weft-builder-base|weft-node-tests)$'
+# One docker-daemon reachability probe, the same shape everywhere it
+# gates a best-effort action. (The --purge refusal keeps its own
+# PATH-then-daemon form: it must TELL docker-missing and daemon-down
+# apart in its error, so it does not share this shape.)
+docker_reachable() {
+  docker version --format '{{.Server.Version}}' >/dev/null 2>&1
+}
+
+# The engine's major version, empty when the daemon is unreachable.
+# Gates the one step whose SAFETY depends on the engine generation
+# (the anonymous-only scope of `docker volume prune`, Docker >= 23).
+docker_server_major() {
+  # `|| true`: under pipefail an unreachable daemon would otherwise
+  # fail the pipeline and, through the caller's assignment, the whole
+  # script under set -e; empty output IS the unreachable answer.
+  { docker version --format '{{.Server.Version}}' 2>/dev/null || true; } | cut -d. -f1
+}
+
+# The images an ENGINE change strands: the builder base and the
+# node-test image bake the engine crates in. Worker images bake it in
+# too, but a running project still USES its old-engine image until the
+# user resyncs it, so workers are NOT swept here: `weft clean --images
+# --all` (run after the daemon refresh) reclaims exactly the ones the
+# dispatcher's referenced set no longer covers and keeps the rest.
+build_plane_repos_re='^(weft-builder-base|weft-node-tests)$'
 
 # Remove one docker object (image | container | volume) if it is
 # there. THE one removal shape, so absence always reads as absence, a
@@ -312,7 +358,13 @@ remove_docker_object() { # kind ref [note]
     hint "${ref}: not present${note}"
     return 0
   fi
-  if docker "${kind}" rm -f "${ref}" >/dev/null 2>&1; then
+  # -v on a container: an image that declares a VOLUME (postgres,
+  # the object store) leaves an anonymous volume behind on a plain
+  # rm; -v takes it along and never touches named volumes. Ignored
+  # by the image and volume kinds.
+  local -a rm_flags=(-f)
+  [[ "${kind}" == container ]] && rm_flags+=(-v)
+  if docker "${kind}" rm "${rm_flags[@]}" "${ref}" >/dev/null 2>&1; then
     ok "removed ${ref}${note}"
   else
     warn "could not remove ${ref} (still in use?)"
@@ -351,10 +403,15 @@ remove_docker_images_by_id() { # label ids [note] [warn_reason]
 }
 
 # Drop everything an engine change strands: the tagged build-plane
-# images on host docker and inside the kind node, the BuildKit cache
-# (the cargo layers of worker/infra/test builds all bake the engine, so
-# a bounded prune would keep 20GB of dead weight), and the node-test
-# cargo cache under target/tmp. Best effort throughout: a --cli install
+# images (builder base + node-test image) on host docker and inside
+# the kind node, the BuildKit cache (the cargo layers of
+# worker/infra/test builds all bake the engine, so a bounded prune
+# would keep 20GB of dead weight), and the node-test cargo cache under
+# target/tmp. Worker images are deliberately NOT this sweep's to take:
+# a running project keeps using its old-engine image until the user
+# resyncs it, so those go through `weft clean --images --all` (the
+# daemon-refresh step below), which keeps everything the dispatcher's
+# referenced set still covers. Best effort throughout: a --cli install
 # must finish even with the docker daemon down; the loud bounded prune
 # earlier in the CLI section is the one that fails visibly. Best-effort
 # still SPEAKS: a removal that could not happen warns instead of
@@ -374,7 +431,7 @@ sweep_stale_build_plane() {
   local ids
   if ids="$(weft_image_ids "${build_plane_repos_re}")"; then
     remove_docker_images_by_id "stale build-plane images" "${ids}" \
-      " ${C_DIM}(weft-worker / weft-builder-base / weft-node-tests, host docker)${C_RESET}" \
+      " ${C_DIM}(weft-builder-base / weft-node-tests, host docker)${C_RESET}" \
       "still referenced by a container? they go on a later install"
   else
     # The daemon answered the probe above but not this listing: never
@@ -410,7 +467,7 @@ sweep_stale_build_plane() {
       if [[ -n "${tags}" ]]; then
         # shellcheck disable=SC2086
         if docker exec "${kind_node}" crictl rmi ${tags} >/dev/null 2>&1; then
-          ok "removed cached weft-worker + weft-builder-base + weft-node-tests images in kind containerd"
+          ok "removed cached weft-builder-base + weft-node-tests images in kind containerd"
         else
           warn "some cached build-plane images in kind containerd could not be removed (a pod still runs one?); they go on a later install"
         fi
@@ -914,8 +971,10 @@ if [[ -n "${write_migration}" ]]; then
   pf_pid=""
   migration_cleanup() {
     [[ -n "${pf_pid}" ]] && { kill "${pf_pid}" 2>/dev/null || true; }
+    # -v: the scratch postgres leaves an anonymous volume behind on a
+    # plain rm (see scripts/lib/throwaway-postgres.sh).
     [[ -n "${THROWAWAY_PG_CONTAINER:-}" ]] \
-      && docker rm -f "${THROWAWAY_PG_CONTAINER}" >/dev/null 2>&1 || true
+      && docker rm -f -v "${THROWAWAY_PG_CONTAINER}" >/dev/null 2>&1 || true
   }
   trap 'rc=$?; migration_cleanup; log_run_exit "${rc}"' EXIT
   if ! start_throwaway_postgres weft-migration-scratch; then
@@ -1368,6 +1427,47 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
   exit 0
 fi
 
+# ---- disk hygiene (every install) --------------------------------------
+#
+# One docker-level reap runs on every docker-touching install, not just
+# --cli: the
+# orphaned ANONYMOUS volume leak is not CLI-specific (postgres:18
+# declares a VOLUME, so any throwaway test database whose container was
+# removed without -v strands one forever). `docker volume prune` (no
+# -a) touches ONLY anonymous volumes no container references: the
+# object store's and any running test's named/attached volumes are not
+# anonymous, so they are safe by construction. That anonymous-only
+# scope is Docker >= 23 behavior: an older engine prunes unused NAMED
+# volumes too, and the object store's named volume is unattached
+# whenever its container is between a remove and a recreate, so on
+# such an engine this step would delete every stored file. The floor
+# is PROBED here, before the prune, because this section runs on every
+# flag combination, ahead of anything else that would fail on an old
+# engine (the `--max-used-space` bound lives in the CLI section).
+# A silent skip would let the user believe the reap happened, so an
+# unreachable daemon or an old engine says so; and unlike the CLI
+# section's BuildKit bound (loud by design: it is the user-visible
+# disk-pressure relief), this reap is junk collection, so a failed
+# prune WARNS and the install continues: hygiene must not fail the
+# install.
+# Only on an install that touches docker at all (the CLI build or the
+# daemon refresh): a --vscode-only install never asked for docker, so
+# a "docker unreachable" warning there would read as a failed install.
+if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]]; then
+section "Disk hygiene"
+docker_major="$(docker_server_major)"
+if [[ -z "${docker_major}" ]]; then
+  warn "docker unreachable; the orphaned anonymous-volume reap is skipped this install"
+elif [[ ! "${docker_major}" =~ ^[0-9]+$ || "${docker_major}" -lt 23 ]]; then
+  warn "docker engine ${docker_major:-?} is older than 23, whose volume prune would also take unused NAMED volumes; the anonymous-volume reap is skipped this install"
+elif spin "reap orphaned anonymous docker volumes" \
+  docker volume prune --force; then
+  :
+else
+  warn "the anonymous-volume reap failed; re-run ${C_BOLD}docker volume prune --force${C_RESET} by hand"
+fi
+fi
+
 # ---- CLI -------------------------------------------------------------
 
 if [[ $build_cli -eq 1 ]]; then
@@ -1376,17 +1476,25 @@ if [[ $build_cli -eq 1 ]]; then
 
   # ---- disk hygiene, BEFORE the build -------------------------------
   #
-  # Two unbounded caches live on this machine and both once grew to
-  # ~100GB each before anyone noticed:
+  # The two BUILD caches are bounded on every --cli install (the
+  # default includes it):
   #   - the cargo target/ dir (incremental artifacts accumulate across
-  #     dep bumps and crate renames and are never evicted), and
+  #     dep bumps and crate renames and are never evicted; once grew to
+  #     ~100GB before anyone noticed), and
   #   - docker's BuildKit layer cache (every worker/infra/test image
   #     build adds entries; nothing prunes them).
-  # Bound both on every install. The target/ bound is a cap, not a
-  # wipe: under the cap the incremental cache is untouched and rebuilds
-  # stay fast; over it we clean and pay one cold build now instead of
-  # filling the disk later. Override with WEFT_TARGET_CAP_GB.
-  target_cap_gb="${WEFT_TARGET_CAP_GB:-60}"
+  # (The anonymous-volume reap is NOT here: it runs on every install
+  # regardless of flags, in its own section above.)
+  # The target/ bound is a cap, not a wipe: under the cap the
+  # incremental cache is untouched and rebuilds stay fast; over it we
+  # clean and pay one cold build now instead of filling the disk later.
+  # The cap measures the WHOLE of target/ (debug + release + tmp); a
+  # full debug build of this workspace with line-tables-only debuginfo
+  # plus the db-test and e2e binaries sits well under 40G, so the
+  # default only trips on real accumulation, never on a routine tree
+  # (a cap under the working size would wipe on every install).
+  # Override with WEFT_TARGET_CAP_GB.
+  target_cap_gb="${WEFT_TARGET_CAP_GB:-40}"
   if [[ ! "${target_cap_gb}" =~ ^[0-9]+$ ]]; then
     fail "WEFT_TARGET_CAP_GB must be a whole number of gigabytes, got '${target_cap_gb}'"
     exit 1
@@ -1412,10 +1520,13 @@ if [[ $build_cli -eq 1 ]]; then
   fi
   # Gate on daemon REACHABILITY, not binary presence: a --cli install
   # on a machine whose docker isn't running must still produce a
-  # binary. With a live daemon, a failed prune fails loud.
-  if docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+  # binary. With a live daemon, a failed prune fails loud; with none,
+  # SAY the bound was skipped instead of letting silence read as done.
+  if docker_reachable; then
     spin "bound BuildKit cache to 20GB (LRU)" \
       docker builder prune --force --max-used-space 20GB
+  else
+    warn "docker unreachable; the BuildKit cache bound is skipped this install"
   fi
 
   # Prebuilt path: this checkout matches the commit CI built, so the
@@ -1519,10 +1630,12 @@ if [[ $build_cli -eq 1 ]]; then
     ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${src}${C_RESET}"
   fi
 
-  # Engine-change sweep, on either path: worker images, the builder
-  # base and the node-test image all bake the engine crates in, so an
-  # engine change strands every cached build-plane image (host docker +
-  # kind containerd), the BuildKit cache and the node-test cargo cache.
+  # Engine-change sweep, on either path: the builder base and the
+  # node-test image bake the engine crates in, so an engine change
+  # strands them (host docker + kind containerd), the BuildKit cache
+  # and the node-test cargo cache. Worker images bake the engine too,
+  # but they are NOT swept here (see `build_plane_repos_re` above for
+  # why: running projects keep theirs until they resync).
   # Keyed on the ENGINE'S OWN identity (the builder-base ref the
   # freshly installed CLI computes from source content), which is the
   # same on the prebuilt and the compiled path and does not move when
@@ -1588,7 +1701,51 @@ if [[ $refresh_daemon -eq 1 ]]; then
     # (boot and refresh are the same operation; `restart` is its alias).
     spin_passthrough "weft daemon start" \
       env WEFT_REPO_ROOT="${here}" "${weft_bin}" daemon start ${rebuild_flag} ${rebuild_cluster_flag} ${public_url_flag}
+
+    # Reclaim what the update stranded, now that the refreshed daemon
+    # can answer for what is still in use: `weft clean --images --all`
+    # keeps exactly the dispatcher's referenced set (running projects'
+    # current worker images, draining pods', live tasks', every
+    # project's infra image tags, every live infra unit's recorded
+    # image refs) and removes everything else of
+    # weft's: unreferenced worker images, stale `weft-infra-*` tags,
+    # old builder bases, on host docker AND the kind node. Stale
+    # system images were already reclaimed by the daemon start itself.
+    # This is the "old version gone, running things untouched" pass:
+    # a project the user has not resynced yet KEEPS its old-engine
+    # image (it is still its running pointer) and the reclaim catches
+    # it on a later install once the resync moves the pointer.
+    # No health re-probe before it: `weft daemon start` returning 0
+    # already implies the dispatcher answered /health (the CLI probes
+    # it as reconcile's last step), and a failed start exits this
+    # script under set -e. The clean itself fails loudly if the daemon
+    # became unreachable in between, and the warn below is the recovery
+    # hint. Warn-only either way: hygiene must not fail the install.
+    # Not safe against a `weft build`/`run` in flight in another window
+    # (a fresh image is referenced by nothing until its register lands;
+    # that run fails loudly and rebuild heals), so it runs AFTER the
+    # reconcile, when this window's own builds are done.
+    # Passthrough (not spin): the reclaim names what it removes, and
+    # "kept the running project's images, dropped the dead ones" is
+    # exactly the output a user updating weft wants to see.
+    if spin_passthrough "weft clean --images --all" \
+      env WEFT_REPO_ROOT="${here}" WEFT_DISPATCHER_URL="${dispatcher_url}" \
+        "${weft_bin}" clean --images --all; then
+      :
+    else
+      warn "the image reclaim failed; re-run ${C_BOLD}weft clean --images --all${C_RESET} by hand once the daemon is settled"
+    fi
   fi
+elif [[ $build_cli -eq 1 ]]; then
+  # Worker and infra images are only ever reclaimed through the
+  # daemon refresh above (the reclaim needs the daemon's referenced
+  # set, and the engine sweep deliberately leaves workers alone: a
+  # running project keeps its old-engine image until it resyncs). A
+  # silent skip would let unreferenced worker images pile up on a
+  # --cli / --no-daemon workflow with nothing ever saying so; a
+  # --vscode-only install builds no images and gets no such line.
+  section "Daemon"
+  hint "daemon refresh skipped, so no image reclaim this install; run ${C_BOLD}weft clean --images --all${C_RESET} with the daemon up to reclaim stale worker/infra images"
 fi
 
 # The address the daemon recorded for the public trigger surface, when

@@ -213,19 +213,35 @@ impl LiveConnectionConfig {
     /// `fields` is the node's `ctx.inputs.object()` map.
     pub fn from_node_fields(
         fields: &serde_json::Map<String, serde_json::Value>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let path = fields.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let auth = if fields.get("generateApiKey").and_then(|v| v.as_bool()).unwrap_or(false) {
+        // A flag is absent or a boolean. Anything else is refused: read
+        // as false, "generate an api key" would quietly mount the
+        // endpoint open to the world.
+        let flag = |name: &str| -> Result<bool, String> {
+            match fields.get(name) {
+                None | Some(serde_json::Value::Null) => Ok(false),
+                Some(serde_json::Value::Bool(b)) => Ok(*b),
+                Some(other) => Err(format!("{name} is yes or no, got {other}")),
+            }
+        };
+        let auth = if flag("generateApiKey")? {
             super::PublicEntryAuth::OptionalApiKey
         } else {
             super::PublicEntryAuth::None
         };
-        let can_suspend = fields.get("canSuspend").and_then(|v| v.as_bool()).unwrap_or(false);
-        let default_hold_secs = fields
-            .get("defaultHoldSecs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(crate::wait::LANGUAGE_DEFAULT_HOLD_SECS);
-        Self {
+        let can_suspend = flag("canSuspend")?;
+        // Absent, the language default; present, a whole non-negative
+        // number of seconds (a JSON `60.0` is one), anything else a
+        // refusal rather than a silent fall back to the default.
+        let default_hold_secs = match fields.get("defaultHoldSecs") {
+            None | Some(serde_json::Value::Null) => crate::wait::LANGUAGE_DEFAULT_HOLD_SECS,
+            Some(v) => match v.as_f64() {
+                Some(n) if n >= 0.0 && n.fract() == 0.0 => n as u64,
+                _ => return Err(format!("defaultHoldSecs must be a whole number of seconds, got {v}")),
+            },
+        };
+        Ok(Self {
             path,
             auth,
             suspend: crate::wait::SuspendPolicy { can_suspend, default_hold_secs },
@@ -238,7 +254,7 @@ impl LiveConnectionConfig {
             error_mode: ErrorMode::default(),
             journal_mode: JournalMode::default(),
             window: None,
-        }
+        })
     }
 
     /// Shared validation for both kinds. `kind_tag` only flavors the error

@@ -9,6 +9,38 @@ weft run
 `weft new` scaffolds a project. `weft run` compiles it, registers it with the
 daemon, fires one execution, and streams the events back until it finishes.
 
+## Bring your AI assistant
+
+You are meant to build weft by talking. The assistant that builds with you
+is called Tangle: a persona weft installs into your project, who knows the
+language, the whole node catalog on disk, and the loop of build one stage,
+run it, read what came out. Tangle is part of weft, not a plugin you wire
+up.
+
+The flow is two steps:
+
+```bash
+weft new hello --assistant kilo-code       # shorthand: --assistant kc
+```
+
+then open the `hello` folder in that assistant (Kilo Code, here). Tangle
+loads on its own, with its method, its node reference, and its commands
+already in place. You describe what you want, in plain words; it shapes the
+program, picks or writes the nodes, runs it, and shows you what happened.
+
+The flag's value is the assistant you use, so the same command covers every
+assistant weft supports as more arrive (repeat the flag to install for
+several at once). And the choice is remembered: your next `weft new`
+installs the same assistant with no flag at all, until you pass
+`--assistant <name>` to change it or `--assistant none` to stop. Claude Code
+is also available as `--assistant claude-code` (shorthand `cc`).
+
+Tangle is deliberately symlinked from your weft checkout rather than
+copied, so updating weft (`git pull` + `./setup.sh` in the checkout)
+refreshes Tangle in every such project at once. That is the one exception to
+"the project owns everything" below; the links are machine-local and
+already gitignored for you.
+
 ## What got created
 
 ```

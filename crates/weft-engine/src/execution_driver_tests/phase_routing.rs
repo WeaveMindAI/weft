@@ -3,7 +3,7 @@
     //! pure `node_body_for` rule; layer 3 drives real executions through
     //! `run_one_execution` and asserts which methods actually ran.
 
-    use super::engine_test_rig::{test_manifest, MemJournal, NoopInfra, NoopInfraState, NoopProject, NoopTasks};
+    use super::engine_test_rig::{test_manifest, MemJournal, NoopInfra, NoopInfraState, NoopProject, NoopSteering, NoopTasks};
     use super::*;
     use std::sync::Mutex as StdMutex;
     use async_trait::async_trait;
@@ -156,6 +156,7 @@
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         }
     }
 

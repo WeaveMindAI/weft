@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -53,7 +53,6 @@
     {
       "name": "dropBackgroundAudio",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -66,36 +65,28 @@
     {
       "name": "file",
       "type": "Audio",
-      "required": false,
       "description": "The dubbed audio."
     },
     {
       "name": "dubbingId",
       "type": "String",
-      "required": false,
       "description": "The dub project's id on the account (re-download other languages, or delete it)."
     },
     {
       "name": "filename",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "mimeType",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "sizeBytes",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ],
   "display": {
     "kind": "media",
     "output": "file"
-  },
-  "features": {
-    "isOutputDefault": true
   }
 }

@@ -21,21 +21,37 @@ import * as readline from 'node:readline';
 import { WeftCliError } from './cli';
 import type { EditOp, TextEdit } from '../../packages/weft-graph/src/protocol';
 
-/** A parse-server request. `kind` selects the pipeline; `source` is the buffer
- *  text (parsed as-is, no disk read); `file` gives the `@file`/`@include` base
- *  and the project to resolve; `reloadCatalog` drops the server's warm catalog
- *  for this project first (sent when the host's `nodes/` watcher fired). */
-export interface ParseServerRequest {
-  kind: 'parse' | 'validate' | 'edit' | 'applyEdit';
+/** Which validation tier a `validate` request runs. `structural` = graph
+ *  shape only (the Problems panel); `runtime` = additionally the rules
+ *  flagged `level: runtime` such as missing credentials (the pre-flight
+ *  gate before Run). */
+// SYNC: ValidationMode <-> crates/weft-compiler/src/validate.rs ValidationMode
+export type ValidationMode = 'structural' | 'runtime';
+
+/** Fields every parse-server request carries. `source` is the buffer text
+ *  (parsed as-is, no disk read); `file` gives the `@file`/`@include` base
+ *  and the project to resolve; `reloadCatalog` drops the server's warm
+ *  catalog for this project first (sent when the host's `nodes/` watcher
+ *  fired). */
+interface ParseServerRequestBase {
   source: string;
   file?: string;
   reloadCatalog?: boolean;
-  /** Edit ops (kind 'edit' only), applied in order to `source`. */
-  ops?: EditOp[];
-  /** A raw text edit to replay (kind 'applyEdit' only, the undo/redo path). */
-  textEdit?: TextEdit;
 }
 
+/** A parse-server request. A union on `kind` so each pipeline's required
+ *  inputs are required by the type: a `validate` without a mode (which the
+ *  server refuses) or an `edit` without ops cannot be written. */
+// SYNC: ParseServerRequest <-> crates/weft-cli/src/commands/parse.rs ServerRequest
+export type ParseServerRequest =
+  | ({ kind: 'parse' } & ParseServerRequestBase)
+  | ({ kind: 'validate'; mode: ValidationMode } & ParseServerRequestBase)
+  /** Edit ops, applied in order to `source`. */
+  | ({ kind: 'edit'; ops: EditOp[] } & ParseServerRequestBase)
+  /** A raw text edit to replay (the undo/redo path). */
+  | ({ kind: 'applyEdit'; textEdit: TextEdit } & ParseServerRequestBase);
+
+// SYNC: ServerResponseEnvelope <-> crates/weft-cli/src/commands/parse.rs ServerResponse
 interface ServerResponseEnvelope {
   id: number;
   payload?: unknown;
@@ -46,6 +62,9 @@ interface Pending {
   resolve: (payload: unknown) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  /// Detaches the request's abort listener; run on every settle so a
+  /// long-lived signal cannot accumulate listeners.
+  cleanup?: () => void;
 }
 
 /** The server ANSWERED with an error (an invalid edit, a parse/catalog
@@ -89,38 +108,61 @@ export class ParseServer {
 
   /** Send a request and resolve with its typed payload. Spawns the server on
    *  first use. Rejects with WeftCliError if the server can't be reached,
-   *  answers with an error envelope, or doesn't answer within the timeout. */
-  request<T>(req: ParseServerRequest): Promise<T> {
+   *  answers with an error envelope, or doesn't answer within the timeout.
+   *  An aborted `signal` rejects immediately (the server's late reply is
+   *  dropped by the pending-map miss); the server itself is untouched. */
+  request<T>(req: ParseServerRequest, signal?: AbortSignal): Promise<T> {
     if (this.disposed) {
       return Promise.reject(new Error('parse server is disposed'));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(new WeftCliError(['parse-server'], null, 'request aborted'));
     }
     const child = this.ensureChild();
     const id = this.nextId++;
     const line = JSON.stringify({ id, ...req }) + '\n';
     return new Promise<T>((resolve, reject) => {
+      const onAbort = () => {
+        this.settle(id)?.reject(new WeftCliError(['parse-server'], null, 'request aborted'));
+      };
       const timer = setTimeout(() => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        reject(new WeftCliError(['parse-server'], null, `parse server did not respond within ${REQUEST_TIMEOUT_MS}ms (restarting)`));
+        const p = this.settle(id);
+        if (!p) return;
+        p.reject(new WeftCliError(['parse-server'], null, `parse server did not respond within ${REQUEST_TIMEOUT_MS}ms (restarting)`));
         // A wedged server won't answer the next request either; tear it down so
         // ensureChild respawns a fresh one. This also rejects siblings pending.
         this.onChildGone(child, new WeftCliError(['parse-server'], null, 'parse server wedged; restarted'));
       }, REQUEST_TIMEOUT_MS);
-      this.pending.set(id, { resolve: resolve as (p: unknown) => void, reject, timer });
+      this.pending.set(id, {
+        resolve: resolve as (p: unknown) => void,
+        reject,
+        timer,
+        cleanup: signal ? () => signal.removeEventListener('abort', onAbort) : undefined,
+      });
+      signal?.addEventListener('abort', onAbort);
       // stdin write errors (broken pipe on a dying child) surface via the
       // child 'exit' handler, which rejects all pending; absorb here so an
       // EPIPE doesn't crash the extension host.
       child.stdin.write(line, (err) => {
         if (err) {
-          const p = this.pending.get(id);
-          if (p) {
-            clearTimeout(p.timer);
-            this.pending.delete(id);
-            reject(new WeftCliError(['parse-server'], null, err.message));
-          }
+          this.settle(id)?.reject(new WeftCliError(['parse-server'], null, err.message));
         }
       });
     });
+  }
+
+  /** Take one pending request out of flight: clear its timer, detach
+   *  its abort listener, and hand it back for the caller to settle.
+   *  THE one path out of the pending map; every resolve/reject route
+   *  (reply, timeout, abort, write error, child death, dispose) goes
+   *  through it, so no route can forget the timer or the listener. */
+  private settle(id: number): Pending | undefined {
+    const p = this.pending.get(id);
+    if (!p) return undefined;
+    this.pending.delete(id);
+    clearTimeout(p.timer);
+    p.cleanup?.();
+    return p;
   }
 
   private ensureChild(): ChildProcessWithoutNullStreams {
@@ -130,9 +172,10 @@ export class ParseServer {
     this.child = child;
     this.watchBinary(child);
 
-    // One response per line.
+    // One response per line. The handler captures ITS child: a stale
+    // reader's late line must never tear down a newer child.
     this.reader = readline.createInterface({ input: child.stdout });
-    this.reader.on('line', (line) => this.onLine(line));
+    this.reader.on('line', (line) => this.onLine(child, line));
 
     // stderr is the server's tracing channel; surface it for debugging but
     // don't treat it as a response.
@@ -157,7 +200,7 @@ export class ParseServer {
     return child;
   }
 
-  private onLine(line: string): void {
+  private onLine(child: ChildProcessWithoutNullStreams, line: string): void {
     if (!line.trim()) return;
     let env: ServerResponseEnvelope;
     try {
@@ -165,28 +208,23 @@ export class ParseServer {
     } catch {
       // A line that is not JSON must still settle SOMETHING: leaving it
       // on the floor stalls the pending request until the 30s timeout.
-      // Salvage the id and fail that request now; with no id the line
-      // cannot be attributed, so the child is torn down (which rejects
+      // Salvage the id and fail that request now; an id that is no
+      // longer pending (aborted, timed out) has nobody waiting, so the
+      // line is simply dropped. Only a line with NO id at all cannot
+      // be attributed, and then THIS child is torn down (which rejects
       // every pending request) rather than left silently wedged.
       const id = line.match(/"id"\s*:\s*(\d+)/);
       if (id) {
-        const p = this.pending.get(Number(id[1]));
-        if (p) {
-          clearTimeout(p.timer);
-          this.pending.delete(Number(id[1]));
-          p.reject(new WeftCliError(['parse-server'], null, `malformed response line: ${line.slice(0, 200)}`));
-          return;
-        }
+        this.settle(Number(id[1]))?.reject(
+          new WeftCliError(['parse-server'], null, `malformed response line: ${line.slice(0, 200)}`),
+        );
+        return;
       }
-      if (this.child) {
-        this.onChildGone(this.child, new WeftCliError(['parse-server'], null, `unparseable response line: ${line.slice(0, 200)}`));
-      }
+      this.onChildGone(child, new WeftCliError(['parse-server'], null, `unparseable response line: ${line.slice(0, 200)}`));
       return;
     }
-    const p = this.pending.get(env.id);
+    const p = this.settle(env.id);
     if (!p) return;
-    clearTimeout(p.timer);
-    this.pending.delete(env.id);
     if (env.error !== undefined) {
       p.reject(new ParseServerError(env.error));
     } else {
@@ -232,11 +270,8 @@ export class ParseServer {
     this.binaryWatcher?.close();
     this.binaryWatcher = undefined;
     child.kill();
-    const pendings = [...this.pending.values()];
-    this.pending.clear();
-    for (const p of pendings) {
-      clearTimeout(p.timer);
-      p.reject(err);
+    for (const id of [...this.pending.keys()]) {
+      this.settle(id)?.reject(err);
     }
   }
 
@@ -248,11 +283,9 @@ export class ParseServer {
     this.reader = undefined;
     this.binaryWatcher?.close();
     this.binaryWatcher = undefined;
-    for (const p of this.pending.values()) {
-      clearTimeout(p.timer);
-      p.reject(new Error('parse server disposed'));
+    for (const id of [...this.pending.keys()]) {
+      this.settle(id)?.reject(new Error('parse server disposed'));
     }
-    this.pending.clear();
     child?.kill();
   }
 }

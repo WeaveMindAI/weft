@@ -38,10 +38,9 @@ mkdir -p nodes/reply
       "description": "Kick from the ApiEndpoint trigger." }
   ],
   "outputs": [
-    { "name": "done", "type": "Boolean", "required": false,
+    { "name": "done", "type": "Boolean",
       "description": "Fires true once the response has been sent." }
   ],
-  "features": { "isOutputDefault": true },
   "requires_infra": false
 }
 ```

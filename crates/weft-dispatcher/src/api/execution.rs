@@ -8,12 +8,46 @@ use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use weft_core::exec::CancelCause;
 use weft_core::Color;
 
 use crate::authenticator::{authorize_execution, authorize_project, CallerTenant};
 use crate::journal::{ExecutionPage, ExecutionQuery};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
+
+/// The one execution of the caller's whose color starts with `prefix`
+/// (a full uuid resolves to itself). 404 when nothing matches, 409
+/// when the prefix is short enough to match several, naming them.
+pub async fn resolve_color(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(prefix): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let prefix = prefix.to_ascii_lowercase();
+    if prefix.len() < 4 || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{prefix}' is not the start of a color: give at least four hex characters"),
+        ));
+    }
+    let matches = state
+        .journal
+        .colors_with_prefix(caller.0.as_str(), &prefix)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("colors_with_prefix: {e}")))?;
+    match matches.as_slice() {
+        [] => Err((StatusCode::NOT_FOUND, format!("no execution starts with '{prefix}'"))),
+        [one] => Ok(Json(serde_json::json!({ "color": one.to_string() }))),
+        several => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "'{prefix}' starts more than one execution ({}, ...); give more characters",
+                several.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}
 
 pub async fn cancel(
     State(state): State<DispatcherState>,
@@ -24,164 +58,105 @@ pub async fn cancel(
         .parse()
         .map_err(|e: uuid::Error| (StatusCode::BAD_REQUEST, e.to_string()))?;
     authorize_execution(&*state.journal, &caller.0, color).await?;
-    cancel_color(&state, color).await.map_err(|e| {
+    cancel_color(&state, color, &CancelCause::User).await.map_err(|e| {
         tracing::error!(target: "weft_dispatcher::cancel", color = %color, error = %e, "cancel_color failed");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Cancel a single execution.
-///
-/// Two paths converge to a single observable outcome (the journal
-/// reaches `ExecutionCancelled`):
-///
-///   - When a worker Pod is alive for this project, it might be
-///     actively running this color's loop driver. We enqueue a
-///     `cancel_execution` task; the worker fires the per-color
-///     `CancellationFlag`, the loop driver exits, the worker would
-///     try to journal terminals (idempotent: skips if already done).
-///   - In every case, the dispatcher writes the terminal events
-///     itself (NodeCancelled per non-terminal node + ExecutionCancelled).
-///     This handles the suspended-execution case (no Pod alive, the
-///     worker exited cleanly when it stalled) and races where the
-///     worker is alive but not running this color.
-///
-/// Order matters:
-///   1. Strip wake signals so webhooks / timers / forms can no
-///      longer revive the execution.
-///   2. Enqueue the cancel task IF a live worker exists. We don't
-///      want orphan tasks accumulating for projects with no worker
-///      (the queue would leak).
-///   3. Journal NodeCancelled for non-terminal nodes (the worker's
-///      same code path is idempotent on `has_terminal_event` so it
-///      won't double-write).
-///   4. Journal ExecutionCancelled.
-///   5. The journal bridge polls these new rows and publishes them
-///      onto the project's SSE bus so the frontend exits the
-///      "Cancelling..." pending state.
-pub async fn cancel_color(state: &DispatcherState, color: Color) -> anyhow::Result<()> {
-    tracing::info!(
-        target: "weft_dispatcher::cancel",
-        color = %color,
-        "cancel_color start"
-    );
-
-    // 1. Strip wake-signal registrations. Must be first: if we
-    //    journaled terminals first, a webhook could fire in the
-    //    gap and resume a dead execution. A DB failure here MUST
-    //    abort the cancel: continuing past it leaves the wake
-    //    signals registered, so the next webhook revives a
-    //    "cancelled" execution.
-    let removed = state
-        .journal
-        .signal_remove_for_color(color)
-        .await?;
-    tracing::info!(
-        target: "weft_dispatcher::cancel",
-        color = %color,
-        signals_removed = removed.len(),
-        "wake signals stripped"
-    );
-    state
-        .listeners
-        .unregister_many(&state.pg_pool, &removed)
-        .await;
-
-    let Some(project_id) = state.journal.execution_owner(color).await?.map(|o| o.project_id)
-    else {
-        tracing::warn!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            "no project_id for color; nothing to do"
-        );
-        return Ok(());
-    };
-
-    // 2. Always enqueue cancel_execution. If a worker is alive AND
-    //    is currently running this color, the task fires the
-    //    per-color CancellationFlag fast (~50ms), the loop driver
-    //    exits, and the worker stops emitting node events. If no
-    //    worker is running this color (suspended, or no worker at
-    //    all), the task is a harmless no-op when claimed (or
-    //    eventually reaped). The dispatcher's terminal-journal
-    //    write below still runs in every case, so the frontend's
-    //    "Cancelling..." state always exits.
-    let tenant = state.tenant_router.tenant_for_project(&project_id).await?;
-    let enqueued = crate::task_kinds::execute::enqueue_cancel(
-        &state.pg_pool,
-        &project_id,
-        color,
-        Some(tenant.as_str()),
-    )
-    .await?;
-    if enqueued {
-        tracing::info!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            project = %project_id,
-            "cancel task enqueued"
-        );
-    } else {
-        tracing::debug!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            project = %project_id,
-            "no live worker pod; cancel is a no-op (execution already terminal)"
+/// Cancel every color in `targets`, each with its own cause, attempting
+/// ALL of them before reporting. One failing color must not strand the
+/// ones after it (they would stay live with their wakes registered), and
+/// a failure must not disappear either: if any cancel failed, the
+/// result is an error naming every failed color and why, so a task
+/// built on this is recorded failed with the real errors, never
+/// completed with a count nobody reads. Returns the colors cancelled.
+pub async fn cancel_colors(
+    state: &DispatcherState,
+    targets: &[(Color, &CancelCause)],
+) -> anyhow::Result<Vec<Color>> {
+    let mut cancelled = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (color, cause) in targets {
+        match cancel_color(state, *color, cause).await {
+            Ok(()) => cancelled.push(*color),
+            Err(e) => failures.push(format!("{color}: {e:#}")),
+        }
+    }
+    if !failures.is_empty() {
+        // Name both sides: whoever repairs this by hand needs to know
+        // which runs are terminal now and which are still live.
+        let succeeded: Vec<String> = cancelled.iter().map(|c| c.to_string()).collect();
+        anyhow::bail!(
+            "{} of {} cancel(s) failed: {}; cancelled: [{}]",
+            failures.len(),
+            failures.len() + cancelled.len(),
+            failures.join("; "),
+            succeeded.join(", ")
         );
     }
-
-    // 3 + 4. Journal terminal events directly. Done in every path
-    // (live worker or not). The worker's own terminal-write path
-    // is idempotent and skips if these rows already exist.
-    journal_cancel_terminals(state, color, "Cancelled by user").await?;
-
-    Ok(())
+    Ok(cancelled)
 }
 
-/// Write NodeCancelled per non-terminal node + ExecutionCancelled
-/// directly from the dispatcher. Used when
-/// the worker isn't going to do it (suspended execution, no live
-/// worker, race window). Idempotent: skips entirely if the journal
-/// already shows a terminal for this color, so it never stacks a second
-/// terminal on a color a worker may have already finished (the canonical
-/// dispatcher-side terminal writer; other call sites must route through it
-/// rather than recording `ExecutionCancelled` directly).
-pub(crate) async fn journal_cancel_terminals(
+/// Cancel a single execution, for `cause`. THE cancel: every caller
+/// (`weft stop`, the sweeps, a sibling run's `stop_tagged`) goes
+/// through here and says why, and the cause lands on every terminal
+/// row this writes AND on the `cancel_execution` task, so the owning
+/// worker's own write (if it gets there first) names the same cause.
+///
+/// The durable part is ONE transaction (`Journal::cancel_execution`):
+/// strip the wake signals, journal the terminals, queue the cancel
+/// task for the alive owner pod. Either all of it lands or none does,
+/// so a database failure mid-cancel leaves the run exactly as it was
+/// and the next attempt succeeds; nothing can strip a run's wakes and
+/// then fail to end it. Two paths then converge on the one observable
+/// outcome (the journal reads `ExecutionCancelled`):
+///
+///   - When a worker Pod is alive and driving this color, the task
+///     fires the per-color `CancellationFlag` (~50ms), the loop driver
+///     exits, and the worker's own terminal write finds the rows
+///     already there and skips (idempotent).
+///   - With no worker driving it (a suspended run, no pod at all), the
+///     rows written here ARE the terminal.
+///
+/// After the commit the listener forgets the stripped signals in RAM
+/// (the durable row is already gone, so a late fire finds nothing),
+/// and the journal bridge publishes the new rows onto the project's
+/// SSE bus so the frontend exits "Cancelling...".
+pub async fn cancel_color(
     state: &DispatcherState,
     color: Color,
-    reason: &str,
+    cause: &CancelCause,
 ) -> anyhow::Result<()> {
-    if has_terminal_event(&state.pg_pool, color).await? {
-        tracing::info!(
-            target: "weft_dispatcher::cancel",
-            color = %color,
-            "terminal already journaled; skipping dispatcher-side write"
-        );
-        return Ok(());
-    }
-    let now = crate::lease::now_unix() as u64;
-    let events = state.journal.events_log(color).await?;
-    let writes = cancel_terminal_events(color, &events, reason, now);
-    let node_cancellations = writes.len() - 1;
-    for (event, dedup) in &writes {
-        state.journal.record_event_dedup(event, dedup).await?;
-    }
     tracing::info!(
         target: "weft_dispatcher::cancel",
         color = %color,
-        node_cancellations,
-        "journaled ExecutionCancelled"
+        %cause,
+        "cancel_color start"
+    );
+    let write = state.journal.cancel_execution(color, cause).await?;
+    state
+        .listeners
+        .unregister_many(&state.pg_pool, &write.removed)
+        .await;
+    tracing::info!(
+        target: "weft_dispatcher::cancel",
+        color = %color,
+        signals_removed = write.removed.len(),
+        task_enqueued = write.task_enqueued,
+        node_cancellations = ?write.node_cancellations,
+        "cancel committed"
     );
     Ok(())
 }
 
 /// THE definition of a dispatcher-side cancel write: the ordered
-/// `(event, dedup_key)` list that flips a color terminal. Pure, so BOTH
-/// cancel writers (`journal_cancel_terminals`, retrying via the trait's
-/// dedup'd appends, and `Journal::cancel_never_claimed_execution`, writing on
-/// its own transaction) emit IDENTICAL rows and can never drift on the
-/// ordering rule, the dedup-key format, or the closure-emission policy.
+/// `(event, dedup_key)` list that flips a color terminal. Pure, so the
+/// transactional cancel writers (`Journal::cancel_execution` and
+/// `Journal::cancel_never_claimed_execution`) emit IDENTICAL rows and
+/// can never drift on the ordering rule, the dedup-key format, or the
+/// closure-emission policy.
 ///
 /// Per-node cancellations come BEFORE `ExecutionCancelled` (always the last
 /// entry). Otherwise a partial run that journaled the terminal event first
@@ -192,13 +167,14 @@ pub(crate) async fn journal_cancel_terminals(
 /// stacking a duplicate NodeCancelled row (which would also republish a
 /// duplicate UI event); the terminal's key makes the row-level write safe even
 /// if two cancels for the same color race past their has-terminal checks.
-pub(crate) fn cancel_terminal_events(
+pub fn cancel_terminal_events(
     color: Color,
     events: &[weft_journal::ExecEvent],
-    reason: &str,
+    cause: &CancelCause,
     now: u64,
 ) -> Vec<(weft_journal::ExecEvent, String)> {
     use weft_journal::ExecEvent;
+    let reason = cause.to_string();
     let snapshot = weft_journal::fold_to_snapshot(color, events);
     // `snapshot.corruptions` is intentionally not consumed here. The
     // cancel writers only need the executions map to know which
@@ -218,7 +194,7 @@ pub(crate) fn cancel_terminal_events(
                     color,
                     node_id: node_id.clone(),
                     frames: e.frames.clone(),
-                    reason: reason.to_string(),
+                    reason: reason.clone(),
                     // Dispatcher-side catch-up cancel only flips records
                     // terminal; the closure cascade is the worker/cleanup's
                     // job, so no per-node closures ride here.
@@ -230,7 +206,7 @@ pub(crate) fn cancel_terminal_events(
         }
     }
     writes.push((
-        ExecEvent::ExecutionCancelled { color, reason: reason.to_string(), at_unix: now },
+        ExecEvent::ExecutionCancelled { color, reason, cause: Some(cause.clone()), at_unix: now },
         format!("execution_cancelled:{color}"),
     ));
     writes
@@ -245,6 +221,7 @@ pub(crate) async fn terminal_outcome(
     pool: &sqlx::PgPool,
     color: Color,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
+    // SYNC: terminal_outcome (SQL kind list) <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal, crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list)
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT kind FROM exec_event \
          WHERE color = $1 \
@@ -333,8 +310,10 @@ pub async fn get(
         "project_id": summary.project_id,
         "entry_node": summary.entry_node,
         "status": summary.status,
+        "phase": summary.phase,
         "started_at": summary.started_at,
         "completed_at": summary.completed_at,
+        "tags": summary.tags,
     })))
 }
 
@@ -342,33 +321,73 @@ pub async fn get(
 pub struct LogLineOut {
     pub at_unix: u64,
     pub level: String,
+    /// The firing this line is about: the node, and the loop
+    /// iteration it was in. Absent on the wire for a run-level line
+    /// (the run itself failing or being cancelled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub frames: weft_core::LoopFrames,
     pub message: String,
+}
+
+/// How many log lines one read returns, and the ceiling on asking for
+/// more. The journal answers with the TAIL, so the default holds the
+/// end of a long run, which is where a run goes wrong. A `limit`
+/// outside `1..=MAX` is refused, not quietly moved: a caller who
+/// asked for more than the ceiling would otherwise read a cut log as
+/// the whole one.
+const DEFAULT_LOG_LINES: u32 = 1_000;
+const MAX_LOG_LINES: u32 = 20_000;
+
+#[derive(Debug, Deserialize)]
+pub struct ListLogsParams {
+    pub limit: Option<u32>,
+}
+
+/// A run's log: the tail, and the limit that cut it, so a reader who
+/// sent none still knows how long a full page is.
+#[derive(Debug, Serialize)]
+pub struct LogsOut {
+    pub limit: u32,
+    pub lines: Vec<LogLineOut>,
 }
 
 pub async fn list_logs(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(color_str): Path<String>,
-) -> Result<Json<Vec<LogLineOut>>, StatusCode> {
-    let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_execution(&*state.journal, &caller.0, color)
-        .await
-        .map_err(|(s, _)| s)?;
+    Query(params): Query<ListLogsParams>,
+) -> Result<Json<LogsOut>, (StatusCode, String)> {
+    let color: Color = color_str
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("'{color_str}' is not a color (a uuid)")))?;
+    authorize_execution(&*state.journal, &caller.0, color).await?;
+    let limit = params.limit.unwrap_or(DEFAULT_LOG_LINES);
+    if !(1..=MAX_LOG_LINES).contains(&limit) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("limit is {limit}; one read holds between 1 and {MAX_LOG_LINES} lines"),
+        ));
+    }
+    // The journal's error names the color and `weft clean` when a row
+    // no longer decodes; the reader gets it, not a bare 500.
     let entries = state
         .journal
-        .logs_for(color, 1_000)
+        .logs_for(color, limit)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(
-        entries
-            .into_iter()
-            .map(|e| LogLineOut {
-                at_unix: e.at_unix,
-                level: e.level,
-                message: e.message,
-            })
-            .collect(),
-    ))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let lines = entries
+        .into_iter()
+        .map(|e| LogLineOut {
+            at_unix: e.at_unix,
+            level: e.level,
+            node: e.node,
+            frames: e.frames,
+            message: e.message,
+        })
+        .collect();
+    Ok(Json(LogsOut { limit, lines }))
 }
 
 /// Replay a past execution: returns every journaled event the SSE
@@ -391,7 +410,7 @@ pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(color_str): Path<String>,
-) -> Result<Json<Vec<DispatcherEvent>>, StatusCode> {
+) -> Result<Json<Vec<crate::events::LiveEvent>>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     // Resolve + tenant-gate in the ONE place that owns "who owns this
     // execution": a lookup failure is 500, an unknown or cross-tenant
@@ -421,28 +440,28 @@ pub async fn replay(
     // trip and gives the inspector a one-shot list of any rows that
     // could not be applied. The same fold runs in the engine resume
     // path and the cancel handler; this is the inspector's window.
-    let snapshot = weft_journal::fold_to_snapshot(color, &raw_events);
-    let mut out: Vec<DispatcherEvent> = raw_events
+    let snapshot = weft_journal::fold_to_snapshot(color, raw_events.iter().map(|record| &record.event));
+    let mut out: Vec<crate::events::LiveEvent> = raw_events
         .into_iter()
         .flat_map(|e| {
-            crate::journal_bridge::to_dispatcher_events(&e, project_id.clone())
+            crate::journal_bridge::project_recorded_event(e, project_id.clone())
         })
         .collect();
     for c in snapshot.corruptions {
-        out.push(DispatcherEvent::JournalCorruption {
+        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
             color,
             project_id: project_id.clone(),
             site: c.site,
             reason: c.reason,
-        });
+        }));
     }
     for reason in undecodable {
-        out.push(DispatcherEvent::JournalCorruption {
+        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
             color,
             project_id: project_id.clone(),
             site: weft_core::primitive::CorruptionSite::UndecodableRow,
             reason,
-        });
+        }));
     }
     Ok(Json(out))
 }
@@ -459,6 +478,8 @@ pub struct ListExecutionsParams {
     pub started_after: Option<u64>,
     /// Exclusive upper bound on start time (unix seconds).
     pub started_before: Option<u64>,
+    /// Only runs of this phase (`fire`, `trigger_setup`, `infra_setup`).
+    pub phase: Option<weft_core::context::Phase>,
 }
 
 const DEFAULT_PAGE: u32 = 50;
@@ -475,6 +496,7 @@ pub async fn list_executions(
         project_id: params.project_id,
         started_after: params.started_after,
         started_before: params.started_before,
+        phase: params.phase,
     };
     let mut page = state
         .journal
@@ -505,6 +527,7 @@ pub async fn latest_for_project(
         project_id: Some(id_str),
         started_after: None,
         started_before: None,
+        phase: None,
     };
     let mut page = state
         .journal

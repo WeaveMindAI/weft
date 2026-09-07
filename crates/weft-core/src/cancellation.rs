@@ -7,24 +7,38 @@
 //! later must see it.
 //!
 //! This wraps an `AtomicBool` (the persistent flag) plus a `Notify` (the
-//! wakeup mechanism for blocked waits). `cancel()` sets the bool AND
-//! notifies. `is_cancelled()` reads the bool synchronously.
+//! wakeup mechanism for blocked waits). `cancel_because()` sets the bool
+//! AND notifies, recording why. `is_cancelled()` reads the bool
+//! synchronously.
 //! `cancelled()` returns a future that resolves immediately if the flag
 //! is already set, or on the next notify otherwise.
 //!
 //! Use `is_cancelled()` at iteration boundaries (loop drivers, apply
 //! pipelines) and `cancelled()` inside `tokio::select!` arms to race
 //! it against work futures.
+//!
+//! The flag also remembers WHY, when the canceller says: an execution's
+//! flag is flipped by the worker acting on a `cancel_execution` task, by
+//! the pod shutting down, or by a live caller dropping, and the terminal
+//! event the driver writes afterwards has to name that cause. The first
+//! cause to land is the one kept: a run cancelled twice for two reasons
+//! was cancelled for the first.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
+
+use crate::exec::CancelCause;
 
 #[derive(Debug, Default)]
 pub struct CancellationFlag {
     cancelled: AtomicBool,
     notify: Notify,
+    /// Why the flag was flipped. `None` only before any cancel: the one
+    /// door, [`Self::cancel_because`], stores the cause before it trips
+    /// the flag, so a tripped flag always carries one.
+    cause: Mutex<Option<CancelCause>>,
 }
 
 impl CancellationFlag {
@@ -38,10 +52,34 @@ impl CancellationFlag {
 
     /// Mark cancelled. Idempotent. Wakes every task currently
     /// awaiting `cancelled()`; every future call resolves
-    /// immediately.
-    pub fn cancel(&self) {
+    /// immediately. Private: the only door is [`Self::cancel_because`],
+    /// so a tripped flag always carries its cause and no terminal ever
+    /// has to guess (a node body holds this flag through
+    /// `ctx.cancellation()` and would otherwise be able to trip it
+    /// causeless).
+    fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    /// Mark cancelled, recording why. The one door: every cancel of an
+    /// execution's flag goes through here, so the driver's terminal
+    /// write can say what happened instead of guessing. The first
+    /// cause recorded wins; a later one is ignored (the run was already
+    /// cancelled for the first reason).
+    pub fn cancel_because(&self, cause: CancelCause) {
+        {
+            let mut slot = self.cause.lock().expect("cancellation cause poisoned");
+            if slot.is_none() {
+                *slot = Some(cause);
+            }
+        }
+        self.cancel();
+    }
+
+    /// The cause recorded by [`Self::cancel_because`], if any.
+    pub fn cause(&self) -> Option<CancelCause> {
+        self.cause.lock().expect("cancellation cause poisoned").clone()
     }
 
     /// Cheap synchronous check. Use at iteration boundaries.
@@ -106,7 +144,7 @@ mod tests {
                 let flag = Arc::new(CancellationFlag::new());
                 let f2 = flag.clone();
                 let wait = tokio::spawn(async move { f2.cancelled().await });
-                let cancel = tokio::spawn(async move { flag.cancel() });
+                let cancel = tokio::spawn(async move { flag.cancel_because(CancelCause::User) });
                 let result = tokio::time::timeout(std::time::Duration::from_millis(500), wait)
                     .await
                     .expect("cancelled() must not hang under multi-threaded runtime");
@@ -120,7 +158,20 @@ mod tests {
     #[tokio::test]
     async fn cancelled_returns_immediately_when_already_set() {
         let flag = CancellationFlag::new();
-        flag.cancel();
+        flag.cancel_because(CancelCause::User);
         flag.cancelled().await;
+    }
+
+    /// The first cause recorded is the one the terminal write reads; a
+    /// second cancel for a different reason changes nothing, and an
+    /// untripped flag carries none.
+    #[test]
+    fn first_cause_wins() {
+        let flag = CancellationFlag::new();
+        assert_eq!(flag.cause(), None);
+        flag.cancel_because(CancelCause::CallerGone);
+        flag.cancel_because(CancelCause::User);
+        assert!(flag.is_cancelled());
+        assert_eq!(flag.cause(), Some(CancelCause::CallerGone));
     }
 }

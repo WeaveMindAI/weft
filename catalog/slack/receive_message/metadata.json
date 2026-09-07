@@ -15,7 +15,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "channels:history"
@@ -57,7 +57,6 @@
       "name": "keyword",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "Contains",
       "placeholder": "Only fire when the text contains this",
       "description": "Only fire on messages whose text contains this. Leave empty for every message."
@@ -66,7 +65,6 @@
       "name": "pattern",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "Matches pattern",
       "placeholder": "A regular expression the text must match",
       "description": "Only fire on messages whose text matches this regular expression. Leave empty for no pattern filter."
@@ -75,7 +73,6 @@
       "name": "fromUser",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "From user",
       "placeholder": "A Slack user id (U...)",
       "description": "Only fire on messages sent by this user id. Leave empty for anyone."
@@ -83,7 +80,6 @@
     {
       "name": "includeBots",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -94,7 +90,6 @@
     {
       "name": "replies",
       "type": "String",
-      "exposure": "config",
       "default": "all",
       "widget": {
         "kind": "select",
@@ -111,28 +106,23 @@
   "outputs": [
     {
       "name": "text",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "user",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "channel",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "ts",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "thread",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ]
 }

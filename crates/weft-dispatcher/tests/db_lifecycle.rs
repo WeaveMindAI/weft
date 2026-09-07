@@ -25,6 +25,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::ProjectDefinition;
+use weft_dispatcher::api::project::{due_parked_tokens, release_stale_drain_claims};
+use weft_dispatcher::api::signal::{
+    append_parked_fire, restamp_parked_fire, ParkAppend, ParkedFire, ParkRefusal,
+};
 use weft_dispatcher::journal::postgres::PostgresJournal;
 use weft_dispatcher::journal::{Journal, SignalPlacement, SignalRegistration};
 use weft_dispatcher::listener::{ListenerBackend, ListenerHandle, ListenerPool};
@@ -688,16 +692,78 @@ async fn removed_projects_do_not_keep_supervisor_leases(pool: PgPool) {
 
 /// The referenced-image set (`GET /images/referenced`) must cover a
 /// project's current hash, the hash a still-alive (e.g. draining) worker
-/// pod runs, AND the hash stamped on a pending/claimed task (a task can
+/// pod runs, the hash stamped on a pending/claimed task (a task can
 /// outlive both the project pointer and its pod between a resync and the
-/// cold-start sweep): `weft clean --images` deletes everything outside
-/// this set, so any of them escaping it would be deleted out from under a
-/// running workload. Terminal pods' and completed tasks' hashes drop out.
+/// cold-start sweep), every infra image ref in any project's tag map,
+/// AND the refs recorded on live infra units (a unit left UP across a
+/// sync stays frozen at its recorded image, which can be older than the
+/// project's current map): `weft clean --images` deletes everything
+/// outside this set, so any of them escaping it would be deleted out
+/// from under a running workload. Terminal pods' and completed tasks'
+/// hashes drop out; a project with no infra tags contributes none; a
+/// blank ref is skipped (matches no image); a unit stamped before refs
+/// were recorded contributes nothing.
 #[sqlx::test]
-async fn referenced_images_cover_projects_live_pods_and_live_tasks(pool: PgPool) {
+async fn referenced_images_cover_projects_pods_tasks_maps_and_unit_refs(
+    pool: PgPool,
+) {
     let (_journal, projects) = setup(&pool).await;
     let now = weft_dispatcher::lease::now_unix();
-    seed_project(&projects, Uuid::new_v4(), "hash-current").await;
+    let plain = Uuid::new_v4();
+    seed_project(&projects, plain, "hash-current").await;
+    // A second project whose committed infra sync recorded two nodes'
+    // image tags; both refs are the supervisor's to apply, so both are
+    // referenced no matter which node they belong to. One blank ref is
+    // skipped (a buggy writer's blank matches no image and must not be
+    // laundered into the set).
+    let with_infra = Uuid::new_v4();
+    seed_project(&projects, with_infra, "hash-infra-project").await;
+    sqlx::query("UPDATE project SET infra_image_tags_json = $1 WHERE id = $2")
+        .bind(serde_json::json!({
+            "bridge-node": { "bridge": "weft-infra-bridge:live1", "blank": "" },
+            "engine-node": { "engine": "weft-infra-engine:live2" },
+        }))
+        .bind(with_infra)
+        .execute(&pool)
+        .await
+        .expect("seed infra image tags");
+    // An infra_node row for that project: one unit UP and frozen at an
+    // image OLDER than the map above (the case the map alone cannot
+    // cover), one unit stamped before refs were recorded (contributes
+    // nothing), one unit long gone terminal.
+    sqlx::query(
+        "INSERT INTO infra_node \
+         (project_id, node_id, instance_id, namespace, status, units_json) \
+         VALUES ($1, 'n1', 'inst1', 'ns', 'running', $2)",
+    )
+    // `infra_node.project_id` is TEXT (the row keys by the id's string
+    // form), unlike `project.id`.
+    .bind(with_infra.to_string())
+    .bind(serde_json::json!({
+        "frozen": {
+            "status": "running",
+            "stop_behavior": { "kind": "no_op" },
+            "flaky_after_seconds": 30,
+            "recovery_after_seconds": 30,
+            "image_refs": ["weft-infra-bridge:0ld-frozen"]
+        },
+        "legacy": {
+            "status": "running",
+            "stop_behavior": { "kind": "no_op" },
+            "flaky_after_seconds": 30,
+            "recovery_after_seconds": 30
+        },
+        "terminal": {
+            "status": "stopped",
+            "stop_behavior": { "kind": "scale_to_zero" },
+            "flaky_after_seconds": 30,
+            "recovery_after_seconds": 30,
+            "image_refs": ["weft-infra-bridge:terminal-gone"]
+        }
+    }))
+    .execute(&pool)
+    .await
+    .expect("seed infra_node units");
     for (pod, hash, terminal) in [
         ("wp-drain", "hash-draining", false),
         ("wp-done", "hash-terminal", true),
@@ -716,7 +782,11 @@ async fn referenced_images_cover_projects_live_pods_and_live_tasks(pool: PgPool)
         .await
         .expect("seed worker_pod");
     }
-    for (status, hash) in [("pending", "hash-pending-task"), ("complete", "hash-done-task")] {
+    for (status, hash) in [
+        ("pending", "hash-pending-task"),
+        ("claimed", "hash-claimed-task"),
+        ("complete", "hash-done-task"),
+    ] {
         sqlx::query(
             "INSERT INTO task \
              (id, kind, target, project_id, status, binary_hash, payload, attempts, created_at_unix) \
@@ -731,19 +801,35 @@ async fn referenced_images_cover_projects_live_pods_and_live_tasks(pool: PgPool)
         .expect("seed task");
     }
 
-    let mut hashes = weft_dispatcher::api::project::referenced_image_hashes(&pool)
+    let referenced = weft_dispatcher::api::project::referenced_images_query(&pool)
         .await
         .expect("referenced set");
+    let mut hashes = referenced.worker_hashes.clone();
     hashes.sort();
     assert_eq!(
         hashes,
         vec![
+            "hash-claimed-task".to_string(),
             "hash-current".to_string(),
             "hash-draining".to_string(),
+            "hash-infra-project".to_string(),
             "hash-pending-task".to_string(),
         ],
-        "project + live pod + live task hashes in; terminal pod and \
-         completed task hashes out"
+        "project + live pod + live task hashes in (pending AND claimed); \
+         terminal pod and completed task hashes out"
+    );
+    assert_eq!(
+        referenced.infra_refs,
+        vec![
+            "weft-infra-bridge:0ld-frozen".to_string(),
+            "weft-infra-bridge:live1".to_string(),
+            "weft-infra-bridge:terminal-gone".to_string(),
+            "weft-infra-engine:live2".to_string(),
+        ],
+        "every ref of every project's tag map AND every recorded unit \
+         ref is referenced (all rows, all units: over-keeping is the \
+         safe direction); the blank ref and the ref-less legacy unit \
+         contribute nothing"
     );
 }
 
@@ -814,6 +900,303 @@ async fn placement_rearms_grace_so_a_midflight_reap_declines(pool: PgPool) {
     assert!(
         backend.stopped.lock().unwrap().is_empty(),
         "nothing may be torn down while the placement is in flight"
+    );
+}
+
+// ----- parked-fire queue: append classification, retry backoff ---------
+
+/// One parked element with an explicit retry state (the values every
+/// backoff decision reads).
+fn parked(id: &str, attempts: u32, not_before_unix: i64) -> ParkedFire {
+    ParkedFire {
+        id: id.to_string(),
+        payload: json!({ "v": 1 }),
+        received_at_unix: 1_700_000_000,
+        attempts,
+        not_before_unix,
+    }
+}
+
+/// Seed one signal row for `token`, placed on the `listener-park` pod
+/// the caller seeds once per test. Entry rows are keyed by
+/// `(project_id, node_id)`, so the node id is derived from the token:
+/// many tokens per project, no collisions.
+async fn seed_parked_signal(journal: &PostgresJournal, token: &str, project: Uuid) {
+    let mut sig = entry_signal(token, project);
+    sig.node_id = format!("trigger-{token}");
+    journal
+        .signal_insert(
+            &sig,
+            &SignalPlacement { listener_pod: "listener-park".to_string(), generation: 1 },
+        )
+        .await
+        .expect("seed signal row");
+}
+
+/// Read one token's queue back as parsed JSON.
+async fn parked_queue(pool: &PgPool, token: &str) -> serde_json::Value {
+    sqlx::query_as::<_, (serde_json::Value,)>("SELECT parked_fires FROM signal WHERE token = $1")
+        .bind(token)
+        .fetch_one(pool)
+        .await
+        .expect("read parked_fires")
+        .0
+}
+
+/// The append names its refusal instead of returning "0 rows": a re-run
+/// that finds its own element queued (nothing lost), a resume signal
+/// already answered, an entry queue at its cap (a refused NEW fire, a
+/// loss the caller must say out loud), and a vanished row (the project
+/// was wiped under the fire) are four different facts.
+#[sqlx::test]
+async fn parked_fire_append_names_its_refusal(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    seed_listener_pod(&pool, "listener-park", "disp-1").await;
+    seed_parked_signal(&journal, "tok-entry", project).await;
+    let mut resume = entry_signal("tok-resume", project);
+    resume.is_resume = true;
+    journal
+        .signal_insert(
+            &resume,
+            &SignalPlacement { listener_pod: "listener-park".to_string(), generation: 1 },
+        )
+        .await
+        .expect("seed resume signal");
+
+    assert_eq!(
+        append_parked_fire(&pool, "tok-entry", &parked("f1", 0, 0)).await.unwrap(),
+        ParkAppend::Parked
+    );
+    assert_eq!(
+        append_parked_fire(&pool, "tok-entry", &parked("f1", 9, 99)).await.unwrap(),
+        ParkAppend::Refused(ParkRefusal::AlreadyQueued),
+        "a re-run of a task that already parked this fire finds its element"
+    );
+
+    append_parked_fire(&pool, "tok-resume", &parked("r1", 0, 0))
+        .await
+        .unwrap();
+    assert_eq!(
+        append_parked_fire(&pool, "tok-resume", &parked("r2", 0, 0)).await.unwrap(),
+        ParkAppend::Refused(ParkRefusal::ResumeAlreadyAnswered),
+        "one submission answers one suspension; a second is a duplicate"
+    );
+
+    // Fill the entry queue to its cap in one write, then a NEW fire is
+    // refused (a loss, named as such).
+    sqlx::query(
+        "UPDATE signal SET parked_fires = ( \
+             SELECT jsonb_agg(jsonb_build_object('id', 'filler-' || g, 'payload', '{}', \
+                                        'received_at_unix', 0) ORDER BY g) \
+             FROM generate_series(1, 1000) g) \
+         WHERE token = 'tok-entry'",
+    )
+    .execute(&pool)
+    .await
+    .expect("fill the queue to the cap");
+    assert_eq!(
+        append_parked_fire(&pool, "tok-entry", &parked("f2", 0, 0)).await.unwrap(),
+        ParkAppend::Refused(ParkRefusal::QueueFull)
+    );
+
+    sqlx::query("DELETE FROM signal WHERE token = 'tok-resume'")
+        .execute(&pool)
+        .await
+        .expect("wipe the resume row");
+    assert_eq!(
+        append_parked_fire(&pool, "tok-resume", &parked("r3", 0, 0)).await.unwrap(),
+        ParkAppend::Refused(ParkRefusal::RowGone),
+        "a vanished row means the project was wiped under the fire"
+    );
+}
+
+/// The sweep's selection, against the real statement: only ACTIVE
+/// projects, only unclaimed rows, only tokens whose HEAD is due. A
+/// backing-off head blocks its whole token (FIFO: a later fire may not
+/// overtake it), and an element from before the backoff fields existed
+/// reads as due now.
+#[sqlx::test]
+async fn the_sweep_selects_only_due_heads_on_active_projects(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let active = Uuid::new_v4();
+    let inactive = Uuid::new_v4();
+    seed_project(&projects, active, "bin-A").await;
+    seed_project(&projects, inactive, "bin-B").await;
+    // A fresh register is 'registered', one step below Active; only the
+    // first project is promoted.
+    sqlx::query("UPDATE project SET status = 'active' WHERE id = $1")
+        .bind(active)
+        .execute(&pool)
+        .await
+        .expect("promote one project");
+    seed_listener_pod(&pool, "listener-park", "disp-1").await;
+
+    let now = weft_dispatcher::lease::now_unix();
+    seed_parked_signal(&journal, "tok-due", active).await;
+    append_parked_fire(&pool, "tok-due", &parked("f-due", 0, now - 10))
+        .await
+        .unwrap();
+    seed_parked_signal(&journal, "tok-later", active).await;
+    append_parked_fire(&pool, "tok-later", &parked("f-later", 3, now + 300))
+        .await
+        .unwrap();
+    seed_parked_signal(&journal, "tok-legacy", active).await;
+    append_parked_fire(&pool, "tok-legacy", &parked("f-legacy", 0, 0))
+        .await
+        .unwrap();
+    // Strip the backoff fields: the element shape an older dispatcher
+    // wrote, which must read as due now.
+    sqlx::query(
+        "UPDATE signal SET parked_fires = \
+         '[{\"id\": \"f-legacy\", \"payload\": {}, \"received_at_unix\": 1}]'::jsonb \
+         WHERE token = 'tok-legacy'",
+    )
+    .execute(&pool)
+    .await
+    .expect("write a legacy element");
+    seed_parked_signal(&journal, "tok-claimed", active).await;
+    append_parked_fire(&pool, "tok-claimed", &parked("f-claimed", 0, now - 10))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE signal SET drain_claimed_at_unix = $1, drain_claimed_by = 'pod-x' \
+         WHERE token = 'tok-claimed'",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("claim the token");
+    seed_parked_signal(&journal, "tok-inactive", inactive).await;
+    append_parked_fire(&pool, "tok-inactive", &parked("f-inactive", 0, now - 10))
+        .await
+        .unwrap();
+
+    let selected: std::collections::HashSet<String> =
+        due_parked_tokens(&pool, now).await.unwrap().into_iter().map(|(t, _)| t).collect();
+    let expected: std::collections::HashSet<String> =
+        ["tok-due", "tok-legacy"].into_iter().map(String::from).collect();
+    assert_eq!(
+        selected,
+        expected,
+        "due heads on Active projects only; a backing-off head, a claimed row, \
+         and a non-Active project's queue are all left alone"
+    );
+}
+
+/// Claims older than the threshold release (both columns); a fresh
+/// claim survives. The sweep depends on this: it is the only thing that
+/// re-drives an Active project's queue, so a crashed pod's stale claim
+/// must not starve the token's retries until the next activate.
+#[sqlx::test]
+async fn stale_drain_claims_release_and_fresh_ones_survive(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    seed_listener_pod(&pool, "listener-park", "disp-1").await;
+    seed_parked_signal(&journal, "tok-stale", project).await;
+    seed_parked_signal(&journal, "tok-fresh", project).await;
+    let now = weft_dispatcher::lease::now_unix();
+    sqlx::query(
+        "UPDATE signal SET drain_claimed_at_unix = $1, drain_claimed_by = 'pod-x' \
+         WHERE token = 'tok-stale'",
+    )
+    .bind(now - 301)
+    .execute(&pool)
+    .await
+    .expect("seed a stale claim");
+    sqlx::query(
+        "UPDATE signal SET drain_claimed_at_unix = $1, drain_claimed_by = 'pod-y' \
+         WHERE token = 'tok-fresh'",
+    )
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed a fresh claim");
+
+    release_stale_drain_claims(&pool).await.expect("release pass");
+
+    let stale: (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT drain_claimed_at_unix, drain_claimed_by FROM signal WHERE token = 'tok-stale'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("stale row");
+    assert_eq!(stale, (None, None), "the stale claim must be gone, both columns");
+    let fresh: (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT drain_claimed_at_unix, drain_claimed_by FROM signal WHERE token = 'tok-fresh'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("fresh row");
+    assert_eq!(
+        fresh,
+        (Some(now), Some("pod-y".to_string())),
+        "a live claim must survive the release"
+    );
+}
+
+/// A dispatch failure re-stamps its head IN PLACE: attempt count up, due
+/// time out, position kept (a pop-and-re-append would reorder one
+/// trigger's events), the rest of the queue untouched, and the write
+/// fenced on the drain's claim nonce.
+#[sqlx::test]
+async fn a_failed_dispatch_restamps_its_head_in_place(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    seed_listener_pod(&pool, "listener-park", "disp-1").await;
+    seed_parked_signal(&journal, "tok", project).await;
+    append_parked_fire(&pool, "tok", &parked("f1", 2, 1)).await.unwrap();
+    append_parked_fire(&pool, "tok", &parked("f2", 0, 0)).await.unwrap();
+    sqlx::query("UPDATE signal SET drain_claimed_by = 'drain-owner' WHERE token = 'tok'")
+        .execute(&pool)
+        .await
+        .expect("hold the drain claim");
+
+    let now = weft_dispatcher::lease::now_unix();
+    let rows = restamp_parked_fire(&pool, "tok", "f1", 3, now + 4, Some("drain-owner"))
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "our own claim restamps the element");
+
+    let queue = parked_queue(&pool, "tok").await;
+    let elements = queue.as_array().expect("queue is an array");
+    assert_eq!(elements.len(), 2, "no element may be added or lost");
+    assert_eq!(elements[0]["id"], json!("f1"), "the failed fire stays the head");
+    assert_eq!(elements[0]["attempts"], json!(3), "the attempt count moves up");
+    assert_eq!(elements[0]["not_before_unix"], json!(now + 4), "the due time moves out");
+    assert_eq!(
+        (
+            elements[1]["id"].clone(),
+            elements[1]["attempts"].clone(),
+            elements[1]["not_before_unix"].clone()
+        ),
+        (json!("f2"), json!(0), json!(0)),
+        "the element behind the head is untouched"
+    );
+
+    // Someone else's claim, and an element that is not queued: both are
+    // no-ops, and neither may disturb the array.
+    assert_eq!(
+        restamp_parked_fire(&pool, "tok", "f1", 4, now + 8, Some("someone-else"))
+            .await
+            .unwrap(),
+        0,
+        "a fenced restamp on another owner's claim writes nothing"
+    );
+    assert_eq!(
+        restamp_parked_fire(&pool, "tok", "nope", 1, now + 1, Some("drain-owner"))
+            .await
+            .unwrap(),
+        0,
+        "restamping an element that is not queued writes nothing"
+    );
+    assert_eq!(
+        parked_queue(&pool, "tok").await,
+        queue,
+        "both refused restamps left the queue exactly as it was"
     );
 }
 

@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use weft_core::is_rust_identifier;
 use weft_core::node::{MetadataCatalog, NodeMetadata};
 
 /// Directory names that are never part of a node's source tree:
@@ -109,24 +110,6 @@ pub fn guard_node_tree_cycle(dir: &Path, chain: &[PathBuf]) -> std::io::Result<P
     Ok(canon)
 }
 
-/// True if `s` is a plain Rust identifier (`[A-Za-z_][A-Za-z0-9_]*`).
-/// Every name codegen interpolates into generated Rust source (a
-/// node's `node_type`, a shared file's module stem) must pass this,
-/// so a bad name fails at discovery/emit with the offending file
-/// named instead of surfacing as a confusing rustc error deep inside
-/// generated code. Also the grammar of every bare name the language
-/// admits (ports, entry keys, connection segments), via the
-/// compiler's `is_bare_ident` re-export.
-/// SYNC: bare-ident grammar <->
-///       packages/weft-graph/src/webview/lib/utils/port-specs.ts (isValidFieldKey)
-pub fn is_rust_identifier(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
 
 // ----- Filesystem-backed catalog -------------------------------------
 
@@ -1239,6 +1222,8 @@ fn load_node_entry(
             CatalogError::Parse { path: package_key.join("metadata.json"), error }
         })?;
     }
+    weft_core::node::refuse_removed_metadata_keys(&value)
+        .map_err(|error| CatalogError::Parse { path: meta_path.clone(), error })?;
     let metadata: NodeMetadata =
         serde_json::from_value(value).map_err(|e| CatalogError::Parse {
             path: meta_path.clone(),
@@ -1443,16 +1428,6 @@ mod root_tests {
 mod package_tests {
     use super::*;
 
-    #[test]
-    fn rust_identifier_check() {
-        for ok in ["Text", "SlackSendMessage", "_hidden", "a1", "A_b_2"] {
-            assert!(is_rust_identifier(ok), "{ok} should pass");
-        }
-        for bad in ["", "1abc", "my-node", "my.node", "with space", "émoji", "a\"b"] {
-            assert!(!is_rust_identifier(bad), "{bad} should fail");
-        }
-    }
-
     fn copy_dir(src: &Path, dst: &Path) {
         fs::create_dir_all(dst).expect("mkdir");
         for entry in fs::read_dir(src).expect("read dir") {
@@ -1509,6 +1484,78 @@ mod package_tests {
         let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root"))
             .expect("all stdlib metadata.json must load under strict parse");
         assert!(!cat.all().is_empty(), "catalog discovered no nodes");
+    }
+
+    /// The stdlib census for the compact wiring view: every top-level
+    /// key any shipped `metadata.json` actually uses is classified,
+    /// kept or dropped, in weft-core's compact lists. A new top-level
+    /// key with `skip_serializing_if` is absent from a minimal parse,
+    /// so the core-side classification test cannot see it; this is
+    /// the net that catches it the first time a stdlib node uses it,
+    /// forcing the keep-or-drop decision instead of a silent drop.
+    #[test]
+    fn every_stdlib_top_level_key_is_classified_for_compact() {
+        use weft_core::node::{COMPACT_DROP_TOP_LEVEL, COMPACT_KEEP_TOP_LEVEL};
+
+        let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root")).unwrap();
+        for entry in cat.iter() {
+            let resolved = serde_json::to_value(entry.metadata.resolved()).unwrap();
+            for key in resolved.as_object().unwrap().keys() {
+                assert!(
+                    COMPACT_KEEP_TOP_LEVEL.contains(&key.as_str())
+                        || COMPACT_DROP_TOP_LEVEL.contains(&key.as_str()),
+                    "unclassified top-level key `{key}` on `{}`: \
+                     decide keep or drop in weft-core's compact lists",
+                    entry.node_type
+                );
+            }
+        }
+    }
+
+    /// The compact wiring view stamps each access node's access widget
+    /// with the service name and `connection_optional` from its own
+    /// recipe (the same stamp the compiler applies at enrich time),
+    /// because the compact view drops the recipe itself and those two
+    /// facts are what a wiring reader needs from it: which service,
+    /// and whether the node runs with no connection picked.
+    #[test]
+    fn compact_view_stamps_the_access_widget() {
+        let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root")).unwrap();
+        let mut access_nodes = 0;
+        for entry in cat.iter() {
+            let Some(recipe) = &entry.metadata.service else { continue };
+            access_nodes += 1;
+            let compact = entry.metadata.compact_json();
+            let widget = compact["inputs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|i| i["widget"].as_object().filter(|w| w["kind"] == "access"))
+                .unwrap_or_else(|| panic!("{}: an access node needs an access widget", entry.node_type));
+            assert_eq!(
+                widget["service"].as_str(),
+                Some(recipe.service.as_str()),
+                "{}: the widget names the recipe's service",
+                entry.node_type
+            );
+            if recipe.connection_optional {
+                assert_eq!(
+                    widget["optional"], true,
+                    "{}: connection_optional is stamped onto the widget",
+                    entry.node_type
+                );
+            } else {
+                assert!(
+                    widget.get("optional").is_none(),
+                    "{}: a required connection omits `optional` (serde skips false)",
+                    entry.node_type
+                );
+            }
+        }
+        assert!(
+            access_nodes >= 10,
+            "the stdlib ships a dozen access nodes; only {access_nodes} carried a recipe"
+        );
     }
 
     #[test]

@@ -39,6 +39,7 @@
 - [Talking to a live caller](nodes/live-callers.md)
 - [Streams and buses in Rust](nodes/streams-and-buses.md)
 - [Cancellation](nodes/cancellation.md)
+- [Stopping other runs](nodes/steering-executions.md)
 - [Infrastructure nodes](nodes/infrastructure.md)
 - [Packaging](nodes/packaging.md)
 - [Testing a node](nodes/testing.md)

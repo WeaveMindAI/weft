@@ -105,8 +105,8 @@ fn base64_decoded_len(b64: &str) -> Option<u64> {
 // TTS $0.10 per 1k characters (flash/turbo models $0.05), sound
 // effects / voice changer / voice isolator $0.12 per minute of audio,
 // music $0.15 per minute, dubbing $0.50 per minute (no watermark),
-// forced alignment billed like batch transcription at $0.22 per hour
-// of input audio.
+// batch transcription (Scribe, `speech-to-text`) $0.22 per hour of
+// input audio, forced alignment billed the same way.
 const TTS_USD_PER_1K_CHARS: f64 = 0.10;
 const TTS_FLASH_USD_PER_1K_CHARS: f64 = 0.05;
 const SOUND_EFFECT_USD_PER_MINUTE: f64 = 0.12;
@@ -115,6 +115,7 @@ const ISOLATOR_USD_PER_MINUTE: f64 = 0.12;
 const MUSIC_USD_PER_MINUTE: f64 = 0.15;
 const DUBBING_USD_PER_MINUTE: f64 = 0.50;
 const ALIGN_USD_PER_HOUR: f64 = 0.22;
+const STT_USD_PER_HOUR: f64 = 0.22;
 
 /// The worst (most minutes per byte) plausible input audio: 32 kbps
 /// mono mp3 = 240 KB per minute. Input-priced routes only see the
@@ -206,6 +207,9 @@ enum BatchRoute {
     Music,
     Dub,
     Align,
+    /// Batch transcription (`speech-to-text`): the upload's duration
+    /// at the Scribe hourly rate, priced like alignment.
+    Stt,
     Free,
 }
 
@@ -245,6 +249,7 @@ fn batch_route(method: &str, path: &str) -> Option<BatchRoute> {
         "music" => Some(BatchRoute::Music),
         "dubbing" => Some(BatchRoute::Dub),
         "forced-alignment" => Some(BatchRoute::Align),
+        "speech-to-text" => Some(BatchRoute::Stt),
         // `voices/add` (and the text-to-voice mint) create ACCOUNT
         // ASSETS: a voice minted through a credential lands in that
         // credential's account. Unknown keeps the runtime credential
@@ -460,6 +465,7 @@ impl ProviderMeter for ElevenLabsMeter {
             Some(BatchRoute::Isolation) => Ok(input_minutes(body) * ISOLATOR_USD_PER_MINUTE),
             Some(BatchRoute::Dub) => Ok(input_minutes(body) * DUBBING_USD_PER_MINUTE),
             Some(BatchRoute::Align) => Ok(input_minutes(body) / 60.0 * ALIGN_USD_PER_HOUR),
+            Some(BatchRoute::Stt) => Ok(input_minutes(body) / 60.0 * STT_USD_PER_HOUR),
             _ => anyhow::bail!("'{path}' has no pre-call price on this meter"),
         }
     }
@@ -472,6 +478,9 @@ impl ProviderMeter for ElevenLabsMeter {
             Some(BatchRoute::Dub) => BatchPricing::DubbedMinutes,
             Some(BatchRoute::Align) => BatchPricing::FromRequest {
                 usd: input_minutes(request_body) / 60.0 * ALIGN_USD_PER_HOUR,
+            },
+            Some(BatchRoute::Stt) => BatchPricing::FromRequest {
+                usd: input_minutes(request_body) / 60.0 * STT_USD_PER_HOUR,
             },
             // Output-priced audio: the answered bytes, at the output
             // format's byte rate, are the duration.
@@ -662,7 +671,11 @@ mod tests {
             ELEVENLABS.classify("GET", REALTIME_STT),
             RouteClass::BillableSession
         );
-        assert_eq!(ELEVENLABS.classify("POST", "speech-to-text"), RouteClass::Unknown);
+        assert_eq!(
+            ELEVENLABS.classify("POST", "speech-to-text"),
+            RouteClass::Billable(crate::Pricing::Metered)
+        );
+        assert!(ELEVENLABS.observe_session("speech-to-text", "").is_err());
         assert_eq!(ELEVENLABS.classify("GET", "user"), RouteClass::Free);
         assert!(ELEVENLABS.observe_session("user", "").is_err());
     }
@@ -680,6 +693,7 @@ mod tests {
             "music",
             "dubbing",
             "forced-alignment",
+            "speech-to-text",
         ] {
             assert!(billable("POST", p), "POST {p} bills metered");
             assert_eq!(ELEVENLABS.classify("GET", p), RouteClass::Unknown, "GET {p}");

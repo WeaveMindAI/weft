@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/calendar.events"
@@ -48,13 +48,11 @@
     {
       "name": "events",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each event: id, summary, start, end, location, description, link."
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

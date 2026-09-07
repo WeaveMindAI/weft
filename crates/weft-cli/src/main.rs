@@ -32,8 +32,22 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Scaffold a new project (git init, main.weft, weft.toml).
-    New { name: String },
+    /// Scaffold a new project (git init, main.weft, weft.toml). With
+    /// `--assistant <name>` also install the Tangle assistant persona for
+    /// that AI coding assistant, symlinked from this weft checkout's
+    /// `tangle/<name>/`, so a later `git pull` + `./setup.sh` of the
+    /// checkout refreshes Tangle in every such project at once. The choice
+    /// is remembered: later runs of `weft new` install the same assistants
+    /// with no flag; `--assistant none` clears it.
+    New {
+        name: String,
+        /// Install the Tangle persona for this AI coding assistant
+        /// (e.g. `claude-code`/`cc` or `kilo-code`/`kc`), symlinked from the weft
+        /// checkout so updating weft updates Tangle. Repeatable, and
+        /// remembered as the default for future projects; `none` opts out.
+        #[arg(long = "assistant", value_name = "NAME")]
+        assistants: Vec<String>,
+    },
     /// Compile the current project to a native rust binary.
     Build,
     /// Build (if stale) the shared worker builder-base image and print its
@@ -72,6 +86,15 @@ enum Cmd {
         /// keys its engine-change sweep on.
         #[arg(long, conflicts_with_all = ["push", "push_suffix"])]
         print: bool,
+    },
+    /// Manage a node's service connection from the terminal: list the
+    /// stored connections and pick one, connect a new account (paste a
+    /// key, browser sign-in, shared app), upgrade or forget one, or
+    /// disconnect the node. Interactive by default; every choice has a
+    /// flag for scripts.
+    Connect {
+        #[command(flatten)]
+        opts: commands::connect::ConnectOpts,
     },
     /// Run node self-tests. Without a target: every package. Without
     /// --tier: the basic + fake tiers (compiled + run locally, no
@@ -125,7 +148,7 @@ enum Cmd {
         target: Option<String>,
     },
     /// Run the current project via the dispatcher. Streams logs until
-    /// completion or suspension unless `--detach` is set.
+    /// completion, including across waits, unless `--detach` is set.
     ///
     /// Rebuilding while executions are in flight is non-disruptive:
     /// in-flight work finishes on workers baked from its own image,
@@ -133,10 +156,11 @@ enum Cmd {
     Run {
         #[arg(long)]
         detach: bool,
-        /// Run only what this output node needs (repeatable). A run
-        /// normally starts from every output node and walks upstream;
-        /// this narrows that set, so a project's other branches stay
-        /// untouched. A node that is not an output is refused.
+        /// Run only this node and what it needs (repeatable: several
+        /// targets run the union of what each needs). A run normally
+        /// kicks every root of the graph; an aimed run is held to the
+        /// targets' upstream, so a root shared with another branch
+        /// never drags that branch in. Any node can be a target.
         #[arg(long, value_name = "node-id")]
         target: Vec<String>,
     },
@@ -230,12 +254,23 @@ enum Cmd {
         /// and the user wants the project gone NOW.
         #[arg(long)]
         force: bool,
+        /// Answer the confirmation. Required when there is no terminal
+        /// to ask on: removing a project wipes its triggers, cancels
+        /// its runs, terminates its infra and reclaims its stored
+        /// data, so nothing does that on a bare command.
+        #[arg(long)]
+        yes: bool,
     },
     /// Tail logs. No arg → latest execution of the cwd project.
     /// UUID arg → that specific execution.
     Logs {
         #[arg(value_name = "color")]
         target: Option<String>,
+        /// How many lines, counted from the END of the log: a run that
+        /// wrote more than this shows its last lines, and says so.
+        /// Unset, the dispatcher's own default applies.
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// Print a summary of the cwd project's current state.
     /// Registration, listener, infra per-node, recent executions.
@@ -254,14 +289,34 @@ enum Cmd {
         #[command(subcommand)]
         action: InfraAction,
     },
-    /// Print the per-project catalog as JSON (for editor / tooling
-    /// introspection).
+    /// Print the per-project catalog: `--list` for one line per node
+    /// type (the way to find a node), `--node <Type> --compact` for
+    /// how one node wires, the bare form for the whole catalog as
+    /// JSON (the editor's palette; large).
     DescribeNodes {
+        /// One line per node type: the type, its tags, and its
+        /// one-line description. The cheap first look at a catalog;
+        /// pick a type, then `--node <Type> --compact` for its ports.
+        /// `--json` prints the same as an array.
+        #[arg(long, conflicts_with_all = ["node", "compact"])]
+        list: bool,
         /// Describe the bundled stdlib catalog instead of a project's
         /// `nodes/`. Needs no project on disk; used to produce the browser
         /// parser's catalog asset.
         #[arg(long)]
         stdlib: bool,
+        /// Print only this node TYPE's metadata (resolved). Unknown
+        /// type is an error naming the fix.
+        #[arg(long)]
+        node: Option<String>,
+        /// The wiring-only view: presentation (labels, icons, tags,
+        /// placeholders, form render hints) and authoring machinery
+        /// (connect recipes, image lists, graph-body display) stripped,
+        /// so an AI reading the catalog burns tokens only on what
+        /// decides how nodes connect. Without `--node`, the whole
+        /// catalog compacted.
+        #[arg(long)]
+        compact: bool,
     },
     /// Parse weft source (read from stdin) against the project's
     /// `nodes/` catalog and print the project + referenced catalog +
@@ -303,15 +358,44 @@ enum Cmd {
         #[command(subcommand)]
         action: TokenAction,
     },
-    /// List past executions for any project (newest first).
+    /// List past executions (newest first): one line per run with its
+    /// status, phase, start time, entry node and tags. `--json` prints
+    /// the page as the dispatcher returns it.
     Executions {
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Only this project's runs (a project id). Without it, every
+        /// project's.
+        #[arg(long)]
+        project: Option<String>,
+        /// Only runs of this phase: `fire` (a trigger fired, or a
+        /// manual run), `trigger_setup` or `infra_setup` (the runs an
+        /// activate, resync or infra start makes). "Has my trigger
+        /// fired since the change" is `--phase fire`.
+        #[arg(long, value_parser = parse_phase)]
+        phase: Option<weft_core::context::Phase>,
     },
-    /// Print a past execution's node events in order. Use for
-    /// offline inspection; `weft replay <color>` drives the graph
-    /// view animation.
-    Events { color: String },
+    /// Print a past execution's events in order, one line each:
+    /// time, kind, node, and a short summary of the value or error.
+    /// Values are truncated so a long run stays readable; `--node`
+    /// and `--kind` narrow it, `--full` opens the values, and `--json`
+    /// prints the replay rows the graph view reads.
+    Events {
+        color: String,
+        /// Only events of this node (its id in the source).
+        #[arg(long)]
+        node: Option<String>,
+        /// Only events of this kind (`node_failed`, `node_completed`,
+        /// `node_skipped`, `execution_cancelled`, ...), or of every
+        /// kind containing it (`failed` matches both failure kinds).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Print every value in full instead of the truncated summary.
+        /// Only the human output truncates, so this changes nothing
+        /// under `--json`, which always carries the whole row.
+        #[arg(long)]
+        full: bool,
+    },
     /// Inspect every active listener: per-tenant, prints the
     /// journal's signal count alongside the listener's local
     /// registry. Drift between the two means cleanup went wrong.
@@ -371,6 +455,12 @@ enum Cmd {
         /// Prune docker BuildKit cache (heavy: invalidates cargo dep cache).
         #[arg(long, default_value_t = false)]
         build_cache: bool,
+        /// Answer the confirmation a journal deletion asks for.
+        /// Required when there is no terminal to ask on. Image and
+        /// build-cache sweeps ask nothing: the next build re-makes
+        /// what they drop.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -501,6 +591,20 @@ enum InfraAction {
     /// retry per-node from where it stopped. 412 if nothing is in
     /// flight.
     Cancel,
+    /// Print what the project's infra containers wrote: every unit of
+    /// every infra node, or one node's. Lines are prefixed with the pod
+    /// and container they came from.
+    Logs {
+        /// The infra node to read; unset reads every infra node of the project.
+        #[arg(value_name = "node_id")]
+        node_id: Option<String>,
+        /// Number of lines to print, counted from the end.
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
+        /// Keep streaming new lines as the containers write them.
+        #[arg(long, short = 'f', default_value_t = false)]
+        follow: bool,
+    },
     /// Per-node stop. Targets one infra node by id, leaves the rest
     /// of the project's infra untouched. Used from the graph's per-
     /// node menu (the trash icon's siblings).
@@ -647,6 +751,10 @@ impl InfraAction {
                 commands::infra::InfraAction::NodeTerminate { node_id },
                 Default::default(),
             ),
+            InfraAction::Logs { node_id, tail, follow } => (
+                commands::infra::InfraAction::Logs { node_id, tail, follow },
+                Default::default(),
+            ),
         }
     }
 }
@@ -680,6 +788,21 @@ impl From<DaemonAction> for commands::daemon::DaemonAction {
     }
 }
 
+/// `--phase` as the phase itself, so the set of names has ONE
+/// definition (`Phase::as_str`) instead of a copy in the flag.
+fn parse_phase(text: &str) -> Result<weft_core::context::Phase, String> {
+    weft_core::context::Phase::from_tag(text).ok_or_else(|| {
+        format!(
+            "unknown phase '{text}': one of {}",
+            weft_core::context::Phase::ALL
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     weft_core::net::install_crypto_provider();
@@ -705,12 +828,13 @@ async fn main() -> anyhow::Result<()> {
     let ctx = commands::Ctx::new(cli.dispatcher, cli.json);
 
     match cli.command {
-        Cmd::New { name } => commands::new::run(ctx, name).await,
+        Cmd::New { name, assistants } => commands::new::run(ctx, name, assistants).await,
         Cmd::Build => commands::build::run(ctx).await,
         Cmd::BuildBase { quiet } => commands::build::run_build_base(quiet).await,
         Cmd::BuildImages { push, push_suffix, print } => {
             commands::build::run_build_images(push, push_suffix, print).await
         }
+        Cmd::Connect { opts } => commands::connect::run(ctx, opts).await,
         Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
             commands::test_node::run(
                 ctx,
@@ -766,21 +890,23 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Ps => commands::ps::run(ctx).await,
-        Cmd::Rm { project, journal, local, all, force } => {
+        Cmd::Rm { project, journal, local, all, force, yes } => {
             commands::rm::run(
                 ctx,
-                commands::rm::RmArgs { project, journal, local, all, force },
+                commands::rm::RmArgs { project, journal, local, all, force, yes },
             )
             .await
         }
-        Cmd::Logs { target } => commands::logs::run(ctx, target).await,
+        Cmd::Logs { target, limit } => commands::logs::run(ctx, target, limit).await,
         Cmd::Status => commands::status::run(ctx).await,
         Cmd::Daemon { action } => commands::daemon::run(ctx, action.into()).await,
         Cmd::Infra { action } => {
             let (verb, opts) = action.split();
             commands::infra::run(ctx, verb, opts).await
         }
-        Cmd::DescribeNodes { stdlib } => commands::describe_nodes::run(ctx, stdlib).await,
+        Cmd::DescribeNodes { list, stdlib, node, compact } => {
+            commands::describe_nodes::run(ctx, stdlib, node, compact, list).await
+        }
         Cmd::Parse { file } => commands::parse::parse(file).await,
         Cmd::Validate { file } => commands::parse::validate(ctx, file).await,
         Cmd::ParseServer => commands::parse::serve(ctx).await,
@@ -788,8 +914,17 @@ async fn main() -> anyhow::Result<()> {
             CatalogAction::Update => commands::catalog::update(ctx).await,
         },
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
-        Cmd::Executions { limit } => commands::executions::list(ctx, limit).await,
-        Cmd::Events { color } => commands::executions::events(ctx, color).await,
+        Cmd::Executions { limit, project, phase } => {
+            commands::executions::list(ctx, limit, project, phase).await
+        }
+        Cmd::Events { color, node, kind, full } => {
+            commands::executions::events(
+                ctx,
+                color,
+                commands::executions::EventsFilter { node, kind, full },
+            )
+            .await
+        }
         Cmd::Listener { action } => match action {
             ListenerAction::Inspect => commands::listener::inspect(ctx).await,
         },
@@ -802,9 +937,9 @@ async fn main() -> anyhow::Result<()> {
             FilesAction::Rm { target, yes } => commands::files::rm(ctx, target, yes).await,
             FilesAction::Usage => commands::files::usage(ctx).await,
         },
-        Cmd::Clean { color, keep_days, all, images, build_cache, project } => {
+        Cmd::Clean { color, keep_days, all, images, build_cache, project, yes } => {
             commands::executions::clean(
-                ctx, color, keep_days, all, images, build_cache, project,
+                ctx, color, keep_days, all, images, build_cache, project, yes,
             )
             .await
         }

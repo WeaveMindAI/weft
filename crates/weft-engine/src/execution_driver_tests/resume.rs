@@ -95,7 +95,7 @@
         (pid, events)
     }
 
-    fn apply(events: &[ExecEvent]) -> (PulseTable, NodeExecutionTable, HashMap<String, weft_core::primitive::KickedNode>) {
+    fn apply(events: &[ExecEvent]) -> (PulseTable, NodeExecutionTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>) {
         let snap = weft_journal::fold_to_snapshot(color(), events);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
@@ -285,7 +285,7 @@
     #[test]
     fn crashed_kicked_node_redispatches() {
         let (_, _, kicked) = apply(&kick_events());
-        assert!(!kicked.get("n").expect("kick present").dispatched);
+        assert!(!kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched);
     }
 
     #[test]
@@ -300,7 +300,7 @@
             at_unix: 0,
         });
         let (_, _, kicked) = apply(&events);
-        assert!(kicked.get("n").expect("kick present").dispatched);
+        assert!(kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched);
     }
 
     /// A kicked node parked on a still-pending suspension must NOT
@@ -314,7 +314,7 @@
         events.push(suspended("tk"));
         let (_, _, kicked) = apply(&events);
         assert!(
-            kicked.get("n").expect("kick present").dispatched,
+            kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched,
             "pending suspension: no re-dispatch churn"
         );
         events.push(ExecEvent::SuspensionResolved {
@@ -325,7 +325,7 @@
         });
         let (_, _, kicked) = apply(&events);
         assert!(
-            !kicked.get("n").expect("kick present").dispatched,
+            !kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched,
             "resolved suspension: kick synthesis must re-fire the node"
         );
     }

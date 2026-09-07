@@ -56,6 +56,11 @@
         "description": "Send email as this account."
       },
       {
+        "id": "https://www.googleapis.com/auth/gmail.metadata",
+        "label": "Read mail headers",
+        "description": "Read subjects, senders and message ids, never message bodies (this is what threading a reply needs)."
+      },
+      {
         "id": "https://www.googleapis.com/auth/gmail.readonly",
         "label": "Read mail",
         "description": "Read the account's email (needed by the new-email trigger and message reads)."
@@ -183,7 +188,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -194,24 +198,7 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The Google access: wire it into Google action nodes."
-    }
-  ],
-  "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "account"
-        }
-      },
-      "then": {
-        "message": "GoogleAccess '{id}' has no connected account; connect one on the node.",
-        "level": "runtime",
-        "field": "account"
-      }
     }
   ]
 }

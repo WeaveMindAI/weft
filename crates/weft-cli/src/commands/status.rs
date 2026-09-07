@@ -29,14 +29,35 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // equality, so a shortened desired hash would never match and every
     // project would permanently report drift. Short hashes are for
     // human log lines only.
+    //
+    // The definition is hashed AFTER its `@asset` refs resolve, exactly
+    // as build / run / resync hash it before registering: hashing the
+    // unresolved source would differ from every running hash of a
+    // project with an asset in it, and the drift banner would never
+    // clear. Asset resolution also publishes the current references,
+    // including an empty set when the last asset was removed.
     let (desired_binary, desired_definition, desired_infra) =
         match weft_compiler::hash::load_enriched_project(project) {
-            Ok((def, catalog)) => (
-                weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog).ok(),
-                weft_compiler::hash::compute_definition_hash(&def).ok(),
-                weft_compiler::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
-                    .ok(),
-            ),
+            Ok((mut def, catalog)) => {
+                let resolved = crate::commands::assets::resolve_project_assets(
+                    &ctx.client(),
+                    &project.root,
+                    &mut def,
+                )
+                .await;
+                match resolved {
+                    Ok(()) => (
+                        weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog).ok(),
+                        weft_compiler::hash::compute_definition_hash(&def).ok(),
+                        weft_compiler::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
+                            .ok(),
+                    ),
+                    // An asset that cannot resolve is what a build will
+                    // refuse; status stays display-only and reports no
+                    // desired hashes rather than a made-up drift.
+                    Err(_) => (None, None, None),
+                }
+            }
             Err(_) => (None, None, None),
         };
 
@@ -62,7 +83,22 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         path.push_str(h);
     }
 
-    let data: serde_json::Value = ctx.client().get_json(&path).await?;
+    // A project that exists on disk but was never registered is not an error:
+    // it is the state every project starts in, and the answer is the
+    // command that leaves it. The marked 404 is how the dispatcher says
+    // "no project I know under this id" (as opposed to a missing route).
+    let Some(data) = ctx.client().get_json_if_found(&path).await? else {
+        if ctx.json() {
+            println!("{}", serde_json::json!({ "registered": false, "project_id": project_id }));
+        } else {
+            println!(
+                "project: {} ({project_id})\n  not registered with the dispatcher yet: \
+                 use `weft run` to run it, or `weft activate` to enable its triggers",
+                project.manifest.package.name
+            );
+        }
+        return Ok(());
+    };
 
     if ctx.json() {
         // One JSON object on stdout; the extension reads it.

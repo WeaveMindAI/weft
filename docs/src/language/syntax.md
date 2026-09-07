@@ -25,6 +25,16 @@ Read it right to left: the value flows from `source.output_port` into
 `target.input_port`, and the types have to be compatible. Every required input
 must be wired; an optional one (`port?`) may be left alone.
 
+If you only want one key of the value, keep going with dots:
+
+```weft
+speed.wpm = reader.profile.stats.wpm
+```
+
+That is still one wire, from `reader.profile`, and it delivers `stats.wpm`
+read off the value. For what it needs from the type, go and read
+[reading a key off a wire](types.md#reading-a-key-off-a-wire).
+
 ## Config values
 
 Config fields are typed JSON-ish literals.
@@ -70,7 +80,8 @@ outside, on their own lines, by a wire or by a value.
 
 #### A key that CREATES a port
 
-On a node type that accepts extra inputs (`ExecPython`, `FirstInOrder`), a key
+On a node type that accepts extra inputs (`ExecPython`, `FirstInOrder`,
+`TagRun`, `StopTagged`), a key
 naming no declared port creates one. A wire gives it the type of whatever feeds
 it, a literal gives it the literal's own type, and a `null` literal is an error
 because it says nothing about the type.
@@ -103,11 +114,15 @@ post = SlackSendMessage { channel: "#alerts" }   # in the braces
 post.text = "deploy finished"                    # or on its own line
 ```
 
-Which of the two a given port accepts is its `exposure`, declared in the node's
-metadata: `all` takes both, `assignment` takes only the line, `config` takes
-only the braces, and `wire` takes neither because it has to be driven by
-another node. Getting it wrong is `port-literal-placement`, and the message
-names the form that port does take.
+Both spellings are the same thing, a constant written for the port, and no
+port takes one spelling and refuses the other. What a port can refuse is a
+whole family: a value written in the source (`literal`) or a value another
+node produces (`wire`). Every port takes both unless its node says otherwise
+with `accepts` in its metadata, and getting it wrong is `input-accepts`, with
+the message reading the list back ("`params` accepts: wire"). A port the
+compiler reads to build the node (a form's `fields`, the access picker) is the
+one exception: it takes an inline typed value only, never a wire and never a
+`@file` or `@asset`.
 
 The same line works on a `Group`, a `Loop`, or an `@include` alias: its
 ports are the ones in its signature, and a value on one reaches everything
@@ -117,8 +132,11 @@ inside that reads it.
 escalation.tone = "formal"
 ```
 
-One target still takes no value: a group's own output written from inside
-(`self.result = "lit"`). Drive it from a node.
+An output never takes a value: a firing emits on it, and you read it as
+`node.port`. Writing one (`step.out = "lit"`, or `out: "lit"` in the braces of
+a node whose signature declares `-> (out: String)`) is refused, and so is a
+group's own output written from inside (`self.result = "lit"`). Drive it from
+a node.
 
 ### Multi-line strings
 
@@ -134,13 +152,12 @@ step = ExecPython() -> (out: Number) {
 
 ### Reserved keys
 
-Keys starting with `_` are reserved, and there are exactly four.
+Keys starting with `_` are reserved, and there are exactly three.
 
 | Key | What it does |
 |---|---|
 | `_label: "..."` | sets the node's display label. A quoted string, settable once, never by wire. |
 | `_tags: ["a", "b"]` | attaches tags, used by signal scoping. |
-| `_is_output: true` | overrides whether this node counts as a production target. |
 | `_should_flow: <wire or false>` | decides whether this node runs at all. |
 
 <!-- SYNC: reserved keys <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
@@ -149,10 +166,6 @@ Keys starting with `_` are reserved, and there are exactly four.
 
 Any other leading-underscore key is a compile error, so the namespace stays
 available.
-
-`_is_output` decides what runs: a run executes the subgraph needed to feed the
-output nodes, so flipping this changes which branches execute. Each node type
-carries a default from its author.
 
 `_should_flow` is how a branch turns off. Leave it out and the node runs.
 Wire it and the node runs only when what arrives is not `false`; a `false`, or
@@ -224,7 +237,14 @@ out.data = Text { value: "hi" }.value
 That synthesizes an anonymous child node (id `{host}__{field}`, here
 `out__data`) plus the edge into `out.data`. The same form works as a config
 field's value inside a node body, and carries full node syntax including its
-own inline signature and nesting.
+own inline signature and nesting. With a signature, the `.port` reads one of
+the outputs the signature declares:
+
+```weft
+summary.text = ExecPython(m: List[JsonDict]) -> (text: String) {
+  code: "return {'text': ' '.join(x['body'] for x in m)}"
+}.text
+```
 
 Omitting the trailing `.port` is a compile error, because a node with several
 outputs would otherwise be silently ambiguous.
@@ -254,7 +274,9 @@ no header comment to keep in sync.
 
 `@require_one_of(a, b)` states that at least one of the named inputs must be
 satisfied, either wired or set to a non-null literal. It goes on its own line
-inside a node or group body, or inside an inline port signature.
+inside a node body, or inside an inline port signature. A group or loop
+refuses it: a group's inputs are all optional at its boundary, so the
+directive belongs on the node inside that needs one of them.
 
 ```weft
 lookup = SlackFindUser {
@@ -290,7 +312,7 @@ node_expr   := TYPE port_sig? body?
 port_sig    := port_sig_in? port_sig_out?
 port_sig_in := '(' port_decl,* ')'
 port_sig_out:= '->' '(' port_decl,* ')'
-port_decl   := IDENT ':' type
+port_decl   := IDENT '?'? ':' type     # `?` (inputs only) = may be absent
 body        := '{' body_item* '}'
 body_item   := IDENT '?'? ':' value     # config field (`?` = the port it
              |                          #   creates is optional)

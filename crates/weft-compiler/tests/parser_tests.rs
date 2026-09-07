@@ -8,6 +8,25 @@ use weft_core::node::{MetadataCatalog, NodeMetadata};
 /// diagnostics, so an empty catalog is enough to exercise the keep-and-flag
 /// behavior for a bad port type.
 struct EmptyCatalog;
+
+#[test]
+fn uppercase_node_references_are_wires_in_every_assignment_form() {
+    for source in [
+        "Source = Text {}\nsink = Debug { data: Source.value }\n",
+        "Source = Text {}\nsink = Debug {}\nsink.data = Source.value\n",
+        "Text = Text {}\nsink = Debug { data: Text.value }\n",
+    ] {
+        let project = compile(source, uuid::Uuid::nil(), CompileFs::none()).unwrap();
+        assert_eq!(project.nodes.len(), 2, "must not invent an inline node: {source}");
+        assert_eq!(project.edges.len(), 1);
+        let edge = &project.edges[0];
+        assert_eq!(edge.source, project.nodes[0].id);
+        assert_eq!(edge.source_handle.as_deref(), Some("value"));
+        assert_eq!(edge.target, "sink");
+        assert_eq!(edge.target_handle.as_deref(), Some("data"));
+    }
+}
+
 impl MetadataCatalog for EmptyCatalog {
     fn lookup(&self, _node_type: &str) -> Option<&NodeMetadata> {
         None
@@ -92,10 +111,10 @@ fn test_node_with_ports() {
     let source = r#"
 worker = ExecPython(
     data: String,
-    context: String?
+    context?: String
 ) -> (
     result: String,
-    score: Number?
+    score: Number
 ) {
     code: "return {}"
 }
@@ -109,8 +128,56 @@ worker = ExecPython(
     assert!(!node.inputs[1].required, "context should be optional (?)");
     assert_eq!(node.outputs.len(), 2);
     assert_eq!(node.outputs[0].name, "result");
-    assert!(node.outputs[0].required);
-    assert!(!node.outputs[1].required, "score should be optional");
+    assert_eq!(node.outputs[1].name, "score");
+}
+
+/// `?` sits on the NAME, the one spelling of "may be absent" the language
+/// has (a record field spells it the same way). The old `name: Type?` is
+/// refused naming the new spelling, never read as the same port.
+#[test]
+fn optional_marker_on_the_type_is_refused_naming_the_name_spelling() {
+    let source = "worker = ExecPython(context: String?) -> (result: String) { code: \"return {}\" }\n";
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    let e = errors.iter().find(|e| e.message.contains("`context?: String`"));
+    assert!(e.is_some(), "expected the message to spell `context?: String`, got {errors:?}");
+}
+
+/// An output has no optionality: a firing that emits nothing on it closes
+/// it, and no marker changes that. `?` on an output is refused.
+#[test]
+fn optional_marker_on_an_output_is_refused() {
+    let source = "worker = ExecPython() -> (score?: Number) { code: \"return {}\" }\n";
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.message.contains("output port \"score\"") && e.message.contains("no optionality")),
+        "got {errors:?}"
+    );
+}
+
+/// A record type inside a signature carries commas of its own; the header
+/// keeps the whole record as one port (nested records included).
+#[test]
+fn record_types_in_a_signature_are_one_port_each() {
+    let source = r#"
+p = ExecPython(
+    profile: { wpm: Number, read_delay: Number },
+    nested: { a: { b: String, c: String }, d: List[Number] }
+) -> (out: String) {
+    code: "return {}"
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("records in a signature compile");
+    let node = &result.nodes[0];
+    let names: Vec<&str> = node.inputs.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["profile", "nested"], "one port per record, no phantom ports");
+    assert_eq!(
+        node.inputs[0].port_type,
+        WeftType::parse("{ wpm: Number, read_delay: Number }").unwrap()
+    );
+    assert_eq!(
+        node.inputs[1].port_type,
+        WeftType::parse("{ a: { b: String, c: String }, d: List[Number] }").unwrap()
+    );
 }
 
 #[test]
@@ -233,7 +300,7 @@ fn test_reserved_type_keyword_as_name() {
     // Naming a group with the reserved `Group` keyword must fail loudly ON the
     // declaration line (line 1 here), not only cryptically where it's later
     // referenced.
-    let source = "Group = Group() -> (test: MustOverride?) {\n}\n";
+    let source = "Group = Group() -> (test: MustOverride) {\n}\n";
     let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
     let reserved = errors.iter().find(|e| e.message.contains("reserved type keyword"));
     assert!(reserved.is_some(), "expected a reserved-keyword error, got {errors:?}");
@@ -371,8 +438,8 @@ batch = Group(items: List[String]) -> (results: List[String]) {
 fn test_require_one_of() {
     let source = r#"
 resolver = ExecPython(
-    text: String?,
-    audio: Audio?,
+    text?: String,
+    audio?: Audio,
     @require_one_of(text, audio)
 ) -> (result: String) {
     code: "return {}"
@@ -704,16 +771,16 @@ fn test_pack_with_require_one_of_in_group() {
 # Test
 
 grp = Group(
-  notes: String?,
-  priority: String?
+  notes?: String,
+  priority?: String
 ) -> (
   metadata: Dict[String, String]
 ) {
   # desc
 
   pack_node = Pack(
-    notes: String?,
-    priority: String?,
+    notes?: String,
+    priority?: String,
     @require_one_of(notes, priority)
   ) -> (
     out: Dict[String, String]
@@ -1516,10 +1583,10 @@ node = ExecPython(data: String) -> (result: String) { # This is a config block
 fn test_multiple_require_one_of_groups() {
     let source = r#"
 node = ExecPython(
-    text: String?,
-    audio: Audio?,
-    url: String?,
-    file: String?,
+    text?: String,
+    audio?: Audio,
+    url?: String,
+    file?: String,
     @require_one_of(text, audio)
     @require_one_of(url, file)
 ) -> (result: String) {}
@@ -1655,8 +1722,8 @@ b = Group(data: String) -> (result: String) {
 fn test_require_one_of_in_config_block() {
     let source = r#"
 node = ExecPython(
-    a: String?,
-    b: String?
+    a?: String,
+    b?: String
 ) -> (result: String) {
     @require_one_of(a, b)
     code: "return {}"
@@ -2012,6 +2079,58 @@ c = @include("cleaner.weft")
     assert!(project.nodes.iter().any(|n| n.id == "c.strip"));
 }
 
+/// Every spliced node, edge, and per-field span names the FILE it was
+/// written in, two levels of `@include` deep, and a value written in
+/// the MIDDLE file onto the inner file's port carries the middle file,
+/// while sitting on a boundary node whose own file is the inner one's.
+/// This is what lets a diagnostic point at the right buffer.
+#[test]
+fn include_stamps_the_owning_file_on_nodes_edges_and_spans() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("inner.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n  deep = Text { value: \"x\" }\n  self.cleaned = deep.value\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("mid.weft"),
+        "Group() -> (out: String) {\n  i = @include(\"inner.weft\")\n  i.raw = \"from-mid\"\n  m = Text { value: \"y\" }\n  self.out = i.cleaned\n}\n",
+    )
+    .unwrap();
+    let project = compile("c = @include(\"mid.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path()))
+        .expect("compile");
+    let node = |id: &str| project.nodes.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id}"));
+    let file_of = |id: &str| node(id).source_file.clone().unwrap_or_default();
+    assert!(file_of("c.i.deep").ends_with("inner.weft"), "{}", file_of("c.i.deep"));
+    assert!(file_of("c.m").ends_with("mid.weft"), "{}", file_of("c.m"));
+    // The inner group's IN boundary belongs to inner.weft, and the fill
+    // `i.raw = "from-mid"` written in mid.weft carries mid.weft on ITS
+    // span entry, on that same node.
+    let boundary = node("c.i__in");
+    assert!(
+        boundary.source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
+        "{:?}",
+        boundary.source_file
+    );
+    let fill = boundary.port_literal_spans.get("raw").expect("fill span");
+    assert!(
+        fill.source_file.as_deref().unwrap_or_default().ends_with("mid.weft"),
+        "{:?}",
+        fill.source_file
+    );
+    // An edge written inside the inner file names it too.
+    let edge = project
+        .edges
+        .iter()
+        .find(|e| e.source == "c.i.deep")
+        .expect("inner edge");
+    assert!(
+        edge.source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
+        "{:?}",
+        edge.source_file
+    );
+}
+
 /// An included file with INTERNAL nesting (a nested group + an inline-expr) must
 /// scope every id under the call-site alias in ONE pass (no `rescope_group`
 /// string surgery). Pins the include-reshape: the included file is parsed with
@@ -2306,9 +2425,15 @@ fn nested_include_error_keeps_line() {
         "Group -> (x: String) {\n inner = @include(\"inner.weft\")\n self.x = inner.x\n}\n",
     ).unwrap();
     let errs = compile("c = @include(\"outer.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
-    // The error path carries the inner file + its line (`inner.weft: 2:...`),
-    // not a bare message with the location dropped.
-    assert!(errs.iter().any(|e| e.message.contains("inner.weft: 2:")), "errs: {errs:?}");
+    // The error keeps its OWN span (line 2 of inner.weft) and names the
+    // file STRUCTURALLY, so a click lands on the real line instead of
+    // the `@include` line; the rendered form still reads `inner.weft:2:...`.
+    let hit = errs
+        .iter()
+        .find(|e| e.file.as_deref().unwrap_or_default().ends_with("inner.weft"))
+        .unwrap_or_else(|| panic!("no error names inner.weft: {errs:?}"));
+    assert_eq!(hit.span.start_line, 2, "errs: {errs:?}");
+    assert!(hit.to_string().contains("inner.weft"), "{hit}");
 }
 
 #[test]
@@ -2599,7 +2724,7 @@ fn group_keyword_misuse_is_one_error() {
 /// `@require_one_of(a, b)` (no space) still parses and carries the constraint.
 #[test]
 fn require_one_of_with_space_before_paren_fails_loud() {
-    let with_space = "g = Group(a: String, b: String) -> () {\n  @require_one_of (a, b)\n  n = Debug\n  n.data = self.a\n}\n";
+    let with_space = "n = ExecPython(a?: String, b?: String) -> (out: String) {\n  @require_one_of (a, b)\n}\n";
     let (_p, errs) = compile_lenient(with_space, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(
         errs.iter().any(|e| e.message.contains("@require_one_of needs a parenthesized port list")),
@@ -2612,19 +2737,95 @@ fn require_one_of_with_space_before_paren_fails_loud() {
     );
 
     // The well-formed form carries the constraint with no errors.
-    let no_space = "g = Group(a: String, b: String) -> () {\n  @require_one_of(a, b)\n  n = Debug\n  n.data = self.a\n}\n";
+    let no_space = "n = ExecPython(a?: String, b?: String) -> (out: String) {\n  @require_one_of(a, b)\n}\n";
     let (p2, errs2) = compile_lenient(no_space, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(errs2.is_empty(), "well-formed @require_one_of has no errors: {errs2:?}");
-    let g = p2.groups.iter().find(|g| g.id == "g").expect("group g");
-    assert_eq!(g.one_of_required, vec![vec!["a".to_string(), "b".to_string()]], "constraint carried");
+    let n = p2.nodes.iter().find(|n| n.id == "n").expect("node n");
+    assert_eq!(n.features.one_of_required, vec![vec!["a".to_string(), "b".to_string()]], "constraint carried");
 
     // An empty `@require_one_of()` is also a loud error (not a silent no-op).
-    let empty = "g = Group(a: String) -> () {\n  @require_one_of()\n  n = Debug\n  n.data = self.a\n}\n";
+    let empty = "n = ExecPython(a?: String) -> (out: String) {\n  @require_one_of()\n}\n";
     let (_p3, errs3) = compile_lenient(empty, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
     assert!(
         errs3.iter().any(|e| e.message.contains("@require_one_of needs a parenthesized port list")),
         "empty @require_one_of() must fail loud: {errs3:?}"
     );
+}
+
+/// A group or loop takes no `@require_one_of`: its inputs are optional at
+/// its boundary, and the node inside that needs one of them carries the
+/// `_is_output` marked the nodes a run existed to feed. Every reached
+/// node runs now, so the key is refused naming `--target`, under both
+/// spellings it ever had.
+#[test]
+fn is_output_is_refused_naming_target() {
+    for key in ["_is_output", "is_output"] {
+        let src = format!("t = Text {{ value: \"x\", {key}: true }}\n");
+        let err = compile(&src, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("refused");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("`_is_output` no longer exists") && msg.contains("--target"), "{key}: {msg}");
+    }
+}
+
+/// A value lands on an INPUT port, in one of two families (a quoted
+/// constant, a dotted wire), and nowhere else. The rows the language
+/// refuses, each with the fix in its message: a bare word (neither
+/// family), a wire inside a list literal (that is several edges into
+/// one port), a wire on a loop knob (`over` NAMES ports), a constant on
+/// a group's own input from inside (`self.x` is driven from outside),
+/// and a group's own input in its braces (the braces hold children;
+/// the value goes on the group's name outside).
+#[test]
+fn a_value_lands_on_an_input_and_nowhere_else() {
+    let refused = |src: &str, what: &str, expect: &[&str]| {
+        let err = compile(src, uuid::Uuid::new_v4(), CompileFs::none()).expect_err(what);
+        let msg = format!("{err:?}");
+        for needle in expect {
+            assert!(msg.contains(needle), "{what}: expected `{needle}` in {msg}");
+        }
+    };
+    refused(
+        "t = Text { value: raw }\n",
+        "bare word",
+        &["invalid value `raw`", "must be quoted", "node_id.port_name"],
+    );
+    refused(
+        "a = Text { value: \"1\" }\nb = Text { value: \"2\" }\nt = ExecPython(xs: List[String]) -> (o: String) {\n  code: \"return {}\"\n  xs: [a.value, b.value]\n}\n",
+        "wires in a list",
+        &["cannot carry a wire", "declare an input port per value"],
+    );
+    refused(
+        "s = Text { value: \"x\" }\nl = Loop(items: List[String]) -> (out: List[String | Null]) {\n  over: s.value\n  step = Text {}\n  step.value = self.items\n  self.out = step.value\n}\n",
+        "wire on a loop knob",
+        &["not valid loop config values"],
+    );
+    refused(
+        "g = Group(x: String) -> (y: String) {\n  self.x = \"hi\"\n  self.y = self.x\n}\n",
+        "constant on self.x",
+        &["cannot assign a literal to 'self.x'", "self.x = source.out"],
+    );
+    refused(
+        "g = Group(x: String) -> (y: String) {\n  x: \"hi\"\n  self.y = self.x\n}\n",
+        "own input in the braces",
+        &["groups take no config fields beyond `_should_flow`", "g.x = ..."],
+    );
+}
+
+/// directive. Both spellings (in the signature, in the body) are refused
+/// with the same message, and so is a loop.
+#[test]
+fn require_one_of_on_a_scope_is_refused() {
+    for src in [
+        "g = Group(a: String, b: String) -> () {\n  @require_one_of(a, b)\n  n = Debug\n  n.data = self.a\n}\n",
+        "g = Group(a: String, b: String, @require_one_of(a, b)) -> () {\n  n = Debug\n  n.data = self.a\n}\n",
+        "g = Loop(a: List[String], b: String) -> () {\n  @require_one_of(a, b)\n  over: [\"a\"]\n  n = Debug\n  n.data = self.b\n}\n",
+    ] {
+        let (_p, errs) = compile_lenient(src, uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None);
+        assert!(
+            errs.iter().any(|e| e.message.contains("`@require_one_of` goes on a node")),
+            "{src}: {errs:?}"
+        );
+    }
 }
 
 /// A NESTED anonymous `Group(){}` is meaningless (a file has exactly one
@@ -2822,16 +3023,38 @@ each = Loop(items: List[String]) -> (out: List[String]) {
 /// statement, literal or wire, on a node or on a container.
 #[test]
 fn every_written_form_of_should_flow() {
-    let cases: [(&str, &str); 4] = [
+    let cases: [(&str, &str); 6] = [
         ("node braces", "t = Text {\n  value: \"x\"\n  _should_flow: false\n}\nout = Debug {}\nout.data = t.value\n"),
         ("node statement", "t = Text { value: \"x\" }\nt._should_flow = false\nout = Debug {}\nout.data = t.value\n"),
         ("node statement wired", "c = Debug {}\nt = Text { value: \"x\" }\nt._should_flow = c.data\nout = Debug {}\nout.data = t.value\n"),
         ("container from outside, wired", "c = Debug {}\ng = Group(x: String) -> (y: String) {\n  self.y = self.x\n}\ng._should_flow = c.data\nout = Debug {}\nout.data = g.y\n"),
+        ("group braces, wired", "c = Debug {}\ng = Group(x: String) -> (y: String) {\n  _should_flow: c.data\n  self.y = self.x\n}\nout = Debug {}\nout.data = g.y\n"),
+        ("loop from outside, wired", "c = Text { value: \"x\" }\nl = Loop(items: List[String]) -> (out: List[String | Null]) {\n  over: [\"items\"]\n  step = Text {}\n  step.value = self.items\n  self.out = step.value\n}\nl.items = [\"a\"]\nl._should_flow = c.value\nout = Debug { data: l.out }\n"),
     ];
     for (name, src) in cases {
-        compile(src, uuid::Uuid::new_v4(), CompileFs::none())
+        let p = compile(src, uuid::Uuid::new_v4(), CompileFs::none())
             .unwrap_or_else(|e| panic!("{name} must compile: {e:?}"));
+        if name.starts_with("loop") {
+            let wire = p.edges.iter().find(|e| e.target == "l__in").expect("the guard wire on the loop's In boundary");
+            assert_eq!(wire.target_handle.as_deref(), Some("_should_flow"), "{name}");
+        }
     }
+
+    // An include alias is a group: the guard lands on its In boundary
+    // from outside the same way.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.weft"),
+        "Group(raw: String) -> (cleaned: String) {\n  s = Text {}\n  s.value = self.raw\n  self.cleaned = s.value\n}\n",
+    )
+    .unwrap();
+    let src = "c = Debug {}\na = @include(\"sub.weft\")\na.raw = \"x\"\na._should_flow = c.data\nout = Debug { data: a.cleaned }\n";
+    let p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("include alias takes the guard");
+    assert!(
+        p.edges.iter().any(|e| e.target == "a__in" && e.target_handle.as_deref() == Some("_should_flow")),
+        "the guard wire lands on the alias's In boundary: {:?}",
+        p.edges.iter().map(|e| (&e.target, &e.target_handle)).collect::<Vec<_>>()
+    );
 
     // From outside, a literal on a container's port lands on its In
     // boundary, the node those ports belong to.
@@ -2889,4 +3112,263 @@ fn a_literal_on_an_include_alias_port_lands_on_the_included_group() {
     assert!(errs.is_empty(), "{errs:?}");
     let node = p2.nodes.iter().find(|n| n.id == "c").expect("opaque include node");
     assert_eq!(node.config.get("raw"), Some(&serde_json::json!("hi")));
+}
+
+/// `name?: Type` is the one optional spelling: the `?` on the name once
+/// closed the declaration early, so `: Type` became a second port named
+/// after the type and the error read "Duplicate in port \"Boolean\"".
+#[test]
+fn optional_marker_on_the_name_precedes_the_type() {
+    let source = r#"
+act = ExecPython(sent?: JsonDict, reacted?: Boolean, stale?: Boolean, done?: Boolean) -> (ok: Boolean) {
+    code: "return {'ok': True}"
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none())
+        .expect("`name?: Type` compiles");
+    let node = &result.nodes[0];
+    let names: Vec<&str> = node.inputs.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["sent", "reacted", "stale", "done"], "no phantom port named after a type");
+    assert!(node.inputs.iter().all(|p| !p.required), "every one is optional: {:?}", node.inputs);
+    assert_eq!(node.inputs[0].port_type.wire_string(), "JsonDict");
+    assert_eq!(node.inputs[1].port_type.wire_string(), "Boolean");
+}
+
+/// A wire written inside a list or object literal is refused with the
+/// rule the author needs (values from the graph are input ports), not
+/// with the JSON reader's "expected value at line 1 column 2".
+#[test]
+fn a_wire_inside_a_list_literal_names_the_rule() {
+    let source = r#"
+a = Text { value: "x" }
+q = HttpRequest {
+    url: "https://example.test"
+    headers: [a.value, "plain"]
+}
+"#;
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none())
+        .expect_err("a wire in a list literal is refused");
+    let text = errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("holds plain values only") && text.contains("`a.value`"), "{text}");
+    assert!(text.contains("declare an input port"), "{text}");
+    assert!(!text.contains("expected value at line"), "the serde text is gone: {text}");
+
+    // A plain JSON typo keeps the JSON reader's diagnosis.
+    let typo = r#"
+q = HttpRequest {
+    url: "https://example.test"
+    headers: ["a", "b",]
+}
+"#;
+    let errors = compile(typo, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("bad JSON is refused");
+    let text = errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("invalid JSON value"), "{text}");
+
+    // An unquoted path or version is a missing pair of quotes, not a
+    // wire: only a word that starts a value AND parses as `node.port`
+    // gets the wire message. (`{ file: a.txt }` is genuinely
+    // indistinguishable from a wire and keeps the wire message.)
+    for unquoted in ["[logs/app.log]", "[v1.2.beta]", "[1.5.2]"] {
+        let source = format!("q = HttpRequest {{\n    url: \"https://example.test\"\n    headers: {unquoted}\n}}\n");
+        let errors = compile(&source, uuid::Uuid::new_v4(), CompileFs::none())
+            .expect_err("still invalid JSON");
+        let text = errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("invalid JSON value"), "{unquoted}: {text}");
+    }
+
+    // A dereferencing wire is a wire: `[a.b.c]` is two edges' worth of
+    // trouble in a list, and gets the same rule.
+    let deref = "q = HttpRequest {\n    url: \"https://example.test\"\n    headers: [a.b.c]\n}\n";
+    let errors = compile(deref, uuid::Uuid::new_v4(), CompileFs::none()).expect_err("a wire in a list");
+    let text = errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("holds plain values only") && text.contains("`a.b.c`"), "{text}");
+}
+
+// ─── Source-level named types ───────────────────────────────────────────────
+
+/// `type Name = <type>` at the top of a file is visible to every header in
+/// the file, in any order, and the port carries the name (nominal).
+#[test]
+fn a_file_level_type_declaration_names_ports_anywhere_in_the_file() {
+    let source = r#"
+n = ExecPython(p: Profile) -> (out: Pair) { code: "return {}" }
+type Pair = { x: Number, y: Number }
+type Profile = {
+  # words per minute
+  wpm: Number,
+  pair: Pair
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("declared types compile");
+    let node = &result.nodes[0];
+    match &node.inputs[0].port_type {
+        WeftType::Named { name, body } => {
+            assert_eq!(name, "Profile");
+            assert_eq!(**body, WeftType::parse("{ wpm: Number, pair: Pair={ x: Number, y: Number } }").unwrap());
+        }
+        other => panic!("expected the nominal Profile, got {other:?}"),
+    }
+    assert!(matches!(&node.outputs[0].port_type, WeftType::Named { name, .. } if name == "Pair"));
+}
+
+/// A type declared inside a group body is visible in that body and every
+/// nested scope, and nowhere outside: a sibling scope or the file level
+/// does not see it.
+#[test]
+fn a_group_level_type_is_scoped_to_the_group_body() {
+    let source = r#"
+g = Group() -> () {
+  type Inner = List[String]
+  a = ExecPython(v: Inner) -> (out: String) { code: "return {}" }
+  deep = Group() -> () {
+    b = ExecPython(v: Inner) -> (out: String) { code: "return {}" }
+  }
+}
+outside = ExecPython(v: Inner) -> (out: String) { code: "return {}" }
+"#;
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    let bad: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(bad.len(), 1, "only the outside use fails: {bad:?}");
+    assert!(bad[0].contains("Invalid port type 'Inner'"), "the file level does not see a group's type: {bad:?}");
+    assert_eq!(errors[0].line(), 9, "the squiggle sits on the outside header");
+}
+
+/// A group's own signature is lowered in the enclosing scope, so a type
+/// declared inside the braces cannot name the group's ports.
+#[test]
+fn a_group_type_is_invisible_on_the_groups_own_interface() {
+    let source = r#"
+g = Group(v: Inner) -> () {
+  type Inner = List[String]
+  a = ExecPython(v: Inner) -> (out: String) { code: "return {}" }
+  a.v = self.v
+}
+"#;
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("Invalid port type 'Inner'"), "{errors:?}");
+    assert_eq!(errors[0].line(), 2);
+}
+
+/// Nothing shadows: a name already visible (an outer scope's declaration,
+/// or the builtin table) cannot be declared again, identical body or not.
+#[test]
+fn a_type_visible_from_outside_cannot_be_redeclared() {
+    let source = r#"
+type Pair = { x: Number, y: Number }
+g = Group() -> () {
+  type Pair = { x: Number, y: Number }
+}
+"#;
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("`Pair` is already declared")), "{errors:?}");
+    assert_eq!(errors[0].line(), 4, "anchored on the inner declaration");
+
+    let source = "type Media = String\n";
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert!(errors.iter().any(|e| e.message.contains("`Media` is reserved")), "{errors:?}");
+}
+
+/// A by-value cycle can never resolve; the scope reports it at the
+/// declarations and lowers everything else under the outer registry.
+#[test]
+fn a_type_cycle_is_refused() {
+    let source = r#"
+type A = { b: B }
+type B = { a: A }
+n = ExecPython(v: String) -> (out: String) { code: "return {}" }
+"#;
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].message.contains("could not be resolved"), "{errors:?}");
+}
+
+/// A node's braces hold values; a `type` line inside them is refused with
+/// the two places it belongs.
+#[test]
+fn a_type_declaration_inside_a_node_body_is_refused() {
+    let source = r#"
+n = ExecPython(v: String) -> (out: String) {
+  type Pair = { x: Number, y: Number }
+  code: "return {}"
+}
+"#;
+    let errors = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.message.contains("top of a scope") && e.line() == 3),
+        "{errors:?}"
+    );
+}
+
+/// The declaration form takes any type the type parser accepts, aliases
+/// and unions included, and `type = ...` is still a node named `type`.
+#[test]
+fn a_type_declaration_takes_any_type_and_type_stays_a_legal_id() {
+    let source = r#"
+type Names = List[String]
+type MaybeNumber = Number | Null
+type = Text { value: "x" }
+n = ExecPython(a: Names, b: MaybeNumber) -> (out: String) { code: "return {}" }
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compiles");
+    assert!(result.nodes.iter().any(|n| n.id == "type"), "a node named `type`");
+    let n = result.nodes.iter().find(|n| n.id == "n").unwrap();
+    assert!(matches!(&n.inputs[0].port_type, WeftType::Named { name, .. } if name == "Names"));
+    assert!(matches!(&n.inputs[1].port_type, WeftType::Named { name, .. } if name == "MaybeNumber"));
+}
+
+// ─── Inline expressions with a signature ────────────────────────────────────
+
+/// An inline node may carry a signature, and its declared output is the
+/// port the `.port` reads (A12: this once failed with "no output port
+/// 'text'. Available: []" because the signature was never read).
+#[test]
+fn an_inline_expression_with_a_signature_resolves_its_declared_output() {
+    let source = r#"
+t = Text {}
+t.value = ExecPython(m: List[JsonDict]) -> (text: String) { code: "return {'text': 'x'}" }.text
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("inline with signature compiles");
+    let inline = result.nodes.iter().find(|n| n.id == "t__value").expect("the inline node");
+    assert_eq!(inline.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["m"]);
+    assert_eq!(inline.inputs[0].port_type, WeftType::parse("List[JsonDict]").unwrap());
+    assert_eq!(inline.outputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["text"]);
+    assert!(result.edges.iter().any(|e| e.source == "t__value" && e.source_handle.as_deref() == Some("text") && e.target == "t"));
+}
+
+// ─── Reading a key off a wire ───────────────────────────────────────────────
+
+/// `t.n = s.out.profile.wpm` is one edge from `s.out` carrying the keys
+/// read on the way; the braces spelling is the same edge; a path on the
+/// TARGET side is refused (a value lands on a port, never inside one).
+#[test]
+fn a_dotted_source_carries_its_path_on_the_edge() {
+    let source = r#"
+s = ExecPython() -> (out: { profile: { wpm: Number } }) { code: "return {'out': {'profile': {'wpm': 3}}}" }
+t = ExecPython(n: Number) -> (r: Number) { code: "return {'r': n}" }
+t.n = s.out.profile.wpm
+u = ExecPython(n: Number) -> (r: Number) {
+  code: "return {'r': n}"
+  n: s.out.profile.wpm
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compiles");
+    for target in ["t", "u"] {
+        let edge = result.edges.iter().find(|e| e.target == target).expect("the edge");
+        assert_eq!(edge.source, "s");
+        assert_eq!(edge.source_handle.as_deref(), Some("out"));
+        assert_eq!(edge.target_handle.as_deref(), Some("n"));
+        assert_eq!(edge.path, vec!["profile".to_string(), "wpm".to_string()], "{target}");
+    }
+    let plain = compile("s = Text {}\nd = Debug\nd.data = s.value\n", uuid::Uuid::new_v4(), CompileFs::none()).unwrap();
+    assert!(plain.edges[0].path.is_empty(), "a plain wire carries no path");
+
+    let (_p, errs) = compile_lenient(
+        "s = Text {}\nd = Debug\nd.data.x = s.value\n",
+        uuid::Uuid::new_v4(), CompileFs::none(), IncludeMode::Interface, None,
+    );
+    assert!(
+        errs.iter().any(|e| e.message.contains("a wire lands on a port")),
+        "a path on the target is refused: {errs:?}"
+    );
 }

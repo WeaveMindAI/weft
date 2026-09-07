@@ -32,45 +32,97 @@ use crate::SupervisorState;
 /// its `prior` status. This is what lets apply touch only the down
 /// units while up units stay Running at their old version.
 ///
+/// IMAGE REFS mirror that split, because they are the reclamation
+/// keep-set's only window into what running units actually use (the
+/// project row's tag map only holds the CURRENT refs, so a frozen
+/// unit's older image would otherwise be reclaimable while it runs):
+/// a reconciled unit records the refs its containers resolve to in
+/// `image_tags` (the refs this apply puts in the cluster); a frozen
+/// unit carries its `prior` refs forward unchanged. With
+/// `transitioning` (the PROVISIONING pre-commit stamp), a reconciled
+/// unit records prior ∪ current: its old pods may still exist during
+/// the sweep half of the apply, so both generations must stay
+/// referenced; the post-readiness (`set_applied`) stamp drops the
+/// prior generation, closing the window.
+///
+/// Also under `transitioning` only: a unit in `prior` but DROPPED from
+/// the spec is carried forward verbatim. Its workload is reaped later
+/// in the same apply, but a cancel or kubectl failure BEFORE the reap
+/// leaves the row `Failed` with those pods still running - carried,
+/// they keep their refs in the keep-set and the honest roster shows a
+/// unit that may still exist in the cluster. The post-readiness stamp
+/// rebuilds from the CURRENT spec only, so a completed apply drops
+/// them (by then the reap has taken their workloads down).
+///
 /// Units in the spec but absent from `prior` are new -> they're always
 /// in `reconciled` (the caller computes that), so they get `status`.
 fn resolve_units(
     spec: &InfraSpec,
+    node_id: &str,
     prior: &std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     reconciled: &std::collections::HashSet<String>,
     status: weft_broker_client::protocol::InfraNodeStatus,
-) -> std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime> {
+    image_tags: &std::collections::BTreeMap<String, String>,
+    transitioning: bool,
+) -> Result<std::collections::BTreeMap<String, weft_broker_client::protocol::UnitRuntime>> {
     use crate::health_engine::{FLAKY_AFTER, RECOVERY_AFTER};
-    spec.units
-        .iter()
-        .map(|u| {
-            let unit_status = if reconciled.contains(&u.name) {
-                status
-            } else {
-                // Left up / frozen: keep its current status (Running or
-                // Flaky). Fall back to `status` if somehow not in prior.
-                prior
-                    .get(&u.name)
-                    .map(|p| p.status)
-                    .unwrap_or(status)
-            };
-            (
-                u.name.clone(),
-                weft_broker_client::protocol::UnitRuntime {
-                    status: unit_status,
-                    stop_behavior: u.on_stop,
-                    flaky_after_seconds: u
-                        .health
-                        .flaky_after_seconds
-                        .unwrap_or(FLAKY_AFTER.as_secs() as u32),
-                    recovery_after_seconds: u
-                        .health
-                        .recovery_after_seconds
-                        .unwrap_or(RECOVERY_AFTER.as_secs() as u32),
-                },
-            )
-        })
-        .collect()
+    let mut out = std::collections::BTreeMap::new();
+    for u in &spec.units {
+        let (unit_status, image_refs) = if reconciled.contains(&u.name) {
+            let mut refs = infra::unit_image_refs(u, node_id, image_tags)?;
+            if transitioning {
+                // The sweep half of this apply may not have taken the
+                // unit's old pods down yet: keep both generations
+                // referenced until the post-readiness stamp.
+                if let Some(p) = prior.get(&u.name) {
+                    refs.extend(p.image_refs.iter().cloned());
+                }
+            }
+            (status, refs)
+        } else {
+            // Left up / frozen: keep its current status (Running or
+            // Flaky) AND the refs its last apply recorded (they can be
+            // older than the project's current tag map). A frozen unit
+            // is by construction in `prior` (`units_to_reconcile`
+            // reconciles every unit that is not), so its absence is a
+            // caller bug; empty refs here would silently drop a
+            // running unit's image from the keep-set, so fail instead.
+            let p = prior.get(&u.name).ok_or_else(|| {
+                anyhow!(
+                    "unit '{}' of node '{node_id}' is neither reconciled nor in the prior roster",
+                    u.name
+                )
+            })?;
+            (p.status, p.image_refs.clone())
+        };
+        out.insert(
+            u.name.clone(),
+            weft_broker_client::protocol::UnitRuntime {
+                status: unit_status,
+                stop_behavior: u.on_stop,
+                flaky_after_seconds: u
+                    .health
+                    .flaky_after_seconds
+                    .unwrap_or(FLAKY_AFTER.as_secs() as u32),
+                recovery_after_seconds: u
+                    .health
+                    .recovery_after_seconds
+                    .unwrap_or(RECOVERY_AFTER.as_secs() as u32),
+                image_refs,
+            },
+        );
+    }
+    if transitioning {
+        // Units dropped from the spec: see the doc block. Verbatim
+        // (status included): at stamp time their pods may still be up,
+        // so their prior entry is still the truth about them.
+        for (name, runtime) in prior {
+            if !out.contains_key(name) {
+                out.insert(name.clone(), runtime.clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Set of declared unit names to reconcile (apply) this pass: a unit
@@ -294,22 +346,27 @@ pub async fn tick(state: &SupervisorState) -> Result<bool> {
         .map(|e| e.downcast_ref::<CancelledByUser>().is_some())
         .unwrap_or(false);
     let error = result.as_ref().err().map(|e| e.to_string());
-    // `command_complete` returns Raced if the row was already completed
-    // (remove_node cascade cancelled it) OR this pod no longer owns the
-    // project (drain / lease takeover moved it mid-command). In the
-    // ownership case the command stays UNCOMPLETED on purpose, so the
-    // new owner re-runs and finishes it (the user never re-acts). Either
-    // way, log + move on; never propagate as a failure of this tick.
-    let outcome = state
+    // `command_complete` is Gone if the row was already completed
+    // (remove_node cascade cancelled it) and Displaced if this pod no
+    // longer owns the project (drain / lease takeover moved it
+    // mid-command). In the displaced case the command stays
+    // UNCOMPLETED on purpose, so the new owner re-runs and finishes it
+    // (the user never re-acts). Either way, log + move on; never
+    // propagate as a failure of this tick.
+    match state
         .broker
         .command_complete(&state.pod_name, cmd.id, error.as_deref(), cancelled)
-        .await?;
-    if outcome.is_raced() {
-        tracing::info!(
+        .await?
+    {
+        weft_broker_client::WriteOutcome::Applied(_) => {}
+        weft_broker_client::WriteOutcome::Displaced => tracing::info!(
             command_id = cmd.id,
-            "command_complete raced (already completed, or project ownership moved \
-             and the command is left for the new owner); no-op"
-        );
+            "command_complete displaced (project ownership moved); the command is left for the new owner"
+        ),
+        weft_broker_client::WriteOutcome::Gone => tracing::info!(
+            command_id = cmd.id,
+            "command_complete: the command was already completed; no-op"
+        ),
     }
     if let Err(e) = result {
         if cancelled {
@@ -411,15 +468,36 @@ async fn execute(
                     let Some(unit) = w.labels.get("weft.dev/unit") else {
                         continue;
                     };
+                    // A workload whose unit is NOT in the row's roster
+                    // is an orphan: a unit dropped from the spec whose
+                    // reap never landed (the apply meant it gone), or
+                    // foreign debris. Scaling it to zero regardless of
+                    // `force` finishes that intent; there is no
+                    // stop_behavior to honor because the row does not
+                    // know the unit. Never STAMP it: the broker fences
+                    // per-unit stamps on roster membership, so the
+                    // write would come back Raced and read below as
+                    // "ownership moved", ending the stop early. The
+                    // honest record for an orphan is its absence from
+                    // the roster.
+                    let Some(runtime) = n.units.get(unit) else {
+                        tracing::warn!(
+                            project_id = %cmd.project_id,
+                            node_id = %n.node_id,
+                            unit = %unit,
+                            workload = %w.name,
+                            "stopping an orphan workload with no roster entry; scaling down without stamping the row"
+                        );
+                        state
+                            .kube
+                            .scale_workload(&namespace, w.kind, &w.name, 0)
+                            .await?;
+                        continue;
+                    };
                     // `force` takes every unit down regardless of
-                    // on_stop. Otherwise honor the unit's stop_behavior
-                    // (a workload with no roster entry, which shouldn't
-                    // happen post-apply, defaults to ScaleToZero).
+                    // on_stop. Otherwise honor the unit's stop_behavior.
                     let scale_to_zero = cmd.force
-                        || n.units
-                            .get(unit)
-                            .map(|u| u.stop_behavior == weft_core::StopBehavior::ScaleToZero)
-                            .unwrap_or(true);
+                        || runtime.stop_behavior == weft_core::StopBehavior::ScaleToZero;
                     if !scale_to_zero {
                         continue;
                     }
@@ -468,19 +546,43 @@ async fn execute(
                             None,
                         )
                         .await?;
-                    if outcome.is_raced() {
-                        // Row removed mid-stop (remove_node cascade) or
-                        // claim reassigned. This pod's job is done.
-                        tracing::info!(
-                            project_id = %cmd.project_id,
-                            node_id = %n.node_id,
-                            unit = %unit,
-                            "set_status(stopped) raced; skipping remaining units + event"
-                        );
-                        any_stopped = false;
-                        break;
+                    match outcome {
+                        weft_broker_client::WriteOutcome::Applied(_) => any_stopped = true,
+                        weft_broker_client::WriteOutcome::Displaced => {
+                            // Project ownership moved: this pod must not
+                            // keep scaling the remaining nodes down. The
+                            // new owner re-runs the (idempotent) stop, and
+                            // command_complete is displaced for the same
+                            // reason, so `tick` leaves the command for it.
+                            // Same exit as the terminate path.
+                            tracing::info!(
+                                project_id = %cmd.project_id,
+                                node_id = %n.node_id,
+                                unit = %unit,
+                                "set_status(stopped) displaced; aborting stop for the new owner to re-run"
+                            );
+                            return Ok(());
+                        }
+                        weft_broker_client::WriteOutcome::Gone => {
+                            // This node's row is gone (removed mid-stop)
+                            // while the project is still ours. It cannot
+                            // be "the unit left the roster": only an
+                            // apply rewrites the roster and this pod's
+                            // per-project work loop runs one command at
+                            // a time. Nothing left to record for the
+                            // node; on to the next one, and the command
+                            // completes normally. Units of it that did
+                            // stop keep their event (`any_stopped`
+                            // stays what they earned).
+                            tracing::info!(
+                                project_id = %cmd.project_id,
+                                node_id = %n.node_id,
+                                unit = %unit,
+                                "set_status(stopped): row gone; skipping this node's remaining units"
+                            );
+                            break;
+                        }
                     }
-                    any_stopped = true;
                 }
                 // One Stopped event per node that actually stopped a
                 // unit (the event rail is node-scoped; the per-unit
@@ -509,11 +611,25 @@ async fn execute(
                 // leaves it in its prior RESTING status, never stuck in the
                 // transient `terminating` (which blocks re-apply reuse and shows
                 // a permanent spinner). Halt, not rollback: nodes already deleted
-                // stay gone; the rest keep their status. The set_status is a UI
-                // hint (the terminal `terminated` event after the delete is what
-                // counts), so a broker failure here is logged, not fatal.
+                // stay gone; the rest keep their status.
+                //
+                // The stamp is REQUIRED before the delete, never best-effort:
+                // it is the durable record that this instance's resources are
+                // being torn down. Were the delete to run without it and
+                // `remove_node` then fail (same broker, so the two fail
+                // together), the row would keep saying Running with the old
+                // applied hash while nothing is deployed, and every later
+                // apply would full-skip on the hash match, unable to repair
+                // it. Stamped, the row says Terminating, which is the one
+                // status the next apply refuses to reuse: it mints a fresh
+                // instance and finishes this delete first. Displaced means
+                // ownership moved: the new owner re-runs the terminate.
+                // Gone means the row vanished under us (a project removal
+                // in flight): the delete below still runs, since the
+                // instance's resources are exactly what this verb takes
+                // down and the label selector needs no row.
                 check_cancel(state, cmd.id, "terminating infra nodes").await?;
-                if let Err(e) = state
+                match state
                     .broker
                     .set_status(
                         &state.pod_name,
@@ -525,14 +641,22 @@ async fn execute(
                         None,
                         None,
                     )
-                    .await
+                    .await?
                 {
-                    tracing::warn!(
+                    weft_broker_client::WriteOutcome::Applied(_) => {}
+                    weft_broker_client::WriteOutcome::Displaced => {
+                        tracing::info!(
+                            project_id = %cmd.project_id,
+                            node_id = %n.node_id,
+                            "set_status(terminating) displaced (project ownership moved); aborting terminate for re-run"
+                        );
+                        return Ok(());
+                    }
+                    weft_broker_client::WriteOutcome::Gone => tracing::info!(
                         project_id = %cmd.project_id,
                         node_id = %n.node_id,
-                        error = %e,
-                        "set_status(terminating) failed; continuing with kubectl delete"
-                    );
+                        "set_status(terminating): row gone; deleting the instance's resources anyway"
+                    ),
                 }
                 let selector = format!("weft.dev/instance={}", n.instance_id);
                 // The list of PVCs to preserve was carried on the
@@ -544,21 +668,25 @@ async fn execute(
                     .kube
                     .delete_by_label(&namespace, &selector, &n.preserve_pvcs)
                     .await?;
-                if state
+                // remove_node is ownership-gated only: a row that is
+                // already gone is `Applied { removed: false }`, and the
+                // event below still records that this instance was
+                // taken down.
+                if !state
                     .broker
                     .remove_node(&state.pod_name, &cmd.project_id, &n.node_id)
                     .await?
-                    .is_raced()
+                    .is_applied()
                 {
                     // Lost ownership mid-Terminate (drain / lease
                     // takeover). Abort: leave the command uncompleted so
                     // the new owner re-runs the (idempotent) terminate.
-                    // command_complete will also be rejected for the same
-                    // reason, so `tick` won't mark it done.
+                    // command_complete will also be displaced for the
+                    // same reason, so `tick` won't mark it done.
                     tracing::info!(
                         project_id = %cmd.project_id,
                         node_id = %n.node_id,
-                        "remove_node raced (project ownership moved); aborting terminate for re-run"
+                        "remove_node displaced (project ownership moved); aborting terminate for re-run"
                     );
                     return Ok(());
                 }
@@ -719,6 +847,72 @@ async fn execute_apply(
         return Ok(());
     }
 
+    // A Fresh apply over an existing row means the row is `Terminating`
+    // (the only status that refuses instance-id reuse): a terminate
+    // stamped it and then failed or died before its delete landed, so
+    // the PRIOR instance's workloads can still be running. Every sweep
+    // in the apply selects by the NEW instance id and would leave them
+    // up, while the post-readiness stamp rebuilds the roster from the
+    // current spec and drops their image refs from the keep-set (an
+    // image reclaim would then delete what those pods run). Finish the
+    // terminate first, delete the prior instance by its own label with
+    // the PVC list its row recorded, and do it BEFORE the provisioning
+    // stamp below overwrites the row's instance_id: after that stamp
+    // the prior id lives nowhere durable, so a pod death between the
+    // stamp and this delete would strand the old instance forever
+    // (the retry reuses the new id). The row is already a visible,
+    // terminable `Terminating` row, so the "row before kubectl" rule
+    // the stamp exists for is already met, and a failure here leaves
+    // it exactly as it was for the next apply to finish. What the
+    // provisioning stamp ALSO provides is the ownership fence before
+    // the first kubectl call (a pod that lost the project's lease
+    // must not touch its namespace), so the same fence is taken here
+    // by re-stamping the row's own `Terminating` through the
+    // command-gated write: it changes nothing on the row; Displaced
+    // means the lease moved (leave the apply for the owner), and Gone
+    // means the row or the command vanished under a running apply,
+    // which nothing here can act on, so it fails loud.
+    if let (ApplyMode::Fresh, Some(p)) = (&mode, prior.as_ref()) {
+        match state
+            .broker
+            .set_status(
+                &state.pod_name,
+                Some(cmd.id),
+                &cmd.project_id,
+                node_id,
+                None,
+                weft_broker_client::protocol::InfraNodeStatus::Terminating,
+                None,
+                None,
+            )
+            .await?
+        {
+            weft_broker_client::WriteOutcome::Applied(_) => {}
+            weft_broker_client::WriteOutcome::Displaced => {
+                tracing::info!(
+                    project_id = %cmd.project_id,
+                    node_id = %node_id,
+                    "ownership fence displaced before finishing the prior terminate; leaving apply for the new owner"
+                );
+                return Ok(());
+            }
+            weft_broker_client::WriteOutcome::Gone => {
+                return Err(anyhow!(
+                    "infra_node row for node '{node_id}' (or its apply command) vanished before \
+                     the prior instance could be finished; re-run the apply"
+                ));
+            }
+        }
+        state
+            .kube
+            .delete_by_label(
+                &namespace,
+                &format!("weft.dev/instance={}", p.instance_id),
+                &p.preserve_pvcs,
+            )
+            .await?;
+    }
+
     // Pre-apply commitment: write the infra_node row before any
     // kubectl call so a partial-apply failure leaves a visible row the
     // user can Terminate. Reconciled units go Provisioning; up units
@@ -726,6 +920,9 @@ async fn execute_apply(
     // the (possibly removed) prior units' absence: it's rebuilt from
     // the CURRENT spec, so a unit dropped from the spec disappears
     // from the row here (its workloads are reaped below).
+    // `transitioning = true`: the reconciled units' PRIOR image refs
+    // stay recorded until the post-readiness stamp, because their old
+    // pods can still exist while the sweep half of this apply runs.
     let provision_outcome = state
         .broker
         .set_provisioning(
@@ -738,20 +935,26 @@ async fn execute_apply(
             spec.lifecycle.on_terminate.preserve_pvcs.clone(),
             resolve_units(
                 &spec,
+                node_id,
                 &prior_units,
                 &reconcile,
                 weft_broker_client::protocol::InfraNodeStatus::Provisioning,
-            ),
+                &image_tags,
+                true,
+            )?,
         )
         .await?;
-    if provision_outcome.is_raced() {
-        // Project ownership moved before we committed the Provisioning
-        // row (or the node was removed). Abort without completing; the
-        // new owner re-runs the apply from scratch.
+    if !provision_outcome.is_applied() {
+        // Displaced: project ownership moved before we committed the
+        // Provisioning row; the new owner re-runs the apply from
+        // scratch and the command stays uncompleted. Gone: the command
+        // is already completed (a node removal cancelled it), so there
+        // is nothing left to apply for; `tick`'s completion is a no-op.
         tracing::info!(
             project_id = %cmd.project_id,
             node_id = %node_id,
-            "set_provisioning raced; project ownership moved, leaving apply for the new owner"
+            outcome = ?provision_outcome,
+            "set_provisioning not applied; leaving the apply"
         );
         return Ok(());
     }
@@ -869,23 +1072,31 @@ async fn execute_apply(
             endpoints,
             &namespace,
             spec.lifecycle.on_terminate.preserve_pvcs.clone(),
+            // `transitioning = false`: readiness waited, the reconciled
+            // units' old pods are gone, so their PRIOR image refs leave
+            // the row here (the keep-set window closes with this stamp).
             resolve_units(
                 &spec,
+                node_id,
                 &prior_units,
                 &reconcile,
                 weft_broker_client::protocol::InfraNodeStatus::Running,
-            ),
+                &image_tags,
+                false,
+            )?,
         )
         .await?;
-    if outcome.is_raced() {
-        // Project ownership moved mid-apply (drain / lease takeover) or
-        // the node was removed. Don't fire the Started event and don't
-        // complete the command; the new owner re-runs the (idempotent)
-        // apply and finishes it.
+    if !outcome.is_applied() {
+        // Displaced: project ownership moved mid-apply (drain / lease
+        // takeover); don't fire the Started event and don't complete
+        // the command; the new owner re-runs the (idempotent) apply
+        // and finishes it. Gone: the command was completed under us (a
+        // node removal cancelled it); nothing to record.
         tracing::info!(
             project_id = %cmd.project_id,
             node_id = %node_id,
-            "set_applied raced; project ownership moved, leaving apply for the new owner"
+            outcome = ?outcome,
+            "set_applied not applied; leaving the apply"
         );
         return Ok(());
     }
@@ -1052,5 +1263,133 @@ mod tests {
             map.get("api").unwrap(),
             "http://inst1-api.wft-project-x-y.svc.cluster.local:8080"
         );
+    }
+
+    /// The image-ref bookkeeping that lets `GET /images/referenced` keep
+    /// what running units actually use while the project's tag map has
+    /// moved on. Three rules, one test: a FROZEN up unit carries its
+    /// prior refs forward untouched (the whole point: its image is older
+    /// than the map); the PROVISIONING stamp unions a reconciled unit's
+    /// prior refs with its new ones (old pods can still exist during the
+    /// sweep half of the apply); the post-readiness stamp drops the
+    /// prior generation (the window closes). Local names resolve through
+    /// the tag map, upstream literals pass through.
+    #[test]
+    fn resolve_units_records_the_refs_running_units_use() {
+        use std::collections::{BTreeMap, HashSet};
+        use weft_broker_client::protocol::{InfraNodeStatus, UnitRuntime};
+        use weft_core::infra::*;
+
+        fn runtime(status: InfraNodeStatus, refs: &[&str]) -> UnitRuntime {
+            UnitRuntime {
+                status,
+                stop_behavior: weft_core::StopBehavior::ScaleToZero,
+                flaky_after_seconds: 1,
+                recovery_after_seconds: 1,
+                image_refs: refs.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        let spec = InfraSpec {
+            units: vec![
+                Unit {
+                    name: "frozen".into(),
+                    containers: vec![Container::new(
+                        "c",
+                        Image::Local { name: "bridge".into() },
+                    )],
+                    ..Default::default()
+                },
+                Unit {
+                    name: "replaced".into(),
+                    containers: vec![
+                        Container::new("c", Image::Local { name: "bridge".into() }),
+                        Container::new(
+                            "sidecar",
+                            Image::Upstream { reference: "busybox:1".into() },
+                        ),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Both units ran weft-infra-bridge:old; "replaced" is down, so it
+        // reconciles onto the map's current bridge ref. A third unit,
+        // "gone", was dropped from the spec entirely (its workload is
+        // the orphan the apply will reap).
+        let mut prior = BTreeMap::new();
+        prior.insert("frozen".into(), runtime(InfraNodeStatus::Running, &["weft-infra-bridge:old"]));
+        prior.insert(
+            "replaced".into(),
+            runtime(InfraNodeStatus::Stopped, &["weft-infra-bridge:old"]),
+        );
+        prior.insert(
+            "gone".into(),
+            runtime(InfraNodeStatus::Running, &["weft-infra-gone:0ld"]),
+        );
+        let reconciled: HashSet<String> = ["replaced".to_string()].into_iter().collect();
+        let tags: BTreeMap<String, String> =
+            [("bridge".to_string(), "weft-infra-bridge:new".to_string())]
+                .into_iter()
+                .collect();
+
+        let provisioning = resolve_units(
+            &spec,
+            "n1",
+            &prior,
+            &reconciled,
+            InfraNodeStatus::Provisioning,
+            &tags,
+            true,
+        )
+        .unwrap();
+        // Frozen: prior refs carried forward, current map ignored.
+        assert_eq!(
+            provisioning["frozen"].image_refs,
+            ["weft-infra-bridge:old".to_string()].into_iter().collect()
+        );
+        // Reconciling: BOTH generations stay referenced while the sweep
+        // may still have old pods up (plus the upstream literal).
+        assert_eq!(
+            provisioning["replaced"].image_refs,
+            [
+                "weft-infra-bridge:old".to_string(),
+                "weft-infra-bridge:new".to_string(),
+                "busybox:1".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+        // Dropped from the spec: carried VERBATIM at the provisioning
+        // stamp (its pods may still run until the reap; the keep-set
+        // must keep seeing its ref).
+        assert_eq!(provisioning["gone"], *prior.get("gone").unwrap());
+
+        let applied = resolve_units(
+            &spec,
+            "n1",
+            &prior,
+            &reconciled,
+            InfraNodeStatus::Running,
+            &tags,
+            false,
+        )
+        .unwrap();
+        // Readiness waited: the prior generation leaves the row here.
+        assert_eq!(
+            applied["replaced"].image_refs,
+            ["weft-infra-bridge:new".to_string(), "busybox:1".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            applied["frozen"].image_refs,
+            ["weft-infra-bridge:old".to_string()].into_iter().collect()
+        );
+        // The dropped unit's reap completed with the apply: the
+        // post-readiness row is rebuilt from the CURRENT spec only, so
+        // it disappears here (and with it, its ref leaves the keep-set).
+        assert!(!applied.contains_key("gone"));
     }
 }

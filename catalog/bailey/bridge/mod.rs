@@ -16,7 +16,6 @@ use weft::infra::{
     Mount, Probe, Protocol, Resources, TerminateBehavior, Unit, UnitKind, UpgradeBehavior, Volume,
     VolumeKind,
 };
-use weft::node::NodeOutput;
 use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
 #[derive(NodeManifest)]
@@ -121,9 +120,11 @@ impl Node for BaileyBridgeNode {
         // the lookup. Output ports: `endpointUrl` (the bare URL, so
         // downstream nodes like BaileySend can target the bridge
         // from outside the declared-endpoint graph) plus the bridge's
-        // `/outputs` keys (status, phoneNumber, jid, pushName), each
-        // a declared port in metadata.json. The `/outputs` key set
-        // and the declared output ports must stay in sync.
+        // `/outputs` keys (status, phoneNumber, jid, pushName). The
+        // fan takes the declared ports and nothing else, so a key the
+        // container grows does not have to be added here first, and it
+        // skips the nulls an unpaired bridge reports (no phone number
+        // yet), which leaves those ports closed rather than mismatched.
         let api = ctx.endpoint("api").await?;
         let bridge_outputs = api
             .call(weft::EndpointMethod::Get, "/outputs", None)
@@ -131,9 +132,7 @@ impl Node for BaileyBridgeNode {
         // `endpointUrl` is our locally-known truth (the resolved
         // EndpointHandle URL). Set AFTER the fan (set-after-fan wins) so a
         // misbehaving container can't shadow it with its own value.
-        let out = NodeOutput::new()
-            .extend_from_object(&bridge_outputs)
-            .set("endpointUrl", api.url());
+        let out = ctx.fan_declared(&bridge_outputs).set("endpointUrl", api.url());
         ctx.pulse_downstream(out).await
     }
 }

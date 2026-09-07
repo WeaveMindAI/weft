@@ -1,80 +1,91 @@
-//! Aimed runs: `weft run --target <output>` executes only the target's
-//! upstream closure, and holds that boundary honestly in the journal.
+//! Aimed runs: `weft run --target <node>` runs the target and what it
+//! needs, its upstream closure, and nothing else: the run is held to
+//! that set, so a root shared with another branch never drags the
+//! branch in.
 //!
-//! The fixture fans one source into two output branches plus a leaf
-//! that feeds no output (see fixtures/aimed_run/main.weft). Three
-//! contracts are pinned across two runs of the same project:
+//! The fixture holds two independent chains and a leaf hanging off the
+//! first (see fixtures/aimed_run/main.weft). Three contracts are pinned:
 //!
-//!  - untargeted: pulses run everything they reach, the non-output
-//!    leaf included, and nothing skips;
-//!  - aimed: the sibling branch's first node (fed directly by an
-//!    in-scope producer) journals exactly ONE skip whose reason is
-//!    `outside_this_run`, and nodes past that boundary stay blank;
-//!  - aiming at a non-output (or unknown) node is refused before
-//!    anything runs.
+//!  - untargeted: every root is kicked and everything runs;
+//!  - aimed at a chain's end: that chain's root is the only kick, the
+//!    chain runs up to the target, the leaf hanging off it is never
+//!    touched (it is downstream of the chain, not upstream of the
+//!    target), and neither is the other chain (no skip row, nothing);
+//!  - any node is a target: aiming at a node in the middle of a chain
+//!    runs that node and its upstream only, while a name that is no
+//!    node is refused before anything runs.
 #![cfg(feature = "e2e")]
 
 use weft_e2e::{ensure, project::Project, run};
 
 #[tokio::test]
-async fn an_untargeted_run_reaches_everything_the_wiring_does() -> anyhow::Result<()> {
+async fn an_untargeted_run_kicks_every_root() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("aimed_run", disp).await?;
 
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
-    // Both output branches AND the side-effect leaf ran: an untargeted
-    // run behaves like a fire, pulses go wherever the wiring takes
-    // them, is_output or not.
+    settled.assert_completed("left_src")?;
     settled.assert_completed("left")?;
     settled.assert_completed("out_left")?;
+    settled.assert_completed("side")?;
+    settled.assert_completed("right_src")?;
     settled.assert_completed("right")?;
     settled.assert_completed("out_right")?;
-    settled.assert_completed("side")?;
 
     project.finish().await
 }
 
 #[tokio::test]
-async fn an_aimed_run_holds_its_boundary_and_says_why() -> anyhow::Result<()> {
+async fn an_aimed_run_kicks_only_what_the_target_needs() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("aimed_run", disp).await?;
 
     let settled = run::run_targeted_and_settle(&mut project, &["out_left"]).await?;
     settled.completed()?;
-    // The aimed branch runs whole.
+    // The chain runs up to the target. The leaf hanging off `left` is
+    // not upstream of the target, so the pulse into it is absorbed and
+    // it never appears: an aimed run is what the target needs, not
+    // what its roots happen to reach.
+    // The target's ROOT is what gets kicked: `left_src` ran, and
+    // `left` read its value rather than being kicked bare.
+    settled.assert_completed("left_src")?;
     settled.assert_completed("left")?;
     settled.assert_completed("out_left")?;
-    // The boundary nodes (fed directly by the in-scope source) journal
-    // exactly one skip each, with the reason a user can act on.
-    settled.assert_skip_reason("right", "outside_this_run")?;
-    settled.assert_skip_reason("side", "outside_this_run")?;
-    // Past the boundary, NOTHING: no cascade is manufactured for a
-    // region that was never going to run, so the inspector shows the
-    // boundary row and blank beyond, not a wall of skips.
+    settled.assert_untouched("side")?;
+    // The right chain's root was never kicked, so the chain is blank:
+    // no skip row is manufactured for a region that never started.
+    settled.assert_untouched("right_src")?;
+    settled.assert_untouched("right")?;
     settled.assert_untouched("out_right")?;
 
     project.finish().await
 }
 
 #[tokio::test]
-async fn aiming_at_a_non_output_or_unknown_node_is_refused() -> anyhow::Result<()> {
+async fn any_node_is_a_target_and_an_unknown_name_is_refused() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("aimed_run", disp).await?;
 
-    // `right` exists but is not an output node; `nope` does not exist.
-    // Both must be refused by the dispatcher before anything runs, with
-    // the message naming the problem. The refused run still built and
-    // registered the project on its way in, so mark it for teardown.
-    project.mark_registered();
-    for (target, expect) in [("right", "not an output node"), ("nope", "no node")] {
-        let err = project
-            .weft(&["run", "--json", "--target", target])
-            .await
-            .expect_err("an invalid target must refuse the run");
-        let msg = format!("{err:#}");
-        anyhow::ensure!(msg.contains(expect), "target '{target}': {msg}");
-    }
+    // A node in the middle of a chain: its root is kicked, it runs,
+    // and nothing past it does: the target is the end of the run.
+    let settled = run::run_targeted_and_settle(&mut project, &["left"]).await?;
+    settled.completed()?;
+    settled.assert_completed("left_src")?;
+    settled.assert_completed("left")?;
+    settled.assert_untouched("out_left")?;
+    settled.assert_untouched("side")?;
+    settled.assert_untouched("right_src")?;
+    settled.assert_untouched("right")?;
+
+    // A name that is no node is refused by the dispatcher before anything
+    // runs, with the message naming it.
+    let err = project
+        .weft(&["run", "--json", "--target", "nope"])
+        .await
+        .expect_err("an unknown target must refuse the run");
+    let msg = format!("{err:#}");
+    anyhow::ensure!(msg.contains("no node 'nope'"), "{msg}");
 
     project.finish().await
 }

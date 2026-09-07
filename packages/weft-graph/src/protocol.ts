@@ -8,18 +8,27 @@ export interface Span {
   endColumn: number;
 }
 
-/// Where an input's value may come from. Exposure governs LITERALS:
-/// 'all' = braces or assignment plus wires, 'assignment' = statement
-/// only plus wires, 'config' = braces only and NOT wireable (a pure
-/// design-time setting), 'wire' = wires alone.
-// SYNC: Exposure <-> crates/weft-core/src/weft_type.rs Exposure
-export type Exposure = 'all' | 'assignment' | 'config' | 'wire';
+/// One of the two things that can drive an input: a constant written in
+/// the source (any spelling: braces, statement, `@file`, `@asset`), or a
+/// value another node produces at run time (an edge, a dotted value in
+/// the braces, an inline node).
+// SYNC: AcceptedForm <-> crates/weft-core/src/node.rs AcceptedForm
+export type AcceptedForm = 'literal' | 'wire';
+
+/// Which drivers an input takes, as the list of accepted forms. Absent
+/// on an input means both. A port never adds a form; it only removes
+/// one, and the compiler resolves the list onto every instance input.
+// SYNC: Accepts <-> crates/weft-core/src/node.rs Accepts
+export type Accepts = AcceptedForm[];
 
 /// A pure WIRE port on a node instance's output side or a group/loop
 /// interface. Inputs are the richer `InputDefinition`.
+// SYNC: PortDefinition <-> crates/weft-core/src/project.rs PortDefinition
 export interface PortDefinition {
   name: string;
   portType: string;
+  /// Whether the node waits for a value here. Inputs only: an output
+  /// carries no optionality and is always `true` here.
   required: boolean;
   description?: string;
   /// True iff this port was auto-synthesized by the loop-lowering pass
@@ -27,17 +36,27 @@ export interface PortDefinition {
   /// mirror of the matching carry output. Never user-editable; the user
   /// changes the output's role to remove the synthesized input.
   synthesizedFromCarry?: boolean;
+  /// The type the SOURCE header declares for this port; absent when the
+  /// header does not declare it (a catalog port, a config-derived one,
+  /// a synthesized one). The editor rewrites the header from THIS,
+  /// never from `portType`: the rendered type may be an
+  /// inference-resolved instantiation of a generic, which must not get
+  /// frozen into source as if the author wrote it.
+  // Declared once here and inherited by InputDefinition (Rust flattens
+  // its PortDefinition into InputDefinition the same way).
+  // SYNC: PortDefinition.declaredType <-> crates/weft-core/src/project.rs PortDefinition.declared_type
+  declaredType?: string;
 }
 
-/// One INPUT on a node instance, enriched: exposure resolved and the
-/// editor surface (widget/default/label/placeholder) stamped by the
+/// One INPUT on a node instance, enriched: accepted drivers resolved and
+/// the editor surface (widget/default/label/placeholder) stamped by the
 /// compiler, so the editor never re-derives any of it. The optional
 /// members are only absent on a locally-added port that has not
 /// round-tripped through a parse yet.
 // SYNC: InputDefinition <-> crates/weft-core/src/project.rs InputDefinition
 export interface InputDefinition extends PortDefinition {
-  // SYNC: InputDefinition.exposure <-> crates/weft-core/src/project.rs InputDefinition.exposure
-  exposure?: Exposure;
+  // SYNC: InputDefinition.accepts <-> crates/weft-core/src/project.rs InputDefinition.accepts
+  accepts?: Accepts;
   // SYNC: InputDefinition.widget <-> crates/weft-core/src/project.rs InputDefinition.widget
   widget?: Widget;
   default?: unknown;
@@ -65,10 +84,15 @@ export interface InputDefinition extends PortDefinition {
 /// Source span of one config field plus how it was written. `origin` tells
 /// the editor how to rewrite the field in place: an inline field
 /// (`n = Type { k: v }`) becomes `k: v`; a connection-line field (`n.k = v`)
-/// keeps its `n.k = ` prefix. Matches the Rust `ConfigFieldSpan`.
+/// keeps its `n.k = ` prefix.
+// SYNC: ConfigFieldSpan <-> crates/weft-core/src/project.rs ConfigFieldSpan
 export interface ConfigFieldSpan {
   span: Span;
   origin: 'inline' | 'connection';
+  /// The file the span's coordinates live in; absent = the compiled
+  /// source. An interface-port fill written in an including file
+  /// carries its own file, which may differ from its node's.
+  sourceFile?: string;
 }
 
 /// A `@file("path", Type)` / `@asset("path", Type)` reference on a config
@@ -207,27 +231,40 @@ function findTopLevel(s: string, delimiter: string): number {
   return -1;
 }
 
+/** Whether any LEAF of the type satisfies `leaf`. The one tree walk
+ *  behind every "does this type still hold an X" question. */
+function anyLeaf(t: WeftType, leaf: (kind: WeftType['kind']) => boolean): boolean {
+  switch (t.kind) {
+    case 'list':
+    case 'generator':
+      return anyLeaf(t.inner, leaf);
+    case 'dict':
+      return anyLeaf(t.key, leaf) || anyLeaf(t.value, leaf);
+    case 'union':
+      return t.types.some(u => anyLeaf(u, leaf));
+    case 'record':
+      return t.fields.some(f => anyLeaf(f.ty, leaf));
+    case 'named':
+      return anyLeaf(t.body, leaf);
+    default:
+      return leaf(t.kind);
+  }
+}
+
 /** Any unresolved leaf (`typevar`, `must_override`) anywhere in the type. */
 // SYNC: containsUnresolvedLeaf <-> crates/weft-core/src/weft_type.rs contains_unresolved_leaf
 function containsUnresolvedLeaf(t: WeftType): boolean {
-  switch (t.kind) {
-    case 'typevar':
-    case 'must_override':
-      return true;
-    case 'list':
-    case 'generator':
-      return containsUnresolvedLeaf(t.inner);
-    case 'dict':
-      return containsUnresolvedLeaf(t.key) || containsUnresolvedLeaf(t.value);
-    case 'union':
-      return t.types.some(containsUnresolvedLeaf);
-    case 'record':
-      return t.fields.some(f => containsUnresolvedLeaf(f.ty));
-    case 'named':
-      return containsUnresolvedLeaf(t.body);
-    default:
-      return false;
-  }
+  return anyLeaf(t, kind => kind === 'typevar' || kind === 'must_override');
+}
+
+/** Whether a type still holds a TYPEVAR anywhere (`T`, `List[T]`,
+ *  `Dict[String, T]`), meaning inference resolves it per instance and
+ *  its spelling is not what a reparse renders. Deliberately EXCLUDES
+ *  `must_override`, unlike `containsUnresolvedLeaf`: a wired
+ *  MustOverride port is an error, never resolved, so its rendered type
+ *  stays MustOverride and the spelling is honest. */
+export function containsTypevar(t: WeftType): boolean {
+  return anyLeaf(t, kind => kind === 'typevar');
 }
 
 function parseSingleType(s: string): WeftType | null {
@@ -486,11 +523,6 @@ export interface NodeFeaturesWire {
   canAddOutputPorts?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
-  /// This node type's firing is the deliverable, so a run started from
-  /// the outputs reaches it. The editor reads it to know which nodes a
-  /// run can be aimed at; a project overrides it per instance with
-  /// `_is_output` in the node's config.
-  isOutputDefault?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
   /// so the panel doesn't show a broken eye.
@@ -514,13 +546,13 @@ export interface NodeDefinition {
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
-  /// Body values that DRIVE INPUT PORTS, keyed by port name (braces or
-  /// statement form, per the port's literal placement). One home per
-  /// name: a port's value lives here, a config field's value lives in
-  /// `config`, so a braces-closed port and a same-named field coexist. The paired spans carry each entry's
-  /// source range + written form (`origin`: 'inline' = braces,
-  /// 'connection' = statement), which is what the editor's form toggle
-  /// rewrites.
+  /// Every constant written for an INPUT PORT, keyed by port name,
+  /// whichever spelling wrote it (braces or statement, a `@file`/`@asset`
+  /// marker included). The one home for a port's value; `config` keeps
+  /// only what is not a port (the `_` keys, a loop's knobs). The paired
+  /// spans carry each entry's source range + written form (`origin`:
+  /// 'inline' = braces, 'connection' = statement), which is what the
+  /// editor's form toggle rewrites.
   // SYNC: portLiterals/portLiteralSpans <-> crates/weft-core/src/project.rs NodeDefinition.port_literals/port_literal_spans
   portLiterals?: Record<string, unknown>;
   portLiteralSpans?: Record<string, ConfigFieldSpan>;
@@ -528,15 +560,29 @@ export interface NodeDefinition {
   /// Set on an opaque `@include` node: the included `.weft` file path. The
   /// editor renders this as an expandable group that navigates into the file.
   includePath?: string;
+  /// The file this node was written in; absent = the compiled source.
+  /// The editor never edits by span (every EditOp addresses by id/key,
+  /// and the Rust engine resolves the decl in the buffer it is editing,
+  /// failing loudly on an id it cannot find), so this is not consumed
+  /// by the editor; the Problems panel routes diagnostics by it.
+  sourceFile?: string;
 }
 
+// SYNC: Edge <-> crates/weft-core/src/project.rs Edge
 export interface Edge {
   id: string;
   source: string;
   target: string;
   sourceHandle: string | null;
   targetHandle: string | null;
+  /// The keys read off the source value before it lands
+  /// (`w.seconds = x.profile.wpm` carries `["wpm"]`). Absent or empty
+  /// for a plain wire. The graph draws such a wire dotted with the
+  /// path at its target end.
+  path?: string[];
   span?: Span;
+  /// The file the span lives in; absent = the compiled source.
+  sourceFile?: string;
 }
 
 // SYNC: GroupDefinition (kind + loopConfig) <-> crates/weft-core/src/project.rs GroupKind
@@ -559,7 +605,6 @@ export interface GroupDefinition {
   label: string | null;
   inPorts: PortDefinition[];
   outPorts: PortDefinition[];
-  oneOfRequired: string[][];
   parentGroupId: string | null;
   childGroupIds: string[];
   nodeIds: string[];
@@ -576,6 +621,8 @@ export interface GroupDefinition {
   /// Where each `portLiterals` entry was written, and in which form, so an
   /// edit rewrites the value where it already lives.
   portLiteralSpans?: Record<string, ConfigFieldSpan>;
+  /// The file the group's spans live in; absent = the compiled source.
+  sourceFile?: string;
 }
 
 export interface ProjectDefinition {
@@ -603,6 +650,10 @@ export interface Diagnostic {
   severity: Severity;
   message: string;
   code?: string;
+  // The file the coordinates live in, when it is NOT the source that
+  // was compiled (an @include splices other files' nodes in with their
+  // own line numbers). Absent = the compiled source itself.
+  file?: string;
 }
 
 /// Derived from the Widget union below (never a second hand-kept list).
@@ -670,12 +721,18 @@ export type Widget =
   /// `step` is the input's granularity (arrow/slider increment).
   | { kind: 'number'; min?: number | null; max?: number | null; step?: number | null }
   | { kind: 'checkbox' }
+  /// A calendar-and-clock picker; the stored String is ISO-8601 with
+  /// the picker's own zone offset.
+  | { kind: 'datetime' }
   | { kind: 'select'; options: string[] }
   | { kind: 'multiselect'; options: string[] }
   | { kind: 'password' }
-  /// The connection picker; `service` is compiler-stamped from the
-  /// node metadata's `service.service`.
-  | { kind: 'access'; service?: string | null }
+  /// The connection picker; `service` and `optional` are
+  /// compiler-stamped from the node metadata's recipe
+  /// (`service.service` / `service.connection_optional`). `optional` =
+  /// the node runs without a connection, so the editor neither pins
+  /// the unconnected node open nor gates the run on it.
+  | { kind: 'access'; service?: string | null; optional?: boolean }
   /// Pick a resource on the connected service. `access` names this
   /// node's Access input; `sources` are the fill ways in preference
   /// order; `depends_on` are parent inputs for drill-down.
@@ -700,15 +757,15 @@ export type Widget =
   | { kind: 'file_drop'; accept?: string | null; type: string; multiple?: boolean };
 
 // One declared INPUT of a node type, as authored in metadata.json and
-// RESOLVED by the CLI before it ships (exposure + widget always filled
+// RESOLVED by the CLI before it ships (accepts + widget always filled
 // with their effective values on this wire).
 // SYNC: InputSpec <-> crates/weft-core/src/node.rs InputSpec
 export interface InputSpec {
   name: string;
   type: string;
   required?: boolean;
-  // SYNC: InputSpec.exposure <-> crates/weft-core/src/node.rs InputSpec.exposure
-  exposure?: Exposure;
+  // SYNC: InputSpec.accepts <-> crates/weft-core/src/node.rs InputSpec.accepts
+  accepts?: Accepts;
   widget?: Widget;
   default?: unknown;
   label?: string;
@@ -729,7 +786,6 @@ export interface InputSpec {
 export interface OutputSpec {
   name: string;
   type: string;
-  required?: boolean;
   description?: string;
 }
 
@@ -848,6 +904,11 @@ export interface OwnPageWire {
 export interface AccessSpecWire {
   service: string;
   label?: string;
+  /** The node runs without a connection picked (a possibly
+   *  unauthenticated custom endpoint): no synthesized "no connection
+   *  picked" rule, no pinned-open node. Default false: every access
+   *  node requires a connection unless it says otherwise. */
+  connection_optional?: boolean;
   grants?: GrantCoexistence;
   /** The connect doors this service offers; default ['own']. */
   doors?: Door[];
@@ -883,7 +944,7 @@ export interface AccessSpecWire {
 
 /** A connection row as the store lists it: everything the connection
  *  list renders, never a stored value. */
-// SYNC: GrantSummary <-> crates/weft-access-store/src/lib.rs GrantSummary
+// SYNC: GrantSummary <-> crates/weft-core/src/access/wire.rs GrantSummary
 export interface GrantSummary {
   id: string;
   service: string;
@@ -1008,7 +1069,19 @@ export type SkipReason =
   | { kind: 'required_input_closed'; port: string }
   | { kind: 'every_input_closed' }
   | { kind: 'one_of_group_closed'; ports: string[] }
-  | { kind: 'outside_this_run' };
+  | { kind: 'scope_skipped'; scope: string };
+
+/// Why an execution was cancelled: a person, a sibling run's
+/// `ctx.stop_tagged` (naming the run and the tag), the live caller
+/// dropping, or the runtime itself. Rides the `execution_cancelled`
+/// event beside its text `reason`; absent only on a journal row written
+/// before the field existed.
+// SYNC: CancelCause <-> crates/weft-core/src/exec/cancel.rs CancelCause
+export type CancelCause =
+  | { kind: 'user' }
+  | { kind: 'execution'; by: string; tag: string }
+  | { kind: 'caller_gone' }
+  | { kind: 'runtime'; detail: string };
 
 /// The port every node carries, deciding whether it runs at all.
 // SYNC: SHOULD_FLOW_PORT <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
@@ -1048,6 +1121,10 @@ export type CredentialOwner = 'their-own' | 'ours';
 export interface NodeExecEvent {
   nodeId: string;
   state: NodeExecutionStatus;
+  /// The journal's stamp for this transition (unix seconds), so a
+  /// replay renders when the firing started and ended rather than
+  /// when it was read.
+  atUnix: number;
   /// This `running` transition is a RESUME of the same firing (a
   /// crash re-dispatch or a suspension waking), not a fresh attempt.
   /// Per-firing state accumulated before the resume (port warnings)
@@ -1243,11 +1320,13 @@ export interface LiveDataItem {
   label: string;
   data: string | number;
   /// Optional action button rendered next to the item. Click
-  /// posts a `signalAction` message; the host routes through
-  /// `/projects/{id}/signals/{node_id}/action`. The listener's
-  /// kind impl owns the action's payload schema. Use for
-  /// regenerate-api-key, future "rotate", etc. Generic so node
-  /// authors can add buttons without changing the inspector.
+  /// posts a `signalAction` message; the host routes it to
+  /// `/projects/{id}/infra/nodes/{node_id}/action` for an infra
+  /// node (the container behind `/live` serves `/action`) and to
+  /// `/projects/{id}/signals/{node_id}/action` for a trigger (the
+  /// listener's kind impl). Whoever serves the action owns its
+  /// payload schema. Generic so node authors can add buttons
+  /// without changing the inspector.
   action?: {
     label: string;
     actionKind: string;
@@ -1426,8 +1505,9 @@ export type ActionVerb =
   | 'infra_node_stop'
   | 'infra_node_terminate';
 
-/// CLI progress phase. Matches the CLI's Phase enum. Closed set so
-/// the reducer's match is exhaustive at the type level.
+/// CLI progress phase. Closed set so the reducer's match is
+/// exhaustive at the type level.
+// SYNC: CliPhase <-> crates/weft-cli/src/progress.rs Phase
 export type CliPhase =
   | 'build_start'
   | 'build_skip'
@@ -1440,8 +1520,17 @@ export type CliPhase =
   | 'infra_provision_done'
   | 'trigger_register_start'
   | 'trigger_register_done'
+  /// Periodic heartbeat while an infra verb waits on the supervisor
+  /// (unbounded: draining executions). Detail carries `elapsedSeconds`.
+  | 'infra_wait'
   | 'complete'
   | 'error';
+
+/// What the action bar's working label can show: every CLI phase, plus
+/// the extension-side `preflight` window (the saved-state check that
+/// runs between the click and the CLI spawn). Extension-only: the CLI
+/// never emits it, so it is NOT part of the CliPhase wire SYNC.
+export type BarPhase = CliPhase | 'preflight';
 
 /// One NDJSON line emitted by the CLI in --json mode.
 export interface CliEvent {
@@ -1509,7 +1598,7 @@ export interface ActionErrorDetails {
   /// Stage where the failure happened. Drives the modal's icon and
   /// helps the user understand which subsystem reported the error.
   /// "compile" | "spawn" | "runtime" | "dispatch" | "edit" | "parse"
-  /// | "catalog" | "cli" | "unknown"
+  /// | "catalog" | "cli" | "preflight" | "unknown"
   stage: string;
   /// Per-diagnostic items. A compile failure fans out into many; an
   /// exit-code failure produces one item with the stderr blob in raw.
@@ -1524,14 +1613,22 @@ export interface ActionErrorDetails {
   command?: string;
 }
 
+/// A position in a source file: 1-based line, 0-based column.
+export interface SourceLocation {
+  file: string;
+  line: number;
+  column: number;
+}
+
 export interface ActionErrorDiagnostic {
   severity: 'error' | 'warning' | 'info';
   /// Diagnostic code like `loop-parallel-not-boolean`. Optional.
   code?: string;
   message: string;
-  /// Optional source location. The modal renders "main.weft:12:5"
-  /// and offers click-to-jump.
-  location?: { file: string; line: number; column: number };
+  /// Optional source location. `file` is a full path; the modal
+  /// renders its basename ("main.weft:12:5", full path on hover) and
+  /// offers click-to-jump.
+  location?: SourceLocation;
   /// Optional extended explanation shown below the message.
   hint?: string;
 }
@@ -1575,7 +1672,7 @@ export type BackendSnapshot = {
 
 export type ActionBarOverlay =
   | { kind: 'idle' }
-  | { kind: 'cli_running'; verb: ActionVerb; phase: CliPhase; detail?: Record<string, unknown> }
+  | { kind: 'cli_running'; verb: ActionVerb; phase: BarPhase; detail?: Record<string, unknown> }
   | { kind: 'execution_running'; color: string }
   | { kind: 'pending'; verb: ActionVerb; message: string };
 
@@ -1625,7 +1722,13 @@ export type HostMessage =
   /// `c.inner.`), prepended to node ids when looking up execution values so
   /// the journal's qualified keys match the sub-graph's bare node ids.
   | { kind: 'navState'; depth: number; fileName: string; execPrefix: string }
-  | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled' }
+  /// The run reached a terminal. A cancel carries WHY (`reason` is the
+  /// text, `cause` the structured value), so a run stopped by a sibling
+  /// through `ctx.stop_tagged` reads as that, never as a bare failure.
+  | { kind: 'execTerminal'; color: string; state: 'completed' | 'failed' | 'cancelled'; reason?: string; cause?: CancelCause; atUnix: number }
+  /// The run tagged itself (`ctx.tag_execution`). `tags` is one call's
+  /// list; the webview accumulates the run's set.
+  | { kind: 'execTags'; color: string; tags: string[] }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   /// The node catalog (full set, from `weft describe-nodes`) failed to
   /// load, or loaded with soft warnings. Distinct from `parseError`:
@@ -1871,9 +1974,11 @@ export type WebviewMessage =
   /// follow. A host that surfaces past executions another way (the VS Code
   /// extension has its own history) leaves this unhandled.
   | { kind: 'replayExecution'; color: string | null }
-  /// User clicked the "open .weft source" button on the graph.
-  /// Host opens the watched document in a side editor.
-  | { kind: 'openSource' }
+  /// User clicked the "open .weft source" button on the graph, or a
+  /// diagnostic's file:line:column in the error details modal. Host
+  /// opens the watched document in a side editor; with a `location`
+  /// it opens THAT file and puts the cursor on the position.
+  | { kind: 'openSource'; location?: SourceLocation }
   /// User clicked the action bar's Stop / Cancel affordance. The
   /// host inspects the current ActionBarState to decide:
   ///   - cli_running       -> SIGTERM the spawned CLI process group.
@@ -2013,14 +2118,27 @@ export type EditOp =
   | { op: 'setLabel'; node: string; label: string | null }
   | { op: 'addNode'; id: string; nodeType: string; parentGroup: string | null }
   | { op: 'removeNode'; node: string }
-  | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
+  | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null; path?: string[] }
   | { op: 'removeEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
   | { op: 'addGroup'; label: string; parentGroup: string | null }
   | { op: 'removeGroup'; group: string }
   | { op: 'renameGroup'; group: string; newLabel: string }
   | { op: 'moveNodeScope'; node: string; targetGroup: string | null }
   | { op: 'moveGroupScope'; group: string; targetGroup: string | null }
-  | { op: 'updateNodePorts'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
+  // A NODE's header declares only its CUSTOM/OVERRIDDEN ports (the catalog
+  // provides the node type's own), so `inputs`/`outputs` carry that surface
+  // and `removedInputs`/`removedOutputs` name the ports the gesture DELETED:
+  // only those lose their wires (absence from the header proves nothing).
+  // `revertedInputs`/`revertedOutputs` name ports the gesture returned to
+  // their provided shape (the header line goes away, the port stays): the
+  // server ignores them (its header rewrite already omits them), but the
+  // optimistic projection needs them or it would keep showing the
+  // pre-revert state until the reparse lands.
+  // The removed lists are REQUIRED (empty when nothing was deleted): an
+  // omitted list would read as "sweep nothing" and leave a deleted
+  // port's wires in source, silently; Rust refuses a missing one too.
+  // SYNC: EditOp updateNodePorts <-> crates/weft-compiler/src/edit.rs EditOp::UpdateNodePorts
+  | { op: 'updateNodePorts'; node: string; inputs: EditPortSig[]; outputs: EditPortSig[]; removedInputs: string[]; removedOutputs: string[]; revertedInputs: RevertedPortSig[]; revertedOutputs: RevertedPortSig[] }
   | { op: 'updateGroupPorts'; group: string; inputs: EditPortSig[]; outputs: EditPortSig[] }
   // A group's description is the plain `# ...` comment on its first body line
   // (the single description concept; the old single-file `# Project:` header is
@@ -2040,7 +2158,31 @@ export type EditOp =
   | { op: 'setLoopConfig'; loopId: string; key: string; value: string }
   | { op: 'removeLoopConfig'; loopId: string; key: string };
 
+// SYNC: EditPortSig <-> crates/weft-compiler/src/edit.rs PortSig
+// (`rendered` is projection-only and deliberately absent on the Rust side.)
 export interface EditPortSig {
+  name: string;
+  required: boolean;
+  /** The spelling the source header writes for this port (a node sig's
+   *  declared type, a container sig's full rendered type). Required: a
+   *  missing spelling would have the server write a placeholder over
+   *  the author's type. */
+  portType: string;
+  /** The port's RENDERED type (inference-resolved), which can differ
+   *  from `portType` when a header declares a generic that inference
+   *  instantiates per wire. Only the optimistic projection reads it (it
+   *  must keep showing the rendered type, exactly as a reparse would);
+   *  the server ignores it. */
+  rendered?: string;
+}
+
+/** A port a gesture returned to its provided shape (projection-only,
+ *  never read by the server): the header line goes, the port stays.
+ *  `portType` is the type the projection should now RENDER, present
+ *  only when the producer knows it (a gesture revert carries the
+ *  rendered value; a deletion revert omits it for a generic provided
+ *  spelling, where the current rendered type is the better answer). */
+export interface RevertedPortSig {
   name: string;
   required: boolean;
   portType?: string;

@@ -218,6 +218,7 @@
   // the bus marker JSON.
   let executionState = $state<ExecutionState>({
     isRunning: false,
+    tags: [],
     nodeOutputs: bareRecord(),
     nodeExecutions: bareRecord(),
     busLogByBus: bareRecord(),
@@ -414,6 +415,7 @@
       if (msg.kind === 'execReset') {
         executionState = {
           isRunning: true,
+          tags: [],
           nodeOutputs: bareRecord(),
           nodeExecutions: bareRecord(),
           busLogByBus: bareRecord(),
@@ -439,14 +441,25 @@
         // else (running, waiting_for_input) must be force-closed to the
         // execution's terminal state, not just the last `running` row.
         executionState.isRunning = false;
-        const now = Date.now();
+        // Keep how it ended: a cancel's cause is what tells a run a
+        // sibling stopped (through `ctx.stop_tagged`) apart from one a
+        // person stopped, and the inspector shows it on the run.
+        executionState.terminal = { state: msg.state, reason: msg.reason, cause: msg.cause };
+        // The journal's stamp, so a replayed run closes its rows at the
+        // time it really ended, not at the time it was opened. A row
+        // journaled after the terminal (a node that started in the same
+        // second the cancel landed) closes at its own start, never
+        // before it.
+        const now = msg.atUnix * 1000;
         const isTerminal = (s: NodeExecution['status']) =>
           s === 'completed' || s === 'failed' || s === 'skipped' || s === 'cancelled';
         const rows = bareRecord(executionState.nodeExecutions);
         for (const [nodeId, history] of Object.entries(rows)) {
           if (history.some((r) => !isTerminal(r.status))) {
             rows[nodeId] = history.map((r) =>
-              isTerminal(r.status) ? r : { ...r, status: msg.state, completedAt: now },
+              isTerminal(r.status)
+                ? r
+                : { ...r, status: msg.state, completedAt: Math.max(now, r.startedAt) },
             );
           }
         }
@@ -538,8 +551,9 @@
         // failed/skipped/cancelled) on the same record; we mutate
         // the existing row, not append. A fresh dispatch after a
         // terminal row goes into the same row's history (one pulse
-        // per (node, frames)).
-        const now = Date.now();
+        // per (node, frames)). Rows are stamped with the journal's own
+        // time, so a replay reads as when it happened.
+        const now = e.atUnix * 1000;
         const rows = executionState.nodeExecutions[e.nodeId] ?? [];
         // Key the record by frame stack: each firing
         // at a distinct frame stack gets its own card so parallel fan-outs
@@ -557,7 +571,6 @@
               id: `${e.nodeId}-${framesKey}-${now}`,
               nodeId: e.nodeId,
               status: state as NodeExecution['status'],
-              pulseIdsAbsorbed: [],
               pulseId: `${e.nodeId}-${framesKey}-${now}`,
               startedAt: now,
               completedAt:
@@ -677,6 +690,15 @@
           ...executionState.loopEventsByGroup,
           [gid]: [...log, msg.event],
         };
+        return;
+      }
+      if (msg.kind === 'execTags') {
+        // The run tagged itself. Accumulate the set in claim order; the
+        // same tag can arrive twice (replay then live, or a body re-run
+        // re-tagging), so it is deduplicated here.
+        const seen = new Set(executionState.tags);
+        const fresh = msg.tags.filter((t) => !seen.has(t));
+        if (fresh.length > 0) executionState.tags = [...executionState.tags, ...fresh];
         return;
       }
       if (msg.kind === 'journalCorruption') {
@@ -1086,6 +1108,7 @@
       {onRun}
       {onStop}
       {onDismissError}
+      onOpenLocation={(location) => send({ kind: 'openSource', location })}
       {onActivate}
       {onCancelActivate}
       {onCancelBuild}

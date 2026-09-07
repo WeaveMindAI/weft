@@ -14,7 +14,26 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_tool_message_needs_its_call_id", tool_needs_call_id),
         NodeTest::fake("a_call_id_only_belongs_on_a_tool_message", call_id_only_on_tool),
         NodeTest::fake("refuses_a_message_with_no_substance", refuses_empty),
+        NodeTest::fake("a_cache_breakpoint_marks_the_message", cache_breakpoint),
     ]
+}
+
+async fn cache_breakpoint(rig: FakeRig) -> WeftResult<()> {
+    let outcome = rig
+        .run(
+            &ChatHistoryAppendNode,
+            json!({ "role": "system", "text": "persona", "cacheBreakpoint": true }),
+        )
+        .await
+        .ok()?;
+    let out = outcome.outputs["history"].as_array().expect("history").clone();
+    assert_eq!(out[0]["cache_breakpoint"], json!(true));
+    let plain = rig
+        .run(&ChatHistoryAppendNode, json!({ "role": "user", "text": "hi" }))
+        .await
+        .ok()?;
+    assert!(plain.outputs["history"][0].get("cache_breakpoint").is_none(), "off by default");
+    Ok(())
 }
 
 async fn appends_media(rig: FakeRig) -> WeftResult<()> {

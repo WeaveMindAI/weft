@@ -23,7 +23,7 @@ available to every service rather than to the one that needed it.
     "identity": "{team}"
   },
   "inputs": [
-    { "name": "account", "type": "JsonDict", "exposure": "config",
+    { "name": "account", "type": "JsonDict",
       "widget": { "kind": "access" }, "label": "Workspace" }
   ],
   "outputs": [ { "name": "access", "type": "Access" } ]
@@ -36,10 +36,24 @@ And the entire Rust:
 weft::access_node!(SlackAccessNode);
 ```
 
-The access input is always named `account`, which is the one name every access
-node's metadata declares.
+The compiler finds the picker input by its `access` widget, never by name.
+The `access_node!` macro requires it to be named `account`; a node writing its
+own body (the LLM providers name theirs `connection`) picks its own name.
 
-Every access node's body is the same pass-through, so it cannot drift.
+Every macro access node's body is the same pass-through, so it cannot drift.
+
+Declaring a `service` block also means the node requires a connection: the
+language synthesizes the runtime "no connection picked" rule for it, and the
+editor keeps the unconnected node expanded until one is picked. You never
+write that rule yourself. If the node genuinely runs without a connection (a
+custom endpoint that may be unauthenticated), declare
+`"connection_optional": true` in the `service` block and both behaviors turn
+off. Such a node cannot use `access_node!` (its pass-through body has nothing
+to pass through when no connection is picked, so the macro refuses the
+combination at run time): write your own body and read the pick with
+`ctx.inputs.access("<your picker input's name>")?`, which answers `None` when
+nothing is picked. The LLM providers do exactly this, with an input named
+`connection`.
 
 ## Acquisition: how a credential is obtained
 

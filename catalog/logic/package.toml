@@ -1,0 +1,9 @@
+[package]
+name = "logic"
+
+# The control-flow nodes: branching (`Switch`, `FirstInOrder`) and runs
+# steering each other by tag (`TagRun`, `StopTagged`). `regex` is
+# Switch's `matches` test; the steering pair shares `steering.rs`.
+[dependencies]
+regex = "1"
+sha2 = "0.10"

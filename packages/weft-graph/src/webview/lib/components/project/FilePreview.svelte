@@ -2,6 +2,12 @@
 	import { Download, ExternalLink, FileAudio, FileVideo, FileText, Image as ImageIcon, AlertCircle } from '@lucide/svelte';
 	import type PlyrType from 'plyr';
 	import 'plyr/dist/plyr.css';
+	// Plyr's control icons are one SVG sprite. Its default is to fetch
+	// it from Plyr's CDN at run time, which a VS Code webview's policy
+	// blocks (no outside connections), and which is one more outside
+	// host in the bundle for a store scanner to frown at. The sprite
+	// rides in the bundle instead and is put into the document once.
+	import plyrSprite from 'plyr/dist/plyr.svg?raw';
 	import type { FileValueWire } from '../../../../protocol';
 	import { send, resolveStoredFileUrl } from '../../../host';
 
@@ -113,7 +119,12 @@
 		void (async () => {
 			const { default: Plyr } = await import('plyr');
 			if (cancelled) return;
+			ensurePlyrSprite();
 			instance = new Plyr(host, {
+				// The sprite is already in the document, so icons are
+				// looked up by id (`#plyr-play`) rather than fetched.
+				loadSprite: false,
+				iconUrl: '',
 				controls:
 					media === 'video'
 						? ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'fullscreen']
@@ -125,6 +136,19 @@
 			instance?.destroy();
 		};
 	});
+
+	const PLYR_SPRITE_ID = 'weft-plyr-sprite';
+	/// Put the bundled sprite into the document once, for every player
+	/// on the page. Hidden: it is a definitions sheet the controls
+	/// reference by id, never something to draw on its own.
+	function ensurePlyrSprite(): void {
+		if (document.getElementById(PLYR_SPRITE_ID)) return;
+		const holder = document.createElement('div');
+		holder.id = PLYR_SPRITE_ID;
+		holder.hidden = true;
+		holder.innerHTML = plyrSprite;
+		document.body.insertAdjacentElement('afterbegin', holder);
+	}
 
 	const displayName = $derived(file.filename || file.key || file.url || '');
 </script>

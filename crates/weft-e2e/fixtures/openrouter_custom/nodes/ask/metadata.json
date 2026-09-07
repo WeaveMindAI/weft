@@ -20,7 +20,6 @@
     {
       "name": "model",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },
@@ -30,13 +29,11 @@
     {
       "name": "systemPrompt",
       "type": "String",
-      "exposure": "config",
       "label": "System prompt"
     },
     {
       "name": "connection",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },

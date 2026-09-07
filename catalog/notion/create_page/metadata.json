@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Notion access (wire a NotionAccess node)."
     },
@@ -57,17 +57,12 @@
   "outputs": [
     {
       "name": "pageId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "url",
       "type": "String",
-      "required": false,
       "description": "The new page's link."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

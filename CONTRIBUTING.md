@@ -116,10 +116,9 @@ A few things we look for in review:
   [a connection](https://weavemindai.github.io/weft/connections/using-a-connection.html).
 - **Make it user friendly to use** You can go read
   [which widget when](https://weavemindai.github.io/weft/nodes/metadata.html#widget).
-- **Decide `isOutputDefault`** rather than letting it default. There is no safe
-  answer, and you can go and read   for the fields, and
+- **Say what it shows.** You can go and read
   [what your node shows in the graph](https://weavemindai.github.io/weft/nodes/showing-things-in-the-graph.html)
-  for what it can put on its own body. [how to choose](https://weavemindai.github.io/weft/nodes/metadata.html#isoutputdefault).
+  for what it can put on its own body.
 - **Ship a `fake` test**, in a `tests.rs` beside your `mod.rs`. And if it talks
   to a provider, a `live` one on the cheapest path that still exercises the real
   thing.
@@ -177,9 +176,13 @@ the drafts into the one migration that goes in the PR:
 Releasing also needs your cluster up, since it has to reach the database you
 have been developing against.
 
-That collapses every draft into one released migration per table group and
-tells your database they are already in it, so nothing re-runs. Forget the step
-and the `schema_agreement` test fails.
+That collapses every draft into one released migration per table group. For
+each group it then looks at your database: if it ran the drafts, it is told
+the release is already in it, so nothing re-runs; if you skipped the draft
+pass for that group, the release runs the file on it now. Both can happen in
+one command, and it all lands in one transaction, so a refusal leaves your
+tree and your database as they were. Forget the step and the
+`schema_agreement` test fails.
 
 Never edit a released migration by hand unless you really know what you are doing. Ideally ask for another one instead.
 
@@ -225,22 +228,51 @@ command and the house style, go and read [`docs/README.md`](docs/README.md).
 
 ## Working with an AI assistant
 
-Most of this repo is built with one. If you do,
-everything our own assistant works from is in `.claude/`: the rules in
-`.claude/CLAUDE.md`, the project's own facts in `.claude/MEMORY.md`, the code
-reviewer we hand review work to in `.claude/agents/`, and the five flow
-commands below in `.claude/commands/`.
+Most of this repo is built with one. If you do, everything our
+own assistant works from is in `.claude/`: the rules in `.claude/CLAUDE.md`
+(which imports the root `MEMORY.md`, the project's own facts, at session start),
+the eight mode skills in `.claude/skills/`, the code reviewer we hand review
+work to in `.claude/agents/`, and the five flow commands below in
+`.claude/commands/`. It is written generically, so it works as-is; nothing to
+rename.
 
-Open `.claude/CLAUDE.md` and find-and-replace `[FIRST_NAME]` with your name: it
-appears 35 times, because the file talks to you by name throughout.
+This repo ships its own complete assistant setup, and it deliberately excludes
+your personal memory: `.claude/settings.json` sets `claudeMdExcludes` for
+`~/.claude/CLAUDE.md` and `~/.claude/rules/`, so only the project's rules load
+here. On Windows, or if your home is elsewhere, add your own pattern to
+`.claude/settings.local.json`. Run `/context` in a session to confirm what
+actually loaded.
 
-If you use something other than Claude Code, hand your assistant
-`.claude/CLAUDE.md` and `.claude/MEMORY.md` as context. A few passages name
-Claude Code's own tools (the Edit tool, `AskUserQuestion`), which yours will
-not recognise; the rest is plain instruction. The flow commands below are
-Claude Code slash commands, so typing them will do nothing, but the files
-behind them in `.claude/commands/` are prose you can paste in, minus the odd
-reference to a Claude Code agent.
+One thing the repo cannot override: same-named slash commands resolve
+personal-over-project in Claude Code. If you keep old copies of the flow
+commands in `~/.claude/commands/`, yours will win over this repo's. Rename or
+remove your personal copies, or launch with `claude --setting-sources project`
+in this repo. Agents resolve the other way (project-over-user), so the
+project's `code-reviewer` always wins.
+
+## Using Kilo Code instead
+
+The same setup exists as a Kilo Code derivation in `.kilo/`, maintained
+separately on purpose (one instruction set per harness, each used to its full
+potential). Nothing is always-loaded: there is no root `AGENTS.md`. Instead,
+select the `working-partner` agent in the agent picker (bottom left); it is the
+full persona (reply discipline, the fork rule, boundaries, modes, the decision
+framework) as a self-contained system prompt. The eight mode skills live in
+`.kilo/skills/mode-*/SKILL.md` and load on switch through the skill tool, the
+five flow commands are `/flow-*` in `.kilo/command/`, and `code-reviewer`
+exists as a subagent in `.kilo/agent/` for the review rounds. The project's
+`.kilo/kilo.json` defaults the agent to `working-partner`, loads the root
+`MEMORY.md` at session start, and enforces the git safety permissions. Project
+facts stay shared: both harnesses read the root `MEMORY.md`.
+
+If you use something other than Claude Code, hand your assistant the root
+`CLAUDE.md` (which pulls in the root `MEMORY.md`), the mode skills in
+`.claude/skills/mode-*/SKILL.md`, and the agent file in `.claude/agents/` as
+context. A few passages name Claude Code's own tools (the Edit tool,
+`AskUserQuestion`), which yours will not recognise; the rest is plain
+instruction. The flow commands below are Claude Code slash commands, so typing
+them will do nothing, but the files behind them in `.claude/commands/` are
+prose you can paste in, minus the odd reference to a Claude Code agent.
 
 If you are building a feature, this is our usual workflow. We recommend you use this as this is very effective to write production ready code:
 

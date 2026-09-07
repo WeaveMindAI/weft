@@ -24,6 +24,11 @@ pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(60), "worker_scaledown", sweep_worker_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions);
+    // Re-parked fires (a route that failed) retry with a backoff stamp on
+    // the element; this is what drives the retry once the stamp is due.
+    spawn_loop(state.clone(), Duration::from_secs(5), "parked_fires", |s| async move {
+        crate::api::project::drain_due_parked_fires(&s).await
+    });
     // Storage plane: the durable terminate sweep (un-kept exec files of a
     // terminated color). Idempotent across pods: the queue deletes a color's
     // row only after the broker confirms the sweep. The kept-file expiry sweep
@@ -230,8 +235,18 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
                 "activation orphaned (driver heartbeat stale); wiping activating state"
             );
             if let Err((code, msg)) =
-                crate::api::project::wipe_activating_state(&state, stuck.id, &project_id, None)
-                    .await
+                crate::api::project::wipe_activating_state(
+                    &state, stuck.id, &project_id,
+                    // The activation's driver died mid-transition and
+                    // this sweep is repairing the row; nothing
+                    // superseded the run and no person stopped it.
+                    &weft_core::exec::CancelCause::Runtime {
+                        detail: "the activation's driver died mid-transition; the reaper \
+                                 wiped its state"
+                            .into(),
+                    },
+                )
+                .await
             {
                 tracing::warn!(
                     target: "weft_dispatcher::reaper",
@@ -309,22 +324,27 @@ async fn sweep_orphaned_tasks(state: DispatcherState) -> anyhow::Result<()> {
             );
             continue;
         };
-        // Record the cancel through the canonical GUARDED writer, THEN delete
-        // the task. `journal_cancel_terminals` (a) SKIPS if a terminal already
-        // exists for the color, which closes the race where the worker wrote
-        // `ExecutionCompleted`/`Failed` and then the pod died before its task
-        // flipped to `complete` (a bare `ExecutionCancelled` would stack a
-        // second, contradictory terminal); and (b) writes `NodeCancelled` per
-        // still-running node so node UI state is not left stuck on "running".
+        // Record the cancel through THE cancel, THEN delete the task. It
+        // (a) SKIPS the terminal if one already exists for the color, which
+        // closes the race where the worker wrote `ExecutionCompleted`/
+        // `Failed` and then the pod died before its task flipped to
+        // `complete` (a bare `ExecutionCancelled` would stack a second,
+        // contradictory terminal); (b) writes `NodeCancelled` per
+        // still-running node so node UI state is not left stuck on
+        // "running"; and (c) queues no task, since the owner pod is dead.
         // The task row is the durable retry handle: on failure we `continue`
         // WITHOUT deleting, so the next tick re-finds this orphan and retries
-        // (the writer is idempotent). A per-orphan failure never strands the
-        // others. The write uses NULL pod_name, bypassing the fencing trigger.
-        if let Err(e) = crate::api::execution::journal_cancel_terminals(
+        // (the write is idempotent). A per-orphan failure never strands the
+        // others.
+        if let Err(e) = crate::api::execution::cancel_color(
             &state,
             color,
-            "worker pod died before the live execution completed; the caller connection was \
-             routed to that pod and is gone, so the run cannot resume elsewhere",
+            &weft_core::exec::CancelCause::Runtime {
+                detail: "worker pod died before the live execution completed; the caller \
+                         connection was routed to that pod and is gone, so the run cannot \
+                         resume elsewhere"
+                    .into(),
+            },
         )
         .await
         {

@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": false,
       "description": "A Google account. Leave it unconnected to read sheets shared by link."
     },
@@ -92,7 +92,6 @@
     {
       "name": "hasHeader",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -104,7 +103,6 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "The sheet's rows. With a header, each row is {column: value}; without one, {c0, c1, ...}."
     }
   ]

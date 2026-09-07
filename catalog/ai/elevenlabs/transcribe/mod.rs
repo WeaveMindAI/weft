@@ -36,6 +36,8 @@ pub struct ElevenLabsTranscribeNode;
 
 /// The sample rates the realtime endpoint accepts as `pcm_<rate>`.
 const SUPPORTED_RATES: [u64; 6] = [8_000, 16_000, 22_050, 24_000, 44_100, 48_000];
+/// The one sample encoding the endpoint's `pcm_<rate>` formats mean.
+const PCM_S16LE: &str = "pcm_s16le";
 
 /// One transcript-affecting answer from the session, reduced to what the
 /// forwarding loop acts on. Pure classification so the protocol's
@@ -111,6 +113,24 @@ impl Node for ElevenLabsTranscribeNode {
                  metadata into 'audio'",
             )
         })?;
+        // The endpoint takes signed 16-bit little-endian PCM only; a
+        // u-law or float bus at a supported rate would transcribe to
+        // garbage, so the declared encoding is held to it.
+        match audio.meta()["encoding"].as_str() {
+            Some(PCM_S16LE) => {}
+            Some(other) => {
+                return Err(node_error(format!(
+                    "the audio bus declares encoding {other:?}; the realtime endpoint takes \
+                     {PCM_S16LE} only, convert the source"
+                )))
+            }
+            None => {
+                return Err(node_error(format!(
+                    "the audio bus declares no encoding in its metadata; declare \
+                     {{ sample_rate, encoding: {PCM_S16LE:?} }}"
+                )))
+            }
+        }
         if !SUPPORTED_RATES.contains(&rate) {
             return Err(node_error(format!(
                 "the audio stream's sample rate ({rate} Hz) is not one the realtime \

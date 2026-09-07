@@ -1,6 +1,6 @@
 //! FileSize: read a media/File input's bytes and emit their count. A
 //! project-local custom node used by the e2e rig to prove the `@asset`
-//! config path end to end: an `@asset("path"|"url", File)` source line
+//! config path end to end: an `@asset("path"|"url", Blob)` source line
 //! resolves (via the pre-build asset sync and the compile) into a concrete
 //! file value on this node's `file` config, and at run time the node
 //! consumes it as a normal media input, reads the bytes behind the value's

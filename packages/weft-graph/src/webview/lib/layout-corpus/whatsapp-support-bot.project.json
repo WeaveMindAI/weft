@@ -1,0 +1,1327 @@
+{
+  "id": "f972a87f-ac1f-4256-9d66-527623834807",
+  "nodes": [
+    {
+      "id": "whatsapp",
+      "nodeType": "BaileyBridge",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "endpointUrl",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "status",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "phoneNumber",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "jid",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "pushName",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "features": {
+        "liveEndpoint": "api"
+      },
+      "requiresInfra": true,
+      "images": [
+        "images/bridge"
+      ],
+      "span": {
+        "startLine": 7,
+        "startColumn": 0,
+        "endLine": 7,
+        "endColumn": 23
+      },
+      "headerSpan": {
+        "startLine": 7,
+        "startColumn": 0,
+        "endLine": 7,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "ask",
+      "nodeType": "BaileyReceive",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "endpointUrl",
+          "portType": "String",
+          "required": true,
+          "description": "Output of a BaileyBridge node. The listener subscribes to <endpointUrl without /action>/events.",
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "content",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "from",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "pushName",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "messageId",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "timestamp",
+          "portType": "Number",
+          "required": false
+        },
+        {
+          "name": "isGroup",
+          "portType": "Boolean",
+          "required": false
+        },
+        {
+          "name": "chatId",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "messageType",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "file",
+          "portType": "File",
+          "required": false,
+          "description": "Stored-file reference for image/video/audio/document/sticker messages; absent for text."
+        }
+      ],
+      "features": {
+        "isTrigger": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 9,
+        "startColumn": 0,
+        "endLine": 9,
+        "endColumn": 57
+      },
+      "headerSpan": {
+        "startLine": 9,
+        "startColumn": 0,
+        "endLine": 9,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "draft",
+      "nodeType": "LlmInference",
+      "label": null,
+      "config": {
+        "parseJson": true
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "prompt",
+          "portType": "String",
+          "required": false,
+          "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone).",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "history",
+          "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
+          "required": false,
+          "description": "The conversation so far (a Chat Message chain or a previous call's history output).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "media",
+          "portType": "Image | Video | Audio | List[Media]",
+          "required": false,
+          "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them.",
+          "exposure": "assignment",
+          "widget": {
+            "kind": "file_drop",
+            "accept": null,
+            "type": "Media",
+            "multiple": true
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "provider",
+          "portType": "LlmProvider=JsonDict",
+          "required": true,
+          "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends.",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "params",
+          "portType": "Dict[String, String | Number | Boolean | List[String]]",
+          "required": false,
+          "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply.",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "tools",
+          "portType": "JsonDict | List[JsonDict]",
+          "required": false,
+          "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them.",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "toolChoice",
+          "portType": "String",
+          "required": false,
+          "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one.",
+          "exposure": "config",
+          "widget": {
+            "kind": "select",
+            "options": [
+              "auto",
+              "required",
+              "none"
+            ]
+          },
+          "default": "auto",
+          "label": "Tool choice",
+          "fromSpec": true
+        },
+        {
+          "name": "parseJson",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Parse and repair JSON from the response (changes output to Dict).",
+          "exposure": "config",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "default": false,
+          "label": "Parse JSON",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "response",
+          "portType": "MustOverride",
+          "required": false,
+          "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly."
+        },
+        {
+          "name": "history",
+          "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
+          "required": false,
+          "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
+        },
+        {
+          "name": "toolCalls",
+          "portType": "List[ToolCall={id: String, name: String, arguments: String}]",
+          "required": false,
+          "description": "The tool calls the model made, if any (each with the raw JSON text of its arguments). Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
+        },
+        {
+          "name": "answer",
+          "portType": "String",
+          "required": true,
+          "declaredType": "String"
+        },
+        {
+          "name": "sensitivity",
+          "portType": "String",
+          "required": true,
+          "declaredType": "String"
+        }
+      ],
+      "features": {
+        "oneOfRequired": [
+          [
+            "prompt",
+            "history",
+            "media"
+          ]
+        ],
+        "canAddOutputPorts": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 11,
+        "startColumn": 0,
+        "endLine": 16,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 11,
+        "startColumn": 0,
+        "endLine": 11,
+        "endColumn": 61
+      },
+      "configSpans": {
+        "parseJson": {
+          "span": {
+            "startLine": 12,
+            "startColumn": 2,
+            "endLine": 12,
+            "endColumn": 17
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "route",
+      "nodeType": "Switch",
+      "label": null,
+      "config": {
+        "cases": [
+          {
+            "kind": "equals",
+            "port": "needsAPerson",
+            "value": "high"
+          },
+          {
+            "kind": "otherwise",
+            "port": "goAhead"
+          }
+        ]
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "value",
+          "portType": "String",
+          "required": true,
+          "description": "The value the cases match against.",
+          "exposure": "assignment",
+          "widget": {
+            "kind": "text"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "cases",
+          "portType": "List[JsonDict]",
+          "required": true,
+          "description": "One entry per branch: `{ \"kind\": \"equals\", \"value\": \"high\", \"port\": \"urgent\" }`, or any other test kind in place of `equals`. The `otherwise` kind catches everything else and goes last.",
+          "exposure": "config",
+          "widget": {
+            "kind": "entry_list"
+          },
+          "label": "Cases",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "needsAPerson",
+          "portType": "Boolean",
+          "required": false
+        },
+        {
+          "name": "goAhead",
+          "portType": "Boolean",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 19,
+        "startColumn": 0,
+        "endLine": 25,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 19,
+        "startColumn": 0,
+        "endLine": 19,
+        "endColumn": 15
+      },
+      "configSpans": {
+        "cases": {
+          "span": {
+            "startLine": 21,
+            "startColumn": 2,
+            "endLine": 24,
+            "endColumn": 3
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "review",
+      "nodeType": "HumanQuery",
+      "label": null,
+      "config": {
+        "fields": [
+          {
+            "key": "from",
+            "kind": "display"
+          },
+          {
+            "key": "question",
+            "kind": "display"
+          },
+          {
+            "key": "answer",
+            "kind": "display"
+          },
+          {
+            "key": "send",
+            "kind": "approve_reject"
+          }
+        ],
+        "title": "Send this answer?"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "title",
+          "portType": "String",
+          "required": false,
+          "description": "Title the reviewer sees at the top of the form.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Title",
+          "placeholder": "Review request",
+          "fromSpec": true
+        },
+        {
+          "name": "description",
+          "portType": "String",
+          "required": false,
+          "description": "Description shown under the title.",
+          "exposure": "config",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Description",
+          "placeholder": "What you want the reviewer to do.",
+          "fromSpec": true
+        },
+        {
+          "name": "fields",
+          "portType": "List[JsonDict]",
+          "required": true,
+          "description": "Each field contributes inputs/outputs per its kind (see the node's portsFromConfig).",
+          "exposure": "config",
+          "widget": {
+            "kind": "entry_list"
+          },
+          "label": "Form fields",
+          "fromSpec": true
+        },
+        {
+          "name": "from",
+          "portType": "String",
+          "required": true,
+          "exposure": "assignment",
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "question",
+          "portType": "String",
+          "required": true,
+          "exposure": "assignment",
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "answer",
+          "portType": "String",
+          "required": true,
+          "exposure": "assignment",
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "_should_flow",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "send_approved",
+          "portType": "Boolean",
+          "required": false
+        },
+        {
+          "name": "send_rejected",
+          "portType": "Boolean",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 27,
+        "startColumn": 0,
+        "endLine": 39,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 27,
+        "startColumn": 0,
+        "endLine": 27,
+        "endColumn": 20
+      },
+      "configSpans": {
+        "fields": {
+          "span": {
+            "startLine": 30,
+            "startColumn": 2,
+            "endLine": 35,
+            "endColumn": 3
+          },
+          "origin": "inline"
+        },
+        "title": {
+          "span": {
+            "startLine": 29,
+            "startColumn": 2,
+            "endLine": 29,
+            "endColumn": 28
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "allowed",
+      "nodeType": "FirstInOrder",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "approved",
+          "portType": "Boolean",
+          "required": false,
+          "exposure": "assignment",
+          "widget": {
+            "kind": "checkbox"
+          }
+        },
+        {
+          "name": "automatic",
+          "portType": "Boolean",
+          "required": false,
+          "exposure": "assignment",
+          "widget": {
+            "kind": "checkbox"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "value",
+          "portType": "Boolean",
+          "required": false,
+          "description": "The first input that spoke, in written order. Closed when none did."
+        }
+      ],
+      "features": {
+        "canAddInputPorts": true,
+        "optionalCustomInputs": true,
+        "customInputType": "T"
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 41,
+        "startColumn": 0,
+        "endLine": 44,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 41,
+        "startColumn": 0,
+        "endLine": 41,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "reply",
+      "nodeType": "BaileySend",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "endpointUrl",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "to",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "message",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "messageId",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 46,
+        "startColumn": 0,
+        "endLine": 52,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 46,
+        "startColumn": 0,
+        "endLine": 46,
+        "endColumn": 19
+      },
+      "configSpans": {}
+    },
+    {
+      "id": "draft__provider",
+      "nodeType": "OpenRouterProvider",
+      "label": null,
+      "config": {
+        "model": "z-ai/glm-5.3"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "connection",
+          "portType": "Access",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "access",
+            "service": "openrouter"
+          },
+          "label": "Connection",
+          "fromSpec": true
+        },
+        {
+          "name": "model",
+          "portType": "String",
+          "required": true,
+          "exposure": "config",
+          "widget": {
+            "kind": "remote_select",
+            "access": "connection",
+            "sources": [
+              {
+                "kind": "list",
+                "get": "https://openrouter.ai/api/v1/models",
+                "items": "data",
+                "label": "id",
+                "value": "id",
+                "public": true
+              }
+            ],
+            "free_text": true
+          },
+          "label": "Model",
+          "placeholder": "deepseek/deepseek-v4-flash-0731",
+          "fromSpec": true
+        },
+        {
+          "name": "servingProvider",
+          "portType": "String",
+          "required": false,
+          "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Serving provider",
+          "placeholder": "(any)",
+          "fromSpec": true
+        },
+        {
+          "name": "providerFallbacks",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top-ranked choice) is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else.",
+          "exposure": "config",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "label": "Allow provider fallbacks",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "provider",
+          "portType": "LlmProvider=JsonDict",
+          "required": false,
+          "description": "The provider value: wire it into an LLM node's provider input."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 14,
+        "startColumn": 12,
+        "endLine": 14,
+        "endColumn": 65
+      },
+      "configSpans": {
+        "model": {
+          "span": {
+            "startLine": 14,
+            "startColumn": 33,
+            "endLine": 14,
+            "endColumn": 55
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "draft__params",
+      "nodeType": "LlmParams",
+      "label": null,
+      "config": {
+        "systemPrompt": "You are the support account of a small software consultancy, answering\nWhatsApp messages from clients. Reply as JSON in exactly this shape:\n\n{ \"answer\": \"your reply to the message\", \"sensitivity\": \"high\" }\n\n`sensitivity` is \"high\", \"medium\" or \"low\", lowercased.\n\nWe build custom software for companies and we are close with our clients,\nso be warm and personal, never stiff or robotic. We can take on almost any\nproject. Day rate is 1000: when someone asks for a price, estimate the work\nand quote confidently.\n\nSet `sensitivity` to \"high\" whenever the message deserves a human look\nbefore the reply goes out: a quote for a big project, a complaint, anything\nlegal or contractual, or anything you are unsure about. Everything routine\nis \"low\" or \"medium\".\n",
+        "temperature": 0.75
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "systemPrompt",
+          "portType": "String",
+          "required": false,
+          "description": "System prompt for every LLM node wired to these params. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node.",
+          "exposure": "config",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "System Prompt",
+          "placeholder": "You are a helpful assistant.",
+          "fromSpec": true
+        },
+        {
+          "name": "maxTokens",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 1.0,
+            "max": null,
+            "step": 1.0
+          },
+          "label": "Max Tokens",
+          "placeholder": "4096",
+          "fromSpec": true
+        },
+        {
+          "name": "temperature",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.1
+          },
+          "label": "Temperature",
+          "placeholder": "0.7",
+          "fromSpec": true
+        },
+        {
+          "name": "topP",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05
+          },
+          "label": "Top P",
+          "placeholder": "1.0",
+          "fromSpec": true
+        },
+        {
+          "name": "topK",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 1.0,
+            "max": null,
+            "step": 1.0
+          },
+          "label": "Top K",
+          "fromSpec": true
+        },
+        {
+          "name": "frequencyPenalty",
+          "portType": "Number",
+          "required": false,
+          "description": "-2.0 to 2.0",
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.1
+          },
+          "label": "Frequency Penalty",
+          "placeholder": "0.0",
+          "fromSpec": true
+        },
+        {
+          "name": "presencePenalty",
+          "portType": "Number",
+          "required": false,
+          "description": "-2.0 to 2.0",
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.1
+          },
+          "label": "Presence Penalty",
+          "placeholder": "0.0",
+          "fromSpec": true
+        },
+        {
+          "name": "stop",
+          "portType": "List[String]",
+          "required": false,
+          "description": "Generation stops when the model produces any of these strings.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text_list"
+          },
+          "label": "Stop sequences",
+          "fromSpec": true
+        },
+        {
+          "name": "reasoning",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Enable extended thinking for supported models",
+          "exposure": "config",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "label": "Enable Reasoning",
+          "fromSpec": true
+        },
+        {
+          "name": "reasoningEffort",
+          "portType": "String",
+          "required": false,
+          "description": "Only used when reasoning is enabled",
+          "exposure": "config",
+          "widget": {
+            "kind": "select",
+            "options": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "label": "Reasoning Effort",
+          "fromSpec": true
+        },
+        {
+          "name": "forcePrepend",
+          "portType": "String",
+          "required": false,
+          "description": "Force the model's reply to start with this exact text (constrained generation).",
+          "exposure": "config",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Force response prefix",
+          "fromSpec": true
+        },
+        {
+          "name": "seed",
+          "portType": "Number",
+          "required": false,
+          "description": "For reproducible outputs",
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": null,
+            "max": null,
+            "step": null
+          },
+          "label": "Seed",
+          "placeholder": "Leave empty for random",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "params",
+          "portType": "Dict[String, String | Number | Boolean | List[String]]",
+          "required": false,
+          "description": "The parameters object, fed into one or more LLM nodes."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 15,
+        "startColumn": 10,
+        "endLine": 15,
+        "endColumn": 91
+      },
+      "configSpans": {
+        "systemPrompt": {
+          "span": {
+            "startLine": 15,
+            "startColumn": 22,
+            "endLine": 15,
+            "endColumn": 63
+          },
+          "origin": "inline"
+        },
+        "temperature": {
+          "span": {
+            "startLine": 15,
+            "startColumn": 65,
+            "endLine": 15,
+            "endColumn": 83
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "systemPrompt": {
+          "path": "prompts/support.md",
+          "type": "String",
+          "marker": "file"
+        }
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-whatsapp-endpointUrl-ask-endpointUrl",
+      "source": "whatsapp",
+      "target": "ask",
+      "sourceHandle": "endpointUrl",
+      "targetHandle": "endpointUrl",
+      "span": {
+        "startLine": 9,
+        "startColumn": 22,
+        "endLine": 9,
+        "endColumn": 56
+      }
+    },
+    {
+      "id": "e-ask-content-draft-prompt",
+      "source": "ask",
+      "target": "draft",
+      "sourceHandle": "content",
+      "targetHandle": "prompt",
+      "span": {
+        "startLine": 13,
+        "startColumn": 2,
+        "endLine": 13,
+        "endColumn": 21
+      }
+    },
+    {
+      "id": "e-draft__provider-provider-draft-provider",
+      "source": "draft__provider",
+      "target": "draft",
+      "sourceHandle": "provider",
+      "targetHandle": "provider",
+      "span": {
+        "startLine": 14,
+        "startColumn": 12,
+        "endLine": 14,
+        "endColumn": 65
+      }
+    },
+    {
+      "id": "e-draft__params-params-draft-params",
+      "source": "draft__params",
+      "target": "draft",
+      "sourceHandle": "params",
+      "targetHandle": "params",
+      "span": {
+        "startLine": 15,
+        "startColumn": 10,
+        "endLine": 15,
+        "endColumn": 91
+      }
+    },
+    {
+      "id": "e-draft-sensitivity-route-value",
+      "source": "draft",
+      "target": "route",
+      "sourceHandle": "sensitivity",
+      "targetHandle": "value",
+      "span": {
+        "startLine": 20,
+        "startColumn": 2,
+        "endLine": 20,
+        "endColumn": 26
+      }
+    },
+    {
+      "id": "e-route-needsAPerson-review-_should_flow",
+      "source": "route",
+      "target": "review",
+      "sourceHandle": "needsAPerson",
+      "targetHandle": "_should_flow",
+      "span": {
+        "startLine": 28,
+        "startColumn": 2,
+        "endLine": 28,
+        "endColumn": 34
+      }
+    },
+    {
+      "id": "e-ask-pushName-review-from",
+      "source": "ask",
+      "target": "review",
+      "sourceHandle": "pushName",
+      "targetHandle": "from",
+      "span": {
+        "startLine": 36,
+        "startColumn": 2,
+        "endLine": 36,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "e-ask-content-review-question",
+      "source": "ask",
+      "target": "review",
+      "sourceHandle": "content",
+      "targetHandle": "question",
+      "span": {
+        "startLine": 37,
+        "startColumn": 2,
+        "endLine": 37,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "e-draft-answer-review-answer",
+      "source": "draft",
+      "target": "review",
+      "sourceHandle": "answer",
+      "targetHandle": "answer",
+      "span": {
+        "startLine": 38,
+        "startColumn": 2,
+        "endLine": 38,
+        "endColumn": 22
+      }
+    },
+    {
+      "id": "e-review-send_approved-allowed-approved",
+      "source": "review",
+      "target": "allowed",
+      "sourceHandle": "send_approved",
+      "targetHandle": "approved",
+      "span": {
+        "startLine": 42,
+        "startColumn": 2,
+        "endLine": 42,
+        "endColumn": 32
+      }
+    },
+    {
+      "id": "e-route-goAhead-allowed-automatic",
+      "source": "route",
+      "target": "allowed",
+      "sourceHandle": "goAhead",
+      "targetHandle": "automatic",
+      "span": {
+        "startLine": 43,
+        "startColumn": 2,
+        "endLine": 43,
+        "endColumn": 26
+      }
+    },
+    {
+      "id": "e-allowed-value-reply-_should_flow",
+      "source": "allowed",
+      "target": "reply",
+      "sourceHandle": "value",
+      "targetHandle": "_should_flow",
+      "span": {
+        "startLine": 48,
+        "startColumn": 2,
+        "endLine": 48,
+        "endColumn": 29
+      }
+    },
+    {
+      "id": "e-whatsapp-endpointUrl-reply-endpointUrl",
+      "source": "whatsapp",
+      "target": "reply",
+      "sourceHandle": "endpointUrl",
+      "targetHandle": "endpointUrl",
+      "span": {
+        "startLine": 49,
+        "startColumn": 2,
+        "endLine": 49,
+        "endColumn": 35
+      }
+    },
+    {
+      "id": "e-ask-chatId-reply-to",
+      "source": "ask",
+      "target": "reply",
+      "sourceHandle": "chatId",
+      "targetHandle": "to",
+      "span": {
+        "startLine": 50,
+        "startColumn": 2,
+        "endLine": 50,
+        "endColumn": 16
+      }
+    },
+    {
+      "id": "e-draft-answer-reply-message",
+      "source": "draft",
+      "target": "reply",
+      "sourceHandle": "answer",
+      "targetHandle": "message",
+      "span": {
+        "startLine": 51,
+        "startColumn": 2,
+        "endLine": 51,
+        "endColumn": 23
+      }
+    }
+  ],
+  "groups": [],
+  "createdAt": "2026-09-03T11:13:44.110345241Z",
+  "updatedAt": "2026-09-03T11:13:44.110345241Z"
+}

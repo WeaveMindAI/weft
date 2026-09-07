@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The fal access (wire a FalAccess node)."
     },
@@ -26,7 +26,6 @@
     {
       "name": "model",
       "type": "String",
-      "exposure": "config",
       "default": "fal-ai/flux/dev",
       "label": "Model",
       "placeholder": "Pick a model, or paste a fal route",
@@ -54,7 +53,6 @@
     {
       "name": "imageSize",
       "type": "String",
-      "exposure": "config",
       "default": "landscape_4_3",
       "widget": {
         "kind": "select",
@@ -72,7 +70,6 @@
     {
       "name": "count",
       "type": "Number",
-      "exposure": "config",
       "default": 1,
       "widget": {
         "kind": "number",
@@ -99,21 +96,16 @@
     {
       "name": "images",
       "type": "List[Image]",
-      "required": false,
       "description": "Every generated image."
     },
     {
       "name": "image",
       "type": "Image",
-      "required": false,
       "description": "The first generated image."
     }
   ],
   "display": {
     "kind": "media",
     "output": "image"
-  },
-  "features": {
-    "isOutputDefault": true
   }
 }

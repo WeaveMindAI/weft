@@ -55,7 +55,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// Set the `infra_node.status` row.
     /// `command_id = Some(id)` for lifecycle-driven writes; the
     /// broker rejects the UPDATE if the command is no longer
-    /// claimed by the caller's pod (returns `WriteOutcome::Raced`).
+    /// claimed by the caller's pod (returns `WriteOutcome::Displaced`).
     /// `command_id = None` for the health loop's autonomous
     /// Flaky/Running reconciliation (tenant scope still applies).
     /// `unit = Some` sets that unit's status (and recomputes the node
@@ -73,7 +73,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         failure_message: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>>;
     /// Cascade-delete the node, gated on the caller still OWNING the
-    /// project (via `pod_name` = the supervisor's claim id). `Raced`
+    /// project (via `pod_name` = the supervisor's claim id). `Displaced`
     /// means ownership moved mid-Terminate; the supervisor aborts and
     /// leaves the command for the new owner.
     async fn remove_node(

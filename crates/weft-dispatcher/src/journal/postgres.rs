@@ -12,8 +12,13 @@ use sqlx::postgres::{PgPool, PgPoolOptions};
 use weft_core::Color;
 
 use weft_journal::{decode_event, ExecEvent};
+// The tag column every summary read selects, in claim order. The SQL
+// itself lives with the table's every other read and write, in
+// `weft_journal::tags`; it is spliced into the two summary queries,
+// which both have the color in scope as `execution_color ec`.
+use weft_journal::tags::TAGS_LATERAL;
 use crate::journal::{
-    SignalToken, ColorLookup, ExecutionOwner, ExecutionPage, ExecutionQuery, ExecutionSummary,
+    CancelWrite, SignalToken, ColorLookup, ExecutionOwner, ExecutionPage, ExecutionQuery, ExecutionSummary,
     Journal, LogEntry, SignalRegistration,
 };
 
@@ -21,22 +26,74 @@ pub struct PostgresJournal {
     pool: PgPool,
 }
 
+/// The `execution_color.phase` column as a phase. The column is NOT
+/// NULL and only ever written from `Phase::as_str`, so an unreadable
+/// value is corruption of the same row whose payload already failed to
+/// decode; it is logged and answered as a fire so the row still
+/// appears (in the listing and on the point-get alike).
+fn phase_from_column(text: &str) -> weft_core::context::Phase {
+    weft_core::context::Phase::from_tag(text).unwrap_or_else(|| {
+        tracing::warn!(
+            target: "weft_dispatcher::journal",
+            phase = %text,
+            "execution_color row holds an unknown phase; answered as a fire"
+        );
+        weft_core::context::Phase::Fire
+    })
+}
+
+/// The row a run whose journal no longer decodes is listed as: the
+/// same corrupt row from the listing and from the point-get, so the
+/// run that `weft executions` shows as corrupt can still be opened,
+/// inspected through its replay, and deleted. Everything on it comes
+/// from the `execution_color` columns the query matched on, never
+/// from a guess: a corrupt row that said `fire` while `--phase
+/// trigger_setup` selected it would contradict the filter that found
+/// it.
+fn corrupt_summary(
+    color: Color,
+    project_id: String,
+    phase_text: &str,
+    started_at: i64,
+    error: &anyhow::Error,
+) -> ExecutionSummary {
+    // `warn`, not `error`: the point-get is polled by the editor for
+    // an open run, so a corrupt one would otherwise fill the log with
+    // the same line; the row's `corrupt` status is what the reader
+    // acts on, and the replay carries the error itself.
+    tracing::warn!(
+        target: "weft_dispatcher::journal",
+        %color, error = %error,
+        "execution row does not decode; answered as corrupt"
+    );
+    ExecutionSummary {
+        color,
+        project_id,
+        entry_node: String::new(),
+        status: "corrupt".to_string(),
+        phase: phase_from_column(phase_text),
+        started_at: started_at as u64,
+        completed_at: None,
+        tags: Vec::new(),
+    }
+}
+
 /// Turn a `(started_payload, terminal_payload)` pair (an `execution_started`
 /// event JSON + its latest terminal event JSON, if any) into an
 /// `ExecutionSummary`. Shared by `list_executions` and `execution_summary` so
 /// the started-decode + terminal-status mapping lives in exactly one place.
 /// `Err` (naming the color and `weft clean`) for any unusable row: one
-/// that does not decode, or one whose kind column and payload disagree.
-/// The caller decides whether that fails the read or renders as a
-/// broken row.
+/// that does not decode, or one whose kind column and payload disagree;
+/// both callers answer that with `corrupt_summary`.
 fn summary_from_payloads(
     color: Color,
     started_payload: &str,
     terminal_payload: Option<String>,
+    tags: Vec<String>,
 ) -> anyhow::Result<ExecutionSummary> {
     let started = decode_event(color, started_payload).map_err(anyhow::Error::msg)?;
     let ExecEvent::ExecutionStarted {
-        color, project_id, entry_node, at_unix, ..
+        color, project_id, entry_node, phase, at_unix, ..
     } = started
     else {
         // The row was selected by kind = 'execution_started', so a
@@ -68,9 +125,41 @@ fn summary_from_payloads(
         project_id,
         entry_node,
         status,
+        phase,
         started_at: at_unix,
         completed_at,
+        tags,
     })
+}
+
+/// Write the dispatcher-side cancel terminals for `color` on the
+/// caller's transaction: `NodeCancelled` per non-terminal node, then
+/// `ExecutionCancelled`, from the ONE shared definition of that list
+/// (`cancel_terminal_events`), so every transactional cancel writer
+/// emits identical rows. Skips entirely (`None`) when the journal
+/// already holds a terminal, so a worker's own terminal is never
+/// contradicted. Per-node cancels land BEFORE the terminal: a
+/// terminal-first partial write would make a retry skip the per-node
+/// rows forever. A payload that fails to decode fails the whole read,
+/// matching `events_log`. Returns the per-node count written.
+async fn cancel_terminals_in(
+    tx: &mut sqlx::PgConnection,
+    color: Color,
+    cause: &weft_core::exec::CancelCause,
+) -> anyhow::Result<Option<usize>> {
+    let events = decode_all(color, payload_rows(&mut *tx, color).await?)?;
+    if events.iter().any(ExecEvent::is_execution_terminal) {
+        return Ok(None);
+    }
+    let now = crate::lease::now_unix() as u64;
+    let writes = crate::api::execution::cancel_terminal_events(color, &events, cause, now);
+    let node_cancellations = writes.len() - 1;
+    for (event, dedup) in writes {
+        weft_journal::record_event_in(&mut *tx, &event, None, Some(&dedup))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(Some(node_cancellations))
 }
 
 /// Every payload for `color`, in write order, undecoded. Takes the
@@ -79,22 +168,22 @@ fn summary_from_payloads(
 async fn payload_rows<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     color: Color,
-) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
+) -> anyhow::Result<Vec<(i64, String)>> {
+    let rows = sqlx::query_as(
+        "SELECT id, payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
     )
     .bind(color.to_string())
     .fetch_all(executor)
     .await?;
-    Ok(rows.into_iter().map(|(p,)| p).collect())
+    Ok(rows)
 }
 
 /// Strictly decode every row: one undecodable row fails the whole read
 /// (a fold over a partial event list rebuilds a state that never
 /// existed).
-fn decode_all(color: Color, rows: Vec<String>) -> anyhow::Result<Vec<ExecEvent>> {
+fn decode_all(color: Color, rows: Vec<(i64, String)>) -> anyhow::Result<Vec<ExecEvent>> {
     rows.into_iter()
-        .map(|payload| decode_event(color, &payload).map_err(anyhow::Error::msg))
+        .map(|(_, payload)| decode_event(color, &payload).map_err(anyhow::Error::msg))
         .collect()
 }
 
@@ -277,7 +366,7 @@ impl PostgresJournal {
 /// boot's one `apply_core_schema` pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "exec_event",
-    tables: &["exec_event", "signal_token", "signal", "execution_color"],
+    tables: &["exec_event", "signal_token", "signal", "execution_color", "execution_tag"],
     ddl: &[
         // exec_event: append-only journal. `dedup_key` is the
         // idempotency knob writers that may retry (dispatcher tasks
@@ -470,6 +559,38 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_tenant ON execution_color(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_color_project ON execution_color(project_id)"#,
+        // The execution LISTING reads exactly this shape: one tenant's
+        // project runs, newest first, a page at a time, with the
+        // optional project / time / phase filters applied on top. The
+        // index carries the wall, the sort and the tie-break, so a page
+        // is a walk of `limit` rows instead of a sort of the tenant's
+        // whole history; `kind` is in the predicate rather than the key
+        // because every listing query is about project runs (a node
+        // test's color is never listed).
+        r#"CREATE INDEX IF NOT EXISTS idx_execution_color_listing
+             ON execution_color(tenant_id, started_at_unix DESC, color DESC)
+             WHERE kind = 'execution'"#,
+        // execution_tag: the selectable copy of `ctx.tag_execution`, one
+        // row per (color, tag), written by the broker on the worker's
+        // behalf in the same transaction as the `ExecutionTagged`
+        // event. `ctx.stop_tagged` selects on it: "every live execution
+        // of this project carrying tag T" is one indexed read joined to
+        // `execution_color` instead of a fold over every open journal.
+        // `seq` is the order tags were written, gap-tolerant and never
+        // tied, which is what the last-one-wins rule compares (unix
+        // seconds would tie two runs of the same user inside one
+        // second). The (color, tag) uniqueness is what makes a body
+        // re-run after a crash land on the same row instead of moving
+        // the run's place in the order. Rows go with the color's
+        // journal on `weft clean`.
+        r#"CREATE TABLE IF NOT EXISTS execution_tag (
+            seq BIGSERIAL PRIMARY KEY,
+            color TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            tagged_at_unix BIGINT NOT NULL,
+            UNIQUE (color, tag)
+        )"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_execution_tag_tag ON execution_tag(tag)"#,
     ],
     seed: &[],
 };
@@ -495,13 +616,13 @@ impl Journal for PostgresJournal {
     async fn events_log_lossy(
         &self,
         color: Color,
-    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)> {
+    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)> {
         let rows = payload_rows(&self.pool, color).await?;
         let mut out = Vec::with_capacity(rows.len());
         let mut bad = Vec::new();
-        for payload in rows {
+        for (id, payload) in rows {
             match decode_event(color, &payload) {
-                Ok(ev) => out.push(ev),
+                Ok(ev) => out.push(crate::events::IdentifiedEvent::recorded(id, ev)),
                 Err(reason) => bad.push(reason),
             }
         }
@@ -552,7 +673,7 @@ impl Journal for PostgresJournal {
     async fn cancel_never_claimed_execution(
         &self,
         color: Color,
-        reason: &str,
+        cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome> {
         use weft_task_store::tasks::SetupFailureOutcome;
         let mut tx = self.pool.begin().await?;
@@ -565,36 +686,51 @@ impl Journal for PostgresJournal {
         }
         // No worker will ever run this color: journal the cancel terminals in
         // the SAME transaction as the task delete, so "task deleted" and
-        // "cancel journaled" can never disagree. Per-node cancels land BEFORE
-        // ExecutionCancelled (same ordering rule as the dispatcher's cancel
-        // catch-up writer: a terminal-first partial write would make a retry
-        // skip the per-node rows forever). A payload that fails to decode
-        // fails the whole read, matching `events_log`.
-        let events = decode_all(color, payload_rows(&mut *tx, color).await?)?;
-        let has_terminal = events.iter().any(|e| {
-            matches!(
-                e,
-                ExecEvent::ExecutionCompleted { .. }
-                    | ExecEvent::ExecutionFailed { .. }
-                    | ExecEvent::ExecutionCancelled { .. }
-            )
-        });
-        if !has_terminal {
-            // The write list comes from the ONE shared definition of a
-            // dispatcher-side cancel (`cancel_terminal_events`), so this
-            // transactional writer and the retrying trait-based writer
-            // (`journal_cancel_terminals`) can never drift.
-            let now = crate::lease::now_unix() as u64;
-            for (event, dedup) in
-                crate::api::execution::cancel_terminal_events(color, &events, reason, now)
-            {
-                weft_journal::record_event_in(&mut *tx, &event, None, Some(&dedup))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            }
-        }
+        // "cancel journaled" can never disagree.
+        cancel_terminals_in(&mut tx, color, cause).await?;
         tx.commit().await?;
         Ok(SetupFailureOutcome::NoWorkerWillRun)
+    }
+
+    async fn cancel_execution(
+        &self,
+        color: Color,
+        cause: &weft_core::exec::CancelCause,
+    ) -> anyhow::Result<CancelWrite> {
+        let mut tx = self.pool.begin().await?;
+        // 1. The wake signals go first in the write order for the same
+        //    reason they went first when these were separate statements:
+        //    a fire that resolves its signal row after this commits finds
+        //    nothing, and one that resolved it before enqueues a resume
+        //    the worker refuses on the terminal below.
+        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_COLOR_RETURNING)
+            .bind(color.to_string())
+            .fetch_all(&mut *tx)
+            .await?;
+        let removed: Vec<SignalRegistration> =
+            rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
+        // 2 + 3. Only a started color has a journal to close and a pod to
+        //    flag; its project and tenant were stamped on this row in the
+        //    birth transaction, so no other lookup is needed.
+        let owner: Option<(String, String)> =
+            sqlx::query_as("SELECT project_id, tenant_id FROM execution_color WHERE color = $1")
+                .bind(color.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
+        let mut write = CancelWrite { removed, ..CancelWrite::default() };
+        if let Some((project_id, tenant_id)) = owner {
+            write.node_cancellations = cancel_terminals_in(&mut tx, color, cause).await?;
+            write.task_enqueued = crate::task_kinds::execute::enqueue_cancel_in(
+                &mut tx,
+                &project_id,
+                color,
+                Some(tenant_id.as_str()),
+                cause,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(write)
     }
 
     async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool> {
@@ -702,24 +838,35 @@ impl Journal for PostgresJournal {
     }
 
     async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM exec_event \
-             WHERE color = $1 AND kind = 'log_line' \
-             ORDER BY id ASC LIMIT $2",
+        // Only the log-worthy kinds leave the database (`LogEntry::KINDS`
+        // is the projection's own list): every one of the color's, in
+        // journal order, and the tail is cut by `LogEntry::tail` in
+        // WRITTEN order, the same code the mock runs. The cut cannot be
+        // the SQL's: a node's line lands in the journal whenever a pod
+        // drains its task, so the row order is not the run's, and the
+        // written time lives inside the payload, which only a decode
+        // can read honestly. A display read, like `events_log_lossy`:
+        // a payload that fails to decode becomes an error line naming
+        // the row and `weft clean`, never a line quietly missing (read
+        // as "the node never said that") and never a read that hides
+        // every surviving line behind a 500.
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT payload_json, created_at FROM exec_event \
+             WHERE color = $1 AND kind = ANY($2) \
+             ORDER BY id ASC",
         )
         .bind(color.to_string())
-        .bind(limit as i64)
+        .bind(LogEntry::KINDS)
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (payload,) in rows {
-            if let Ok(ExecEvent::LogLine { level, message, at_unix, .. }) =
-                serde_json::from_str::<ExecEvent>(&payload)
-            {
-                out.push(LogEntry { at_unix, level, message });
+        let mut entries: Vec<LogEntry> = Vec::with_capacity(rows.len());
+        for (payload, created_at) in &rows {
+            match decode_event(color, payload) {
+                Ok(event) => entries.extend(LogEntry::from_event(&event)),
+                Err(e) => entries.push(LogEntry::corrupt_row(*created_at as u64, e)),
             }
         }
-        Ok(out)
+        Ok(LogEntry::tail(entries, limit))
     }
 
     async fn list_executions(
@@ -735,9 +882,9 @@ impl Journal for PostgresJournal {
         // total so a consumer can render page controls. Filters + paging live in
         // SQL so a tenant with a huge history never truncates blindly.
         //
-        // Bind order is fixed ($1 tenant, $2 project filter, $3 after, $4 before)
-        // and every optional filter is a `($n IS NULL OR ...)` clause so one
-        // prepared statement serves every filter combination.
+        // Bind order is fixed ($1 tenant, $2 project filter, $3 after, $4 before,
+        // $5 phase) and every optional filter is a `($n IS NULL OR ...)` clause
+        // so one prepared statement serves every filter combination.
         // The `execution_color` row (seeded at start) carries the real, indexed
         // columns the filters key on: `tenant_id` (the wall), `project_id`, and
         // `started_at_unix`. `exec_event` only has `color`/`kind`/`payload_json`,
@@ -746,6 +893,7 @@ impl Journal for PostgresJournal {
         let project = query.project_id.as_deref();
         let after = query.started_after.map(|v| v as i64);
         let before = query.started_before.map(|v| v as i64);
+        let phase = query.phase.map(|p| p.as_str());
         // PROJECT EXECUTIONS only: this list is the user's record of
         // their project running. A node-test color is a real identity
         // (its cost trail is addressed by color from the test report),
@@ -755,7 +903,8 @@ impl Journal for PostgresJournal {
              AND ec.kind = 'execution' \
              AND ($2::text IS NULL OR ec.project_id = $2) \
              AND ($3::bigint IS NULL OR ec.started_at_unix >= $3) \
-             AND ($4::bigint IS NULL OR ec.started_at_unix < $4)";
+             AND ($4::bigint IS NULL OR ec.started_at_unix < $4) \
+             AND ($5::text IS NULL OR ec.phase = $5)";
 
         // The count carries the SAME started-event predicate as the row
         // query's inner lateral join: a seeded `execution_color` row
@@ -773,12 +922,13 @@ impl Journal for PostgresJournal {
         .bind(project)
         .bind(after)
         .bind(before)
+        .bind(phase)
         .fetch_one(&self.pool)
         .await?;
 
-        let rows: Vec<(String, String, i64, String, Option<String>)> = sqlx::query_as(&format!(
-            "SELECT ec.color, ec.project_id, ec.started_at_unix, \
-                    s.payload_json, t.payload_json \
+        let rows: Vec<(String, String, String, i64, String, Option<String>, Vec<String>)> = sqlx::query_as(&format!(
+            "SELECT ec.color, ec.project_id, ec.phase, ec.started_at_unix, \
+                    s.payload_json, t.payload_json, {TAGS_LATERAL} \
              FROM execution_color ec \
              JOIN LATERAL ( \
                  SELECT payload_json FROM exec_event \
@@ -792,19 +942,20 @@ impl Journal for PostgresJournal {
                  ORDER BY id DESC LIMIT 1 \
              ) t ON TRUE \
              WHERE {where_clause} \
-             ORDER BY ec.started_at_unix DESC, ec.color DESC LIMIT $5 OFFSET $6"
+             ORDER BY ec.started_at_unix DESC, ec.color DESC LIMIT $6 OFFSET $7"
         ))
         .bind(tenant)
         .bind(project)
         .bind(after)
         .bind(before)
+        .bind(phase)
         .bind(query.limit as i64)
         .bind(query.offset as i64)
         .fetch_all(&self.pool)
         .await?;
 
         let mut executions = Vec::with_capacity(rows.len());
-        for (color_text, project_id, started_at, started_payload, terminal_payload) in rows {
+        for (color_text, project_id, phase_text, started_at, started_payload, terminal_payload, tags) in rows {
             let color: Color = color_text.parse().map_err(|e| {
                 anyhow::anyhow!("execution_color row holds a non-uuid color '{color_text}': {e}")
             })?;
@@ -813,26 +964,32 @@ impl Journal for PostgresJournal {
             // exactly this state), and it must not vanish either: the
             // count includes it, so the page renders it as a broken
             // row (inspectable via replay, deletable).
-            match summary_from_payloads(color, &started_payload, terminal_payload) {
-                Ok(summary) => executions.push(summary),
-                Err(e) => {
-                    tracing::error!(
-                        target: "weft_dispatcher::journal",
-                        %color, error = %e,
-                        "execution row does not decode; listed as corrupt"
-                    );
-                    executions.push(ExecutionSummary {
-                        color,
-                        project_id,
-                        entry_node: String::new(),
-                        status: "corrupt".to_string(),
-                        started_at: started_at as u64,
-                        completed_at: None,
-                    });
-                }
-            }
+            executions.push(
+                summary_from_payloads(color, &started_payload, terminal_payload, tags)
+                    .unwrap_or_else(|e| corrupt_summary(color, project_id, &phase_text, started_at, &e)),
+            );
         }
         Ok(ExecutionPage { executions, total: total.0.max(0) as u64 })
+    }
+
+    async fn colors_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<Color>> {
+        // `LIKE` on the text form with the prefix escaped: a prefix is
+        // hex and dashes, but the escape keeps a stray `%` or `_` from
+        // widening the match.
+        let pattern = format!(
+            "{}%",
+            prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT color FROM execution_color \
+             WHERE tenant_id = $1 AND kind = 'execution' AND color LIKE $2 \
+             ORDER BY started_at_unix DESC LIMIT 2",
+        )
+        .bind(tenant)
+        .bind(pattern)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(|(c,)| c.parse::<Color>().map_err(Into::into)).collect()
     }
 
     async fn execution_summary(
@@ -842,9 +999,10 @@ impl Journal for PostgresJournal {
         // Direct point-lookup by color: the started row plus its latest terminal
         // event, no windowed list scan. Returns None when the color has no
         // `execution_started` row.
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT s.payload_json, t.payload_json \
+        let row: Option<(String, String, i64, String, Option<String>, Vec<String>)> = sqlx::query_as(&format!(
+            "SELECT ec.project_id, ec.phase, ec.started_at_unix, s.payload_json, t.payload_json, {TAGS_LATERAL} \
              FROM exec_event s \
+             JOIN execution_color ec ON ec.color = s.color \
              LEFT JOIN LATERAL ( \
                  SELECT payload_json FROM exec_event \
                  WHERE color = s.color \
@@ -852,16 +1010,19 @@ impl Journal for PostgresJournal {
                  ORDER BY id DESC LIMIT 1 \
              ) t ON TRUE \
              WHERE s.kind = 'execution_started' AND s.color = $1 \
-             ORDER BY s.id ASC LIMIT 1",
-        )
+             ORDER BY s.id ASC LIMIT 1"
+        ))
         .bind(color.to_string())
         .fetch_optional(&self.pool)
         .await?;
 
         match row {
             None => Ok(None),
-            Some((started_payload, terminal_payload)) => {
-                summary_from_payloads(color, &started_payload, terminal_payload).map(Some)
+            Some((project_id, phase_text, started_at, started_payload, terminal_payload, tags)) => {
+                Ok(Some(
+                    summary_from_payloads(color, &started_payload, terminal_payload, tags)
+                        .unwrap_or_else(|e| corrupt_summary(color, project_id, &phase_text, started_at, &e)),
+                ))
             }
         }
     }
@@ -869,6 +1030,7 @@ impl Journal for PostgresJournal {
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
+        phase: Option<weft_core::context::Phase>,
     ) -> anyhow::Result<Vec<Color>> {
         // A color is "non-terminal" iff it belongs to this project
         // AND has no terminal event in the journal. `execution_color`
@@ -880,10 +1042,13 @@ impl Journal for PostgresJournal {
         // read behind the cancel/wipe sweeps and the drain count, and
         // a node-test color's lifecycle is owned by its task, never by
         // the project's.
+        // `$2 IS NULL OR ec.phase = $2`: one query for both the
+        // whole-project read and the per-phase one.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT ec.color FROM execution_color ec \
              WHERE ec.project_id = $1 \
                AND ec.kind = 'execution' \
+               AND ($2::text IS NULL OR ec.phase = $2) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM exec_event t \
                    WHERE t.color = ec.color \
@@ -893,6 +1058,7 @@ impl Journal for PostgresJournal {
                )",
         )
         .bind(project_id)
+        .bind(phase.map(|p| p.as_str()))
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
@@ -903,6 +1069,14 @@ impl Journal for PostgresJournal {
             out.push(color);
         }
         Ok(out)
+    }
+
+    async fn live_tagged_executions(
+        &self,
+        project_id: &str,
+        tag: &str,
+    ) -> anyhow::Result<Vec<weft_journal::tags::TaggedExecution>> {
+        Ok(weft_journal::tags::live_tagged_executions(&self.pool, project_id, tag).await?)
     }
 
     async fn list_terminal_colors_for_project(
@@ -937,17 +1111,25 @@ impl Journal for PostgresJournal {
     }
 
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
-        let s = color.to_string();
+        // One transaction for the whole footprint: the journal, the tag
+        // rows, the resume tokens, and the color index must die
+        // together. Half-applied (four autocommit deletes), a crash in
+        // the window leaves tag + execution_color rows whose journal is
+        // empty, which is exactly the row set the live tag read selects
+        // for, and a later stop writes fresh cancel rows into a deleted
+        // journal, resurrecting a ghost run.
+        let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM exec_event WHERE color = $1")
-            .bind(&s)
-            .execute(&self.pool)
+            .bind(color.to_string())
+            .execute(&mut *tx)
             .await?;
+        weft_journal::tags::delete_for_color(&mut tx, color).await?;
         // Resume tokens for this color: signal rows with is_resume=true.
         sqlx::query(
             "DELETE FROM signal WHERE color = $1 AND is_resume = TRUE",
         )
-        .bind(&s)
-        .execute(&self.pool)
+        .bind(color.to_string())
+        .execute(&mut *tx)
         .await?;
         // execution_color is the denormalized (color, project_id,
         // tenant_id) index seeded at ExecutionStarted time. Without
@@ -957,9 +1139,10 @@ impl Journal for PostgresJournal {
         // terminal-event check passes vacuously when all events are
         // gone). Wipe / cancel_running then re-sweep a ghost.
         sqlx::query("DELETE FROM execution_color WHERE color = $1")
-            .bind(&s)
-            .execute(&self.pool)
+            .bind(color.to_string())
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1191,28 +1374,28 @@ const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
 /// Row shape for signal SELECTs. `FromRow` (not a tuple) because
 /// the row exceeds sqlx's 16-tuple cap.
 #[derive(sqlx::FromRow)]
-struct SignalRow {
-    token: String,
-    tenant_id: String,
-    project_id: String,
-    color: Option<String>,
-    node_id: String,
-    is_resume: bool,
-    spec_json: String,
-    access_id: Option<String>,
-    consumer_kind: Option<String>,
-    tags: Vec<String>,
-    port_snapshot: Option<serde_json::Value>,
-    consumer_payload: Option<String>,
-    surface_kind: String,
-    mount_path: Option<String>,
-    auth_kind: String,
-    auth_config: Option<serde_json::Value>,
-    kind_state: serde_json::Value,
-    kind_state_seq: i64,
+pub(crate) struct SignalRow {
+    pub(crate) token: String,
+    pub(crate) tenant_id: String,
+    pub(crate) project_id: String,
+    pub(crate) color: Option<String>,
+    pub(crate) node_id: String,
+    pub(crate) is_resume: bool,
+    pub(crate) spec_json: String,
+    pub(crate) access_id: Option<String>,
+    pub(crate) consumer_kind: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) port_snapshot: Option<serde_json::Value>,
+    pub(crate) consumer_payload: Option<String>,
+    pub(crate) surface_kind: String,
+    pub(crate) mount_path: Option<String>,
+    pub(crate) auth_kind: String,
+    pub(crate) auth_config: Option<serde_json::Value>,
+    pub(crate) kind_state: serde_json::Value,
+    pub(crate) kind_state_seq: i64,
 }
 
-fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
+pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
     // Distinguish a NULL column (a legitimately absent value) from a NON-NULL value
     // that fails to decode (corrupt state). A resume signal's `color` is matched by
     // the fire/resume path to route the signal to its suspended execution: silently
@@ -1225,11 +1408,30 @@ fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
                 .map_err(|e| anyhow::anyhow!("corrupt signal.color '{s}' for token {}: {e}", row.token))?,
         ),
     };
+    // The payload is the CACHE of what a consumer surface renders,
+    // rebuilt from the spec on every re-register and read by nothing
+    // else. One unreadable cache must not make the row unreadable: this
+    // decoder is on the path that cancels and deletes signals, so
+    // failing here would leave a row nobody can list and nobody can
+    // remove. It is loud in the log and the row keeps its identity.
     let consumer_payload = match row.consumer_payload {
         None => None,
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            anyhow::anyhow!("corrupt signal.consumer_payload for token {}: {e}", row.token)
-        })?),
+        Some(s) => match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(
+                    target: "weft_dispatcher::journal",
+                    token = %row.token,
+                    error = %e,
+                    "corrupt signal.consumer_payload: this signal is missing from every \
+                     consumer's list. A trigger's row rebuilds its card the next time the \
+                     project is activated; a row waiting mid-execution never does, so that \
+                     one stays invisible until the execution is cancelled (weft stop, or \
+                     clear-all on the token)."
+                );
+                None
+            }
+        },
     };
     Ok(SignalRegistration {
         token: row.token,

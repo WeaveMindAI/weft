@@ -81,6 +81,40 @@ into your cluster.
 Every other path answers "not found" on purpose. If something were broken you
 would see a Cloudflare error page or a timeout instead.
 
+## Turn off the browser check for this hostname
+
+Cloudflare's Browser Integrity Check refuses some client signatures with a
+403 and the text `error code: 1010`, at Cloudflare's edge, before anything
+reaches your cluster. Python's standard library is one of them: a node
+fetching a file link with `urllib` gets that 403 while `curl` and `requests`
+get the bytes. The links weft hands out under this address
+(`/public/files/...`) are read by programs, never by browsers, so the check
+only ever refuses your own nodes. Turn it off for this hostname, and leave
+it on for the rest of your domain.
+
+1. In the Cloudflare dashboard (`dash.cloudflare.com`, not the Zero Trust
+   one), open your domain, then **Rules**, then **Overview**, then
+   **Create rule**, then **Configuration Rule**.
+2. Name it anything, such as `weft no browser check`.
+3. Under **When incoming requests match**, pick the field **Hostname**,
+   the operator **equals**, and type your weft hostname without the
+   `https://`, such as `weft-dev-amber-comet.example.com`.
+4. Under **Then the settings are**, add **Browser Integrity Check** and
+   set it to **Off**.
+5. **Deploy**.
+
+If you would rather switch it off for the whole domain, it is the
+**Browser integrity check** toggle under **Security**, then **Settings**.
+
+To confirm, from any shell:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -A "Python-urllib/3.12" https://<your-host>/
+```
+
+`200` means fixed; `403` means the check is still on (a rule takes a
+minute or so to apply).
+
 ## Register the address at providers, once
 
 **Slack**: OAuth redirect URL `https://<your-host>/access/oauth/callback`.

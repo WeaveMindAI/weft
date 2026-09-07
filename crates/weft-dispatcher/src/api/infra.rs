@@ -539,7 +539,7 @@ pub async fn cancel(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup colors: {e}")))?;
     let had_setup = !colors.is_empty();
     for color in colors {
-        crate::api::execution::cancel_color(&state, color)
+        crate::api::execution::cancel_color(&state, color, &weft_core::exec::CancelCause::User)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
     }
@@ -690,6 +690,21 @@ async fn issue_per_node(
     // Validation is in the type: serde rejected unknown variants
     // at deserialize. None falls back to the verb's default.
     let running_policy = body.running_policy.unwrap_or(default_running);
+    // Surgical or not, the verb is the same destructive command the
+    // project-level one is: it is held to the same reconciliation the
+    // action bar renders, so a transitional project refuses it here
+    // instead of tearing one node out from under a build.
+    let action = match verb {
+        InfraLifecycleVerb::Stop => "infra_stop",
+        InfraLifecycleVerb::Terminate => "infra_terminate",
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{} is not a per-node verb", other.as_str()),
+            ))
+        }
+    };
+    crate::api::project::require_action(&state, id, &[action]).await?;
 
     // Per-node verbs are surgical, not consent-bypassing. Refuse
     // when the project is currently Active AND any trigger has the
@@ -821,42 +836,7 @@ pub async fn live(
     caller: CallerTenant,
     Path((id_str, node_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let id = parse_id(&id_str)?;
-    authorize_project(&state, &caller.0, id).await?;
-    let project_id = id.to_string();
-
-    // Gate on the catalog metadata's `features.live_endpoint`.
-    // Nodes that don't expose a /live HTTP route (Postgres, Redis,
-    // anything TCP-only) leave it unset and hit this 404 instead of a
-    // 502 from the downstream connection refusal.
-    let project = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let node_def = project
-        .nodes
-        .iter()
-        .find(|n| n.id == node_id)
-        .ok_or((StatusCode::NOT_FOUND, "no such node in project".into()))?;
-    // A node opts into /live by naming the endpoint that serves it
-    // (features.live_endpoint). `None` = no /live: 404. Resolving by
-    // name (not an arbitrary map entry) means a multi-endpoint node's
-    // /live hits the right one.
-    let live_endpoint = node_def.features.live_endpoint.as_deref().ok_or((
-        StatusCode::NOT_FOUND,
-        "node does not expose a /live endpoint".to_string(),
-    ))?;
-
-    let row = infra_node::get(&state.pg_pool, &project_id, &node_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "no such infra node".into()))?;
-    let endpoint_url = row.endpoints.get(live_endpoint).cloned().ok_or((
-        StatusCode::NOT_FOUND,
-        format!("infra node has no endpoint named '{live_endpoint}' (live_endpoint)"),
-    ))?;
+    let endpoint_url = live_endpoint_url(&state, &caller, &id_str, &node_id).await?;
     let live_url = format!("{}/live", endpoint_url.trim_end_matches('/'));
     // Reuse the dispatcher's shared HTTP client (one connection pool for the
     // process, not a fresh pool per request). Bound the WHOLE exchange, connect +
@@ -876,6 +856,128 @@ pub async fn live(
     .await
     .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, "live endpoint timed out".to_string()))??;
     Ok(Json(value))
+}
+
+/// Body for `/infra/nodes/{node_id}/action`: the button a `/live` item
+/// carries, pressed. Same shape as a signal action so the editor sends
+/// one message for both.
+#[derive(Debug, Deserialize)]
+pub struct InfraActionBody {
+    pub kind: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+/// POST /projects/{id}/infra/nodes/{node_id}/action: press a button a
+/// `/live` item offered. The container serving `/live` also serves
+/// `/action` with the bridge envelope (`{ "action", "payload" }` in,
+/// `{ "result" }` out; a `result.error` is the container refusing),
+/// and this route carries the press there, so a container's own
+/// action (log a phone out, rotate a key) needs nothing in weft beyond
+/// the button on its `/live` item. The container's refusal comes back
+/// as 400 with its text, whether it refused in the envelope or with a
+/// 4xx of its own; an unreachable container or a 5xx is a 502.
+///
+/// SYNC: the /action envelope <-> catalog/bailey/bridge/images/bridge/src/actions.js, catalog/postgres/database/images/credential/bootstrap.py The press waits as
+/// long as the container takes: the work is the container's and the
+/// wait the user's, so no deadline is put on it here (the editor shows
+/// the button pressed until the answer lands).
+pub async fn action(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((id_str, node_id)): Path<(String, String)>,
+    Json(body): Json<InfraActionBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let endpoint_url = live_endpoint_url(&state, &caller, &id_str, &node_id).await?;
+    let action_url = format!("{}/action", endpoint_url.trim_end_matches('/'));
+    let resp = state
+        .http
+        .post(&action_url)
+        .json(&serde_json::json!({ "action": body.kind, "payload": body.payload }))
+        .send()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action send: {e}")))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action read: {e}")))?;
+    if !status.is_success() {
+        // A 4xx is the container saying the press was wrong (an action
+        // it does not have, a missing field), which is the caller's
+        // problem and comes back as one. Only a 5xx or an unreachable
+        // container is a gateway fault.
+        let code = if status.is_client_error() {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return Err((code, format!("the container answered {status}: {text}")));
+    }
+    let answer = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action parse: {e}")))?;
+    let result = infra_action_result(&body.kind, answer)?;
+    Ok(Json(result))
+}
+
+/// The `result` of a container's `/action` answer, or the refusal it
+/// carried (`result.error`) as a 400 naming the action. An answer with
+/// no `result` at all is not the envelope: a container that answered
+/// 200 with something else is reported as such (502), never read as an
+/// action that succeeded with nothing to say.
+fn infra_action_result(
+    kind: &str,
+    answer: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let Some(result) = answer.get("result").cloned() else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("{kind}: the container answered without a `result` envelope: {answer}"),
+        ));
+    };
+    if let Some(err) = result.get("error").and_then(|e| e.as_str()) {
+        return Err((StatusCode::BAD_REQUEST, format!("{kind}: {err}")));
+    }
+    Ok(result)
+}
+
+/// The URL of the endpoint an infra node names as serving `/live` (and
+/// `/action`): the node must opt in through `features.live_endpoint`,
+/// and the endpoint must be provisioned. Every miss is a 404 naming
+/// which of those it is, so a TCP-only node (Postgres) answers "no
+/// live endpoint" instead of a 502 from a refused connection.
+async fn live_endpoint_url(
+    state: &DispatcherState,
+    caller: &CallerTenant,
+    id_str: &str,
+    node_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    let id = parse_id(id_str)?;
+    authorize_project(state, &caller.0, id).await?;
+    let project_id = id.to_string();
+    let project = state
+        .projects
+        .project(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
+    let node_def = project
+        .nodes
+        .iter()
+        .find(|n| n.id == node_id)
+        .ok_or((StatusCode::NOT_FOUND, "no such node in project".into()))?;
+    let live_endpoint = node_def.features.live_endpoint.as_deref().ok_or((
+        StatusCode::NOT_FOUND,
+        "node does not expose a /live endpoint".to_string(),
+    ))?;
+    let row = infra_node::get(&state.pg_pool, &project_id, node_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "no such infra node".into()))?;
+    row.endpoints.get(live_endpoint).cloned().ok_or((
+        StatusCode::NOT_FOUND,
+        format!("infra node has no endpoint named '{live_endpoint}' (live_endpoint)"),
+    ))
 }
 
 // =================================================================
@@ -1602,5 +1704,23 @@ mod tests {
             r.image_hashes.get("tgi").unwrap().get("bridge").unwrap(),
             "weft-infra-bridge:abc123"
         );
+    }
+
+    #[test]
+    fn an_action_answer_is_its_result_or_the_refusal_it_carried() {
+        use super::infra_action_result;
+        let ok = infra_action_result("logout", serde_json::json!({ "result": { "success": true } })).unwrap();
+        assert_eq!(ok, serde_json::json!({ "success": true }));
+        let (status, msg) = infra_action_result(
+            "logout",
+            serde_json::json!({ "result": { "error": "WhatsApp not connected" } }),
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(msg, "logout: WhatsApp not connected");
+        // No `result` at all is not the envelope: reported, never read as success.
+        let (status, msg) = infra_action_result("x", serde_json::json!({ "ok": true })).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(msg.contains("without a `result` envelope"), "{msg}");
     }
 }

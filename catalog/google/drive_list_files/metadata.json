@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Google access (wire a GoogleAccess node). Browsing all of Drive needs the read-all-of-Drive permission; Google classes it restricted, so a shared app covering it is rare and your own app is the usual road.",
       "requiresScopes": [
@@ -29,7 +29,6 @@
     {
       "name": "pageSize",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": 1,
@@ -44,7 +43,6 @@
     {
       "name": "files",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "The listed files: {id, name, mimeType} each."
     }
   ]

@@ -481,8 +481,110 @@ async fn the_plan_renders_array_and_enum_types_as_runnable_sql(pool: PgPool) {
         });
     }
     if let Some(diff) =
-        weft_task_store::schema_guard::diff_things(&after, &read_schema(&pool).await.unwrap())
+        weft_task_store::schema_guard::diff_things(&after, "the plan", &read_schema(&pool).await.unwrap(), "the database")
     {
         panic!("running the plan must land on the target shape:\n{diff}");
+    }
+}
+
+/// The release path: `settle_release` is what `./setup.sh --migration
+/// <name> --release` runs on the database you work against, in one
+/// transaction, so what it records is only ever what the database
+/// holds.
+mod release {
+    use super::*;
+    use weft_task_store::schema_guard::{read_schema, settle_release, Settling};
+
+    /// The draft a developer's database ran while the shape was being
+    /// decided: the same change `ADD_EXTRA` releases.
+    static DRAFT_EXTRA: &[Migration] = &[Migration {
+        group: "guard_probe",
+        id: "draft_20260823T1100_guard_probe_extra",
+        draft: true,
+        sql: "ALTER TABLE guard_probe ADD COLUMN extra TEXT",
+    }];
+
+    async fn recorded_ids(pool: &PgPool) -> Vec<String> {
+        sqlx::query_as::<_, (String,)>(
+            "SELECT id FROM weft_migration WHERE group_name = 'guard_probe' AND id <> 'origin' ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(id,)| id)
+        .collect()
+    }
+
+    fn release(run: bool) -> Vec<Settling> {
+        vec![Settling {
+            group: "guard_probe".into(),
+            id: ADD_EXTRA[0].id.into(),
+            sql: ADD_EXTRA[0].sql.into(),
+            run,
+        }]
+    }
+
+    /// A database that ran the draft has the release RECORDED: the
+    /// draft row goes, the released id is in, nothing runs, and the
+    /// next boot with the released file has nothing to do.
+    #[sqlx::test]
+    async fn a_database_that_ran_the_drafts_records_the_release(pool: PgPool) {
+        apply(&pool, &[&GUARDED], NONE).await.expect("origin");
+        apply(&pool, &[&GUARDED_V2], DRAFT_EXTRA).await.expect("the draft ran");
+        assert_eq!(recorded_ids(&pool).await, vec![DRAFT_EXTRA[0].id.to_string()]);
+        let expected = read_schema(&pool).await.unwrap();
+
+        settle_release(&pool, &[&GUARDED_V2], &expected, &release(false)).await.expect("recorded");
+        assert_eq!(recorded_ids(&pool).await, vec![ADD_EXTRA[0].id.to_string()]);
+        apply(&pool, &[&GUARDED_V2], ADD_EXTRA).await.expect("nothing left to run");
+    }
+
+    /// A database that never saw the draft has the release RUN on it,
+    /// and recorded, in the same transaction.
+    #[sqlx::test]
+    async fn a_database_that_never_saw_the_drafts_runs_the_release(pool: PgPool) {
+        apply(&pool, &[&GUARDED], NONE).await.expect("origin");
+        // The shape the release describes, read off the database once
+        // it holds it, then put back to where the last release left it.
+        sqlx::raw_sql(ADD_EXTRA[0].sql).execute(&pool).await.unwrap();
+        let expected = read_schema(&pool).await.unwrap();
+        sqlx::raw_sql("ALTER TABLE guard_probe DROP COLUMN extra").execute(&pool).await.unwrap();
+
+        settle_release(&pool, &[&GUARDED_V2], &expected, &release(true)).await.expect("ran");
+        assert!(has_extra_column(&pool).await, "the release ran");
+        assert_eq!(recorded_ids(&pool).await, vec![ADD_EXTRA[0].id.to_string()]);
+    }
+
+    /// A release whose SQL fails, or whose result is not the shape the
+    /// code declares, records nothing: the draft rows are still there
+    /// and the released id is not.
+    #[sqlx::test]
+    async fn a_release_that_fails_or_misses_the_shape_records_nothing(pool: PgPool) {
+        apply(&pool, &[&GUARDED], NONE).await.expect("origin");
+        apply(&pool, &[&GUARDED_V2], DRAFT_EXTRA).await.expect("the draft ran");
+        let holds = read_schema(&pool).await.unwrap();
+
+        // Running the SQL again on a database that already ran the
+        // draft fails on the column that is there.
+        let err = format!(
+            "{:#}",
+            settle_release(&pool, &[&GUARDED_V2], &holds, &release(true))
+                .await
+                .expect_err("the column exists")
+        );
+        assert!(err.contains(ADD_EXTRA[0].id), "names the migration: {err}");
+        assert_eq!(recorded_ids(&pool).await, vec![DRAFT_EXTRA[0].id.to_string()], "rolled back");
+
+        // Recording against a shape the database does not hold is
+        // refused naming the group, and the row is not written.
+        let mut wrong = holds.clone();
+        wrong.retain(|t| !t.to_string().contains("extra"));
+        let err = settle_release(&pool, &[&GUARDED_V2], &wrong, &release(false))
+            .await
+            .expect_err("the shape differs")
+            .to_string();
+        assert!(err.contains("guard_probe") && err.contains("extra"), "{err}");
+        assert_eq!(recorded_ids(&pool).await, vec![DRAFT_EXTRA[0].id.to_string()], "rolled back");
     }
 }

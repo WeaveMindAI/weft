@@ -14,15 +14,13 @@
       "type": "String",
       "widget": { "kind": "textarea" },
       "required": true,
-      "exposure": "config",
       "label": "Value"
     }
   ],
   "outputs": [
     {
       "name": "value",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ],
   "requires_infra": false

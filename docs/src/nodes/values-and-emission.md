@@ -46,8 +46,8 @@ errors loudly.
 
 That is the **config-node pattern**, and the engine does nothing special for
 it: the config node emits one plain object, the consuming node declares an
-ordinary object-typed input (usually `exposure: "wire"`, so a real node must
-be wired), and reads that object itself. No input name triggers hidden
+ordinary object-typed input (usually `"accepts": ["wire"]`, so a real node
+must be wired), and reads that object itself. No input name triggers hidden
 behavior, and an object wired to an input always arrives as that object.
 
 ### Iterating
@@ -63,7 +63,11 @@ in advance:
 | `.in_order()` | every value that ARRIVED, in the node's port order |
 
 `.custom()` is the one for nodes that treat "whatever the user wired in" as a
-dynamic set: script variables, form prefill.
+dynamic set: script variables, a query's parameters, a template's holes, form
+prefill. It pairs with `canAddInputPorts` in the metadata, and it is the shape
+for any open-ended set of values: a node never takes a `List` the author has
+to assemble from wires, because a list literal cannot hold a wire and the
+author ends up writing a Python node just to build it.
 
 `.in_order()` is for a node that answers by ORDER. A port that delivered
 nothing is absent, so the first pair is the first branch that spoke, which is

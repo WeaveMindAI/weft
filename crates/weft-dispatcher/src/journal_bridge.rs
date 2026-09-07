@@ -240,9 +240,7 @@ async fn process_one_row(
     // first pod observing the terminal row removes the signal
     // entries; sibling pods see an empty result and skip.
     match &event {
-        ExecEvent::ExecutionCompleted { .. }
-        | ExecEvent::ExecutionFailed { .. }
-        | ExecEvent::ExecutionCancelled { .. } => {
+        e if e.is_execution_terminal() => {
             terminal_cleanup(state, color).await?;
             // Storage terminate sweep: queue the un-kept exec-file
             // sweep DURABLY (workers stall-then-die, so worker-side
@@ -276,7 +274,7 @@ async fn process_one_row(
     // PulseEmitted carrying a bus marker yields both BusParticipant
     // edges (source-node + target-node) in addition to the pulse
     // notification itself.
-    for de in to_dispatcher_events(&event, project_id) {
+    for de in project_recorded_event(crate::events::IdentifiedEvent::recorded(id, event), project_id) {
         // Local-only: every dispatcher pod runs this same bridge,
         // so every pod's own subscribers get the event from its
         // own poll. NOTIFY would cause double-delivery.
@@ -356,18 +354,25 @@ pub(crate) async fn try_finish_drain(
     Ok(())
 }
 
+pub(crate) fn project_recorded_event(
+    record: crate::events::IdentifiedEvent<ExecEvent>,
+    project_id: String,
+) -> Vec<crate::events::LiveEvent> {
+    record.project(|event| to_dispatcher_events(&event, project_id))
+}
+
 pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<DispatcherEvent> {
     match ev {
-        ExecEvent::ExecutionStarted { color, entry_node, .. } => {
+        ExecEvent::ExecutionStarted { color, entry_node, at_unix, .. } => {
             vec![DispatcherEvent::ExecutionStarted {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 entry_node: entry_node.clone(),
                 project_id,
             }]
         }
-        ExecEvent::NodeStarted { color, node_id, frames, input, closed_ports, .. } => {
+        ExecEvent::NodeStarted { color, node_id, frames, input, closed_ports, at_unix, .. } => {
             vec![DispatcherEvent::NodeStarted {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 input: input.clone(),
@@ -375,27 +380,27 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 project_id,
             }]
         }
-        ExecEvent::NodeCompleted { color, node_id, frames, output, .. } => {
+        ExecEvent::NodeCompleted { color, node_id, frames, output, at_unix, .. } => {
             vec![DispatcherEvent::NodeCompleted {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 output: output.clone(),
                 project_id,
             }]
         }
-        ExecEvent::NodeFailed { color, node_id, frames, error, .. } => {
+        ExecEvent::NodeFailed { color, node_id, frames, error, at_unix, .. } => {
             vec![DispatcherEvent::NodeFailed {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 error: error.clone(),
                 project_id,
             }]
         }
-        ExecEvent::NodeSkipped { color, node_id, frames, closed_ports, reason, .. } => {
+        ExecEvent::NodeSkipped { color, node_id, frames, closed_ports, reason, at_unix, .. } => {
             vec![DispatcherEvent::NodeSkipped {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 closed_ports: closed_ports.clone(),
@@ -403,9 +408,9 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 project_id,
             }]
         }
-        ExecEvent::PortTypeMismatch { color, node_id, frames, port, expected, actual, .. } => {
+        ExecEvent::PortTypeMismatch { color, node_id, frames, port, expected, actual, at_unix, .. } => {
             vec![DispatcherEvent::PortTypeMismatch {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 port: port.clone(),
@@ -414,18 +419,18 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 project_id,
             }]
         }
-        ExecEvent::NodeSuspended { color, node_id, frames, token, .. } => {
+        ExecEvent::NodeSuspended { color, node_id, frames, token, at_unix, .. } => {
             vec![DispatcherEvent::NodeSuspended {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 token: token.clone(),
                 project_id,
             }]
         }
-        ExecEvent::NodeResumed { color, node_id, frames, token, value, .. } => {
+        ExecEvent::NodeResumed { color, node_id, frames, token, value, at_unix, .. } => {
             vec![DispatcherEvent::NodeResumed {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 token: token.clone(),
@@ -433,46 +438,54 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
                 project_id,
             }]
         }
-        ExecEvent::NodeCancelled { color, node_id, frames, reason, .. } => {
+        ExecEvent::NodeCancelled { color, node_id, frames, reason, at_unix, .. } => {
             vec![DispatcherEvent::NodeCancelled {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 node: node_id.clone(),
                 frames: frames.clone(),
                 reason: reason.clone(),
                 project_id,
             }]
         }
-        ExecEvent::ExecutionCompleted { color, outputs, .. } => {
+        ExecEvent::ExecutionCompleted { color, outputs, at_unix, .. } => {
             vec![DispatcherEvent::ExecutionCompleted {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 outputs: outputs.clone(),
                 project_id,
             }]
         }
-        ExecEvent::ExecutionFailed { color, error, .. } => {
+        ExecEvent::ExecutionFailed { color, error, at_unix, .. } => {
             // No truncation: journal_bridge fans out via
             // `publish_local` (no NOTIFY hop); the full error is
             // what the operator wants for debugging. Truncation
             // belongs at NOTIFY producer sites (api/project.rs,
             // infra_event_bridge.rs), not here.
             vec![DispatcherEvent::ExecutionFailed {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 error: error.clone(),
                 project_id,
             }]
         }
-        ExecEvent::ExecutionCancelled { color, reason, .. } => {
+        ExecEvent::ExecutionCancelled { color, reason, cause, at_unix, .. } => {
             vec![DispatcherEvent::ExecutionCancelled {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 reason: reason.clone(),
+                cause: cause.clone(),
+                project_id,
+            }]
+        }
+        ExecEvent::ExecutionTagged { color, tags, at_unix, .. } => {
+            vec![DispatcherEvent::ExecutionTagged {
+                color: *color, at_unix: *at_unix,
+                tags: tags.clone(),
                 project_id,
             }]
         }
         ExecEvent::CostReported {
-            color, node_id, frames, cost_id, service, amount_usd, origin, ..
+            color, node_id, frames, cost_id, service, amount_usd, origin, at_unix, ..
         } => {
             vec![DispatcherEvent::CostReported {
-                color: *color,
+                color: *color, at_unix: *at_unix,
                 project_id,
                 node_id: node_id.clone(),
                 frames: frames.clone(),
@@ -545,16 +558,21 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
             color, source_node, target_node, value, closed, ..
         } => sniff_bus_participants(*color, &project_id, source_node, target_node, value, *closed),
         ExecEvent::LoopInstantiated {
-            color, group_id, parent_frames, iter_cap, parallel, ..
+            color, group_id, parent_frames, iter_cap, parallel, at_unix, ..
         } => vec![DispatcherEvent::LoopInstantiated {
-            color: *color, project_id,
+            color: *color, at_unix: *at_unix, project_id,
             group_id: group_id.clone(),
             parent_frames: parent_frames.clone(),
             iter_cap: *iter_cap,
             parallel: *parallel,
         }],
+        // A group body starting is a kick set, not something the
+        // inspector paints: the members it kicked show up through their
+        // own NodeStarted rows, and a gated group through its members'
+        // NodeSkipped rows.
+        ExecEvent::ScopeLaunched { .. } => vec![],
         ExecEvent::LoopIterationLaunched {
-            color, group_id, parent_frames, index, body_emissions, ..
+            color, group_id, parent_frames, index, body_emissions, at_unix, ..
         } => {
             // The body pulses ride INSIDE this row (atomic marker+pulses),
             // so the bus-participant sniff must run over them here, just
@@ -562,7 +580,7 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
             // marker pulsed into a loop body never registers its consumer
             // as a participant (the agent-swarm pattern).
             let mut out = vec![DispatcherEvent::LoopIterationLaunched {
-                color: *color, project_id: project_id.clone(),
+                color: *color, at_unix: *at_unix, project_id: project_id.clone(),
                 group_id: group_id.clone(),
                 parent_frames: parent_frames.clone(),
                 index: *index,
@@ -575,23 +593,23 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
             out
         }
         ExecEvent::LoopOutFired {
-            color, group_id, parent_frames, index, done_vote, ..
+            color, group_id, parent_frames, index, done_vote, at_unix, ..
         } => vec![DispatcherEvent::LoopOutFired {
-            color: *color, project_id,
+            color: *color, at_unix: *at_unix, project_id,
             group_id: group_id.clone(),
             parent_frames: parent_frames.clone(),
             index: *index,
             done_vote: *done_vote,
         }],
         ExecEvent::LoopTerminated {
-            color, group_id, parent_frames, reason, outward_emissions, ..
+            color, group_id, parent_frames, reason, outward_emissions, at_unix, ..
         } => {
             // Outward pulses ride INSIDE this row; sniff them for bus
             // markers too (a loop exporting a bus handle outward through a
             // gather/carry port must register its downstream consumer as a
             // participant).
             let mut out = vec![DispatcherEvent::LoopTerminated {
-                color: *color, project_id: project_id.clone(),
+                color: *color, at_unix: *at_unix, project_id: project_id.clone(),
                 group_id: group_id.clone(),
                 parent_frames: parent_frames.clone(),
                 reason: *reason,

@@ -222,14 +222,17 @@ pub struct ExecutionSnapshot {
     /// per-loop state on resume.
     #[serde(default)]
     pub loop_instances: HashMap<LoopInstanceKey, LoopInstanceSnapshot>,
-    /// Roots kicked into this execution. The scheduler dispatches a
-    /// kicked node once even when it has no wired pending inputs (it
-    /// IS the entry point). Folded from `ExecEvent::NodeKicked`.
-    /// `dispatched=true` once the engine has consumed the kick (the
-    /// node was dispatched at frames=[]; further kicks on the same
-    /// node id are a no-op).
+    /// Nodes kicked into this execution, keyed by where they fire. The
+    /// scheduler dispatches a kicked node once even when it has no
+    /// wired pending inputs (it IS an entry point). Folded from
+    /// `ExecEvent::NodeKicked` (the run's roots, at frames `[]`),
+    /// `ExecEvent::ScopeLaunched` (a group body's roots, at the group's
+    /// frames) and `ExecEvent::LoopIterationLaunched::roots` (a loop
+    /// body's roots, at the iteration's frames). `dispatched=true` once
+    /// the engine has consumed the kick (the node started at that
+    /// location; further kicks at the same location are a no-op).
     #[serde(default)]
-    pub kicked: HashMap<String, KickedNode>,
+    pub kicked: HashMap<crate::frames::FiringLocation, KickedNode>,
     /// Fires that arrived for live suspensions but haven't been
     /// consumed by a worker's node completion yet. The worker
     /// seeds these into its link on startup so every waiting node
@@ -385,10 +388,10 @@ pub struct SuspensionInfo {
 /// entry point of a fresh execution (a firing trigger, a manual-run
 /// root, an InfraSetup root) that has no wired pending inputs and so
 /// would never become ready on its own. The scheduler dispatches it
-/// once at frames=[]. The optional `payload` carries the wake event's
-/// data for the firing trigger (the HTTP body, the SSE event JSON,
-/// the form submission, the timer info); node bodies read it via
-/// the `ctx.wake` bag in Fire phase.
+/// once, at the frames its key names. The optional `payload` carries
+/// the wake event's data for the firing trigger (the HTTP body, the SSE
+/// event JSON, the form submission, the timer info); node bodies read
+/// it via the `ctx.wake` bag in Fire phase.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KickedNode {
     /// This kick IS the firing trigger of the execution. Explicit,
@@ -405,10 +408,15 @@ pub struct KickedNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port_snapshot: Option<Value>,
     /// Flips to `true` once the engine has dispatched this kick (the
-    /// node started at root frames). A second tick that sees
+    /// node started at the kick's frames). A second tick that sees
     /// `dispatched` must NOT re-dispatch.
     #[serde(default)]
     pub dispatched: bool,
+    /// The scope this kick belongs to was gated off: the node is
+    /// dispatched straight into a `ScopeSkipped` skip, so every node
+    /// inside a scope that did not run says so in the journal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_skipped: Option<String>,
 }
 
 // ----- Loop instance snapshot ----------------------------------------

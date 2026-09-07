@@ -66,9 +66,6 @@ about signal kinds. Never touches the database.
 **Meter.** The per-provider code that computes the real cost of a paid call
 from the bytes. A node never states a cost.
 
-**Output node.** A node whose firing is the deliverable. A run executes the
-union of everything the output nodes depend on.
-
 **Pulse.** One emission travelling to one input port, carrying a value, a
 color, and a frame stack. The only thing that moves in a running program.
 
@@ -79,6 +76,9 @@ arrive.
 **Registered app.** One OAuth application this weft signs users in with, living
 in the operator's trusted apps file. A recipe may use one and can never extract
 from it.
+
+**Root.** A node no wire feeds. A manual run kicks every root at the top level;
+a scope's own roots are kicked when the scope starts.
 
 **Scope** (storage). Which of `Execution`, `Project`, or `Shared` a file is
 written under. It is a lifetime contract, not a folder name.

@@ -1,8 +1,8 @@
 # How the runtime is built
 
-Weft runs as four tiers plus a broker, one job each. If you are operating a
-weft, or you want to know why a crash mid-execution does not lose anything,
-this is the page.
+Weft runs as four tiers plus a broker, one job each. This page describes how
+they share work and recover from failures. Recovery depends on what reached
+the [journal](the-journal.md#the-execution-guarantee) before a crash.
 
 ```mermaid
 flowchart TD
@@ -10,7 +10,8 @@ flowchart TD
     D["<b>Dispatcher</b><br/>routing, lifecycle, journal<br/>never runs user code"]
     D -->|HTTP| L["<b>Listener</b><br/>holds live event sources<br/>never touches the database"]
     D -.->|"task rows"| S["<b>Supervisor</b><br/>runs kubectl for user infra<br/>one lease per project"]
-    D -.->|"task rows"| W["<b>Worker</b><br/>the compiled project binary<br/>one pod per project"]
+    D -.->|"task rows"| W["<b>Worker</b><br/>the compiled project binary<br/>a pool per project"]
+    Caller["Live callers"] --> G["Live-connection gateway"] --> W
     L -->|HTTP| B
     S -->|HTTP| B
     W -->|HTTP| B["<b>Broker</b><br/>the only door to the database<br/>for tenant pods"]
@@ -23,9 +24,10 @@ flowchart TD
 Routes events, manages worker lifecycle, orchestrates infrastructure, owns the
 journal, aggregates cost.
 
-It and the broker are the only two things that open a database connection, and
-it is the only one that hosts a public URL, so every external address, webhook,
-form link and fire token lives on it.
+It and the broker are the only two things that open a database connection.
+Webhooks, form links and fire tokens reach the dispatcher. Live callers get
+a signed address through a separate public gateway, which connects them to
+their worker.
 
 It **never** executes user node code. It never does node-aware work either:
 parsing, validation, and catalog reading are client-side, in the CLI, because
@@ -55,8 +57,9 @@ and a sibling claims it. It never touches Postgres and never serves HTTP.
 
 ## Worker
 
-The compiled project binary. One pod per project, multiplexing many executions,
-shutting itself down after thirty seconds with nothing to do.
+The compiled project binary. Each project has a pool that adds workers as
+memory pressure grows. Each worker handles multiple executions and shuts
+itself down after thirty seconds with nothing to do.
 
 It claims work from a queue, runs the drive loop, writes journal rows, and
 exits when idle. It holds no project definition of its own: each claim fetches

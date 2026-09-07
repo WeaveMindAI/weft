@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::frames::LoopFrames;
+use weft_core::frames::{FiringLocation, LoopFrames};
 use weft_core::primitive::{
     ExecutionSnapshot, KickedNode, LoopInstanceKey, LoopInstanceSnapshot,
     LoopTerminationReason, SignalSpec, SuspensionInfo,
@@ -51,11 +51,14 @@ pub enum ExecEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         node_test: bool,
         /// The node set this execution is allowed to dispatch, or
-        /// `None` for the whole graph. A manual run aimed at targets
-        /// journals its computed subgraph here, so the engine skips
-        /// everything outside it (`OutsideThisRun`) and a resume
-        /// rebuilds the same boundary; a trigger-fired execution
-        /// carries `None`. (Named `subgraph`, not `scope`:
+        /// `None` for the whole graph. A trigger fire journals its
+        /// computed program here (the fired trigger's downstream plus
+        /// what that needs), so a pulse into another program's node is
+        /// absorbed and a resume rebuilds the same boundary. A targeted
+        /// manual run also records its selected nodes and dependencies.
+        /// Untargeted manual runs and setup phases carry `None` (setup
+        /// phases compute their scope engine-side). (Named
+        /// `subgraph`, not `scope`:
         /// `NodeDefinition.scope` is a node's group-nesting path, a
         /// different thing entirely.)
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,6 +291,13 @@ pub enum ExecEvent {
         parent_frames: LoopFrames,
         index: u32,
         body_emissions: Vec<LaunchedEmission>,
+        /// The body's own roots (members no wire feeds), kicked at the
+        /// iteration's frames alongside the pulses: everything inside
+        /// a loop runs once per iteration, wired to the loop's edges
+        /// or not. In the same row as the pulses for the same reason
+        /// they are: a launch is one atomic fact.
+        #[serde(default)]
+        roots: Vec<String>,
         /// When this iteration's `over` item came from a STREAM
         /// (`over` on a `Generator[T]` port): the item pulse this
         /// launch consumed, absorbed by the fold in the same atomic
@@ -298,6 +308,24 @@ pub enum ExecEvent {
         /// launch" (which would leave the item pulse un-absorbed and
         /// re-deliver it).
         stream_pulse: Option<String>,
+        at_unix: u64,
+    },
+
+    /// A group's body started at `frames` (its In boundary forwarded),
+    /// and these members, which no wire feeds, are kicked there:
+    /// everything inside a scope runs when the scope starts. The loop
+    /// twin of this row is `LoopIterationLaunched::roots`. When
+    /// `skipped_by` names the scope, the scope was gated off instead
+    /// and every member listed is dispatched straight into a
+    /// `ScopeSkipped` skip, so the journal says of each node inside
+    /// that its scope did not run.
+    ScopeLaunched {
+        color: Color,
+        group_id: String,
+        frames: LoopFrames,
+        roots: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skipped_by: Option<String>,
         at_unix: u64,
     },
 
@@ -412,8 +440,36 @@ pub enum ExecEvent {
 
     LogLine {
         color: Color,
+        /// The node that wrote it, and the iteration it was in: a log
+        /// line is about one firing, and a graph where ten nodes log
+        /// is unreadable without it. `default` so the rows written
+        /// before the field existed still decode (they read as an
+        /// empty id, which the log renders as a run-level line).
+        #[serde(default)]
+        node_id: String,
+        #[serde(default)]
+        frames: LoopFrames,
         level: String,
         message: String,
+        /// The worker's clock at the write, in milliseconds (`at_unix`
+        /// is its seconds), and the line's place among its firing's
+        /// side effects. Absent on rows written before they were
+        /// carried, which read at the end of their second.
+        #[serde(default)]
+        at_unix_ms: Option<u64>,
+        #[serde(default)]
+        seq: Option<u64>,
+        at_unix: u64,
+    },
+
+    /// A node tagged its own execution (`ctx.tag_execution`). The
+    /// record of the act, for the inspector; the SELECTABLE copy a
+    /// sibling's `ctx.stop_tagged` reads lives beside the execution row
+    /// (`execution_tag`), written in the same transaction as this event.
+    /// Not folded: tags are not execution state a resume rebuilds.
+    ExecutionTagged {
+        color: Color,
+        tags: Vec<String>,
         at_unix: u64,
     },
 
@@ -447,7 +503,15 @@ pub enum ExecEvent {
 
     ExecutionCancelled {
         color: Color,
+        /// The cause in words, what a person reads (`cause.to_string()`
+        /// when `cause` is set). Kept as its own field because rows
+        /// written before `cause` existed carry only this.
         reason: String,
+        /// The structured cause: who or what stopped the run. `None`
+        /// only on a row written before the field existed (the UI then
+        /// has only `reason`); every live writer sets it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<weft_core::exec::CancelCause>,
         at_unix: u64,
     },
 
@@ -593,6 +657,21 @@ impl From<weft_core::exec::PulseEmission> for LaunchedEmission {
 }
 
 impl ExecEvent {
+    /// Whether this event ends the execution: completed, failed, or
+    /// cancelled. The ONE definition of the terminal set in Rust; the
+    /// SQL that filters on it lives in
+    /// `weft-dispatcher/src/api/execution.rs` (`terminal_outcome`) and
+    /// carries a marker back here.
+    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-dispatcher/src/api/execution.rs terminal_outcome (SQL kind list), crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list), crates/weft-journal/src/tags.rs live_tagged_executions (SQL kind list)
+    pub fn is_execution_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::ExecutionCompleted { .. }
+                | Self::ExecutionFailed { .. }
+                | Self::ExecutionCancelled { .. }
+        )
+    }
+
     pub fn color(&self) -> Color {
         match self {
             Self::ExecutionStarted { color, .. }
@@ -608,6 +687,7 @@ impl ExecEvent {
             | Self::PulsesConsumed { color, .. }
             | Self::LoopInstantiated { color, .. }
             | Self::LoopIterationLaunched { color, .. }
+            | Self::ScopeLaunched { color, .. }
             | Self::LoopOutFired { color, .. }
             | Self::LoopStreamEnded { color, .. }
             | Self::LoopTerminated { color, .. }
@@ -616,6 +696,7 @@ impl ExecEvent {
             | Self::RunOutput { color, .. }
             | Self::CostReported { color, .. }
             | Self::LogLine { color, .. }
+            | Self::ExecutionTagged { color, .. }
             | Self::PortTypeMismatch { color, .. }
             | Self::ExecutionCompleted { color, .. }
             | Self::ExecutionFailed { color, .. }
@@ -647,6 +728,7 @@ impl ExecEvent {
             Self::PulsesConsumed { .. } => "pulses_consumed",
             Self::LoopInstantiated { .. } => "loop_instantiated",
             Self::LoopIterationLaunched { .. } => "loop_iteration_launched",
+            Self::ScopeLaunched { .. } => "scope_launched",
             Self::LoopOutFired { .. } => "loop_out_fired",
             Self::LoopStreamEnded { .. } => "loop_stream_ended",
             Self::LoopTerminated { .. } => "loop_terminated",
@@ -655,6 +737,7 @@ impl ExecEvent {
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
             Self::LogLine { .. } => "log_line",
+            Self::ExecutionTagged { .. } => "execution_tagged",
             Self::PortTypeMismatch { .. } => "port_type_mismatch",
             Self::ExecutionCompleted { .. } => "execution_completed",
             Self::ExecutionFailed { .. } => "execution_failed",
@@ -674,7 +757,7 @@ impl ExecEvent {
 
 // ----- Fold: events -> ExecutionSnapshot -----------------------------
 
-pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot {
+pub fn fold_to_snapshot<'a>(color: Color, events: impl IntoIterator<Item = &'a ExecEvent>) -> ExecutionSnapshot {
     use weft_core::exec::{NodeExecution, NodeExecutionStatus, NodeExecutionTable};
     use weft_core::primitive::{CorruptionSite, JournalCorruption};
     use weft_core::pulse::{Pulse, PulseStatus, PulseTable};
@@ -683,7 +766,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
     let mut executions: NodeExecutionTable = Default::default();
     let mut suspensions: HashMap<String, SuspensionInfo> = HashMap::new();
     let mut pending_deliveries: HashMap<String, Value> = HashMap::new();
-    let mut kicked: HashMap<String, KickedNode> = HashMap::new();
+    let mut kicked: HashMap<FiringLocation, KickedNode> = HashMap::new();
     let mut loop_instances: HashMap<LoopInstanceKey, LoopInstanceSnapshot> = HashMap::new();
     let mut awaited_sequences: HashMap<
         weft_core::liveness::FiringLocation,
@@ -822,12 +905,26 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 // payload and `dispatched` flag are authoritative; a later
                 // kick carrying a different payload is a writer-level bug
                 // the fold must not paper over by silently merging.
-                kicked.entry(node_id.clone()).or_insert_with(|| KickedNode {
+                kicked.entry(FiringLocation::new(node_id.clone(), Vec::new())).or_insert_with(|| KickedNode {
                     firing: *firing,
                     payload: payload.clone(),
                     port_snapshot: port_snapshot.clone(),
                     dispatched: false,
+                    scope_skipped: None,
                 });
+            }
+            ExecEvent::ScopeLaunched { group_id: _, frames, roots, skipped_by, .. } => {
+                // A scope's body roots are kicks at the scope's frames,
+                // first launch wins like every other kick.
+                for root in roots {
+                    kicked.entry(FiringLocation::new(root.clone(), frames.clone())).or_insert_with(|| KickedNode {
+                        firing: false,
+                        payload: None,
+                        port_snapshot: None,
+                        dispatched: false,
+                        scope_skipped: skipped_by.clone(),
+                    });
+                }
             }
             ExecEvent::PulseEmitted {
                 color: c,
@@ -890,10 +987,8 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         }
                     }
                 }
-                if frames.is_empty() {
-                    if let Some(k) = kicked.get_mut(node_id) {
-                        k.dispatched = true;
-                    }
+                if let Some(k) = kicked.get_mut(&FiringLocation::new(node_id.clone(), frames.clone())) {
+                    k.dispatched = true;
                 }
                 // Open a new record unless a NON-TERMINAL record already
                 // sits at this (color, frames). Live dispatch opens a new
@@ -1029,7 +1124,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                     {
                         e.status = NodeExecutionStatus::Completed;
                         e.completed_at = Some(*at_unix);
-                        e.output = Some(output.clone());
+                        e.set_output(output);
                         e.callback_id = None;
                     }
                 }
@@ -1112,8 +1207,24 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 }
             }
             ExecEvent::LoopIterationLaunched {
-                color: c, group_id, parent_frames, index, body_emissions, stream_pulse, ..
+                color: c, group_id, parent_frames, index, body_emissions, stream_pulse, roots, ..
             } => {
+                // The body's roots are kicks at the iteration's frames,
+                // in the same atomic row as the pulses.
+                let body_frames = {
+                    let mut f = parent_frames.clone();
+                    f.push(weft_core::frames::LoopIteration { index: *index });
+                    f
+                };
+                for root in roots {
+                    kicked.entry(FiringLocation::new(root.clone(), body_frames.clone())).or_insert_with(|| KickedNode {
+                        firing: false,
+                        payload: None,
+                        port_snapshot: None,
+                        dispatched: false,
+                        scope_skipped: None,
+                    });
+                }
                 // Replay the carried body pulses exactly as the
                 // `PulseEmitted` arm does (same `push_pulse` helper):
                 // marker and pulses are one atomic row, so a fold
@@ -1376,6 +1487,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
             // design (a live connection dies with its worker), so they
             // never contribute to a resumed run's state.
             ExecEvent::LogLine { .. }
+            | ExecEvent::ExecutionTagged { .. }
             | ExecEvent::ExecutionCompleted { .. }
             | ExecEvent::ExecutionFailed { .. }
             | ExecEvent::ExecutionCancelled { .. }
@@ -1464,13 +1576,46 @@ mod fold_pulse_tests {
             },
         ];
         let snap = fold_to_snapshot(color(), &events);
-        let kick = snap.kicked.get("trigger").expect("trigger kick survives fold");
+        let kick = snap.kicked.get(&FiringLocation::new("trigger", Vec::new())).expect("trigger kick survives fold");
         assert!(kick.dispatched, "NodeStarted at root frames consumed the kick");
         assert_eq!(
             kick.payload.as_ref(),
             Some(&payload),
             "wake payload preserved so resume can replay it into the wake bag"
         );
+    }
+
+    #[test]
+    fn a_sink_that_emitted_nothing_folds_to_no_output() {
+        // Live, a firing that hands out nothing never writes an output
+        // on its record. The completion row still carries the (empty)
+        // bag, so the fold must land on the same `None`, or a replayed
+        // run holds an explicit "nothing" where the live run held no
+        // note at all.
+        let events = vec![
+            ExecEvent::NodeStarted {
+                color: color(),
+                node_id: "debug".into(),
+                frames: frames(&[]),
+                input: json!({"data": []}),
+                pulses_absorbed: vec![],
+                closed_ports: vec![],
+                at_unix: 0,
+            },
+            ExecEvent::NodeCompleted {
+                color: color(),
+                node_id: "debug".into(),
+                frames: frames(&[]),
+                output: Value::Null,
+                closure_emissions: vec![],
+                at_unix: 1,
+            },
+        ];
+        let snap = fold_to_snapshot(color(), &events);
+        let execs = snap.executions.get("debug").expect("debug execs");
+        assert_eq!(execs[0].status, weft_core::exec::NodeExecutionStatus::Completed);
+        assert_eq!(execs[0].output, None, "an empty bag is no output, not Some(Null)");
+        assert_eq!(execs[0].input, Some(json!({"data": []})), "the value it received is still on the record");
     }
 
     #[test]
@@ -1719,6 +1864,7 @@ mod fold_pulse_tests {
                 group_id: "lp".into(),
                 parent_frames: frames(&[]),
                 index: i,
+                roots: Vec::new(),
                 body_emissions: vec![LaunchedEmission {
                     pulse_id: pid.clone(),
                     source_node: "lp".into(),
@@ -1913,6 +2059,7 @@ mod fold_pulse_tests {
                 group_id: "lp".into(),
                 parent_frames: frames(&[]),
                 index: 1,
+                roots: Vec::new(),
                 body_emissions: vec![LaunchedEmission {
                     pulse_id: pid.clone(),
                     source_node: "lp".into(),
@@ -2415,7 +2562,7 @@ mod fold_pulse_tests {
             },
         ];
         let snap = fold_to_snapshot(color(), &events);
-        let kick = snap.kicked.get("trigger").expect("trigger kick");
+        let kick = snap.kicked.get(&FiringLocation::new("trigger", Vec::new())).expect("trigger kick");
         assert!(kick.payload.is_none(), "first kick's payload (None) is authoritative");
     }
 
@@ -2442,7 +2589,63 @@ mod fold_pulse_tests {
         assert!(*firing, "the explicit flag carries firing-ness");
         assert!(payload.is_none(), "Some(Null) collapses to None over JSON; that is WHY the flag exists");
         let snap = fold_to_snapshot(color(), &[back]);
-        assert!(snap.kicked.get("sock").expect("kick").firing);
+        assert!(snap.kicked.get(&FiringLocation::new("sock", Vec::new())).expect("kick").firing);
+    }
+
+    /// A scope launch is a kick per body root at the scope's frames,
+    /// consumed by a NodeStarted at that exact location; a loop's
+    /// launch row carries its roots the same way, at the iteration's
+    /// frames. A gated scope's members fold as kicks that skip.
+    #[test]
+    fn scope_launches_fold_into_kicks_at_their_frames() {
+        let events = vec![
+            ExecEvent::ScopeLaunched {
+                color: color(),
+                group_id: "g".into(),
+                frames: Vec::new(),
+                roots: vec!["g.seed".into()],
+                skipped_by: None,
+                at_unix: 0,
+            },
+            ExecEvent::LoopIterationLaunched {
+                color: color(),
+                group_id: "l".into(),
+                parent_frames: Vec::new(),
+                index: 2,
+                body_emissions: Vec::new(),
+                roots: vec!["l.seed".into()],
+                stream_pulse: None,
+                at_unix: 0,
+            },
+            ExecEvent::NodeStarted {
+                color: color(),
+                node_id: "l.seed".into(),
+                frames: frames(&[LoopIteration { index: 2 }]),
+                input: json!({}),
+                pulses_absorbed: vec![],
+                closed_ports: vec![],
+                at_unix: 0,
+            },
+            ExecEvent::ScopeLaunched {
+                color: color(),
+                group_id: "off".into(),
+                frames: Vec::new(),
+                roots: vec!["off.a".into()],
+                skipped_by: Some("off".into()),
+                at_unix: 0,
+            },
+        ];
+        let snap = fold_to_snapshot(color(), &events);
+        let seed = snap.kicked.get(&FiringLocation::new("g.seed", Vec::new())).expect("group root kicked");
+        assert!(!seed.dispatched && seed.scope_skipped.is_none());
+        let iter_seed = snap
+            .kicked
+            .get(&FiringLocation::new("l.seed", frames(&[LoopIteration { index: 2 }])))
+            .expect("loop root kicked at the iteration's frames");
+        assert!(iter_seed.dispatched, "the NodeStarted at that location consumed it");
+        assert!(!snap.kicked.contains_key(&FiringLocation::new("l.seed", Vec::new())), "never at the root frames");
+        let gated = snap.kicked.get(&FiringLocation::new("off.a", Vec::new())).expect("gated member kicked");
+        assert_eq!(gated.scope_skipped.as_deref(), Some("off"));
     }
 
     /// SuspensionResolved and SuspensionRegistered are written by
@@ -2515,6 +2718,62 @@ mod caller_event_wire_tests {
         );
     }
 
+    /// A cancel carries WHO: the structured cause rides the wire beside
+    /// the text, and a row written before the field existed (text only)
+    /// still decodes with `cause: None`, so old journals stay readable.
+    #[test]
+    fn execution_cancelled_round_trips_its_cause_and_reads_old_rows() {
+        let color = Color::new_v4();
+        let by = Color::new_v4();
+        round_trip(ExecEvent::ExecutionCancelled {
+            color,
+            reason: "Stopped by execution".into(),
+            cause: Some(weft_core::exec::CancelCause::Execution { by, tag: "user_1".into() }),
+            at_unix: 7,
+        });
+        let old_row = serde_json::json!({
+            "kind": "execution_cancelled",
+            "color": color,
+            "reason": "Cancelled by user",
+            "at_unix": 7
+        });
+        let decoded: ExecEvent = serde_json::from_value(old_row).expect("old row decodes");
+        match decoded {
+            ExecEvent::ExecutionCancelled { cause, reason, .. } => {
+                assert_eq!(cause, None);
+                assert_eq!(reason, "Cancelled by user");
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+        // A cause-less row does not grow a `cause: null` on the wire.
+        let json = serde_json::to_value(ExecEvent::ExecutionCancelled {
+            color,
+            reason: "x".into(),
+            cause: None,
+            at_unix: 1,
+        })
+        .unwrap();
+        assert!(json.get("cause").is_none(), "{json}");
+    }
+
+    /// Tagging is a journaled act with its own kind, and it is NOT
+    /// execution state: the fold ignores it.
+    #[test]
+    fn execution_tagged_round_trips_and_does_not_fold() {
+        let color = Color::new_v4();
+        let ev = ExecEvent::ExecutionTagged {
+            color,
+            tags: vec!["user_1".into(), "exp_7".into()],
+            at_unix: 3,
+        };
+        assert_eq!(ev.kind_str(), "execution_tagged");
+        assert_eq!(ev.color(), color);
+        round_trip(ev.clone());
+        let snapshot = fold_to_snapshot(color, &[ev]);
+        assert!(snapshot.executions.is_empty());
+        assert!(snapshot.corruptions.is_empty());
+    }
+
     /// A skip carries WHY, and the reason survives the wire with its
     /// payload: the inspector reads `did_not_flow` (a decision) apart
     /// from `required_input_closed` (a consequence), and the port name
@@ -2529,7 +2788,7 @@ mod caller_event_wire_tests {
             weft_core::exec::skip::SkipReason::OneOfGroupClosed {
                 ports: vec!["email".into(), "phone".into()],
             },
-            weft_core::exec::skip::SkipReason::OutsideThisRun,
+            weft_core::exec::skip::SkipReason::ScopeSkipped { scope: "g".into() },
         ] {
             let skipped = ExecEvent::NodeSkipped {
                 color: color(),
@@ -2759,6 +3018,7 @@ mod caller_event_wire_tests {
             group_id: "lp".into(),
             parent_frames: vec![],
             index: 3,
+            roots: Vec::new(),
             body_emissions: vec![LaunchedEmission {
                 pulse_id: uuid::Uuid::new_v4().to_string(),
                 source_node: "lp__in".into(),

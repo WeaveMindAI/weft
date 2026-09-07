@@ -12,12 +12,12 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.send"
       ],
-      "description": "A Google account with the send-mail permission."
+      "description": "A Google account with the send-mail permission, and the read-headers permission a reply needs to thread onto the original."
     },
     {
       "name": "to",
@@ -76,16 +76,11 @@
     {
       "name": "id",
       "type": "String",
-      "required": false,
       "description": "The sent message's id."
     },
     {
       "name": "threadId",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

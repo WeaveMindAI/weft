@@ -22,7 +22,6 @@
     {
       "name": "done",
       "type": "Boolean",
-      "required": false,
       "description": "Fires true once the response has been sent."
     }
   ],

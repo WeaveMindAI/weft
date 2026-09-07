@@ -45,13 +45,14 @@ impl Node for RssFeedNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let wake = ctx.wake.record()?;
         let entry = wake["item"].clone();
-        let title = entry["title"].as_str().unwrap_or_default().to_string();
-        let link = entry["link"].as_str().unwrap_or_default().to_string();
+        // A feed that gives no title or no link says so with a null.
+        // Turning either into an empty string sent an empty URL down a
+        // wire that then fetched nothing, with nothing to look at.
         entry["id"].as_str().node_err("the poll wake carries no entry id")?;
         ctx.pulse_downstream(
             NodeOutput::new()
-                .set("title", title)
-                .set("link", link)
+                .set("title", entry["title"].clone())
+                .set("link", entry["link"].clone())
                 .set("summary", entry["summary"].clone())
                 .set("published", entry["published"].clone())
                 .set("entry", entry),

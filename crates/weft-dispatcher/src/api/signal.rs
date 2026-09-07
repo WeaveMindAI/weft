@@ -27,7 +27,7 @@ use crate::state::DispatcherState;
 /// onto the array; the drain loop deserializes it back. A typo on
 /// either side becomes a compile error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ParkedFire {
+pub struct ParkedFire {
     /// Per-fire UUID stamped at park time. The drain pass uses this
     /// as the task-table dedup nonce so a crash between
     /// `dispatch_listener_outcome`'s task-insert and the head-pop
@@ -36,6 +36,43 @@ pub(crate) struct ParkedFire {
     pub id: String,
     pub payload: Value,
     pub received_at_unix: i64,
+    /// How many times the dispatcher has tried and failed to move this
+    /// fire along: a dispatch that could not place it, or a route that
+    /// failed (a transient read, the project not Active at route time).
+    /// Zero for a fire parked by the lifecycle gate. Drives the backoff
+    /// below; an element written before the field existed reads as
+    /// zero.
+    #[serde(default)]
+    pub attempts: u32,
+    /// Not drained before this instant. A re-parked fire waits
+    /// `park_backoff_secs(attempts)` before the next try, so a fire that
+    /// keeps failing (a missing definition, a project row gone) retries
+    /// every few minutes instead of spinning against Postgres and the
+    /// logs. Zero (the default) means due now.
+    #[serde(default)]
+    pub not_before_unix: i64,
+}
+
+/// A parked fire's identity as a drain hands it to the fire path: the
+/// stable fire id (the route task's dedup nonce and color seed) and how
+/// many routes have already failed, so the next re-park backs off
+/// further.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParkedRef<'a> {
+    pub id: &'a str,
+    pub attempts: u32,
+}
+
+/// Seconds a fire waits before its `attempts`-th retry: 1, 2, 4, ...
+/// doubling, capped at five minutes. The first failure retries almost at
+/// once (a transient read); a fire that keeps failing settles at the cap
+/// and the reaper's parked-fire sweep picks it up when due.
+pub(crate) fn park_backoff_secs(attempts: u32) -> i64 {
+    const CAP_SECS: i64 = 300;
+    if attempts == 0 {
+        return 0;
+    }
+    1i64.checked_shl(attempts - 1).unwrap_or(CAP_SECS).min(CAP_SECS)
 }
 
 /// Ceiling on an ENTRY signal's `parked_fires` queue. Entry fires accumulate while
@@ -60,37 +97,105 @@ const MAX_PARKED_ENTRY_FIRES: i64 = 1000;
 ///   - id dedup: an element with the same `ParkedFire.id` already
 ///     queued matches zero rows, so a retry of the same park (task
 ///     re-run after a crash) collapses instead of double-queueing.
-/// Returns the number of rows updated (0 = guard refused or the
-/// signal row is gone; the caller decides what that means).
-pub(crate) async fn append_parked_fire(
+/// Returns what happened; a refusal names its cause, read back from the
+/// row in a second query, so no caller has to guess from "0 rows" (the
+/// guards above are four different facts and each one means something
+/// different to the caller). The read is not in the UPDATE's
+/// transaction, so the row can move between them (a drain pops the
+/// queue, a sibling appends); the classification is made from the state
+/// actually observed, and when that state no longer explains a refusal
+/// (the queue drained under us) the append is simply tried again.
+pub async fn append_parked_fire(
     pool: &sqlx::PgPool,
     token: &str,
     entry: &ParkedFire,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<ParkAppend> {
     let entry_json = serde_json::to_value(entry)?;
     // `@>` containment on `[{"id": ...}]` matches any element
     // carrying that id, regardless of its other fields.
     let dedup_probe = serde_json::json!([{ "id": entry.id }]);
-    // `is_resume` is read from the TARGETED ROW (not a caller arg) so a
-    // caller that could not first fetch the signal row (a transient read
-    // error before re-parking) can still park correctly: a resume signal
-    // caps `parked_fires` at one element, an entry signal caps at
-    // `MAX_PARKED_ENTRY_FIRES`.
-    let updated = sqlx::query(
-        "UPDATE signal \
-         SET parked_fires = parked_fires || $1::jsonb \
-         WHERE token = $2 \
-           AND (is_resume = FALSE OR jsonb_array_length(parked_fires) = 0) \
-           AND (is_resume = TRUE OR jsonb_array_length(parked_fires) < $4) \
-           AND NOT (parked_fires @> $3::jsonb)",
+    // Bounded so two writers racing the row forever cannot spin here;
+    // hitting the bound is a loud error, not a silent drop.
+    const CONTENDED_ATTEMPTS: usize = 3;
+    for _ in 0..CONTENDED_ATTEMPTS {
+        // `is_resume` is read from the TARGETED ROW (not a caller arg) so a
+        // caller that could not first fetch the signal row (a transient read
+        // error before re-parking) can still park correctly: a resume signal
+        // caps `parked_fires` at one element, an entry signal caps at
+        // `MAX_PARKED_ENTRY_FIRES`.
+        let updated = sqlx::query(
+            "UPDATE signal \
+             SET parked_fires = parked_fires || $1::jsonb \
+             WHERE token = $2 \
+               AND (is_resume = FALSE OR jsonb_array_length(parked_fires) = 0) \
+               AND (is_resume = TRUE OR jsonb_array_length(parked_fires) < $4) \
+               AND NOT (parked_fires @> $3::jsonb)",
+        )
+        .bind(&entry_json)
+        .bind(token)
+        .bind(&dedup_probe)
+        .bind(MAX_PARKED_ENTRY_FIRES)
+        .execute(pool)
+        .await?;
+        if updated.rows_affected() > 0 {
+            return Ok(ParkAppend::Parked);
+        }
+        // Refused: read the row once and classify from what it holds NOW,
+        // in the order that matters to a caller (an element already
+        // carrying this id is the retry case and never a loss; the caps
+        // are). `jsonb_array_length` is INT4, cast to BIGINT so the
+        // i64 decode matches (a mismatch here only shows at runtime,
+        // against a real Postgres).
+        let row: Option<(bool, i64, bool)> = sqlx::query_as(
+            "SELECT is_resume, jsonb_array_length(parked_fires)::bigint, \
+                    parked_fires @> $2::jsonb \
+             FROM signal WHERE token = $1",
+        )
+        .bind(token)
+        .bind(&dedup_probe)
+        .fetch_optional(pool)
+        .await?;
+        let refusal = match row {
+            None => ParkRefusal::RowGone,
+            Some((_, _, true)) => ParkRefusal::AlreadyQueued,
+            Some((true, len, _)) if len > 0 => ParkRefusal::ResumeAlreadyAnswered,
+            Some((false, len, _)) if len >= MAX_PARKED_ENTRY_FIRES => ParkRefusal::QueueFull,
+            // The row no longer refuses this append: the queue moved
+            // between the UPDATE and the read. Try again.
+            Some(_) => continue,
+        };
+        return Ok(ParkAppend::Refused(refusal));
+    }
+    anyhow::bail!(
+        "could not park fire {} on signal {}: the parked queue kept changing under the \
+         append for {CONTENDED_ATTEMPTS} attempts",
+        entry.id,
+        token
     )
-    .bind(&entry_json)
-    .bind(token)
-    .bind(&dedup_probe)
-    .bind(MAX_PARKED_ENTRY_FIRES)
-    .execute(pool)
-    .await?;
-    Ok(updated.rows_affected())
+}
+
+/// Outcome of [`append_parked_fire`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkAppend {
+    Parked,
+    Refused(ParkRefusal),
+}
+
+/// Why [`append_parked_fire`] refused, one per guard plus the row being
+/// gone. Each is a different fact for the caller: a retry that finds its
+/// element already queued has lost nothing; a cap has refused a NEW fire,
+/// which is a loss the caller must say out loud; a vanished row means the
+/// project was wiped under the fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkRefusal {
+    /// An element with this `ParkedFire.id` is already queued.
+    AlreadyQueued,
+    /// A resume signal whose one submission is already queued.
+    ResumeAlreadyAnswered,
+    /// An entry signal at `MAX_PARKED_ENTRY_FIRES`.
+    QueueFull,
+    /// No signal row for this token.
+    RowGone,
 }
 
 /// THE one removal from `parked_fires` (mirror of `append_parked_fire`).
@@ -121,6 +226,53 @@ pub(crate) async fn remove_parked_fire(
     .bind(token)
     .bind(fire_id)
     .bind(fence)
+    .execute(pool)
+    .await?;
+    Ok(updated.rows_affected())
+}
+
+/// THE one re-stamp of a `parked_fires` element (completes the set with
+/// [`append_parked_fire`] / [`remove_parked_fire`]): bump its attempt
+/// count and push its due time out to `not_before_unix`, IN PLACE. The
+/// caller is a drain whose dispatch of this element failed without
+/// popping it: the fire is still the queue's head, and re-appending it
+/// at the tail would reorder one trigger's events, so the failed
+/// element keeps its position and only its retry clock moves. `fence`
+/// is the drain's claim nonce, same semantics as
+/// [`remove_parked_fire`]'s. Returns rows affected (0 = row gone, no
+/// such element, or not our claim; the containment guard means an id
+/// that is not queued writes nothing at all).
+pub async fn restamp_parked_fire(
+    pool: &sqlx::PgPool,
+    token: &str,
+    fire_id: &str,
+    attempts: u32,
+    not_before_unix: i64,
+    fence: Option<&str>,
+) -> anyhow::Result<u64> {
+    // Same containment probe shape as the append's id-dedup guard: an
+    // array element carrying this id, regardless of its other fields.
+    let probe = serde_json::json!([{ "id": fire_id }]);
+    let updated = sqlx::query(
+        "UPDATE signal \
+         SET parked_fires = COALESCE( \
+             (SELECT jsonb_agg( \
+                 CASE WHEN elem ->> 'id' = $2 THEN \
+                     elem || jsonb_build_object('attempts', $3, 'not_before_unix', $4) \
+                 ELSE elem END \
+                 ORDER BY ord) \
+              FROM jsonb_array_elements(parked_fires) WITH ORDINALITY AS t(elem, ord)), \
+             '[]'::jsonb) \
+         WHERE token = $1 \
+           AND parked_fires @> $6::jsonb \
+           AND ($5::text IS NULL OR drain_claimed_by = $5)",
+    )
+    .bind(token)
+    .bind(fire_id)
+    .bind(attempts as i64)
+    .bind(not_before_unix)
+    .bind(fence)
+    .bind(&probe)
     .execute(pool)
     .await?;
     Ok(updated.rows_affected())
@@ -327,34 +479,24 @@ async fn apply_lifecycle_gate(
             id: uuid::Uuid::new_v4().to_string(),
             payload,
             received_at_unix: crate::lease::now_unix(),
+            attempts: 0,
+            not_before_unix: 0,
         };
-        // The shared append returns 0 rows when a guard refused OR the signal row
-        // is gone. Never silently swallow that under a 200: distinguish the causes
-        // and fail loud. A fresh-UUID id can't hit the dedup guard on a live fire,
-        // so for a live fire 0 rows means one of: resume queue already answered,
-        // entry queue at its cap, or the row vanished between routing lookup and
-        // park.
-        let updated = append_parked_fire(&state.pg_pool, token, &entry)
+        // The shared append names its refusal; never swallow one under a
+        // 200. A fresh-UUID id can't hit the dedup guard on a live fire, so
+        // that arm is a contract violation if it ever fires.
+        match append_parked_fire(&state.pg_pool, token, &entry)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?;
-        if updated == 0 {
-            if routing.is_resume {
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?
+        {
+            ParkAppend::Parked => {}
+            ParkAppend::Refused(ParkRefusal::ResumeAlreadyAnswered) => {
                 return Err((
                     StatusCode::CONFLICT,
                     "suspension already answered; duplicate submission ignored".into(),
                 ));
             }
-            // Entry signal: tell "queue full" (still registered) apart from "row
-            // gone" (no longer registered) so the caller gets an actionable status
-            // instead of a false 200.
-            let still_registered: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM signal WHERE token = $1)",
-            )
-            .bind(token)
-            .fetch_one(&state.pg_pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park recheck: {e}")))?;
-            if still_registered {
+            ParkAppend::Refused(ParkRefusal::QueueFull) => {
                 return Err((
                     StatusCode::TOO_MANY_REQUESTS,
                     "this entry has too many pending fires queued; wait for the project \
@@ -362,10 +504,18 @@ async fn apply_lifecycle_gate(
                         .into(),
                 ));
             }
-            return Err((
-                StatusCode::GONE,
-                "this signal is no longer registered; the fire was not accepted".into(),
-            ));
+            ParkAppend::Refused(ParkRefusal::RowGone) => {
+                return Err((
+                    StatusCode::GONE,
+                    "this signal is no longer registered; the fire was not accepted".into(),
+                ));
+            }
+            ParkAppend::Refused(ParkRefusal::AlreadyQueued) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("park: a fresh fire id {} is already queued; dispatcher contract broken", entry.id),
+                ));
+            }
         }
         return Ok(StatusCode::OK);
     }
@@ -395,12 +545,6 @@ pub(crate) struct FireGateInfo {
     pub accepting_fires: bool,
     pub fires_deadline_unix: Option<i64>,
     pub surface_kind: String,
-    /// Drives the park-queue cap: entry signals append on every
-    /// fire (each event is distinct); resume signals append iff the
-    /// queue is empty, because a single form submission answers a
-    /// single suspension and any later submission on the same token
-    /// is a duplicate.
-    pub is_resume: bool,
 }
 
 pub(crate) async fn lookup_signal_routing(
@@ -408,7 +552,7 @@ pub(crate) async fn lookup_signal_routing(
     token: &str,
 ) -> Result<FireGateInfo, (StatusCode, String)> {
     let row = sqlx::query(
-        "SELECT s.project_id, s.tenant_id, s.surface_kind, s.is_resume, \
+        "SELECT s.project_id, s.tenant_id, s.surface_kind, \
                 COALESCE(p.status, 'inactive') AS status, \
                 COALESCE(p.accepting_fires, FALSE) AS accepting_fires, \
                 p.fires_deadline_unix \
@@ -430,9 +574,6 @@ pub(crate) async fn lookup_signal_routing(
     let surface_kind: String = row
         .try_get("surface_kind")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
-    let is_resume: bool = row
-        .try_get("is_resume")
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
     let status_str: String = row
         .try_get("status")
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}")))?;
@@ -450,7 +591,6 @@ pub(crate) async fn lookup_signal_routing(
         accepting_fires: accepting,
         fires_deadline_unix: deadline,
         surface_kind,
-        is_resume,
     })
 }
 
@@ -487,6 +627,38 @@ fn fire_should_retry(target: &ProcessTarget, attempt: usize) -> bool {
 }
 
 #[cfg(test)]
+mod park_backoff_tests {
+    use super::*;
+
+    /// 1, 2, 4, ... doubling from the first failed route, capped at five
+    /// minutes, and never overflowing on an absurd count.
+    #[test]
+    fn backoff_doubles_from_one_second_and_caps() {
+        assert_eq!(park_backoff_secs(0), 0);
+        assert_eq!(park_backoff_secs(1), 1);
+        assert_eq!(park_backoff_secs(2), 2);
+        assert_eq!(park_backoff_secs(5), 16);
+        assert_eq!(park_backoff_secs(9), 256);
+        assert_eq!(park_backoff_secs(10), 300);
+        assert_eq!(park_backoff_secs(40), 300);
+        assert_eq!(park_backoff_secs(u32::MAX), 300);
+    }
+
+    /// An element written before the backoff fields existed still
+    /// decodes: it reads as never retried and due now, so a queue
+    /// parked by an older dispatcher drains as before.
+    #[test]
+    fn a_parked_element_without_backoff_fields_reads_as_due_now() {
+        let old = serde_json::json!({
+            "id": "f1", "payload": {"x": 1}, "received_at_unix": 7
+        });
+        let fire: ParkedFire = serde_json::from_value(old).expect("old element decodes");
+        assert_eq!(fire.attempts, 0);
+        assert_eq!(fire.not_before_unix, 0);
+    }
+}
+
+#[cfg(test)]
 mod retry_tests {
     use super::*;
 
@@ -519,12 +691,16 @@ pub(crate) async fn dispatch_listener_outcome(
     project_id: &str,
     tenant: &str,
     payload: Value,
-    dedup_nonce: Option<&str>,
+    // `Some` when a drain pops a parked element: its id is the fire's
+    // stable identity and its attempt count carries into the route
+    // task. `None` for a live fire, which mints a fresh id.
+    parked: Option<ParkedRef<'_>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let token_owned = token.to_string();
     let project_owned = project_id.to_string();
     let tenant_str = tenant.to_string();
-    let dedup_nonce_owned = dedup_nonce.map(|s| s.to_string());
+    let parked_id = parked.map(|p| p.id.to_string());
+    let attempts = parked.map(|p| p.attempts).unwrap_or(0);
     // Resolve the listener holding this signal, re-placing it from its
     // durable row if the prior holder was reaped (a parked webhook may
     // fire long after its listener idled out). A fire must always find a
@@ -655,15 +831,18 @@ pub(crate) async fn dispatch_listener_outcome(
                         // enqueue_dedup (live fires too): the re-park path
                         // IS a re-insert path, so a non-deduped live task
                         // and its re-parked twin would otherwise both run.
-                        let fire_id = dedup_nonce_owned
+                        let fire_id = parked_id
                             .clone()
                             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                        let task_payload = serde_json::json!({
-                            "token": token_owned,
-                            "fire_id": fire_id,
-                            "payload": outcome.value,
-                            "tenant_id": tenant_str,
-                        });
+                        let task_payload = serde_json::to_value(
+                            crate::task_kinds::route_entry::RouteEntryPayload {
+                                token: token_owned.clone(),
+                                fire_id: fire_id.clone(),
+                                payload: outcome.value,
+                                tenant_id: tenant_str.clone(),
+                                attempts,
+                            },
+                        )?;
                         let key = format!("entry:{token_owned}:{fire_id}");
                         weft_task_store::tasks::enqueue_dedup(
                             &state.pg_pool,
@@ -830,12 +1009,12 @@ pub async fn cancel_signal(
     }
 
     if let Some(color) = row.color {
-        // cancel_color strips wake signals for the color and
-        // enqueues a cancel_execution task. The worker fires the
-        // per-color Notify, journals NodeCancelled per non-terminal
-        // node + ExecutionFailed, and the journal bridge publishes
-        // each event onto the project SSE bus.
-        crate::api::execution::cancel_color(&state, color)
+        // cancel_color, in one transaction, strips the color's wake
+        // signals, journals NodeCancelled per non-terminal node plus
+        // ExecutionCancelled, and queues the cancel task for the pod
+        // driving it (which flips the run's CancellationFlag); the
+        // journal bridge publishes each row onto the project SSE bus.
+        crate::api::execution::cancel_color(&state, color, &weft_core::exec::CancelCause::User)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
     } else {
@@ -848,6 +1027,135 @@ pub async fn cancel_signal(
 }
 
 /// `GET /signal-token/signals` (signal token in `Authorization: Bearer`).
+/// `GET /signal-token/signals/{signal token}/files/{field}`: the link a
+/// consumer fetches a form's stored file through, made at the moment it
+/// asks. The consumer payload carries a stored file as its facts only
+/// (`FormSchema::for_consumer`), so a form answered a month after it
+/// parked still shows its image: the link is never stored, it is minted
+/// on every read and lives an hour. A file that is gone answers 410 in
+/// the consumer's own terms (the store's own message names the storage
+/// key, which is exactly what this door keeps in); a store that cannot
+/// be reached answers 502, because "your file is gone" is a claim a
+/// timeout does not support.
+///
+/// Scoped exactly like the listing: the bearer is the api token, the
+/// signal must be one that token sees (same tenant, allowed projects and
+/// tags, project visibility), the field is one the signal's kind names a
+/// file for (`Signal::stored_file`, asked through the kind inventory so
+/// this door knows no kind), and the file must belong to the signal (its
+/// project, its execution, or the tenant's shared space). Anything else
+/// is 404, so a token learns nothing about signals or files it cannot see.
+pub async fn signal_file_for_token(
+    State(state): State<DispatcherState>,
+    headers: HeaderMap,
+    Path((signal_token, field)): Path<(String, String)>,
+) -> Result<Json<SignalFileLink>, (StatusCode, String)> {
+    let api_token = bearer_token(&headers)?;
+    let scope = require_scoped_signal_token(&state, &api_token).await?;
+    let not_found = || (StatusCode::NOT_FOUND, "no such signal file".to_string());
+    let visible = scope
+        .visible_signals(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
+    // The same row set the listing serves. A row is listed only when
+    // its kind rendered a consumer payload (a form does; a socket or a
+    // poll returns nothing to show), so a row with none is not a
+    // consumer's to read files from either.
+    let sig = visible
+        .into_iter()
+        .find(|s| s.token == signal_token && s.consumer_payload.is_some())
+        .ok_or_else(not_found)?;
+    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&sig.spec_json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt signal spec: {e}")))?;
+    // A field that holds no file is a 404; a field whose file cannot be
+    // read is the signal being broken, and says so.
+    let file = weft_core::signal::stored_file(&spec, &field)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(not_found)?;
+    let parsed = weft_core::storage::key::parse_key(&file.key).map_err(|_| not_found())?;
+    if !file_belongs_to_signal(&parsed, &sig) {
+        return Err(not_found());
+    }
+    // The store's own message names the storage key, and this door
+    // exists so a consumer never sees one. Say what happened in the
+    // consumer's terms and keep the store's text for the operator log.
+    let link = crate::storage::download_link(&state, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS))
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                target: "weft_dispatcher::api::signal",
+                key = %file.key,
+                error = format!("{e:#}"),
+                "a signal's file could not be linked"
+            );
+            // Only a store that says the file is gone means it is gone.
+            // A timeout or a refused credential is the store being
+            // unreachable, and telling the consumer their file is
+            // permanently lost (and to re-run the workflow, which costs
+            // real calls) would be a claim this never established.
+            if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() {
+                (
+                    StatusCode::GONE,
+                    format!(
+                        "the file behind '{field}' is no longer available: it expired or was \
+                         deleted. Run the workflow again to make it afresh."
+                    ),
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("the file behind '{field}' could not be reached just now; try again"),
+                )
+            }
+        })?;
+    // The facts come from the signal's own value, not from the link:
+    // they describe the file the form is showing, and the mime (which
+    // the store's answer does not carry) has to come from there anyway,
+    // so taking all four from one source keeps them consistent.
+    Ok(Json(SignalFileLink {
+        url: link.url,
+        mime_type: file.mime_type,
+        size_bytes: file.size_bytes,
+        filename: file.filename,
+    }))
+}
+
+/// What the files door answers: a link that lives an hour, plus the
+/// facts a consumer needs to render the file without fetching it.
+// SYNC: SignalFileLink <-> extension-browser/src/lib/api.ts TaskFileLink, crates/weft-core/src/signal/form.rs consumer_file_value (the URL-backed arm publishes the same four keys)
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalFileLink {
+    pub url: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub filename: String,
+}
+
+/// How long a link the files door hands out lives: the same hour a
+/// node's own inputs get, long enough to look at, short enough that a
+/// leaked link is soon worthless. A consumer asks again when it renders.
+const SIGNAL_FILE_LINK_TTL_SECS: u64 = 3600;
+
+/// May a signal's consumer be handed this file: the file sits in the
+/// signal's own tenant, and in the signal's project (a project file or
+/// asset), its execution (a file the run made), or the tenant's shared
+/// space. A file of another project or run is not the form's to show.
+fn file_belongs_to_signal(
+    parsed: &weft_core::storage::key::ParsedKey,
+    sig: &crate::journal::SignalRegistration,
+) -> bool {
+    use weft_core::storage::key::KeyScope;
+    if parsed.tenant != sig.tenant_id {
+        return false;
+    }
+    match &parsed.scope {
+        KeyScope::Project { project_id } | KeyScope::Asset { project_id } => *project_id == sig.project_id,
+        KeyScope::Exec { color } => sig.color.is_some_and(|c| c.to_string() == *color),
+        KeyScope::Shared { .. } => true,
+    }
+}
+
 /// Scoped enumeration. Filters by
 /// the signal token's allowed_projects, allowed_tags AND
 /// by project visibility (`fires_visible_to_consumers = TRUE`):
@@ -964,7 +1272,9 @@ pub async fn clear_all_signals(
 /// the whole clear-all. (The handler exists for the admin "drop
 /// everything" verb where best-effort is the contract.)
 async fn cancel_color_logged(state: &DispatcherState, color: weft_core::Color) {
-    if let Err(e) = crate::api::execution::cancel_color(state, color).await {
+    if let Err(e) =
+        crate::api::execution::cancel_color(state, color, &weft_core::exec::CancelCause::User).await
+    {
         tracing::warn!(
             target: "weft_dispatcher::signal",
             %color, error = %e,
@@ -1054,8 +1364,10 @@ impl TokenScope {
         &self,
         state: &DispatcherState,
     ) -> anyhow::Result<Vec<crate::journal::SignalRegistration>> {
-        use sqlx::Row;
-        let rows = sqlx::query(
+        // One decoder for a signal row, shared with the journal
+        // (`row_to_signal`): the SELECT differs (a join and the
+        // consumer filters), the decoding must not.
+        let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(
             "SELECT s.token, s.tenant_id, s.project_id, s.color, s.node_id, s.is_resume, \
                     s.spec_json, s.access_id, s.consumer_kind, s.tags, s.port_snapshot, \
                     s.consumer_payload, \
@@ -1080,42 +1392,7 @@ impl TokenScope {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            // Color parse fails loud: a corrupt `color` would silently
-            // reclassify a resume signal as an entry signal, and
-            // `clear_all_signals` would then DELETE it instead of
-            // cancelling its execution. (consumer_payload stays
-            // best-effort: it's display-only enumeration data.)
-            let color_str: Option<String> = r.try_get("color")?;
-            let color = match color_str {
-                Some(s) => Some(
-                    s.parse::<weft_core::Color>()
-                        .map_err(|e| anyhow::anyhow!("corrupt signal.color '{s}': {e}"))?,
-                ),
-                None => None,
-            };
-            let payload_str: Option<String> = r.try_get("consumer_payload")?;
-            let consumer_payload =
-                payload_str.and_then(|s| serde_json::from_str(&s).ok());
-            out.push(crate::journal::SignalRegistration {
-                token: r.try_get("token")?,
-                tenant_id: r.try_get("tenant_id")?,
-                project_id: r.try_get("project_id")?,
-                color,
-                node_id: r.try_get("node_id")?,
-                is_resume: r.try_get("is_resume")?,
-                spec_json: r.try_get("spec_json")?,
-                access_id: r.try_get("access_id")?,
-                consumer_kind: r.try_get("consumer_kind")?,
-                tags: r.try_get("tags")?,
-                port_snapshot: r.try_get("port_snapshot")?,
-                consumer_payload,
-                surface_kind: r.try_get("surface_kind")?,
-                mount_path: r.try_get("mount_path")?,
-                auth_kind: r.try_get("auth_kind")?,
-                auth_config: r.try_get("auth_config")?,
-                kind_state: r.try_get("kind_state")?,
-                kind_state_seq: r.try_get("kind_state_seq")?,
-            });
+            out.push(crate::journal::postgres::row_to_signal(r)?);
         }
         Ok(out)
     }
@@ -1202,7 +1479,6 @@ pub async fn fire_public_entry(
         // tokens use surface_kind='task_callback' and hit a
         // different route (lookup-by-token), never this one.
         surface_kind: "public_entry".to_string(),
-        is_resume: false,
     };
     apply_lifecycle_gate(&state, &token, &routing, payload).await
 }
@@ -1535,38 +1811,28 @@ async fn prepare_live_execution(
     let project_def: weft_core::ProjectDefinition = serde_json::from_str(&project_json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def parse: {e}")))?;
 
-    let kicks =
-        crate::api::project::compute_trigger_kicks(&project_def, node_id, &Value::Null, port_snapshot);
-    if kicks.is_empty() {
+    let Some(crate::api::project::TriggerFire { kicks, subgraph }) =
+        crate::api::project::compute_trigger_fire(&project_def, node_id, &Value::Null, port_snapshot)
+    else {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("live trigger '{node_id}' has nothing downstream to run"),
         ));
-    }
+    };
 
     let now = crate::lease::now_unix() as u64;
-    let start = weft_journal::ExecEvent::ExecutionStarted {
+    // The fire's computed subgraph rides on ExecutionStarted: the
+    // boundary the engine holds the run to (see `TriggerFire`).
+    let (start, kick_events) = crate::api::project::execution_birth_events(
         color,
-        project_id: project_id.to_string(),
-        entry_node: node_id.to_string(),
-        phase: weft_core::context::Phase::Fire,
-        definition_hash: Some(definition_hash.clone()),
-        node_test: false,
-        // A live-trigger fire runs the whole graph, like any fire.
-        subgraph: None,
-        at_unix: now,
-    };
-    let kick_events: Vec<weft_journal::ExecEvent> = kicks
-        .iter()
-        .map(|kick| weft_journal::ExecEvent::NodeKicked {
-            color,
-            node_id: kick.node_id.clone(),
-            firing: kick.firing,
-            payload: kick.payload.clone(),
-            port_snapshot: kick.port_snapshot.clone(),
-            at_unix: now,
-        })
-        .collect();
+        project_id,
+        weft_core::context::Phase::Fire,
+        node_id,
+        &kicks,
+        &definition_hash,
+        Some(&subgraph),
+        now,
+    );
     let spec_json = serde_json::to_value(spec)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec serialize: {e}")))?;
     // The pinned execute task, unpinned here: the admission picks the pod and
@@ -1768,7 +2034,9 @@ async fn teardown_unclaimed_live_execution(state: &DispatcherState, color: uuid:
         .journal
         .cancel_never_claimed_execution(
             color,
-            "live-connection setup failed; no worker run was created",
+            &weft_core::exec::CancelCause::Runtime {
+                detail: "live-connection setup failed; no worker run was created".into(),
+            },
         )
         .await
     {
@@ -2275,5 +2543,54 @@ mod can_cancel_tests {
             !a.can_cancel_within_tenant(&sig),
             "a tag-scoped token can never cancel (403)"
         );
+    }
+}
+
+#[cfg(test)]
+mod signal_file_scope_tests {
+    use super::file_belongs_to_signal;
+    use crate::journal::SignalRegistration;
+    use weft_core::storage::key::parse_key;
+
+    fn signal(color: Option<&str>) -> SignalRegistration {
+        SignalRegistration {
+            token: "tok-1".into(),
+            tenant_id: "t".into(),
+            project_id: "p".into(),
+            color: color.map(|c| c.parse().expect("a uuid")),
+            node_id: "n".into(),
+            is_resume: color.is_some(),
+            spec_json: "{}".into(),
+            access_id: None,
+            consumer_kind: None,
+            tags: vec![],
+            port_snapshot: None,
+            consumer_payload: None,
+            surface_kind: "task_callback".into(),
+            mount_path: None,
+            auth_kind: "none".into(),
+            auth_config: None,
+            kind_state: serde_json::Value::Object(Default::default()),
+            kind_state_seq: 0,
+        }
+    }
+
+    /// A form may show its own project's files, its own run's files,
+    /// and the tenant's shared files; nothing of another tenant,
+    /// project or run.
+    #[test]
+    fn a_file_is_the_forms_to_show_only_inside_its_own_walls() {
+        let color = "11111111-1111-1111-1111-111111111111";
+        let sig = signal(Some(color));
+        let ok = |key: &str| file_belongs_to_signal(&parse_key(key).expect(key), &sig);
+        assert!(ok("t/project/p/cat"));
+        assert!(ok("t/asset/p/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+        assert!(ok(&format!("t/exec/{color}/cat")));
+        assert!(ok("t/shared/pool/cat"));
+        assert!(!ok("other/project/p/cat"), "another tenant");
+        assert!(!ok("t/project/q/cat"), "another project");
+        assert!(!ok("t/exec/22222222-2222-2222-2222-222222222222/cat"), "another run");
+        let entry = signal(None);
+        assert!(!file_belongs_to_signal(&parse_key(&format!("t/exec/{color}/cat")).unwrap(), &entry), "an entry signal has no run");
     }
 }

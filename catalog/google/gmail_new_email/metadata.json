@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.readonly"
@@ -23,7 +23,6 @@
       "name": "query",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "Search query",
       "placeholder": "label:inbox",
       "description": "A Gmail search query filtering which messages fire. Empty = every new message."
@@ -31,14 +30,17 @@
     {
       "name": "intervalSecs",
       "type": "Number",
-      "exposure": "config",
       "default": 60,
-      "label": "Check every (seconds)"
+      "label": "Check every (seconds)",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
     },
     {
       "name": "includeAttachments",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -49,58 +51,47 @@
   "outputs": [
     {
       "name": "id",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "subject",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "from",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "to",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "date",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "body",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "bodyIsHtml",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     },
     {
       "name": "threadId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "snippet",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "labels",
-      "type": "List[String]",
-      "required": false
+      "type": "List[String]"
     },
     {
       "name": "attachments",
-      "type": "List[File]",
-      "required": false
+      "type": "List[File]"
     }
   ],
   "features": {

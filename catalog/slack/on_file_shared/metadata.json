@@ -15,7 +15,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "files:read"
@@ -26,7 +26,6 @@
       "name": "channel",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -55,19 +54,16 @@
     {
       "name": "fileId",
       "type": "String",
-      "required": false,
       "description": "The shared file's id (F...)."
     },
     {
       "name": "channel",
       "type": "String",
-      "required": false,
       "description": "The channel it was shared into."
     },
     {
       "name": "user",
       "type": "String",
-      "required": false,
       "description": "Who shared it."
     }
   ]

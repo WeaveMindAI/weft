@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The object store access (wire an S3Access node)."
     },
@@ -42,11 +42,7 @@
     {
       "name": "etag",
       "type": "String",
-      "required": false,
       "description": "The stored object's ETag."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

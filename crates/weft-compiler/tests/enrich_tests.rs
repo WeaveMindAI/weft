@@ -107,6 +107,45 @@ t = Text() -> (bogus: String) { value: "hi" }
     );
 }
 
+/// An output takes no value: a firing emits on it. On a node that
+/// accepts custom inputs, a braces key, a statement, or a wire aimed at
+/// one of its outputs is refused instead of quietly creating an input
+/// of the same name beside the output.
+#[test]
+fn a_value_on_an_output_port_is_refused_instead_of_creating_an_input() {
+    let cases = [
+        ("braces", "t = ExecPython -> (o: String) {\n  code: \"return {}\"\n  o: \"hi\"\n}\n"),
+        ("statement", "t = ExecPython -> (o: String) { code: \"return {}\" }\nt.o = \"hi\"\n"),
+        ("wire", "s = Text { value: \"x\" }\nt = ExecPython -> (o: String) { code: \"return {}\" }\nt.o = s.value\n"),
+    ];
+    for (name, src) in cases {
+        let mut project = compile(src, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        let err = enrich(&mut project, &catalog()).expect_err(name);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("'o' is an output port") && msg.contains("takes no value") && msg.contains("`t.o`"),
+            "{name}: {msg}"
+        );
+    }
+    // The same name on both sides (a passthrough's `value`/`value`)
+    // is an input first: the value lands there.
+    let mut project = compile("t = Text { value: \"x\" }\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &catalog()).expect("an input that shares its output's name takes the value");
+    // The opt-in on a custom node: declare the input in the signature and
+    // every spelling drives it again.
+    let declared = [
+        ("braces", "t = ExecPython(o: String) -> (o: String) {\n  code: \"return {}\"\n  o: \"hi\"\n}\n"),
+        ("statement", "t = ExecPython(o: String) -> (o: String) { code: \"return {}\" }\nt.o = \"hi\"\n"),
+        ("wire", "s = Text { value: \"x\" }\nt = ExecPython(o: String) -> (o: String) { code: \"return {}\" }\nt.o = s.value\n"),
+    ];
+    for (name, src) in declared {
+        let mut project = compile(src, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        enrich(&mut project, &catalog()).unwrap_or_else(|e| panic!("{name}: a declared input takes the value: {e}"));
+        let t = project.nodes.iter().find(|n| n.id == "t").unwrap();
+        assert!(t.inputs.iter().any(|p| p.name == "o") && t.outputs.iter().any(|p| p.name == "o"), "{name}");
+    }
+}
+
 // ─── Layer 2 wire-shape: Loop boundary nodes round-trip ────────────────────
 
 #[test]
@@ -400,7 +439,7 @@ fn human_trigger_accepts_a_matching_declared_port_header() {
     // "custom output port" even though HumanTrigger forbids custom ports.
     let source = r#"
 
-human = HumanTrigger() -> (test_approved: Boolean?, test_rejected: Boolean?) {
+human = HumanTrigger() -> (test_approved: Boolean, test_rejected: Boolean) {
   fields: [ { "kind": "approve_reject", "key": "test" } ]
 }
 out = Debug

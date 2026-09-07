@@ -60,7 +60,6 @@
     {
       "name": "connection",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -70,7 +69,6 @@
       "name": "model",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "remote_select",
         "access": "connection",
@@ -92,7 +90,6 @@
     {
       "name": "servingProvider",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },
@@ -103,7 +100,6 @@
     {
       "name": "providerFallbacks",
       "type": "Boolean",
-      "exposure": "config",
       "label": "Allow provider fallbacks",
       "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top-ranked choice) is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else."
     }
@@ -112,25 +108,10 @@
     {
       "name": "provider",
       "type": "LlmProvider",
-      "required": false,
       "description": "The provider value: wire it into an LLM node's provider input."
     }
   ],
   "validate": [
-    {
-      "when": {
-        "kind": "not",
-        "of": {
-          "kind": "config_nonempty",
-          "field": "connection"
-        }
-      },
-      "then": {
-        "message": "OpenRouterProvider '{id}' has no connection picked; pick one on the node.",
-        "level": "runtime",
-        "field": "connection"
-      }
-    },
     {
       "when": {
         "kind": "not",

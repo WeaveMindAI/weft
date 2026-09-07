@@ -45,8 +45,6 @@ extension-browser-v1/web-ext-artifacts/*
 # Misc v1 (frozen but kept out of build)
 dashboard-v1/static/projects
 
-# AI agent scratch
-.claude/agents/prompt-engineering.md
 # The agent memory index is private working notes, not part of the public repo.
 CODE_QUALITY_TRIAGE.md
 packages/weft-graph/node_modules
@@ -66,3 +64,4 @@ packages/weft-syntax/node_modules
 
 # Example projects generate build state when opened; never commit it.
 examples/*/.weft/
+tangle/old

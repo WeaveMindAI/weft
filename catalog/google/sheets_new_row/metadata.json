@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/drive.file"
@@ -94,15 +94,18 @@
     {
       "name": "intervalSecs",
       "type": "Number",
-      "exposure": "config",
       "default": 30,
       "label": "Check every (seconds)",
-      "description": "How often the sheet is checked for new rows."
+      "description": "How often the sheet is checked for new rows.",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
     },
     {
       "name": "hasHeader",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -115,19 +118,16 @@
     {
       "name": "row",
       "type": "JsonDict",
-      "required": false,
       "description": "The new row keyed by the header (positional c0, c1, ... without one)."
     },
     {
       "name": "cells",
       "type": "List[String]",
-      "required": false,
       "description": "The new row's raw cells in order."
     },
     {
       "name": "rowNumber",
       "type": "Number",
-      "required": false,
       "description": "The new row's 1-based sheet row number."
     }
   ],

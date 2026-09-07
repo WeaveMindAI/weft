@@ -9,6 +9,7 @@ use crate::cancellation::CancellationFlag;
 use crate::error::{WeftError, WeftResult};
 use crate::frames::LoopFrames;
 use crate::primitive::SignalSpec;
+use crate::tag::StopSelf;
 use crate::weft_type::WeftType;
 use crate::Color;
 
@@ -46,6 +47,17 @@ impl Phase {
             Self::Fire => "fire",
         }
     }
+
+    /// The inverse of `as_str`: a stored or typed tag back to the
+    /// phase, `None` for anything else. Every reader of a phase
+    /// written as text (the DB column, a CLI flag) comes through here,
+    /// so the set of names has one definition.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == tag)
+    }
+
+    /// Every phase, for a caller that has to offer the choice.
+    pub const ALL: [Phase; 3] = [Self::InfraSetup, Self::TriggerSetup, Self::Fire];
 }
 
 /// How long a node's provider work may take, unless it says otherwise
@@ -95,7 +107,70 @@ pub struct ExecutionContext {
     handle: Arc<dyn ContextHandle>,
 }
 
+/// How long a link minted for a node body stays fetchable. A body
+/// reads its inputs at the start and is done long before this; the
+/// link never leaves the firing (every exit strips it), so a short
+/// life costs nothing and bounds what a leaked URL is worth.
+pub const NODE_LINK_TTL_SECS: u64 = 60 * 60;
+
+/// An emission with every firing-scoped file link taken off: what
+/// leaves a node is the stored form, never a link that expires.
+fn without_links(mut output: crate::node::NodeOutput) -> crate::node::NodeOutput {
+    for value in output.outputs.values_mut() {
+        *value = crate::storage::media::strip_links(value);
+    }
+    output
+}
+
 impl ExecutionContext {
+    /// Put a fetchable link on every stored file among this firing's
+    /// inputs, per the declared port types (`ports` is the node's
+    /// inputs: name and type). A key-backed marker keeps its `key`
+    /// (a Rust node reads the bytes through storage as before) and
+    /// gains a `url` good for [`NODE_LINK_TTL_SECS`], which is what a
+    /// body that only speaks URLs (a Python snippet, a provider) reads.
+    /// The link exists inside the firing only: every way a value
+    /// leaves the node strips it, and the journal never sees it. A
+    /// link that cannot be minted fails the firing loudly.
+    pub async fn link_file_inputs<'a>(
+        &mut self,
+        ports: impl Iterator<Item = (&'a str, &'a WeftType)>,
+    ) -> WeftResult<()> {
+        use crate::storage::media::{classify_media_slot, media_slots, with_links, MediaSlotContent};
+        let storage = self.storage(crate::storage::StorageScope::Project);
+        let mut linked: Vec<(String, Value)> = Vec::new();
+        for (name, ty) in ports {
+            if !ty.references_file() {
+                continue;
+            }
+            let Some(value) = self.inputs.values.get(name) else { continue };
+            let mut links = std::collections::HashMap::new();
+            for slot in media_slots(value, ty) {
+                let Ok(MediaSlotContent::Stored { handle, .. }) = classify_media_slot(&slot) else {
+                    continue;
+                };
+                if !matches!(handle, crate::storage::FileHandle::Key(_)) {
+                    continue;
+                }
+                let file = crate::storage::StoredFile::from_value(&slot)?;
+                let url = storage.presign(&handle, Some(NODE_LINK_TTL_SECS)).await.map_err(|error| {
+                    crate::error::node_error(format!(
+                        "Input '{name}' needs file '{}', but it could not be opened: {error}",
+                        file.filename
+                    ))
+                })?;
+                links.insert(slot.to_string(), url);
+            }
+            if !links.is_empty() {
+                linked.push((name.to_string(), with_links(value, ty, &links)));
+            }
+        }
+        for (name, value) in linked {
+            self.inputs.values.insert(name, value);
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_id: String,
@@ -132,9 +207,10 @@ impl ExecutionContext {
     ///
     /// Returns the value the fire carried.
     pub async fn await_signal<K: crate::signal::Signal>(&self, kind: K) -> WeftResult<Value> {
-        self.handle
-            .await_signal(crate::signal::to_spec(kind))
-            .await
+        let mut spec = crate::signal::to_spec(kind);
+        // A parked signal outlives the firing's file links.
+        spec.config = crate::storage::media::strip_links(&spec.config);
+        self.handle.await_signal(spec).await
     }
 
     // ----- Entry-trigger registration --------------------------------
@@ -164,15 +240,15 @@ impl ExecutionContext {
         // trigger's inputs are whatever they were at trigger setup
         // (re-activation re-registers and re-snapshots).
         let port_snapshot =
-            Value::Object(self.inputs.values.clone());
-        self.handle
-            .register_signal(crate::signal::to_spec(kind), port_snapshot)
-            .await
+            crate::storage::media::strip_links(&Value::Object(self.inputs.values.clone()));
+        let mut spec = crate::signal::to_spec(kind);
+        spec.config = crate::storage::media::strip_links(&spec.config);
+        self.handle.register_signal(spec, port_snapshot).await
     }
 
     // ----- Memoized step ---------------------------------------------
 
-    /// Run `work` once and journal its output, OR return the past
+    /// Run `work` and save its output, OR return the past
     /// journaled output on replay. Use this to wrap any
     /// non-deterministic / side-effecting work between awaits so
     /// the value stays consistent across replays.
@@ -188,9 +264,10 @@ impl ExecutionContext {
     /// }).await?;
     /// ```
     ///
-    /// The closure runs at most once across all replays of this
-    /// (node, frames). On every subsequent replay the journaled
-    /// output is returned directly without invoking the closure.
+    /// Once its result is saved, subsequent replays of this
+    /// (node, frames) return that output without invoking the closure.
+    /// A crash after the action but before saving can repeat it; the
+    /// receiving service must prevent duplicates when they matter.
     /// `name` is author-supplied for log traceability; the
     /// runtime keys on call_index ordering, not on the name.
     pub async fn run<F, Fut>(&self, name: &str, work: F) -> WeftResult<Value>
@@ -207,7 +284,7 @@ impl ExecutionContext {
         if let Some(value) = maybe_value {
             return Ok(value);
         }
-        let value = work().await?;
+        let value = crate::storage::media::strip_links(&work().await?);
         self.handle.run_record(name, call_index, &value).await?;
         Ok(value)
     }
@@ -223,7 +300,7 @@ impl ExecutionContext {
     /// mentions, neither here nor via `close_port`, get a CLOSURE marker
     /// at termination so downstream consumers learn nothing's coming.
     pub async fn pulse_downstream(&self, output: crate::node::NodeOutput) -> WeftResult<()> {
-        self.handle.pulse_downstream(output, false).await
+        self.handle.pulse_downstream(without_links(output), false).await
     }
 
     /// [`Self::pulse_downstream`] that DOES NOT RETURN until the
@@ -250,7 +327,7 @@ impl ExecutionContext {
         &self,
         output: crate::node::NodeOutput,
     ) -> WeftResult<()> {
-        self.handle.pulse_downstream(output, true).await
+        self.handle.pulse_downstream(without_links(output), true).await
     }
 
     /// Allow the stream on `port` (a `Generator[T]` output of this
@@ -432,6 +509,7 @@ impl ExecutionContext {
         StorageHandle {
             handle: self.handle.clone(),
             scope,
+            identity: None,
         }
     }
 
@@ -535,6 +613,61 @@ impl ExecutionContext {
     /// the commit point.
     pub async fn log(&self, level: LogLevel, message: impl Into<String>) -> WeftResult<()> {
         self.handle.log(level, message.into()).await
+    }
+
+    // ----- Steering other executions ---------------------------------
+
+    /// Tag THIS execution. Additive: the tags join whatever the run
+    /// already carries, and tagging twice with the same tag is a
+    /// no-op, so a body re-run after a crash lands on the same state.
+    /// Any node can call it, at any point. The tags are what a sibling
+    /// run's [`Self::stop_tagged`] selects on, and they show on the
+    /// run in the inspector.
+    ///
+    /// Tag grammar is [`crate::tag`]'s: `[A-Za-z0-9_-]{1,64}`. A bad
+    /// tag fails here, before anything is written, naming the character.
+    pub async fn tag_execution<I, S>(&self, tags: I) -> WeftResult<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let tags: Vec<String> = tags.into_iter().map(Into::into).collect();
+        if tags.is_empty() {
+            return Err(WeftError::Input("tag_execution needs at least one tag".into()));
+        }
+        crate::tag::validate_tags(&tags).map_err(|e| WeftError::Input(e.to_string()))?;
+        self.handle.tag_execution(tags).await
+    }
+
+    /// Stop every live execution of this project carrying `tag`, right
+    /// now: the ones running, the ones parked on a signal or a timer
+    /// (their wake is erased, so they never resume), and the ones whose
+    /// wake is already in flight (it finds the run dead and does
+    /// nothing). Each stopped run is journaled `ExecutionCancelled`
+    /// naming this execution and the tag, so it reads as exactly that
+    /// in the inspector, never as a failure.
+    ///
+    /// `stop_self` says whether this run is one of them. With
+    /// [`StopSelf::Keep`] the call only reaches executions that tagged
+    /// themselves BEFORE this one did (or, if this run never carried
+    /// the tag, everything carrying it now): two runs that both say
+    /// "stop the others, keep me" a few milliseconds apart therefore
+    /// leave the LATER one alive instead of killing each other. With
+    /// [`StopSelf::Include`] every live run carrying the tag goes,
+    /// this one too: its current await returns cancelled at the next
+    /// cancellation point, exactly as `weft stop` would end it.
+    ///
+    /// The stop is asynchronous: this call returns once the request is
+    /// durably queued, and the runtime carries it out. A node that
+    /// needs the siblings gone before its next step has no such
+    /// guarantee and should not be written to depend on one.
+    ///
+    /// Never crosses a project: a tag is scoped to the project the
+    /// caller runs in, and the broker refuses anything else.
+    pub async fn stop_tagged(&self, tag: impl Into<String>, stop_self: StopSelf) -> WeftResult<()> {
+        let tag = tag.into();
+        crate::tag::validate_tag(&tag).map_err(|e| WeftError::Input(e.to_string()))?;
+        self.handle.stop_tagged(tag, stop_self).await
     }
 
     // ----- Read helpers ----------------------------------------------
@@ -703,6 +836,33 @@ pub struct ValueBag {
     /// so [`Self::custom`] can hand back just the instance data. Empty
     /// on wake and nested bags.
     spec_names: std::collections::HashSet<String>,
+    /// The node's access (connection-picker) inputs, keyed by input
+    /// name, carrying what the compiler stamped from the service
+    /// recipe. [`Self::access`] reads the pick through this, so the
+    /// metadata's `connection_optional` is the single source of truth
+    /// for whether a node runs unconnected: no body restates it.
+    /// pub(crate): the node-test rig builds its bag from the manifest
+    /// and fills this from the recipe, the same facts enrich stamps.
+    pub(crate) access_ports: std::collections::BTreeMap<String, AccessPort>,
+}
+
+/// What [`ValueBag::access`] knows about one access input: the service
+/// the widget was stamped with and whether the recipe declared the
+/// connection optional.
+#[derive(Debug, Clone)]
+pub struct AccessPort {
+    pub service: String,
+    pub optional: bool,
+}
+
+impl AccessPort {
+    /// The bag entry a service recipe implies: the same two facts
+    /// enrich stamps onto the access widget. The node-test rig (which
+    /// runs with no enrich pass) fills its bag through this, so the
+    /// two derivations cannot drift.
+    pub fn from_recipe(spec: &crate::access::spec::AccessSpec) -> Self {
+        Self { service: spec.service.clone(), optional: spec.connection_optional }
+    }
 }
 
 impl ValueBag {
@@ -711,7 +871,14 @@ impl ValueBag {
         spec_names: std::collections::HashSet<String>,
         order: Vec<String>,
     ) -> Self {
-        Self { values, order: Some(order), side: BagSide::Inputs, no_record: None, spec_names }
+        Self {
+            values,
+            order: Some(order),
+            side: BagSide::Inputs,
+            no_record: None,
+            spec_names,
+            access_ports: Default::default(),
+        }
     }
 
     /// The wake bag: the fire payload's top-level fields when the
@@ -726,7 +893,14 @@ impl ValueBag {
             None => Some("no wake payload was delivered for this firing".into()),
         };
         let values = payload.and_then(Value::as_object).cloned().unwrap_or_default();
-        Self { values, order: None, side: BagSide::Wake, no_record, spec_names: Default::default() }
+        Self {
+            values,
+            order: None,
+            side: BagSide::Wake,
+            no_record,
+            spec_names: Default::default(),
+            access_ports: Default::default(),
+        }
     }
 
     /// The whole bag as one record. The inputs bag always has one; a
@@ -815,6 +989,30 @@ impl ValueBag {
             .collect()
     }
 
+    /// Read the picked connection on the access input `name`. `Some`
+    /// when a connection is picked; `None` when none is AND the service
+    /// recipe declared `connection_optional` (the node runs
+    /// unconnected). A missing pick on a required connection errors
+    /// naming the service, and reading a non-access input this way is
+    /// its own loud error. The metadata is the single source of truth:
+    /// no node body declares whether its connection is required.
+    pub fn access(&self, name: &str) -> WeftResult<Option<crate::access::Access>> {
+        let Some(port) = self.access_ports.get(name) else {
+            return Err(self.err(format!(
+                "{} '{name}' is not an access (connection picker) input",
+                self.noun()
+            )));
+        };
+        match self.opt::<crate::access::Access>(name)? {
+            Some(marker) => Ok(Some(marker)),
+            None if port.optional => Ok(None),
+            None => Err(self.err(format!(
+                "no {} connection picked; connect one on the node",
+                port.service
+            ))),
+        }
+    }
+
     /// The raw value behind `name`, if any. For pass-through reads that
     /// must not reinterpret the value; a REQUIRED raw read is
     /// `get::<Value>(name)`.
@@ -838,7 +1036,14 @@ impl ValueBag {
                 )))
             }
         };
-        Ok(Self { values, order: None, side: self.side, no_record: None, spec_names: Default::default() })
+        Ok(Self {
+            values,
+            order: None,
+            side: self.side,
+            no_record: None,
+            spec_names: Default::default(),
+            access_ports: Default::default(),
+        })
     }
 
     /// Iterate over every named value (name + raw value), the node's
@@ -862,6 +1067,57 @@ impl ValueBag {
     /// uniform surface over all of them.
     pub fn custom(&self) -> impl Iterator<Item = (&String, &Value)> {
         self.values.iter().filter(|(k, _)| !self.spec_names.contains(k.as_str()))
+    }
+
+    /// The values behind the named holes of a text, in hole order.
+    ///
+    /// A node whose input ports ARE its parameters (a SQL query
+    /// reading `$user_id`, a template reading `{{user}}`) has the same
+    /// job twice over: every hole needs a port, and every custom port
+    /// needs a hole. Both mismatches are the author's, and both
+    /// refusals have to name the thing they wrote, so the matching
+    /// lives here instead of once per node. `what` is the node's own
+    /// word for the text ("query", "template"), `spell` writes a name
+    /// back the way that text spells a hole, and `declare` is the
+    /// header the refusal tells them to write.
+    ///
+    /// A hole with no port is an error rather than a null: a
+    /// placeholder reading nothing is a bug to name, not a value to
+    /// invent. A port with no hole is an error too: a wired value the
+    /// text never reads is a typo waiting to be found in production.
+    pub fn for_holes(
+        &self,
+        holes: &[String],
+        what: &str,
+        spell: impl Fn(&str) -> String,
+        declare: impl Fn(&str) -> String,
+    ) -> WeftResult<Vec<&Value>> {
+        let ports: std::collections::BTreeMap<&String, &Value> = self.custom().collect();
+        let arrived: Vec<&str> = ports.keys().map(|k| k.as_str()).collect();
+        let mut values = Vec::with_capacity(holes.len());
+        for hole in holes {
+            let Some(value) = ports.get(hole) else {
+                return Err(self.err(format!(
+                    "the {what} reads `{}` but no `{hole}` input carried a value; declare the \
+                     port on the node (`{}`) and wire it. Ports that arrived: [{}]",
+                    spell(hole),
+                    declare(hole),
+                    arrived.join(", ")
+                )));
+            };
+            values.push(*value);
+        }
+        for port in ports.keys() {
+            if !holes.iter().any(|h| h == *port) {
+                return Err(self.err(format!(
+                    "the `{port}` input is wired but the {what} never reads `{}`; read it, or \
+                     drop the port. Holes in the {what}: [{}]",
+                    spell(port),
+                    holes.iter().map(|h| spell(h)).collect::<Vec<_>>().join(", ")
+                )));
+            }
+        }
+        Ok(values)
     }
 
     /// Every input the firing DELIVERED, in the node's port order (a
@@ -894,18 +1150,15 @@ impl ValueBag {
 }
 
 /// Build a node's ONE input bag for a firing. `delivered` is what the
-/// ready paths handed over: wired pulse values plus the body literals
-/// the enrich normalization homed in `node.port_literals`. On top of
-/// that, in precedence order (earlier wins):
-///
-///   1. `delivered` (wires + `all`/`assignment`-form literals);
-///   2. the node's remaining `config` object verbatim (braces literals
-///      on `config`-exposure inputs, reserved `_` keys, passthrough
-///      keys on nodes that accept them);
-///   3. declared defaults, for declared inputs still absent, unless the
-///      input's wire arrived CLOSED (`closed_ports`): a closure means
-///      upstream produced nothing, and silently substituting the
-///      default would mask that.
+/// ready paths handed over: wired pulse values plus every constant the
+/// source wrote for a port (`node.port_literals`, whichever spelling
+/// wrote it, delivered the same way a wire is). On top of that, declared
+/// defaults fill the declared inputs still absent, unless the input's
+/// wire arrived CLOSED (`closed_ports`): a closure means upstream
+/// produced nothing, and silently substituting the default would mask
+/// that. Nothing else reaches the bag: `node.config` holds only what is
+/// not a port (compiler and editor plumbing, a loop's knobs), which the
+/// engine reads off the definition directly.
 ///
 /// No name is special: an object wired to an input (a config node's
 /// output, say) arrives AS that object, and the node decides what to
@@ -920,27 +1173,22 @@ pub fn node_input_bag(
     mut delivered: serde_json::Map<String, Value>,
     closed_ports: &[String],
 ) -> Result<ValueBag, String> {
-    // The braces store under-lays what the ready paths delivered.
-    // Compiler/editor plumbing keys co-resident in the config blob
-    // (`parentId`, `_`-reserved) are not input data and never reach
-    // the bag; the engine reads them from `node.config` directly.
-    if let Some(cfg) = node.config.as_object() {
-        for (k, v) in cfg {
-            if crate::project::is_internal_config_key(k) {
-                continue;
-            }
-            delivered.entry(k.clone()).or_insert_with(|| v.clone());
-        }
-    }
-
     for input in &node.inputs {
         let Some(default) = &input.default else { continue };
         if closed_ports.iter().any(|p| p == &input.name) {
             continue;
         }
-        delivered
-            .entry(input.name.clone())
-            .or_insert_with(|| default.clone());
+        // A delivered null is a value only on a port whose type admits
+        // Null; on any other port it is "nothing arrived" and the
+        // default fills it like an absent input.
+        let absent = match delivered.get(&input.name) {
+            None => true,
+            Some(Value::Null) => !crate::exec::ready::port_admits_null(node, &input.name),
+            Some(_) => false,
+        };
+        if absent {
+            delivered.insert(input.name.clone(), default.clone());
+        }
     }
 
     // Connection inputs get their metadata threaded onto the value, so
@@ -952,9 +1200,19 @@ pub fn node_input_bag(
     // reads (the label is an editor-side display cache, never data).
     // The rewrite exists only in the bag; the config value on disk /
     // in the journal is untouched.
+    let mut access_ports = std::collections::BTreeMap::new();
     for input in &node.inputs {
+        if let (Some(widget), Some(value)) = (&input.widget, delivered.get(&input.name)) {
+            widget
+                .check_handle_shape(value)
+                .map_err(|e| format!("input '{}': {e}; re-pick it in the editor", input.name))?;
+        }
         match &input.widget {
-            Some(crate::node::Widget::Access { service: Some(service) }) => {
+            Some(crate::node::Widget::Access { service: Some(service), optional }) => {
+                access_ports.insert(
+                    input.name.clone(),
+                    AccessPort { service: service.clone(), optional: *optional },
+                );
                 let Some(obj) = delivered.get(&input.name).and_then(Value::as_object) else {
                     // Not connected yet: leave the input absent so a
                     // REQUIRED read errors as a missing input, and an
@@ -963,10 +1221,7 @@ pub fn node_input_bag(
                     delivered.remove(&input.name);
                     continue;
                 };
-                let Some(id) = obj.get("id").and_then(Value::as_str) else {
-                    delivered.remove(&input.name);
-                    continue;
-                };
+                let id = obj.get("id").and_then(Value::as_str).expect("checked above");
                 let identity =
                     obj.get("identity").and_then(Value::as_str).map(|s| s.to_string());
                 let marker = crate::access::Access::new(id, service.clone(), identity).to_value();
@@ -977,7 +1232,7 @@ pub fn node_input_bag(
             // reaching a firing without one is a broken node spec, and
             // building a marker without a service would misroute every
             // downstream resolution.
-            Some(crate::node::Widget::Access { service: None }) => {
+            Some(crate::node::Widget::Access { service: None, .. }) => {
                 return Err(format!(
                     "input '{}': access widget carries no service stamp (the compiler \
                      stamps it from the node metadata's `service` recipe); the node spec \
@@ -989,15 +1244,7 @@ pub fn node_input_bag(
                 // Only the OBJECT form is unwrapped; a non-object value
                 // is a pasted raw id and passes through untouched.
                 if let Some(obj) = delivered.get(&input.name).and_then(Value::as_object) {
-                    let Some(id) = obj.get("id").and_then(Value::as_str).map(str::to_string)
-                    else {
-                        return Err(format!(
-                            "input '{}': a remote_select pick must be an {{id, label}} \
-                             object with a string `id`; the stored value has none, re-pick \
-                             the resource",
-                            input.name
-                        ));
-                    };
+                    let id = obj.get("id").and_then(Value::as_str).expect("checked above").to_string();
                     delivered.insert(input.name.clone(), Value::String(id));
                 }
             }
@@ -1031,7 +1278,9 @@ pub fn node_input_bag(
         .map(|i| i.name.clone())
         .filter(|name| name != crate::exec::skip::SHOULD_FLOW_PORT)
         .collect();
-    Ok(ValueBag::inputs(delivered, spec_names, order))
+    let mut bag = ValueBag::inputs(delivered, spec_names, order);
+    bag.access_ports = access_ports;
+    Ok(bag)
 }
 
 /// A consumer input declaring `requiresScopes`/`requiresValues` stamps
@@ -1197,9 +1446,37 @@ impl EndpointHandle {
 pub struct StorageHandle {
     handle: Arc<dyn ContextHandle>,
     scope: crate::storage::StorageScope,
+    /// What the next put is a copy OF; see [`Self::identified`].
+    identity: Option<String>,
 }
 
 impl StorageHandle {
+    /// Name what the file about to be stored is a copy of, so storing
+    /// it twice stores it once.
+    ///
+    /// A node that pulls a thing by a stable id (a WhatsApp message, a
+    /// document at a provider) would otherwise download and store a
+    /// fresh copy every time a run asks. With an identity on the put,
+    /// the storage service answers a second put of the same identity
+    /// in the same scope with the file it already holds, and no bytes
+    /// move. Pair it with the project scope so the copy outlives the
+    /// run that first fetched it:
+    ///
+    /// ```ignore
+    /// ctx.storage(StorageScope::Project)
+    ///     .identified(format!("whatsapp:{message_id}"))
+    ///     .put_from_url(&url, None, None)
+    ///     .await?
+    /// ```
+    ///
+    /// The identity is a label, scoped to the handle's scope: the same
+    /// string in two projects is two files. Choose one that names the
+    /// SOURCE (`<service>:<id>`), never the content.
+    pub fn identified(mut self, identity: impl Into<String>) -> Self {
+        self.identity = Some(identity.into());
+        self
+    }
+
     /// Store `bytes` under this handle's scope. Returns the
     /// self-describing stored-file value (`key` + `mimeType` +
     /// `sizeBytes` + `filename`, NO url) to emit downstream. `keep` flags an
@@ -1222,6 +1499,7 @@ impl StorageHandle {
         self.handle
             .storage_put(
                 &self.scope,
+                self.identity.as_deref(),
                 crate::storage::bytes_stream(bytes),
                 mime_type,
                 filename,
@@ -1242,7 +1520,7 @@ impl StorageHandle {
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
         self.handle
-            .storage_put(&self.scope, stream, mime_type, filename, keep, None)
+            .storage_put(&self.scope, self.identity.as_deref(), stream, mime_type, filename, keep, None)
             .await
     }
 
@@ -1272,14 +1550,16 @@ impl StorageHandle {
                 crate::truncate_user_string(&body, 500)
             )));
         }
+        // The header goes through the one normalizer every remote
+        // stream uses, so a `image/png; charset=binary` is stored as
+        // `image/png` here exactly as it is from `put_from_url`.
         let mime = match mime {
             Some(m) => m.to_string(),
-            None => resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("application/octet-stream")
-                .to_string(),
+            None => crate::storage::normalize_content_type(
+                resp.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+            ),
         };
         let stored = self
             .put_stream(crate::storage::response_stream(resp), &mime, filename, keep)
@@ -1300,7 +1580,9 @@ impl StorageHandle {
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
     ) -> WeftResult<Value> {
-        self.handle.storage_put_from_url(&self.scope, url, filename, keep).await
+        self.handle
+            .storage_put_from_url(&self.scope, self.identity.as_deref(), url, filename, keep)
+            .await
     }
 
     /// Stream a file's bytes. Takes the file's parsed HANDLE (the typed
@@ -1389,13 +1671,17 @@ impl StorageHandle {
         self.handle.storage_keep(key, ttl).await
     }
 
-    /// Mint a TEMPORARY signed URL for handing this file to an
-    /// external URL-accepting API; the external service streams
-    /// directly from the storage bucket. `ttl_secs: None` uses the
-    /// service default (~15 min). The URL is an explicit, per-file,
-    /// expiring artifact; the stored-file VALUE never carries it. For a
-    /// bucket-backed file this counts as access (bumps a kept file's
-    /// TTL). A url-backed file value is
+    /// Mint a TEMPORARY link to this file: the internet-reachable one
+    /// when the install serves one (a tunnel, a real ingress, a bucket
+    /// declared public), which an external URL-accepting API streams
+    /// from directly, else one signed for the cluster's own address,
+    /// which your body can fetch and nothing outside can. When the
+    /// consumer is outside and inline bytes are an option, use
+    /// [`Self::public_link`], which says which case you are in.
+    /// `ttl_secs: None` uses the service default (~15 min). The URL is
+    /// an explicit, per-file, expiring artifact; the stored-file VALUE
+    /// never carries it. For a bucket-backed file this counts as access
+    /// (bumps a kept file's TTL). A url-backed file value is
     /// ALREADY a URL an external service can fetch: presign returns it
     /// as-is (no expiry to mint, nothing in the bucket to sign), so the
     /// caller's contract ("a URL to hand out") holds for both handles.
@@ -1640,6 +1926,12 @@ pub trait ContextHandle: Send + Sync {
     /// Backs [`ExecutionContext::published_access`].
     async fn published_access(&self) -> WeftResult<Option<crate::access::Access>>;
     async fn log(&self, level: LogLevel, message: String) -> WeftResult<()>;
+    /// Backs [`ExecutionContext::tag_execution`]. `tags` are already
+    /// validated and non-empty.
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()>;
+    /// Backs [`ExecutionContext::stop_tagged`]. `tag` is already
+    /// validated.
+    async fn stop_tagged(&self, tag: String, stop_self: StopSelf) -> WeftResult<()>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 
     /// The output port names this node declares in its metadata.
@@ -1718,6 +2010,7 @@ pub trait ContextHandle: Send + Sync {
     async fn storage_put(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         data: crate::storage::ByteStream,
         mime_type: &str,
         filename: &str,
@@ -1737,6 +2030,7 @@ pub trait ContextHandle: Send + Sync {
     async fn storage_put_from_url(
         &self,
         scope: &crate::storage::StorageScope,
+        identity: Option<&str>,
         url: &str,
         filename: Option<&str>,
         keep: Option<crate::storage::KeepTtl>,
@@ -1955,6 +2249,8 @@ mod value_bag_tests {
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
+        async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
+        async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
@@ -1962,8 +2258,8 @@ mod value_bag_tests {
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
         fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
         fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
-        async fn storage_put(&self, _: &crate::storage::StorageScope, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
-        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
         async fn storage_get(&self, _: &str, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
         async fn storage_get_url(&self, _: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
         async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -1980,6 +2276,9 @@ mod value_bag_tests {
     /// Exists to pin `externalize`'s link-or-bytes fallback.
     struct StorageProbeHandle {
         public_link: Option<String>,
+        /// A storage that cannot sign: `link_file_inputs` must fail
+        /// the firing rather than hand the body an unlinked marker.
+        presign_fails: bool,
     }
     #[async_trait::async_trait]
     impl ContextHandle for StorageProbeHandle {
@@ -1993,6 +2292,8 @@ mod value_bag_tests {
         async fn publish_access(&self, _: std::collections::BTreeMap<String, String>) -> WeftResult<crate::access::Access> { unreachable!() }
         async fn published_access(&self) -> WeftResult<Option<crate::access::Access>> { unreachable!() }
         async fn log(&self, _: LogLevel, _: String) -> WeftResult<()> { unreachable!() }
+        async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
+        async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
@@ -2000,8 +2301,8 @@ mod value_bag_tests {
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
         fn create_bus(&self, _: crate::bus::BusOptions) -> WeftResult<(crate::bus::BusHandle, Value)> { unreachable!() }
         fn bus(&self, _: &Value) -> WeftResult<crate::bus::BusHandle> { unreachable!() }
-        async fn storage_put(&self, _: &crate::storage::StorageScope, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
-        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: crate::storage::ByteStream, _: &str, _: &str, _: Option<crate::storage::KeepTtl>, _: Option<u64>) -> WeftResult<Value> { unreachable!() }
+        async fn storage_put_from_url(&self, _: &crate::storage::StorageScope, _: Option<&str>, _: &str, _: Option<&str>, _: Option<crate::storage::KeepTtl>) -> WeftResult<Value> { unreachable!() }
         async fn storage_get(&self, key: &str, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> {
             let meta = crate::storage::StoredFileMeta {
                 key: key.to_string(),
@@ -2019,7 +2320,12 @@ mod value_bag_tests {
         async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
         async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
         async fn storage_keep(&self, _: &str, _: crate::storage::KeepTtl) -> WeftResult<()> { unreachable!() }
-        async fn storage_presign(&self, _: &str, _: Option<u64>) -> WeftResult<String> { unreachable!() }
+        async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
+            if self.presign_fails {
+                return Err(crate::error::node_error("signer down"));
+            }
+            Ok(format!("https://signed/{key}?ttl={}", ttl_secs.unwrap_or(0)))
+        }
         async fn storage_public_link(&self, _: &str, _: Option<u64>) -> WeftResult<Option<String>> {
             Ok(self.public_link.clone())
         }
@@ -2029,8 +2335,82 @@ mod value_bag_tests {
 
     /// `MediaForm::Url` is a preference: the slot takes the storage's
     /// public link when one exists and falls back to inline bytes when
+    /// A link the storage cannot mint is the firing's error, not a
+    /// marker quietly handed over without one: the body would fetch a
+    /// URL that is not there. A text input needs no signer at all.
+    #[tokio::test]
+    async fn a_link_that_cannot_be_minted_fails_the_firing() {
+        let file = crate::storage::StoredFile {
+            key: "project/p1/img1".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 3,
+            filename: "p.png".into(),
+        };
+        let mut ctx = ExecutionContext::new(
+            "exec-1".into(),
+            "project-1".into(),
+            "node-1".into(),
+            "TestNode".into(),
+            None,
+            crate::Color::nil(),
+            LoopFrames::default(),
+            inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
+            Arc::new(StorageProbeHandle { public_link: None, presign_fails: true }),
+        );
+        let note_ty = WeftType::parse("String").unwrap();
+        ctx.link_file_inputs([("note", &note_ty)].into_iter()).await.expect("no file, no signer needed");
+        let photo_ty = WeftType::parse("Image").unwrap();
+        let err = ctx
+            .link_file_inputs([("photo", &photo_ty)].into_iter())
+            .await
+            .expect_err("a signer that is down fails the firing");
+        assert!(err.to_string().contains("signer down"), "{err}");
+        assert!(err.to_string().contains("Input 'photo'"), "{err}");
+        assert!(err.to_string().contains(&file.filename), "{err}");
+        let photo: Value = ctx.inputs.get("photo").unwrap();
+        assert_eq!(photo, file.to_value(), "the marker is left as it was");
+    }
+
     /// it does not; `Inline` always embeds.
     #[tokio::test]
+    async fn file_inputs_get_a_firing_link_that_every_exit_strips() {
+        let file = crate::storage::StoredFile {
+            key: "project/p1/img1".into(),
+            mime_type: "image/png".into(),
+            size_bytes: 3,
+            filename: "p.png".into(),
+        };
+        let mut ctx = ExecutionContext::new(
+            "exec-1".into(),
+            "project-1".into(),
+            "node-1".into(),
+            "TestNode".into(),
+            None,
+            crate::Color::nil(),
+            LoopFrames::default(),
+            inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
+            Arc::new(StorageProbeHandle { public_link: None, presign_fails: false }),
+        );
+        let photo_ty = WeftType::parse("Image").unwrap();
+        let note_ty = WeftType::parse("String").unwrap();
+        ctx.link_file_inputs([("photo", &photo_ty), ("note", &note_ty)].into_iter())
+            .await
+            .expect("links mint");
+        let photo: Value = ctx.inputs.get("photo").unwrap();
+        assert_eq!(
+            photo["__weft_image__"]["url"],
+            json!(format!("https://signed/project/p1/img1?ttl={NODE_LINK_TTL_SECS}")),
+            "the marker carries a link minted for this firing"
+        );
+        assert_eq!(photo["__weft_image__"]["key"], json!("project/p1/img1"), "and keeps its key");
+        let note: Value = ctx.inputs.get("note").unwrap();
+        assert_eq!(note, json!("text"), "a text input is untouched");
+        // What leaves the node is the stored form again.
+        let out = without_links(crate::node::NodeOutput::new().set("photo", photo));
+        assert_eq!(out.outputs["photo"], file.to_value());
+    }
+
+#[tokio::test]
     async fn externalize_url_form_falls_back_to_inline_without_a_public_link() {
         use crate::storage::media::ExternalizePolicy;
         let file = crate::storage::StoredFile {
@@ -2050,7 +2430,7 @@ mod value_bag_tests {
                 crate::Color::nil(),
                 LoopFrames::default(),
                 inputs_bag(json!({})),
-                Arc::new(StorageProbeHandle { public_link: link.map(str::to_string) }),
+                Arc::new(StorageProbeHandle { public_link: link.map(str::to_string), presign_fails: false }),
             )
         };
 
@@ -2194,14 +2574,57 @@ mod node_input_bag_tests {
         values.as_object().unwrap().clone()
     }
 
-    /// Delivered values and braces config values land in the ONE bag;
-    /// delivered wins over a same-named braces value.
+    /// A node whose one input carries a stamped access widget.
+    fn access_node(optional: bool, config: serde_json::Value) -> crate::project::NodeDefinition {
+        serde_json::from_value(json!({
+            "id": "n1", "nodeType": "Test", "label": null,
+            "config": config, "position": {"x": 0.0, "y": 0.0},
+            "inputs": [{
+                "name": "account", "portType": "Access", "required": false,
+                "widget": { "kind": "access", "service": "slack", "optional": optional }
+            }],
+            "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
+            "requiresInfra": false, "images": []
+        }))
+        .expect("test access node")
+    }
+
+    /// The four arms of [`ValueBag::access`]: picked, optional and
+    /// unpicked, required and unpicked (errors naming the service),
+    /// and a non-access input (its own loud error).
     #[test]
-    fn delivered_and_config_merge_delivered_wins() {
+    fn access_reads_the_pick_through_the_stamped_port() {
+        let picked = access_node(false, json!({}));
+        let handle = json!({"account": {"id": "g-1", "identity": "Q"}});
+        let bag = node_input_bag(&picked, delivered(handle), &[]).expect("bag");
+        let marker = bag.access("account").expect("read").expect("picked");
+        assert_eq!(marker.service(), "slack");
+
+        let optional = access_node(true, json!({}));
+        let bag = node_input_bag(&optional, delivered(json!({})), &[]).expect("bag");
+        assert!(bag.access("account").expect("read").is_none(), "optional + unpicked = None");
+
+        let required = access_node(false, json!({}));
+        let bag = node_input_bag(&required, delivered(json!({})), &[]).expect("bag");
+        let err = bag.access("account").unwrap_err().to_string();
+        assert!(err.contains("no slack connection picked"), "{err}");
+
+        let plain = node(&[("prompt", None)], json!({}));
+        let bag = node_input_bag(&plain, delivered(json!({})), &[]).expect("bag");
+        let err = bag.access("prompt").unwrap_err().to_string();
+        assert!(err.contains("not an access (connection picker) input"), "{err}");
+    }
+
+    /// Only what the ready paths delivered reaches the bag: a constant
+    /// written for a port arrives through `port_literals` like a wire,
+    /// and whatever is left in `config` is not a port's value.
+    #[test]
+    fn only_delivered_values_reach_the_bag() {
         let n = node(&[("to", None)], json!({"label": "x", "to": "braces"}));
         let bag = node_input_bag(&n, delivered(json!({"to": 10})), &[]).expect("bag");
-        assert_eq!(bag.get::<u64>("to").unwrap(), 10, "delivered beats the braces value");
-        assert_eq!(bag.get::<String>("label").unwrap(), "x");
+        assert_eq!(bag.get::<u64>("to").unwrap(), 10, "the delivered value is the value");
+        assert!(bag.raw("label").is_none(), "config is not an input home");
+        assert_eq!(bag.object().unwrap().len(), 1);
     }
 
     /// No name is special: an OBJECT wired to an input (a config node's
@@ -2210,7 +2633,7 @@ mod node_input_bag_tests {
     /// decides what to do with it.
     #[test]
     fn a_wired_object_arrives_as_that_object() {
-        let n = node(&[("prompt", None), ("config", None)], json!({"own": "braces"}));
+        let n = node(&[("prompt", None), ("config", None)], json!({}));
         let bag = node_input_bag(
             &n,
             delivered(json!({
@@ -2226,7 +2649,6 @@ mod node_input_bag_tests {
             "the object is data on its input, not spread"
         );
         assert!(bag.raw("model").is_none(), "no key of the object leaks into the bag");
-        assert_eq!(bag.get::<String>("own").unwrap(), "braces");
     }
 
     /// Defaults fill last: an absent declared input gets its default;
@@ -2248,6 +2670,20 @@ mod node_input_bag_tests {
         let bag =
             node_input_bag(&n, delivered(json!({})), &["method".to_string()]).expect("bag");
         assert!(bag.raw("method").is_none(), "a closed input is not defaulted");
+
+        // A null on a plain String port is no value: the default fills it.
+        let bag = node_input_bag(&n, delivered(json!({"method": null})), &[]).expect("bag");
+        assert_eq!(bag.get::<String>("method").unwrap(), "GET");
+        // On a nullable port the null IS the value and stays.
+        let nullable: crate::project::NodeDefinition = serde_json::from_value(json!({
+            "id": "n1", "nodeType": "Test", "label": null,
+            "config": {}, "position": {"x": 0.0, "y": 0.0},
+            "inputs": [{ "name": "note", "portType": "String | Null", "required": false, "default": "hi" }],
+            "outputs": [], "features": {}, "scope": [], "groupBoundary": null,
+            "requiresInfra": false, "images": []
+        })).unwrap();
+        let bag = node_input_bag(&nullable, delivered(json!({"note": null})), &[]).expect("bag");
+        assert_eq!(bag.raw("note"), Some(&json!(null)), "null is data on a nullable port");
     }
 
     /// Compiler/editor plumbing keys living in the config blob
@@ -2257,9 +2693,9 @@ mod node_input_bag_tests {
     fn internal_config_keys_never_reach_the_bag() {
         let n = node(
             &[("url", None)],
-            json!({"url": "http://x", "parentId": "g1", "_label": "My node", "_tags": ["a"]}),
+            json!({"parentId": "g1", "_label": "My node", "_tags": ["a"]}),
         );
-        let bag = node_input_bag(&n, delivered(json!({})), &[]).expect("bag");
+        let bag = node_input_bag(&n, delivered(json!({"url": "http://x"})), &[]).expect("bag");
         assert_eq!(bag.get::<String>("url").unwrap(), "http://x");
         assert!(bag.raw("parentId").is_none(), "parentId is compiler plumbing, not input data");
         assert!(bag.raw("_label").is_none(), "_-reserved keys are editor plumbing, not input data");
@@ -2277,10 +2713,7 @@ mod node_input_bag_tests {
     fn connection_widgets_thread_their_metadata_into_the_bag() {
         let n: crate::project::NodeDefinition = serde_json::from_value(json!({
             "id": "n1", "nodeType": "SlackAccess", "label": null,
-            "config": {
-                "account": {"id": "grant-1", "identity": "Q @ Acme"},
-                "channel": "C42"
-            },
+            "config": {},
             "position": {"x": 0.0, "y": 0.0}, "scope": [],
             "inputs": [
                 {"name": "account", "portType": "Access", "required": false,
@@ -2293,7 +2726,11 @@ mod node_input_bag_tests {
             "outputs": [],
         }))
         .expect("node json");
-        let bag = node_input_bag(&n, delivered(json!({})), &[]).expect("bag");
+        let written = json!({
+            "account": {"id": "grant-1", "identity": "Q @ Acme"},
+            "channel": "C42"
+        });
+        let bag = node_input_bag(&n, delivered(written), &[]).expect("bag");
 
         let access: crate::access::Access = bag.get("account").unwrap();
         assert_eq!(access.access_id(), "grant-1");
@@ -2310,10 +2747,10 @@ mod node_input_bag_tests {
     /// service is a broken node spec and fails loud too.
     #[test]
     fn a_remote_select_pick_object_unwraps_to_the_bare_id() {
-        let make = |config: Value, service: Value| -> crate::project::NodeDefinition {
+        let make = |service: Value| -> crate::project::NodeDefinition {
             serde_json::from_value(json!({
                 "id": "n1", "nodeType": "SlackSendMessage", "label": null,
-                "config": config,
+                "config": {},
                 "position": {"x": 0.0, "y": 0.0}, "scope": [],
                 "inputs": [
                     {"name": "account", "portType": "Access", "required": false,
@@ -2328,15 +2765,16 @@ mod node_input_bag_tests {
             .expect("node json")
         };
 
-        let n = make(json!({"channel": {"id": "C42", "label": "#general"}}), json!("slack"));
-        let bag = node_input_bag(&n, delivered(json!({})), &[]).expect("bag");
+        let n = make(json!("slack"));
+        let pick = json!({"channel": {"id": "C42", "label": "#general"}});
+        let bag = node_input_bag(&n, delivered(pick), &[]).expect("bag");
         assert_eq!(bag.get::<String>("channel").unwrap(), "C42", "the object form unwraps");
 
-        let n = make(json!({"channel": {"label": "#general"}}), json!("slack"));
-        let e = node_input_bag(&n, delivered(json!({})), &[]).unwrap_err();
+        let bad = json!({"channel": {"label": "#general"}});
+        let e = node_input_bag(&n, delivered(bad), &[]).unwrap_err();
         assert!(e.contains("string `id`"), "{e}");
 
-        let n = make(json!({}), json!(null));
+        let n = make(json!(null));
         let e = node_input_bag(&n, delivered(json!({})), &[]).unwrap_err();
         assert!(e.contains("no service stamp"), "{e}");
     }
@@ -2395,7 +2833,7 @@ mod node_input_bag_tests {
     fn custom_excludes_the_specs_own_settings() {
         let n: crate::project::NodeDefinition = serde_json::from_value(json!({
             "id": "n1", "nodeType": "ExecPython", "label": null,
-            "config": {"code": "return {}"},
+            "config": {},
             "position": {"x": 0.0, "y": 0.0}, "scope": [],
             "inputs": [
                 {"name": "code", "portType": "String", "required": true, "fromSpec": true},
@@ -2404,7 +2842,7 @@ mod node_input_bag_tests {
             "outputs": [],
         }))
         .expect("node json");
-        let bag = node_input_bag(&n, delivered(json!({"a": 7})), &[]).expect("bag");
+        let bag = node_input_bag(&n, delivered(json!({"code": "return {}", "a": 7})), &[]).expect("bag");
         let data: Vec<&str> = bag.custom().map(|(k, _)| k.as_str()).collect();
         assert_eq!(data, vec!["a"], "settings are excluded, instance ports remain");
         let settings: Vec<&str> = bag.declared().map(|(k, _)| k.as_str()).collect();

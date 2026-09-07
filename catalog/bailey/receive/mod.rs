@@ -41,12 +41,13 @@ impl Node for BaileyReceiveNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // The SSE listener delivers the parsed `data:` object as the wake
         // payload. Fan the DECLARED fields onto their matching output
-        // ports; payload extras that are routing handles, not data
-        // (`messageKey`, used by the bridge's own media resolve), are
-        // skipped by the declared-set intersection. Missing fields
-        // stay un-mentioned and the engine closes those ports at
-        // termination (substituting empty strings / `false` would
-        // publish data nulls indistinguishable from real user values).
+        // ports; a payload field no port declares (`isGroup`, `chatId`,
+        // routing handles rather than data) is dropped by the
+        // declared-set intersection. A missing field stays un-mentioned
+        // and the engine closes its port at termination (substituting
+        // empty strings / `false` would publish data indistinguishable
+        // from real user values); a field the payload sends as null
+        // lands as null and is refused by a port whose type has no Null.
         //
         // `file` is a port THIS node computes (a stored-file reference, only
         // on the media path below); it is never a payload field. Strip it
@@ -59,7 +60,8 @@ impl Node for BaileyReceiveNode {
         let mut out = ctx.fan_declared(&data);
 
         // Media messages: stream the bytes from the bridge's media
-        // endpoint STRAIGHT into execution-scoped storage and emit the
+        // endpoint straight into PROJECT storage under the message's
+        // identity (see `bridge_api::fetch_media`) and emit the
         // self-describing stored-file reference on `file`. Bytes never ride
         // the pulse path; downstream nodes get/stream/presign via the
         // reference.
@@ -70,19 +72,7 @@ impl Node for BaileyReceiveNode {
                 .get("messageId")
                 .and_then(|v| v.as_str())
                 .node_err("media message without a messageId; cannot fetch its bytes")?;
-            // Stream the bytes from the bridge's media endpoint straight
-            // into execution storage via the language capability (it GETs,
-            // derives the mime, streams in bounded-memory). The node only
-            // builds the URL + a stable filename; no HTTP plumbing here.
-            let url = super::bridge_api::route(&bridge, &format!("/media/{message_id}"));
-            let filename = format!("whatsapp-{message_id}");
-            let file = ctx
-                .storage(weft::storage::StorageScope::Execution)
-                // Incoming media can't be re-fetched once the bridge's
-                // copy ages out: keep it past the run (default 30-day
-                // access-bumped TTL).
-                .put_from_url(&url, Some(&filename), Some(weft::storage::KeepTtl::Default))
-                .await?;
+            let file = super::bridge_api::fetch_media(&ctx, &bridge, message_id).await?;
             out = out.set("file", file);
         }
         ctx.pulse_downstream(out).await
@@ -91,4 +81,7 @@ impl Node for BaileyReceiveNode {
 
 /// Message types whose bytes the bridge can serve via
 /// `/media/<messageId>`.
+// SYNC: MEDIA_TYPES <-> the media route's message chain in
+// catalog/bailey/bridge/images/bridge/src/index.js (a type listed
+// here that the route cannot serve is a 404 at fire time).
 const MEDIA_TYPES: [&str; 5] = ["image", "video", "audio", "document", "sticker"];

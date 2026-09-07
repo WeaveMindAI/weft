@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
         "host",
@@ -53,16 +53,11 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "The changed rows as the database stored them."
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

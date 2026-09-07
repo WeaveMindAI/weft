@@ -2,6 +2,7 @@
 	import { SvelteFlowProvider } from "@xyflow/svelte";
 	import ProjectEditorInner from "./ProjectEditorInner.svelte";
 	import type { ProjectDefinition } from "../../types";
+	import type { SourceLocation } from "../../../../protocol";
 
 	// The bound inner instance's public API this wrapper forwards. Typed (not
 	// `any`) so a signature drift between wrapper and inner is a compile error,
@@ -46,6 +47,7 @@
 		onRun,
 		onStop,
 		onDismissError,
+		onOpenLocation,
 		onActivate,
 		onCancelActivate,
 		onCancelBuild,
@@ -86,6 +88,7 @@
 		onRun?: (targets: string[]) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
+		onOpenLocation: (location: SourceLocation) => void;
 		onActivate?: () => void;
 		onCancelActivate?: () => void;
 		onCancelBuild?: () => void;
@@ -132,6 +135,7 @@
 		{onRun}
 		{onStop}
 		{onDismissError}
+		{onOpenLocation}
 		{onActivate}
 		{onCancelActivate}
 		{onCancelBuild}

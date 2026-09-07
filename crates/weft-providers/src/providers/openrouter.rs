@@ -32,6 +32,7 @@ use minillmlib::{
     ReasoningConfig,
 };
 use serde_json::{json, Value};
+use weft_core::access::spec::percent_encode;
 
 use crate::sse::DataLineScanner;
 use crate::{
@@ -361,18 +362,6 @@ async fn query_ledger(follow_up: &FollowUp<'_>, generation_id: &str) -> Option<(
             "tokensCompletion": data["tokens_completion"],
         }),
     ))
-}
-
-fn percent_encode(raw: &str) -> String {
-    raw.bytes()
-        .flat_map(|b| {
-            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-                vec![b as char]
-            } else {
-                format!("%{b:02X}").chars().collect()
-            }
-        })
-        .collect()
 }
 
 /// Cap on a buffered non-streaming response body. Chat completions are far

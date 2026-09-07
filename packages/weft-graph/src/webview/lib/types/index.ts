@@ -20,10 +20,10 @@ import type {
 // webview-local copy that drifts from the wire shape).
 export type { NodeExecutionStatus };
 export type { NodeFeaturesWire as NodeFeatures } from '../../../protocol';
-// The exposure/widget vocabulary IS the wire type, re-exported for the
+// The accepts/widget vocabulary IS the wire type, re-exported for the
 // same one-definition reason.
-import { ACCESS_MARKER_KEY, type Exposure, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
-export type { Exposure, Widget, WidgetKind };
+import { ACCESS_MARKER_KEY, type Accepts, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
+export type { Accepts, Widget, WidgetKind };
 
 // =============================================================================
 // PORT TYPE SYSTEM
@@ -332,16 +332,17 @@ export function inferTypeFromValue(value: unknown): WeftType {
 	return { kind: 'primitive', value: 'String' };
 }
 
-/** An input's exposure. The compiler RESOLVES exposure onto every
- *  instance input and the CLI resolves it onto every catalog input, so
- *  the editor never re-derives it from the type. The fallback exists
- *  ONLY for a locally-added port that has not round-tripped through a
- *  parse yet: its type is the `MustOverride` placeholder, whose
- *  exposure is `assignment` (no braces literal can be typed for an
- *  unknown type). */
-export function inputExposure(port: PortDefinition): Exposure {
-	if (port.exposure !== undefined) return port.exposure;
-	return String(port.portType) === 'MustOverride' ? 'assignment' : 'all';
+/** Does this input take a wire? The compiler RESOLVES `accepts` onto
+ *  every instance input and the CLI onto every catalog input, so the
+ *  editor never re-derives it from the type; an absent list (a locally
+ *  added port that has not round-tripped yet) means both. */
+export function acceptsWire(port: PortDefinition): boolean {
+	return port.accepts === undefined || port.accepts.includes('wire');
+}
+
+/** Does this input take a written value? See `acceptsWire`. */
+export function acceptsLiteral(port: PortDefinition): boolean {
+	return port.accepts === undefined || port.accepts.includes('literal');
 }
 
 /** Unify a list of inferred types: dedup by MUTUAL compatibility (each
@@ -380,9 +381,10 @@ export interface FieldDefinition {
 	key: string;
 	label: string;
 	type: WidgetKind | string;
-	/// This field edits a WIREABLE input's body value (an entry in the
-	/// node's portLiterals). A `config`-exposure input's field edits the
-	/// config home instead (portDriven false). The strip routes the
+	/// This field edits an input's written value (an entry in the node's
+	/// portLiterals, the one home a port's constant has). False only for
+	/// a value that is not a port's: a loop's knob, an entry's own fields
+	/// (the entry list is the value being edited). The strip routes the
 	/// value read/write accordingly.
 	portDriven?: boolean;
 	placeholder?: string;
@@ -415,7 +417,6 @@ export interface NodeExecution {
 	id: string;
 	nodeId: string;
 	status: NodeExecutionStatus;
-	pulseIdsAbsorbed: string[];
 	pulseId: string;
 	error?: string;
 	callbackId?: string;
@@ -473,6 +474,15 @@ export interface PortWarning {
 /** Node executions keyed by node ID. */
 export type NodeExecutionTable = Record<string, NodeExecution[]>;
 
+/** How the run ended, once it has: the state plus, for a cancel, the
+ *  text and structured cause (a sibling run stopping it names the run
+ *  and the tag). Undefined while the run is live. */
+export interface ExecutionTerminal {
+	state: 'completed' | 'failed' | 'cancelled';
+	reason?: string;
+	cause?: import('../../../protocol').CancelCause;
+}
+
 /** Live execution state the webview maintains from the extension
  *  host's SSE stream. Single source of truth: lifted here so
  *  `App.svelte` (which owns the state) and the editor components
@@ -482,6 +492,11 @@ export type NodeExecutionTable = Record<string, NodeExecution[]>;
  */
 export interface ExecutionState {
 	isRunning: boolean;
+	/** The tags the run put on itself (`ctx.tag_execution`), in claim
+	 *  order, deduplicated. The handle a sibling's `ctx.stop_tagged`
+	 *  selects on; shown on the run in the inspector. */
+	tags: string[];
+	terminal?: ExecutionTerminal;
 	nodeOutputs: Record<string, unknown>;
 	nodeExecutions: NodeExecutionTable;
 	/** Full bus log per `busId` (in arrival order). The inspector
@@ -602,9 +617,8 @@ export interface NodeInstance {
 	nodeType: string;
 	label: string | null;
 	config: Record<string, unknown>;
-	/// Body-set PORT values keyed by port name, the two-home twin of
-	/// `config` (braces or statement form, per the port's literal
-	/// placement). Mirrors the definition's `portLiterals`.
+	/// Every constant written for a port, keyed by port name, whichever
+	/// spelling wrote it. Mirrors the definition's `portLiterals`.
 	portLiterals?: Record<string, unknown>;
 	portLiteralSpans?: Record<string, import('../../../protocol').ConfigFieldSpan>;
 	position: Position;
@@ -634,6 +648,8 @@ export interface Edge {
 	target: string;
 	sourceHandle: string | null;
 	targetHandle: string | null;
+	/// Keys read off the source value on the way; absent for a plain wire.
+	path?: string[];
 }
 
 export interface ProjectDefinition {

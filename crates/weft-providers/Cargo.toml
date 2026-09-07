@@ -10,6 +10,11 @@ repository.workspace = true
 # into a link-time-collected registry, so adding a provider needs no edit to
 # any central list (same pattern weft-core uses for signal kinds).
 inventory = { workspace = true }
+# Pure type layer only (no runtime): the shared percent_encode.
+# Direct path dep (NOT `workspace = true`): `default-features = false`
+# must take effect, and cargo ignores a member-level
+# `default-features = false` on a `workspace = true` inherited dep.
+weft-core = { path = "../weft-core", default-features = false }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -24,7 +29,7 @@ url = { workspace = true }
 # The OpenRouter meter's billing ceiling: the request body is the JSON
 # minillmlib serialized, so its conversation deserializes straight back and
 # the lib's own deliberately-high estimator prices it (`estimate` feature).
-minillmlib = { version = "0.5.10", features = ["estimate"] }
+minillmlib = { version = "0.5.11", features = ["estimate"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

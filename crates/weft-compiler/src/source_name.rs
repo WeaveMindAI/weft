@@ -39,7 +39,7 @@ pub fn derive_label(file: Option<&Path>) -> String {
 /// user couldn't write as a decl name must not sneak in via a filename either.
 fn pascal_case(stem: &str) -> Option<String> {
     let id = capitalized_words(stem).join("");
-    if weft_catalog::is_rust_identifier(&id) && !crate::weft_compiler::is_reserved_local(&id) {
+    if weft_core::is_rust_identifier(&id) && !crate::weft_compiler::is_reserved_local(&id) {
         Some(id)
     } else {
         None

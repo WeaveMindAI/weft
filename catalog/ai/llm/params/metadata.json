@@ -15,7 +15,6 @@
       "name": "systemPrompt",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "exposure": "config",
       "label": "System Prompt",
       "placeholder": "You are a helpful assistant.",
       "description": "System prompt for every LLM node wired to these params. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node."
@@ -23,19 +22,18 @@
     {
       "name": "maxTokens",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": 1,
         "step": 1
       },
       "label": "Max Tokens",
-      "placeholder": "4096"
+      "placeholder": "4096",
+      "description": "The most tokens the reply may hold, thinking included on a reasoning model. Unset, nothing is sent and the provider's own default applies."
     },
     {
       "name": "temperature",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": 0.0,
@@ -48,7 +46,6 @@
     {
       "name": "topP",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": 0.0,
@@ -61,7 +58,6 @@
     {
       "name": "topK",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": 1,
@@ -72,7 +68,6 @@
     {
       "name": "frequencyPenalty",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": -2.0,
@@ -86,7 +81,6 @@
     {
       "name": "presencePenalty",
       "type": "Number",
-      "exposure": "config",
       "widget": {
         "kind": "number",
         "min": -2.0,
@@ -100,21 +94,20 @@
     {
       "name": "stop",
       "type": "List[String]",
-      "exposure": "config",
       "label": "Stop sequences",
       "description": "Generation stops when the model produces any of these strings."
     },
     {
       "name": "reasoning",
       "type": "Boolean",
-      "exposure": "config",
+      "widget": { "kind": "checkbox" },
+      "default": false,
       "label": "Enable Reasoning",
-      "description": "Enable extended thinking for supported models"
+      "description": "Off by default: the call sends no reasoning request. A model that cannot switch reasoning off refuses on providers that spell the off position, and the error says to set this on; on the others it reasons at its own default and bills the thinking. A model with no reasoning fails with its provider's own error: set this off. On: reasoning at `reasoningEffort` (`low` when none is picked, raise it for one hard step). A reasoning model that answered nothing usually spent `maxTokens` thinking: raise it."
     },
     {
       "name": "reasoningEffort",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "select",
         "options": [
@@ -124,20 +117,18 @@
         ]
       },
       "label": "Reasoning Effort",
-      "description": "Only used when reasoning is enabled"
+      "description": "Only used when reasoning is enabled. Unpicked means `low`."
     },
     {
       "name": "forcePrepend",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "exposure": "config",
       "label": "Force response prefix",
       "description": "Force the model's reply to start with this exact text (constrained generation)."
     },
     {
       "name": "seed",
       "type": "Number",
-      "exposure": "config",
       "label": "Seed",
       "placeholder": "Leave empty for random",
       "description": "For reproducible outputs"
@@ -147,7 +138,6 @@
     {
       "name": "params",
       "type": "Dict[String, String | Number | Boolean | List[String]]",
-      "required": false,
       "description": "The parameters object, fed into one or more LLM nodes."
     }
   ],

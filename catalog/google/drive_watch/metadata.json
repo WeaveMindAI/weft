@@ -15,7 +15,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Google access (wire a GoogleAccess node). The account needs at least read access to the watched file."
     },
@@ -62,7 +62,6 @@
     {
       "name": "changes",
       "type": "String",
-      "exposure": "config",
       "default": "any",
       "widget": {
         "kind": "select",
@@ -80,38 +79,31 @@
   "outputs": [
     {
       "name": "state",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "changed",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "name",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "mimeType",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "modifiedTime",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "modifiedBy",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "fileId",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ]
 }

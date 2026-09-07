@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -35,13 +35,11 @@
     {
       "name": "words",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each word: text, start, end (seconds)."
     },
     {
       "name": "loss",
       "type": "Number",
-      "required": false,
       "description": "How well the transcript matched the audio (lower is better)."
     }
   ]

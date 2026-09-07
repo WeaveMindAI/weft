@@ -118,9 +118,9 @@ out.data = f.file
 }
 
 #[test]
-fn literal_placement_gates_where_a_literal_may_drive_a_port() {
-    // `literal: none` (LlmInference's `params` port): no literal
-    // in ANY form. The braces form...
+fn input_accepts_gates_each_family_whatever_the_spelling() {
+    // `accepts: ["wire"]` (LlmInference's `params` port): no written
+    // value in ANY spelling. The braces form...
     let project = parse_enrich(
         r#"
 n = LlmInference -> (response: String) { params: {"temperature": 0.5} }
@@ -130,10 +130,10 @@ out.data = n.response
 "#,
     );
     let d = validate(&project, &catalog());
-    let hit = d.iter().find(|e| e.code.as_deref() == Some("port-literal-placement"));
-    assert!(hit.is_some_and(|e| e.message.contains("takes no literal")), "braces literal on a none port must error: {d:?}");
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("input-accepts"));
+    assert!(hit.is_some_and(|e| e.message.contains("`params` accepts: wire")), "braces literal on a wire-only port must error: {d:?}");
 
-    // ...and the assignment form are both rejected.
+    // ...and the statement form are refused the same way.
     let project = parse_enrich(
         r#"
 n = LlmInference -> (response: String) {}
@@ -144,44 +144,43 @@ out.data = n.response
 "#,
     );
     let d = validate(&project, &catalog());
-    let hit = d.iter().find(|e| e.code.as_deref() == Some("port-literal-placement"));
-    assert!(hit.is_some_and(|e| e.message.contains("takes no literal")), "assignment literal on a none port must error: {d:?}");
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("input-accepts"));
+    assert!(hit.is_some_and(|e| e.message.contains("`params` accepts: wire")), "statement literal on a wire-only port must error: {d:?}");
 
-    // `literal: assignment` (a file-typed port, by type default): the
-    // braces form is refused with the assignment remediation...
+    // A file-typed port takes a marker in either spelling: the value is
+    // a constant like any other, and it homes in `port_literals`.
+    let project = parse_enrich(
+        r#"
+n = MediaDisplay { media: @asset("a.png", Image) }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"input-accepts") && !codes(&d).contains(&"config-type-mismatch"), "{d:?}");
+    let node = project.nodes.iter().find(|n| n.id == "n").unwrap();
+    assert!(node.port_literals.contains_key("media"), "{:?}", node.port_literals);
+    assert!(node.config.get("media").is_none(), "one home: {:?}", node.config);
+
+    // A String where the port wants an Image is a type error, never a
+    // placement error: the marker's declared type is what is checked.
     let project = parse_enrich(
         r#"
 n = MediaDisplay { media: "not-a-file" }
 "#,
     );
     let d = validate(&project, &catalog());
-    let hit = d.iter().find(|e| e.code.as_deref() == Some("port-literal-placement"));
-    assert!(hit.is_some_and(|e| e.message.contains("only as an assignment")), "braces literal on an assignment port must error: {d:?}");
-
-    // ...but the assignment form is legal and normalizes into
-    // `port_literals`, exactly like a wire would deliver it.
+    assert!(codes(&d).contains(&"config-type-mismatch"), "{d:?}");
+    assert!(!codes(&d).contains(&"input-accepts"), "{d:?}");
     let project = parse_enrich(
         r#"
-n = MediaDisplay
-n.media = "a-literal"
+n = FalUpscaleImage { image: @asset("a.mp4", Video) }
 "#,
     );
     let d = validate(&project, &catalog());
-    assert!(
-        !codes(&d).contains(&"port-literal-placement"),
-        "assignment literal on an assignment port is legal: {d:?}"
-    );
-    let node = project.nodes.iter().find(|n| n.id == "n").unwrap();
-    assert!(
-        node.port_literals.contains_key("media"),
-        "the literal must normalize into port_literals: {:?}",
-        node.port_literals
-    );
+    assert!(codes(&d).contains(&"config-type-mismatch"), "a Video marker on an Image port: {d:?}");
 
-    // A none port that is BOTH wired and body-assigned is one mistake,
-    // not two: double-driven-port owns it ("remove one driver"), and
-    // the placement error ("wire it") must stay silent, since the port
-    // is already wired.
+    // A wire-only port that is BOTH wired and written is one mistake,
+    // not two: double-driven-port owns it ("remove one driver"), and the
+    // family error stays silent, since the port is already wired.
     let project = parse_enrich(
         r#"
 cfg = LlmParams {}
@@ -195,10 +194,42 @@ out.data = n.response
     );
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"double-driven-port"), "{d:?}");
-    assert!(
-        !codes(&d).contains(&"port-literal-placement"),
-        "double-driven-port owns the wired-and-assigned case: {d:?}"
+    assert!(!codes(&d).contains(&"input-accepts"), "double-driven-port owns the wired-and-written case: {d:?}");
+}
+
+/// On a node that takes no custom inputs, a config key naming one of
+/// its outputs is `value-on-output`, never a silently accepted key: an
+/// output takes no value.
+#[test]
+fn a_value_on_an_output_of_a_fixed_node_is_refused() {
+    let project = parse_enrich(
+        r#"
+r = Range { to: 3, values: [1] }
+"#,
     );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("value-on-output")).unwrap_or_else(|| panic!("{d:?}"));
+    assert!(hit.message.contains("'values' is an output port") && hit.message.contains("`r.values`"), "{}", hit.message);
+    assert!(!codes(&d).contains(&"undeclared-port-no-custom"), "one finding, the precise one: {d:?}");
+}
+
+#[test]
+fn a_written_should_flow_must_be_a_boolean() {
+    let project = parse_enrich(
+        r#"
+t = Text { value: "x", _should_flow: "yes" }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"should-flow-not-boolean"), "{d:?}");
+    let project = parse_enrich(
+        r#"
+t = Text { value: "x" }
+t._should_flow = false
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"should-flow-not-boolean"), "{d:?}");
 }
 
 #[test]
@@ -282,7 +313,9 @@ out.data = a.value
         target: "out".into(),
         source_handle: Some("value".into()),
         target_handle: Some("data".into()),
+        path: Vec::new(),
         span: None,
+        source_file: None,
     };
     project.edges.push(dup);
     let d = validate(&project, &catalog());
@@ -320,16 +353,19 @@ t = Text
 "#);
     let t = &mut project.nodes[0];
     t.inputs.push(weft_core::project::InputDefinition {
-        name: "value".into(),
-        port_type: WeftType::primitive(WeftPrimitive::String),
-        required: false,
-        description: None,
-        exposure: weft_core::weft_type::Exposure::All,
+        port: weft_core::project::PortDefinition {
+            name: "value".into(),
+            port_type: WeftType::primitive(WeftPrimitive::String),
+            required: false,
+            description: None,
+            synthesized_from_carry: false,
+            declared_type: None,
+        },
+        accepts: weft_core::node::Accepts::both(),
         widget: None,
         default: None,
         label: None,
         placeholder: None,
-        synthesized_from_carry: false,
         from_spec: false,
         requires_scopes: None,
         requires_values: None,
@@ -347,18 +383,21 @@ fn required_port_unmet_is_flagged() {
 t = Text { value: "ok" }
 "#);
     project.nodes[0].inputs.push(weft_core::project::InputDefinition {
-        name: "foo".into(),
-        port_type: weft_core::weft_type::WeftType::primitive(
-            weft_core::weft_type::WeftPrimitive::String,
-        ),
-        required: true,
-        description: None,
-        exposure: weft_core::weft_type::Exposure::Wire,
+        port: weft_core::project::PortDefinition {
+            name: "foo".into(),
+            port_type: weft_core::weft_type::WeftType::primitive(
+                weft_core::weft_type::WeftPrimitive::String,
+            ),
+            required: true,
+            description: None,
+            synthesized_from_carry: false,
+            declared_type: None,
+        },
+        accepts: weft_core::node::Accepts::wire_only(),
         widget: None,
         default: None,
         label: None,
         placeholder: None,
-        synthesized_from_carry: false,
         from_spec: false,
         requires_scopes: None,
         requires_values: None,
@@ -384,35 +423,26 @@ out.data = a.value
 #[test]
 fn top_level_include_does_not_make_project_look_like_a_component() {
     // Regression: a Full-mode @include must NOT leave its group flagged
-    // `anonymous`, or check_output_reachability treats the whole build as a
-    // standalone component and skips the no-output-node requirement (a
-    // non-runnable project would silently pass the build gate).
+    // `anonymous`. The anonymous root of a component file is that file's
+    // own interface (validate treats it as the includer's business); an
+    // INCLUDED group is an ordinary node of the project, and the flag is
+    // what tells the two apart.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("comp.weft"),
         "Group(raw: String) -> (cleaned: String) {\n s = Text { value: \"x\" }\n self.cleaned = s.value\n}\n",
     ).unwrap();
 
-    // No output node anywhere: must fire no-output-node.
-    let src_no_out = "c = @include(\"comp.weft\")\n";
-    let mut p = compile(src_no_out, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
+    let src = "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\n";
+    let mut p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     enrich(&mut p, &catalog()).expect("enrich");
+    let included = p.groups.iter().find(|g| g.id == "c").expect("the include is a group of the project");
+    assert!(
+        !included.anonymous,
+        "an included group is a node of the project, not a component's own root: {included:?}"
+    );
     let d = validate(&p, &catalog());
-    assert!(codes(&d).contains(&"no-output-node"), "expected no-output-node, got {d:?}");
-
-    // With a real Debug output downstream of the include: no no-output error,
-    // and the Debug node is NOT spuriously flagged unreachable. The include's
-    // input is driven by an inline node (a group port takes wiring, not a bare
-    // literal).
-    let src_out = "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n";
-    let mut p2 = compile(src_out, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
-    enrich(&mut p2, &catalog()).expect("enrich");
-    let d2 = validate(&p2, &catalog());
-    assert!(!codes(&d2).contains(&"no-output-node"), "unexpected no-output: {d2:?}");
-    // The Debug node `out` (the project's output) must NOT be flagged unreachable.
-    // Match the node id precisely (`'out'`), not the substring "out" which also
-    // appears in "output"/"outputs" in unrelated messages.
-    assert!(!d2.iter().any(|x| x.code.as_deref() == Some("unreachable-from-output") && x.message.contains("'out'")), "Debug wrongly unreachable: {d2:?}");
+    assert!(d.is_empty(), "the include compiles clean: {d:?}");
 }
 
 // ── declarative-rule engine (ConfigMatches) ──────────────────────────────────
@@ -963,7 +993,9 @@ out.data = b.value
         target: "a".into(),
         source_handle: Some("value".into()),
         target_handle: Some("value".into()),
+        path: Vec::new(),
         span: None,
+        source_file: None,
     });
     let d = validate(&project, &catalog());
     assert!(codes(&d).contains(&"graph-cycle"), "{d:?}");
@@ -974,7 +1006,7 @@ fn trigger_wiring_rules_are_compile_errors() {
     // trigger-into-trigger, via a plain node in between (transitive).
     let project = parse_enrich(
         r#"
-t1 = Cron { cron: "* * * * *" }
+t1 = Cron { cron: "0 * * * * *" }
 mid = Debug
 mid.data = t1.scheduledTime
 t2 = HumanTrigger
@@ -993,7 +1025,7 @@ fn a_trigger_inside_a_loop_is_a_compile_error() {
         r#"
 my = Loop(items: List[String]) -> (results: List[String | Null]) {
     over: ["items"]
-    t = Cron { cron: "* * * * *" }
+    t = Cron { cron: "0 * * * * *" }
     p = Text {}
     p.value = self.items
     self.results = p.value
@@ -1005,13 +1037,37 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
 }
 
 #[test]
+fn an_infra_node_inside_a_loop_is_a_compile_error() {
+    // No stdlib infra node fits a loop body's ports, so mark the member
+    // infra by hand; the rule guards the definition shape itself.
+    let mut project = parse_enrich(
+        r#"
+my = Loop(items: List[String]) -> (results: List[String]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+"#,
+    );
+    project
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "my.p")
+        .expect("the body's node is present")
+        .requires_infra = true;
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"infra-in-loop"), "{d:?}");
+}
+
+#[test]
 fn a_trigger_wired_into_an_infra_node_is_a_compile_error() {
     // trigger-into-infra, via a plain node in between (transitive). No
     // stdlib infra node takes inputs, so mark the sink infra by hand;
     // the rule guards the definition shape itself.
     let mut project = parse_enrich(
         r#"
-t = Cron { cron: "* * * * *" }
+t = Cron { cron: "0 * * * * *" }
 mid = Debug
 mid.data = t.scheduledTime
 sink = Debug
@@ -1031,39 +1087,59 @@ sink.data = mid.data
 // ── unified-input diagnostics ───────────────────────────────────────────────
 
 #[test]
-fn wiring_a_config_input_is_input_not_wireable() {
-    // HttpRequest's `method` is a `config`-exposure input (a select):
-    // design-time configuration, never graph data.
+fn a_setting_takes_a_wire_by_default_and_a_compiler_read_port_never_does() {
+    // HttpRequest's `method` is a select: a setting, and a program may
+    // still compute it.
     let project = parse_enrich(
         r#"
 t = Text { value: "GET" }
-req = HttpRequest { url: "http://x" method: "GET" }
+req = HttpRequest { url: "http://x" }
 req.method = t.value
 out = Debug
 out.data = req.body
 "#,
     );
     let d = validate(&project, &catalog());
-    assert!(codes(&d).contains(&"input-not-wireable"), "{:?}", d);
+    assert!(!codes(&d).contains(&"input-accepts"), "a setting is wireable by default: {d:?}");
+
+    // HumanQuery's `fields` is the list its ports come from: the
+    // compiler reads it to build the node, so no wire and no marker.
+    let project = parse_enrich(
+        r#"
+src = ExecPython() -> (fields: List[JsonDict]) { code: "return {'fields': []}" }
+q = HumanQuery { title: "t" }
+q.fields = src.fields
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("input-accepts"));
+    assert!(hit.is_some_and(|e| e.message.contains("read by the compiler")), "{d:?}");
+
+    let project = parse_enrich(
+        r#"
+q = HumanQuery { title: "t", fields: @asset("https://x/fields.json", List[JsonDict]) }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("input-accepts"));
+    assert!(hit.is_some_and(|e| e.message.contains("no @file, no @asset")), "{d:?}");
 }
 
 #[test]
-fn a_type_mismatched_wire_onto_a_config_input_fires_only_input_not_wireable() {
-    // The edge is illegal as a whole; input-not-wireable owns it. The
-    // type machinery must stay silent instead of stacking type-mismatch
-    // on top of the real cause.
+fn a_type_mismatched_wire_onto_a_compiler_read_port_fires_only_input_accepts() {
+    // The edge is illegal as a whole; input-accepts owns it. The type
+    // machinery must stay silent instead of stacking type-mismatch on
+    // top of the real cause.
     let project = parse_enrich(
         r#"
 n = Range { from: 1, to: 3 }
-req = HttpRequest { url: "http://x", method: "GET" }
-req.method = n.values
-out = Debug
-out.data = req.body
+q = HumanQuery { title: "t" }
+q.fields = n.values
 "#,
     );
     let d = validate(&project, &catalog());
     let cs = codes(&d);
-    assert!(cs.contains(&"input-not-wireable"), "{d:?}");
+    assert!(cs.contains(&"input-accepts"), "{d:?}");
     assert!(!cs.contains(&"type-mismatch"), "one mistake, one diagnostic: {d:?}");
 }
 
@@ -1087,8 +1163,9 @@ send.account = ws.access
     // The connect widget carries the compiler-stamped service.
     let account = ws.inputs.iter().find(|i| i.name == "account").expect("account input");
     match &account.widget {
-        Some(weft_core::node::Widget::Access { service }) => {
+        Some(weft_core::node::Widget::Access { service, optional }) => {
             assert_eq!(service.as_deref(), Some("slack"));
+            assert!(!optional, "slack's recipe does not declare connection_optional");
         }
         other => panic!("account input is not an access widget: {other:?}"),
     }
@@ -1167,20 +1244,18 @@ out.data = req.body
 }
 
 #[test]
-fn declaring_a_config_input_as_a_header_port_is_an_enrich_error() {
+fn declaring_a_compiler_read_input_as_a_header_port_is_an_enrich_error() {
     let mut project = compile(
         r#"
-req = HttpRequest(method: String) { url: "http://x" }
-out = Debug
-out.data = req.body
+q = HumanQuery(fields: List[JsonDict]) { title: "t" }
 "#,
         uuid::Uuid::new_v4(),
         CompileFs::none(),
     )
     .expect("compile ok");
-    let err = enrich(&mut project, &catalog()).expect_err("config input as port must fail enrich");
+    let err = enrich(&mut project, &catalog()).expect_err("a compiler-read input as a port must fail enrich");
     let msg = format!("{err}");
-    assert!(msg.contains("configuration-only"), "{msg}");
+    assert!(msg.contains("read by the compiler"), "{msg}");
 }
 
 #[test]
@@ -1199,9 +1274,9 @@ out.data = cfg.params
     assert!(!codes(&d).contains(&"config-type-mismatch"), "{:?}", d);
     let cfg = project.nodes.iter().find(|n| n.id == "cfg").unwrap();
     assert_eq!(
-        cfg.config.get("temperature"),
+        cfg.port_literals.get("temperature"),
         Some(&serde_json::json!(0.7)),
-        "the compiled definition carries the CAST number"
+        "the compiled definition carries the CAST number, in the one home"
     );
 
     // An out-of-range value stays out of range after the cast.
@@ -1610,7 +1685,7 @@ out.data = nums.values
 fn an_optional_stream_over_port_is_rejected() {
     let (project, _) = parse_enrich_lenient(
         r#"
-my = Loop(values: Generator[Number]?) -> (results: List[Number | Null]) {
+my = Loop(values?: Generator[Number]) -> (results: List[Number | Null]) {
     over: ["values"]
     p = ExecPython(n: Number) -> (out: Number) { code: "return {'out': n}" }
     p.n = self.values
@@ -1810,7 +1885,7 @@ fn an_optional_generator_input_is_rejected() {
     let (project, _) = parse_enrich_lenient(
         r#"
 nums = Range { to: 5 }
-p = ExecPython(rows: Generator[Number]?) -> (done: Boolean) { code: "return {'done': True}" }
+p = ExecPython(rows?: Generator[Number]) -> (done: Boolean) { code: "return {'done': True}" }
 p.rows = nums.values
 out = Debug
 out.data = p.done
@@ -2212,44 +2287,48 @@ b = Debug { data: sw.rest }
     );
 }
 
+/// The warning is about upstream values arriving dead: a node whose
+/// every wired input is optional gets it, a node built from written
+/// constants alone (an inline `LlmParams`) has no upstream and does not.
 #[test]
-fn output_sink_is_exempt_from_orphan_outputs() {
-    // A node marked `_is_output: true` is a declared terminus: its output
-    // ports going nowhere is the point, not a mistake. A node with the
-    // same unconsumed outputs and no marker still gets the warning.
+fn no_required_skip_needs_a_wire_to_warn_about() {
+    let project = parse_enrich(
+        r#"
+p = LlmParams { temperature: 0.2 }
+t = Text { value: "hi" }
+loose = Cast(value?: String) -> (value: String) {}
+loose.value = t.value
+out = Debug { data: loose.value }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let warned: Vec<&str> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("no-required-skip"))
+        .filter_map(|x| x.message.split('\'').nth(1))
+        .collect();
+    assert!(warned.contains(&"loose"), "an all-optional wired node warns: {d:?}");
+    assert!(!warned.contains(&"p"), "a constants-only node has no upstream: {d:?}");
+}
+
+/// A leaf is how a program ends (the last node sends the message,
+/// writes the row), so a node whose outputs nobody reads is not warned
+/// about. Telling one that acts from one that only computes needs
+/// something the language does not have; see TODO.md, "A node whose
+/// outputs nobody reads".
+#[test]
+fn a_node_whose_outputs_nobody_reads_is_not_warned_about() {
     let project = parse_enrich(
         r#"
 t = Text { value: "hi" }
 sink = Debug { _label: "sink" }
-sink.value = t.value
+sink.data = t.value
 loose = Cast(value: String) -> (value: String) {}
 loose.value = t.value
 "#,
     );
     let d = validate(&project, &catalog());
-    let flagged: Vec<&str> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("orphan-outputs"))
-        .filter_map(|x| x.message.split('\'').nth(1))
-        .collect();
-    assert!(flagged.contains(&"loose"), "{d:?}");
-    assert!(!flagged.contains(&"t"), "t IS consumed: {d:?}");
-
-    // Same loose node, now marked as an output: warning gone.
-    let project = parse_enrich(
-        r#"
-t = Text { value: "hi" }
-sink = Debug { _label: "sink" }
-sink.value = t.value
-loose = Cast(value: String) -> (value: String) { _is_output: true }
-loose.value = t.value
-"#,
-    );
-    let d = validate(&project, &catalog());
-    assert!(
-        !d.iter().any(|x| x.code.as_deref() == Some("orphan-outputs")),
-        "{d:?}"
-    );
+    assert!(d.is_empty(), "a leaf carries no diagnostic of its own: {d:?}");
 }
 
 #[test]
@@ -2277,4 +2356,919 @@ sink.value = g.out
         !d.iter().any(|x| x.code.as_deref() == Some("unknown-type")),
         "{d:?}"
     );
+}
+
+/// The "no connection picked" rule is the LANGUAGE's: any node declaring a
+/// `service` recipe gets it synthesized at runtime level (no metadata
+/// boilerplate), and `connection_optional: true` on the recipe turns it off.
+#[test]
+fn access_nodes_require_a_connection_by_default() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    // Unconnected access node: the synthesized rule fires in Runtime mode
+    // only (a sketch still builds), naming the access field's message shape.
+    let project = parse_enrich("ws = SlackAccess\n");
+    let runtime = validate_with_mode(&project, &catalog(), ValidationMode::Runtime);
+    let hit = runtime
+        .iter()
+        .find(|d| d.code.as_deref() == Some("rule-runtime"))
+        .expect("unconnected SlackAccess must flag rule-runtime");
+    assert!(hit.message.contains("no") && hit.message.contains("connection"), "{}", hit.message);
+    let structural = validate_with_mode(&project, &catalog(), ValidationMode::Structural);
+    assert!(!codes(&structural).contains(&"rule-runtime"), "{structural:?}");
+
+    // A picked connection satisfies it.
+    let connected =
+        parse_enrich("ws = SlackAccess { account: {\"id\":\"g-1\",\"identity\":\"q\"} }\n");
+    let diags = validate_with_mode(&connected, &catalog(), ValidationMode::Runtime);
+    assert!(
+        !diags.iter().any(|d| d.code.as_deref() == Some("rule-runtime")
+            && d.message.contains("connection")),
+        "{diags:?}"
+    );
+
+    // `connection_optional: true` (CustomProvider) opts out entirely.
+    let optional = parse_enrich(
+        "p = CustomProvider { baseUrl: \"http://localhost:1\", model: \"m\" }\n",
+    );
+    let diags = validate_with_mode(&optional, &catalog(), ValidationMode::Runtime);
+    assert!(
+        !diags.iter().any(|d| d.message.contains("connection picked")),
+        "an optional connection synthesizes no rule: {diags:?}"
+    );
+}
+
+/// A metadata that still carries its OWN rule on the picker field (a
+/// project's copied catalog predating the synthesized rule) reports the
+/// mistake ONCE: the declared rule stands, the twin is not synthesized.
+#[test]
+fn declared_picker_rule_suppresses_the_synthesized_twin() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("legacy");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "LegacyAccess",
+  "label": "Legacy access",
+  "description": "a copied catalog predating the synthesized rule",
+  "service": { "service": "legacy",
+               "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
+  "inputs": [
+    { "name": "account", "type": "Access",
+      "widget": { "kind": "access" } }
+  ],
+  "outputs": [{ "name": "access", "type": "Access" }],
+  "validate": [
+    { "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "account" } },
+      "then": { "message": "the old boilerplate wording",
+                "level": "runtime", "field": "account" } }
+  ]
+}"#,
+    )
+    .unwrap();
+    let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
+    let mut project =
+        compile("a = LegacyAccess\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &legacy).expect("enrich");
+    let diags = validate_with_mode(&project, &legacy, ValidationMode::Runtime);
+    let connection_hits: Vec<_> =
+        diags.iter().filter(|d| d.code.as_deref() == Some("rule-runtime")).collect();
+    assert_eq!(connection_hits.len(), 1, "exactly one report: {diags:?}");
+    assert!(
+        connection_hits[0].message.contains("old boilerplate"),
+        "the DECLARED rule wins: {}",
+        connection_hits[0].message
+    );
+}
+
+/// The mirror of the above, pinning the guard's NARROWNESS: an
+/// UNRELATED declared rule on the picker field (any condition other
+/// than the synthesized not-nonempty shape) must not swallow the
+/// connection requirement, so the synthesized "no connection picked"
+/// still fires. (The declared rule's own condition needs a picked
+/// connection, so on this unpicked node only the synthesized one can.)
+#[test]
+fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("legacy");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "LegacyAccess",
+  "label": "Legacy access",
+  "description": "declares its own unrelated runtime rule on the picker field",
+  "service": { "service": "legacy",
+               "acquisition": { "kind": "static", "fields": [{ "name": "key" }] } },
+  "inputs": [
+    { "name": "account", "type": "Access",
+      "widget": { "kind": "access" } }
+  ],
+  "outputs": [{ "name": "access", "type": "Access" }],
+  "validate": [
+    { "when": { "kind": "config_nonempty", "field": "account" },
+      "then": { "message": "an unrelated declared rule",
+                "level": "runtime", "field": "account" } }
+  ]
+}"#,
+    )
+    .unwrap();
+    let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
+    let mut project =
+        compile("a = LegacyAccess\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+    enrich(&mut project, &legacy).expect("enrich");
+    let diags = validate_with_mode(&project, &legacy, ValidationMode::Runtime);
+    let runtime_hits: Vec<_> =
+        diags.iter().filter(|d| d.code.as_deref() == Some("rule-runtime")).collect();
+    assert!(
+        runtime_hits.iter().any(|d| d.message.contains("has no legacy connection picked")),
+        "the synthesized rule still fires: {diags:?}"
+    );
+}
+
+/// The `declared_type` stamp: enrich marks every port with the type the
+/// SOURCE header spells for it (the editor rewrites headers from this),
+/// and nothing else. A redeclared catalog port keeps the AUTHORED
+/// spelling even though the merge clones the catalog port; catalog-only
+/// ports, `_should_flow`, and config-created ports carry none.
+#[test]
+fn enrich_stamps_declared_types_from_the_header_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("gadget");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "Gadget",
+  "label": "Gadget",
+  "description": "declared-type stamping fixture",
+  "inputs": [
+    { "name": "data", "type": "T" },
+    { "name": "seed", "type": "String", "required": false }
+  ],
+  "outputs": [{ "name": "out", "type": "String" }, { "name": "gen", "type": "T" }],
+  "features": { "canAddInputPorts": true, "canAddOutputPorts": true }
+}"#,
+    )
+    .unwrap();
+    let catalog = FsCatalog::discover(dir.path()).expect("fixture catalog");
+    let mut project = compile(
+        "g = Gadget(data: T, extra: String) -> (haiku: String, gen: T) {\n  made: \"x\"\n}\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+    )
+    .expect("compile");
+    enrich(&mut project, &catalog).expect("enrich");
+    let g = project.nodes.iter().find(|n| n.id == "g").expect("node g");
+    let input_decl = |name: &str| {
+        g.inputs.iter().find(|p| p.name == name).unwrap_or_else(|| panic!("input {name}")).declared_type.clone()
+    };
+    assert_eq!(input_decl("data"), Some("T".into()), "redeclared catalog port keeps the authored spelling");
+    assert_eq!(input_decl("extra"), Some("String".into()), "custom header port is stamped");
+    assert_eq!(input_decl("seed"), None, "untouched catalog port carries no stamp");
+    assert_eq!(input_decl("_should_flow"), None, "enrich's own synthesis carries none");
+    assert_eq!(input_decl("made"), None, "a config-created port carries none");
+    let haiku = g.outputs.iter().find(|p| p.name == "haiku").expect("output haiku");
+    assert_eq!(haiku.declared_type, Some("String".into()), "custom output is stamped");
+    let out = g.outputs.iter().find(|p| p.name == "out").expect("output out");
+    assert_eq!(out.declared_type, None, "catalog output carries none");
+    let gen = g.outputs.iter().find(|p| p.name == "gen").expect("output gen");
+    assert_eq!(
+        gen.declared_type,
+        Some("T".into()),
+        "redeclared catalog OUTPUT keeps the authored spelling through the merge"
+    );
+}
+
+/// Narrowing a typevar port in the header narrows it on every port of
+/// that node that shares the var. `Wait(value: String)` pins the `T`
+/// the pass-through carries in AND out; before this, only the input
+/// narrowed and the output stayed `T`, so the program that had just
+/// named its type failed with `unresolved-typevar`.
+#[test]
+fn declaring_a_typevar_port_narrows_the_whole_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("hold");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "Hold",
+  "label": "Hold",
+  "description": "pass-through fixture",
+  "inputs": [{ "name": "value", "type": "T", "required": false }],
+  "outputs": [{ "name": "value", "type": "T" }, { "name": "many", "type": "List[T]" }]
+}"#,
+    )
+    .unwrap();
+    let catalog = FsCatalog::discover(dir.path()).expect("fixture catalog");
+    let mut project =
+        compile("h = Hold(value: String)\n", uuid::Uuid::new_v4(), CompileFs::none())
+            .expect("compile");
+    enrich(&mut project, &catalog).expect("enrich");
+    let h = project.nodes.iter().find(|n| n.id == "h").expect("node h");
+    let out = h.outputs.iter().find(|p| p.name == "value").expect("output value");
+    assert_eq!(out.port_type.wire_string(), "String", "the pass-through output narrowed too");
+    let many = h.outputs.iter().find(|p| p.name == "many").expect("output many");
+    assert_eq!(many.port_type.wire_string(), "List[String]", "a nested occurrence narrows as well");
+}
+
+/// Two ports that pin the same type variable to different types is a
+/// contradiction: the node would get a contract it never had, so
+/// enrich refuses it naming both types.
+#[test]
+fn two_declarations_of_one_typevar_must_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let node_dir = dir.path().join("pick");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::write(
+        node_dir.join("metadata.json"),
+        r#"{
+  "type": "Pick",
+  "label": "Pick",
+  "description": "two ports of one var",
+  "inputs": [
+    { "name": "a", "type": "T", "required": false },
+    { "name": "b", "type": "T", "required": false }
+  ],
+  "outputs": [{ "name": "out", "type": "T" }]
+}"#,
+    )
+    .unwrap();
+    let catalog = FsCatalog::discover(dir.path()).expect("fixture catalog");
+    let mut project =
+        compile("p = Pick(a: String, b: Number)\n", uuid::Uuid::new_v4(), CompileFs::none())
+            .expect("compile");
+    let err = enrich(&mut project, &catalog).expect_err("a contradiction is refused");
+    let text = format!("{err:?}");
+    assert!(text.contains("String") && text.contains("Number"), "{text}");
+
+    // Agreeing declarations are fine, and narrow the whole node.
+    let mut project =
+        compile("p = Pick(a: String, b: String)\n", uuid::Uuid::new_v4(), CompileFs::none())
+            .expect("compile");
+    enrich(&mut project, &catalog).expect("agreeing declarations enrich");
+    let p = project.nodes.iter().find(|n| n.id == "p").expect("node p");
+    assert_eq!(
+        p.outputs.iter().find(|o| o.name == "out").unwrap().port_type.wire_string(),
+        "String"
+    );
+}
+
+/// `declared_type` is the VERBATIM header annotation, never a re-print of
+/// the parsed type. A re-print would expand a registry alias and, worse,
+/// turn an unparseable annotation into the `MustOverride` placeholder,
+/// which the editor's next ports gesture would write back over the
+/// author's text (destroying both the typo and the squiggle naming it).
+#[test]
+fn declared_type_is_the_verbatim_header_spelling() {
+    use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
+    let (project, _) = compile_lenient(
+        "n = Debug(data?: Strng)\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::none(),
+        IncludeMode::Full,
+        None,
+    );
+    let n = project.nodes.iter().find(|n| n.id == "n").expect("node n");
+    let data = n.inputs.iter().find(|p| p.name == "data").expect("input data");
+    assert_eq!(data.declared_type, Some("Strng".into()), "the typo round-trips as typed");
+    assert_eq!(data.port_type.wire_string(), "MustOverride", "the parsed type is the placeholder");
+}
+
+/// An `@include` line declares no ports: the interface node's ports come
+/// from the INCLUDED file's group header, so they must carry no declared
+/// spelling (a stamp would make the editor write a signature onto a decl
+/// that has no signature slot).
+#[test]
+fn include_interface_ports_carry_no_declared_type() {
+    use weft_compiler::weft_compiler::{compile_lenient, IncludeMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.weft"),
+        "Group(inp: String) -> (outp: String) {\n  t = Text { value: \"x\" }\n  self.outp = self.inp\n}\n",
+    )
+    .unwrap();
+    let (project, _) = compile_lenient(
+        "c = @include(\"sub.weft\")\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+        IncludeMode::Interface,
+        None,
+    );
+    let c = project.nodes.iter().find(|n| n.id == "c").expect("include node c");
+    assert!(
+        c.inputs.iter().all(|p| p.declared_type.is_none()),
+        "include inputs unstamped: {:?}", c.inputs
+    );
+    assert!(c.outputs.iter().all(|p| p.declared_type.is_none()), "include outputs unstamped: {:?}", c.outputs);
+}
+
+/// A finding inside an `@include`d file carries that file's path on the
+/// diagnostic, so every consumer can point at the right buffer.
+#[test]
+fn diagnostics_carry_the_included_file() {
+    use weft_compiler::validate::{validate_with_mode, ValidationMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sub.weft"),
+        "Group() -> (out: Access) {\n  ws = SlackAccess\n  self.out = ws.access\n}\n",
+    )
+    .unwrap();
+    let mut project = compile(
+        "c = @include(\"sub.weft\")\nout = Debug\nout.data = c.out\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+    )
+    .expect("compile");
+    enrich(&mut project, &catalog()).expect("enrich");
+    let diags = validate_with_mode(&project, &catalog(), ValidationMode::Runtime);
+    let hit = diags
+        .iter()
+        .find(|d| d.code.as_deref() == Some("rule-runtime"))
+        .expect("the included access node flags rule-runtime");
+    assert!(
+        hit.file.as_deref().unwrap_or_default().ends_with("sub.weft"),
+        "the finding names the included file: {:?}",
+        hit.file
+    );
+}
+
+/// `@require_one_of` on a catalog-typed node survives enrich (the
+/// catalog's features once replaced it wholesale, so it guarded
+/// nothing), a name that is not a port is refused naming the inputs,
+/// and a satisfied group is not warned about as "no required input".
+#[test]
+fn require_one_of_survives_the_catalog_merge_and_checks_its_names() {
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+act = ExecPython(a?: String, b?: String, @require_one_of(a, b)) -> (out: String) {
+    code: "return {'out': a or b}"
+    a: seed.value
+}
+"#,
+    );
+    let act = project.nodes.iter().find(|n| n.id == "act").expect("act");
+    assert_eq!(act.features.one_of_required, vec![vec!["a".to_string(), "b".to_string()]]);
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"no-required-skip"), "the group counts as a requirement: {d:?}");
+    assert!(!codes(&d).contains(&"require-one-of-unmet"), "a is wired: {d:?}");
+
+    // A name that is not a port on a node whose ports are the
+    // catalog's is a typo, and the directive guarded nothing.
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+look = Debug(@require_one_of(data, bogus))
+look.data = seed.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown = d
+        .iter()
+        .find(|e| e.code.as_deref() == Some("require-one-of-unknown-port"))
+        .expect("an unknown name in the directive is refused");
+    assert!(unknown.message.contains("'bogus'") && unknown.message.contains("Inputs: ["), "{}", unknown.message);
+
+    // Where the author can add input ports, a name is a port once the
+    // header declares it, a wire lands on it, or a config key names it;
+    // a name that is none of those does not exist, whatever the node
+    // type, and is refused the same way.
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+act = ExecPython(@require_one_of(a, b)) -> (out: String) {
+    code: "return {'out': a}"
+    a: seed.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let unknown = d
+        .iter()
+        .find(|e| e.code.as_deref() == Some("require-one-of-unknown-port"))
+        .expect("`b` is no port of this instance");
+    assert!(unknown.message.contains("'b'"), "{}", unknown.message);
+
+    let project = parse_enrich(
+        r#"
+seed = Text { value: "x" }
+act = ExecPython(b?: String, @require_one_of(a, b)) -> (out: String) {
+    code: "return {'out': a}"
+    a: seed.value
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(
+        !codes(&d).contains(&"require-one-of-unknown-port"),
+        "declared in the header, `b` exists even unwired: {d:?}"
+    );
+}
+
+/// One unknown node type must not switch type inference off for the
+/// whole file: the generic nodes elsewhere still resolve, so the
+/// only diagnostics are the unknown type's own.
+#[test]
+fn an_unknown_node_type_does_not_unresolve_every_typevar() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+seed = Text { value: "yes" }
+route = Switch {
+    value: seed.value
+    cases: [
+        { "kind": "equals", "value": "yes", "port": "go" },
+        { "kind": "otherwise", "port": "stop" }
+    ]
+}
+show = Debug { data: route.go }
+ghost = NoSuchNodeType { x: seed.value }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let typevars: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|e| e.code.as_deref() == Some("unresolved-typevar"))
+        .collect();
+    assert!(typevars.is_empty(), "the Switch and Debug resolved against the Text: {typevars:?}");
+}
+
+/// `self.<port>` inside a loop nested in a group, where the port is the
+/// GROUP's input: the rule holds (`self` is the loop's own boundary)
+/// and the message says so, naming the fix, instead of reading like
+/// the port does not exist.
+#[test]
+fn a_loop_reading_the_enclosing_groups_self_is_told_to_thread_it_in() {
+    let (project, _) = parse_enrich_lenient(
+        r#"
+outer = Group(db: String, items: List[String]) -> (done: List[String | Null]) {
+    run = Loop(items: List[String]) -> (results: List[String | Null]) {
+        over: ["items"]
+        step = ExecPython(row: String, db: String) -> (out: String) {
+            code: "return {'out': row + db}"
+            row: self.items
+            db: self.db
+        }
+        self.results = step.out
+    }
+    run.items = self.items
+    self.done = run.results
+}
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hint = d
+        .iter()
+        .find(|e| e.code.as_deref() == Some("unknown-source-port"))
+        .expect("the missing port is reported");
+    assert!(hint.message.contains("inside the loop 'outer.run'"), "{}", hint.message);
+    assert!(hint.message.contains("enclosing group 'outer'"), "{}", hint.message);
+    assert!(hint.message.contains("run.db = self.db"), "{}", hint.message);
+}
+
+/// A container's boundaries hold their ports optional by construction
+/// (a closed group input reaches the inside as a closure; a loop's
+/// gathers are optional), so the "no required input" warning never
+/// lands on either side. The OUT side's own warning, nobody consuming
+/// the loop's results, names the loop at its header (the boundary id
+/// `my__out` appears nowhere in the source, and line 0 is nowhere to
+/// point).
+#[test]
+fn boundary_warnings_name_the_group_at_its_header() {
+    let project = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String]) { code: "return {'items': ['a']}" }
+my = Loop(items?: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.items = seed.items
+out = Debug { data: my.results }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let on_boundaries: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|e| e.message.contains("__out") || e.message.contains("__in"))
+        .collect();
+    assert!(on_boundaries.is_empty(), "no diagnostic names a boundary node: {on_boundaries:?}");
+    assert!(
+        !d.iter().any(|e| e.code.as_deref() == Some("no-required-skip")),
+        "a container's optional boundary is not a node with no required input: {d:?}"
+    );
+
+    let unread = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String]) { code: "return {'items': ['a']}" }
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.items = seed.items
+out = Debug { data: seed.items }
+"#,
+    );
+    let d = validate(&unread, &catalog());
+    assert!(
+        !d.iter().any(|e| e.message.contains("__out") || e.message.contains("__in")),
+        "no diagnostic names a boundary node: {d:?}"
+    );
+
+    // A mistyped group port names the group, not the boundary the
+    // edge was rewritten onto.
+    let typo = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String]) { code: "return {'items': ['a']}" }
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.itmes = seed.items
+out = Debug { data: my.results }
+"#,
+    );
+    let d = validate(&typo, &catalog());
+    assert!(
+        d.iter().any(|e| e.code.as_deref() == Some("unknown-target-port") && e.message.contains("node 'my'")),
+        "the typo is refused under the loop's name: {d:?}"
+    );
+    assert!(
+        !d.iter().any(|e| e.message.contains("__out") || e.message.contains("__in")),
+        "no diagnostic names a boundary node (the unmet required input included): {d:?}"
+    );
+
+    // Two drivers on a group port, and a wrong type into one: named
+    // after the group as well.
+    let driven_twice = parse_enrich(
+        r#"
+seed = ExecPython() -> (items: List[String], n: Number) { code: "return {'items': ['a'], 'n': 1}" }
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    p = Text {}
+    p.value = self.items
+    self.results = p.value
+}
+my.items = seed.items
+my.items = seed.n
+out = Debug { data: my.results }
+"#,
+    );
+    let d = validate(&driven_twice, &catalog());
+    assert!(
+        d.iter().any(|e| e.code.as_deref() == Some("duplicate-input-port") && e.message.contains("'my.items'")),
+        "{d:?}"
+    );
+    assert!(
+        !d.iter().any(|e| e.message.contains("__out") || e.message.contains("__in")),
+        "no diagnostic names a boundary node: {d:?}"
+    );
+
+    // A component file's root boundaries are its interface: nothing
+    // inside consumes its outputs by construction, and that warns on
+    // nobody.
+    let component = parse_enrich(
+        r#"
+Group(raw?: String) -> (cleaned: String) {
+    s = Text { value: "x" }
+    self.cleaned = s.value
+}
+"#,
+    );
+    let d = validate(&component, &catalog());
+    assert!(
+        !d.iter().any(|e| e.code.as_deref() == Some("no-required-skip")),
+        "a component's optional input is the includer's to make required: {d:?}"
+    );
+}
+
+
+
+// ─── Reading a key off a wire ───────────────────────────────────────────────
+
+/// The type a dereferencing wire carries is the last key's type: a
+/// String key into a Number port is a plain type mismatch naming the
+/// path, and a Number key into a Number port is clean.
+#[test]
+fn a_path_is_type_checked_at_the_key_it_reads() {
+    let clean = parse_enrich(r#"
+s = ExecPython() -> (out: { profile: { wpm: Number, name?: String } }) { code: "x" }
+t = ExecPython(n: Number) -> (r: Number) { code: "x" }
+t.n = s.out.profile.wpm
+"#);
+    let d = validate(&clean, &catalog());
+    assert!(!codes(&d).contains(&"type-mismatch") && !codes(&d).contains(&"deref-path"), "{d:?}");
+
+    let wrong = parse_enrich(r#"
+s = ExecPython() -> (out: { profile: { wpm: Number, name?: String } }) { code: "x" }
+t = ExecPython(n: Number) -> (r: Number) { code: "x" }
+t.n = s.out.profile.name
+"#);
+    let d = validate(&wrong, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("type-mismatch")).expect("type-mismatch");
+    assert!(m.message.contains("'s.out.profile.name: String'"), "{}", m.message);
+}
+
+/// A path that does not fit the type is its own error: a key that is
+/// not there names what is, and a type with no keys at all (JsonDict, a
+/// scalar) says to declare the shape or Cast first.
+#[test]
+fn a_path_that_does_not_fit_the_source_type_is_refused() {
+    let missing = parse_enrich(r#"
+s = ExecPython() -> (out: { profile: { wpm: Number } }) { code: "x" }
+t = ExecPython(n: Number) -> (r: Number) { code: "x" }
+t.n = s.out.profile.speed
+"#);
+    let d = validate(&missing, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("deref-path")).expect("deref-path");
+    assert!(m.message.contains("cannot read 's.out.profile.speed'") && m.message.contains("Available: wpm"), "{}", m.message);
+
+    let dict = parse_enrich(r#"
+s = ExecPython() -> (out: JsonDict) { code: "x" }
+t = ExecPython(n: Number) -> (r: Number) { code: "x" }
+t.n = s.out.wpm
+"#);
+    let d = validate(&dict, &catalog());
+    let m = d.iter().find(|x| x.code.as_deref() == Some("deref-path")).expect("deref-path");
+    assert!(m.message.contains("declare the type on the source port or Cast first"), "{}", m.message);
+    assert!(!codes(&d).contains(&"type-mismatch"), "one error for one wire: {d:?}");
+}
+
+/// A port created by a dereferencing wire takes the type of the key it
+/// reads, the way a plain wire gives a created port its source's type.
+#[test]
+fn a_created_port_takes_the_type_of_the_key_it_reads() {
+    let project = parse_enrich(r#"
+s = ExecPython() -> (out: { profile: { wpm: Number } }) { code: "x" }
+t = ExecPython -> (r: Number) {
+  code: "x"
+  speed: s.out.profile.wpm
+}
+"#);
+    let t = project.nodes.iter().find(|n| n.id == "t").unwrap();
+    let speed = t.inputs.iter().find(|p| p.name == "speed").expect("created port");
+    assert_eq!(speed.port_type, weft_core::weft_type::WeftType::parse("Number").unwrap());
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"unresolved-typevar"), "{d:?}");
+}
+
+/// level-too-large: 16 nodes flat on the file's top level warn once,
+/// anchored on the first item of that level (the level has no header
+/// of its own); the same work as three groups of six warns nothing,
+/// because the warning is about what one LEVEL holds, not node count.
+#[test]
+fn a_level_past_fifteen_warns_and_a_grouped_one_does_not() {
+    let mut flat = String::from("\n");
+    for i in 0..16 {
+        flat.push_str(&format!("t{i} = Debug {{ data: \"{i}\" }}\n"));
+    }
+    let d = validate(&parse_enrich(&flat), &catalog());
+    let warned: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("level-too-large"))
+        .collect();
+    assert_eq!(warned.len(), 1, "one warning for the one crowded level: {d:?}");
+    assert!(
+        warned[0].message.contains("the top level holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+    assert_eq!(warned[0].line, 2, "anchored on the level's first item: {warned:?}");
+
+    let mut grouped = String::from("\n");
+    for g in 0..3 {
+        grouped.push_str(&format!("g{g} = Group -> (out: String) {{\n  # stage {g}\n"));
+        for i in 0..6 {
+            grouped.push_str(&format!("  d{i} = Debug {{ data: \"{g}-{i}\" }}\n"));
+        }
+        grouped.push_str("  last = Text { value: \"end\" }\n  self.out = last.value\n}\n");
+    }
+    let d2 = validate(&parse_enrich(&grouped), &catalog());
+    assert!(
+        !codes(&d2).contains(&"level-too-large"),
+        "three groups of six is the shape the rule asks for: {d2:?}"
+    );
+}
+
+/// A group takes ONE seat at its parent's table: its In and Out
+/// boundary halves dedupe, so 15 plain nodes plus a group is 16 items
+/// and warns, while the group's own inside (one node) stays quiet.
+#[test]
+fn a_group_counts_as_one_item_and_its_two_halves_dedupe() {
+    let mut src = String::from("\n");
+    for i in 0..15 {
+        src.push_str(&format!("t{i} = Debug {{ data: \"{i}\" }}\n"));
+    }
+    src.push_str(
+        "one = Group -> (out: String) {\n  inner = Text { value: \"x\" }\n  self.out = inner.value\n}\n",
+    );
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("level-too-large"))
+        .collect();
+    assert_eq!(warned.len(), 1, "16 items at the top level: {d:?}");
+    assert!(
+        warned[0].message.contains("the top level holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+}
+
+/// The rule reaches the inside of every group, and the warning names
+/// which inside it is and lands on that group's own header line, not
+/// on the file: 16 direct members of `big`.
+#[test]
+fn a_group_inside_past_fifteen_warns_naming_the_group() {
+    let mut src = String::from("big = Group(x: String) -> (out: String) {\n");
+    for i in 0..15 {
+        src.push_str(&format!("  d{i} = Debug {{ data: \"{i}\" }}\n"));
+    }
+    src.push_str("  last = Text { value: self.x }\n  self.out = last.value\n}\nbig.x = \"seed\"\n");
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("level-too-large"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(
+        warned[0].message.contains("the inside of 'big' holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+    assert_eq!(warned[0].line, 1, "anchored on the group's own header line: {warned:?}");
+}
+
+/// A level made only of groups still counts its items: 16 groups on
+/// the top level with no plain node among them warn, anchored on the
+/// first group's line (the level's first item).
+#[test]
+fn a_top_level_of_only_groups_warns_too() {
+    let mut src = String::from("\n");
+    for g in 0..16 {
+        src.push_str(&format!(
+            "g{g} = Group -> (out: String) {{\n  inner = Text {{ value: \"x\" }}\n  self.out = inner.value\n}}\n"
+        ));
+    }
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("level-too-large"))
+        .collect();
+    assert_eq!(warned.len(), 1, "each group holds one node; only the top level is crowded: {d:?}");
+    assert!(
+        warned[0].message.contains("the top level holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+    assert_eq!(warned[0].line, 2, "anchored on the level's first item: {warned:?}");
+}
+
+/// Every level answers for itself, each on its own line: one file with
+/// a crowded top level AND a crowded group inside gets two warnings at
+/// two different lines, not one warning painted over the file.
+#[test]
+fn crowded_levels_warn_each_on_its_own_line() {
+    let mut lines: Vec<String> = vec![String::new()];
+    for i in 0..15 {
+        lines.push(format!("a{i} = Debug {{ data: \"{i}\" }}"));
+    }
+    let wrap_line = lines.len() + 1;
+    lines.push("wrap = Group(x: String) -> (out: String) {".to_string());
+    for i in 0..15 {
+        lines.push(format!("  d{i} = Debug {{ data: \"w{i}\" }}"));
+    }
+    lines.push("  last = Text { value: self.x }".to_string());
+    lines.push("  self.out = last.value".to_string());
+    lines.push("}".to_string());
+    lines.push("wrap.x = \"seed\"".to_string());
+    let src = lines.join("\n");
+
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("level-too-large"))
+        .collect();
+    assert_eq!(warned.len(), 2, "two crowded levels, two warnings: {d:?}");
+    let top = warned
+        .iter()
+        .find(|x| x.message.contains("the top level"))
+        .expect("the top level (15 nodes + the group) holds 16");
+    let inside = warned
+        .iter()
+        .find(|x| x.message.contains("the inside of 'wrap'"))
+        .expect("the inside of wrap holds 16");
+    assert_eq!(top.line, 2, "the top level's first item: {top:?}");
+    assert_eq!(inside.line, wrap_line, "the group's own header line: {inside:?}");
+}
+
+/// A loop body is a level like any other: 16 direct members of a loop
+/// warn, naming the loop's inside and landing on its header line.
+#[test]
+fn a_loop_body_past_fifteen_warns_naming_the_loop() {
+    let mut src = String::from(
+        "l = Loop(items: List[String]) -> (results: List[String | Null]) {\n  over: [\"items\"]\n",
+    );
+    for i in 0..15 {
+        src.push_str(&format!("  d{i} = Debug {{ data: \"{i}\" }}\n"));
+    }
+    src.push_str("  last = Text { value: \"x\" }\n  self.results = last.value\n}\nl.items = [\"a\"]\n");
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned: Vec<&Diagnostic> = d
+        .iter()
+        .filter(|x| x.code.as_deref() == Some("level-too-large"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(
+        warned[0].message.contains("the inside of 'l' holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+    assert_eq!(warned[0].line, 1, "anchored on the loop's own header line: {warned:?}");
+}
+
+/// A `null` constant is data only on a port whose type admits Null.
+/// There it fills a required port and satisfies a `@require_one_of`; on
+/// a plain port it is no value, and the rules read it the way the firing
+/// will. (The source grammar refuses a bare `null`; the constant reaches
+/// the port through the editor's projection.)
+#[test]
+fn a_null_constant_fills_a_nullable_port_and_no_other() {
+    let mut project = parse_enrich(
+        r#"
+act = ExecPython(a: String | Null, b?: String, @require_one_of(a, b)) -> (out: String) {
+  code: "return {'out': 'x'}"
+}
+"#,
+    );
+    project.nodes[0].port_literals.insert("a".into(), serde_json::Value::Null);
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"required-port-unmet"), "null is data on `String | Null`: {d:?}");
+    assert!(!codes(&d).contains(&"require-one-of-unmet"), "{d:?}");
+
+    let mut project = parse_enrich(
+        r#"
+act = ExecPython(a: String, b?: String, @require_one_of(a, b)) -> (out: String) {
+  code: "return {'out': 'x'}"
+}
+"#,
+    );
+    project.nodes[0].port_literals.insert("a".into(), serde_json::Value::Null);
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"required-port-unmet"), "null on a plain String is no value: {d:?}");
+    assert!(codes(&d).contains(&"require-one-of-unmet"), "{d:?}");
+}
+
+/// A text marker on a compiler-read port is read into its value by the
+/// compile, so the ban has to see the field's file-ref record rather
+/// than the marker text.
+#[test]
+fn a_text_marker_on_a_compiler_read_port_is_refused_after_it_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fields.json"), "[]").unwrap();
+    let mut project = compile(
+        "q = HumanQuery { title: \"t\", fields: @file(\"fields.json\", List[JsonDict]) }\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+    )
+    .expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    assert_eq!(project.nodes[0].port_literals["fields"], serde_json::json!([]), "the marker resolved");
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("input-accepts"));
+    assert!(hit.is_some_and(|e| e.message.contains("no @file, no @asset")), "{d:?}");
+}
+
+/// The object form on a connection widget is legal by the widget's
+/// contract, and held to it: a pick without a string `id` is refused
+/// at compile time with the rule the runtime applies to the bag.
+#[test]
+fn a_malformed_widget_handle_is_refused_at_compile_time() {
+    let project = parse_enrich(
+        r##"
+ws = SlackAccess
+send = SlackSendMessage { channel: {"label": "#general"}, text: "hi" }
+send.account = ws.access
+"##,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("config-type-mismatch"));
+    assert!(hit.is_some_and(|e| e.message.contains("string `id`")), "{d:?}");
+
+    let project = parse_enrich(
+        r##"
+ws = SlackAccess { account: {"identity": 42} }
+"##,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("config-type-mismatch"));
+    assert!(hit.is_some_and(|e| e.message.contains("string `id`")), "{d:?}");
 }

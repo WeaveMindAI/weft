@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.modify"
@@ -42,11 +42,7 @@
     {
       "name": "labels",
       "type": "List[String]",
-      "required": false,
       "description": "The message's label ids after the change."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

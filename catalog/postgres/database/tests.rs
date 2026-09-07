@@ -76,7 +76,27 @@ async fn declares(rig: FakeRig) -> WeftResult<()> {
             weft::infra::EnvEntry::Literal { name, .. } if name == "POSTGRES_PASSWORD")),
         "and never from a value carried in the spec"
     );
-    assert_eq!(spec.volumes.len(), 1, "data and password share one disk");
+    assert_eq!(spec.volumes.len(), 2, "one disk for data and password, one pod-local socket dir");
+    assert!(
+        matches!(spec.volumes[1].kind, weft::infra::VolumeKind::EmptyDir { .. }),
+        "the socket never lands on the disk"
+    );
+    let socket_dir = "/var/run/postgresql";
+    for container in &unit.containers {
+        assert!(
+            container.mounts.iter().any(|m| m.path == socket_dir && m.volume == "socket"),
+            "{} shares the socket: it is how a password nobody holds gets replaced",
+            container.name
+        );
+    }
+    let credential = &unit.containers[1];
+    for name in ["WEFT_SOCKET_DIR", "WEFT_ADMIN_USER"] {
+        assert!(
+            credential.env.iter().any(|e| matches!(e,
+                weft::infra::EnvEntry::Literal { name: n, .. } if n == name)),
+            "the credential server is told {name} by the node"
+        );
+    }
     Ok(())
 }
 

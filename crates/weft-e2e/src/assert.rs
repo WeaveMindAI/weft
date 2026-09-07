@@ -109,6 +109,23 @@ impl SettledRun {
             .collect()
     }
 
+    /// Does an integer spelling name the same value as a float: the float
+    /// is whole, sits where a float is exact (|f| < 2^53), and equals it.
+    fn int_matches_float(int: &serde_json::Number, f: f64) -> bool {
+        const EXACT: f64 = 9007199254740992.0; // 2^53
+        if f.fract() != 0.0 || f.abs() >= EXACT {
+            return false;
+        }
+        // `f` is already known whole and below 2^53, so equality with
+        // `i as f64` is itself the size check: any larger integer casts
+        // to a float at or above 2^53 and cannot equal `f`.
+        match (int.as_i64(), int.as_u64()) {
+            (Some(i), _) => i as f64 == f,
+            (None, Some(u)) => u as f64 == f,
+            (None, None) => false,
+        }
+    }
+
     /// Compare two journalled values the way WEFT's type system does,
     /// which for numbers is by VALUE, not by JSON spelling. A weft
     /// `Number` is one type (the engine's own zero for it is the
@@ -120,22 +137,19 @@ impl SettledRun {
     /// result, which is exactly what it must not do.
     ///
     /// The bridge is deliberately narrow: two INTEGERS still compare
-    /// exactly (no f64 round-trip, so nothing above 2^53 can collapse
-    /// into a false match); only an integer-vs-float pair converts.
-    /// Everything else (strings, bools, shapes, key sets, ordering) is
-    /// still exact.
+    /// exactly, and an integer-vs-float pair matches only when the
+    /// float is that whole number and small enough for a float to hold
+    /// exactly (below 2^53), so a big integer never collapses into a
+    /// float that merely rounds to it. Everything else (strings, bools,
+    /// shapes, key sets, ordering) is still exact.
     fn same_weft_value(a: &Value, b: &Value) -> bool {
         match (a, b) {
-            (Value::Number(x), Value::Number(y)) => {
-                if x.is_f64() || y.is_f64() {
-                    match (x.as_f64(), y.as_f64()) {
-                        (Some(xf), Some(yf)) => xf == yf,
-                        _ => x == y,
-                    }
-                } else {
-                    x == y
-                }
-            }
+            (Value::Number(x), Value::Number(y)) => match (x.is_f64(), y.is_f64()) {
+                (true, true) => x.as_f64() == y.as_f64(),
+                (false, false) => x == y,
+                (true, false) => Self::int_matches_float(y, x.as_f64().expect("is_f64")),
+                (false, true) => Self::int_matches_float(x, y.as_f64().expect("is_f64")),
+            },
             (Value::Array(xs), Value::Array(ys)) => {
                 xs.len() == ys.len()
                     && xs.iter().zip(ys).all(|(x, y)| Self::same_weft_value(x, y))
@@ -240,7 +254,7 @@ impl SettledRun {
     }
 
     /// Assert a node was skipped EXACTLY ONCE, with the given reason
-    /// (`did_not_flow`, `required_input_closed`, `outside_this_run`,
+    /// (`did_not_flow`, `required_input_closed`, `scope_skipped`,
     /// ...). The count matters as much as the reason: a firing location
     /// terminates once, and a duplicated lifecycle pair is a bug this
     /// assertion must surface, never read past.
@@ -272,8 +286,11 @@ impl SettledRun {
         Ok(self)
     }
 
-    /// Assert the replay holds NO events at all for `node`: it was never
-    /// kicked, started, skipped, or closed. The shape of a node BEYOND
+    /// Assert the replay holds NO lifecycle events at all for `node`: it
+    /// was never started, skipped, or closed. (A kick is not in the
+    /// replay: `NodeKicked` is not projected into dispatcher events, so
+    /// the kick set is pinned at the unit level, in the dispatcher's
+    /// `trigger_kick_tests`.) The shape of a node BEYOND
     /// an aimed run's boundary: nothing manufactures pulses past the
     /// first out-of-scope node, so deeper nodes stay blank rather than
     /// painting the whole graph "skipped".
@@ -458,5 +475,13 @@ mod same_weft_value_tests {
             &json!(9_007_199_254_740_993_u64),
             &json!(9_007_199_254_740_992_u64)
         ));
+        // An integer past 2^53 never matches a float that merely rounds
+        // to it, and a float with a fraction matches no integer.
+        assert!(!SettledRun::same_weft_value(
+            &json!(9_007_199_254_740_993_u64),
+            &json!(9_007_199_254_740_992.0_f64)
+        ));
+        assert!(!SettledRun::same_weft_value(&json!(2), &json!(2.5)));
+        assert!(SettledRun::same_weft_value(&json!(-3), &json!(-3.0)));
     }
 }

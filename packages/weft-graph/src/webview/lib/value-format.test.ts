@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fileRefsOf, formatConfigValue, parseConfigToken, type WeftFileRefValue } from './value-format';
+import { fileRefFromToken, fileRefsOf, formatConfigValue, parseConfigToken, type WeftFileRefValue } from './value-format';
 
 /** format then parse must recover the original value (the two are documented as
  *  exact inverses). */
@@ -129,9 +129,39 @@ describe('several files on one port', () => {
       ref('a.png'),
       ref('b.png'),
     ]);
+    // A named type rides in its wire form (`Name=Body`, a union body
+    // parenthesized), which the token reader accepts and round-trips.
+    const named: WeftFileRefValue = { __weftFileRef: { path: 'a.png', type: 'Pic=Image', marker: 'asset' } };
+    expect(fileRefsOf('@asset("a.png", Pic=Image)')).toEqual([named]);
+    expect(roundTrip(named)).toEqual(named);
+    const unionNamed = '@asset("a.png", Snap=(Image | Audio))';
+    expect(fileRefsOf(unionNamed)[0]?.__weftFileRef.type).toBe('Snap=(Image | Audio)');
+    expect(fileRefsOf('@asset("a.png", {not a type)')).toEqual([]);
     // Anything else names no files.
     expect(fileRefsOf('hello')).toEqual([]);
     expect(fileRefsOf(['hello'])).toEqual([]);
     expect(fileRefsOf(null)).toEqual([]);
+  });
+});
+
+describe('a marker the compiler would refuse', () => {
+  it('a typeless @asset is not a marker (the kind is never guessed)', () => {
+    expect(fileRefFromToken('@asset("a.png")')).toBeNull();
+  });
+
+  it('a typeless @file is String, as the grammar says', () => {
+    expect(fileRefFromToken('@file("a.txt")')?.__weftFileRef.type).toBe('String');
+  });
+
+  it('tolerates the whitespace the compiler tolerates', () => {
+    const ref = fileRefFromToken('@file(  "p.txt" ,  Number )');
+    expect(ref?.__weftFileRef.path).toBe('p.txt');
+    expect(ref?.__weftFileRef.type).toBe('Number');
+  });
+
+  it('round-trips a path with a tab, a quote and a backslash', () => {
+    const path = 'a\tb"c\\d.png';
+    const token = formatConfigValue({ __weftFileRef: { path, type: 'Image', marker: 'asset' } });
+    expect(fileRefFromToken(token)?.__weftFileRef.path).toBe(path);
   });
 });

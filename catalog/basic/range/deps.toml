@@ -1,4 +1,5 @@
 # Extra dependencies this node needs beyond the codegen base
-# (weft, tokio, serde, serde_json, async-trait, anyhow, tracing,
-# uuid). Base deps are always available; list only the extras here.
+# (weft, weft-providers, tokio, serde, serde_json, async-trait,
+# anyhow, tracing). Base deps are always available; list only the
+# extras here.
 [dependencies]

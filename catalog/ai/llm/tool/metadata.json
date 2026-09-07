@@ -15,7 +15,6 @@
       "name": "name",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },
@@ -26,7 +25,6 @@
       "name": "description",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "exposure": "config",
       "label": "Description",
       "placeholder": "Get the current weather for a city",
       "description": "What the tool does, written for the model: this is how it decides when to call it."
@@ -34,7 +32,6 @@
     {
       "name": "parameters",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "code",
         "language": "json"
@@ -48,7 +45,6 @@
     {
       "name": "tool",
       "type": "JsonDict",
-      "required": false,
       "description": "The tool declaration: wire it into an LLM node's tools input."
     }
   ],

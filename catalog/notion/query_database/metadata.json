@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Notion access (wire a NotionAccess node)."
     },
@@ -72,7 +72,6 @@
     {
       "name": "limit",
       "type": "Number",
-      "exposure": "config",
       "default": 100,
       "widget": {
         "kind": "number",
@@ -87,13 +86,11 @@
     {
       "name": "items",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "The matching pages, raw Notion page objects."
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

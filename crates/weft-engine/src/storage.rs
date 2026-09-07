@@ -46,10 +46,14 @@ const HDR_COLOR: &str = "x-weft-color";
 /// delegate to. One impl per worker process; Layer-3 tests inject a fake.
 #[async_trait]
 pub trait WorkerStorageOps: Send + Sync {
+    /// `identity` names what the file is a copy of; a put whose
+    /// identity is already stored in `scope` answers the existing file
+    /// and moves no bytes (see `StorageHandle::identified`).
     async fn put(
         &self,
         color: Color,
         scope: &StorageScope,
+        identity: Option<&str>,
         mime_type: &str,
         filename: &str,
         keep: Option<KeepTtl>,
@@ -64,7 +68,11 @@ pub trait WorkerStorageOps: Send + Sync {
     ) -> WeftResult<(StoredFileMeta, ByteStream)>;
     async fn delete(&self, color: Color, key: &str) -> WeftResult<()>;
     async fn list(&self, color: Color, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>>;
+    /// The file already stored under `identity` in `scope`, if any.
+    async fn find(&self, color: Color, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>>;
     async fn keep(&self, color: Color, key: &str, ttl: KeepTtl) -> WeftResult<()>;
+    /// A temporary link to `key`: internet-reachable when the install
+    /// serves one, else signed for the cluster's own address.
     async fn presign(&self, color: Color, key: &str, ttl_secs: Option<u64>) -> WeftResult<String>;
     /// A temporary INTERNET-reachable URL for `key`, or `None` when the
     /// deployment cannot serve one (callers fall back to inline bytes).
@@ -136,6 +144,25 @@ impl WorkerStorage {
         color: Color,
     ) -> WeftResult<reqwest::RequestBuilder> {
         Ok(req.bearer_auth(self.bearer().await?).header(HDR_COLOR, color.to_string()))
+    }
+
+    /// GET a broker storage endpoint and deserialize the JSON response.
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        color: Color,
+        what: &str,
+    ) -> WeftResult<T> {
+        let resp = self
+            .authed(self.http.get(self.url(path)), color)
+            .await?
+            .send()
+            .await
+            .map_err(|e| http_err(what, e))?;
+        if !resp.status().is_success() {
+            return Err(status_err(what, resp).await);
+        }
+        resp.json().await.map_err(|e| http_err(what, e))
     }
 
     /// POST a JSON body to a broker storage endpoint and deserialize the JSON
@@ -339,6 +366,7 @@ impl WorkerStorageOps for WorkerStorage {
         &self,
         color: Color,
         scope: &StorageScope,
+        identity: Option<&str>,
         mime_type: &str,
         filename: &str,
         keep: Option<KeepTtl>,
@@ -348,10 +376,7 @@ impl WorkerStorageOps for WorkerStorage {
         // Begin: the broker mints the key, charges a declared size against the
         // quota up front, and opens the multipart upload. The broker never
         // sees the bytes.
-        // `already_stored` cannot fire here: the worker path never sends a
-        // content hash (only the asset scope is content-addressed, and the
-        // worker data path may not write it).
-        let UploadBeginResponse { key, part_size, already_stored: _ } = self
+        let UploadBeginResponse { key, part_size, already_stored } = self
             .post_json(
                 "/v1/storage/upload/begin",
                 color,
@@ -361,10 +386,24 @@ impl WorkerStorageOps for WorkerStorage {
                     filename: filename.to_string(),
                     keep,
                     declared_size,
+                    identity: identity.map(str::to_string),
                 },
                 "upload begin",
             )
             .await?;
+        // An identified put whose identity the scope already holds:
+        // the broker answered the file it has, nothing to upload. The
+        // stream is dropped unread (a URL fetch never pulls its body).
+        if already_stored {
+            let meta: StoredFileMeta = self.get_json(&format!("/v1/storage/meta/{key}"), color, "meta").await?;
+            return Ok(StoredFile {
+                key: meta.key,
+                mime_type: meta.mime_type,
+                size_bytes: meta.size_bytes,
+                filename: meta.filename,
+            }
+            .to_value());
+        }
         // Drive the parts + completion; on ANY failure past begin, abort the
         // upload so its quota reservation is freed (idempotent: a quota
         // rejection already aborted broker-side), then surface the failure.
@@ -458,6 +497,21 @@ impl WorkerStorageOps for WorkerStorage {
         Ok(())
     }
 
+    async fn find(&self, color: Color, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
+        let out: weft_core::storage::IdentityLookupResponse = self
+            .post_json(
+                "/v1/storage/identity",
+                color,
+                &weft_core::storage::IdentityLookupRequest {
+                    scope: scope.clone(),
+                    identity: identity.to_string(),
+                },
+                "identity lookup",
+            )
+            .await?;
+        Ok(out.file)
+    }
+
     async fn list(&self, color: Color, scope: &StorageScope) -> WeftResult<Vec<StoredFileMeta>> {
         let resp = self
             .authed(self.http.get(self.url("/v1/storage/list")), color)
@@ -541,6 +595,9 @@ mod fake {
         /// project p1, color c1), mirroring the broker's verdict.
         identity: CallerAuth,
         files: Mutex<BTreeMap<String, (StoredFileMeta, bytes::Bytes)>>,
+        /// `(scope, identity)` of every identified put, to the key it
+        /// minted.
+        identities: Mutex<BTreeMap<(String, String), String>>,
         /// Monotonic id counter: the broker mints collision-free keys, so the
         /// fake must too. Deriving the id from `files.len()` reused a freed id
         /// after a delete (delete `f2`, next put reuses `f2`), which could
@@ -558,6 +615,7 @@ mod fake {
                     color: Some("c1".into()),
                 },
                 files: Mutex::new(BTreeMap::new()),
+                identities: Mutex::new(BTreeMap::new()),
                 next_id: Mutex::new(0),
             })
         }
@@ -577,12 +635,29 @@ mod fake {
             &self,
             _color: Color,
             scope: &StorageScope,
+            identity: Option<&str>,
             mime_type: &str,
             filename: &str,
             keep: Option<KeepTtl>,
             _declared_size: Option<u64>,
             data: ByteStream,
         ) -> WeftResult<Value> {
+            // An identified put the scope already holds answers the
+            // stored file, as the broker does; nothing is written.
+            let identity_key = identity.map(|i| (format!("{scope:?}"), i.to_string()));
+            if let Some(identity_key) = &identity_key {
+                if let Some(existing) = self.identities.lock().get(identity_key) {
+                    let files = self.files.lock();
+                    let (meta, _) = files.get(existing).expect("an identified key is stored");
+                    return Ok(StoredFile {
+                        key: meta.key.clone(),
+                        mime_type: meta.mime_type.clone(),
+                        size_bytes: meta.size_bytes,
+                        filename: meta.filename.clone(),
+                    }
+                    .to_value());
+                }
+            }
             let id = {
                 let mut n = self.next_id.lock();
                 let id = *n;
@@ -611,8 +686,16 @@ mod fake {
                 size_bytes: meta.size_bytes,
                 filename: meta.filename.clone(),
             };
+            if let Some(identity_key) = identity_key {
+                self.identities.lock().insert(identity_key, key.clone());
+            }
             self.files.lock().insert(key, (meta, bytes));
             Ok(file.to_value())
+        }
+
+        async fn find(&self, _color: Color, scope: &StorageScope, identity: &str) -> WeftResult<Option<StoredFileMeta>> {
+            let key = self.identities.lock().get(&(format!("{scope:?}"), identity.to_string())).cloned();
+            Ok(key.and_then(|k| self.files.lock().get(&k).map(|(meta, _)| meta.clone())))
         }
 
         async fn get(

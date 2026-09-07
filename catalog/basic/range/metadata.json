@@ -11,7 +11,7 @@
     { "name": "step", "type": "Number", "required": false, "default": 1 }
   ],
   "outputs": [
-    { "name": "values", "type": "Generator[Number]", "required": false }
+    { "name": "values", "type": "Generator[Number]" }
   ],
   "requires_infra": false
 }

@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The fal access (wire a FalAccess node)."
     },
@@ -25,7 +25,6 @@
     {
       "name": "scale",
       "type": "Number",
-      "exposure": "config",
       "default": 2,
       "widget": {
         "kind": "number",
@@ -38,7 +37,6 @@
     {
       "name": "model",
       "type": "String",
-      "exposure": "config",
       "default": "fal-ai/esrgan",
       "label": "Model",
       "placeholder": "Pick a model, or paste a fal route",
@@ -74,15 +72,11 @@
     {
       "name": "image",
       "type": "Image",
-      "required": false,
       "description": "The upscaled image."
     }
   ],
   "display": {
     "kind": "media",
     "output": "image"
-  },
-  "features": {
-    "isOutputDefault": true
   }
 }

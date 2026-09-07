@@ -86,7 +86,11 @@ impl KindHandler for FormHandler {
         // Loud on a schema that cannot serialize: silently omitting
         // `formSchema` would hand the consumer an actionless card
         // ("no form fields configured") over a real broken form.
-        let schema_json = serde_json::to_value(&form.schema)
+        let consumer_schema = form
+            .schema
+            .for_consumer()
+            .map_err(|e| anyhow::anyhow!("form schema for its consumer: {e}"))?;
+        let schema_json = serde_json::to_value(consumer_schema)
             .map_err(|e| anyhow::anyhow!("serialize form schema: {e}"))?;
         obj.insert("formSchema".into(), schema_json);
         Ok(Some(Value::Object(obj)))
@@ -168,6 +172,40 @@ mod tests {
         assert!(obj.contains_key("formSchema"));
         // No title on the spec: the fallback names the node.
         assert_eq!(obj["title"], serde_json::json!("Input for node-7"));
+    }
+
+    /// A stored file among the fields reaches the consumer as its
+    /// facts, never as the marker with the storage key (the files door
+    /// hands out the link).
+    #[test]
+    fn render_keeps_the_storage_key_out_of_the_consumer_payload() {
+        let spec = weft_core::signal::to_spec(Form {
+            form_type: "human-query".into(),
+            schema: FormSchema {
+                fields: vec![weft_core::signal::FormField {
+                    field_type: "display_image".into(),
+                    key: "pic".into(),
+                    label: String::new(),
+                    render: weft_core::node::FormFieldRender {
+                        component: "image".into(),
+                        source: None,
+                        multiple: false,
+                        prefilled: false,
+                    },
+                    value: Some(serde_json::json!({ "__weft_image__": {
+                        "key": "t/project/p/cat", "mimeType": "image/png", "sizeBytes": 7, "filename": "cat.png"
+                    } })),
+                    config: Default::default(),
+                }],
+            },
+            title: None,
+            description: None,
+            consumer_kind: None,
+        });
+        let rendered = FormHandler.render("tok", &registered(spec)).expect("render ok").expect("renders");
+        let value = &rendered["formSchema"]["fields"][0]["value"];
+        assert_eq!(value, &serde_json::json!({ "mimeType": "image/png", "sizeBytes": 7, "filename": "cat.png" }));
+        assert!(!rendered.to_string().contains("t/project/p/cat"), "{rendered}");
     }
 
     #[test]

@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "voice_lab"
@@ -42,7 +42,6 @@
     {
       "name": "removeBackgroundNoise",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -55,11 +54,7 @@
     {
       "name": "voiceId",
       "type": "String",
-      "required": false,
       "description": "The minted voice's id: what the speak nodes take."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

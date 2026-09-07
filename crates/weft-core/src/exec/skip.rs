@@ -54,10 +54,10 @@ pub enum SkipReason {
     EveryInputClosed,
     /// Every port of a `@require_one_of` group arrived closed.
     OneOfGroupClosed { ports: Vec<String> },
-    /// This execution runs only a scoped part of the graph (a setup
-    /// phase's upstream closure, or a manual run aimed at targets);
-    /// this firing is outside that set.
-    OutsideThisRun,
+    /// The scope this node lives in (a group or a loop) did not run:
+    /// its `_should_flow` said no, or a loop's list never came. Every
+    /// node inside a gated scope carries this, however deep.
+    ScopeSkipped { scope: String },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -72,8 +72,8 @@ impl std::fmt::Display for SkipReason {
             Self::OneOfGroupClosed { ports } => {
                 write!(f, "every input of the group ({}) closed", ports.join(", "))
             }
-            Self::OutsideThisRun => {
-                write!(f, "it is outside the part of the graph this execution runs")
+            Self::ScopeSkipped { scope } => {
+                write!(f, "the scope '{scope}' it lives in did not run")
             }
         }
     }
@@ -152,6 +152,21 @@ pub fn check_should_skip(
         }
     }
 
+    // A scope's In boundary stops here: `_should_flow` is the only gate
+    // a group has, and a loop's only other gates are the lists it
+    // iterates (its required ports, rule 1). Every other input of a
+    // scope is optional at the boundary: a closed one closes that edge
+    // into the children, and each child applies its own rule as if the
+    // scope were not there. So "every input closed" never skips a
+    // scope; it starts, and what runs inside decides for itself.
+    if node
+        .group_boundary
+        .as_ref()
+        .is_some_and(|b| b.role == crate::project::GroupBoundaryRole::In)
+    {
+        return None;
+    }
+
     // Rule 2: every port dead -> skip. Covers the all-optional case
     // (a node with only optional inputs whose every input was closed
     // upstream has no value to act on). For nodes with at least one
@@ -163,11 +178,11 @@ pub fn check_should_skip(
     // the body with a completely empty input bag, exactly the
     // busy-work firing this rule exists to prevent. Same shape as the
     // oneOfRequired loop below.
-    // Only WIREABLE inputs participate: a `config`-exposure input is a
-    // design-time setting, not data flow, so it neither keeps the node
-    // alive (a node whose data wires all closed has nothing to act on,
-    // config or not) nor counts as a dead port (a node with ONLY config
-    // inputs, like Text, is an emitter and must run).
+    // Only inputs a wire can drive participate: a literal-only port (a
+    // compiler-read list, an author-narrowed setting) is not data flow,
+    // so it neither keeps the node alive (a node whose data wires all
+    // closed has nothing to act on) nor counts as a dead port (a node
+    // with ONLY such inputs is an emitter and must run).
     // `_should_flow` is permission, not data: it can never be the value
     // a body acts on, so it neither keeps a node alive here nor counts
     // as one of the dead ports. Rule 0 above is the only rule that reads
@@ -175,7 +190,7 @@ pub fn check_should_skip(
     let wireable: Vec<&crate::project::InputDefinition> = node
         .inputs
         .iter()
-        .filter(|p| p.exposure.wireable() && p.name != SHOULD_FLOW_PORT)
+        .filter(|p| p.accepts.wire && p.name != SHOULD_FLOW_PORT)
         .collect();
     if !wireable.is_empty() {
         let all_dead = wireable.iter().all(|port| {
@@ -485,6 +500,32 @@ mod tests {
         assert!(
             check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_some(),
             "all-optional + all-closed must skip"
+        );
+    }
+
+    /// A scope's In boundary has one gate, `_should_flow`: every input
+    /// closed does not skip it (the closures reach the children, who
+    /// decide for themselves), where the same shape on a plain node
+    /// skips.
+    #[test]
+    fn a_scope_in_boundary_never_skips_on_closed_inputs() {
+        let mut boundary = node_all_optional();
+        boundary.group_boundary = Some(crate::project::GroupBoundary {
+            group_id: "g".into(),
+            role: crate::project::GroupBoundaryRole::In,
+        });
+        let pulses = vec![closure_pulse("a"), closure_pulse("b")];
+        let required = HashSet::new();
+        let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
+        let literal_filled = HashSet::new();
+        assert!(
+            check_should_skip(&boundary, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_none(),
+            "an In boundary starts its scope whatever its inputs did"
+        );
+        let plain = node_all_optional();
+        assert!(
+            check_should_skip(&plain, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_some(),
+            "the same closures skip a plain node"
         );
     }
 

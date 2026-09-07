@@ -89,6 +89,9 @@ pub struct EngineClients {
     /// The connection surface (`ctx.open` resolve/release). Production:
     /// the broker-backed client; tests inject a fake.
     pub access_broker: Arc<dyn AccessBroker>,
+    /// Steering other runs (`ctx.tag_execution` / `ctx.stop_tagged`).
+    /// Production: the broker-backed client; tests inject a fake.
+    pub steering: Arc<dyn ExecutionSteeringClient>,
     /// Cost resolutions still in flight (a metered call's figure being
     /// resolved + recorded after its response ended). The pod's exit paths
     /// refuse to die while this is non-zero, so money is never dropped by
@@ -134,10 +137,63 @@ impl EngineClients {
             ),
             access_broker: weft_broker_client::BrokerAccessClient::new(
                 broker_url.to_string(),
+                token.clone(),
+            ),
+            steering: weft_broker_client::BrokerExecutionClient::new(
+                broker_url.to_string(),
                 token,
             ),
             pending_costs: crate::metering::PendingCostRecords::new(),
         }
+    }
+}
+
+/// Trait surface over `BrokerExecutionClient` so tests can inject a
+/// recording fake. Production has one impl: the broker-backed HTTP
+/// client. Both calls are worker-only and pod-bound on the broker
+/// side, so the pod name rides along.
+#[async_trait]
+pub trait ExecutionSteeringClient: Send + Sync {
+    /// Tag `color` with `tags`, synchronously (the rows exist on
+    /// return).
+    async fn tag_execution(
+        &self,
+        color: Color,
+        tags: Vec<String>,
+        pod_name: &str,
+    ) -> anyhow::Result<()>;
+    /// Queue a stop of every live sibling of `color` carrying `tag`.
+    async fn stop_tagged(
+        &self,
+        color: Color,
+        tag: String,
+        stop_self: weft_core::StopSelf,
+        pod_name: &str,
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl ExecutionSteeringClient for weft_broker_client::BrokerExecutionClient {
+    async fn tag_execution(
+        &self,
+        color: Color,
+        tags: Vec<String>,
+        pod_name: &str,
+    ) -> anyhow::Result<()> {
+        <weft_broker_client::BrokerExecutionClient>::tag_execution(self, color, tags, pod_name)
+            .await
+    }
+    async fn stop_tagged(
+        &self,
+        color: Color,
+        tag: String,
+        stop_self: weft_core::StopSelf,
+        pod_name: &str,
+    ) -> anyhow::Result<()> {
+        <weft_broker_client::BrokerExecutionClient>::stop_tagged(
+            self, color, tag, stop_self, pod_name,
+        )
+        .await
     }
 }
 
@@ -423,8 +479,8 @@ impl AccessBroker for FakeAccessBroker {
 fn published_connection(
     node_id: &str,
     service: &str,
-) -> weft_broker_client::protocol::PublishedConnection {
-    weft_broker_client::protocol::PublishedConnection {
+) -> weft_core::access::wire::PublishedConnection {
+    weft_core::access::wire::PublishedConnection {
         connection_id: format!("published-{node_id}-{service}"),
         identity: Some(format!("{service} run by {node_id}")),
     }
@@ -1068,12 +1124,6 @@ pub enum EmitKind {
 pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Journal write stamped with this Pod's name for fencing. Logs the
-/// error instead of propagating (most call sites are teardown paths
-/// that cannot fail), BUT the drive's journal client is wrapped in
-/// `PoisonOnWriteFailure`, so the failure latches a flag the drive
-/// loop checks every iteration: the worker exits instead of driving
-/// on top of a journal that no longer matches its live state.
 /// The runtime output-type gate: a node may only emit on a port a value
 /// its declared type accepts (`WeftType::accepts_runtime_value`: a
 /// declared named/record shape validates the value against its
@@ -1083,6 +1133,8 @@ fn type_accepts(declared: &WeftType, value: &Value) -> bool {
     declared.accepts_runtime_value(value)
 }
 
+/// Journal write for teardown paths that cannot propagate errors.
+/// `PoisonOnWriteFailure` also marks the drive for exit on failure.
 pub async fn record_from_pod(journal: &dyn JournalClient, event: ExecEvent, pod_name: &str) {
     if let Err(e) = journal.record_event(&event, Some(pod_name)).await {
         tracing::error!(
@@ -1485,12 +1537,16 @@ impl RunnerHandle {
         &self,
         dedup_prefix: &str,
         kind: weft_task_store::TaskKind,
-        payload: P,
+        payload: impl FnOnce(u64) -> P,
     ) -> WeftResult<()> {
-        let payload_json = serde_json::to_value(&payload).map_err(|e| {
+        // The effect's index is minted once and goes both into the
+        // dedup key and to the payload builder, so what the journal
+        // orders by is exactly what the broker dedups on.
+        let seq = u64::from(self.next_side_effect_index());
+        let payload_json = serde_json::to_value(payload(seq)).map_err(|e| {
             WeftError::Config(format!("{dedup_prefix} payload: {e}"))
         })?;
-        let dedup_key = self.side_effect_dedup_key(dedup_prefix)?;
+        let dedup_key = self.side_effect_dedup_key(dedup_prefix, seq)?;
         self.clients
             .tasks
             .enqueue_dedup(weft_task_store::NewTask {
@@ -1523,14 +1579,13 @@ impl RunnerHandle {
     /// would shift these indices and mis-key one (double-write or wrongly
     /// suppress). `log` is the only side effect keyed this way, and log
     /// output is observational, so a mis-keyed line is harmless.
-    fn side_effect_dedup_key(&self, prefix: &str) -> WeftResult<String> {
+    fn side_effect_dedup_key(&self, prefix: &str, idx: u64) -> WeftResult<String> {
         let frames_key = frames_dedup_key(&self.node_frames)
             .map_err(|e| WeftError::Config(format!("{prefix} frames key: {e}")))?;
         Ok(format!(
             "{prefix}:{color}:{node}:{frames_key}:{idx}",
             color = self.color,
             node = self.node_id,
-            idx = self.next_side_effect_index(),
         ))
     }
 
@@ -2044,9 +2099,8 @@ impl ContextHandle for RunnerHandle {
         // call_index is the value run_step returned, passed in so
         // run_step and run_record agree on the index explicitly
         // rather than via a shared counter both sides read.
-        record_from_pod(
-            self.clients.journal.as_ref(),
-            ExecEvent::RunOutput {
+        self.clients.journal.record_event(
+            &ExecEvent::RunOutput {
                 color: self.color,
                 node_id: self.node_id.clone(),
                 frames: self.node_frames.clone(),
@@ -2055,15 +2109,20 @@ impl ContextHandle for RunnerHandle {
                 value: value.clone(),
                 at_unix: now_unix(),
             },
-            &self.pod_name,
+            Some(&self.pod_name),
         )
-        .await;
-        Ok(())
+        .await
+        .map_err(|error| WeftError::NodeExecution(format!(
+            "could not save result of '{name}' for node '{}': {error}. \
+             The action may already have happened; inspect this run before repeating it.",
+            self.node_id,
+        )))
     }
 
     async fn storage_put(
         &self,
         scope: &weft_core::storage::StorageScope,
+        identity: Option<&str>,
         data: weft_core::storage::ByteStream,
         mime_type: &str,
         filename: &str,
@@ -2072,17 +2131,34 @@ impl ContextHandle for RunnerHandle {
     ) -> WeftResult<Value> {
         self.clients
             .storage
-            .put(self.color, scope, mime_type, filename, keep, declared_size, data)
+            .put(self.color, scope, identity, mime_type, filename, keep, declared_size, data)
             .await
     }
 
     async fn storage_put_from_url(
         &self,
         scope: &weft_core::storage::StorageScope,
+        identity: Option<&str>,
         url: &str,
         filename: Option<&str>,
         keep: Option<weft_core::storage::KeepTtl>,
     ) -> WeftResult<Value> {
+        // An identified fetch asks the store first: a source already
+        // stored costs no request at all (the server behind `url` may
+        // do real work to answer one, a bridge pulling a clip out of
+        // WhatsApp, say). The begin's already-stored answer remains the
+        // race-safe backstop for two fetches landing at once.
+        if let Some(identity) = identity {
+            if let Some(meta) = self.clients.storage.find(self.color, scope, identity).await? {
+                return Ok(weft_core::storage::StoredFile {
+                    key: meta.key,
+                    mime_type: meta.mime_type,
+                    size_bytes: meta.size_bytes,
+                    filename: meta.filename,
+                }
+                .to_value());
+            }
+        }
         // Reuse the process-wide pooled client (a fresh Client::new()
         // per fetch rebuilds the connection pool; see http_client).
         let resp = http_client()
@@ -2101,9 +2177,18 @@ impl ContextHandle for RunnerHandle {
         let mime = weft_core::storage::normalize_content_type(
             resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
         );
+        // The caller's name wins; then whatever the server calls the
+        // file (a media route serving `/media/<id>` still says
+        // `voice.ogg` in its Content-Disposition); the URL last.
         let name = filename
             .filter(|f| !f.is_empty())
             .map(String::from)
+            .or_else(|| {
+                resp.headers()
+                    .get(reqwest::header::CONTENT_DISPOSITION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(weft_core::storage::filename_from_disposition)
+            })
             .unwrap_or_else(|| weft_core::storage::filename_from_url(url));
         // A sized response body (Content-Length) is declared up front so the
         // whole quota charge happens before the first byte moves.
@@ -2114,7 +2199,10 @@ impl ContextHandle for RunnerHandle {
             resp.bytes_stream()
                 .map_err(|e| std::io::Error::other(format!("fetch stream: {e}"))),
         );
-        self.clients.storage.put(self.color, scope, &mime, &name, keep, declared_size, stream).await
+        self.clients
+            .storage
+            .put(self.color, scope, identity, &mime, &name, keep, declared_size, stream)
+            .await
     }
 
     async fn storage_get(
@@ -2483,16 +2571,41 @@ impl ContextHandle for RunnerHandle {
             level = level_str,
             "{message}"
         );
-        self.enqueue_side_effect_task(
-            "log",
-            weft_task_store::TaskKind::RecordLog,
+        self.enqueue_side_effect_task("log", weft_task_store::TaskKind::RecordLog, |seq| {
             weft_task_store::RecordLogPayload {
                 color: self.color.to_string(),
+                node_id: self.node_id.clone(),
+                frames: self.node_frames.clone(),
                 level: level_str.to_string(),
                 message,
-            },
-        )
+                at_unix_ms: Some(crate::now_unix_ms()),
+                seq: Some(seq),
+            }
+        })
         .await
+    }
+
+    /// Synchronous through the broker (the tag rows exist on return),
+    /// and safe to re-run: the broker's insert keeps an existing
+    /// (color, tag) row, so a body replayed after a crash re-tags onto
+    /// the same state. Not journaled through `ctx.run` for that reason.
+    async fn tag_execution(&self, tags: Vec<String>) -> WeftResult<()> {
+        self.clients
+            .steering
+            .tag_execution(self.color, tags, &self.pod_name)
+            .await
+            .map_err(|e| WeftError::Config(format!("tag_execution: {e}")))
+    }
+
+    /// Queues the stop through the broker, which anchors the ordering
+    /// at this instant. Re-running it after a crash asks again for the
+    /// same set (anything it already stopped is terminal and skipped).
+    async fn stop_tagged(&self, tag: String, stop_self: weft_core::StopSelf) -> WeftResult<()> {
+        self.clients
+            .steering
+            .stop_tagged(self.color, tag, stop_self, &self.pod_name)
+            .await
+            .map_err(|e| WeftError::Config(format!("stop_tagged: {e}")))
     }
 
     fn cancellation(&self) -> Arc<CancellationFlag> {
@@ -2964,6 +3077,7 @@ mod type_check_tests {
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+    use super::test_journal::CaptureJournal;
     use weft_core::context::ContextHandle;
     use weft_core::primitive::{AwaitedEntry, AwaitedEntryKind};
 
@@ -2981,6 +3095,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
             "exec-1".into(),
@@ -3002,6 +3117,38 @@ mod replay_tests {
         .with_awaited_sequence(seq)
     }
 
+    #[tokio::test]
+    async fn run_refuses_to_return_an_unsaved_result() {
+        let journal = Arc::new(CaptureJournal::default());
+        *journal.fail_count.lock().unwrap() = 1;
+        let mut handle = handle_with_sequence(Vec::new());
+        handle.clients.journal = journal.clone();
+        let ctx = ctx_over(handle);
+        let mut reached_followup = false;
+        let result: WeftResult<()> = async {
+            ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await?;
+            reached_followup = true;
+            Ok(())
+        }.await;
+        assert!(!reached_followup, "a caller must not act on an unsaved result");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("request-id"), "{error}");
+        assert!(error.contains("simulated journal failure"), "{error}");
+        assert!(journal.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_returns_a_result_after_recording_it() {
+        let journal = Arc::new(CaptureJournal::default());
+        let mut handle = handle_with_sequence(Vec::new());
+        handle.clients.journal = journal.clone();
+        let ctx = ctx_over(handle);
+        let result = ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await.unwrap();
+        let events = journal.events.lock().unwrap();
+        assert!(matches!(events.as_slice(), [ExecEvent::RunOutput { name, value, call_index: 0, .. }]
+            if name == "request-id" && *value == result));
+    }
+
     /// Same rig as `handle_with_sequence` but with a caller-supplied
     /// `PaidCallClient` fake, for the access/provision/settle tests.
     fn handle_with_access_broker(access_broker: Arc<FakeAccessBroker>) -> RunnerHandle {
@@ -3015,6 +3162,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker,
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
             "exec-1".into(),
@@ -3276,6 +3424,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: worker_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         let color = uuid::Uuid::from_u128(0xC0);
         let worker_handle = Arc::new(RunnerHandle::new(
@@ -3311,6 +3460,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: test_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            steering: Arc::new(NoopSteering),
         };
         let runner = crate::test_rig::LiveTestRunner::new(
             test_clients,
@@ -3355,6 +3505,7 @@ mod replay_tests {
         let file = handle
             .storage_put(
                 &StorageScope::Execution,
+                None,
                 weft_core::storage::bytes_stream(bytes::Bytes::from_static(b"payload")),
                 "audio/ogg",
                 "clip.ogg",
@@ -3392,6 +3543,43 @@ mod replay_tests {
         assert!(url.starts_with("http") && url.contains(&stored.key), "{url}");
     }
 
+    /// An identified put is idempotent within its scope: the second put
+    /// of the same identity answers the first file and stores nothing,
+    /// and the same identity in another scope is another file.
+    #[tokio::test]
+    async fn an_identified_put_answers_the_file_already_stored() {
+        use weft_core::storage::{StorageScope, StoredFile};
+        let handle = handle_with_sequence(vec![]);
+        async fn put(
+            handle: &RunnerHandle,
+            scope: StorageScope,
+            identity: Option<&str>,
+            body: &'static [u8],
+        ) -> StoredFile {
+            let value = handle
+                .storage_put(
+                    &scope,
+                    identity,
+                    weft_core::storage::bytes_stream(bytes::Bytes::from_static(body)),
+                    "audio/ogg",
+                    "voice.ogg",
+                    None,
+                    Some(body.len() as u64),
+                )
+                .await
+                .expect("put");
+            StoredFile::from_value(&value).expect("self-describing value")
+        }
+        let first = put(&handle, StorageScope::Project, Some("whatsapp:m1"), b"first").await;
+        let again = put(&handle, StorageScope::Project, Some("whatsapp:m1"), b"second-would-be").await;
+        assert_eq!(again.key, first.key, "the same source is the same file");
+        assert_eq!(again.size_bytes, 5, "the bytes already stored, not the new ones");
+        let elsewhere = put(&handle, StorageScope::Execution, Some("whatsapp:m1"), b"first").await;
+        assert_ne!(elsewhere.key, first.key, "an identity is scoped");
+        let anonymous = put(&handle, StorageScope::Project, None, b"first").await;
+        assert_ne!(anonymous.key, first.key, "no identity, no sharing");
+    }
+
     /// A url-backed file value routes by its handle in every storage
     /// verb: presign hands the URL back as-is (it already IS a URL an
     /// external service can fetch); delete/keep are bucket-only and
@@ -3414,6 +3602,23 @@ mod replay_tests {
     }
 
     use weft_journal::NoopJournal;
+
+    struct NoopSteering;
+    #[async_trait]
+    impl ExecutionSteeringClient for NoopSteering {
+        async fn tag_execution(&self, _: Color, _: Vec<String>, _: &str) -> anyhow::Result<()> {
+            unreachable!("these tests steer no executions")
+        }
+        async fn stop_tagged(
+            &self,
+            _: Color,
+            _: String,
+            _: weft_core::StopSelf,
+            _: &str,
+        ) -> anyhow::Result<()> {
+            unreachable!("these tests steer no executions")
+        }
+    }
 
     struct NoopTaskStore;
     #[async_trait]
@@ -3771,7 +3976,8 @@ pub async fn apply_via_supervisor(
     let cmd_id = infra_state
         .enqueue_apply(project_id, node_id, spec_json)
         .await?;
-    let deadline = clock.now() + TASK_WAIT_TIMEOUT;
+    let started = clock.now();
+    let mut next_report = started + Duration::from_secs(30);
     loop {
         let resp = infra_state.wait_apply(project_id, cmd_id).await?;
         if resp.completed {
@@ -3808,13 +4014,63 @@ pub async fn apply_via_supervisor(
                 }
             }
         }
-        if clock.now() >= deadline {
-            anyhow::bail!(
-                "supervisor did not complete apply command {cmd_id} within {}s",
-                TASK_WAIT_TIMEOUT.as_secs()
+        if clock.now() >= next_report {
+            tracing::info!(
+                project_id, node_id, command_id = cmd_id,
+                elapsed_secs = clock.now().duration_since(started).as_secs(),
+                "infrastructure apply is still running; inspect it with `weft infra status`"
             );
+            next_report = clock.now() + Duration::from_secs(30);
         }
         clock.sleep(TASK_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod infra_apply_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use weft_broker_client::protocol::{InfraWaitApplyResponse, LifecycleOutcome};
+    use weft_platform_traits::clock::FakeClock;
+
+    struct ApplyState {
+        clock: Arc<FakeClock>,
+        responses: std::sync::Mutex<VecDeque<InfraWaitApplyResponse>>,
+    }
+
+    #[async_trait]
+    impl InfraStateClient for ApplyState {
+        async fn enqueue_apply(&self, _: &str, _: &str, _: Value) -> anyhow::Result<i64> {
+            Ok(42)
+        }
+        async fn wait_apply(&self, _: &str, id: i64) -> anyhow::Result<InfraWaitApplyResponse> {
+            assert_eq!(id, 42);
+            self.clock.advance(Duration::from_secs(3600));
+            Ok(self.responses.lock().unwrap().pop_front().expect("unexpected extra poll"))
+        }
+    }
+
+    #[tokio::test]
+    async fn infrastructure_apply_waits_for_completion_even_after_hours() {
+        let clock = FakeClock::new();
+        let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
+            InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
+            InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
+            InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Succeeded), outcome_message: None },
+        ])) };
+        apply_via_supervisor(&state, clock.as_ref(), "project", "database", &Default::default()).await.unwrap();
+        assert!(clock.elapsed() >= Duration::from_secs(3 * 3600));
+        assert!(state.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn infrastructure_apply_still_reports_an_actual_failure() {
+        let clock = FakeClock::new();
+        let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
+            InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Failed), outcome_message: Some("image cannot start".into()) },
+        ])) };
+        let error = apply_via_supervisor(&state, clock.as_ref(), "project", "database", &Default::default()).await.unwrap_err();
+        assert!(error.to_string().contains("image cannot start"));
     }
 }
 
@@ -3835,22 +4091,19 @@ pub async fn apply_via_supervisor(
 //      serializes both with the `closed` flag.
 
 #[cfg(test)]
-mod bus_pump_tests {
+mod test_journal {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
-    use weft_core::bus::{BusOptions, SendError};
     use weft_journal::ExecEvent;
 
     /// Capturing journal client. Stores every `record_event` payload
-    /// so tests can assert on the bus events the pump shipped.
-    /// Optionally throws on every Nth call to exercise the degraded
-    /// path; `fail_next` set to `Some(N)` fails the Nth following
-    /// call exactly once, then resets.
+    /// so context and bus tests can assert what was saved. `fail_count`
+    /// rejects that many following writes before accepting them again.
     #[derive(Default)]
-    struct CaptureJournal {
-        events: StdMutex<Vec<ExecEvent>>,
-        fail_count: StdMutex<usize>,
+    pub(super) struct CaptureJournal {
+        pub(super) events: StdMutex<Vec<ExecEvent>>,
+        pub(super) fail_count: StdMutex<usize>,
     }
     #[async_trait]
     impl weft_journal::JournalClient for CaptureJournal {
@@ -3875,6 +4128,13 @@ mod bus_pump_tests {
             Ok(false)
         }
     }
+}
+
+#[cfg(test)]
+mod bus_pump_tests {
+    use super::*;
+    use super::test_journal::CaptureJournal;
+    use weft_core::bus::{BusOptions, SendError};
 
     fn spawn_pump(
         coordinator: &Arc<BusCoordinator>,
@@ -4477,7 +4737,7 @@ mod endpoint_tests {
             |_| {
                 // Cancelled while the very first attempt is in flight,
                 // exactly as `weft stop` would.
-                armed.cancel();
+                armed.cancel_because(weft_core::exec::CancelCause::User);
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async { Err("connection refused".to_string()) }
             },

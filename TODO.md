@@ -554,6 +554,21 @@ no-suspension-while-open rule keeps the gap honest until then.
 [Update Notice Warning] If we touch the BusCoordinator, implement
 Generator[T], or rework await_signal journaling, revisit this entry.
 
+## Concurrent builds have no order for the asset reference set
+Every build publishes "the files this project uses now". Two builds of one
+project at once can land in either order, so a slow older build can
+overwrite a newer one's set: the newer files get a 30-day expiry countdown
+they should not have, which the next successful build clears. Fixing it
+needs a version on builds to compare against, and the publish happens
+before the definition is registered, so nothing carries one yet.
+
+## A time type?
+`Cron` takes a cron string plus a `timezone`, `WaitUntil` an ISO-8601
+string, `Wait` a number of seconds: three spellings of "a moment" with
+no type behind them. Worth deciding whether time (and a repeating time)
+should be a WeftType of its own, or whether three string-ish inputs on
+three nodes is fine.
+
 ## Rename color to exec
 Color was a concept I was experimenting with for mutliple execution in the same runtime but I changed my mind and never ended up changing the name.
 
@@ -613,51 +628,28 @@ boolean out) would cover it and compose anywhere a boolean goes.
 Decide whether that node is worth adding, or whether "emit nothing on
 the branch you do not want" is the one way it should be said.
 
-## Executions steering each other by tag
+## Killing tagged NODES inside one execution
 
-Two `ctx` functions, and the pair is what makes the feature.
-
-The first lets a node tag its own execution: one tag or several, added to
-whatever that execution already carries. Any node can call it, at any
-point.
-
-The second lets a node act on OTHER executions through those tags:
-"stop every execution carrying this tag, right now, including the ones
-parked waiting for a signal, and stop that waiting too."
-
-What it buys, in one shape everybody has hit: somebody fires three
-messages at an assistant in a row. Each message starts an execution
-whose first node tags it with the sender's id and whose second node
-waits ten seconds before answering. Each new execution begins by killing
-everything already carrying that id, so only the last message is
-answered, with all three in view. No queue, no debounce service, no
-state anywhere.
-
-The open parts: what a stopped execution looks like in the journal
-(cancelled by whom, on whose behalf), whether the caller may stop
-executions outside its own project (no), what happens to an execution
-that is mid-call in a node when the stop lands, and whether "stop"
-should have a sibling that only stops the waiting and lets the rest run
-on.
+The execution-level half of this idea shipped. For the mechanism, go and
+read `docs/src/nodes/steering-executions.md`.
 
 **The same verb, one scope down.** Tags name nodes too (`_tags`), so the
 same idea points INSIDE one execution: "stop every node tagged `pathB`".
 Where it pays is a fork whose two branches race, one short and one long:
 the moment the short one wins, the long one is dead weight, and killing
 it saves the model calls and the compute it was about to spend rather
-than discarding its answer at the end. That is the difference between
-ignoring a branch and never paying for it.
+than discarding its answer at the end.
 
 Whether that is the same function with a scope, or two functions, is
 part of the decision. What a killed branch leaves behind is the harder
 half: its nodes have to close their outputs so whatever was waiting on
-them skips cleanly rather than hanging, and a node that is mid-call when
-the kill lands is the same in-flight problem as above, one layer down.
-This one pairs with [fire-on-arrival](#fire-on-arrival-should-a-node-be-able-to-run-before-all-its-inputs-are-in),
-which is what makes the race expressible in the first place.
+them skips cleanly instead of hanging. A node that is mid-call when the
+kill lands is the same in-flight problem the execution-level stop already
+answers: the flag flips, the node stops at its next await. For how a race
+between branches becomes possible at all, go and read
+[fire-on-arrival](#fire-on-arrival-should-a-node-be-able-to-run-before-all-its-inputs-are-in).
 
-Not doing it now. Writing it down because it turns a weft program from
-something that runs into something that can manage its own kind.
+Not doing it now: without fire-on-arrival there is no race to lose.
 
 ## Nothing tests the editor: a rig that drives the real webview
 
@@ -703,6 +695,23 @@ it should be able to stand up an extension host as well as a webview.
   decides how much it may cost.
 
 Not now: it is a real piece of infrastructure, not an afternoon.
+
+## Type rules in metadata: an output typed from the node's other ports
+
+Two nodes want an output whose type the metadata cannot write down as a
+single type, and today each fakes it: `FirstInOrder` emits whichever
+branch survived, so its output is really the UNION of what its created
+inputs carry, and `LlmInference.response` is a `String` without
+`parseJson` and a record or `JsonDict` with it. Both are `MustOverride`
+or a type variable now, and the author restates the type in the
+signature every time.
+
+The feature is a small rule language in `metadata.json` (an output typed
+as "the union of these inputs", "this type when that input is true"),
+read by enrich the way `portsFromConfig` is. Nothing of it exists in the
+code on purpose: it is the whole feature or nothing, since a half rule
+would send the editor, the validator and the runtime three different
+answers about one port. Design it before writing the first rule.
 
 ## Fire-on-arrival: should a node be able to run before all its inputs are in?
 
@@ -753,6 +762,53 @@ the journal (durable, replayable, another thing on the write path).
   there any case where it should be otherwise?
 - Cost. A node that fired four times bills as what.
 
-It pairs with [tags stopping work](#executions-steering-each-other-by-tag):
+It pairs with [tags stopping work](#killing-tagged-nodes-inside-one-execution):
 fire-on-arrival is what makes a race expressible, and cancelling the
 losing branch by tag is what stops it costing money.
+
+## A node whose outputs nobody reads
+
+There used to be a warning for it, `orphan-outputs`, and it was removed
+because it fired on the last node of nearly every real program. This
+entry is what would have to be true to bring it back.
+
+**What the warning was for.** A node that computes a value nobody uses
+is usually a mistake: a `Cast` left over from an edit, a `Format` whose
+result was meant to go somewhere. Catching that is worth a line of
+advice in the editor.
+
+**Why it fires on correct programs.** A program ends by DOING
+something: sending the message, writing the row, uploading the file.
+Those nodes have outputs (a message id, a row count) that nobody has to
+read, so every one of them looked like the mistake above. `_is_output:
+true` used to mark them and is gone, because every reached node runs
+now and the marker meant nothing to the runtime. So today the last node
+of a Telegram bot, a Slack bot and a Postgres writer all warn, which
+teaches people to ignore warnings, which costs us the two cases where
+the warning was right.
+
+**Why a metadata flag is not enough.** The obvious fix is a per-node
+flag in the catalog ("this node's effect is the point"), set on send,
+write, upload and react nodes. It works for those, and it breaks on the
+nodes that are both: `ExecPython` is usually a computation whose result
+matters, and sometimes the script itself is the whole point (it calls
+something, it writes a file). Whichever way the flag is set on such a
+node, half its uses are wrong.
+
+**So the shape it needs.** A default in the node's metadata, plus a way
+for a program to override the default on one instance. Which raises the
+questions to answer before writing any of it:
+
+- What is the override's spelling, and is it a config key (the language
+  reading a `_`-reserved key again, which is the thing `_is_output` did
+  and we removed) or something else entirely?
+- Does the override belong on the node at all, or is it really a
+  property of the WIRE that is missing (this output is a receipt) so
+  the check is per-port rather than per-node?
+- Is the editor a better home than the compiler? A node with nothing
+  leaving it is visible at a glance in the graph, and a diagnostic that
+  is only ever advice may not belong in the compile output at all.
+- What does it do inside a group? A member whose outputs feed nothing
+  and no `self.x` is the same mistake one level down.
+
+Until that is answered there is no warning, and a leaf is just a leaf.

@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+// The published-connection shape lives in weft-core `access::wire`
+// beside the other connect wire types; the store's read-back query
+// answers the same struct, so publish and read-back cannot drift.
+use weft_core::access::wire::PublishedConnection;
 use weft_journal::ExecEvent;
 use weft_task_store::tasks::{ClaimFilter, NewTask, Task, TaskOutcome, TaskStatus};
 
@@ -198,6 +202,23 @@ impl InfraNodeStatus {
             .max_by_key(|s| s.rollup_rank())
             .unwrap_or(InfraNodeStatus::Stopped)
     }
+
+    /// The node status a completed apply stamps (`set_applied`), from
+    /// the roster it writes: every reconciled unit just came up
+    /// `Running`, and the only other status a unit can hold at that
+    /// point is `Flaky` (a frozen unit the apply left alone), so the
+    /// node is `Flaky` if any unit is and `Running` otherwise. The
+    /// general `rollup` would say `Stopped` for a unit-less roster
+    /// (a spec of shared resources only), which a successful apply is
+    /// not. The broker and the supervisor's test fake both stamp
+    /// through this, so the node status agrees with its roster.
+    pub fn applied_rollup<'a>(units: impl IntoIterator<Item = &'a InfraNodeStatus>) -> InfraNodeStatus {
+        if units.into_iter().any(|s| *s == InfraNodeStatus::Flaky) {
+            InfraNodeStatus::Flaky
+        } else {
+            InfraNodeStatus::Running
+        }
+    }
 }
 
 /// Per-unit runtime state carried in `infra_node.units_json`. The map
@@ -218,6 +239,17 @@ pub struct UnitRuntime {
     /// Resolved at apply: `Unit.health.recovery_after_seconds` or the
     /// supervisor's global default.
     pub recovery_after_seconds: u32,
+    /// The image refs this unit's containers actually run after the
+    /// apply that stamped this entry (`Image::Upstream` literals and
+    /// resolved `Image::Local` tags alike). A FROZEN unit (left up
+    /// across a sync) keeps the refs its last apply recorded, which can
+    /// be older than the project's current tag map: image reclamation
+    /// (`GET /images/referenced`) unions these so an up unit's old
+    /// image is never reclaimed out from under it. Empty for entries
+    /// stamped before the field existed. The broker's per-unit status
+    /// patches (`jsonb_set ... 'status'`) leave this untouched.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub image_refs: std::collections::BTreeSet<String>,
 }
 
 wire_enum! {
@@ -287,6 +319,45 @@ pub struct JournalRecordRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecordResponse {}
+
+// ---------- Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`) ----------
+
+/// `POST /v1/execution/tag`: the worker tags the execution it is
+/// driving. Worker-only, pod-bound exactly like `journal_record`: the
+/// broker journals `ExecutionTagged` and writes the `execution_tag`
+/// rows in one transaction, synchronously, so by the time the node's
+/// call returns its tag row exists and a following `stop_tagged` can
+/// anchor on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionTagRequest {
+    pub color: String,
+    /// Already validated by the ctx (`weft_core::tag`); the broker
+    /// validates again, because it trusts no pod.
+    pub tags: Vec<String>,
+    pub pod_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionTagResponse {}
+
+/// `POST /v1/execution/stop_tagged`: the worker asks that every live
+/// execution of ITS project carrying `tag` be stopped. The broker
+/// resolves the ordering anchor at this moment (the asker's own tag
+/// seq, or one past the newest row) and enqueues the dispatcher's
+/// `stop_tagged` task with it, so a stop that runs late can never reach
+/// a sibling that tagged itself after the ask. The project is the
+/// color's, read from `execution_color`; the request never names one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStopTaggedRequest {
+    /// The asking execution.
+    pub color: String,
+    pub tag: String,
+    pub stop_self: weft_core::StopSelf,
+    pub pod_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStopTaggedResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalFetchRequest {
@@ -564,16 +635,6 @@ pub struct PublishAccessRequest {
     pub values: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub label: Option<String>,
-}
-
-/// The published connection, as both publish verbs answer it. ONE
-/// shape, so a connection read back is the same value as the one just
-/// published (an identity that appeared on the first run and vanished
-/// on the second was the bug this shape prevents).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PublishedConnection {
-    pub connection_id: String,
-    pub identity: Option<String>,
 }
 
 /// The reference the publisher gets back, to put on its output port.
@@ -1374,6 +1435,80 @@ pub struct SupervisorProjectImageTagsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorProjectImageTagsResponse {
     pub tags: std::collections::HashMap<String, String>,
+}
+
+/// Decode one `infra_image_tags_json` value (`{node: {image: tag}}`, the
+/// complete per-node map the dispatcher's infra sync writes) into the
+/// typed map. THE canonical decode for the column: the broker (the
+/// supervisor's read) and the dispatcher (the referenced-images
+/// keep-set) both route through it, so no reader hand-rolls the shape
+/// and the two cannot drift (a decode that silently skipped or coerced
+/// a bad row would either mask schema corruption as "no images
+/// registered" or shrink the keep-set below what the supervisor may
+/// still apply). `whose` names the row in the error, so one corrupt row
+/// among many is diagnosable.
+// SYNC: the column's writer <-> crates/weft-dispatcher/src/api/infra.rs
+//       (the sync handler that builds the map) +
+//       crates/weft-dispatcher/src/project_store.rs (set_running_hashes,
+//       the atomic persist)
+pub fn decode_infra_image_tags(
+    value: serde_json::Value,
+    whose: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>> {
+    serde_json::from_value(value).map_err(|e| {
+        anyhow::anyhow!(
+            "infra_image_tags_json for {whose} has wrong shape (expected \
+             {{node: {{image: tag}}}}): {e}"
+        )
+    })
+}
+
+/// Decode one `infra_node.units_json` value (`{unit: UnitRuntime}`, the
+/// roster the supervisor's apply stamps) into the typed map. THE
+/// canonical decode for the column: the broker (the supervisor's
+/// reads), the dispatcher's row reader and the referenced-images
+/// keep-set all route through it, so no reader hand-rolls the shape.
+/// Loud on a bad row, never coerced to empty (an empty roster would
+/// read as "nothing runs here" to the stop loop and shrink the keep-set
+/// below what still runs). `whose` names the row.
+///
+/// The one corruption this column has historically carried is a
+/// `{"status": ...}` stub: a per-unit status stamp that landed on a
+/// unit missing from the roster, back when the broker's SQL seeded the
+/// member with COALESCE (it now fences on membership and refuses).
+/// Such a stub lacks every other field, so it fails this decode; the
+/// error carries the exact repair statement (drop every entry with no
+/// `stop_behavior`), because a stub is undeletable through any weft
+/// surface and would otherwise brick this row's reads for good.
+// SYNC: the column's writers <-> crates/weft-broker/src/handlers.rs
+//       (write_apply_row, the full-map stamp; supervisor_set_status,
+//       the per-unit status patch)
+pub fn decode_units_json(
+    value: serde_json::Value,
+    project_id: &str,
+    node_id: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, UnitRuntime>> {
+    serde_json::from_value(value).map_err(|e| {
+        anyhow::anyhow!(
+            "infra_node.units_json for project={project_id} node={node_id} has wrong \
+             shape (expected {{unit: UnitRuntime}}): {e}. If the row holds a \
+             status-only stub entry, repair it with: {}",
+            units_json_repair_sql(project_id, node_id)
+        )
+    })
+}
+
+/// The statement that drops every status-only stub entry from one
+/// row's `units_json` (see `decode_units_json`): keeps exactly the
+/// entries carrying `stop_behavior`, which every real `UnitRuntime`
+/// has. Printed in the decode error for the operator to run by hand,
+/// and executed by the broker's db suite to prove it heals a row.
+pub fn units_json_repair_sql(project_id: &str, node_id: &str) -> String {
+    format!(
+        "UPDATE infra_node SET units_json = (SELECT COALESCE(jsonb_object_agg(k, v), \
+         '{{}}'::jsonb) FROM jsonb_each(units_json) AS e(k, v) WHERE v ? 'stop_behavior') \
+         WHERE project_id = '{project_id}' AND node_id = '{node_id}';"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
