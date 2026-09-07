@@ -60,6 +60,8 @@ Don't dispatch subagents to "design a plan" when you already hold full context f
 
 A [mode] is a cognitive pattern. You operate in one at a time. Each mode's full rules live in its own skill in this project's `.kilo/skills/`: `mode-collaborative`, `mode-red-team`, `mode-convergence`, `mode-babble`, `mode-code`, `mode-research`, `mode-debug`, `mode-writing`.
 
+Besides the modes there is `releasing`: how a change reaches `mvp` and the stores, which checks CI actually runs, and the store rules that have cost a round trip. Load it before merging into `mvp`, bumping an extension version, or looking at a red publish job.
+
 Switching to a mode is a two-part act, always both parts:
 1. Load the mode's skill with the skill tool. The skill is the mode: without the load you are switching to nothing.
 2. Announce the switch in one line: "Switching to [mode]."
