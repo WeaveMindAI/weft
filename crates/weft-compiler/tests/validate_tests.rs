@@ -423,33 +423,26 @@ out.data = a.value
 #[test]
 fn top_level_include_does_not_make_project_look_like_a_component() {
     // Regression: a Full-mode @include must NOT leave its group flagged
-    // `anonymous`. The anonymous root of a component file is the file's own
-    // interface, exempt from orphan-outputs by construction; an INCLUDED
-    // group is an ordinary node of the project, and its unread outputs are
-    // exactly what the warning is for.
+    // `anonymous`. The anonymous root of a component file is that file's
+    // own interface (validate treats it as the includer's business); an
+    // INCLUDED group is an ordinary node of the project, and the flag is
+    // what tells the two apart.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("comp.weft"),
         "Group(raw: String) -> (cleaned: String) {\n s = Text { value: \"x\" }\n self.cleaned = s.value\n}\n",
     ).unwrap();
 
-    // The include's output goes nowhere: orphan-outputs, named after the
-    // include (its boundary's own id appears nowhere in the source).
-    let src_loose = "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\n";
-    let mut p = compile(src_loose, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
+    let src = "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\n";
+    let mut p = compile(src, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     enrich(&mut p, &catalog()).expect("enrich");
-    let d = validate(&p, &catalog());
+    let included = p.groups.iter().find(|g| g.id == "c").expect("the include is a group of the project");
     assert!(
-        d.iter().any(|x| x.code.as_deref() == Some("orphan-outputs") && x.message.contains("'c'")),
-        "expected orphan-outputs on the include, got {d:?}"
+        !included.anonymous,
+        "an included group is a node of the project, not a component's own root: {included:?}"
     );
-
-    // Consumed downstream: nothing to say.
-    let src_read = "c = @include(\"comp.weft\")\nc.raw = Text { value: \"hi\" }.value\nout = Debug\nout.data = c.cleaned\n";
-    let mut p2 = compile(src_read, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
-    enrich(&mut p2, &catalog()).expect("enrich");
-    let d2 = validate(&p2, &catalog());
-    assert!(!codes(&d2).contains(&"orphan-outputs"), "unexpected orphan-outputs: {d2:?}");
+    let d = validate(&p, &catalog());
+    assert!(d.is_empty(), "the include compiles clean: {d:?}");
 }
 
 // ── declarative-rule engine (ConfigMatches) ──────────────────────────────────
@@ -2318,28 +2311,24 @@ out = Debug { data: loose.value }
     assert!(!warned.contains(&"p"), "a constants-only node has no upstream: {d:?}");
 }
 
+/// A leaf is how a program ends (the last node sends the message,
+/// writes the row), so a node whose outputs nobody reads is not warned
+/// about. Telling one that acts from one that only computes needs
+/// something the language does not have; see TODO.md, "A node whose
+/// outputs nobody reads".
 #[test]
-fn unconsumed_outputs_warn_and_a_terminal_node_does_not() {
-    // A node whose outputs go nowhere gets the warning; a node with no
-    // outputs at all (Debug) is a terminus and has nothing to warn about.
+fn a_node_whose_outputs_nobody_reads_is_not_warned_about() {
     let project = parse_enrich(
         r#"
 t = Text { value: "hi" }
 sink = Debug { _label: "sink" }
-sink.value = t.value
+sink.data = t.value
 loose = Cast(value: String) -> (value: String) {}
 loose.value = t.value
 "#,
     );
     let d = validate(&project, &catalog());
-    let flagged: Vec<&str> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("orphan-outputs"))
-        .filter_map(|x| x.message.split('\'').nth(1))
-        .collect();
-    assert!(flagged.contains(&"loose"), "{d:?}");
-    assert!(!flagged.contains(&"t"), "t IS consumed: {d:?}");
-    assert!(!flagged.contains(&"sink"), "a node with no outputs has nothing to orphan: {d:?}");
+    assert!(d.is_empty(), "a leaf carries no diagnostic of its own: {d:?}");
 }
 
 #[test]
@@ -2891,12 +2880,6 @@ out = Debug { data: seed.items }
         !d.iter().any(|e| e.message.contains("__out") || e.message.contains("__in")),
         "no diagnostic names a boundary node: {d:?}"
     );
-    let orphan: Vec<&Diagnostic> = d
-        .iter()
-        .filter(|e| e.code.as_deref() == Some("orphan-outputs") && e.message.contains("node 'my'"))
-        .collect();
-    assert_eq!(orphan.len(), 1, "unconsumed loop results warn under the loop's name: {d:?}");
-    assert_eq!(orphan[0].line, 3, "{:?}", orphan[0]);
 
     // A mistyped group port names the group, not the boundary the
     // edge was rewritten onto.
@@ -2962,8 +2945,8 @@ Group(raw?: String) -> (cleaned: String) {
     );
     let d = validate(&component, &catalog());
     assert!(
-        !d.iter().any(|e| e.code.as_deref() == Some("orphan-outputs") || e.code.as_deref() == Some("no-required-skip")),
-        "a component's interface is nobody's orphan: {d:?}"
+        !d.iter().any(|e| e.code.as_deref() == Some("no-required-skip")),
+        "a component's optional input is the includer's to make required: {d:?}"
     );
 }
 

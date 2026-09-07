@@ -765,3 +765,50 @@ the journal (durable, replayable, another thing on the write path).
 It pairs with [tags stopping work](#killing-tagged-nodes-inside-one-execution):
 fire-on-arrival is what makes a race expressible, and cancelling the
 losing branch by tag is what stops it costing money.
+
+## A node whose outputs nobody reads
+
+There used to be a warning for it, `orphan-outputs`, and it was removed
+because it fired on the last node of nearly every real program. This
+entry is what would have to be true to bring it back.
+
+**What the warning was for.** A node that computes a value nobody uses
+is usually a mistake: a `Cast` left over from an edit, a `Format` whose
+result was meant to go somewhere. Catching that is worth a line of
+advice in the editor.
+
+**Why it fires on correct programs.** A program ends by DOING
+something: sending the message, writing the row, uploading the file.
+Those nodes have outputs (a message id, a row count) that nobody has to
+read, so every one of them looked like the mistake above. `_is_output:
+true` used to mark them and is gone, because every reached node runs
+now and the marker meant nothing to the runtime. So today the last node
+of a Telegram bot, a Slack bot and a Postgres writer all warn, which
+teaches people to ignore warnings, which costs us the two cases where
+the warning was right.
+
+**Why a metadata flag is not enough.** The obvious fix is a per-node
+flag in the catalog ("this node's effect is the point"), set on send,
+write, upload and react nodes. It works for those, and it breaks on the
+nodes that are both: `ExecPython` is usually a computation whose result
+matters, and sometimes the script itself is the whole point (it calls
+something, it writes a file). Whichever way the flag is set on such a
+node, half its uses are wrong.
+
+**So the shape it needs.** A default in the node's metadata, plus a way
+for a program to override the default on one instance. Which raises the
+questions to answer before writing any of it:
+
+- What is the override's spelling, and is it a config key (the language
+  reading a `_`-reserved key again, which is the thing `_is_output` did
+  and we removed) or something else entirely?
+- Does the override belong on the node at all, or is it really a
+  property of the WIRE that is missing (this output is a receipt) so
+  the check is per-port rather than per-node?
+- Is the editor a better home than the compiler? A node with nothing
+  leaving it is visible at a glance in the graph, and a diagnostic that
+  is only ever advice may not belong in the compile output at all.
+- What does it do inside a group? A member whose outputs feed nothing
+  and no `self.x` is the same mistake one level down.
+
+Until that is answered there is no warning, and a leaf is just a leaf.

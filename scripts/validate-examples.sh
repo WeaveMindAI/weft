@@ -4,8 +4,10 @@
 # The examples are the first thing a new user copies, and nothing else
 # compiles them, so a broken graph or a dead @file(...) reference would
 # ship silently. A fresh checkout has no credentials connected, so the
-# connect-an-account diagnostics are the expected baseline; anything
-# else fails.
+# connect-an-account diagnostics are the expected baseline; any other
+# ERROR fails. A warning is advice (a leaf node whose outputs nobody
+# reads is how a program that sends a message ends), and an example is
+# allowed to carry it.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,6 +30,7 @@ for main in examples/*/main.weft; do
   # print "ok" over diagnostics nobody read.
   if ! unexpected="$(printf '%s' "$out" | jq -r '
     .diagnostics[]
+    | select(.severity == "error")
     | select((.code == "rule-runtime"
               and ((.message | contains("has no connected"))
                    or (.message | contains("connection picked")))) | not)
@@ -38,7 +41,7 @@ for main in examples/*/main.weft; do
     continue
   fi
   if [ -n "$unexpected" ]; then
-    echo "FAIL $dir: diagnostics beyond the expected connect-a-credential ones:" >&2
+    echo "FAIL $dir: errors beyond the expected connect-a-credential ones:" >&2
     echo "$unexpected" >&2
     status=1
   else

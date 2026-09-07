@@ -2509,22 +2509,23 @@ fn is_list_of_nullable(ty: &weft_core::weft_type::WeftType) -> bool {
 
 // ─── group 6: warnings ──────────────────────────────────────────────────────
 
-/// orphan-outputs: a non-debug node whose outputs are all unconnected
-///   is probably a mistake.
 /// no-required-skip: a node with inputs but none marked required will
 ///   never be skipped, even if all inputs are null. Usually a modeling
 ///   error (the user wanted at least one to be required).
 /// config-null-literal: `key: null` is meaningless.
 ///
-/// v1 refs: 4022-4039 (orphan-outputs), 4048-4068 (no-required-skip),
-/// 4296-4299 (config-null-literal).
+/// There is deliberately no "this node's outputs go nowhere" warning.
+/// A leaf is how a program ends: the last node sends the message,
+/// writes the row, uploads the file, and its outputs are receipts
+/// nobody has to read. `_is_output` used to mark those and is gone
+/// (every reached node runs), so the warning fired on the last node of
+/// nearly every real program, which teaches people to ignore warnings.
+/// Telling a leaf that acts from a leaf that only computes needs
+/// something the language does not have yet; see TODO.md, "A node
+/// whose outputs nobody reads".
+///
+/// v1 refs: 4048-4068 (no-required-skip), 4296-4299 (config-null-literal).
 fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    // Build "used as source" set.
-    let source_nodes: std::collections::HashSet<&str> = project
-        .edges
-        .iter()
-        .map(|e| e.source.as_str())
-        .collect();
     // The ports a wire lands on, per target node.
     let mut wired_ports: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
         std::collections::HashMap::new();
@@ -2540,51 +2541,23 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // header, and their ids (`my__in`, `my__out`) appear nowhere
         // in the source: a warning about either names the GROUP and
         // points at its header. Which warnings apply follows the
-        // half. The IN side holds the header's inputs and config, so
-        // "no required input" and "null config" are the author's to
-        // fix there. The OUT side holds the header's outputs, so
-        // "nobody consumes these" is the author's to fix there; its
+        // half, and today no warning applies to either: a boundary's
         // input ports are optional by construction (a gather port is
-        // `List[T | Null]` because a missed iteration leaves null),
-        // so "no required input" would be one they cannot act on. A
-        // component file's root boundaries are the file's interface:
-        // its outputs are consumed by whoever includes it, and its
-        // inputs are theirs to make required, so neither warns here.
+        // `List[T | Null]` because a missed iteration leaves null), so
+        // "no required input" would be one the author cannot act on.
         if node.group_boundary.as_ref().is_some_and(|b| Some(b.group_id.as_str()) == root) {
             continue;
         }
-        let role = node.group_boundary.as_ref().map(|b| b.role);
-        let in_boundary = role == Some(weft_core::project::GroupBoundaryRole::In);
-        let out_boundary = role == Some(weft_core::project::GroupBoundaryRole::Out);
+        // A boundary holds every group port as optional by construction
+        // (a closed one reaches the inside as a closure, and the node
+        // that needs it skips there), so the warning below would fire on
+        // every group; it is about nodes.
+        if node.group_boundary.is_some() {
+            continue;
+        }
         let name = author_name(node);
         let span = node.header_span_or_default();
         let file = node.source_file.as_deref();
-
-        // orphan-outputs: only flag when the node has outputs at all.
-        // Nodes like Debug (no outputs) are terminal and exempt. An IN
-        // boundary's outputs face the inside of its group, so "none
-        // consumed" would say the group's outputs go unread when it is
-        // the group's INPUTS nobody inside reads; not this warning.
-        if !in_boundary
-            && !node.outputs.is_empty()
-            && !source_nodes.contains(node.id.as_str())
-        {
-            push(
-                d,
-                file,
-                span,
-                Severity::Warning,
-                "orphan-outputs",
-                format!("node '{name}' produces outputs but none are consumed by downstream nodes"),
-            );
-        }
-        // An In boundary holds every group port as optional by
-        // construction (a closed one reaches the inside as a closure,
-        // and the node that needs it skips there), so the warning below
-        // would fire on every group; it is about nodes.
-        if out_boundary || in_boundary {
-            continue;
-        }
 
         // no-required-skip: only applies when the node has inputs,
         // none are required, no @require_one_of is declared, and the

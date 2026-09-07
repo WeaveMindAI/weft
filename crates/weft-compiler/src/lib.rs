@@ -150,7 +150,7 @@ fn parse_only_inner(
     }
 
     // Structural validate so the IDE gets inline feedback for
-    // graph-shape problems (graph-cycle, orphan-outputs, duplicate
+    // graph-shape problems (graph-cycle, scope-reachability, duplicate
     // ids, etc.) directly from /parse. Runtime-only rules
     // still only fire from the dedicated /validate endpoint.
     diagnostics.extend(validate::validate_with_mode(

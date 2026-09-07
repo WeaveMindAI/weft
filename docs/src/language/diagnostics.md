@@ -48,7 +48,6 @@ there.
 |---|---|
 | `graph-cycle` | a cycle in the wire graph. Iterate with a `Loop`; exchange feedback over a bus. |
 | `scope-reachability` | a connection reaches across a group boundary. Children reach each other and `self`, nothing else. |
-| `orphan-outputs` | a node's outputs go nowhere and nothing depends on it. |
 | `level-too-large` | **a warning.** A level of the graph (the file, or the inside of a group or loop) holds more than fifteen items, nodes or groups. About six per level is what reads; group the nodes cooperating on one job, and nest groups rather than widen the level. The program still runs: this is advice about how it reads. |
 | `loop-boundary-unpaired` | a loop's internal boundary nodes do not line up. This is an internal invariant; hitting it is a compiler bug worth reporting. |
 

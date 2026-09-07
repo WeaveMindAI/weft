@@ -517,7 +517,7 @@ Types: `unresolved-typevar`, `must-override-unmet`, `cast-not-allowed`,
 `named-type-conflict`.
 
 Shape: `graph-cycle` (iterate with a Loop, exchange feedback over a Bus),
-`scope-reachability`, `orphan-outputs`, `level-too-large` (a warning: a
+`scope-reachability`, `level-too-large` (a warning: a
 level holds more than fifteen items; group the nodes cooperating on one
 job, and nest rather than widen).
 
