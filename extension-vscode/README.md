@@ -1,11 +1,13 @@
 # Weft for VS Code
 
-The editor side of [Weft](https://weavemindai.github.io/weft/), an
-open-source language and runtime for AI workflows (the source is on
-the [`mvp` branch](https://github.com/WeaveMindAI/weft/tree/mvp), where
-the rebuild lives; `main` is the old proof of concept). Open a `.weft` file
-and the extension shows it as a live graph; run it, and the graph
-lights up with the execution as it happens.
+The editor side of [Weft](https://weavemindai.github.io/weft/), a
+programming language and framework for AI orchestration: as flexible as
+an agent, as reliable as code. Open a `.weft` file and the extension
+shows it as a live graph; run it, and the graph lights up with the
+execution as it happens.
+
+Weft is made by [Weavemind](https://weavemind.ai) and developed in the
+open at [github.com/WeaveMindAI/weft](https://github.com/WeaveMindAI/weft).
 
 ## What you get
 
@@ -31,9 +33,20 @@ it is one script. By default the extension connects to
 `http://localhost:9999` (the local daemon); the `weft.dispatcherUrl`
 setting points it elsewhere.
 
+## What it does on your machine
+
+It talks to the weft runtime on `localhost` and to nothing else: no
+telemetry, no account, no outside service. To compile and run your
+programs it starts the `weft` command that the install script put on
+your PATH.
+
 ## Learn more
 
 The full documentation lives at
-[weavemindai.github.io/weft](https://weavemindai.github.io/weft/).
-Issues and contributions are welcome at
-[github.com/WeaveMindAI/weft](https://github.com/WeaveMindAI/weft).
+[weavemindai.github.io/weft](https://weavemindai.github.io/weft/), and
+questions and bug reports are welcome
+[on the issue tracker](https://github.com/WeaveMindAI/weft/issues).
+
+## License
+
+See [LICENSE](https://github.com/WeaveMindAI/weft/blob/mvp/LICENSE).
