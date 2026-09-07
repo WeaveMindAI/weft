@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "users:read"
@@ -38,31 +38,26 @@
     {
       "name": "id",
       "type": "String",
-      "required": false,
       "description": "The user's Slack id (U...)."
     },
     {
       "name": "name",
       "type": "String",
-      "required": false,
       "description": "Display name (falls back to real name)."
     },
     {
       "name": "email",
       "type": "String",
-      "required": false,
       "description": "The profile email (empty without users:read.email)."
     },
     {
       "name": "timezone",
       "type": "String",
-      "required": false,
       "description": "The user's timezone, e.g. Europe/Paris."
     },
     {
       "name": "user",
       "type": "JsonDict",
-      "required": false,
       "description": "The full user object as Slack returns it."
     }
   ]

@@ -34,12 +34,21 @@ impl Node for FalGenerateImageNode {
         let seed: Option<f64> = ctx.inputs.opt("seed")?;
         let params = ctx.inputs.raw("params").cloned();
 
+        // `count` is bound to [1, 8] whole by its widget, wired or written.
         let mut payload = json!({
             "prompt": prompt,
             "image_size": size,
-            "num_images": (count as u64).clamp(1, 8),
+            "num_images": count as u64,
         });
         if let Some(s) = seed {
+            // Bounded on both ends: the cast below saturates, so a huge
+            // seed would silently become u64::MAX, and past 2^53 the
+            // number the author typed is not the number that arrived.
+            if s.fract() != 0.0 || s < 0.0 || s > 9_007_199_254_740_992.0 {
+                weft::node_bail!(
+                    "seed must be a whole number between 0 and 9007199254740992, got {s}"
+                );
+            }
             payload["seed"] = json!(s as u64);
         }
         merge_params(&mut payload, params.as_ref())?;

@@ -3,9 +3,10 @@
 //! The tags are whatever the user wired onto the node (each created
 //! input is one tag) plus the optional `tags` list, so a program says
 //! `TagRun(sender: String)` and wires the sender in; nothing is
-//! assembled by hand. The node exists so the debounce shape (a new
-//! message stops the answer to the previous one) is two catalog nodes
-//! and no Rust: this one, then `StopTagged`.
+//! assembled by hand, and any string works (see `steering::safe_tag`).
+//! The node exists so the debounce shape (a new message stops the
+//! answer to the previous one) is two catalog nodes and no Rust: this
+//! one, then `StopTagged`.
 
 use async_trait::async_trait;
 
@@ -30,6 +31,6 @@ impl Node for TagRunNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let tags = tags_from_inputs(&ctx)?;
         ctx.tag_execution(tags.iter().map(String::as_str)).await?;
-        ctx.pulse_downstream(NodeOutput::new().set("tags", tags).set("done", true)).await
+        ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

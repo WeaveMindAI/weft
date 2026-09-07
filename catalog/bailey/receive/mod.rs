@@ -41,13 +41,13 @@ impl Node for BaileyReceiveNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         // The SSE listener delivers the parsed `data:` object as the wake
         // payload. Fan the DECLARED fields onto their matching output
-        // ports; payload extras that are routing handles, not data
-        // (`isGroup`, `chatId`), are skipped by the declared-set
-        // intersection, and so is a field the payload sends as null (a
-        // picture with no caption). Missing fields
-        // stay un-mentioned and the engine closes those ports at
-        // termination (substituting empty strings / `false` would
-        // publish data nulls indistinguishable from real user values).
+        // ports; a payload field no port declares (`isGroup`, `chatId`,
+        // routing handles rather than data) is dropped by the
+        // declared-set intersection. A missing field stays un-mentioned
+        // and the engine closes its port at termination (substituting
+        // empty strings / `false` would publish data indistinguishable
+        // from real user values); a field the payload sends as null
+        // lands as null and is refused by a port whose type has no Null.
         //
         // `file` is a port THIS node computes (a stored-file reference, only
         // on the media path below); it is never a payload field. Strip it

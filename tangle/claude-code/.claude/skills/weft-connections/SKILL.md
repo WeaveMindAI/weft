@@ -63,7 +63,11 @@ The scripted surface, which is yours:
   outside a project, or in one with no access node, it lists every stored
   connection across all services.
 - `--node <id> --grant <grant>` picks a stored connection (no secrets
-  travel; this one is yours to run).
+  travel; this one is yours to run). It edits the `.weft` source and prints
+  the edit as an edit tool would (`main.weft:15`, then `- old` and `+ new`
+  lines), so read that block and update your picture of the file: the
+  node's braces now carry the pick, and your next edit of that node builds
+  on the printed line. `--disconnect` prints the same block for the removal.
 - `--set name=value` fills an acquisition field, and `--set-env
   NAME=ENV_VAR` reads the value from an environment variable so a secret
   never rides the command line. An explicitly empty `--set` or `--set-env`
@@ -120,7 +124,10 @@ reaches people through the **weft browser extension**:
 A token with no scope sees every task of the tenant. Handing one to
 somebody else: `weft token mint --name "reviewer" --projects <id> --tags
 approvals` narrows it to projects and task tags. `weft token ls` and
-`weft token revoke <id>` manage them.
+`weft token revoke <id>` manage them. The extension is one client of the
+token's doors, which list and fire any signal kind that renders for
+consumers; for building your own (a website, a bot, another extension),
+read the `weft-consumers` skill.
 
 While a question waits, the node sits in its cyan waiting state in the
 graph, the worker has exited, and the wait costs one row in a table. The
@@ -134,4 +141,9 @@ installed in other workspaces) need the runtime reachable from the
 internet: `weft daemon start --public-url` tunnels a public base and the
 trigger surfaces get real URLs (shown in the trigger node's live feed in
 the graph). Without it, polling triggers (Telegram, email, sheets, RSS,
-cron) and everything local still work.
+cron) and everything local still work. With a public address, the `url` on
+a file marker is a link under it, and a fetch answered `403` with the text
+`error code: 1010` is Cloudflare's Browser Integrity Check refusing the
+client (Python's `urllib` is one it refuses), never weft: the fix is a
+Cloudflare configuration rule on the user's side, and the book's public
+address page walks through it.

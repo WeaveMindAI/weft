@@ -21,16 +21,16 @@ happens in it is journaled, node by node, with the values on the wires.
 |---|---|
 | `weft build` | compile, resolve assets, build the worker image (content-addressed) |
 | `weft validate --file main.weft < main.weft` | strict compile + validate, diagnostics as JSON, nothing runs |
-| `weft run [--target <id>]...` | register and fire one execution; follows it live unless `--detach` |
+| `weft run [--target <id>]...` | register and fire one execution; follows it live unless `--detach`. With targets, only those nodes and what they need run (the union when you name several, independent branches included); nothing past a target and no sibling branch, even one sharing a root like the database. Without targets, every root fires and triggers close their outputs |
 | `weft stop <color>` | cancel an execution |
 | `weft status` | registration, build state, listener, infra, drift |
 | `weft ps` | every registered project |
 | `weft executions [--limit N] [--project <id>] [--phase fire]` | past executions, newest first (see Reading a run) |
-| `weft events <color> [--node <id>] [--kind <kind>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run) |
+| `weft events <color> [--node <id>] [--kind <kind>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run). Every command that takes a color also takes the first characters of one (`weft events 3f2a`), at least four, as long as they name a single run |
 | `weft logs [color]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run) |
 | `weft follow <project>` | live events for a project |
-| `weft activate` / `weft deactivate` | turn triggers on / off. `weft deactivate` defaults to `--mode wipe`, which cancels every run waiting on a person or a timer; `--mode hibernate` or `--mode park` keeps them alive |
-| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph |
+| `weft activate` / `weft deactivate` | turn triggers on / off. They ask on a terminal; you have no terminal, so pass the answer: `weft deactivate --mode <wipe\|hibernate\|park>` (required without a terminal on an active project; `--running-policy <wait\|cancel>` defaults to `wait`) (see The three modes below) |
+| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. On an active project it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
 | `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` | the project's long-running infra (Postgres, bridges) |
 | `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension |
 | `weft daemon start` / `status` / `logs` | the local runtime |
@@ -39,8 +39,8 @@ happens in it is journaled, node by node, with the values on the wires.
 | `weft describe-nodes --node <Type> --compact` | one node's wiring view, which is what you read before wiring it. With no flags you get the whole catalog as JSON, which is large |
 | `weft test-node <target>` | run node self-tests (`--tier live` spends money, asks first) |
 | `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect` |
-| `weft rm [--all] [--force]` | unregister the project, terminate infra, reclaim data |
-| `weft clean` | journal and image cleanup |
+| `weft rm [--all] [--force] --yes` | unregister the project, terminate infra, reclaim data. Asks first; you have no terminal, so pass `--yes`, and only after the user confirmed |
+| `weft clean --yes` | journal and image cleanup. Deleting runs asks first; same rule, `--yes` after the user confirmed |
 
 How a run picks which nodes execute is in the `weft-language` skill. A
 trigger only fires on its event once the project is activated. `--json` is a
@@ -79,6 +79,28 @@ Editing a trigger's subgraph needs `weft resync` to take effect. Infra nodes
 must be running for a run that touches them: `weft infra status`, then
 `weft infra start`.
 
+### The three modes
+
+Taking triggers down (`deactivate`, `resync` on an active project, the
+infra verbs that deactivate on the way) asks what happens to the runs
+parked on a person or a timer:
+
+- `wipe`: their forms and timers are dropped and the runs end cancelled.
+  Pass it only when nothing is in flight (`weft executions` shows no
+  suspended run of the project) or the user said to drop the waiting work.
+- `hibernate`: the runs stay alive for a grace window (`--grace <minutes>`,
+  15 unless set); a fire arriving inside it is held and delivered when the
+  project comes back. Past the window new fires are refused (the waiting
+  runs and the project survive; wiping is the mode that drops them).
+- `park`: the runs stay alive with no time limit; every fire is held until
+  the project is reactivated. The default choice when the user is editing
+  and people are mid-conversation.
+
+`--running-policy wait` (the default) lets executions already running
+finish first (new fires are held meanwhile); `cancel` stops them now, and
+`wipe` takes it on its own. Without `--mode` on a run with no terminal the
+command refuses and names the flag, so a script never hangs on a prompt.
+
 ## The infra verbs
 
 An infra node (`PostgresDatabase`, `BaileyBridge`) is a container the runtime
@@ -111,7 +133,9 @@ depends on what you want to keep:
   steps; whatever it already did stays done.
 
 `weft infra status` says per node whether it is running and what its
-endpoint is. A run that touches infra is refused until that infra is
+endpoint is. `weft infra logs <node>` (or no node, for all of them) prints
+what the containers wrote, `--tail N` and `-f` as for a run: that is where
+a failure inside a service is read from, and it needs no kubectl. A run that touches infra is refused until that infra is
 running, both from the CLI and from the editor's Run button.
 
 ## Reading a run
@@ -156,9 +180,10 @@ failing node and the wrong value.
   wire. `required_input_closed` names the input that arrived closed, so walk
   to that node's line. `every_input_closed` and `one_of_group_closed` are the
   same story for a node with no required inputs and for a `@require_one_of`
-  group. `outside_this_run` means this run was aimed at
-  some output nodes and none of them depends on this node; usually that is a
-  missing `_is_output`.
+  group. `scope_skipped` names the group or loop whose `_should_flow` said
+  no, taking this node with it: walk to that container. (A group input
+  arriving closed is not this: it passes through to the nodes inside that
+  read it, and they carry their own reason.)
 - **If a `Debug` shows `output=` empty**: that is correct, because a
   `Debug` has no outputs. Its value is on its `node_started` line as
   `input=`, or `weft events <color> --node <debug id>`.
@@ -210,9 +235,9 @@ failing node and the wrong value.
    line names every firing left holding a pulse and the wired ports it never
    received (`theirs has value, still waiting on go`): walk to whatever
    should have driven the missing port.
-7. **Nothing ran.** A branch wired to no output never executes: check
-   `_is_output` on the deliverable, and check that the trigger that should
-   have fired is activated.
+7. **Nothing ran.** Nothing reached the branch: check that the trigger that
+   should have fired is activated, then walk from it down to the first
+   `_should_flow` or required input that closed.
 8. **Dispatcher unreachable.** `weft daemon start` (idempotent reconcile),
    then `weft daemon logs --tail 50` if it still refuses.
 

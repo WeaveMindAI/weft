@@ -15,7 +15,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node): whose key the call spends."
     },
@@ -29,7 +29,6 @@
       "name": "language",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "Language",
       "placeholder": "(auto-detect)",
       "description": "ISO language code of the audio (en, fr, ...). Empty lets the model detect it."
@@ -37,7 +36,6 @@
     {
       "name": "model",
       "type": "String",
-      "exposure": "config",
       "default": "scribe_v1",
       "widget": {
         "kind": "select",
@@ -53,13 +51,11 @@
     {
       "name": "text",
       "type": "String",
-      "required": false,
       "description": "The transcript."
     },
     {
       "name": "language",
       "type": "String",
-      "required": false,
       "description": "The language the model heard (ISO code)."
     }
   ],

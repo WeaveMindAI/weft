@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The object store access (wire an S3Access node)."
     },
@@ -34,18 +34,15 @@
     {
       "name": "objects",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each object: key, sizeBytes, lastModified."
     },
     {
       "name": "keys",
-      "type": "List[String]",
-      "required": false
+      "type": "List[String]"
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

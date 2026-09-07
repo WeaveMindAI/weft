@@ -24,7 +24,7 @@ struct AssistantSpec {
     /// Directory under `tangle/` in the weft checkout.
     dir: &'static str,
     /// Shorthand accepted as the `--assistant` value (`cc` for
-    /// `claude-code`).
+    /// `claude-code`, `kc` for `kilo-code`).
     shorthand: &'static str,
     /// `(name in the project, path inside the template dir)` pairs, each
     /// installed as a symlink.
@@ -35,6 +35,10 @@ const ASSISTANTS: &[AssistantSpec] = &[AssistantSpec {
     dir: "claude-code",
     shorthand: "cc",
     links: &[("CLAUDE.md", "CLAUDE.md"), (".claude", ".claude")],
+}, AssistantSpec {
+    dir: "kilo-code",
+    shorthand: "kc",
+    links: &[("kilo.json", "kilo.json"), (".kilo", ".kilo")],
 }];
 
 /// Where the remembered default assistants live: one canonical assistant
@@ -191,9 +195,7 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
         }
     }
 
-    for spec in &installed {
-        install_tangle(&root, spec)?;
-    }
+    install_tangle(&root, &installed)?;
 
     if explicit {
         write_recorded_assistants(&installed)?;
@@ -233,8 +235,10 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
     Ok(())
 }
 
-/// Symlink one assistant's Tangle persona from the weft checkout into a
-/// fresh project, one link per entry in the spec.
+/// Symlink every selected Tangle persona from the weft checkout into a fresh
+/// project. All template sources and destinations are checked before any link
+/// is written, so a bad later assistant cannot leave an earlier one half
+/// installed.
 ///
 /// Symlinks, deliberately: the point of the flag is that a `git pull` of the
 /// checkout refreshes Tangle in every project that asked for it, with no
@@ -249,43 +253,85 @@ pub async fn run(_ctx: Ctx, name: String, assistants: Vec<String>) -> anyhow::Re
 /// self-contained), this is an intentional reach back into the
 /// installation, the one place a running project depends on the checkout
 /// staying put.
-fn install_tangle(root: &Path, spec: &AssistantSpec) -> anyhow::Result<()> {
+fn install_tangle(root: &Path, assistants: &[&AssistantSpec]) -> anyhow::Result<()> {
     let repo = weft_catalog::weft_repo_root()
         .map_err(|e| anyhow::anyhow!("locating the weft checkout for tangle: {e}"))?;
-    let template = repo.join("tangle").join(spec.dir);
-    if !template.is_dir() {
-        anyhow::bail!(
-            "the tangle template for {} is missing in this weft checkout (expected {}); \
-             git pull the checkout, or create the project without --assistant {}",
-            spec.dir,
-            template.display(),
-            spec.dir
-        );
-    }
-    for (link_name, rel) in spec.links {
-        let target = template.join(rel);
-        if !target.exists() {
+    let mut links = Vec::new();
+
+    for spec in assistants {
+        let template = repo.join("tangle").join(spec.dir);
+        if !template.is_dir() {
             anyhow::bail!(
-                "the tangle template for {} is incomplete in this weft checkout ({} is missing); \
+                "the tangle template for {} is missing in this weft checkout (expected {}); \
                  git pull the checkout, or create the project without --assistant {}",
                 spec.dir,
-                target.display(),
+                template.display(),
                 spec.dir
             );
         }
-        let link = root.join(link_name);
-        // symlink_metadata, not exists(): a dangling link must also count
-        // as taken, or we would layer a second link over it.
-        if std::fs::symlink_metadata(&link).is_ok() {
-            anyhow::bail!(
-                "{} already exists; tangle ({}) not installed over it",
-                link.display(),
-                spec.dir
-            );
+
+        for (link_name, rel) in spec.links {
+            let target = template.join(rel);
+            // metadata follows links: a dangling source in the template must
+            // not become a dangling link in the new project.
+            if let Err(error) = std::fs::metadata(&target) {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::bail!(
+                        "the tangle template for {} is incomplete in this weft checkout ({} is missing); \
+                         git pull the checkout, or create the project without --assistant {}",
+                        spec.dir,
+                        target.display(),
+                        spec.dir
+                    );
+                }
+                return Err(error).with_context(|| format!("inspect {}", target.display()));
+            }
+
+            let link = root.join(link_name);
+            ensure_link_available(&link, spec)?;
+            links.push((link, target));
         }
+    }
+
+    for (link, target) in links {
         std::os::unix::fs::symlink(&target, &link).with_context(|| {
             format!("symlink {} -> {}", link.display(), target.display())
         })?;
     }
     Ok(())
+}
+
+fn ensure_link_available(link: &Path, spec: &AssistantSpec) -> anyhow::Result<()> {
+    match std::fs::symlink_metadata(link) {
+        Ok(_) => anyhow::bail!(
+            "{} already exists; tangle ({}) not installed over it",
+            link.display(),
+            spec.dir
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", link.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_link_available, resolve_assistants, ASSISTANTS};
+
+    #[test]
+    fn resolves_kilo_code_and_its_shorthand() {
+        let assistants = resolve_assistants(&["kilo-code".into(), "kc".into()]).unwrap();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].dir, "kilo-code");
+        assert_eq!(assistants[0].links, &[("kilo.json", "kilo.json"), (".kilo", ".kilo")]);
+    }
+
+    #[test]
+    fn refuses_to_replace_a_dangling_tangle_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let link = temp.path().join("kilo.json");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &link).unwrap();
+
+        let error = ensure_link_available(&link, &ASSISTANTS[1]).unwrap_err();
+        assert!(error.to_string().contains("not installed over it"));
+    }
 }

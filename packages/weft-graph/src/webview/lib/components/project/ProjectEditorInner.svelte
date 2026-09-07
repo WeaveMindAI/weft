@@ -11,12 +11,15 @@
 	import ActionBar from "./ActionBar.svelte";
 	import NodeTagsEditor from "./NodeTagsEditor.svelte";
 	import { nodeTags, TAGS_CONFIG_KEY } from "../../node-tags";
-	import { isOutputNode, pruneTargets, runTargetFacts } from "../../run-targets";
+	import { pruneTargets, runTargetFacts } from "../../run-targets";
+	import { containerStatus } from "../../utils/container-status";
+	import { derefKeys, derefType } from '../../utils/deref-menu';
 	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import type { LoopIteration } from "../../../../protocol";
+	import { isContainerNodeType, isLoopNodeType, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
 	import type { EditOp, SourceLocation, TextEdit } from "../../../../protocol";
 	import { SHOULD_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
@@ -105,8 +108,8 @@
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		// Action-bar verb callbacks. The webview emits these; the
 		// host translates each into a CLI shell-out.
-		/// Targets are the output nodes the user aimed the run at, empty for
-		/// the ordinary run.
+		/// Targets are the nodes the user aimed the run at, empty for the
+		/// ordinary run.
 		onRun?: (targets: string[]) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
@@ -652,12 +655,18 @@
 					const directParent = nodeById.get(rawParentId);
 					const directParentExpanded = directParent ? ((directParent.data.config as Record<string, boolean>)?.expanded ?? true) : false;
 					const xyParentId = directParentExpanded && !hidden ? rawParentId : undefined;
+					// Hidden through xyflow's own flag, never through a display:none
+					// style: a node styled away keeps its last measured size (the
+					// library ignores zero-size measurements), so the Controls
+					// fit-view button, which uses the library's fitView, kept fitting
+					// the phantom boxes of collapsed children at their parent-
+					// relative positions and missed the real graph.
 					if (hidden) {
-						return { ...n, parentId: undefined, style: 'display: none;' };
+						return { ...n, parentId: undefined, hidden: true };
 					}
 					// Visible: restyle through the one sizing ladder, then layer the
 					// xyflow parentId (collapsed-parent children detach to top level).
-					return { ...applyNodeSizing(n, n.data as Record<string, unknown>), parentId: xyParentId };
+					return { ...applyNodeSizing(n, n.data as Record<string, unknown>), parentId: xyParentId, hidden: false };
 				});
 
 				// Hide/show edges touching hidden nodes
@@ -707,7 +716,7 @@
 								}
 
 								// Keep edges touching collapsed-group-hidden nodes hidden.
-								const currentHidden = new Set(nodes.filter(n => n.style === 'display: none;').map(n => n.id));
+								const currentHidden = new Set(nodes.filter(n => n.hidden).map(n => n.id));
 								if (currentHidden.size > 0) {
 									edges = edges.map(e => {
 										const touchesHidden = currentHidden.has(e.source) || currentHidden.has(e.target);
@@ -826,7 +835,6 @@
 					updates.portLiterals,
 					(foldNode?.portLiterals as Record<string, unknown> | undefined) ?? {},
 					foldNode?.portLiteralSpans ?? {},
-					foldNode?.inputs ?? [],
 				));
 			}
 			if ('portValueForm' in updates && updates.portValueForm) {
@@ -848,9 +856,8 @@
 					// the user's edit with no trace.
 					toast.error(`Cannot edit ports: '${nodeId}' is not in the current project state`);
 				} else {
-					// headerWorthy: carry ghosts never, config-exposure inputs
-					// only when the source header already declares them (see
-					// its doc in projection/header-ports).
+					// headerWorthy: carry ghosts never (see its doc in
+					// projection/header-ports).
 					const nextInputs = ((updates.inputs as PortDefinition[] | undefined) ?? foldPorts.inputs)
 						.filter(headerWorthy);
 					const nextOutputs = (updates.outputs as HeaderPortLike[] | undefined) ?? foldPorts.outputs;
@@ -875,22 +882,22 @@
 						// is round-tripped from each port's DECLARED type);
 						// deletions are named explicitly so only their wires
 						// die. The previous lists are filtered the same way as
-						// the next, or a carry ghost / config-exposure input
-						// (never in a signature) would read as "removed".
+						// the next, or a carry ghost (never in a signature)
+						// would read as "removed".
 						const defaults = NODE_TYPE_CONFIG[foldPorts.nodeType as NodeType];
 						const prevInputs = foldPorts.inputs.filter(headerWorthy);
 						const prevOutputs: HeaderPortLike[] = foldPorts.outputs;
 						// What each side is PROVIDED (the header aside): the
 						// catalog defaults plus the ports the config list derives
 						// (a form's `fields`, a switch's `cases`), re-derived
-						// here exactly as the enricher does. The config comes
-						// from the projection, overlaid with the gesture's own
-						// config change so a case edit is judged against the
-						// list it just wrote.
+						// here exactly as the enricher does. The list is a port's
+						// written value, read from the projection's port
+						// literals overlaid with the gesture's own write so a
+						// case edit is judged against the list it just wrote.
 						const pfc = defaults?.portsFromConfig;
 						const entrySpecs = pfc ? buildSpecMap(pfc.specs ?? []) : {};
 						const entryList = pfc
-							? (({ ...(foldPorts.config as Record<string, unknown>), ...(('config' in updates ? updates.config : undefined) ?? {}) })[pfc.field] as PortEntryDef[] | undefined) ?? []
+							? (({ ...((foldPorts.portLiterals as Record<string, unknown> | undefined) ?? {}), ...(('portLiterals' in updates ? updates.portLiterals : undefined) ?? {}) })[pfc.field] as PortEntryDef[] | undefined) ?? []
 							: [];
 						const derivedInPorts = deriveInputsFromEntries(entryList, entrySpecs);
 						const derivedOutPorts = deriveOutputsFromEntries(entryList, entrySpecs);
@@ -1102,7 +1109,7 @@
 					// The one input fallback (shared with the renderer), so
 					// the two callers of the predicate can never disagree.
 					inputsOf(n.inputs),
-					n.config,
+					n.portLiterals as Record<string, unknown> | undefined,
 					wiredByNode.get(n.id) ?? noWires,
 				);
 				if (pinned) pinnedIds.add(n.id);
@@ -1358,9 +1365,8 @@
 					onSaveFileRef: saveFileRef,
 					onOpenInclude: openInclude,
 				},
-				...(hiddenByCollapsedGroup
-					? { style: 'display: none;' }
-					: { style: sizing.style }),
+				style: sizing.style,
+				hidden: hiddenByCollapsedGroup,
 				parentId,
 			};
 		});
@@ -1406,7 +1412,7 @@
 			// means the mid-run rebuild (or a view switch) still needs a pass.
 			const entries = parseLayoutCode(layoutCode, layoutVerb);
 			const still: Array<[string, { x: number; y: number }]> = nodes
-				.filter(n => n.style !== 'display: none;' && !entries[n.id])
+				.filter(n => !n.hidden && !entries[n.id])
 				.map(n => [n.id, n.position]);
 			if (still.length > 0) organizeUnplaced(layoutVerb, still);
 		});
@@ -1549,6 +1555,7 @@
 				type: 'custom',
 				animated: false,
 				zIndex: 5,
+				data: { path: e.path ?? [] },
 				style: `stroke-width: 2px; stroke: ${edgeColor};`,
 				markerEnd: {
 					type: MarkerType.ArrowClosed,
@@ -1676,6 +1683,13 @@
 	 *  Pure: spreads each node, never reorders or repositions. Used by BOTH
 	 *  the structural rebuild and the overlay-tick refresh, so the two render
 	 *  paths cannot drift. */
+	/// Is a row at `frames` inside the iteration at `iteration`: the same
+	/// frame stack, or one that extends it (a nested loop's own frames).
+	function withinFrames(frames: LoopIteration[], iteration: LoopIteration[]): boolean {
+		return frames.length >= iteration.length
+			&& iteration.every((f, i) => frames[i].index === f.index);
+	}
+
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
 		const {
 			nodeOutputs, nodeExecutions, busLogByBus, busesByNode, busMetaByBus,
@@ -1766,17 +1780,14 @@
 						// Build synthetic execution: one per __in execution
 						executions = inExecs.map((inExec) => {
 							const outExec = outByFrames.get(inExec.framesKey);
-							// Derive status from all children + in/out
-							const allRelated = [...internalExecs, ...inExecs, ...outExecs];
-							const hasRunning = allRelated.some(e => e.status === 'running' || e.status === 'waiting_for_input');
-							const hasFailed = allRelated.some(e => e.status === 'failed');
-							const allTerminal = allRelated.length > 0 && allRelated.every(e =>
-								e.status === 'completed' || e.status === 'skipped' || e.status === 'failed' || e.status === 'cancelled'
-							);
-							const status: import('../../types').NodeExecutionStatus = hasRunning ? 'running'
-								: hasFailed ? 'failed'
-								: allTerminal ? 'completed'
-								: inExec.status;
+							// Derive status and cost from THIS iteration's rows only:
+							// the boundary pair at its frames and every internal
+							// row at those frames or deeper (a nested loop's
+							// iterations). A parallel loop's other iterations are
+							// sibling cards, not this one's children.
+							const allRelated = [...internalExecs, ...inExecs, ...outExecs]
+								.filter((e) => withinFrames(e.frames, inExec.frames));
+							const status = containerStatus(inExec.status, allRelated);
 
 							return {
 								// Frame-stack-keyed id so an iteration's card keeps
@@ -2000,7 +2011,7 @@
 			// no organize in flight; `organizeUnplaced` owns that); only react
 			// to LATER resizes.
 			const entries = parseLayoutCode(layoutCode, layoutVerb);
-			const laidOut = !organizeInFlight && nodes.every(n => n.style === 'display: none;' || entries[n.id]);
+			const laidOut = !organizeInFlight && nodes.every(n => n.hidden || entries[n.id]);
 			if (!laidOut) { leafSizeSig = sig; return; }
 			if (sig === leafSizeSig) return;
 			leafSizeSig = sig;
@@ -2015,9 +2026,8 @@
 
 	let contextMenu = $state<{ x: number; y: number; flowX: number; flowY: number; nodeId: string | null } | null>(null);
 
-	/// Targets the graph still holds. A targeted node the user then deleted,
-	/// or demoted out of being an output, is dropped here rather than sent to
-	/// a dispatcher that would refuse it.
+	/// Targets the graph still holds. A targeted node the user then deleted
+	/// is dropped here rather than sent to a dispatcher that would refuse it.
 	const liveRunTargets = $derived([...pruneTargets(runTargets, nodes)]);
 	// And the STATE prunes itself too (the derived view above covers the
 	// same render tick): without this, deleting a targeted node and later
@@ -2031,21 +2041,19 @@
 	/// What the aimed run executes, read off the graph: whether its joined
 	/// subgraph touches any trigger (if not, the action bar offers Run
 	/// beside the trigger lifecycle), and which infra nodes it holds.
+	// Read off the PROJECTION, not the rendered graph: a collapsed
+	// ancestor re-parents (or hides) what it holds for drawing, and the
+	// facts of a run are about the program, not the picture.
 	const runTargetFactsLive = $derived(
 		runTargetFacts(
 			liveRunTargets,
-			nodes.map((n) => ({
+			fold.project.nodes.map((n) => ({
 				id: n.id,
-				isTrigger: nodeIsTrigger({
-					nodeType: (n.data?.nodeType as string) ?? '',
-					features: n.data?.features as { isTrigger?: boolean } | undefined,
-				}),
-				isInfra: nodeRequiresInfra({
-					nodeType: (n.data?.nodeType as string) ?? '',
-					requiresInfra: n.data?.requiresInfra as boolean | undefined,
-				}),
+				isTrigger: nodeIsTrigger({ nodeType: n.nodeType, features: n.features }),
+				isInfra: nodeRequiresInfra({ nodeType: n.nodeType, requiresInfra: undefined }),
+				parentId: n.parentId,
 			})),
-			edges,
+			fold.project.edges,
 		),
 	);
 
@@ -2257,7 +2265,7 @@
 		if (containerW === 0 || containerH === 0) return;
 
 		// Compute bounding box of visible, measured nodes (using absolute positions)
-		const visibleNodes = nodes.filter(n => n.style !== 'display: none;' && n.measured?.width && n.measured?.height);
+		const visibleNodes = nodes.filter(n => !n.hidden && n.measured?.width && n.measured?.height);
 		if (visibleNodes.length === 0) return;
 
 		// For child nodes, compute absolute position by walking up parentId chain
@@ -2389,7 +2397,7 @@
 			let settled = false;
 			while (Date.now() < deadline) {
 				await tick();
-				const allMeasured = nodes.every(n => n.style === 'display: none;' || (n.measured?.width && n.measured?.height));
+				const allMeasured = nodes.every(n => n.hidden || (n.measured?.width && n.measured?.height));
 				const sig = nodes.map(n => `${n.id}:${n.measured?.width ?? 0}x${n.measured?.height ?? 0}`).join('|');
 				if (allMeasured && sig === prevSig) { settled = true; break; }
 				prevSig = sig;
@@ -2410,7 +2418,7 @@
 		// Measure actual port Y positions from the DOM
 		const portPositions = new Map<string, Map<string, number>>();
 		for (const n of nodes) {
-			if (n.style === 'display: none;') continue;
+			if (n.hidden) continue;
 			const portYs = measurePortPositions(n.id);
 			if (portYs.size > 0) {
 				portPositions.set(n.id, portYs);
@@ -2473,7 +2481,7 @@
 			const persistAll = (layout: string) => {
 				let next = layout;
 				for (const n of nodes) {
-					if (n.style === 'display: none;') continue;
+					if (n.hidden) continue;
 					next = layoutUpdateAny(n)(next);
 				}
 				return next;
@@ -2524,7 +2532,7 @@
 		}
 		hasFitView = true;
 		const entries = parseLayoutCode(layoutCode, layoutVerb);
-		const everyNodePlaced = nodes.every(n => n.style === 'display: none;' || entries[n.id]);
+		const everyNodePlaced = nodes.every(n => n.hidden || entries[n.id]);
 		if (everyNodePlaced && !autoOrganizeOnMount) {
 			setTimeout(() => { doFitView(); canvasReady = true; }, 100);
 		} else if (everyNodePlaced && autoOrganizeOnMount) {
@@ -2666,9 +2674,23 @@
 		// (the frontend mirror in lib/types). Unresolvable or unparsable
 		// port types pass: the compiler is the authority, this gate only
 		// stops the certainly-wrong wire early.
-		const sourceType = handlePortType(connection.source!, connection.sourceHandle, 'source');
+		const portType = handlePortType(connection.source!, connection.sourceHandle, 'source');
 		const targetType = handlePortType(connection.target!, connection.targetHandle, 'target');
-		if (sourceType === null || targetType === null) return true;
+		if (portType === null || targetType === null) return true;
+		// A dotted wire being reconnected carries what the source READS
+		// off its port (`a.out.name`), so that is the type held to the
+		// new target, not the whole port's.
+		// A path the new source's type does not have is a read that cannot
+		// work, so the wire is refused here rather than becoming a compile
+		// error the user has to go and find. An unparsable type still
+		// passes: the compiler is the authority on those.
+		let sourceType = portType;
+		if (reconnectingPath.length > 0) {
+			const walked = derefType(portType, reconnectingPath);
+			if (walked.kind === 'absent') return false;
+			if (walked.kind === 'unparsed') return true;
+			sourceType = walked.type;
+		}
 		if (parseWeftType(sourceType) === null || parseWeftType(targetType) === null) return true;
 		return isWeftTypeCompatible(sourceType, targetType);
 	}
@@ -2686,11 +2708,15 @@
 
 	// Track if reconnection was successful (dropped on valid handle)
 	let reconnectSuccessful = false;
+	// The dotted path of the wire being reconnected (empty for a plain
+	// wire): the type gate derefs through it, and the rewire keeps it.
+	let reconnectingPath: string[] = [];
 	
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnectStart(event: MouseEvent | TouchEvent, edge: any) {
 		if (simplified) return; // simplified edges are merged + non-interactive
 		reconnectSuccessful = false;
+		reconnectingPath = (edge?.data?.path as string[] | undefined) ?? [];
 		// Set connection line color based on the edge being reconnected
 		if (edge?.source) {
 			currentConnectionColor = getEdgeColor(edge.source, edge.sourceHandle);
@@ -2718,17 +2744,21 @@
 		reconnectSuccessful = true;
 
 		// Remove old edge, add new one: one atomic batch. The projection paints
-		// the swap as soon as the op is appended; no live edge mutation.
+		// the swap as soon as the op is appended; no live edge mutation. A
+		// dotted wire keeps its path: the reconnect moves an end, it does
+		// not change what the wire reads.
+		const path = (oldEdge?.data?.path as string[] | undefined) ?? [];
 		const oldRef = toWeftEdgeRef(oldEdge.source, oldEdge.sourceHandle || 'value', oldEdge.target, oldEdge.targetHandle || 'value');
 		const newRef = toWeftEdgeRef(newConnection.source, newConnection.sourceHandle || 'value', newConnection.target, newConnection.targetHandle || 'value');
 		recordEdit([
 			{ op: 'removeEdge', source: oldRef.srcRef, sourcePort: oldRef.srcPort, target: oldRef.tgtRef, targetPort: oldRef.tgtPort, scopeGroup: oldRef.scopeGroupLabel ?? null },
-			{ op: 'addEdge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null },
+			{ op: 'addEdge', source: newRef.srcRef, sourcePort: newRef.srcPort, target: newRef.tgtRef, targetPort: newRef.tgtPort, scopeGroup: newRef.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
 		]);
 	}
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function onReconnectEnd(event: MouseEvent | TouchEvent, edge: any) {
+		reconnectingPath = [];
 		if (simplified) return; // no wiring edits in simplified view
 		// Reconnect dropped on empty space = remove the edge (the gesture's
 		// meaning, expressed as the same removeEdge op a delete uses).
@@ -2880,7 +2910,7 @@
 				const originType = handlePortType(wire.nodeId, wire.handle, wire.side);
 				if (wire.side === 'source') {
 					const input = (template?.defaultInputs ?? []).find(
-						p => inputExposure(p) !== 'config' && compatible(originType, p.portType),
+						p => acceptsWire(p) && compatible(originType, p.portType),
 					);
 					if (input) {
 						const ref = toWeftEdgeRef(wire.nodeId, wire.handle || 'value', id, input.name);
@@ -3116,6 +3146,48 @@
 		// No-op: kept for SvelteFlow binding
 	}
 
+	// Right-click on a wire: read a key off the value it carries. The menu
+	// lists the fields one level below the wire's current path (a record
+	// type on the source port), and picking one rewrites the wire as
+	// removeEdge + addEdge with the longer path.
+	let edgeMenu = $state<{ x: number; y: number; edgeId: string } | null>(null);
+
+	function onEdgeContextMenu({ edge, event }: { edge: Edge; event: MouseEvent | TouchEvent }) {
+		if (simplified) return;
+		event.preventDefault();
+		event.stopPropagation();
+		const mouse = event as MouseEvent;
+		contextMenu = null;
+		justOpenedContextMenu = true;
+		setTimeout(() => { justOpenedContextMenu = false; }, 100);
+		edgeMenu = { x: mouse.clientX, y: mouse.clientY, edgeId: edge.id };
+	}
+
+	/// What the edge menu shows for one wire: the wire, the keys below its
+	/// path, or null keys when the value has none to read.
+	function edgeMenuFacts(edgeId: string): { edge: import('../../types').Edge; path: string[]; keys: ReturnType<typeof derefKeys> } | null {
+		const edge = fold.project.edges.find((e) => e.id === edgeId);
+		if (!edge) return null;
+		const path = edge.path ?? [];
+		const source = fold.project.nodes.find((n) => n.id === edge.source);
+		const isInnerSrc = edge.sourceHandle?.endsWith('__inner') ?? false;
+		const handle = isInnerSrc ? edge.sourceHandle!.slice(0, -'__inner'.length) : edge.sourceHandle;
+		const ports = (isInnerSrc ? source?.inputs : source?.outputs) as Array<{ name: string; portType: string }> | undefined;
+		const portType = ports?.find((p) => p.name === handle)?.portType;
+		return { edge, path, keys: portType ? derefKeys(portType, path) : null };
+	}
+
+	function rewireWithPath(edge: import('../../types').Edge, path: string[]) {
+		const ref = toWeftEdgeRef(edge.source, edge.sourceHandle || 'value', edge.target, edge.targetHandle || 'value');
+		// One op: addEdge replaces the port's driver in place, so the wire
+		// keeps the spelling it was written in (braces or statement).
+		// A removeEdge first would erase that spelling before the add saw it.
+		recordEdit([
+			{ op: 'addEdge', source: ref.srcRef, sourcePort: ref.srcPort, target: ref.tgtRef, targetPort: ref.tgtPort, scopeGroup: ref.scopeGroupLabel ?? null, ...(path.length > 0 ? { path } : {}) },
+		]);
+		edgeMenu = null;
+	}
+
 	function getGroupDimensions(group: Node): { width: number; height: number } {
 		const measured = (group as unknown as { measured?: { width?: number; height?: number } }).measured;
 		if (measured?.width && measured?.height) {
@@ -3258,7 +3330,7 @@
 			if (group.type !== 'group') continue; // expanded groups only (collapsed = 'groupCollapsed')
 			if (group.id === node.id) continue;
 			if (isDescendantOf(group.id, node.id)) continue;
-			if (group.style?.includes('display: none')) continue;
+			if (group.hidden) continue;
 			if (!nodeCentreInGroup(node, group)) continue;
 			const { width: gw, height: gh } = getGroupDimensions(group);
 			const depth = getGroupDepth(group);
@@ -3644,7 +3716,7 @@
 	<div 
 		class="flex flex-1 relative overflow-hidden"
 		oncontextmenu={onContextMenu}
-		onclick={() => { if (!justOpenedContextMenu) { contextMenu = null; pendingConnection = null; tagEditor = null; } }}
+		onclick={() => { if (!justOpenedContextMenu) { contextMenu = null; edgeMenu = null; pendingConnection = null; tagEditor = null; } }}
 	>
 	<!-- Main Canvas (code panel removed for VS Code embedding) -->
 	<div class="flex-1 relative" oncontextmenucapture={(e: MouseEvent) => {
@@ -3710,6 +3782,7 @@
 				onselectiondragstart={(_event, selectedNodes) => { if (selectedNodes.length > 0) onNodeDragStart({ targetNode: selectedNodes[0], event: _event, nodes: selectedNodes }); }}
 				onselectiondragstop={onSelectionDragStop}
 				onedgeclick={onEdgeClick}
+				onedgecontextmenu={onEdgeContextMenu}
 				bind:viewport={currentViewport}
 				minZoom={0.05}
 				maxZoom={2}
@@ -3820,6 +3893,55 @@
 		/>
 	</div>
 
+	<!-- Wire menu: read a key off the value a wire carries -->
+	{#if edgeMenu}
+		{@const facts = edgeMenuFacts(edgeMenu.edgeId)}
+		{#if facts}
+			<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+			<div
+				class="fixed bg-popover border rounded-xl shadow-xl py-1 z-50 min-w-[200px] backdrop-blur-sm"
+				style="left: {edgeMenu.x}px; top: {edgeMenu.y}px;"
+				onclick={(e) => e.stopPropagation()}
+			>
+				<div class="px-3 py-1 text-xs text-muted-foreground">
+					{facts.path.length > 0 ? `reads .${facts.path.join('.')}` : 'Dereference a value'}
+				</div>
+				{#if facts.keys && facts.keys.length > 0}
+					{#each facts.keys as key (key.name)}
+						<button
+							class="w-full flex items-center justify-between gap-3 px-3 py-1.5 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+							onclick={() => rewireWithPath(facts.edge, [...facts.path, key.name])}
+						>
+							<span class="font-mono">.{key.name}{key.optional ? '?' : ''}</span>
+							<span class="text-muted-foreground text-xs">{key.type}</span>
+						</button>
+					{/each}
+				{:else}
+					<div class="px-3 py-1.5 text-xs text-muted-foreground max-w-[260px]">
+						This value has no keys to read: declare the shape on the source port, or Cast it first.
+					</div>
+				{/if}
+				{#if facts.path.length > 0}
+					<div class="my-1 mx-2 border-t"></div>
+					<button
+						class="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+						onclick={() => rewireWithPath(facts.edge, facts.path.slice(0, -1))}
+					>
+						<span class="text-muted-foreground text-xs">↑</span>
+						<span>Up one level</span>
+					</button>
+					<button
+						class="w-full flex items-center gap-2 px-3 py-1.5 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+						onclick={() => rewireWithPath(facts.edge, [])}
+					>
+						<span class="text-muted-foreground text-xs">=</span>
+						<span>Read the whole value</span>
+					</button>
+				{/if}
+			</div>
+		{/if}
+	{/if}
+
 	<!-- Context Menu -->
 	{#if contextMenu}
 		<!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
@@ -3870,16 +3992,13 @@
 								<span>Tags…</span>
 							</button>
 						{/if}
-						{#if isOutputNode(nodeToEdit.data?.config, nodeToEdit.data?.features)}
-							{@const isTarget = runTargets.has(targetNodeId)}
-							<button
-								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
-							>
-								<span class="text-muted-foreground text-xs">◎</span>
-								<span>{isTarget ? 'Unset target' : 'Set as target'}</span>
-							</button>
-						{/if}
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+							onclick={() => { toggleRunTarget(targetNodeId); contextMenu = null; }}
+						>
+							<span class="text-muted-foreground text-xs">◎</span>
+							<span>{runTargets.has(targetNodeId) ? 'Unset target' : 'Set as target'}</span>
+						</button>
 						{#if hasInfraActions}
 							{#if !simplified}<div class="my-1 mx-2 border-t"></div>{/if}
 							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">

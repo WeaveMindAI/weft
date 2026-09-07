@@ -17,7 +17,7 @@
 // defaults would mistake every such instantiation for an author
 // override and freeze it into source.
 
-import type { EditPortSig, Exposure, RevertedPortSig } from '../../../protocol';
+import type { EditPortSig, RevertedPortSig } from '../../../protocol';
 import { SHOULD_FLOW_PORT, containsTypevar, parseWeftType } from '../../../protocol';
 
 export interface HeaderPortLike {
@@ -26,22 +26,15 @@ export interface HeaderPortLike {
 	/** The rendered type. Every rendered port carries one. */
 	portType: string;
 	declaredType?: string;
-	exposure?: Exposure;
 	synthesizedFromCarry?: boolean;
 }
 
 /** Whether a port may appear in a node's HEADER signature at all.
  *  Carry-synthesized ghost inputs are derived from the loop's carry
- *  list; a `config`-exposure input is a metadata setting the emitter
- *  must never INVENT a line for. But a source header CAN already
- *  declare a config-exposure input (the enricher flags it with a
- *  diagnostic and keeps the merged port, declaredType stamped), and a
- *  declared line always round-trips: the diagnostic, not a silent
- *  deletion on the next gesture, is the way out. The ONE predicate for
- *  every surface that builds header lists. */
-export const headerWorthy = (p: Pick<HeaderPortLike, 'exposure' | 'declaredType' | 'synthesizedFromCarry'>): boolean =>
-	!p.synthesizedFromCarry
-	&& (p.exposure !== 'config' || p.declaredType !== undefined);
+ *  list, never written. The ONE predicate for every surface that builds
+ *  header lists. */
+export const headerWorthy = (p: Pick<HeaderPortLike, 'synthesizedFromCarry'>): boolean =>
+	!p.synthesizedFromCarry;
 
 /// A port's requiredness with an ABSENT flag read as not required,
 /// matching the catalog side (`InputSpec`/`OutputSpec`, plain
@@ -100,14 +93,9 @@ export function headerPortSigs(
 		else if (p.declaredType !== undefined) portType = p.declaredType;
 		else if (requiredChanged) portType = defByName.get(p.name)?.portType ?? p.portType;
 		else continue; // untouched and undeclared: the catalog provides it
-		// ONE restates-the-default gate, gesture or not. A
-		// config-exposure port is EXEMPT: a catalog config port is never
-		// implied into the header, so a line spelling it is not the
-		// redundant pollution the gate heals but a distinct, diagnosed
-		// authoring choice that must round-trip.
+		// ONE restates-the-default gate, gesture or not.
 		const d = defByName.get(p.name);
-		if (d && p.exposure !== 'config'
-			&& d.portType === portType && portRequired(d) === portRequired(p)) {
+		if (d && d.portType === portType && portRequired(d) === portRequired(p)) {
 			reverted.push({ name: p.name, required: portRequired(p), portType: p.portType });
 			continue;
 		}

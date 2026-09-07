@@ -52,12 +52,10 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-/// Handle to a running supervisor: just its admin URL. Like the
-/// listener, there is no bearer auth dispatcher->supervisor; the trust
-/// boundary is the network (NetworkPolicy in k8s, loopback in dev). The
-/// dispatcher does not currently call the supervisor over this URL (the
-/// supervisor pulls work from the broker), but the spawn health-wait
-/// uses it and it is kept for symmetry + future direct calls.
+/// Spawn result carrying the address recorded in the supervisor registry.
+/// This is a placeholder, not a working HTTP endpoint: supervisors pull
+/// work from the broker. Kubernetes spawn waits for rollout readiness;
+/// subprocess spawn relies on the broker lease and reaper.
 #[derive(Debug, Clone)]
 pub struct SupervisorHandle {
     pub admin_url: String,

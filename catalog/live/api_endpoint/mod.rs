@@ -30,7 +30,7 @@ impl Node for ApiEndpointNode {
     }
 
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?);
+        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?).map_err(weft::node_error)?;
         ctx.register_signal(ApiEndpoint { common }).await
     }
 

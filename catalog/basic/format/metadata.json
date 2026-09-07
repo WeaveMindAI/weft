@@ -16,7 +16,6 @@
       "name": "template",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": { "kind": "textarea" },
       "label": "Template",
       "description": "The text, with `{{name}}` where an input port's value goes."
@@ -26,7 +25,6 @@
     {
       "name": "text",
       "type": "String",
-      "required": false,
       "description": "The template with every placeholder filled."
     }
   ],

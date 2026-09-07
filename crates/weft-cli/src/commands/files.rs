@@ -159,6 +159,37 @@ struct DownloadHandshake {
     size_bytes: u64,
 }
 
+/// The whole content of one stored file, in memory: the build's read of a
+/// text-typed `@asset` that names a stored key. Small files by contract
+/// (a prompt, a JSON shape), so no streaming, no resume; the size the
+/// handshake promised is checked so a cut transfer is never cast as a
+/// value.
+pub(crate) async fn download_bytes(
+    client: &crate::client::DispatcherClient,
+    key: &str,
+    project: &Option<String>,
+) -> anyhow::Result<Vec<u8>> {
+    let handshake = mint_download_url(client, key, project).await?;
+    let resp = reqwest::Client::new()
+        .get(&handshake.url)
+        .send()
+        .await
+        .with_context(|| format!("GET stored file {key}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        anyhow::bail!("download of '{key}' failed ({status})");
+    }
+    let bytes = resp.bytes().await.with_context(|| format!("read stored file {key}"))?;
+    if bytes.len() as u64 != handshake.size_bytes {
+        anyhow::bail!(
+            "download of '{key}' was cut short ({} of {} bytes)",
+            bytes.len(),
+            handshake.size_bytes
+        );
+    }
+    Ok(bytes.to_vec())
+}
+
 /// Ask the dispatcher for a fresh download pass (the brokered handshake): the
 /// dispatcher authenticates, then returns a short-lived presigned bucket URL for
 /// the single file plus its name + size. The bytes stream DIRECTLY from the

@@ -332,7 +332,7 @@ pub fn fixture_spec(name: &str, label: &str, description: &str) -> InputSpec {
         name: name.to_string(),
         input_type: WeftType::Primitive(crate::weft_type::WeftPrimitive::String),
         required: true,
-        exposure: None,
+        accepts: None,
         widget: None,
         default: None,
         label: Some(label.to_string()),
@@ -1326,7 +1326,7 @@ fn declared_output_map(manifest: &NodeMetadata, config: &Value) -> HashMap<Strin
         .map(|o| (o.name.clone(), o.port_type.clone()))
         .collect();
     if let Some(ports_from_config) = &manifest.ports_from_config {
-        let (_, outputs) = crate::node::derive_config_ports(config, ports_from_config);
+        let (_, outputs) = crate::node::derive_config_ports(config.get(&ports_from_config.field), ports_from_config);
         for port in outputs {
             declared.insert(port.name, port.port_type);
         }

@@ -1222,6 +1222,8 @@ fn load_node_entry(
             CatalogError::Parse { path: package_key.join("metadata.json"), error }
         })?;
     }
+    weft_core::node::refuse_removed_metadata_keys(&value)
+        .map_err(|error| CatalogError::Parse { path: meta_path.clone(), error })?;
     let metadata: NodeMetadata =
         serde_json::from_value(value).map_err(|e| CatalogError::Parse {
             path: meta_path.clone(),

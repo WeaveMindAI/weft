@@ -47,7 +47,7 @@ impl Node for LlmStreamNode {
         let mut stream = leaf
             .complete_streaming(&llm.generator, Some(&llm.params))
             .await
-            .node_err("llm")?;
+            .map_err(|e| llm.call_error(e))?;
         let cancelled = ctx.cancellation();
         loop {
             let chunk = tokio::select! {
@@ -62,7 +62,7 @@ impl Node for LlmStreamNode {
         }
         drop(bus); // the close IS the end-of-stream signal
 
-        let response = stream.collect().await.node_err("llm")?;
+        let response = stream.collect().await.map_err(|e| llm.call_error(e))?;
         let output = call::finish(&ctx, llm, &response, NodeOutput::new())
             .await?
             .set("response", response.content.clone());

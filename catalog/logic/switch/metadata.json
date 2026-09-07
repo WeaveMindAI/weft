@@ -22,7 +22,6 @@
       "name": "cases",
       "type": "List[JsonDict]",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "entry_list"
       },

@@ -8,10 +8,19 @@ use serde_json::json;
 
 use weft::{FakeRig, LiveRig, NodeTest, WeftResult, WeftType};
 
+use super::super::call::{empty_reply_message, reasoning_config};
+use super::super::chat::{auto_cache_marks, has_cache_mark};
 use super::LlmInferenceNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
+        NodeTest::basic("reasoning_has_two_states_and_off_is_the_default", reasoning_states),
+        NodeTest::basic("an_empty_reply_names_the_thinking_budget", empty_reply_wording),
+        NodeTest::basic("auto_cache_marks_the_persona_and_the_last_history_turn", auto_cache_placement),
+        NodeTest::fake("reasoning_off_sends_none", reasoning_off_on_the_wire),
+        NodeTest::fake("unwritten_params_are_off_and_send_no_max_tokens", unset_sends_nothing),
+        NodeTest::fake("a_refused_reasoning_off_says_what_to_change", reasoning_refused),
+        NodeTest::fake("auto_cache_tracks_each_request_without_marking_saved_history", auto_cache_on_the_wire),
         NodeTest::fake("a_completion_answers_text_and_history", completion),
         NodeTest::fake("parse_json_repairs_and_parses_the_reply", parse_json),
         NodeTest::fake("a_stream_without_finish_reason_is_truncated", truncated),
@@ -24,6 +33,152 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("openrouter_routing_pins_ride_the_provider_key", routing_pins),
         NodeTest::live("one_real_completion", "openrouter", live_completion),
     ]
+}
+
+fn reasoning_states() -> WeftResult<()> {
+    assert_eq!(reasoning_config(false, Some("high")).effort.as_deref(), Some("none"), "off is off, whatever effort sits beside it");
+    assert_eq!(reasoning_config(true, None).effort.as_deref(), Some("low"), "on with no effort picked is the cheap one");
+    assert_eq!(reasoning_config(true, Some("high")).effort.as_deref(), Some("high"));
+    Ok(())
+}
+
+fn empty_reply_wording() -> WeftResult<()> {
+    let thought = minillmlib::Usage { reasoning_tokens: Some(812), ..Default::default() };
+    let msg = empty_reply_message(Some(&thought));
+    assert!(msg.contains("812 reasoning tokens") && msg.contains("0 text tokens"), "{msg}");
+    assert!(msg.contains("maxTokens") && msg.contains("reasoning off"), "{msg}");
+    let plain = empty_reply_message(None);
+    assert!(plain.contains("empty response"), "{plain}");
+    Ok(())
+}
+
+fn auto_cache_placement() -> WeftResult<()> {
+    let message = |role: &str, text: &str| json!({ "role": role, "content": text });
+    // A persona, two history turns, and this call's new user message.
+    let mut stored = vec![
+        message("system", "persona"),
+        message("user", "q1"),
+        message("assistant", "a1"),
+        message("user", "q2"),
+    ];
+    auto_cache_marks(&mut stored, 1);
+    let marks: Vec<bool> = stored.iter().map(has_cache_mark).collect();
+    assert_eq!(marks, vec![true, false, true, false], "persona and the last history turn");
+
+    // The author's own marks win: nothing is added.
+    let mut own = vec![message("system", "persona"), message("user", "q1")];
+    own[1]["cache_breakpoint"] = json!(true);
+    auto_cache_marks(&mut own, 0);
+    assert!(!has_cache_mark(&own[0]) && has_cache_mark(&own[1]));
+
+    // A first call (persona + the new turn, no history yet) marks the
+    // persona alone.
+    let mut first = vec![message("system", "persona"), message("user", "q1")];
+    auto_cache_marks(&mut first, 1);
+    assert!(has_cache_mark(&first[0]) && !has_cache_mark(&first[1]));
+    Ok(())
+}
+
+async fn reasoning_off_on_the_wire(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("response", WeftType::parse("String").expect("String parses"));
+    rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["ok"], Some("stop")));
+    rig.run(
+        &LlmInferenceNode,
+        json!({ "provider": provider(&rig), "prompt": "hi", "params": { "reasoning": false } }),
+    )
+    .await
+    .ok()?;
+    let sent = rig.requests();
+    let off = sent[0].body.as_ref().expect("body");
+    assert_eq!(off["reasoning"]["effort"], json!("none"), "explicit false sends none");
+    Ok(())
+}
+
+async fn unset_sends_nothing(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("response", WeftType::parse("String").expect("String parses"));
+    rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["ok"], Some("stop")));
+    rig.run(&LlmInferenceNode, json!({ "provider": provider(&rig), "prompt": "hi", "params": {} }))
+        .await
+        .ok()?;
+    let sent = rig.requests();
+    let unset = sent[0].body.as_ref().expect("body");
+    assert!(unset.get("max_completion_tokens").is_none(), "no maxTokens, none sent: {unset}");
+    // Nothing written for `reasoning` is the same state as off: no model
+    // runs at a default nobody wrote down.
+    assert_eq!(unset["reasoning"]["effort"], json!("none"), "unwritten reasoning is off: {unset}");
+    Ok(())
+}
+
+async fn reasoning_refused(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("response", WeftType::parse("String").expect("String parses"));
+    rig.respond_raw(
+        "POST",
+        "/api/v1/chat/completions",
+        400,
+        "application/json",
+        br#"{"error":{"message":"reasoning cannot be disabled for this model"}}"#.to_vec(),
+    );
+    let err = rig
+        .run(
+            &LlmInferenceNode,
+            json!({ "provider": provider(&rig), "prompt": "hi", "params": { "reasoning": false } }),
+        )
+        .await
+        .failure()?;
+    assert!(err.contains("always reasons") && err.contains("reasoning: true"), "{err}");
+    Ok(())
+}
+
+async fn auto_cache_on_the_wire(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("response", WeftType::parse("String").expect("String parses"));
+    rig.respond_raw("POST", "/api/v1/chat/completions", 200, "text/event-stream", sse(&["ok"], Some("stop")));
+    let history = json!([
+        { "role": "user", "content": "q1" },
+        { "role": "assistant", "content": "a1" }
+    ]);
+    // OpenRouter passes cache markers through for Claude models only
+    // (the others cache on their own), so the wire proof uses one.
+    let claude = json!({ "kind": "openrouter", "model": "anthropic/claude-test", "account": rig.access("openrouter") });
+    let outcome = rig
+        .run(
+            &LlmInferenceNode,
+            json!({
+                "provider": claude,
+                "prompt": "q2",
+                "history": history,
+                "params": { "systemPrompt": "persona" },
+            }),
+        )
+        .await
+        .ok()?;
+    let emitted = outcome.outputs["history"].as_array().expect("history").clone();
+    let marks: Vec<bool> = emitted.iter().map(has_cache_mark).collect();
+    assert_eq!(marks, vec![false; 5], "automatic marks must not become author instructions: {emitted:?}");
+    let sent = rig.requests();
+    let body = sent[0].body.as_ref().expect("body");
+    assert!(body["messages"][0].to_string().contains("cache_control"), "persona: {body}");
+    assert!(body["messages"][2].to_string().contains("cache_control"), "last previous answer: {body}");
+    assert!(!body["messages"][3].to_string().contains("cache_control"), "new question: {body}");
+
+    let second = rig.run(&LlmInferenceNode, json!({
+        "provider": claude, "prompt": "q3", "history": emitted,
+    })).await.ok()?;
+    let sent = rig.requests();
+    let body = sent[1].body.as_ref().expect("second request");
+    assert!(body["messages"][0].to_string().contains("cache_control"), "persona remains cached: {body}");
+    assert!(!body["messages"][2].to_string().contains("cache_control"), "old automatic mark must move: {body}");
+    assert!(body["messages"][4].to_string().contains("cache_control"), "latest answer must be cached: {body}");
+    assert!(!second.outputs["history"].as_array().unwrap().iter().any(has_cache_mark));
+
+    let mut authored = second.outputs["history"].as_array().unwrap().clone();
+    authored[1]["cache_breakpoint"] = json!(true);
+    let third = rig.run(&LlmInferenceNode, json!({
+        "provider": claude, "prompt": "q4", "history": authored,
+    })).await.ok()?;
+    let marks: Vec<_> = third.outputs["history"].as_array().unwrap().iter().enumerate()
+        .filter(|(_, message)| has_cache_mark(message)).map(|(index, _)| index).collect();
+    assert_eq!(marks, vec![1], "explicit author placement survives every call");
+    Ok(())
 }
 
 fn provider(rig: &FakeRig) -> serde_json::Value {
@@ -330,7 +485,10 @@ async fn anthropic_wire(rig: FakeRig) -> WeftResult<()> {
     let sent = rig.requests();
     assert_eq!(sent[0].path, "/v1/messages");
     let body = sent[0].body.as_ref().expect("call body");
-    assert_eq!(body["system"], json!("Answer in French."));
+    // `autoCache` (on by default) marks the persona, which the native
+    // wire writes as a text block carrying the cache marker.
+    assert_eq!(body["system"][0]["text"], json!("Answer in French."));
+    assert_eq!(body["system"][0]["cache_control"]["type"], json!("ephemeral"));
     assert_eq!(body["max_tokens"], json!(32));
     assert_eq!(body["messages"][0]["role"], json!("user"));
     Ok(())

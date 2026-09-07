@@ -45,32 +45,35 @@ impl Node for MistralParseDocumentNode {
         .await?;
         let file_id = uploaded["id"].as_str().node_err("mistral: upload carries no id")?;
 
-        // 2. The short-lived signed URL the OCR call reads from.
-        let signed: Value = get_json(
-            &http,
-            &format!("https://api.mistral.ai/v1/files/{file_id}/url?expiry=1"),
-            "mistral: mint the document url",
-        )
-        .await?;
-        let doc_url = signed["url"].as_str().node_err("mistral: signed url missing")?;
-
-        // 3. The OCR itself.
-        let answer = post_json(
-            &http,
-            "https://api.mistral.ai/v1/ocr",
-            &json!({
-                "model": "mistral-ocr-latest",
-                "document": { "type": "document_url", "document_url": doc_url },
-            }),
-            "mistral: ocr",
-        )
-        .await?;
+        // 2 + 3. The short-lived signed URL the OCR call reads from, then
+        // the OCR itself. Whichever way these go, the upload below is
+        // deleted before the outcome is delivered.
+        let ocr = async {
+            let signed: Value = get_json(
+                &http,
+                &format!("https://api.mistral.ai/v1/files/{file_id}/url?expiry=1"),
+                "mistral: mint the document url",
+            )
+            .await?;
+            let doc_url = signed["url"].as_str().node_err("mistral: signed url missing")?;
+            post_json(
+                &http,
+                "https://api.mistral.ai/v1/ocr",
+                &json!({
+                    "model": "mistral-ocr-latest",
+                    "document": { "type": "document_url", "document_url": doc_url },
+                }),
+                "mistral: ocr",
+            )
+            .await
+        }
+        .await;
 
         // The upload was only ever OCR fuel: delete it so runs don't
-        // pile files onto the Mistral account. The OCR result above is
-        // the load-bearing outcome, so a failed delete logs loudly and
-        // still delivers it (a stray remote file is recoverable from
-        // Mistral's file list; a discarded OCR is not).
+        // pile files onto the Mistral account, on the failure path too.
+        // The OCR outcome is what matters, so a failed delete logs
+        // loudly and still delivers it (a stray remote file is
+        // recoverable from Mistral's file list; a discarded OCR is not).
         let deleted = http
             .delete(format!("https://api.mistral.ai/v1/files/{file_id}"))
             .send()
@@ -86,7 +89,8 @@ impl Node for MistralParseDocumentNode {
                          OCR; remove it from the account's file list by hand"
                     ),
                 )
-                .await?;
+                .await
+                .ok();
             }
             Err(e) => {
                 ctx.log(
@@ -96,9 +100,11 @@ impl Node for MistralParseDocumentNode {
                          it from the account's file list by hand"
                     ),
                 )
-                .await?;
+                .await
+                .ok();
             }
         }
+        let answer = ocr?;
 
         let pages: Vec<Value> = answer["pages"]
             .as_array()

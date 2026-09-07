@@ -23,7 +23,7 @@ available to every service rather than to the one that needed it.
     "identity": "{team}"
   },
   "inputs": [
-    { "name": "account", "type": "JsonDict", "exposure": "config",
+    { "name": "account", "type": "JsonDict",
       "widget": { "kind": "access" }, "label": "Workspace" }
   ],
   "outputs": [ { "name": "access", "type": "Access" } ]

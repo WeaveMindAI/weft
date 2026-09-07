@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::weft_type::{Exposure, WeftPrimitive, WeftType};
+use crate::weft_type::{WeftPrimitive, WeftType};
 
 // The `Node` trait is the RUNTIME node interface (it runs against the execution
 // context + infra provision context), so it is gated behind `runtime`. The
@@ -194,7 +194,7 @@ pub struct NodeMetadata {
     pub color: Option<String>,
     /// The node's inputs: ONE list covering everything a node takes,
     /// wired data and design-time configuration alike. Each input's
-    /// `exposure` says where its value may come from; its widget (the
+    /// `accepts` says which drivers it takes; its widget (the
     /// editor control) derives from the type unless overridden.
     #[serde(default)]
     pub inputs: Vec<InputSpec>,
@@ -358,6 +358,58 @@ pub fn merge_package_defaults(
     Ok(())
 }
 
+/// Refuse the metadata keys the language dropped, with the reason and the
+/// replacement, before the typed parse turns them into a bare "unknown
+/// field". `deny_unknown_fields` would refuse them anyway; this names what
+/// changed so an author holding an older `metadata.json` knows what to do.
+/// Both producers of a node's document (the catalog load and the derive's
+/// embedded parse) run it, so the message is the same at build and at run.
+pub fn refuse_removed_metadata_keys(value: &serde_json::Value) -> Result<(), String> {
+    let Some(obj) = value.as_object() else { return Ok(()) };
+    if let Some(inputs) = obj.get("inputs").and_then(|o| o.as_array()) {
+        for input in inputs {
+            if let Some(exposure) = input.get("exposure") {
+                let name = input.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                let replacement = match exposure.as_str() {
+                    Some("wire") => "write `\"accepts\": [\"wire\"]` to refuse written values",
+                    Some("config") => {
+                        "drop it (a compiler-read port takes an inline value by a fixed rule; \
+                         any other port takes both a literal and a wire), or write \
+                         `\"accepts\": [\"literal\"]` to refuse wiring"
+                    }
+                    _ => "drop it (an input takes both a literal and a wire unless \
+                          `accepts` narrows it)",
+                };
+                return Err(format!(
+                    "input '{name}' sets `exposure`, which no longer exists: an input's drivers \
+                     are `accepts` (a list of \"literal\" and/or \"wire\", both when absent); \
+                     {replacement}"
+                ));
+            }
+        }
+    }
+    if obj.get("features").and_then(|f| f.get("isOutputDefault")).is_some() {
+        return Err(
+            "`features.isOutputDefault` no longer exists: every node runs when it is reached, \
+             and `weft run --target <node>` narrows a run. Remove the key."
+                .into(),
+        );
+    }
+    if let Some(outputs) = obj.get("outputs").and_then(|o| o.as_array()) {
+        for output in outputs {
+            if output.get("required").is_some() {
+                let name = output.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                return Err(format!(
+                    "output '{name}' sets `required`, which outputs no longer carry: an output \
+                     port has no optionality (a firing that emits nothing on it closes it). \
+                     Remove the key."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl NodeMetadata {
     /// Whether this node consumes a stream: any input whose declared
     /// type is a `Generator` (aliases peel). THE one spelling of the
@@ -405,6 +457,8 @@ impl NodeMetadata {
                 panic!("{site}: the package root's metadata.json is invalid: {e}")
             });
         }
+        refuse_removed_metadata_keys(&value)
+            .unwrap_or_else(|e| panic!("{site}: metadata.json: {e}"));
         serde_json::from_value(value)
             .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"))
     }
@@ -466,6 +520,29 @@ impl NodeMetadata {
                     input.name
                 ));
             }
+            // The two ports whose drivers are not the author's to pick:
+            // a compiler-read port takes an inline value only (a list
+            // there would loosen a rule the compiler needs), and a live
+            // handle can never be written down. The one list each may
+            // carry is the fixed rule's own, which is what `resolved()`
+            // stamps and a re-parse of a shipped document hands back.
+            if let Some(accepts) = input.accepts {
+                if self.is_compiler_read(&input.name) && accepts != Accepts::literal_only() {
+                    return Err(format!(
+                        "input '{}' is read by the compiler to build the node (a `portsFromConfig` \
+                         list or the access picker), so it takes an inline value only; remove \
+                         `accepts`",
+                        input.name
+                    ));
+                }
+                if accepts.literal && Accepts::type_is_handle(&input.input_type) {
+                    return Err(format!(
+                        "input '{}' is a {} port: a live handle no human can write, so `accepts` \
+                         may only list \"wire\"",
+                        input.name, input.input_type
+                    ));
+                }
+            }
             match input.effective_widget() {
                 // The entry-list editor draws the kinds a node's
                 // `portsFromConfig` declares, so on any other input it
@@ -486,18 +563,6 @@ impl NodeMetadata {
                     return Err(format!(
                         "input '{}': a select/multiselect widget must declare a non-empty \
                          `options` list",
-                        input.name
-                    ));
-                }
-                // A connected-account handle is design-time
-                // configuration by nature: it must never arrive over a
-                // wire or an assignment statement. Enforcing the
-                // exposure here lets every consumer treat "access
-                // input" and "config input" as the same fact instead
-                // of re-checking it.
-                Widget::Access { .. } if input.effective_exposure() != Exposure::Config => {
-                    return Err(format!(
-                        "input '{}': an access widget requires `exposure: config`",
                         input.name
                     ));
                 }
@@ -624,17 +689,27 @@ impl NodeMetadata {
                 // rules and remote_select's `access` reference bind on
                 // the access node's own input.
                 Widget::Access { .. } => Some(WeftType::Access),
+                // A text_list edits a list of short strings.
+                Widget::TextList => {
+                    Some(WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::String))))
+                }
                 // textarea is the GENERIC value editor (the derived
                 // default for structural types: the value is edited as
                 // JSON text), so it constrains nothing. entry_list edits
-                // the config-entry list, file_drop a file marker, and
-                // text_list a list of short strings; all three are
-                // shape-checked elsewhere.
-                Widget::Textarea
-                | Widget::EntryList
-                | Widget::TextList
-                | Widget::FileDrop { .. } => None,
+                // the config-entry list, shape-checked with the
+                // portsFromConfig spec; file_drop is held to a type a
+                // file control can serve, just below.
+                Widget::Textarea | Widget::EntryList | Widget::FileDrop { .. } => None,
             };
+            if matches!(input.effective_widget(), Widget::FileDrop { .. })
+                && !input.input_type.is_unresolved()
+                && input.input_type.file_control().is_none()
+            {
+                return Err(format!(
+                    "input '{}': a file_drop widget picks files, which type {} cannot hold",
+                    input.name, input.input_type
+                ));
+            }
             if let Some(value_type) = widget_value_type {
                 if !WeftType::is_compatible(&value_type, &input.input_type) {
                     return Err(format!(
@@ -645,6 +720,13 @@ impl NodeMetadata {
                         input.input_type
                     ));
                 }
+            }
+            // A widget nothing could satisfy is caught whether or not
+            // the input has a default: the metadata is wrong either way,
+            // and every other path (the compiler's literal check, the
+            // runtime's) would otherwise be the one to report it.
+            if let Err(why) = input.effective_widget().check_declaration() {
+                return Err(format!("input '{}': {why}", input.name));
             }
             if let Some(default) = &input.default {
                 // The one runtime gate: declared shapes (Named/Record)
@@ -659,15 +741,11 @@ impl NodeMetadata {
                         input.input_type
                     ));
                 }
-                if let Widget::Number { min, max, .. } = input.effective_widget() {
-                    if let Some(n) = default.as_f64() {
-                        if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
-                            return Err(format!(
-                                "input '{}': default {} is outside the widget's min/max range",
-                                input.name, n
-                            ));
-                        }
-                    }
+                // The default is the value that arrives when nothing else
+                // does, so it is held to the widget's domain through the
+                // same rule as any other value.
+                if let Err(why) = input.effective_widget().check_value(default) {
+                    return Err(format!("input '{}': its default {why}", input.name));
                 }
             }
         }
@@ -676,10 +754,21 @@ impl NodeMetadata {
             // DECLARES, so that key is an ordinary config input like
             // any other: the editor edits it, and validate's
             // undeclared-config-key check needs no exemption for it.
-            if !self.inputs.iter().any(|i| i.name == ports.field) {
+            let Some(list_input) = self.inputs.iter().find(|i| i.name == ports.field) else {
                 return Err(format!(
                     "portsFromConfig reads config key '{}', which this node does not \
                      declare as an input",
+                    ports.field
+                ));
+            };
+            // The ports derive from what the SOURCE writes, on the
+            // compiler and in the editor alike. A default on the list
+            // would give the node entries (and emissions) the compiler
+            // never declared ports for, so the list has no default.
+            if list_input.default.is_some() {
+                return Err(format!(
+                    "portsFromConfig reads '{}', which declares a default; the ports come \
+                     from what the source writes, so the list takes none",
                     ports.field
                 ));
             }
@@ -821,15 +910,38 @@ impl NodeMetadata {
         Ok(())
     }
 
-    /// A copy with every input's `exposure` and `widget`, and every
-    /// config entry field's `widget`, RESOLVED to their effective values (the author's explicit choice, else the
-    /// type-derived default). This is what ships on the wire to the
-    /// editor, so the editor never re-derives either; resolving is
-    /// idempotent (a resolved metadata re-parses to itself).
+    /// Is `name` a port the compiler reads to BUILD the node: the list its
+    /// ports come from (`portsFromConfig`), or the access picker, whose
+    /// id the compiler stamps with the service. Such a port takes an
+    /// inline typed value only (no wire, no `@file`, no `@asset`): a port
+    /// that shapes a node has to be readable in the source without
+    /// following anything. The one definition every reader of that rule
+    /// (the loader, enrich, validate) consults.
+    pub fn is_compiler_read(&self, name: &str) -> bool {
+        if self.ports_from_config.as_ref().is_some_and(|p| p.field == name) {
+            return true;
+        }
+        self.inputs
+            .iter()
+            .find(|i| i.name == name)
+            .is_some_and(|i| matches!(i.effective_widget(), Widget::Access { .. }))
+    }
+
+    /// A copy with every input's `accepts` and `widget`, and every config
+    /// entry field's `widget`, RESOLVED to their effective values (the
+    /// author's explicit choice, else the type-derived default). This is
+    /// what ships on the wire to the editor, so the editor never
+    /// re-derives either; resolving is idempotent (a resolved metadata
+    /// re-parses to itself, the compiler-read ports included: their
+    /// resolved list is the fixed rule's, and the loader lets a resolved
+    /// document through because `resolved()` marks nothing the author
+    /// could not have meant).
     pub fn resolved(&self) -> Self {
         let mut out = self.clone();
-        for input in &mut out.inputs {
-            input.exposure = Some(input.exposure.unwrap_or_else(|| input.input_type.default_exposure()));
+        let compiler_read: Vec<bool> =
+            self.inputs.iter().map(|i| self.is_compiler_read(&i.name)).collect();
+        for (input, compiler_read) in out.inputs.iter_mut().zip(compiler_read) {
+            input.accepts = Some(input.effective_accepts(compiler_read));
             input.widget = Some(input.effective_widget());
         }
         // A config entry kind's own fields resolve the same way, so the
@@ -850,7 +962,7 @@ impl NodeMetadata {
     /// so `weft describe-nodes --compact` can hand an AI the whole
     /// node vocabulary for a fraction of the tokens the full files
     /// cost. What survives is what decides how the node connects:
-    /// ports with types, exposure and widgets (an access widget
+    /// ports with types, accepts and widgets (an access widget
     /// carrying its stamped service and `optional`), features,
     /// config-derived port shapes, declared types, validation rules.
     /// What goes is presentation (an input's `label`/`placeholder`,
@@ -1284,13 +1396,6 @@ pub struct NodeFeatures {
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview", skip_serializing_if = "std::ops::Not::not")]
     pub show_debug_preview: bool,
-    /// Default value of the node's `is_output` config flag. Nodes that
-    /// are semantically "produce this thing" (Debug, Output) default
-    /// to true. Any project can override by setting `is_output` in the
-    /// node's weft config. Read at run-dispatch time to compute the
-    /// subgraph to execute (see docs/v2-design.md section 3.0).
-    #[serde(default, rename = "isOutputDefault", skip_serializing_if = "std::ops::Not::not")]
-    pub is_output_default: bool,
     /// Which declared `Endpoint` (by name) the dispatcher proxies
     /// `/live` to. `Some("api")` means the node exposes a `/live`
     /// HTTP surface (runtime status for the graph body panel) at that
@@ -1709,12 +1814,6 @@ pub trait NodeCatalog: Send + Sync {
     fn all(&self) -> Vec<&'static str>;
 }
 
-/// One declared INPUT of a node: everything the node takes, wired data
-/// and design-time configuration alike, under one name in one namespace.
-/// `exposure` says where a value may come from (see [`Exposure`]);
-/// `widget` overrides the type-derived editor control; `default` is the
-/// value the runtime supplies when nothing else drives the input (never
-/// written into source).
 // NAMING CONVENTION (the three stages a graph concept lives through):
 //   *Spec       = authored intent (metadata.json / a registration): blanks are
 //                 meaningful ("derive from the type", "decide later"). InputSpec,
@@ -1724,6 +1823,110 @@ pub trait NodeCatalog: Send + Sync {
 //                 blindly and never re-derive. NodeDefinition, InputDefinition,
 //                 PortDefinition, GroupDefinition, ProjectDefinition.
 // A new type for one of these stages takes the stage's suffix.
+
+/// One of the two things that can drive an input: a constant written in
+/// the source (whatever its spelling: braces, statement, `@file`,
+/// `@asset`), or a value another node produces at run time (an edge, a
+/// dotted value in the braces, an inline node).
+// SYNC: AcceptedForm <-> packages/weft-graph/src/protocol.ts AcceptedForm
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AcceptedForm {
+    Literal,
+    Wire,
+}
+
+/// Which drivers an input takes. On the wire it is the list of accepted
+/// forms (`["literal", "wire"]`); an empty list or a repeated entry is
+/// refused at parse, so a resolved value always accepts at least one.
+// SYNC: Accepts <-> packages/weft-graph/src/protocol.ts Accepts
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<AcceptedForm>", into = "Vec<AcceptedForm>")]
+pub struct Accepts {
+    pub literal: bool,
+    pub wire: bool,
+}
+
+impl Accepts {
+    pub fn both() -> Self {
+        Self { literal: true, wire: true }
+    }
+
+    pub fn wire_only() -> Self {
+        Self { literal: false, wire: true }
+    }
+
+    pub fn literal_only() -> Self {
+        Self { literal: true, wire: false }
+    }
+
+    /// What a type takes when nobody says otherwise: a live handle (a
+    /// `Bus`, a `Generator`) exists only while something runs, so no
+    /// human can write one; everything else takes both.
+    pub fn for_type(ty: &WeftType) -> Self {
+        if Self::type_is_handle(ty) { Self::wire_only() } else { Self::both() }
+    }
+
+    /// A type whose values are live runtime handles, wire-only by nature.
+    pub fn type_is_handle(ty: &WeftType) -> bool {
+        matches!(ty.structural(), WeftType::Bus | WeftType::Generator(_))
+    }
+
+    /// The list as an error message reads it back: `literal, wire`.
+    pub fn describe(self) -> String {
+        let mut parts = Vec::new();
+        if self.literal {
+            parts.push("literal");
+        }
+        if self.wire {
+            parts.push("wire");
+        }
+        parts.join(", ")
+    }
+}
+
+impl TryFrom<Vec<AcceptedForm>> for Accepts {
+    type Error = String;
+    fn try_from(forms: Vec<AcceptedForm>) -> Result<Self, String> {
+        if forms.is_empty() {
+            return Err("`accepts` lists at least one of \"literal\", \"wire\"; an input \
+                        that takes nothing cannot be driven"
+                .into());
+        }
+        let mut out = Self { literal: false, wire: false };
+        for form in forms {
+            let slot = match form {
+                AcceptedForm::Literal => &mut out.literal,
+                AcceptedForm::Wire => &mut out.wire,
+            };
+            if *slot {
+                return Err(format!("`accepts` repeats {form:?}"));
+            }
+            *slot = true;
+        }
+        Ok(out)
+    }
+}
+
+impl From<Accepts> for Vec<AcceptedForm> {
+    fn from(a: Accepts) -> Self {
+        let mut out = Vec::new();
+        if a.literal {
+            out.push(AcceptedForm::Literal);
+        }
+        if a.wire {
+            out.push(AcceptedForm::Wire);
+        }
+        out
+    }
+}
+
+/// One declared INPUT of a node: everything the node takes, wired data
+/// and design-time configuration alike, under one name in one namespace.
+/// `accepts` says which drivers it takes (see [`Accepts`]);
+/// `widget` overrides the type-derived editor control; `default` is the
+/// value the runtime supplies when nothing else drives the input (never
+/// written into source).
 // SYNC: InputSpec <-> packages/weft-graph/src/protocol.ts InputSpec
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1733,14 +1936,17 @@ pub struct InputSpec {
     pub input_type: WeftType,
     #[serde(default)]
     pub required: bool,
-    /// Where a value may come from. An explicit level is the author's
-    /// choice and wins both ways; absent falls to the input TYPE's
-    /// default (`default_exposure`). `Option` so an author can both open
-    /// a type beyond its default (a file input to `"all"`) and close one
-    /// below it (a String input to `"wire"` or `"config"`).
-    // SYNC: InputSpec.exposure <-> packages/weft-graph/src/protocol.ts InputSpec.exposure
+    /// Which drivers this input takes, when the author narrows it.
+    /// Absent means both (a constant in the source, or a wire from
+    /// another node); `["wire"]` refuses every written value, `["literal"]`
+    /// refuses wiring. A port never adds a form, it only removes one, and
+    /// only for a reason the node can name. Two ports never carry a list:
+    /// a `Bus`/`Generator` port is wire-only by nature (the loader forces
+    /// it), and a compiler-read port (the `portsFromConfig` list, the
+    /// access picker) takes an inline value only by a fixed rule.
+    // SYNC: InputSpec.accepts <-> packages/weft-graph/src/protocol.ts InputSpec.accepts
     #[serde(default)]
-    pub exposure: Option<Exposure>,
+    pub accepts: Option<Accepts>,
     /// The editor control for this input's literal. Absent = derived
     /// from the type ([`Widget::default_for_type`]); declared to pick a
     /// richer control (a select over a String, a code box).
@@ -1802,10 +2008,15 @@ pub struct InputSpec {
 }
 
 impl InputSpec {
-    /// The input's effective exposure: the author's explicit level, else
-    /// the type default.
-    pub fn effective_exposure(&self) -> Exposure {
-        self.exposure.unwrap_or_else(|| self.input_type.default_exposure())
+    /// The drivers this input takes: the fixed rule for a compiler-read
+    /// port (an inline value only), else the author's list, else the
+    /// type's own answer (a live handle is wire-only, everything else
+    /// takes both).
+    pub fn effective_accepts(&self, compiler_read: bool) -> Accepts {
+        if compiler_read {
+            return Accepts::literal_only();
+        }
+        self.accepts.unwrap_or_else(|| Accepts::for_type(&self.input_type))
     }
 
     /// The input's effective widget: the author's declared control, else
@@ -1822,8 +2033,6 @@ pub struct OutputSpec {
     pub name: String,
     #[serde(rename = "type")]
     pub port_type: WeftType,
-    #[serde(default)]
-    pub required: bool,
     /// Human-readable description shown next to the port in the editor.
     /// The webview reads it; the compiler treats it as opaque.
     #[serde(default)]
@@ -1937,6 +2146,100 @@ impl Widget {
     /// (`kind_name_matches_the_serde_tag`) pins every arm to the tag so
     /// the two can never drift. Adding a widget kind: the exhaustive
     /// matches here and in `validate_semantics` are compiler-enforced.
+    /// The shape a connection widget's OBJECT value must have: a
+    /// remote_select pick is `{id: String, label?: String}`, an access
+    /// handle `{id: String, identity?: String}`. One rule for the
+    /// compiler (a compile error on the written value) and the runtime
+    /// (a loud failure when the bag is built), so a shape that compiles
+    /// is a shape that runs. Any other widget, or a non-object value (a
+    /// pasted raw id), has no handle shape and passes.
+    pub fn check_handle_shape(&self, value: &Value) -> Result<(), String> {
+        let (name, extra) = match self {
+            Widget::RemoteSelect { .. } => ("a remote_select pick", "label"),
+            Widget::Access { .. } => ("an access handle", "identity"),
+            _ => return Ok(()),
+        };
+        let Some(obj) = value.as_object() else { return Ok(()) };
+        if !obj.get("id").is_some_and(Value::is_string) {
+            return Err(format!("{name} is an {{id, {extra}}} object with a string `id`"));
+        }
+        if obj.get(extra).is_some_and(|v| !v.is_string() && !v.is_null()) {
+            return Err(format!("{name} carries `{extra}` as a string"));
+        }
+        Ok(())
+    }
+
+    /// What a number widget refuses: a value below `min`, above `max`,
+    /// or off `step` counting from `min` (or from zero when there is no
+    /// min). `Ok(())` for every other widget and for a value that is not
+    /// a number, which the type check owns.
+    ///
+    /// This is a DOMAIN rule, not a drawing hint: the node's own code
+    /// relies on it (a poll interval of zero, a spreadsheet row zero),
+    /// so it binds a value that arrived over a wire exactly as it binds
+    /// one written in the source. The compiler holds the written
+    /// constant to it and the runtime holds the wired value to it,
+    /// through this one function, so a program that compiles is a
+    /// program that runs.
+    ///
+    /// An option list (`Select`, `Multiselect`) is deliberately NOT a
+    /// rule here: it is what the editor offers, and a node's code
+    /// routinely accepts more than the list names (`http.request` takes
+    /// any method, a model id can ship after the list was written).
+    /// A node that really does take a closed set says so in its own
+    /// code, where the message can say what to do about it.
+    pub fn check_value(&self, value: &Value) -> Result<(), String> {
+        let Widget::Number { min, max, step } = self else {
+            return Ok(());
+        };
+        let Some(n) = value.as_f64() else {
+            return Ok(());
+        };
+        if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
+            return Err(format!(
+                "{n} is outside the allowed range [{}, {}]",
+                min.map_or("-inf".into(), |m| m.to_string()),
+                max.map_or("inf".into(), |m| m.to_string()),
+            ));
+        }
+        // A whole-number step says this input takes whole numbers, and
+        // the node's code relies on it (a row number, a count of
+        // seconds cast to an integer). A FRACTIONAL step is the arrow
+        // key's increment and nothing more: a temperature box stepping
+        // by 0.1 still takes 0.85, and holding a typed value to the
+        // arrows would refuse numbers every model accepts.
+        let whole_only = step.is_some_and(|s| s > 0.0 && s.fract() == 0.0);
+        if whole_only && n.fract() != 0.0 {
+            return Err(format!("{n} is not a whole number"));
+        }
+        Ok(())
+    }
+
+    /// Is the widget itself satisfiable, or is the node's metadata
+    /// wrong: a number box whose minimum is above its maximum, or whose
+    /// step is not a size. Checked when a node loads, naming the input,
+    /// so a broken declaration is a metadata error at the door rather
+    /// than a failure in the middle of somebody's run.
+    pub fn check_declaration(&self) -> Result<(), String> {
+        let Widget::Number { min, max, step } = self else {
+            return Ok(());
+        };
+        if let (Some(lo), Some(hi)) = (min, max) {
+            if lo > hi {
+                return Err(format!(
+                    "its number box has a minimum of {lo} above its maximum of {hi}, so no value \
+                     could ever fit it"
+                ));
+            }
+        }
+        if let Some(step) = step {
+            if !matches!(step.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater)) {
+                return Err(format!("its number box has a step of {step}, which is not a size"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             Widget::Text => "text",
@@ -2394,13 +2697,13 @@ mod deny_unknown_tests {
     fn input_carries_widget_default_label_placeholder() {
         let mut meta = base();
         meta.as_object_mut().unwrap().insert("inputs".into(), json!([{
-            "name": "model", "type": "String", "exposure": "config",
+            "name": "model", "type": "String", "accepts": ["literal"],
             "widget": {"kind": "text"}, "default": "sonnet", "label": "Model",
             "placeholder": "anthropic/claude-sonnet-4.6"
         }]));
         let parsed: NodeMetadata = serde_json::from_value(meta).expect("input loads");
         let input = &parsed.inputs[0];
-        assert_eq!(input.effective_exposure(), crate::weft_type::Exposure::Config);
+        assert_eq!(input.effective_accepts(false), Accepts::literal_only());
         assert_eq!(input.effective_widget(), Widget::Text);
         assert_eq!(input.default, Some(json!("sonnet")));
         assert_eq!(input.label.as_deref(), Some("Model"));
@@ -2413,7 +2716,7 @@ mod deny_unknown_tests {
     fn number_widget_carries_min_max_step() {
         let mut meta = base();
         meta.as_object_mut().unwrap().insert("inputs".into(), json!([{
-            "name": "temperature", "type": "Number", "exposure": "config",
+            "name": "temperature", "type": "Number",
             "widget": {"kind": "number", "min": 0.0, "max": 2.0, "step": 0.1}
         }]));
         let parsed: NodeMetadata = serde_json::from_value(meta).expect("number widget loads");
@@ -2619,7 +2922,7 @@ mod catalog_wire_tests {
             "inputs": [
                 { "name": "code", "type": "String", "required": true,
                   "widget": { "kind": "code", "language": "python" } },
-                { "name": "pick", "type": "String", "exposure": "config",
+                { "name": "pick", "type": "String",
                   "widget": { "kind": "select", "options": ["a", "b"] } },
                 { "name": "n", "type": "Number",
                   "widget": { "kind": "number", "min": 0.0, "max": 9.0, "step": 1.0 } },
@@ -2631,7 +2934,7 @@ mod catalog_wire_tests {
                               "sources": [{ "kind": "granted", "from": "sheets" }], "depends_on": ["pick"] } },
                 { "name": "img", "type": "Image",
                   "widget": { "kind": "file_drop", "type": "Image", "accept": "image/png" } },
-                { "name": "fields", "type": "List[JsonDict]", "exposure": "config",
+                { "name": "fields", "type": "List[JsonDict]",
                   "widget": { "kind": "entry_list" } }
             ],
             "outputs": [{ "name": "out", "type": "String" }],
@@ -2674,7 +2977,7 @@ mod catalog_wire_tests {
         // renamed camelCase keys the TS mirror reads.
         assert_eq!(
             keys(&v["inputs"][3]),
-            ["default", "description", "exposure", "label", "name", "placeholder",
+            ["accepts", "default", "description", "label", "name", "placeholder",
              "required", "requiresScopes", "requiresValues", "type", "widget"]
         );
         // Widget variants serialize their own payload under the tag.
@@ -2783,7 +3086,7 @@ mod diagnostic_wire_tests {
 #[cfg(test)]
 mod input_semantics_tests {
     use super::*;
-    use crate::weft_type::{Exposure, WeftPrimitive, WeftType};
+    use crate::weft_type::{WeftPrimitive, WeftType};
     use serde_json::json;
 
     fn metadata_with(inputs: Vec<InputSpec>) -> NodeMetadata {
@@ -2827,6 +3130,12 @@ mod input_semantics_tests {
         declared.ports_from_config =
             Some(PortsFromConfig { field: "cases".into(), match_input: None, specs: vec![spec()] });
         declared.validate_semantics().expect("the list key is declared");
+
+        // A default on the list would derive ports the source never wrote.
+        let mut defaulted = declared.clone();
+        defaulted.inputs[0].default = Some(serde_json::json!([{ "kind": "case", "port": "a" }]));
+        let e = defaulted.validate_semantics().unwrap_err();
+        assert!(e.contains("declares a default"), "{e}");
     }
 
     /// A kind's fields are held to a shape the compiler can check: only
@@ -2987,7 +3296,6 @@ mod input_semantics_tests {
         let access_out = || OutputSpec {
             name: "access".into(),
             port_type: WeftType::Access,
-            required: false,
             description: None,
         };
 
@@ -3011,7 +3319,7 @@ mod input_semantics_tests {
             name: name.into(),
             input_type: ty,
             required: false,
-            exposure: None,
+            accepts: None,
             widget: None,
             default: None,
             label: None,
@@ -3022,25 +3330,117 @@ mod input_semantics_tests {
         }
     }
 
-    /// Exposure comes from the input alone: its explicit level or the
-    /// type default. A file-typed input defaults to assignment; a String
-    /// input to `all`; a Bus is wires-only.
+    /// Every input takes both drivers unless something narrows it: the
+    /// author's list, a live-handle type, or the compiler-read fixed rule.
     #[test]
-    fn exposure_comes_from_the_input_alone() {
+    fn accepts_comes_from_the_rule_then_the_author_then_the_type() {
         let image = input("image", WeftType::primitive(WeftPrimitive::Image));
         let text = input("prompt", WeftType::primitive(WeftPrimitive::String));
         let bus = input("bus", WeftType::Bus);
-        assert_eq!(image.effective_exposure(), Exposure::Assignment, "file types are assignment-only by default");
-        assert_eq!(text.effective_exposure(), Exposure::All, "String is fully open by type default");
-        assert_eq!(bus.effective_exposure(), Exposure::Wire, "a bus never takes a literal");
-
-        let mut explicit = image;
-        explicit.exposure = Some(Exposure::All);
-        assert_eq!(explicit.effective_exposure(), Exposure::All, "the explicit level opens a file input");
+        let stream = input("rows", WeftType::parse("Generator[Number]").unwrap());
+        assert_eq!(image.effective_accepts(false), Accepts::both(), "a file input takes a marker or a wire");
+        assert_eq!(text.effective_accepts(false), Accepts::both());
+        assert_eq!(bus.effective_accepts(false), Accepts::wire_only(), "a bus never takes a literal");
+        assert_eq!(stream.effective_accepts(false), Accepts::wire_only());
 
         let mut closed = text;
-        closed.exposure = Some(Exposure::Config);
-        assert_eq!(closed.effective_exposure(), Exposure::Config, "the explicit level closes a String input");
+        closed.accepts = Some(Accepts::wire_only());
+        assert_eq!(closed.effective_accepts(false), Accepts::wire_only(), "the author narrows");
+        assert_eq!(closed.effective_accepts(true), Accepts::literal_only(), "the fixed rule wins");
+    }
+
+    /// The wire form is the list; an empty or repeated list is refused.
+    #[test]
+    fn accepts_round_trips_as_a_list() {
+        let both: Accepts = serde_json::from_value(json!(["literal", "wire"])).unwrap();
+        assert_eq!(both, Accepts::both());
+        assert_eq!(serde_json::to_value(Accepts::wire_only()).unwrap(), json!(["wire"]));
+        assert!(serde_json::from_value::<Accepts>(json!([])).is_err());
+        assert!(serde_json::from_value::<Accepts>(json!(["wire", "wire"])).is_err());
+        assert!(serde_json::from_value::<Accepts>(json!(["config"])).is_err());
+    }
+
+    /// A number box nothing could satisfy is the node's own metadata
+    /// being wrong, and it is refused when the node loads rather than
+    /// when somebody's run happens to route a number through it.
+    #[test]
+    fn a_number_box_no_value_could_satisfy_is_refused_at_load() {
+        for (widget, wanted) in [
+            (serde_json::json!({ "kind": "number", "min": 5, "max": 1 }), "minimum of 5 above"),
+            (serde_json::json!({ "kind": "number", "step": 0 }), "step of 0"),
+        ] {
+            let mut n = input("count", WeftType::Primitive(WeftPrimitive::Number));
+            n.widget = Some(serde_json::from_value(widget).unwrap());
+            let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
+            assert!(e.contains("count") && e.contains(wanted), "{e}");
+        }
+    }
+
+    /// And a default outside its own box is refused the same way, with
+    /// the message reading as one sentence.
+    #[test]
+    fn a_default_outside_its_own_number_box_is_refused() {
+        let mut n = input("count", WeftType::Primitive(WeftPrimitive::Number));
+        n.widget = Some(serde_json::from_value(
+            serde_json::json!({ "kind": "number", "min": 1, "max": 8, "step": 1 }),
+        ).unwrap());
+        n.default = Some(serde_json::json!(0));
+        let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
+        assert!(e.contains("its default 0 is outside the allowed range [1, 8]"), "{e}");
+    }
+
+    /// A handle port may not list `literal`; a compiler-read port may
+    /// carry nothing but the fixed rule's own list.
+    #[test]
+    fn validate_semantics_holds_the_two_fixed_accepts() {
+        let mut bus = input("bus", WeftType::Bus);
+        bus.accepts = Some(Accepts::both());
+        let e = metadata_with(vec![bus]).validate_semantics().unwrap_err();
+        assert!(e.contains("may only list \"wire\""), "{e}");
+
+        let mut fields = input("fields", WeftType::parse("List[JsonDict]").unwrap());
+        fields.accepts = Some(Accepts::both());
+        let mut m = metadata_with(vec![fields]);
+        m.ports_from_config = Some(
+            serde_json::from_value(json!({ "field": "fields", "specs": [
+                { "kind": "text", "label": "Text", "render": { "component": "text_input" },
+                  "addsOutputs": [{ "nameTemplate": "{key}", "portType": "String" }] }
+            ] })).unwrap(),
+        );
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("read by the compiler"), "{e}");
+        m.inputs[0].accepts = Some(Accepts::literal_only());
+        assert!(m.validate_semantics().is_ok(), "the fixed rule's own list is fine");
+        let resolved = m.resolved();
+        assert_eq!(resolved.inputs[0].accepts, Some(Accepts::literal_only()));
+        assert!(resolved.validate_semantics().is_ok(), "a resolved document re-validates");
+    }
+
+    /// Every dropped metadata key is refused naming what replaced it:
+    /// `exposure` (now `accepts`), `features.isOutputDefault` (every
+    /// reached node runs; `--target` narrows), `required` on an output
+    /// (outputs carry no optionality).
+    #[test]
+    fn removed_metadata_keys_are_refused_naming_the_replacement() {
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "inputs": [{ "name": "x", "type": "String", "exposure": "wire" }] });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.contains("`accepts`") && e.contains("[\"wire\"]"), "{e}");
+
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "features": { "isOutputDefault": true } });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.contains("isOutputDefault") && e.contains("--target"), "{e}");
+
+        let doc = json!({ "type": "T", "label": "T", "description": "",
+            "outputs": [{ "name": "out", "type": "String", "required": false }] });
+        let e = refuse_removed_metadata_keys(&doc).unwrap_err();
+        assert!(e.contains("output 'out'") && e.contains("no optionality"), "{e}");
+
+        let clean = json!({ "type": "T", "label": "T", "description": "",
+            "inputs": [{ "name": "x", "type": "String", "accepts": ["wire"] }],
+            "outputs": [{ "name": "out", "type": "String" }] });
+        assert!(refuse_removed_metadata_keys(&clean).is_ok());
     }
 
     /// The type-derived widget: file-valued types get the drop control,
@@ -3162,7 +3562,6 @@ mod input_semantics_tests {
             m.outputs.push(OutputSpec {
                 name: "file".into(),
                 port_type: WeftType::primitive(WeftPrimitive::Image),
-                required: false,
                 description: None,
             });
             m.display = Some(d);
@@ -3181,17 +3580,16 @@ mod input_semantics_tests {
     }
 
     /// The access widget's rules bind on the access node's OWN input:
-    /// its declared type must be Access (the marker the node reads),
-    /// and the Access type's Wire exposure default never satisfies the
-    /// widget's `exposure: config` requirement, so an author must
-    /// declare it explicitly.
+    /// its declared type must be Access (the marker the node reads), and
+    /// the picker is compiler-read (the fixed rule, no `accepts`).
     #[test]
     fn validate_semantics_types_the_access_widget_input() {
-        // Default (Wire) exposure: the config requirement fires.
         let mut n = input("account", WeftType::Access);
         n.widget = Some(Widget::Access { service: None, optional: false });
-        let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
-        assert!(e.contains("exposure: config"), "{e}");
+        let m = metadata_with(vec![n]);
+        assert!(m.is_compiler_read("account"), "the picker is compiler-read");
+        let e = m.validate_semantics().unwrap_err();
+        assert!(e.contains("service"), "{e}");
 
         // With the service recipe present: an Access-typed input
         // passes, a JsonDict-typed one is rejected by the widget's
@@ -3199,7 +3597,6 @@ mod input_semantics_tests {
         // marker, which JsonDict cannot hold).
         let with_service = |ty: WeftType| -> NodeMetadata {
             let mut n = input("account", ty);
-            n.exposure = Some(Exposure::Config);
             n.widget = Some(Widget::Access { service: None, optional: false });
             let mut m = metadata_with(vec![n]);
             m.service = Some(
@@ -3331,16 +3728,16 @@ mod input_semantics_tests {
         assert!(metadata_with(vec![fine]).validate_semantics().is_ok());
     }
 
-    /// `resolved()` fills every input's exposure + widget with the
+    /// `resolved()` fills every input's accepts + widget with the
     /// effective values and is idempotent.
     #[test]
     fn resolved_fills_effective_values_idempotently() {
         let meta = metadata_with(vec![input("prompt", WeftType::primitive(WeftPrimitive::String))]);
         let resolved = meta.resolved();
-        assert_eq!(resolved.inputs[0].exposure, Some(Exposure::All));
+        assert_eq!(resolved.inputs[0].accepts, Some(Accepts::both()));
         assert_eq!(resolved.inputs[0].widget, Some(Widget::Text));
         let again = resolved.resolved();
-        assert_eq!(again.inputs[0].exposure, resolved.inputs[0].exposure);
+        assert_eq!(again.inputs[0].accepts, resolved.inputs[0].accepts);
         assert_eq!(again.inputs[0].widget, resolved.inputs[0].widget);
     }
 }
@@ -3360,12 +3757,12 @@ use crate::project::{InputDefinition, PortDefinition};
 /// `validate` owns the diagnostics, so an unknown kind surfaces there with a
 /// span instead of as a missing port with no explanation.
 pub fn derive_config_ports(
-    config: &Value,
+    list: Option<&Value>,
     ports_from_config: &PortsFromConfig,
 ) -> (Vec<InputDefinition>, Vec<PortDefinition>) {
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
-    let Some(entries) = config.get(&ports_from_config.field).and_then(|f| f.as_array()) else {
+    let Some(entries) = list.and_then(|f| f.as_array()) else {
         return (inputs, outputs);
     };
 
@@ -3379,10 +3776,10 @@ pub fn derive_config_ports(
         }
 
         for port in &spec.adds_inputs {
-            inputs.push(InputDefinition::from_wire_port(materialize_port(port, key, false)));
+            inputs.push(InputDefinition::from_wire_port(materialize_port(port, key)));
         }
         for port in &spec.adds_outputs {
-            outputs.push(materialize_port(port, key, true));
+            outputs.push(materialize_port(port, key));
         }
     }
     (inputs, outputs)
@@ -3434,13 +3831,15 @@ pub fn materialize_auto_type_vars(t: &WeftType, key: &str) -> WeftType {
     }
 }
 
-fn materialize_port(template: &PortTemplate, key: &str, is_output: bool) -> PortDefinition {
+fn materialize_port(template: &PortTemplate, key: &str) -> PortDefinition {
     let name = template.resolve_name(key);
     let port_type = materialize_auto_type_vars(&template.port_type, key);
     PortDefinition {
         name,
         port_type,
-        required: !is_output,
+        // A created input is required (the node asked for it); an output
+        // carries no optionality, and `true` is the one value it takes.
+        required: true,
         description: None,
         synthesized_from_carry: false,
         declared_type: None,
@@ -3611,7 +4010,7 @@ mod compact_view_tests {
 
     /// What `compact_json` keeps on a node carrying the interesting
     /// shapes: an input whose label/placeholder are presentation but
-    /// whose description/default/exposure are wiring facts; a
+    /// whose description/default/accepts are wiring facts; a
     /// remote-select whose sources' `label`/`value` are DATA paths and
     /// must survive untouched; a config-derived port spec whose
     /// kind/keyField/fields/addsOutputs survive while its label and
@@ -3631,7 +4030,6 @@ mod compact_view_tests {
                     "name": "title",
                     "type": "String",
                     "required": true,
-                    "exposure": "config",
                     "widget": { "kind": "text" },
                     "label": "Title",
                     "placeholder": "Question title",
@@ -3662,7 +4060,6 @@ mod compact_view_tests {
                 "outputs": [{
                     "name": "send",
                     "type": "Boolean",
-                    "required": false,
                     "description": "True when approved."
                 }],
                 "portsFromConfig": {
@@ -3716,7 +4113,7 @@ mod compact_view_tests {
         let input = &compact["inputs"][0];
         assert_eq!(input["name"], "title");
         assert_eq!(input["type"], "String");
-        assert_eq!(input["exposure"], "config", "resolved exposure is a wiring fact");
+        assert_eq!(input["accepts"], serde_json::json!(["literal", "wire"]), "resolved accepts is a wiring fact");
         assert_eq!(input["widget"]["kind"], "text");
         assert_eq!(input["description"], "The form's title.");
         assert_eq!(input["default"], "Approve?", "a default changes whether wiring is needed");
@@ -3750,7 +4147,7 @@ mod compact_view_tests {
 
         let output = &compact["outputs"][0];
         assert_eq!(output["description"], "True when approved.");
-        assert_eq!(output["required"], false);
+        assert!(output.get("required").is_none(), "an output carries no optionality");
 
         let spec = &compact["portsFromConfig"]["specs"][0];
         assert_eq!(spec["kind"], "approve_reject");
@@ -3903,4 +4300,3 @@ mod compact_view_tests {
         );
     }
 }
-

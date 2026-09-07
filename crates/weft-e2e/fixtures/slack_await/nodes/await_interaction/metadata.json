@@ -10,7 +10,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The seeded Slack access."
     }
@@ -18,13 +18,11 @@
   "outputs": [
     {
       "name": "action",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "user",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ],
   "requires_infra": false

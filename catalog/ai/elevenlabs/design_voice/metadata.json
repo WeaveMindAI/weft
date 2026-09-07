@@ -16,7 +16,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "voice_lab"
@@ -41,7 +41,6 @@
     {
       "name": "model",
       "type": "String",
-      "exposure": "config",
       "default": "eleven_multilingual_ttv_v2",
       "widget": {
         "kind": "select",
@@ -57,11 +56,7 @@
     {
       "name": "previews",
       "type": "List[VoicePreview]",
-      "required": false,
       "description": "The generated previews: audio + the preview id Create Voice takes."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

@@ -2,6 +2,9 @@
   import { onMount } from 'svelte';
   import {
     fetchPendingTasks,
+    fetchTaskFile,
+    imageSourceOf,
+    isStoredFileValue,
     isTrigger,
     submitTask,
     skipTask,
@@ -574,11 +577,28 @@
                       {/if}
                     </div>
                   {:else if r.component === 'image'}
-                    {@const imgSrc = typeof field.value === 'string' ? field.value : ((field.value as Record<string, unknown>)?.url as string | undefined)}
+                    {@const imgSrc = imageSourceOf(field.value)}
+                    {@const storedFile = !imgSrc && isStoredFileValue(field.value)}
                     <div class="field">
                       <p class="field-key">{field.label || field.key}</p>
                       {#if imgSrc}
                         <img src={imgSrc} alt={field.label || field.key} class="field-image" />
+                      {:else if storedFile}
+                        <!-- A stored file carries no link: ask the files door
+                             each time this renders, so the link is always fresh
+                             and an expired file says so in the image's place. -->
+                        {#await fetchTaskFile(currentTask, field.key)}
+                          <p class="field-empty">Loading image...</p>
+                        {:then link}
+                          <img src={link.url} alt={field.label || field.key} class="field-image" />
+                        {:catch e}
+                          <div class="error-box">{e instanceof Error ? e.message : String(e)}</div>
+                        {/await}
+                      {:else if field.value != null && field.value !== ''}
+                        <!-- Something is there and it is neither an address a
+                             browser can open nor a file weft stored, so say so
+                             rather than showing an empty space. -->
+                        <div class="error-box">This field does not hold an image address.</div>
                       {:else}
                         <p class="field-empty">(no image)</p>
                       {/if}

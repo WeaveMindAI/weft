@@ -14,7 +14,7 @@
 // scope, moves reject when the moved decl has connections).
 
 import type { ProjectDefinition, NodeInstance, Edge, PortDefinition, NodeFeatures } from '../types';
-import { isContainerNodeType, isLoopNodeType, containerKindOf, inputExposure } from '../types';
+import { isContainerNodeType, isLoopNodeType, containerKindOf } from '../types';
 import type { EditOp, EditPortSig, RevertedPortSig } from '../../../protocol';
 import { SHOULD_FLOW_PORT } from '../../../protocol';
 import { parseConfigToken } from '../value-format';
@@ -106,25 +106,44 @@ function rewriteSubtreePrefix(project: ProjectDefinition, oldPrefix: string, new
   }
 }
 
-/** Resolve an edge endpoint ref (`self` or a local child id) inside a scope
+/** Resolve an edge endpoint ref (`self`, an immediate child, or a top-level id)
  *  container to the xyflow form: scoped node id + handle (`__inner` suffix
  *  for the container's own interface side). */
+/** Resolve an addEdge endpoint the way the server does: `self` is the scope
+ *  group's own body side; otherwise probe the scope's immediate child
+ *  `{scope}.{ref}`, then the bare top-level `ref` (the lowering's outer-ref
+ *  fallthrough). Null when nothing matches; the scope rule then decides
+ *  whether a top-level hit may be wired from inside the group. */
+// SYNC: resolveEndpointId <-> crates/weft-compiler/src/edit/ops.rs require_endpoint,
+// crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to,
+// crates/weft-compiler/src/weft_compiler.rs rescope_endpoint
+export function resolveEndpointId(
+  project: ProjectDefinition,
+  ref: string,
+  scope: NodeInstance | undefined,
+): { id: string; inner: boolean } | null {
+  if (ref === 'self') return scope ? { id: scope.id, inner: true } : null;
+  const local = scopedId(scope?.id, ref);
+  if (project.nodes.some((n) => n.id === local)) return { id: local, inner: false };
+  if (project.nodes.some((n) => n.id === ref)) return { id: ref, inner: false };
+  return null;
+}
+
 function resolveEndpoint(
   project: ProjectDefinition,
   ref: string,
   port: string,
   scope: NodeInstance | undefined,
 ): { id: string; handle: string } {
-  if (ref === 'self') {
-    if (!scope) throw new Error(`'self' endpoint without a scope group`);
-    return { id: scope.id, handle: `${port}__inner` };
-  }
-  const id = scopedId(scope?.id, ref);
-  if (!project.nodes.some((n) => n.id === id)) throw new Error(`node not found: ${id}`);
-  return { id, handle: port };
+  if (ref === 'self' && !scope) throw new Error(`'self' endpoint without a scope group`);
+  const ep = resolveEndpointId(project, ref, scope);
+  if (!ep) throw new Error(`node not found: ${ref}`);
+  return { id: ep.id, handle: ep.inner ? `${port}__inner` : port };
 }
 
-function resolveScopeGroup(project: ProjectDefinition, scopeGroup: string | null): NodeInstance | undefined {
+/** The scope group of an edge op, with the server's wording when the ref is
+ *  unknown or not a container. */
+export function resolveScopeGroup(project: ProjectDefinition, scopeGroup: string | null): NodeInstance | undefined {
   return scopeGroup == null ? undefined : resolveContainer(project, scopeGroup);
 }
 
@@ -322,7 +341,7 @@ function syncLoopCarryInputs(loop: NodeInstance): void {
         name,
         portType: out.portType,
         required: out.required,
-        exposure: 'wire',
+        accepts: ['wire'],
         synthesizedFromCarry: true,
       });
     }
@@ -394,20 +413,17 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
     case 'removeConfig': {
       const node = resolveDecl(project, op.node);
       // Mirror the compiler's enrich normalization so the optimistic
-      // projection matches the host's next parse: a value that DRIVES a
-      // wireable input (braces on an `all`-exposure input, or an
-      // explicit statement-form write on any input) homes in
-      // `portLiterals`; everything else (config-exposure braces values
-      // included) stays in `config`. One home per written form.
-      // A container has only the port home: its `config` is loop knobs,
-      // which ride their own ops.
+      // projection matches the host's next parse: a value written for an
+      // INPUT PORT homes in `portLiterals`, whichever spelling wrote it;
+      // a key that names no port stays in `config`. A container has only
+      // the port home: its `config` is loop knobs, which ride their own
+      // ops.
       const input = node.inputs?.find((p) => p.name === op.key);
       const isContainer = isContainerNodeType(node.nodeType);
       if (isContainer && input === undefined && op.key !== SHOULD_FLOW_PORT) {
         throw new Error(`'${op.node}' has no input port '${op.key}'`);
       }
-      const portHomed = isContainer
-        || (input !== undefined && (inputExposure(input) === 'all' || op.form === 'connection'));
+      const portHomed = isContainer || input !== undefined || op.key === SHOULD_FLOW_PORT;
       if (portHomed) {
         const literals = (node.portLiterals ??= {});
         const spans = (node.portLiteralSpans ??= {});
@@ -498,7 +514,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         parentId: parent?.id,
         inputs: [],
         outputs: [],
-        features: { oneOfRequired: [] },
+        features: {},
         scope: ancestorChain(project, parent?.id),
       };
       project.nodes.push(node);
@@ -549,6 +565,7 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
         target: tgt.id,
         sourceHandle: src.handle,
         targetHandle: tgt.handle,
+        ...(op.path && op.path.length > 0 ? { path: op.path } : {}),
       });
       return;
     }

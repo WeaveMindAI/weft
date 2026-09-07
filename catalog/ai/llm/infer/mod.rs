@@ -56,10 +56,10 @@ impl Node for LlmInferenceNode {
         let stream = leaf
             .complete_streaming(&llm.generator, Some(&llm.params))
             .await
-            .node_err("llm")?;
+            .map_err(|e| llm.call_error(e))?;
         let cancelled = ctx.cancellation();
         let response = tokio::select! {
-            collected = stream.collect() => collected.node_err("llm")?,
+            collected = stream.collect() => collected.map_err(|e| llm.call_error(e))?,
             err = cancelled.cancelled_err() => return Err(err),
         };
         let text = response.content.clone();

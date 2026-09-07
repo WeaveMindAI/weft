@@ -171,6 +171,20 @@ pub async fn tenant_usage(state: &DispatcherState, tenant: &str) -> Result<Tenan
     .await
 }
 
+/// Publish current source references without changing node-created files' TTLs.
+pub async fn set_asset_references(
+    state: &DispatcherState,
+    tenant: &str,
+    references: weft_core::storage::AssetReferencesRequest,
+) -> Result<()> {
+    post_admin_unit(
+        state,
+        "/v1/storage/admin/asset-references",
+        "update asset lifetimes",
+        &Tenanted { tenant: tenant.into(), inner: references },
+    ).await
+}
+
 /// Delete one file by its tenant-anchored key (`weft files rm <key>`).
 pub async fn delete_key(state: &DispatcherState, key: &str) -> Result<()> {
     let resp = state

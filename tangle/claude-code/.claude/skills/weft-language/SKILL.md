@@ -33,8 +33,16 @@ Right to left: the value flows from `source.output_port` into
 wire or a literal; an optional one (`port?`) may be left alone. This line is
 the longhand; the same wire in the target's braces is [the shorthand] (next
 section), and the standalone line survives where the language leaves no
-choice: a group's or an include's boundary ports, and a port whose `exposure`
-is `assignment`.
+choice: a group's or an include's boundary ports.
+
+One key of a record value: keep going with dots (`wpm: reader.profile.stats.wpm`
+in the braces, or `speed.wpm = reader.profile.stats.wpm`). Still one wire; the
+compiler checks every key against the record type at that level and the wire
+carries the last key's type. A source typed `JsonDict` or a scalar has no keys
+to read (`deref-path`): declare the shape on the source port, or `Cast` first.
+At run time a `?` key found absent (or `null`) closes that wire alone; a
+required key absent fails the firing. Never write a Python node whose only
+job is to pull a field out of a dict.
 
 ## Config values
 
@@ -108,12 +116,19 @@ post = SlackSendMessage { channel: "#alerts" }
 post.text = "deploy finished"
 ````
 
-Which form a port accepts is its `exposure` in metadata: `all` takes both,
-`assignment` only the line, `config` only the braces, `wire` neither (it must
-be driven by another node). Wrong form is `port-literal-placement`. The line
-also works on a Group, Loop, or `@include` alias for its interface ports.
-One target takes no literal: a group's own output written from inside
-(`self.result = "lit"` is refused).
+Both spellings are one thing: a constant written for the port, and no port
+takes one spelling and refuses the other. A port refuses a FAMILY, if
+anything: `literal` (a value written in the source, markers included) or
+`wire` (a value another node produces), through `accepts` in its metadata;
+absent means both. Wrong family is `input-accepts`, and the message reads
+the list back ("`params` accepts: wire"). A compiler-read port (a form's
+`fields`, a switch's `cases`, the access picker) takes an inline typed value
+only: no wire, no `@file`, no `@asset`. The line also works on a Group,
+Loop, or `@include` alias for its interface ports. An output port never
+takes a value, on any node: `step.out = "lit"` and `out: "lit"` beside a
+`-> (out: String)` signature are refused, and so is a group's own output
+written from inside (`self.result = "lit"`). A firing emits on an output;
+you read it as `node.port`.
 
 ### Multi-line strings
 
@@ -130,13 +145,12 @@ the closing fence on its own line.
 
 ## Reserved keys
 
-Exactly four, all starting with `_` (any other `_` key is an error):
+Exactly three, all starting with `_` (any other `_` key is an error):
 
 | Key | Effect |
 |---|---|
 | `_label: "..."` | display label. A string, set once, never by wire |
 | `_tags: ["a", "b"]` | tags, used by signal scoping |
-| `_is_output: true` | overrides whether this node counts as a production target |
 | `_should_flow: <wire or false>` | decides whether this node runs at all |
 
 `_should_flow`: leave it out and the node runs. Wire it and the node runs
@@ -166,8 +180,9 @@ ok     = Cast -> (value: Boolean)
 
 Inputs arrive in Python as variables named after ports; the code returns a
 dict keyed by output port name; `None` or a missing key emits no pulse on
-that port. Write only the ports the type leaves open (`MustOverride` outputs
-must be pinned). An empty body equals no body.
+that port. Write only the ports the type leaves open (a `MustOverride`
+output must be pinned once something reads it; one nothing reads may stay
+unpinned). An empty body equals no body.
 
 ## Inline expressions
 
@@ -197,8 +212,9 @@ lookup = SlackFindUser {
 }
 ````
 
-`@require_one_of(a, b)` on its own line in a node, group, or inline
-signature: at least one named input must be satisfied. Compile error when
+`@require_one_of(a, b)` on its own line in a node or inline signature (a
+group or loop refuses it; put it on the node inside that needs the ports):
+at least one named input must be satisfied. Compile error when
 unmet, and a compile error when a name is not a port of that node (on a node
 that takes custom ports, a name is a port once the header declares it, a wire
 lands on it, or a config key names it); at run time the node skips when every
@@ -216,17 +232,34 @@ port in the group arrives closed.
 | records | `{ role: String, name?: String }`, strict: undeclared keys refused |
 | opaque | `JsonDict`, compatible with any `Dict[String, V]` both ways |
 | type variables | `T`, unified across a node's ports, must pin to concrete (`unresolved-typevar`) |
-| `MustOverride` | the author must pin it in an inline signature |
+| `MustOverride` | the author pins it in an inline signature; wired and unpinned is `must-override-unmet`, unwired is left alone |
 | live handles | `Bus`, `Generator[T]`, `Access`; never literals |
 
-Named custom types (declared in a node's metadata `types`, e.g.
-`ChatHistory`) are nominal: the name is the contract. Nothing unnamed wires
-into a named target; the door between the worlds is `Cast`.
+A record is usable inline in any signature (`p: { wpm: Number, delay: Number
+}`), and a type gets a name either in a node's metadata `types` (e.g.
+`ChatHistory`) or in the source, at the top of a scope:
 
-`?` means three things by position: on an input port, accepts a closed pulse
-(fires with the input absent); on an output port, records that it may emit
-nothing (documentation, matches metadata); on a config key, the port it
-creates is optional.
+````weft
+type Profile = {
+  wpm: Number,
+  delay: Number
+}
+typing = ExecPython(p: Profile) -> (ms: Number) { code: "..." }
+````
+
+Any type, multi-line allowed, other declared names allowed on the right.
+File level is visible to the whole file; directly inside a group or loop
+body, to that body and its nested bodies only (the group's own signature
+sits outside, so it cannot use a type declared inside). Never inside a
+node's braces. A visible name cannot be declared again (no shadowing). Named
+types are nominal: the name is the contract. Nothing unnamed wires into a
+named target; the door between the worlds is `Cast`.
+
+`?` goes on the NAME and means "may be absent": `here?: String` on an input
+port (accepts a closed pulse, fires with the input absent), `name?: String`
+on a record field, `notes?: review.notes` on a config key that creates a port.
+`here: String?` is refused. An output port takes no `?`: emitting nothing on
+it closes it, and no marker changes that.
 
 `Cast` converts a value to the type declared on its output:
 `history = Cast() -> (value: ChatHistory)`. The conversion table is checked
@@ -270,17 +303,21 @@ emits `true` on the winning case's port, closing the rest; wire a case port
 into the branch's `_should_flow`. `FirstInOrder` emits the first of its inputs
 that carried a value, in written order, merging alternative paths.
 
-What runs: a manual run starts from every output node and walks upstream,
-executing the union (`--target <node>` narrows it; a target must be an output
-node). A trigger fire starts at the trigger that fired, walks downstream to
-the outputs it can reach, then back up, stopping at other triggers. A branch
-wired to no output never executes. One file can hold several programs, one
-per trigger, and they may share upstream nodes (one database, one provider):
-on a fire the shared node runs for the fired program and the other programs
-are left without a trace. A node skipped with reason `outside_this_run` on a
-fire is in the fired program but no output depends on it: almost always a
-side-effect node missing `_is_output: true`, so fix the wiring, never the
-runtime.
+What runs: a manual run kicks every root (a top-level node no wire feeds).
+A trigger is a root, and with no event behind it its outputs close and prune
+its branch, so a hand run exercises the paths that need no trigger.
+`--target <node>` (repeatable, any node) runs those nodes and what they
+need: the union when you name several, nothing past a target, no sibling
+branch even one sharing a root, and a target inside a group brings the
+whole group and whatever feeds the group's inputs. A trigger fire runs the
+fired trigger's own program:
+everything downstream of it, plus what that needs upstream, stopping at
+other triggers (a trigger's outputs are the event, not a function of its
+inputs, which were read once at activation). Every node the fire reaches
+runs. One file can hold several programs, one per trigger, and they may
+share upstream nodes (one database, one provider): on a fire the shared
+node runs for the fired program and the other programs are left without a
+trace.
 
 Ends: completed (no pulse in flight), suspended (every live firing parked on
 an external wait: a person, a timer; costs nothing), stuck (provably
@@ -337,24 +374,31 @@ clearing one user's whole backlog) has no place in the order, so it
 reaches every run carrying the tag.
 
 A stopped run ends cancelled, and its journal names who did it:
-`Stopped by execution <color> (tag <tag>)`. A tag is letters, digits,
-`_` and `-`, at most 64 characters. A Telegram chat id or a Slack user
-id works as it is; a WhatsApp address (`49151@s.whatsapp.net`) or a
-phone number with a `+` or a space does not, so clean it up before
-tagging with it. Inside your own node the same two moves are
-`ctx.tag_execution` and `ctx.stop_tagged`; for those, go and read
-`weft-node-authoring`.
+`Stopped by execution <color> (tag <tag>)`. Any string is a tag: a
+Telegram chat id, a WhatsApp address (`49151@s.whatsapp.net`), a phone
+number with a `+` and spaces. Both nodes turn it into a safe tag the same
+way (unsafe characters become `_`, a short fingerprint of the original is
+appended, so two different values never share one), so wire the raw value
+and never clean it up yourself. Inside your own node the same two moves are
+`ctx.tag_execution` and `ctx.stop_tagged`, which take a tag already clean
+(letters, digits, `_`, `-`, at most 64) and refuse anything else, naming
+the character; for those, go and read `weft-node-authoring`.
 
 ## Groups
 
-A group is the unit of readable size, the thing [the level rule] asks for:
-every level of the graph, the file and
-the inside of every group, holds at most about six items, nodes or groups;
-when a level grows past that, the nodes cooperating on one job become a group
-of their own, and because groups nest, depth absorbs size. There is almost
-always a way to group: a pipeline stage, one step of the program's story, the
-nodes serving one external service. A level that truly cannot shrink stays
-flat, but that answer comes last. Keep the boundary small too: a group with a
+A group is the unit of readable size, the thing [the level rule] asks
+for: every level of the graph, the file and the inside of every group,
+holds at most about six items, nodes or groups, and past fifteen the
+compiler warns `level-too-large`, because a level is what a reader scans
+in one look and a sixteenth item ends that. When a level grows past six,
+the nodes cooperating on one job become a group of their own, and because
+groups nest, depth absorbs size: growing work goes down into a nested
+group, never wide across a level, and a group's inside holding another
+group or two is the normal shape, not a special one. There is almost
+always a way to group: a pipeline stage, one step of the program's story,
+the nodes serving one external service. A level that truly cannot shrink
+stays flat, but that answer comes last, and past fifteen it is wrong
+anyway. Keep the boundary small too: a group with a
 dozen ports is two groups, or the wrong split.
 
 ````weft
@@ -378,6 +422,13 @@ write `self.<output>` for what it emits. Children reach each other and
 outside by wire or literal on their own lines. Groups nest, names are scoped,
 and the compiler flattens them away: at run time there is one flat graph. A
 group is a region, not a function: it has no call sites and does not return.
+
+A group stops as a whole only through its `_should_flow`; then every node
+inside is skipped with the group's name as the reason (`scope_skipped`). A
+group input arriving closed passes through to the nodes inside that read it,
+which skip, while the rest runs. When a group starts, every node inside that
+no wire feeds starts with it (once per iteration in a loop body), so a group
+may hold its own source.
 
 Reuse across files: `triage = @include("triage.weft")`, where the included
 file is exactly one anonymous top-level group; its ports become `triage`'s.
@@ -435,31 +486,42 @@ emit back.
 | `@include("x.weft")` | a program as a group | no |
 | `@file("x.md")` | a file's contents as a value | yes |
 | `@asset("x.png", Image)` | a file's contents as a value | no |
-| `@asset("x.txt")` | a text file's contents inline | no |
+| `@asset("x.txt", String)` | a text file's contents inline | no |
 
 `@file` is bidirectional (the editor writes edits back into the file) so
 binary types are refused; it is the marker for `prompts/`, `scripts/`,
-`sql/`. `@asset` with a file type resolves through the build's asset sync
-(hash-addressed storage; the source keeps one line, never a blob). A list of
-markers feeds multi-file ports. `@asset` sources may also be an outside path
-or an `http(s)` URL (fetched at run time).
+`sql/`; its type defaults to `String`. `@asset` ALWAYS names its type, and
+a file type names one kind: `Image`, `Video`, `Audio`, or `Blob` (never
+`File` or `Media`; the compiler never guesses a kind from a name or bytes).
+A file-typed `@asset` resolves through the build's asset sync
+(hash-addressed storage; the source keeps one line, never a blob), and the
+sync checks the file's bytes against the declared kind (an `Image` over an
+mp3 fails the build; `Blob` checks nothing). A list of markers feeds
+multi-file ports. `@asset` sources may also be an outside path, an `http(s)`
+URL, or a stored file's key; a text-typed one from a URL or a key is
+fetched at build.
 
 ## Compiler error slugs
 
-Wiring: `type-mismatch`, `required-port-unmet`, `unknown-source-node`,
+Wiring: `type-mismatch`, `deref-path` (a key read off a wire that the
+source type does not have), `required-port-unmet`, `unknown-source-node`,
 `unknown-target-node`, `unknown-source-port`, `unknown-target-port`,
-`double-driven-port`, `input-not-wireable`, `duplicate-input-port`,
-`duplicate-node-id`, `port-literal-placement`, `undeclared-port-no-custom`.
+`double-driven-port`, `input-accepts` (a driver the port refuses, or any
+wire or marker on a compiler-read port), `should-flow-not-boolean`,
+`value-on-output` (a value written on an output port; an output is emitted
+on, never written), `duplicate-input-port`, `duplicate-node-id`,
+`undeclared-port-no-custom`.
 
 Types: `unresolved-typevar`, `must-override-unmet`, `cast-not-allowed`,
 `config-type-mismatch`, `config-null-literal`, `literal-out-of-range`,
 `named-type-conflict`.
 
 Shape: `graph-cycle` (iterate with a Loop, exchange feedback over a Bus),
-`scope-reachability`, `orphan-outputs`, `unreachable-from-output`,
-`no-output-node` (set `_is_output: true` on the deliverable).
+`scope-reachability`, `orphan-outputs`, `level-too-large` (a warning: a
+level holds more than fifteen items; group the nodes cooperating on one
+job, and nest rather than widen).
 
-Triggers: `trigger-in-loop`, `trigger-into-trigger`, `trigger-into-infra`,
+Triggers and infra: `trigger-in-loop`, `infra-in-loop`, `trigger-into-trigger`, `trigger-into-infra`,
 `duplicate-port`, `config-ports-not-a-list`, `config-entry-not-an-object`,
 `unknown-config-entry-kind`, `config-entry-without-a-port`,
 `unknown-config-entry-key`, `config-entry-bad-value`, `config-entry-missing-value`, `duplicate-catch-all`,
@@ -471,18 +533,23 @@ Loops: `loop-unbounded-no-termination`, `parallel-with-carry`,
 `carry-port-type-mismatch`, `loop-over-unknown-port`,
 `loop-carry-unknown-port`, `loop-parallel-not-boolean`,
 `loop-trim-not-boolean`, `loop-max-iters-not-integer`,
-`loop-unknown-config-field`.
+`loop-unknown-config-field`. (`loop-boundary-unpaired` and
+`loop-config-missing-parallel` are internal invariants: neither is
+reachable from source, and hitting either is a compiler bug worth
+reporting.)
 
 Streams: `generator-multiple-consumers`, `generator-through-group`,
 `generator-in-container`, `generator-not-carriable`,
 `generator-input-must-be-required`, `generator-not-iterated`,
 `generator-into-generic-port`.
 
-Names: `reserved-name`, `reserved-port-name`.
+Names: `reserved-name`, `reserved-port-name`, `unknown-type` (a warning:
+the type is not in the project's catalog).
 
 Requirements: `require-one-of-unmet`, `require-one-of-unknown-port`,
-`no-required-skip` (a warning: all
-wireable inputs optional, add `@require_one_of`), `rule-structural`,
+`no-required-skip` (a warning: every input a wire feeds is optional, so
+the node runs even when all of them closed; add `@require_one_of`),
+`rule-structural`,
 `rule-runtime` (a node's own declarative validation; the message is the node
 author's).
 

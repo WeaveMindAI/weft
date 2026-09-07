@@ -29,7 +29,7 @@ async fn a_project_asset_ref_is_synced_and_read_at_runtime() -> anyhow::Result<(
     let assets_dir = project.dir().join("assets");
     std::fs::create_dir_all(&assets_dir)?;
     std::fs::write(assets_dir.join("data.bin"), &payload)?;
-    project.set_node_config("sized", "file", "@asset(\"assets/data.bin\", File)")?;
+    project.set_node_config("sized", "file", "@asset(\"assets/data.bin\", Blob)")?;
 
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
@@ -53,14 +53,20 @@ async fn a_url_file_ref_is_fetched_by_the_worker_at_runtime() -> anyhow::Result<
     // network. Stand up a fake serving known bytes at a cluster-reachable URL.
     let payload = b"weft-e2e url asset; fetched by the worker, never the server".to_vec();
     let fake = BytesFake::start(payload.clone()).await?;
-    project.set_node_config("sized", "file", &format!("@asset(\"{}\", File)", fake.url()))?;
+    project.set_node_config("sized", "file", &format!("@asset(\"{}\", Blob)", fake.url()))?;
+
+    // The build (asset sync included) never touches the URL: the fetch is
+    // the worker's, at run time.
+    project.build().await?;
+    anyhow::ensure!(fake.served() == 0, "the build fetched the URL asset {} time(s)", fake.served());
 
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
 
     // The node fetched the URL and counted the bytes: a url-handle file reads
-    // through the same `get_bytes` path as a bucket-backed one.
+    // through the same `get_bytes` path as a bucket-backed one, once.
     settled.assert_input("out", "data", &json!(payload.len()))?;
+    anyhow::ensure!(fake.served() == 1, "the worker fetched the URL asset {} time(s)", fake.served());
 
     project.finish().await
 }

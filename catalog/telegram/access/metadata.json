@@ -43,7 +43,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -54,7 +53,6 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The bot's access: wire it into Telegram action nodes."
     }
   ]

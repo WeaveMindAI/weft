@@ -65,6 +65,14 @@ changes nothing. A tag is one to sixty-four characters of `[A-Za-z0-9_-]`,
 the same rule a node's `_tags` follows; anything else fails here, naming
 the character, before anything is written.
 
+The two catalog nodes take any string and make a tag of it the same way:
+a value that already is one stays as written, anything else has its other
+characters replaced by `_` and a short fingerprint of the original appended
+(`49151@s.whatsapp.net` becomes `49151_s_whatsapp_net-` and sixteen hex
+characters), so two values that only differ in the replaced characters never
+share a tag. If you write a node that tags with a value it did not choose,
+do the same, or call the ctx with what you know is clean.
+
 The tags show on the run: in the inspector's footer, in the Executions
 view, and in `weft executions`.
 

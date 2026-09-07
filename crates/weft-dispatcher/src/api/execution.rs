@@ -16,6 +16,39 @@ use crate::journal::{ExecutionPage, ExecutionQuery};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 
+/// The one execution of the caller's whose color starts with `prefix`
+/// (a full uuid resolves to itself). 404 when nothing matches, 409
+/// when the prefix is short enough to match several, naming them.
+pub async fn resolve_color(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(prefix): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let prefix = prefix.to_ascii_lowercase();
+    if prefix.len() < 4 || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("'{prefix}' is not the start of a color: give at least four hex characters"),
+        ));
+    }
+    let matches = state
+        .journal
+        .colors_with_prefix(caller.0.as_str(), &prefix)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("colors_with_prefix: {e}")))?;
+    match matches.as_slice() {
+        [] => Err((StatusCode::NOT_FOUND, format!("no execution starts with '{prefix}'"))),
+        [one] => Ok(Json(serde_json::json!({ "color": one.to_string() }))),
+        several => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "'{prefix}' starts more than one execution ({}, ...); give more characters",
+                several.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}
+
 pub async fn cancel(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -377,7 +410,7 @@ pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(color_str): Path<String>,
-) -> Result<Json<Vec<DispatcherEvent>>, StatusCode> {
+) -> Result<Json<Vec<crate::events::LiveEvent>>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     // Resolve + tenant-gate in the ONE place that owns "who owns this
     // execution": a lookup failure is 500, an unknown or cross-tenant
@@ -407,28 +440,28 @@ pub async fn replay(
     // trip and gives the inspector a one-shot list of any rows that
     // could not be applied. The same fold runs in the engine resume
     // path and the cancel handler; this is the inspector's window.
-    let snapshot = weft_journal::fold_to_snapshot(color, &raw_events);
-    let mut out: Vec<DispatcherEvent> = raw_events
+    let snapshot = weft_journal::fold_to_snapshot(color, raw_events.iter().map(|record| &record.event));
+    let mut out: Vec<crate::events::LiveEvent> = raw_events
         .into_iter()
         .flat_map(|e| {
-            crate::journal_bridge::to_dispatcher_events(&e, project_id.clone())
+            crate::journal_bridge::project_recorded_event(e, project_id.clone())
         })
         .collect();
     for c in snapshot.corruptions {
-        out.push(DispatcherEvent::JournalCorruption {
+        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
             color,
             project_id: project_id.clone(),
             site: c.site,
             reason: c.reason,
-        });
+        }));
     }
     for reason in undecodable {
-        out.push(DispatcherEvent::JournalCorruption {
+        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
             color,
             project_id: project_id.clone(),
             site: weft_core::primitive::CorruptionSite::UndecodableRow,
             reason,
-        });
+        }));
     }
     Ok(Json(out))
 }

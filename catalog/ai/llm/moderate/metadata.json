@@ -27,19 +27,16 @@
   "outputs": [
     {
       "name": "flagged",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     },
     {
       "name": "categories",
       "type": "List[String]",
-      "required": false,
       "description": "The categories that flagged."
     },
     {
       "name": "scores",
-      "type": "JsonDict",
-      "required": false
+      "type": "JsonDict"
     }
   ]
 }

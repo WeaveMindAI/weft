@@ -63,13 +63,14 @@ never a lecture about what is not.
    every run. "View in Graph" on an old run replays it, values included.
    Tell them the same list exists as `weft executions` and
    `weft events <color>` in a terminal.
-5. **Aim a run.** Right-click an output node, "Set as target": the Run
-   button becomes "Run 1 target" and only that branch runs. Good for
+5. **Aim a run.** Right-click a node, "Set as target": the Run
+   button becomes "Run 1 target" and only that node's branch runs. Good for
    trying one path of a busy canvas.
 6. **Groups and loops.** Collapse a group: the wiring outside it does not
    change, which is why big programs stay readable. Open it again with its
-   expand button. A loop runs its inside once per item; its iteration
-   number is on its rail.
+   expand button. Groups nest: a box can hold boxes, and that is how a
+   program of a hundred nodes stays readable. A loop runs its inside once
+   per item; its iteration number is on its rail.
 7. **When something starts on its own.** If the project has a trigger:
    "Activate" turns it on (the button sits in the action bar); the
    trigger's own body shows its live feed. A run started by a trigger only

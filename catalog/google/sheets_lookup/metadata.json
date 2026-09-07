@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/drive.file"
@@ -111,19 +111,16 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "The matching rows, keyed by the header."
     },
     {
       "name": "rowNumbers",
       "type": "List[Number]",
-      "required": false,
       "description": "Each match's 1-based sheet row number."
     },
     {
       "name": "found",
       "type": "Boolean",
-      "required": false,
       "description": "Whether at least one row matched."
     }
   ]

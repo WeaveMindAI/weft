@@ -1,6 +1,6 @@
 ---
 name: catalog-scout
-description: Sweeps the project's node catalog (nodes/) and reports which node types can do a job, with their exact ports, config keys, exposure, and features. Use for wide catalog searches and multi-node comparisons so the main conversation stays small; the main agent handles single-node lookups itself.
+description: Sweeps the project's node catalog (nodes/) and reports which node types can do a job, with their exact ports, config keys, what they accept, and features. Use for wide catalog searches and multi-node comparisons so the main conversation stays small; the main agent handles single-node lookups itself.
 tools: Grep, Glob, Read, Bash
 model: inherit
 ---
@@ -11,7 +11,7 @@ The catalog is under `nodes/` in the project root. `nodes/base_catalog/` is the 
 
 Method:
 
-1. Find candidates: `weft describe-nodes --list` prints one line per type (type, tags, one-line description), the cheap first sweep; `weft describe-nodes --compact` prints the catalog's wiring view (ports, exposure, types, features) at a fraction of the full files' size. `Grep` across `nodes/**/metadata.json` works too (in `description`, `tags`, port names).
+1. Find candidates: `weft describe-nodes --list` prints one line per type (type, tags, one-line description), the cheap first sweep; `weft describe-nodes --compact` prints the catalog's wiring view (ports, what they accept, types, features) at a fraction of the full files' size. `Grep` across `nodes/**/metadata.json` works too (in `description`, `tags`, port names).
 2. Read each candidate in full before reporting it: `weft describe-nodes --node <Type> --compact` for the wiring facts, the `metadata.json` file itself when the question reaches past wiring (a service recipe, a validation rule's exact wording). Do not summarize a node you have not read. `--compact` drops `service`, `images`, `label`, `tags`, `icon` and `display`: to report an access node's service recipe or an infra node's images, open the `metadata.json`.
 3. Also check `package.toml` and shared `.rs` files only when the question is about packaging or shared code, not about a node's ports.
 
@@ -19,9 +19,9 @@ Your report, for every candidate, contains:
 
 - `type` and folder path
 - one line: what it does
-- inputs: name, type, required, exposure (`all` / `assignment` / `config` / `wire`), widget kind (and a select's options)
+- inputs: name, type, required, accepts (`literal` and/or `wire`; absent = both; compiler-read ports take an inline value only), widget kind (and a select's options)
 - outputs: name and type
-- features that matter for wiring: `isTrigger`, `isOutputDefault`, `oneOfRequired`, `canAddInputPorts` / `canAddOutputPorts`, `castPorts`, `portsFromConfig`
+- features that matter for wiring: `isTrigger`, `oneOfRequired`, `canAddInputPorts` / `canAddOutputPorts`, `castPorts`, `portsFromConfig`
 - for access nodes: the `service` summary (acquisition kind, doors, scopes)
 - for infra nodes: `requires_infra`, `images`, `publishes`
 - anything that would surprise a wiring agent (a wire-only port, a config-only port, a validation rule)

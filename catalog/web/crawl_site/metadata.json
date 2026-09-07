@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Firecrawl access (wire a FirecrawlAccess node)."
     },
@@ -25,7 +25,6 @@
     {
       "name": "limit",
       "type": "Number",
-      "exposure": "config",
       "default": 25,
       "label": "Max pages",
       "description": "Upper bound on crawled pages (1-1000); the crawl bills per page."
@@ -35,13 +34,11 @@
     {
       "name": "pages",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each page: url, title, markdown."
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

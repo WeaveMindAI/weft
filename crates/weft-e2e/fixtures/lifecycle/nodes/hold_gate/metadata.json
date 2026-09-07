@@ -19,7 +19,6 @@
       "name": "url",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },

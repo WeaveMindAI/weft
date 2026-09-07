@@ -24,7 +24,7 @@ describe('translateProject', () => {
           inputs: [
             {
               name: 'systemPrompt', portType: 'String', required: false,
-              exposure: 'all', widget: { kind: 'textarea' }, default: 'be nice',
+              accepts: ['literal', 'wire'], widget: { kind: 'textarea' }, default: 'be nice',
               label: 'System prompt', placeholder: 'You are...',
               declaredType: 'String',
               fromSpec: true, requiresScopes: ['chat:write'], requiresValues: { team: 'x' },
@@ -54,7 +54,7 @@ describe('translateProject', () => {
     expect(node.portLiteralSpans?.systemPrompt?.origin).toBe('inline');
     // The input's resolved editor surface survives too (the field
     // renderer + form toggle read all of it off the instance).
-    expect(node.inputs[0].exposure).toBe('all');
+    expect(node.inputs[0].accepts).toEqual(['literal', 'wire']);
     expect(node.inputs[0].widget).toEqual({ kind: 'textarea' });
     expect(node.inputs[0].default).toBe('be nice');
     expect(node.inputs[0].label).toBe('System prompt');
@@ -83,7 +83,6 @@ describe('translateProject', () => {
       label: null,
       inPorts: [],
       outPorts: [],
-      oneOfRequired: [],
       parentGroupId,
       childGroupIds: [],
       nodeIds: [],
@@ -109,13 +108,13 @@ describe('translateProject', () => {
       groups: [
         {
           id: 'off', kind: 'group' as const, label: null,
-          inPorts: [], outPorts: [], oneOfRequired: [],
+          inPorts: [], outPorts: [],
           parentGroupId: null, childGroupIds: [], nodeIds: [],
           portLiterals: { _should_flow: false },
         },
         {
           id: 'on', kind: 'group' as const, label: null,
-          inPorts: [], outPorts: [], oneOfRequired: [],
+          inPorts: [], outPorts: [],
           parentGroupId: null, childGroupIds: [], nodeIds: [],
         },
       ],

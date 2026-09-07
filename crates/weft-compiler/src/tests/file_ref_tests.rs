@@ -74,6 +74,14 @@ fn marker_with_explicit_type() {
 }
 
 #[test]
+fn scoped_aliases_with_the_same_name_are_distinct_asset_contracts() {
+    let image = parse_marker("@asset(\"same.bin\", Local=Image)").unwrap().unwrap();
+    let audio = parse_marker("@asset(\"same.bin\", Local=Audio)").unwrap().unwrap();
+    assert_eq!(image.ty.to_string(), audio.ty.to_string());
+    assert_ne!(image.resolution_key(), audio.resolution_key());
+}
+
+#[test]
 fn marker_with_bracketed_type_containing_comma() {
     // The comma inside Dict[String, Number] must not be read as the
     // path/type separator.
@@ -166,20 +174,45 @@ fn file_marker_rejects_types_without_bidirectional_edit() {
 }
 
 #[test]
-fn text_typed_asset_rejects_url_and_stored_file_sources() {
-    // No text to read at parse from a URL or a stored file: only the
-    // deferred file-typed form supports those sources.
+fn text_typed_asset_from_a_url_or_a_stored_file_defers_to_the_build() {
+    // Nothing on disk to read at parse: the build fetches the bytes and
+    // casts them (`resolve_text_bytes`); the parse keeps the marker.
     let dir = tempfile::tempdir().unwrap();
     let fs = crate::file_reader::CompileFs::disk(dir.path());
-    let fr = asset_ref("https://ex.com/a.txt", WeftType::Primitive(WeftPrimitive::String));
-    let err = resolve(&fr, &fs).unwrap_err();
-    assert!(err.contains("needs a file-typed @asset"), "{err}");
-    let fr = asset_ref(
+    let url = asset_ref("https://ex.com/a.txt", WeftType::Primitive(WeftPrimitive::String));
+    assert_eq!(resolve(&url, &fs).unwrap(), Resolved::Deferred);
+    let key = asset_ref(
         "project/11111111-2222-3333-4444-555555555555/f1",
-        WeftType::Primitive(WeftPrimitive::String),
+        WeftType::Primitive(WeftPrimitive::Number),
     );
-    let err = resolve(&fr, &fs).unwrap_err();
-    assert!(err.contains("must reference a project file"), "{err}");
+    assert_eq!(resolve(&key, &fs).unwrap(), Resolved::Deferred);
+    assert_eq!(resolve_text_bytes(&key, b"42").unwrap().as_f64(), Some(42.0));
+    let err = resolve_text_bytes(&key, b"forty-two").unwrap_err();
+    assert!(err.contains("@asset(\"project/"), "the error names the source: {err}");
+}
+
+#[test]
+fn an_asset_names_its_type_and_one_kind_of_file() {
+    let err = parse_marker("@asset(\"a.png\")").unwrap().unwrap_err();
+    assert!(err.contains("@asset(\"a.png\", Image)"), "the fix is spelled out: {err}");
+    let err = parse_marker("@asset(\"a.png\", File)").unwrap().unwrap_err();
+    assert!(err.contains("one kind of file"), "{err}");
+    let err = parse_marker("@asset(\"a.png\", Media)").unwrap().unwrap_err();
+    assert!(err.contains("one kind of file"), "{err}");
+    let ok = parse_marker("@asset(\"a.bin\", Blob)").unwrap().unwrap();
+    assert_eq!(ok.ty, WeftType::Primitive(WeftPrimitive::Blob));
+}
+
+#[test]
+fn literal_type_reads_a_marker_as_the_type_it_declares() {
+    let img = serde_json::json!("@asset(\"a.png\", Image)");
+    assert_eq!(literal_type(&img), WeftType::Primitive(WeftPrimitive::Image));
+    let list = serde_json::json!(["@asset(\"a.png\", Image)", "@asset(\"b.png\", Image)"]);
+    assert_eq!(literal_type(&list), WeftType::parse("List[Image]").unwrap());
+    let text = serde_json::json!("@file(\"n.txt\", Number)");
+    assert_eq!(literal_type(&text), WeftType::Primitive(WeftPrimitive::Number));
+    let plain = serde_json::json!("hello");
+    assert_eq!(literal_type(&plain), WeftType::Primitive(WeftPrimitive::String));
 }
 
 #[test]
@@ -203,12 +236,24 @@ fn resolve_runtime_key_refs_matches_listing_by_tenant_less_key() {
         asset_ref("project/p1/missing", WeftType::Primitive(WeftPrimitive::Image)),
     ];
     let mut map = std::collections::BTreeMap::new();
-    resolve_runtime_key_refs(&refs, &listing, &mut map);
+    resolve_runtime_key_refs(&refs, &listing, &mut map).unwrap();
     // The matched ref resolves to the tenant-anchored key; the unmatched one
     // stays unmapped (apply_asset_resolutions reports it loudly).
     assert_eq!(map.len(), 1);
-    assert_eq!(map["project/p1/f1"]["__weft_image__"]["key"], "t1/project/p1/f1");
-    assert_eq!(map["project/p1/f1"]["__weft_image__"]["filename"], "pic.png");
+    let image_key = refs[0].resolution_key();
+    assert_eq!(map[&image_key]["__weft_image__"]["key"], "t1/project/p1/f1");
+    assert_eq!(map[&image_key]["__weft_image__"]["filename"], "pic.png");
+
+    // A stored file of another kind than the ref declared is refused
+    // naming both; `Blob` takes anything.
+    let wrong = vec![asset_ref("project/p1/f1", WeftType::Primitive(WeftPrimitive::Audio))];
+    let mut map = std::collections::BTreeMap::new();
+    let errs = resolve_runtime_key_refs(&wrong, &listing, &mut map).unwrap_err();
+    assert!(errs[0].contains("is Image (image/png), not Audio"), "{errs:?}");
+    let any = vec![asset_ref("project/p1/f1", WeftType::Primitive(WeftPrimitive::Blob))];
+    let mut map = std::collections::BTreeMap::new();
+    resolve_runtime_key_refs(&any, &listing, &mut map).unwrap();
+    assert!(map[&any[0].resolution_key()].get("__weft_blob__").is_some(), "declared Blob, marked Blob");
 }
 
 #[test]
@@ -220,7 +265,7 @@ fn file_marker_rejects_a_url_source_naming_the_asset_directive() {
     let fr = text_ref("https://ex.com/a.txt", WeftType::Primitive(WeftPrimitive::String));
     let err = resolve(&fr, &fs).unwrap_err();
     assert!(err.contains("@file cannot read from a URL"), "{err}");
-    assert!(err.contains("file-typed @asset"), "{err}");
+    assert!(err.contains("use @asset(\"https://ex.com/a.txt\", String)"), "{err}");
 }
 
 #[test]
@@ -271,7 +316,10 @@ fn apply_asset_resolutions_substitutes_paths_and_urls() {
     let marker = serde_json::json!({"__weft_image__": {
         "key": "t/asset/p/abc", "mimeType": "image/png", "sizeBytes": 4, "filename": "assets/pic.png"
     }});
-    let map = std::collections::BTreeMap::from([("assets/pic.png".to_string(), marker.clone())]);
+    let map = std::collections::BTreeMap::from([(
+        asset_ref("assets/pic.png", WeftType::Primitive(WeftPrimitive::Image)).resolution_key(),
+        marker.clone(),
+    )]);
     apply_asset_resolutions(&mut project, &map).unwrap();
 
     let cfg = project.nodes[0].config.as_object().unwrap();
@@ -310,6 +358,25 @@ fn collect_asset_refs_finds_path_media_refs_only() {
 }
 
 #[test]
+fn one_path_under_two_declared_types_is_two_refs() {
+    // Dedupe is by path AND type: each declaration is held to its own
+    // bytes check and gets its own marker kind, so flipping one of two
+    // refs to the same file cannot ride the other's check.
+    let src = serde_json::json!({
+        "a": "@asset(\"assets/clip.mp3\", Audio)",
+        "b": "@asset(\"assets/clip.mp3\", Image)",
+        "c": "@asset(\"assets/clip.mp3\", Audio)"
+    });
+    let project = definition_with_config(src);
+    let refs = collect_asset_refs(&project);
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    let mut types: Vec<String> = refs.iter().map(|r| r.ty.to_string()).collect();
+    types.sort();
+    assert_eq!(types, ["Audio", "Image"]);
+    assert_ne!(refs[0].resolution_key(), refs[1].resolution_key());
+}
+
+#[test]
 fn collect_runtime_key_refs_finds_storage_key_media_refs_only() {
     // Storage-key media refs (a tenant-less `scope/owner/id` path, from the
     // stored-file picker) are collected separately from path asset refs, and
@@ -327,6 +394,35 @@ fn collect_runtime_key_refs_finds_storage_key_media_refs_only() {
     let assets = collect_asset_refs(&project);
     assert_eq!(assets.len(), 1);
     assert_eq!(assets[0].path, "assets/pic.png");
+}
+
+#[test]
+fn collect_remote_text_refs_finds_text_typed_url_and_key_refs() {
+    // A text-typed `@asset` from a URL or a stored key is the build
+    // driver's to fetch; a file-typed one and a disk-path one are not.
+    let src = serde_json::json!({
+        "a": "@asset(\"https://ex.com/sys.txt\", String)",
+        "b": "@asset(\"project/11111111-2222-3333-4444-555555555555/f1\", Number)",
+        "c": "@asset(\"https://ex.com/x.png\", Image)",
+        "d": "@asset(\"assets/pic.png\", Image)"
+    });
+    let project = definition_with_config(src);
+    let refs = collect_remote_text_refs(&project);
+    let paths: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, ["https://ex.com/sys.txt", "project/11111111-2222-3333-4444-555555555555/f1"]);
+    // Unfetched, it is a loud miss naming the URL.
+    let mut project = definition_with_config(serde_json::json!({
+        "a": "@asset(\"https://ex.com/sys.txt\", String)"
+    }));
+    let errs = apply_asset_resolutions(&mut project, &std::collections::BTreeMap::new()).unwrap_err();
+    assert!(errs[0].contains("did not fetch"), "{errs:?}");
+    // Fetched, the map's value lands in place.
+    let map = std::collections::BTreeMap::from([(
+        asset_ref("https://ex.com/sys.txt", WeftType::Primitive(WeftPrimitive::String)).resolution_key(),
+        serde_json::json!("hello"),
+    )]);
+    apply_asset_resolutions(&mut project, &map).unwrap();
+    assert_eq!(project.nodes[0].config["a"], "hello");
 }
 
 #[test]
@@ -376,6 +472,10 @@ mod markers_in_a_list {
     use serde_json::json;
     use weft_core::project::{NodeDefinition, ProjectDefinition};
 
+    fn image_key(path: &str) -> String {
+        super::asset_ref(path, super::WeftType::Primitive(super::WeftPrimitive::Image)).resolution_key()
+    }
+
     fn project_with(literal: serde_json::Value) -> ProjectDefinition {
         let mut node: NodeDefinition = serde_json::from_value(json!({
             "id": "send", "nodeType": "GmailSend", "label": null,
@@ -408,8 +508,8 @@ mod markers_in_a_list {
             "@asset(\"assets/b.png\", Image)"
         ]));
         let mut map = std::collections::BTreeMap::new();
-        map.insert("assets/a.png".to_string(), json!({ "resolved": "a" }));
-        map.insert("assets/b.png".to_string(), json!({ "resolved": "b" }));
+        map.insert(image_key("assets/a.png"), json!({ "resolved": "a" }));
+        map.insert(image_key("assets/b.png"), json!({ "resolved": "b" }));
         crate::file_ref::apply_asset_resolutions(&mut project, &map).expect("both resolve");
         assert_eq!(
             project.nodes[0].port_literals["attachments"],
@@ -426,7 +526,7 @@ mod markers_in_a_list {
             "@asset(\"assets/gone.png\", Image)"
         ]));
         let mut map = std::collections::BTreeMap::new();
-        map.insert("assets/a.png".to_string(), json!({ "resolved": "a" }));
+        map.insert(image_key("assets/a.png"), json!({ "resolved": "a" }));
         let errs = crate::file_ref::apply_asset_resolutions(&mut project, &map).unwrap_err();
         assert_eq!(errs.len(), 1);
         assert!(errs[0].contains("gone.png"), "got: {}", errs[0]);
@@ -441,25 +541,146 @@ fn a_file_marker_inside_a_list_resolves() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "first").unwrap();
     std::fs::write(dir.path().join("b.txt"), "second").unwrap();
-    let mut config = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
-        serde_json::json!({ "stop": ["@file(\"a.txt\")", "@file(\"b.txt\")"] }),
-    )
-    .unwrap();
-    let mut refs = std::collections::BTreeMap::new();
-    let mut errors = Vec::new();
-    crate::file_ref::resolve_node_file_refs(
-        &mut config,
-        &Default::default(),
-        &mut refs,
-        weft_core::project::Span::default(),
-        &crate::file_reader::CompileFs::disk(dir.path()),
-        &mut errors,
-    );
-    assert!(errors.is_empty(), "got: {errors:?}");
-    assert_eq!(config["stop"], serde_json::json!(["first", "second"]));
+    let project = crate::weft_compiler::compile(
+        "n = LlmParams { stop: [@file(\"a.txt\"), @file(\"b.txt\")] }",
+        uuid::Uuid::nil(), crate::file_reader::CompileFs::disk(dir.path()),
+    ).unwrap();
+    assert_eq!(project.nodes[0].config["stop"], serde_json::json!(["first", "second"]));
     assert!(
-        refs.is_empty(),
+        project.nodes[0].file_refs.is_empty(),
         "a list is not one file-backed field, so nothing is editable through it"
     );
 }
 
+#[test]
+fn file_markers_keep_scoped_types_after_the_source_scope_ends() {
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
+        (std::path::PathBuf::from("/project/a.txt"), "local text".into()),
+    ]));
+    let project = crate::weft_compiler::compile(
+        r#"type TextAlias = String
+n = Text { value: @file("a.txt", TextAlias) }
+g = Group(input: String) {
+  type LocalText = String
+  remote = Text { value: @asset("https://example.test/a.txt", LocalText) }
+}
+g.input = @file("a.txt", TextAlias)
+"#,
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
+    ).unwrap();
+    let local = project.nodes.iter().find(|n| n.id == "n").unwrap();
+    assert_eq!(local.config["value"], serde_json::json!("local text"));
+    assert!(matches!(&local.file_refs["value"].ty, WeftType::Named { name, .. } if name == "TextAlias"));
+    let boundary = project.nodes.iter().find(|n| n.id == "g__in").unwrap();
+    assert_eq!(boundary.port_literals["input"], serde_json::json!("local text"));
+    assert!(boundary.file_refs.contains_key("input"));
+    let remote = crate::file_ref::collect_remote_text_refs(&project);
+    assert_eq!(remote.len(), 1);
+    assert!(matches!(&remote[0].ty, WeftType::Named { name, .. } if name == "LocalText"));
+}
+
+#[test]
+fn include_arguments_and_body_files_resolve_from_their_own_source() {
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
+        (std::path::PathBuf::from("/project/input.txt"), "caller".into()),
+        (std::path::PathBuf::from("/project/components/input.txt"), "callee".into()),
+        (std::path::PathBuf::from("/project/components/box.weft"), "Group(input: String) {\n n = Text { value: @file(\"input.txt\") }\n}".into()),
+    ]));
+    for mode in [crate::weft_compiler::IncludeMode::Full, crate::weft_compiler::IncludeMode::Interface] {
+        let project = crate::weft_compiler::compile_with_mode(
+            "type CallerText = String\nbox = @include(\"components/box.weft\")\nbox.input = @file(\"input.txt\", CallerText)\n",
+            uuid::Uuid::nil(), crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
+            mode, None,
+        ).unwrap();
+        match mode {
+            crate::weft_compiler::IncludeMode::Full => {
+                let boundary = project.nodes.iter().find(|n| n.id == "box__in").unwrap();
+                assert_eq!(boundary.port_literals["input"], serde_json::json!("caller"));
+                assert_eq!(boundary.file_refs["input"].path, "input.txt");
+                let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
+                assert_eq!(body.config["value"], serde_json::json!("callee"));
+                // The body's ref leaves the compiler spelled under the project
+                // root, the anchor every consumer resolves against.
+                assert_eq!(body.file_refs["value"].path, "components/input.txt");
+            }
+            crate::weft_compiler::IncludeMode::Interface => {
+                let node = project.nodes.iter().find(|n| n.id == "box").unwrap();
+                assert_eq!(node.config["input"], serde_json::json!("caller"));
+                assert!(node.file_refs.contains_key("input"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_deferred_asset_in_an_included_file_is_respelled_under_the_project_root() {
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
+        (std::path::PathBuf::from("/project/components/box.weft"), "Group {\n n = Text { value: @asset(\"pics/a.png\", Image) }\n}".into()),
+    ]));
+    let project = crate::weft_compiler::compile_with_mode(
+        "box = @include(\"components/box.weft\")\n",
+        uuid::Uuid::nil(), crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
+        crate::weft_compiler::IncludeMode::Full, None,
+    ).unwrap();
+    let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
+    assert_eq!(body.config["value"], serde_json::json!("@asset(\"components/pics/a.png\", Image)"));
+    assert_eq!(body.file_refs["value"].path, "components/pics/a.png");
+    let refs = crate::file_ref::collect_asset_refs(&project);
+    assert_eq!(refs.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), vec!["components/pics/a.png"]);
+}
+
+#[test]
+fn an_included_ref_climbs_to_the_root_and_a_read_outside_it_is_still_refused() {
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
+        (std::path::PathBuf::from("/project/shared.txt"), "shared".into()),
+        (std::path::PathBuf::from("/project/components/box.weft"), "Group {\n n = Text { value: @file(\"../shared.txt\") }\n}".into()),
+        (std::path::PathBuf::from("/project/components/bad.weft"), "Group {\n n = Text { value: @file(\"../../etc/passwd\") }\n}".into()),
+    ]));
+    let fs = crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project")));
+    let project = crate::weft_compiler::compile_with_mode(
+        "box = @include(\"components/box.weft\")\n", uuid::Uuid::nil(), fs,
+        crate::weft_compiler::IncludeMode::Full, None,
+    ).unwrap();
+    let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
+    assert_eq!(body.config["value"], serde_json::json!("shared"));
+    assert_eq!(body.file_refs["value"].path, "shared.txt");
+    let errs = crate::weft_compiler::compile_with_mode(
+        "box = @include(\"components/bad.weft\")\n", uuid::Uuid::nil(), fs,
+        crate::weft_compiler::IncludeMode::Full, None,
+    ).unwrap_err();
+    // The wall on COMPILER-READ files is the reader's, and it still
+    // holds for a ref written in an included file: the anchored path
+    // lands outside the root and the read is refused there.
+    assert!(errs.iter().any(|e| e.message.contains("escapes the project root")), "{errs:?}");
+}
+
+/// A DEFERRED asset is never read by the compiler, so nothing refuses a
+/// path outside the project: naming a file where it already sits is
+/// allowed, exactly as it is from the compiled file itself. What the
+/// anchoring must guarantee is that the path means the same thing
+/// wherever it was typed, so it comes out absolute rather than as a
+/// climb out of somebody's directory.
+#[test]
+fn a_deferred_asset_outside_the_root_keeps_one_absolute_spelling() {
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
+        (
+            std::path::PathBuf::from("/project/components/box.weft"),
+            "Group {\n n = Text { value: @asset(\"../../shared/logo.png\", Image) }\n}".into(),
+        ),
+    ]));
+    let project = crate::weft_compiler::compile_with_mode(
+        "box = @include(\"components/box.weft\")\n",
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
+        crate::weft_compiler::IncludeMode::Full,
+        None,
+    )
+    .unwrap();
+    let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
+    assert_eq!(body.file_refs["value"].path, "/shared/logo.png");
+    assert_eq!(
+        body.config["value"],
+        serde_json::json!("@asset(\"/shared/logo.png\", Image)")
+    );
+}

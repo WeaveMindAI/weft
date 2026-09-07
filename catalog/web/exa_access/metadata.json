@@ -57,7 +57,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -68,7 +67,6 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The Exa access: wire it into Web Search."
     }
   ]

@@ -55,7 +55,8 @@ impl Node for SlackReceiveMessageNode {
             // message does not.
             "top_level" => filters.push(Predicate::not_exists("thread")),
             "thread_replies" => filters.push(Predicate::exists("thread")),
-            _ => {}
+            "all" => {}
+            other => weft::node_bail!("replies must be top_level, thread_replies or all, got {other:?}"),
         }
 
         ctx.register_signal(ProviderEvents::new(&account, "messages", filters)).await

@@ -170,25 +170,23 @@ describe('partitionRemovals', () => {
 });
 
 describe('headerWorthy', () => {
-	it('keeps a config-exposure input only when the source header declares it, never a carry ghost', () => {
-		expect(headerWorthy({ name: 'title', exposure: 'config' })).toBe(false);
-		expect(headerWorthy({ name: 'title', exposure: 'config', declaredType: 'String' })).toBe(true);
+	it('keeps every input but a carry ghost', () => {
+		expect(headerWorthy({ name: 'title' })).toBe(true);
+		expect(headerWorthy({ name: 'title', declaredType: 'String' })).toBe(true);
 		expect(headerWorthy({ name: 'acc', synthesizedFromCarry: true })).toBe(false);
-		expect(headerWorthy({ name: 'data', exposure: 'all' })).toBe(true);
 	});
 });
 
-describe('declared config-exposure lines', () => {
-	it('round-trip even when they restate the catalog default (the gate exempts config ports)', () => {
-		// `HumanTrigger(title: String)` over a catalog config `title:
-		// String`: the parser keeps the line with a diagnostic, and an
-		// unrelated gesture must not delete it; the diagnostic is the
-		// way out.
-		const catalog = [{ name: 'title', required: false, portType: 'String', exposure: 'config' as const }];
-		const p = [{ name: 'title', required: false, portType: 'String', declaredType: 'String', exposure: 'config' as const }];
+describe('a declared line restating a catalog port', () => {
+	it('is un-declared by the restates-the-default gate, whatever the port accepts', () => {
+		// `HumanTrigger(title: String)` over a catalog `title: String`:
+		// the line says nothing the catalog does not, so the next
+		// gesture heals it out of the header.
+		const catalog = [{ name: 'title', required: false, portType: 'String', accepts: ['literal'] as const }];
+		const p = [{ name: 'title', required: false, portType: 'String', declaredType: 'String', accepts: ['literal'] as const }];
 		expect(headerPortSigs(p, p, catalog)).toEqual({
-			sigs: [{ name: 'title', required: false, portType: 'String', rendered: 'String' }],
-			reverted: [],
+			sigs: [],
+			reverted: [{ name: 'title', required: false, portType: 'String' }],
 		});
 	});
 });

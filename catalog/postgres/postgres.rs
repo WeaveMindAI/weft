@@ -389,44 +389,91 @@ pub async fn query_json(
     rows_to_json(&rows)
 }
 
-/// A query's named placeholders resolved to what the driver wants:
-/// the SQL with every `$name` rewritten to its positional `$N`, the
-/// port names in that order (so `names[N-1]` is what `$N` binds), and
-/// how many statements the text holds.
+/// A query's named placeholders resolved to what the driver wants,
+/// one entry per statement: the statement's SQL with every `$name`
+/// rewritten to its positional `$N` (numbered within THAT statement,
+/// because each statement is its own round trip) and the port names
+/// in that order (so `names[N-1]` is what `$N` binds). `verbatim` is
+/// the whole text as the scanner copied it, for a script the simple
+/// protocol runs as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaceholderSql {
+    pub statements: Vec<Statement>,
+    pub verbatim: String,
+}
+
+/// One statement of a query, ready for the extended protocol.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement {
     pub sql: String,
     pub names: Vec<String>,
-    pub statements: usize,
+}
+
+impl PlaceholderSql {
+    /// Every port name any statement reads, first appearance first,
+    /// each once.
+    pub fn names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in &self.statements {
+            for n in &s.names {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Read a query's `$name` placeholders, the way a node's custom input
-/// ports reach its SQL. Each distinct name gets the position of its
-/// first appearance (`$a ... $b ... $a` becomes `$1 ... $2 ... $1`),
-/// so the same port can be read several times and binds once.
+/// ports reach its SQL. Within each statement, each distinct name gets
+/// the position of its first appearance (`$a ... $b ... $a` becomes
+/// `$1 ... $2 ... $1`), so the same port can be read several times and
+/// binds once; a name read by two statements binds once per statement.
 ///
 /// Only SQL that Postgres itself would read as a parameter is
 /// touched: a `$` inside a string literal, a quoted identifier, a
 /// comment, or a dollar-quoted body (`$$ ... $$`, `$fn$ ... $fn$`, the
 /// way a `DO` block or a function body is written) stays exactly as
-/// written. Statements are counted the same way (a `;` inside any of
-/// those is not a separator) so the caller can tell a script from one
-/// statement.
+/// written. Statements are split the same way (a `;` inside any of
+/// those is not a separator) so the caller can run each on its own.
 ///
 /// A positional `$1` is refused: there is no parameter list for it to
-/// index any more, and naming the port is the fix.
+/// index any more, and naming the port is the fix. In a script that
+/// names no port at all the SQL goes to the server verbatim, so a `$1`
+/// there is the author's own (a `PREPARE`) and stays.
 pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
     let chars: Vec<char> = sql.chars().collect();
+    // The whole text with placeholders numbered per statement (what a
+    // statement sends), and the whole text untouched (what a script
+    // sends through the simple protocol).
     let mut out = String::with_capacity(sql.len());
+    let mut verbatim = String::with_capacity(sql.len());
     let mut names: Vec<String> = Vec::new();
+    let mut statements: Vec<Statement> = Vec::new();
+    // Where the current statement began in `out`.
+    let mut statement_start = 0usize;
     // The first `$1`-shaped tag seen, if any: what it means depends on
     // whether this turns out to be one statement or a script.
     let mut positional: Option<String> = None;
-    let mut statements = 0usize;
     // Whether the current statement has any text besides whitespace
     // and comments, so a trailing `;` (or `;;`) does not count an
     // empty statement.
     let mut statement_has_text = false;
+    // Close the statement being read: its numbered SQL and the ports
+    // it names, then start a fresh numbering.
+    fn close_statement(
+        out: &mut String,
+        names: &mut Vec<String>,
+        statements: &mut Vec<Statement>,
+        statement_start: &mut usize,
+    ) {
+        statements.push(Statement {
+            sql: out[*statement_start..].trim().to_string(),
+            names: std::mem::take(names),
+        });
+        *statement_start = out.len();
+    }
     let ident_start = |c: char| c.is_ascii_alphabetic() || c == '_';
     let ident_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut i = 0;
@@ -438,6 +485,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
             '-' if next == Some('-') => {
                 while i < chars.len() && chars[i] != '\n' {
                     out.push(chars[i]);
+                    verbatim.push(chars[i]);
                     i += 1;
                 }
             }
@@ -451,16 +499,19 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
                         depth += 1;
                         out.push_str("/*");
+                        verbatim.push_str("/*");
                         i += 2;
                     } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
                         depth -= 1;
                         out.push_str("*/");
+                        verbatim.push_str("*/");
                         i += 2;
                         if depth == 0 {
                             break;
                         }
                     } else {
                         out.push(chars[i]);
+                        verbatim.push(chars[i]);
                         i += 1;
                     }
                 }
@@ -475,6 +526,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     && (i < 2 || !ident_char(chars[i - 2]));
                 statement_has_text = true;
                 out.push(quote);
+                verbatim.push(quote);
                 i += 1;
                 loop {
                     let Some(&ch) = chars.get(i) else {
@@ -482,17 +534,21 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     };
                     if ch == '\\' && escapes_with_backslash {
                         out.push(ch);
+                        verbatim.push(ch);
                         if let Some(&escaped) = chars.get(i + 1) {
                             out.push(escaped);
+                            verbatim.push(escaped);
                         }
                         i += 2;
                         continue;
                     }
                     out.push(ch);
+                    verbatim.push(ch);
                     i += 1;
                     if ch == quote {
                         if chars.get(i) == Some(&quote) {
                             out.push(quote);
+                            verbatim.push(quote);
                             i += 1;
                             continue;
                         }
@@ -503,6 +559,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
             // `$` inside an identifier (`x$y` is a legal name) is the name.
             '$' if i > 0 && ident_char(chars[i - 1]) => {
                 out.push('$');
+                verbatim.push('$');
                 i += 1;
             }
             '$' => {
@@ -532,6 +589,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                         weft::node_bail!("the SQL opens a ${tag}$ quote it never closes");
                     };
                     out.extend(&chars[i..end + close.len()]);
+                    verbatim.extend(&chars[i..end + close.len()]);
                     i = end + close.len();
                     statement_has_text = true;
                     continue;
@@ -546,6 +604,8 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     positional.get_or_insert_with(|| tag.clone());
                     out.push('$');
                     out.push_str(&tag);
+                    verbatim.push('$');
+                    verbatim.push_str(&tag);
                     i = j;
                     statement_has_text = true;
                     continue;
@@ -554,6 +614,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     // A bare `$` (an operator such as `$>` in some
                     // extensions) is SQL, not a placeholder.
                     out.push('$');
+                    verbatim.push('$');
                     i += 1;
                     statement_has_text = true;
                     continue;
@@ -566,15 +627,19 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     }
                 };
                 out.push_str(&format!("${position}"));
+                verbatim.push_str(&format!("${tag}"));
                 i = j;
                 statement_has_text = true;
             }
             ';' => {
                 if statement_has_text {
-                    statements += 1;
+                    close_statement(&mut out, &mut names, &mut statements, &mut statement_start);
                     statement_has_text = false;
                 }
                 out.push(';');
+                verbatim.push(';');
+                // The separator belongs to no statement.
+                statement_start = out.len();
                 i += 1;
             }
             _ => {
@@ -582,38 +647,75 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                     statement_has_text = true;
                 }
                 out.push(c);
+                verbatim.push(c);
                 i += 1;
             }
         }
     }
     if statement_has_text {
-        statements += 1;
+        close_statement(&mut out, &mut names, &mut statements, &mut statement_start);
     }
-    if statements == 0 {
+    if statements.is_empty() {
         weft::node_bail!(
             "the query is empty (nothing but whitespace or comments); write the SQL to run"
         );
     }
-    // One statement is a parameterised query, where `$1` is weft's own
-    // numbering and the author cannot write it. A script sends its SQL
-    // verbatim, so `$1` there is theirs and stays.
+    let parsed = PlaceholderSql { statements, verbatim };
+    // A `$1` is weft's own numbering and the author cannot write it,
+    // wherever a statement binds a port. A script that binds nothing
+    // is sent verbatim, so `$1` there is theirs and stays.
     if let Some(tag) = positional {
-        if statements == 1 && names.is_empty() {
+        let bound = parsed.names();
+        if bound.is_empty() && parsed.statements.len() == 1 {
             weft::node_bail!(
                 "the SQL uses `${tag}`, which is not a name this node can bind: parameters are \
                  the node's own input ports, read by name. Declare the port and name it: \
                  `PostgresExecuteQuery(user_id: String) {{ ... WHERE id = $user_id }}`"
             );
         }
-        if statements == 1 {
+        if !bound.is_empty() {
             weft::node_bail!(
                 "the SQL mixes named parameters ({}) with `${tag}`, which is not a name this \
                  node can bind; name every parameter after the input port that carries it",
-                names.join(", ")
+                bound.join(", ")
             );
         }
     }
-    Ok(PlaceholderSql { sql: out, names, statements })
+    Ok(parsed)
+}
+
+/// Run several statements that name ports, one round trip each
+/// through the extended protocol (so every value binds typed, the way
+/// a single query's do), inside ONE transaction: a statement that
+/// fails rolls the ones before it back, so a half-run script never
+/// leaves the database between two states. Answers the rows of the
+/// LAST statement, the way a script does.
+pub async fn steps_json(
+    client: &mut tokio_postgres::Client,
+    steps: &[(Statement, Vec<Value>)],
+) -> WeftResult<Vec<Value>> {
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|e| weft::error::node_error(format!("postgres: begin the transaction: {}", pg_detail(&e))))?;
+    let mut last: Vec<Value> = Vec::new();
+    for (index, (statement, params)) in steps.iter().enumerate() {
+        let boxed = params_of(params);
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+        let rows = tx.query(statement.sql.as_str(), &refs).await.map_err(|e| {
+            weft::error::node_error(format!(
+                "postgres: statement {} of the script: {} (the transaction was rolled back)",
+                index + 1,
+                pg_detail(&e)
+            ))
+        })?;
+        last = rows_to_json(&rows)?;
+    }
+    tx.commit()
+        .await
+        .map_err(|e| weft::error::node_error(format!("postgres: commit the transaction: {}", pg_detail(&e))))?;
+    Ok(last)
 }
 
 /// Run a script (several statements) in one round trip through the

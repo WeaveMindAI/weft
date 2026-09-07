@@ -30,6 +30,35 @@ use tokio::sync::{broadcast, RwLock};
 use weft_core::frames::LoopFrames;
 use weft_core::Color;
 
+/// An event and its delivery identity. Journal projections derive identities
+/// from the stored row plus projection index, so replay and live delivery
+/// identify the same event without comparing timestamps or payload contents.
+// SYNC: IdentifiedEvent.event_id <-> extension-vscode/src/execFollower.ts DispatcherEvent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentifiedEvent<T> {
+    pub event_id: String,
+    #[serde(flatten)]
+    pub event: T,
+}
+
+impl<T> IdentifiedEvent<T> {
+    pub fn recorded(id: i64, event: T) -> Self {
+        Self { event_id: format!("journal:{id}"), event }
+    }
+
+    pub fn transient(event: T) -> Self {
+        Self { event_id: format!("live:{}", uuid::Uuid::new_v4()), event }
+    }
+
+    pub fn project<U>(self, project: impl FnOnce(T) -> Vec<U>) -> Vec<IdentifiedEvent<U>> {
+        project(self.event).into_iter().enumerate().map(|(index, event)| IdentifiedEvent {
+            event_id: format!("{}:{index}", self.event_id), event,
+        }).collect()
+    }
+}
+
+pub type LiveEvent = IdentifiedEvent<DispatcherEvent>;
+
 /// LISTEN channel name. Single channel for all cross-pod events;
 /// receivers route by `project_id` themselves.
 const NOTIFY_CHANNEL: &str = "weft_dispatcher_events";
@@ -394,7 +423,7 @@ impl DispatcherEvent {
 
 #[derive(Clone)]
 pub struct EventBus {
-    inner: Arc<RwLock<HashMap<String, broadcast::Sender<DispatcherEvent>>>>,
+    inner: Arc<RwLock<HashMap<String, broadcast::Sender<LiveEvent>>>>,
     /// Postgres pool used by `publish` for NOTIFY. `None` for tests
     /// or single-pod contexts where the cross-pod channel isn't
     /// wired; in that case `publish` skips the NOTIFY step and
@@ -439,7 +468,7 @@ impl EventBus {
         Ok(bus)
     }
 
-    pub async fn subscribe_project(&self, project_id: &str) -> broadcast::Receiver<DispatcherEvent> {
+    pub async fn subscribe_project(&self, project_id: &str) -> broadcast::Receiver<LiveEvent> {
         let mut inner = self.inner.write().await;
         inner
             .entry(project_id.to_string())
@@ -450,16 +479,17 @@ impl EventBus {
     /// Push to local subscribers only. Used by `journal_bridge`,
     /// where every pod's bridge polls the journal independently
     /// (the cross-pod fanout for ExecEvent is the journal itself).
-    pub async fn publish_local(&self, event: DispatcherEvent) {
+    pub async fn publish_local(&self, event: LiveEvent) {
         self.publish_local_inner(&event).await;
     }
 
     /// Push locally AND issue NOTIFY so sibling pods receive it.
     /// Used for the events that don't ride the journal:
-    /// ProjectRegistered/Activated/Deactivated, TriggerUrlChanged,
-    /// and the ExecutionStarted "fast-path" emitted by run/activate
-    /// before the journal_bridge poll picks up the row.
+    /// ProjectRegistered/Activated/Deactivated and TriggerUrlChanged.
+    /// Execution events use only the journal bridge, preserving their
+    /// identity across history and live delivery.
     pub async fn publish(&self, event: DispatcherEvent) {
+        let event = IdentifiedEvent::transient(event);
         self.publish_local_inner(&event).await;
         let Some(pool) = &self.pool else {
             return;
@@ -480,15 +510,14 @@ impl EventBus {
         // do NOT have a journal poll-based recovery: ProjectRegistered
         // / ProjectActivated / ProjectDeactivated / TriggerUrlChanged /
         // InfraStatusChanged / InfraFlaky / InfraRecovered /
-        // InfraTerminated / InfraConfigError / ExecutionStarted-fast-
-        // path all ride the NOTIFY-only path. If one of these blows
+        // InfraTerminated / InfraConfigError all ride the NOTIFY-only path.
+        // If one of these blows
         // the cap, sibling pods miss the event entirely until the
         // next user action triggers a fresh round-trip; this is a
         // real failure mode worth alerting on, not a recoverable
         // race. Every user-string field on a publish-path event
         // (`reason` on InfraFlaky, `error` on InfraConfigError,
-        // `name` on ProjectRegistered, `entry_node` on the
-        // ExecutionStarted fast-path, `node_id`/`url` on
+        // `name` on ProjectRegistered, `node_id`/`url` on
         // TriggerUrlChanged) is bounded at construction via
         // `weft_core::truncate_user_string(.., 4096)`, so tripping
         // this branch is an invariant violation (an unbounded field
@@ -497,7 +526,7 @@ impl EventBus {
             tracing::error!(
                 target: "weft_dispatcher::events",
                 size = payload.len(),
-                kind = ?std::mem::discriminant(&event),
+                kind = ?std::mem::discriminant(&event.event),
                 "DispatcherEvent too large for Postgres NOTIFY; sibling pods will miss it"
             );
             return;
@@ -516,9 +545,9 @@ impl EventBus {
         }
     }
 
-    async fn publish_local_inner(&self, event: &DispatcherEvent) {
+    async fn publish_local_inner(&self, event: &LiveEvent) {
         let inner = self.inner.read().await;
-        if let Some(tx) = inner.get(event.project_id()) {
+        if let Some(tx) = inner.get(event.event.project_id()) {
             // broadcast::Sender::send errors only when there are
             // no live receivers; that's a normal idle state (no
             // SSE clients subscribed), not a failure to discard.
@@ -589,7 +618,7 @@ async fn run_listener(pool: PgPool, bus: EventBus) -> anyhow::Result<()> {
                 Ok(notif) => {
                     backoff_secs = 1;
                     let payload = notif.payload();
-                    match serde_json::from_str::<DispatcherEvent>(payload) {
+                    match serde_json::from_str::<LiveEvent>(payload) {
                         Ok(event) => bus.publish_local_inner(&event).await,
                         Err(e) => {
                             tracing::warn!(
@@ -620,3 +649,27 @@ async fn run_listener(pool: PgPool, bus: EventBus) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn identities_survive_projection_and_wire_round_trips() {
+        let event = DispatcherEvent::ExecutionCompleted {
+            color: uuid::Uuid::nil(), project_id: "p".into(),
+            outputs: serde_json::json!({}), at_unix: 1,
+        };
+        let record = IdentifiedEvent::recorded(42, event);
+        let projected = record.clone().project(|event| vec![event.clone(), event]);
+        assert_ne!(projected[0].event_id, projected[1].event_id);
+        let replay = record.project(|event| vec![event.clone(), event]);
+        assert_eq!(serde_json::to_value(&projected).unwrap(), serde_json::to_value(replay).unwrap());
+        let json = serde_json::to_value(&projected[0]).unwrap();
+        assert_eq!(json["event_id"], "journal:42:0");
+        assert_eq!(json["kind"], "execution_completed");
+        let decoded: LiveEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.event_id, projected[0].event_id);
+        let distinct = IdentifiedEvent::recorded(43, decoded.event).project(|event| vec![event]);
+        assert_ne!(distinct[0].event_id, projected[0].event_id);
+    }
+}

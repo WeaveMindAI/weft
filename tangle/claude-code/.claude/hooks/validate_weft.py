@@ -6,17 +6,25 @@ The compiler has three tiers, and this hook is the first one:
   1. edit tier (this hook): strict parse + structural validation. Fast,
      local, nothing runs. A broken edit is named the moment it lands.
   2. runtime tier: rule-runtime checks (a connection not picked, other
-     things only knowable once the program runs). Reported early by
-     `weft validate` and the editor's Problems panel; fired at execution
-     as a loud node failure; fixed by a click in the editor, never the
-     source, so they never belong in the edit loop.
+     things only knowable once the program runs). `weft validate` reports
+     them; a build deliberately skips them and a run is not gated on
+     them, so they surface at execution as a loud node failure. Fixed by
+     a click in the editor, never the source, so they never belong in
+     the edit loop.
   3. full compilation: `weft build`, structural errors only by design (a
      program still being wired up still builds) plus the cargo and image
      build.
 
 After every Edit or Write this runs `weft validate` (strict pipeline) and
-keeps only tier-1 findings: severity "error" minus the rule-runtime slug.
-Exit 2 makes Claude Code show stderr to the model as blocking feedback.
+keeps tier-1 findings: severity "error" minus the rule-runtime slug. Exit 2
+makes Claude Code show stderr to the model as blocking feedback.
+
+One warning rides along: `level-too-large` (a level of the graph holding
+more than fifteen items). It is not an error, the program still runs, but
+the model is the one writing the graph, and this is the compiler's way of
+saying the file is becoming a wall. It is printed under its own heading so
+the model can tell law-breaking (errors) from unreadability (this) at a
+glance.
 
 Silence means clean: exit 0 with no output when there is nothing to say,
 when the edit touched nothing weft-related, or when the toolchain needed to
@@ -94,21 +102,41 @@ def validate(root: str, target: str):
         d for d in diags
         if d.get("severity") == "error" and d.get("code") != "rule-runtime"
     ]
-    if not errors:
+    # The one warning worth the model's attention mid-build: a level of
+    # the graph past fifteen items. Everything else at severity warning
+    # (orphan-outputs, no-required-skip) is normal half-built noise and
+    # stays out of the loop.
+    level_warnings = [
+        d for d in diags
+        if d.get("severity") == "warning" and d.get("code") == "level-too-large"
+    ]
+    if not errors and not level_warnings:
         return None
-    lines = ["weft: {} error{} (fix before continuing):".format(
-        len(errors), "" if len(errors) == 1 else "s")]
-    for d in errors:
-        slug = d.get("code")
-        tag = "[{}] ".format(slug) if slug else ""
-        # A finding may point into a file spliced in by @include; the
-        # diagnostic's own `file` key names it (absent = the compiled
-        # source). Never print a wrong file:line pair.
-        where = d.get("file") or target
-        lines.append("  {}:{}:{} {}{}".format(
-            os.path.basename(where), d.get("line"), d.get("column"),
-            tag, d.get("message")))
+    lines = []
+    if errors:
+        lines.append("weft: {} error{} (fix before continuing):".format(
+            len(errors), "" if len(errors) == 1 else "s"))
+        for d in errors:
+            lines.append(_format_finding(d, target))
+    if level_warnings:
+        lines.append("weft: {} level warning{} (the program runs; it will not read):".format(
+            len(level_warnings), "" if len(level_warnings) == 1 else "s"))
+        for d in level_warnings:
+            lines.append(_format_finding(d, target))
     return "\n".join(lines)
+
+
+def _format_finding(d, target):
+    """One diagnostic as `file:line:col [slug] message`, never a wrong
+    file:line pair: a finding may point into a file spliced in by
+    @include, and the diagnostic's own `file` key names it (absent =
+    the compiled source)."""
+    slug = d.get("code")
+    tag = "[{}] ".format(slug) if slug else ""
+    where = d.get("file") or target
+    return "  {}:{}:{} {}{}".format(
+        os.path.basename(where), d.get("line"), d.get("column"),
+        tag, d.get("message"))
 
 
 def main() -> int:

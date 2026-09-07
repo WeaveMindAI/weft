@@ -281,6 +281,7 @@
                 source_handle: Some("items".into()),
                 target: body_id.clone(),
                 target_handle: Some("in".into()),
+                path: Vec::new(),
                 span: None,
                 source_file: None,
             },
@@ -290,6 +291,7 @@
                 source_handle: Some("out".into()),
                 target: loop_out_id.clone(),
                 target_handle: Some("results".into()),
+                path: Vec::new(),
                 span: None,
                 source_file: None,
             },
@@ -299,6 +301,7 @@
                 source_handle: Some("results".into()),
                 target: consumer_id.clone(),
                 target_handle: Some("data".into()),
+                path: Vec::new(),
                 span: None,
                 source_file: None,
             },
@@ -342,6 +345,7 @@
             skip: None,
             pulse_ids: Vec::new(),
             error: None,
+            out_of_scope: false,
         };
         // The rig asserts on pulses + runtime state; the stream runtime
         // is throwaway plumbing here (no stream loops in these
@@ -350,7 +354,7 @@
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
             loop_in, &group, &lp.project, &edge_idx, pulses, journal,
-            "test-pod", rt, &mut stream_rt,
+            "test-pod", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
         )
         .await
         .expect("LoopIn firing");
@@ -376,12 +380,13 @@
             skip: None,
             pulse_ids: Vec::new(),
             error: None,
+            out_of_scope: false,
         };
         let mut stream_rt =
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
             loop_out, &group, &lp.project, &edge_idx, pulses, journal,
-            "test-pod", rt, &mut stream_rt,
+            "test-pod", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
         )
         .await
         .expect("LoopOut firing");
@@ -1025,14 +1030,14 @@
         };
         let edges = vec![
             // body reads element + carry from LoopIn.
-            Edge { id: "e1".into(), source: loop_in_id.clone(),  source_handle: Some("items".into()), target: body_id.clone(),     target_handle: Some("right".into()), span: None, source_file: None },
-            Edge { id: "e2".into(), source: loop_in_id.clone(),  source_handle: Some("acc".into()),   target: body_id.clone(),     target_handle: Some("left".into()),  span: None, source_file: None },
+            Edge { id: "e1".into(), source: loop_in_id.clone(),  source_handle: Some("items".into()), target: body_id.clone(),     target_handle: Some("right".into()), path: Vec::new(), span: None, source_file: None },
+            Edge { id: "e2".into(), source: loop_in_id.clone(),  source_handle: Some("acc".into()),   target: body_id.clone(),     target_handle: Some("left".into()),  path: Vec::new(), span: None, source_file: None },
             // body writes back to LoopOut on both results and acc.
-            Edge { id: "e3".into(), source: body_id.clone(),     source_handle: Some("out".into()),   target: loop_out_id.clone(), target_handle: Some("results".into()), span: None, source_file: None },
-            Edge { id: "e4".into(), source: body_id.clone(),     source_handle: Some("out".into()),   target: loop_out_id.clone(), target_handle: Some("acc".into()),     span: None, source_file: None },
+            Edge { id: "e3".into(), source: body_id.clone(),     source_handle: Some("out".into()),   target: loop_out_id.clone(), target_handle: Some("results".into()), path: Vec::new(), span: None, source_file: None },
+            Edge { id: "e4".into(), source: body_id.clone(),     source_handle: Some("out".into()),   target: loop_out_id.clone(), target_handle: Some("acc".into()),     path: Vec::new(), span: None, source_file: None },
             // outward to consumer.
-            Edge { id: "e5".into(), source: loop_out_id.clone(), source_handle: Some("results".into()), target: consumer_id.clone(), target_handle: Some("data".into()),  span: None, source_file: None },
-            Edge { id: "e6".into(), source: loop_out_id.clone(), source_handle: Some("acc".into()),     target: consumer_id.clone(), target_handle: Some("final".into()), span: None, source_file: None },
+            Edge { id: "e5".into(), source: loop_out_id.clone(), source_handle: Some("results".into()), target: consumer_id.clone(), target_handle: Some("data".into()),  path: Vec::new(), span: None, source_file: None },
+            Edge { id: "e6".into(), source: loop_out_id.clone(), source_handle: Some("acc".into()),     target: consumer_id.clone(), target_handle: Some("final".into()), path: Vec::new(), span: None, source_file: None },
         ];
         let project_json = serde_json::json!({
             "id": "00000000-0000-0000-0000-000000000000",

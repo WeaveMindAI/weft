@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Firecrawl access (wire a FirecrawlAccess node)."
     },
@@ -24,7 +24,6 @@
     {
       "name": "onlyMainContent",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -36,13 +35,11 @@
   "outputs": [
     {
       "name": "markdown",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "title",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ]
 }

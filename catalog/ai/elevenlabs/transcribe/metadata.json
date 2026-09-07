@@ -21,14 +21,13 @@
     },
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node's output): whose key the session spends."
     },
     {
       "name": "language",
       "type": "String",
-      "exposure": "config",
       "label": "Language",
       "placeholder": "(auto-detect)",
       "description": "ISO language code of the audio (en, fr, ...). Empty lets the model detect it."
@@ -38,13 +37,11 @@
     {
       "name": "transcript",
       "type": "Bus",
-      "required": false,
       "description": "The live transcript: one Bus message of kind 'text' per committed speech segment, closed when the audio ends."
     },
     {
       "name": "text",
       "type": "String",
-      "required": false,
       "description": "The full transcript, once the audio stream has ended."
     }
   ],

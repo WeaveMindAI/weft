@@ -352,6 +352,77 @@ export async function fetchPendingTasks(
   };
 }
 
+/// The link a form's stored file is shown through. A stored file
+/// reaches the task as its facts only (`{ mimeType, sizeBytes,
+/// filename }`, no `url`): the link is minted by the dispatcher the
+/// moment it is asked for and lives an hour, so a task rendered a
+/// month after it parked still shows its image, and a refresh of the
+/// page asks again. A file that is gone answers 410 and one that could
+/// not be reached 502, and the renderer shows either in the image's
+/// place.
+/// Scoped like the listing: the api token as bearer, the task one it
+/// lists, the field one the form declares.
+// SYNC: TaskFileLink <-> crates/weft-dispatcher/src/api/signal.rs (SignalFileLink), crates/weft-core/src/signal/form.rs (consumer_file_value, whose URL-backed arm publishes the same four keys)
+export interface TaskFileLink {
+  url: string;
+  mimeType: string;
+  sizeBytes: number;
+  filename: string;
+}
+
+/// The address a browser can put in an `img src`, or undefined. Only a
+/// web or data address counts: a field's plain string is text, and a
+/// storage key is weft's internal address for a file, which means
+/// nothing to a browser and is not a consumer's to see. An empty
+/// string is nothing at all, and reads as a field with no value.
+///
+/// `blob:` is deliberately absent. Such an address only works inside
+/// the one page that minted it, and a form's values arrive as JSON off
+/// the wire, so one appearing here could only ever draw a broken
+/// picture where the page could instead say it has no address to use.
+export function imageSourceOf(value: unknown): string | undefined {
+  if (value === '') return undefined;
+  const web = (s: string): boolean => {
+    const scheme = s.slice(0, s.indexOf(':') + 1).toLowerCase();
+    return scheme === 'https:' || scheme === 'http:' || scheme === 'data:';
+  };
+  if (typeof value === 'string') return web(value) ? value : undefined;
+  const url = (value as Record<string, unknown> | null | undefined)?.url;
+  return typeof url === 'string' && web(url) ? url : undefined;
+}
+
+/// Is this field value weft's projection of a stored file: the three
+/// facts a stored file leaves behind, and no `url` (a URL-backed file
+/// carries its own link and needs no door). All three are required, so
+/// ordinary data that happens to carry a `filename` is not mistaken for
+/// a file and sent to a door that has none.
+// SYNC: isStoredFileValue <-> crates/weft-core/src/signal/form.rs (consumer_file_value, which builds this shape)
+export function isStoredFileValue(value: unknown): boolean {
+  const v = value as Record<string, unknown> | null | undefined;
+  return (
+    typeof v === 'object' && v !== null && v.url === undefined
+    && typeof v.mimeType === 'string'
+    && typeof v.sizeBytes === 'number'
+    && typeof v.filename === 'string'
+  );
+}
+
+export async function fetchTaskFile(task: PendingTask, fieldKey: string): Promise<TaskFileLink> {
+  const tokenConfig = task._tokenConfig;
+  if (!tokenConfig) throw new Error('Task missing token configuration');
+  const url = `${tokenConfig.dispatcherUrl}/signal-token/signals/${encodeURIComponent(task.token)}/files/${encodeURIComponent(fieldKey)}`;
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${tokenConfig.token}` } });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(text || `HTTP ${resp.status}`);
+  }
+  const link = (await resp.json()) as TaskFileLink;
+  if (typeof link?.url !== 'string') {
+    throw new Error('the files door answered without a url (a version mismatch?)');
+  }
+  return link;
+}
+
 /// Submit a form payload (HumanQuery completion / human trigger
 /// fire). The signal token alone is sufficient routing; no extra
 /// auth header is needed because possessing the signal token is the

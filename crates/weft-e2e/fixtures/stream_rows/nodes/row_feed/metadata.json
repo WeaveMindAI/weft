@@ -9,7 +9,7 @@
     { "name": "rows", "type": "List[String]", "required": true }
   ],
   "outputs": [
-    { "name": "kept", "type": "Generator[String]", "required": false }
+    { "name": "kept", "type": "Generator[String]" }
   ],
   "requires_infra": false
 }

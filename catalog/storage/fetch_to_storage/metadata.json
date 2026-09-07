@@ -26,7 +26,6 @@
     {
       "name": "keep",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "label": "Keep past the run",
       "description": "Store the file already flagged to survive the execution-end sweep (30-day access-extended TTL). Only with `scope: execution`: a project file outlives the run already, and the pair is refused."
@@ -34,7 +33,6 @@
     {
       "name": "scope",
       "type": "String",
-      "exposure": "config",
       "default": "execution",
       "widget": {
         "kind": "select",
@@ -49,7 +47,6 @@
     {
       "name": "identity",
       "type": "String",
-      "exposure": "config",
       "required": false,
       "label": "Identity",
       "description": "What the file is a copy of, as a stable label (`<source>:<id>`). A fetch whose identity is already stored in the chosen scope answers that file and downloads nothing, so the same document asked for by many runs is one file. Leave empty for a file that is its own thing."
@@ -59,18 +56,15 @@
     {
       "name": "file",
       "type": "File",
-      "required": false,
       "description": "Self-describing reference to the stored file (any type)."
     },
     {
       "name": "sizeBytes",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     },
     {
       "name": "mimeType",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ],
   "requires_infra": false

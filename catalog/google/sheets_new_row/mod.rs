@@ -74,8 +74,10 @@ impl Node for GoogleSheetsNewRowNode {
             .set("rowNumber", (index + 1) as f64);
         if has_header {
             // The header row is read fresh per fire so renames stay
-            // honest; a header-keyed sheet whose first row IS the new
-            // row (index 0) has no data meaning, skip the object.
+            // honest. A header-keyed sheet whose first row IS the new
+            // row (index 0) has no data meaning: `row` stays
+            // un-mentioned, the engine closes it at termination, and
+            // whatever reads it skips (the cells still fire).
             if index > 0 {
                 let http = ctx.client(&account).await?;
                 let title = tab_title(&http, &id, &gid).await?;

@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
@@ -50,7 +50,6 @@
     {
       "name": "model",
       "type": "String",
-      "exposure": "config",
       "default": "eleven_multilingual_v2",
       "widget": {
         "kind": "select",
@@ -66,7 +65,6 @@
     {
       "name": "outputFormat",
       "type": "String",
-      "exposure": "config",
       "default": "mp3_44100_128",
       "widget": {
         "kind": "select",
@@ -127,30 +125,23 @@
     {
       "name": "file",
       "type": "Audio",
-      "required": false,
       "description": "The spoken audio."
     },
     {
       "name": "filename",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "mimeType",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "sizeBytes",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ],
   "display": {
     "kind": "media",
     "output": "file"
-  },
-  "features": {
-    "isOutputDefault": true
   }
 }

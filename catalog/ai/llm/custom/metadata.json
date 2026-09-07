@@ -50,7 +50,6 @@
     {
       "name": "connection",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -61,7 +60,6 @@
       "name": "baseUrl",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },
@@ -73,7 +71,6 @@
       "name": "model",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },
@@ -83,7 +80,6 @@
     {
       "name": "name",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },
@@ -96,7 +92,6 @@
     {
       "name": "provider",
       "type": "LlmProvider",
-      "required": false,
       "description": "The provider value: wire it into an LLM node's provider input."
     }
   ],

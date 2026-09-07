@@ -86,7 +86,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -97,7 +96,6 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The mailbox's access: wire it into the email trigger and action nodes."
     }
   ]

@@ -13,7 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::project::{downstream_closure, upstream_closure, upstream_closure_stop_at, EdgeIndex};
+use weft_core::project::{downstream_closure, infra_ids, run_subgraph, subgraph_roots, trigger_ids, EdgeIndex};
 use weft_core::ProjectDefinition;
 
 use crate::authenticator::{authorize_project, CallerTenant};
@@ -433,15 +433,12 @@ pub async fn remove(
 // loud 422, never a silently different run than the caller asked for.
 #[serde(deny_unknown_fields)]
 pub struct RunRequest {
-    /// Run only what these nodes need: the upstream walk starts from
-    /// them instead of from every output node. Empty means every
-    /// output node, which is the ordinary run.
-    ///
-    /// Each one must BE an output node. The walk would work from any
-    /// node, but a target that is not an output is a worse thing to
-    /// offer: the graph only lets you select outputs, and a user who
-    /// aimed a run at a middle node would get a run whose result
-    /// nothing collects. Refused with the fix named instead.
+    /// Run only what these nodes need: their upstream closure (a scope
+    /// brings its whole body), which is both the set of roots kicked
+    /// and the boundary the run is held to. Several targets run the
+    /// union of their closures. Empty means the whole project, which
+    /// is the ordinary run. Any node can be a target; an unknown name
+    /// is refused.
     #[serde(default)]
     pub targets: Vec<String>,
     /// Initial payload for the entry node's first pulse.
@@ -519,11 +516,12 @@ pub(crate) async fn coherent_definition(
 
 /// Start a fresh execution for a registered project.
 ///
-/// Manual-run semantics (see docs/v2-design.md 3.0): collect every
-/// node with `is_output: true`, compute the union of their upstream
-/// subgraphs, find the roots, kick each root with a null-valued pulse.
-/// `body.targets` narrows that to the upstream subgraph of the named
-/// output nodes.
+/// Manual-run semantics: kick every root of the graph (a node no wire
+/// feeds, outside any scope; a scope's own roots are the scope
+/// launcher's, fired when the scope starts) and let pulses run
+/// whatever they reach. `body.targets` narrows the run to the named
+/// nodes' upstream closure: only its roots are kicked, and the run is
+/// bounded to it.
 pub async fn run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -540,48 +538,22 @@ pub async fn run(
     let (definition_hash, project) = coherent_definition(&state, id).await?;
     let project_id = id.to_string();
 
-    // Pick targets: the requested ones, else every output node.
-    let targets: Vec<String> = if body.targets.is_empty() {
-        project
-            .nodes
-            .iter()
-            .filter(|n| n.is_output())
-            .map(|n| n.id.clone())
-            .collect()
-    } else {
-        for target in &body.targets {
-            // Caller-supplied strings, bounded before they echo back.
-            let shown = weft_core::truncate_user_string(target, 256);
-            match project.nodes.iter().find(|n| &n.id == target) {
-                None => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!("no node '{shown}' in this project"),
-                    ));
-                }
-                Some(n) if !n.is_output() => {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "'{shown}' is not an output node, so a run aimed at it would \
-                             produce something nothing collects. Make it one by setting \
-                             `_is_output: true` in its config, then target it."
-                        ),
-                    ));
-                }
-                Some(_) => {}
-            }
+    // The whole graph, or what the named targets need.
+    for target in &body.targets {
+        // Caller-supplied strings, bounded before they echo back.
+        let shown = weft_core::truncate_user_string(target, 256);
+        if !project.nodes.iter().any(|n| &n.id == target) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("no node '{shown}' in this project"),
+            ));
         }
-        body.targets.clone()
-    };
-    if targets.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "project has no outputs; add a Debug node or mark one with is_output: true".into(),
-        ));
     }
-
-    let subgraph = RunSubgraph::of(&project, &targets);
+    let subgraph = if body.targets.is_empty() {
+        RunSubgraph::whole(&project)
+    } else {
+        RunSubgraph::of(&project, &body.targets)
+    };
 
     // Pre-flight, scoped to what THIS run executes: every
     // `requires_infra` node inside the subgraph must be Running (the
@@ -590,9 +562,9 @@ pub async fn run(
     // outside the subgraph never runs here, so it does not gate: a
     // maintenance branch with no infra fires whether or not the rest
     // of the project's infra is up.
-    // Only an AIMED run is bounded (see the journal note below); an
-    // untargeted run gates infra for the whole graph, because pulses
-    // will flow wherever the wiring takes them.
+    // Only an AIMED run gates a subset of the infra: an untargeted run
+    // gates the whole graph, because pulses will flow wherever the
+    // wiring takes them.
     let bound = if body.targets.is_empty() { None } else { Some(&subgraph.nodes) };
     let missing = missing_infra_nodes(&state, &project_id, &project, bound).await?;
     if !missing.is_empty() {
@@ -634,7 +606,7 @@ pub async fn run(
     // hash from the journal's ExecutionStarted, NOT from the project
     // row, so a suspended execution is always resumed against the
     // shape it was started on.
-    let started_at = start_queued_execution(
+    start_queued_execution(
         &state,
         color,
         &id.to_string(),
@@ -642,44 +614,32 @@ pub async fn run(
         &entry_node_for_journal,
         &kicks,
         &definition_hash,
-        // Only an AIMED run (non-empty targets) journals a boundary:
-        // the user narrowed the graph, so the engine holds the run
-        // (resumes included) to that set and skips everything outside
-        // it as OutsideThisRun. An untargeted run journals None: the
-        // user asked for the whole project, its kicks come from the
-        // output closure's roots, and pulses then run whatever they
-        // reach, downstream fan-out included (a side-effect leaf that
-        // feeds no output still runs). The subgraph would be WRONG for
-        // it: an upstream closure excludes exactly that fan-out. A
-        // trigger fire is different again: it always journals its
-        // subgraph, because the file may hold other programs sharing
-        // its upstream nodes (see `TriggerFire`).
+        // An AIMED run journals its subgraph as the boundary: the
+        // targets' upstream closure, closed over scopes. The engine
+        // holds the run to it and absorbs, silently, a pulse into
+        // anything outside, so a root shared with another branch (a
+        // database feeding the whole file) never drags that branch in.
+        // "Start only from what these nodes need" means exactly that
+        // set. An untargeted run journals None: the user asked for the
+        // whole file, and pulses go wherever the wiring takes them.
         bound,
     )
     .await?;
 
-    state
-        .events
-        .publish(DispatcherEvent::ExecutionStarted {
-            color,
-            // User string on a NOTIFY-path event: bound at
-            // construction (node ids are user-authored).
-            entry_node: weft_core::truncate_user_string(&entry_node_for_journal, 4096),
-            project_id: id.to_string(),
-            // The same stamp the journal row carries, so the live event
-            // and its replay agree on when the run started.
-            at_unix: started_at,
-        })
-        .await;
+    // The journal bridge publishes the recorded start with the same identity
+    // replay uses. A second direct notification would be an indistinguishable
+    // duplicate with no journal identity, so there is only one delivery path.
 
     Ok(Json(RunResponse { color: color.to_string() }))
 }
 
 /// The subgraph one execution runs: the upstream closure of its
-/// targets with triggers as terminators, next to the edge index and
-/// trigger set every consumer of it needs. Built once per request;
-/// manual runs and trigger fires both go through it, so "what runs"
-/// and "what gets kicked" can never disagree.
+/// targets with triggers as terminators, closed over scopes (a node
+/// inside a group brings the whole group: everything inside a scope
+/// runs when the scope starts), next to the edge index and trigger
+/// set every consumer of it needs. Built once per request; manual runs
+/// and trigger fires both go through it, so "what runs" and "what gets
+/// kicked" can never disagree.
 // SYNC: RunSubgraph::of <-> packages/weft-graph/src/webview/lib/run-targets.ts runTargetFacts
 struct RunSubgraph {
     edge_idx: EdgeIndex,
@@ -692,14 +652,7 @@ impl RunSubgraph {
     /// The edge index and trigger set alone, for a caller (the fire
     /// path) that has to pick its targets before it can aim.
     fn graph_base(project: &ProjectDefinition) -> (EdgeIndex, HashSet<String>) {
-        let edge_idx = EdgeIndex::build(project);
-        let triggers = project
-            .nodes
-            .iter()
-            .filter(|n| n.features.is_trigger)
-            .map(|n| n.id.clone())
-            .collect();
-        (edge_idx, triggers)
+        (EdgeIndex::build(project), trigger_ids(project).into_iter().collect())
     }
 
     fn aimed(
@@ -708,7 +661,7 @@ impl RunSubgraph {
         triggers: HashSet<String>,
         targets: &[String],
     ) -> Self {
-        let nodes = upstream_closure_stop_at(project, &edge_idx, targets, &triggers);
+        let nodes = run_subgraph(project, &edge_idx, targets, &triggers);
         Self { edge_idx, triggers, nodes }
     }
 
@@ -717,8 +670,18 @@ impl RunSubgraph {
         Self::aimed(project, edge_idx, triggers, targets)
     }
 
-    /// One `Kick` per root of the subgraph (a node with no in-subgraph
-    /// parent; triggers are always roots, they were terminators).
+    /// The whole graph: an untargeted manual run.
+    fn whole(project: &ProjectDefinition) -> Self {
+        let (edge_idx, triggers) = Self::graph_base(project);
+        let nodes = project.nodes.iter().map(|n| n.id.clone()).collect();
+        Self { edge_idx, triggers, nodes }
+    }
+
+    /// One `Kick` per root of the subgraph: a node with no in-subgraph
+    /// parent that sits outside every scope (a scope's own roots are
+    /// fired by the scope launcher when the scope starts, never here),
+    /// plus every trigger (always a root: it was a terminator, and a
+    /// trigger inside a group is still kicked by its fire).
     ///
     /// `firing = Some((trigger, snapshot))` is fire time: only that
     /// trigger carries the payload (its wake body) and the snapshot.
@@ -735,7 +698,7 @@ impl RunSubgraph {
         payload: &Value,
         firing: Option<(&str, Option<&Value>)>,
     ) -> Vec<Kick> {
-        roots_of_with_forced(project, &self.edge_idx, &self.nodes, &self.triggers)
+        subgraph_roots(project, &self.edge_idx, &self.nodes, &self.triggers)
             .into_iter()
             .map(|id| match firing {
                 Some((firing_id, snapshot)) if id == firing_id => Kick {
@@ -768,67 +731,41 @@ impl RunSubgraph {
 /// (supervisor_trigger_deps) need it; one definition, no clones.
 pub use weft_core::project::compute_trigger_deps;
 
-/// Mirror of [`compute_trigger_setup_kicks`] for `Phase::InfraSetup`.
-///
-/// Kicks are the roots of the upstream closure of every
-/// `requires_infra` node : NOT the infra nodes themselves. Without
-/// this, "text → compute_url → provision_infra" graphs would skip the
-/// text/compute_url path, and the infra node's `provision()` body
-/// wouldn't see those upstream values as input.
+/// Kicks for an InfraSetup-phase sub-execution: the roots of the run
+/// subgraph seeded by every `requires_infra` node, NOT the infra nodes
+/// themselves. Without this, "text → compute_url → provision_infra"
+/// graphs would skip the text/compute_url path, and the infra node's
+/// `provision()` body wouldn't see those upstream values as input. An
+/// infra node inside a group is reached through its scope, so the kick
+/// is the group's In boundary (see `weft_core::project::run_subgraph`).
 ///
 /// Returns an empty vec if the project has no infra nodes (the
 /// caller short-circuits : no InfraSetup execution needed).
 pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
-    let edge_idx = EdgeIndex::build(project);
-    let infra: Vec<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.requires_infra)
-        .map(|n| n.id.clone())
-        .collect();
-    if infra.is_empty() {
-        return Vec::new();
-    }
-    let in_subgraph = upstream_closure(project, &edge_idx, &infra);
-    roots_of(project, &edge_idx, &in_subgraph)
-        .into_iter()
-        .map(|id| Kick {
-            node_id: id,
-            firing: false,
-            payload: None,
-            port_snapshot: None,
-        })
-        .collect()
+    setup_kicks(project, infra_ids(project))
 }
 
-/// Kicks for a TriggerSetup-phase sub-execution.
-///
-/// Target set = every trigger node. Walk upstream (no terminators);
-/// every node in the closure runs. Triggers call `ctx.register_signal`
+/// Kicks for a TriggerSetup-phase sub-execution: the roots of the run
+/// subgraph seeded by every trigger. Triggers call `ctx.register_signal`
 /// under this phase; infra nodes return their `/outputs`; regular
 /// upstream nodes do their normal work.
 ///
 /// Returns an empty vec if the project has no triggers (activate is
 /// a no-op in that case).
 pub fn compute_trigger_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
-    let edge_idx = EdgeIndex::build(project);
+    setup_kicks(project, trigger_ids(project))
+}
 
-    // A node counts as a trigger iff its metadata sets
-    // `features.is_trigger`. Trigger nodes run `Phase::TriggerSetup`
-    // at activation: their body builds a `SignalSpec` and calls
-    // `ctx.register_signal`.
-    let triggers: Vec<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.features.is_trigger)
-        .map(|n| n.id.clone())
-        .collect();
-    if triggers.is_empty() {
+/// A setup phase kicks the roots of `seeds`' run subgraph, payload-less
+/// and with no terminators (a trigger's setup needs its inputs). The
+/// engine bounds the same phase with the same subgraph.
+fn setup_kicks(project: &ProjectDefinition, seeds: Vec<String>) -> Vec<Kick> {
+    if seeds.is_empty() {
         return Vec::new();
     }
-
-    let in_subgraph = upstream_closure(project, &edge_idx, &triggers);
-    roots_of(project, &edge_idx, &in_subgraph)
+    let edge_idx = EdgeIndex::build(project);
+    let in_subgraph = run_subgraph(project, &edge_idx, &seeds, &HashSet::new());
+    subgraph_roots(project, &edge_idx, &in_subgraph, &HashSet::new())
         .into_iter()
         .map(|id| Kick {
             node_id: id,
@@ -892,7 +829,7 @@ pub(crate) async fn infra_setup_in_flight(
 /// beat the waiter to the terminal event).
 pub struct InfraSetupRun {
     color: weft_core::Color,
-    events: tokio::sync::broadcast::Receiver<crate::events::DispatcherEvent>,
+    events: tokio::sync::broadcast::Receiver<crate::events::LiveEvent>,
     project_id: String,
 }
 
@@ -916,7 +853,7 @@ async fn start_queued_execution(
     // `None` for the setup phases (they compute their scope engine-side)
     // and for anything that runs the whole graph.
     subgraph: Option<&HashSet<String>>,
-) -> Result<u64, (StatusCode, String)> {
+) -> Result<(), (StatusCode, String)> {
     let now = crate::lease::now_unix() as u64;
     let tenant = state
         .tenant_router
@@ -942,7 +879,7 @@ async fn start_queued_execution(
         .start_execution(&start, &kick_events, task)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start execution: {e}")))?;
-    Ok(now)
+    Ok(())
 }
 
 /// The two event shapes that give an execution its identity: the one
@@ -1096,7 +1033,7 @@ pub async fn await_infra_setup(
                 );
             }
             res = events.recv() => {
-                match res {
+                match res.map(|record| record.event) {
                     Ok(crate::events::DispatcherEvent::ExecutionCompleted { color: c, .. })
                         if c == color => return Ok(()),
                     Ok(crate::events::DispatcherEvent::ExecutionFailed { color: c, error, .. })
@@ -1163,26 +1100,17 @@ pub async fn await_infra_setup(
 }
 
 /// What one trigger fire runs: the roots to kick and the node set they
-/// were computed from. The set is journaled on `ExecutionStarted` as the
-/// execution's subgraph, so the engine holds the run to it and skips
-/// everything outside as `OutsideThisRun`. Both come out of one
-/// `RunSubgraph`, so "what runs" and "what gets kicked" cannot disagree.
+/// were computed from, the fire's PROGRAM. The set is journaled on
+/// `ExecutionStarted` as the execution's subgraph, so the engine holds
+/// the run to it and absorbs, silently, a pulse into anything outside.
+/// Both come out of one `RunSubgraph`, so "what runs" and "what gets
+/// kicked" cannot disagree.
 ///
 /// Why the boundary matters for a fire: emission is scope-blind, so a
 /// node shared by two programs in one file (a database, a provider)
 /// pushes a pulse into the OTHER program's consumers too. Unbounded,
 /// those consumers hold a partial input set forever and the run ends
-/// Stuck after all its real work completed. Bounded, they skip.
-///
-/// The cost, and it is deliberate: the set is an UPSTREAM closure of
-/// the outputs, so a node the trigger reaches that no output depends on
-/// (a side-effect node whose author forgot `_is_output`) is outside it
-/// and does not run. Before the boundary it ran by accident of pulse
-/// flow. It now journals one `OutsideThisRun` skip, which is the hint
-/// the author needs; the engine keeps that row precisely for this case
-/// (see `nodes_of_other_programs` in the engine for the other case, the
-/// silent one). An untargeted manual run keeps the old behaviour, see
-/// the comment in `run`.
+/// Stuck after all its real work completed. Bounded, they never appear.
 pub struct TriggerFire {
     pub kicks: Vec<Kick>,
     pub subgraph: HashSet<String>,
@@ -1190,14 +1118,13 @@ pub struct TriggerFire {
 
 /// Kicks for a trigger fire.
 ///
-/// Rule: from the FIRING trigger, walk downstream to find the output
-/// nodes it can reach. From those outputs, walk upstream, treating
-/// every trigger node as a terminator. A node ends up in the
-/// fire-time subgraph iff one of the fired trigger's outputs depends
-/// on it without passing through a trigger. Triggers themselves are
-/// included as kicks: the firing trigger carries the payload and its
-/// setup-time port snapshot; any other trigger in the subgraph is
-/// kicked payload-less, which the engine turns into "close all its
+/// Rule: from the FIRING trigger, walk downstream: everything it
+/// reaches is the fire's. Then walk back up from all of that for what
+/// it needs, treating every trigger node as a terminator. Triggers
+/// themselves are included as kicks: the firing trigger carries the
+/// payload and its setup-time port snapshot; any other trigger in the
+/// subgraph is kicked payload-less, which the engine turns into "close
+/// all its
 /// output ports" (the skip cascade prunes its exclusive branches).
 ///
 /// Why terminators: at fire time a trigger's outputs are the payload,
@@ -1226,64 +1153,23 @@ pub fn compute_trigger_fire(
         return None;
     }
 
-    // Targets = the output nodes the FIRED trigger reaches downstream.
+    // Targets = everything the FIRED trigger reaches downstream (the
+    // trigger itself included, so a trigger with nothing behind it
+    // still fires and runs alone).
     let reachable = downstream_closure(project, &edge_idx, firing_node_id);
     let targets: Vec<String> = project
         .nodes
         .iter()
-        .filter(|n| n.is_output() && reachable.contains(&n.id))
+        .filter(|n| reachable.contains(&n.id))
         .map(|n| n.id.clone())
         .collect();
-    if targets.is_empty() {
-        return None;
-    }
 
-    // Upstream closure from those outputs, stopping at triggers
-    // (include the trigger but do not walk through its incoming
-    // edges). The fired trigger is in this set by construction: every
-    // target was picked from its downstream closure. Only the firing
-    // trigger's kick carries the wake payload and the snapshot.
+    // Upstream closure from all of that, stopping at triggers (include
+    // the trigger but do not walk through its incoming edges). Only the
+    // firing trigger's kick carries the wake payload and the snapshot.
     let subgraph = RunSubgraph::aimed(project, edge_idx, triggers, &targets);
     let kicks = subgraph.root_kicks(project, payload, Some((firing_node_id, port_snapshot)));
     Some(TriggerFire { kicks, subgraph: subgraph.nodes })
-}
-
-/// Nodes of `in_subgraph` whose incoming edges all come from
-/// outside the subgraph. These are the pulse-kick points for a
-/// fresh run.
-fn roots_of(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    in_subgraph: &HashSet<String>,
-) -> Vec<String> {
-    roots_of_with_forced(project, edge_idx, in_subgraph, &HashSet::new())
-}
-
-/// Like `roots_of`, but nodes in `force_roots` are always treated
-/// as roots regardless of their in-subgraph parents. Used at fire
-/// time so triggers (which are terminators, not computed from their
-/// inputs at fire time) always end up as kick roots.
-fn roots_of_with_forced(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    in_subgraph: &HashSet<String>,
-    force_roots: &HashSet<String>,
-) -> Vec<String> {
-    let mut roots = Vec::new();
-    for node_id in in_subgraph {
-        if force_roots.contains(node_id) {
-            roots.push(node_id.clone());
-            continue;
-        }
-        let has_in_subgraph_parent = edge_idx
-            .get_incoming(project, node_id)
-            .iter()
-            .any(|e| in_subgraph.contains(&e.source));
-        if !has_in_subgraph_parent {
-            roots.push(node_id.clone());
-        }
-    }
-    roots
 }
 
 #[derive(Debug, Serialize)]
@@ -4237,7 +4123,7 @@ async fn run_trigger_setup(
     // flight. The CLI / extension is the right layer to choose a
     // client-side patience budget.
     loop {
-        match events.recv().await {
+        match events.recv().await.map(|record| record.event) {
             Ok(crate::events::DispatcherEvent::ExecutionCompleted { color: c, .. })
                 if c == color =>
             {
@@ -4326,21 +4212,23 @@ async fn collect_listener_urls(
 #[cfg(test)]
 mod trigger_kick_tests {
     use super::*;
+    use weft_core::project::{GroupBoundary, GroupBoundaryRole};
 
     /// Build a minimal ProjectDefinition from a JSON spec. Tests
-    /// only care about node id, trigger status, output status, and
-    /// edges; everything else is defaulted.
-    fn project(nodes: &[(&str, bool, bool)], edges: &[(&str, &str)]) -> ProjectDefinition {
+    /// only care about node id, trigger status, the scope a node sits
+    /// in, and edges; everything else is defaulted. The third element
+    /// is the node's scope chain (empty at the top level).
+    fn project(nodes: &[(&str, bool, &[&str])], edges: &[(&str, &str)]) -> ProjectDefinition {
         let mut n_json = Vec::new();
-        for (id, is_trigger, is_output) in nodes {
+        for (id, is_trigger, scope) in nodes {
             n_json.push(serde_json::json!({
                 "id": id,
                 "nodeType": "T",
                 "label": null,
                 "config": {},
                 "position": { "x": 0, "y": 0 },
+                "scope": scope,
                 "features": {
-                    "isOutputDefault": is_output,
                     "isTrigger": is_trigger,
                 },
             }));
@@ -4389,10 +4277,10 @@ mod trigger_kick_tests {
         // through A, so A must not run at fire time.
         let p = project(
             &[
-                ("a", false, false),
-                ("trigger_x", true, false),
-                ("b", false, false),
-                ("out", false, true),
+                ("a", false, &[]),
+                ("trigger_x", true, &[]),
+                ("b", false, &[]),
+                ("out", false, &[]),
             ],
             &[("a", "trigger_x"), ("trigger_x", "b"), ("b", "out")],
         );
@@ -4419,11 +4307,11 @@ mod trigger_kick_tests {
         // path. A must run at fire time (via the B path).
         let p = project(
             &[
-                ("a", false, false),
-                ("trigger_x", true, false),
-                ("b", false, false),
-                ("c", false, false),
-                ("out", false, true),
+                ("a", false, &[]),
+                ("trigger_x", true, &[]),
+                ("b", false, &[]),
+                ("c", false, &[]),
+                ("out", false, &[]),
             ],
             &[
                 ("a", "trigger_x"),
@@ -4456,9 +4344,9 @@ mod trigger_kick_tests {
         // because it's reachable upstream from Out.
         let p = project(
             &[
-                ("trigger_x", true, false),
-                ("trigger_y", true, false),
-                ("out", false, true),
+                ("trigger_x", true, &[]),
+                ("trigger_y", true, &[]),
+                ("out", false, &[]),
             ],
             &[("trigger_x", "out"), ("trigger_y", "out")],
         );
@@ -4475,13 +4363,147 @@ mod trigger_kick_tests {
     }
 
     #[test]
-    fn no_output_downstream_returns_empty() {
-        // TriggerX with no reachable output = nothing to run.
+    fn everything_the_trigger_reaches_runs() {
+        // TriggerX ──► DeadEnd: nothing declares itself a deliverable
+        // any more; whatever the fire reaches runs.
         let p = project(
-            &[("trigger_x", true, false), ("dead_end", false, false)],
+            &[("trigger_x", true, &[]), ("dead_end", false, &[])],
             &[("trigger_x", "dead_end")],
         );
-        assert!(compute_trigger_fire(&p, "trigger_x", &Value::Null, None).is_none());
+        let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::Null);
+        assert_eq!(ids(&kicks), vec!["trigger_x".to_string()]);
+        assert_eq!(sorted(&subgraph), vec!["dead_end", "trigger_x"]);
+    }
+
+    #[test]
+    fn a_manual_run_kicks_no_root_inside_a_scope() {
+        // g__in (nothing feeds it) ──► g.a ──► g__out ──► out
+        // g.seed (no wire feeds it, inside g)
+        // top (no wire feeds it, outside every scope)
+        // The untargeted run kicks the top-level roots, the group's In
+        // boundary among them; the body's seed is the scope launcher's
+        // to start, so it is never a kick. An aimed run at a member
+        // brings the whole scope and kicks the same boundary.
+        let mut p = project(
+            &[
+                ("top", false, &[]),
+                ("g__in", false, &[]),
+                ("g.a", false, &["g"]),
+                ("g.seed", false, &["g"]),
+                ("g__out", false, &[]),
+                ("out", false, &[]),
+            ],
+            &[("g__in", "g.a"), ("g.a", "g__out"), ("g__out", "out")],
+        );
+        // The boundaries carry their role, the way the compiler
+        // flattens them: that is what closes a member over its scope.
+        for (id, role) in [("g__in", GroupBoundaryRole::In), ("g__out", GroupBoundaryRole::Out)] {
+            let node = p.nodes.iter_mut().find(|n| n.id == id).expect(id);
+            node.group_boundary = Some(GroupBoundary { group_id: "g".into(), role });
+        }
+        let kicks = RunSubgraph::whole(&p).root_kicks(&p, &Value::Null, None);
+        assert_eq!(ids(&kicks), vec!["g__in".to_string(), "top".to_string()]);
+
+        let aimed = RunSubgraph::of(&p, &["g.a".to_string()]);
+        assert_eq!(sorted(&aimed.nodes), vec!["g.a", "g.seed", "g__in", "g__out"], "a member brings its scope");
+        let kicks = aimed.root_kicks(&p, &Value::Null, None);
+        assert_eq!(ids(&kicks), vec!["g__in".to_string()]);
+    }
+
+    /// A trigger sitting in the middle of a group fires there: it is
+    /// the run's one kick, the group comes whole around it (the sibling
+    /// its output feeds, and the sibling's other input's source), and
+    /// nothing outside the group is kicked to reach it.
+    #[test]
+    fn a_trigger_in_the_middle_of_a_group_starts_the_run_from_itself() {
+        // cfg ──► g__in ──► g.a ──► g.join ──► g__out ──► out
+        //                   g.trig ─────────┘
+        let mut p = project(
+            &[
+                ("cfg", false, &[]),
+                ("g__in", false, &[]),
+                ("g.a", false, &["g"]),
+                ("g.trig", true, &["g"]),
+                ("g.join", false, &["g"]),
+                ("g__out", false, &[]),
+                ("out", false, &[]),
+            ],
+            &[
+                ("cfg", "g__in"),
+                ("g__in", "g.a"),
+                ("g.a", "g.join"),
+                ("g.trig", "g.join"),
+                ("g.join", "g__out"),
+                ("g__out", "out"),
+            ],
+        );
+        for (id, role) in [("g__in", GroupBoundaryRole::In), ("g__out", GroupBoundaryRole::Out)] {
+            let node = p.nodes.iter_mut().find(|n| n.id == id).expect(id);
+            node.group_boundary = Some(GroupBoundary { group_id: "g".into(), role });
+        }
+        let TriggerFire { kicks, subgraph } = fire(&p, "g.trig", serde_json::json!({ "hi": 1 }));
+        assert_eq!(
+            sorted(&subgraph),
+            vec!["cfg", "g.a", "g.join", "g.trig", "g__in", "g__out", "out"],
+            "the run is the trigger's program: its group whole, and what feeds the group"
+        );
+        let firing: Vec<&str> = kicks.iter().filter(|k| k.firing).map(|k| k.node_id.as_str()).collect();
+        assert_eq!(firing, vec!["g.trig"], "the trigger is the one firing kick");
+        assert_eq!(
+            ids(&kicks),
+            vec!["cfg".to_string(), "g.trig".to_string()],
+            "the group's input source is kicked so g.join's other side arrives; the group's \
+             members start when the group does"
+        );
+    }
+
+    #[test]
+    fn a_scope_the_fire_touches_comes_whole() {
+        // TriggerX ──► g__in ──► g.a ──► g__out ──► Out
+        //              g.seed (no wire feeds it; the scope launcher's)
+        // The fire reaches the group's In boundary; the whole body is
+        // in the program then, the unwired seed included, and the seed
+        // is never a kick of the run (its scope kicks it when it starts).
+        let p = project(
+            &[
+                ("trigger_x", true, &[]),
+                ("g__in", false, &[]),
+                ("g.a", false, &["g"]),
+                ("g.seed", false, &["g"]),
+                ("g__out", false, &[]),
+                ("out", false, &[]),
+            ],
+            &[("trigger_x", "g__in"), ("g__in", "g.a"), ("g.a", "g__out"), ("g__out", "out")],
+        );
+        let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::Null);
+        assert_eq!(ids(&kicks), vec!["trigger_x".to_string()], "the body's seed is not the run's root");
+        assert_eq!(sorted(&subgraph), vec!["g.a", "g.seed", "g__in", "g__out", "out", "trigger_x"]);
+    }
+
+    #[test]
+    fn setup_phases_reach_a_trigger_or_infra_node_inside_a_group() {
+        // cfg ──► g__in ──► g.db (infra, unwired inside the body)
+        //                   g.trig (trigger, unwired inside the body)
+        // Both setup phases seed through the scope: the kick is the
+        // group's In boundary (and the Out boundary, which nothing
+        // feeds), and the source of the group's input runs first.
+        let mut p = project(
+            &[
+                ("cfg", false, &[]),
+                ("g__in", false, &[]),
+                ("g.db", false, &["g"]),
+                ("g.trig", true, &["g"]),
+                ("g__out", false, &[]),
+            ],
+            &[("cfg", "g__in")],
+        );
+        for (id, role) in [("g__in", GroupBoundaryRole::In), ("g__out", GroupBoundaryRole::Out)] {
+            let node = p.nodes.iter_mut().find(|n| n.id == id).expect(id);
+            node.group_boundary = Some(GroupBoundary { group_id: "g".into(), role });
+        }
+        p.nodes.iter_mut().find(|n| n.id == "g.db").unwrap().requires_infra = true;
+        assert_eq!(ids(&compute_infra_setup_kicks(&p)), vec!["cfg".to_string(), "g__out".to_string()]);
+        assert_eq!(ids(&compute_trigger_setup_kicks(&p)), vec!["cfg".to_string(), "g__out".to_string()]);
     }
 
     #[test]
@@ -4489,7 +4511,7 @@ mod trigger_kick_tests {
         // Defensive: caller must never pass a non-trigger id. We
         // return empty rather than silently fabricating kicks.
         let p = project(
-            &[("a", false, false), ("out", false, true)],
+            &[("a", false, &[]), ("out", false, &[])],
             &[("a", "out")],
         );
         assert!(compute_trigger_fire(&p, "a", &Value::Null, None).is_none());
@@ -4509,13 +4531,13 @@ mod trigger_kick_tests {
         // (Shared also wires straight into Bx and By.)
         let p = project(
             &[
-                ("shared", false, false),
-                ("trigger_x", true, false),
-                ("trigger_y", true, false),
-                ("bx", false, false),
-                ("by", false, false),
-                ("out_x", false, true),
-                ("out_y", false, true),
+                ("shared", false, &[]),
+                ("trigger_x", true, &[]),
+                ("trigger_y", true, &[]),
+                ("bx", false, &[]),
+                ("by", false, &[]),
+                ("out_x", false, &[]),
+                ("out_y", false, &[]),
             ],
             &[
                 ("shared", "bx"),

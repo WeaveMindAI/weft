@@ -39,7 +39,9 @@ pub enum StopSelf {
     Include,
 }
 
-const MAX_LEN: usize = 64;
+/// The most characters a tag may have. A node that turns arbitrary
+/// text into a tag (`catalog/logic/steering.rs`) cuts to this.
+pub const MAX_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagError {

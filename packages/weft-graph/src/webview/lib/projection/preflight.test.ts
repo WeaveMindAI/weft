@@ -122,9 +122,10 @@ describe('scope rule', () => {
       [{ op: 'addEdge', source: 'b', sourcePort: 'value', target: 'self', targetPort: 'out', scopeGroup: 'G' }],
       fixture(), unlocked, catalog, NOW,
     );
-    // `b` only exists at top level: inside G it doesn't resolve, and the
-    // dry-run apply reports the missing ref.
+    // `b` only exists at top level: inside G it resolves through the outer-ref
+    // probe, and the scope rule refuses wiring it across into G's body.
     expect(outside.ok).toBe(false);
+    if (!outside.ok) expect(outside.reason).toMatch(/scope/);
   });
 });
 

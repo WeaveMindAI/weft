@@ -50,21 +50,21 @@ So a body with two waits runs three times across its life:
 
 Everything **between** the waits ran three times.
 
-## `ctx.run`: making something happen once
+## `ctx.run`: reusing a saved result
 
 Anything between waits that is non-deterministic or has a side effect must be
 wrapped.
 
 ```rust
 async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    // Minted ONCE. Every replay returns the same token.
+    // Once saved, every replay returns the same request identifier.
     let idem = ctx.run("idem", || async {
         Ok(json!(uuid::Uuid::new_v4().to_string()))
     }).await?;
 
     let approval = ctx.await_signal(approval_spec()).await?;
 
-    // Charged ONCE. Every replay returns the recorded response.
+    // Billing must recognize `idem` and refuse to charge it twice.
     let http = ctx.http();
     let receipt = ctx.run("call_billing", || async {
         let resp = http.post("https://api.billing/charge")
@@ -78,9 +78,15 @@ async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
 }
 ```
 
-The closure runs at most once for this node in this execution, counting each
-loop iteration as its own firing, and every later replay returns the journaled
-value without invoking it.
+Once the result is saved, later replays return it without invoking the closure.
+Each loop iteration has its own saved results. If the worker dies after an
+external action succeeds but before saving its result, the closure can run
+again. `ctx.run` alone cannot prevent that duplicate action.
+
+The billing example depends on the billing service treating repeated requests
+with the same `idem` value as one charge. The identifier is saved before the
+billing call begins, so a replay reuses it. Check the receiving service's
+contract; merely sending an identifier does not make a request safe to repeat.
 
 The `name` is only for traceability in the journal. The runtime keys on
 call-site **order**, so two `ctx.run` calls may share a name and you may rename
@@ -140,7 +146,8 @@ reached disk. The mechanism is in
 
 So a body with no `await_signal` anywhere in it is still not exempt: if its
 worker dies mid-node, the replacement runs it again from the top. The rule is
-simply **if this node's work must not happen twice, wrap it**.
+to use `ctx.run` for saved results and require the receiving service to prevent
+duplicate actions when repeating the work would be harmful.
 
 ## A loop with a wait inside a node
 

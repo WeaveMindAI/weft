@@ -61,7 +61,7 @@ pub async fn run(
         if entry.metadata.features.hidden {
             continue;
         }
-        // Ship RESOLVED metadata: every input's exposure + widget filled
+        // Ship RESOLVED metadata: every input's accepts + widget filled
         // with its effective value, so the editor never re-derives either.
         catalog.insert(entry.node_type.clone(), entry.metadata.resolved());
     }

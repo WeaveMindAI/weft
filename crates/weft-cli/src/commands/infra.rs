@@ -33,6 +33,8 @@ pub enum InfraAction {
     Cancel,
     NodeStop { node_id: String, force: bool },
     NodeTerminate { node_id: String },
+    /// What the infra containers wrote, read straight off the pods.
+    Logs { node_id: Option<String>, tail: usize, follow: bool },
 }
 
 /// Trigger-deactivation choices for the infra verbs that take triggers
@@ -61,6 +63,9 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     if matches!(action, InfraAction::Status) {
         return infra_status(&ctx).await;
     }
+    if let InfraAction::Logs { node_id, tail, follow } = action {
+        return infra_logs(&ctx, node_id.as_deref(), tail, follow).await;
+    }
     let verb = match &action {
         InfraAction::Start => ActionVerb::InfraStart,
         InfraAction::Upgrade => ActionVerb::InfraUpgrade,
@@ -69,7 +74,7 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
         InfraAction::Cancel => ActionVerb::InfraCancel,
         InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
         InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
-        InfraAction::Status => unreachable!(),
+        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
     };
     let ctx_inner = ctx.clone();
     ctx.with_progress(verb, |progress| async move {
@@ -99,7 +104,7 @@ async fn run_inner(
         InfraAction::Cancel => "infra cancel issued",
         InfraAction::NodeStop { .. } => "infra node stopped",
         InfraAction::NodeTerminate { .. } => "infra node terminated",
-        InfraAction::Status => unreachable!(),
+        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
     };
     match action {
         // Plain Start: just bring DOWN units up (apply skips up units).
@@ -118,7 +123,7 @@ async fn run_inner(
         InfraAction::NodeTerminate { node_id } => {
             infra_node_verb(ctx, progress, &node_id, "terminate", false).await?
         }
-        InfraAction::Status => unreachable!(),
+        InfraAction::Status | InfraAction::Logs { .. } => unreachable!(),
     }
     progress.complete(summary);
     Ok(())
@@ -253,6 +258,7 @@ fn action_verb_label(a: &InfraAction) -> &'static str {
         InfraAction::Cancel => "cancel",
         InfraAction::NodeStop { .. } => "node-stop",
         InfraAction::NodeTerminate { .. } => "node-terminate",
+        InfraAction::Logs { .. } => "logs",
     }
 }
 
@@ -386,6 +392,59 @@ async fn wait_for_command(
         }
         tokio::time::sleep(interval).await;
     }
+}
+
+/// `weft infra logs [node]`: the infra containers' own output, which is
+/// where a service says what went wrong when it went wrong. The pods
+/// carry the project and node as labels, so the selector alone finds
+/// them; the project's namespace is read off the first match, because
+/// `kubectl logs` takes no `--all-namespaces`. A node with no pod
+/// (never provisioned, or terminated) is said so by name.
+async fn infra_logs(ctx: &Ctx, node_id: Option<&str>, tail: usize, follow: bool) -> Result<()> {
+    let (_client, project_id, _name) = super::resolve_project(ctx)?;
+    let mut selector = format!("weft.dev/role=infra,weft.dev/project={project_id}");
+    if let Some(node) = node_id {
+        selector.push_str(&format!(",weft.dev/node={node}"));
+    }
+    let found = super::daemon::kubectl(&[
+        "get", "pods", "--all-namespaces", "-l", &selector,
+        "-o", "jsonpath={.items[*].metadata.namespace}",
+    ])
+    .output()
+    .await
+    .context("run kubectl get pods")?;
+    if !found.status.success() {
+        anyhow::bail!(
+            "kubectl get pods exited {}: {}",
+            found.status,
+            String::from_utf8_lossy(&found.stderr).trim()
+        );
+    }
+    let namespaces = String::from_utf8_lossy(&found.stdout);
+    let Some(namespace) = namespaces.split_whitespace().next() else {
+        match node_id {
+            Some(node) => anyhow::bail!(
+                "no pod for infra node `{node}`: it is not provisioned (`weft infra status` \
+                 says where each node stands), or the id is not an infra node"
+            ),
+            None => anyhow::bail!(
+                "no infra pod for this project: nothing is provisioned (`weft infra start`)"
+            ),
+        }
+    };
+    let tail_arg = format!("--tail={tail}");
+    let mut args: Vec<&str> = vec![
+        "-n", namespace, "logs", "-l", &selector,
+        "--all-containers", "--prefix", &tail_arg,
+    ];
+    if follow {
+        args.push("-f");
+    }
+    let status = super::daemon::kubectl(&args).status().await.context("run kubectl logs")?;
+    if !status.success() {
+        anyhow::bail!("kubectl logs exited {status}");
+    }
+    Ok(())
 }
 
 async fn infra_status(ctx: &Ctx) -> Result<()> {

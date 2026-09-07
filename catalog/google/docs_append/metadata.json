@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/documents"
@@ -36,11 +36,7 @@
   "outputs": [
     {
       "name": "done",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

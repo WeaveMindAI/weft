@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "chat:write"
@@ -74,25 +74,21 @@
     {
       "name": "action",
       "type": "String",
-      "required": false,
       "description": "The clicked button's id."
     },
     {
       "name": "user",
       "type": "String",
-      "required": false,
       "description": "Who clicked (their Slack user id)."
     },
     {
       "name": "userName",
       "type": "String",
-      "required": false,
       "description": "Who clicked (their Slack username)."
     },
     {
       "name": "ts",
       "type": "String",
-      "required": false,
       "description": "The posted message's timestamp id."
     }
   ]

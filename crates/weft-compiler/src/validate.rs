@@ -70,7 +70,7 @@ fn validate_scoped(
     check_loop_config(project, &mut d);
     check_double_driven_ports(project, &mut d);
     check_warnings(project, &mut d);
-    check_output_reachability(project, &mut d);
+    check_level_sizes(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
     check_reserved_names(project, catalog, &mut d);
     check_graph_shape(project, &mut d);
@@ -444,6 +444,9 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
 /// trigger-in-loop: a trigger inside a Loop container. Registration
 ///   happens once per project and fires land outside any iteration, so
 ///   a per-iteration trigger has no meaning.
+/// infra-in-loop: an infra node inside a Loop container. Provisioning
+///   happens once per project, before any run; a body that provisions
+///   once per item has no meaning either.
 /// trigger-into-trigger: a trigger wired (directly or transitively)
 ///   into another trigger. The downstream trigger's inputs snapshot at
 ///   setup and its upstream is never walked at fire, so the wiring
@@ -509,16 +512,34 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         .filter(|g| matches!(g.kind, weft_core::project::GroupKind::Loop { .. }))
         .map(|g| g.id.as_str())
         .collect();
-    for node in project.nodes.iter().filter(|n| n.features.is_trigger) {
-        if node.scope.iter().any(|s| loop_groups.contains(s.as_str())) {
-            push(d, node.source_file.as_deref(), node.header_span_or_default(),
-                Severity::Error, "trigger-in-loop",
+    // The same applies to infra: both are set up once per project, and a
+    // setup phase that reached one inside a loop would run the loop and
+    // set the node up once per item. A GROUP is fine for both: a trigger
+    // in the middle of a group fires there and its run starts from it.
+    for node in project.nodes.iter().filter(|n| n.features.is_trigger || n.requires_infra) {
+        if !node.scope.iter().any(|s| loop_groups.contains(s.as_str())) {
+            continue;
+        }
+        let (code, message) = if node.features.is_trigger {
+            (
+                "trigger-in-loop",
                 format!(
                     "trigger '{}' is inside a Loop; a trigger registers once and fires \
                      outside any iteration, so it cannot live in a loop body",
                     author_name(node)
-                ));
-        }
+                ),
+            )
+        } else {
+            (
+                "infra-in-loop",
+                format!(
+                    "infra node '{}' is inside a Loop; infra is provisioned once for the \
+                     project, not once per item, so it cannot live in a loop body",
+                    author_name(node)
+                ),
+            )
+        };
+        push(d, node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, code, message);
     }
 
     // trigger-into-trigger / trigger-into-infra: walk downstream from
@@ -706,23 +727,20 @@ fn eval_condition(cond: &Condition, node: &NodeDefinition, project: &ProjectDefi
             sources.iter().all(|n| &n.node_type == equals)
         }
         Condition::ConfigPresent { field } => node
-            .config
-            .get(field)
+            .written_value(field)
             .map(|v| !v.is_null())
             .unwrap_or(false),
-        Condition::ConfigNonempty { field } => is_nonempty(node.config.get(field)),
+        Condition::ConfigNonempty { field } => is_nonempty(node.written_value(field)),
         Condition::ConfigEquals { field, equals } => {
-            node.config.get(field).map(|v| v == equals).unwrap_or(false)
+            node.written_value(field).map(|v| v == equals).unwrap_or(false)
         }
         Condition::ConfigInSet { field, values } => node
-            .config
-            .get(field)
+            .written_value(field)
             .and_then(|v| v.as_str())
             .map(|s| values.iter().any(|v| v == s))
             .unwrap_or(false),
         Condition::ConfigMatches { field, regex } => node
-            .config
-            .get(field)
+            .written_value(field)
             .and_then(|v| v.as_str())
             // Absent/non-string field -> false (not satisfied), like every sibling
             // ConfigX condition. A malformed regex (a metadata-authoring bug) also
@@ -742,13 +760,16 @@ fn eval_condition(cond: &Condition, node: &NodeDefinition, project: &ProjectDefi
 /// `Llm { prompt: "hi" }` where prompt is provided by a literal rather
 /// than a wire.
 fn input_satisfied(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
-    if has_incoming_edge(node, project, port) {
-        return true;
-    }
+    has_incoming_edge(node, project, port) || literal_fills(node, port)
+}
+
+/// Does a written constant fill the port: the runtime's own line on a
+/// `null` (data on a nullable port, nothing anywhere else), so a port
+/// this rule calls filled is one the firing sees filled.
+fn literal_fills(node: &NodeDefinition, port: &str) -> bool {
     node.port_literals
         .get(port)
-        .map(|v| !v.is_null())
-        .unwrap_or(false)
+        .is_some_and(|v| weft_core::exec::ready::literal_is_data(node, port, v))
 }
 
 fn has_incoming_edge(node: &NodeDefinition, project: &ProjectDefinition, port: &str) -> bool {
@@ -822,7 +843,7 @@ fn push(
 /// config-anchored push takes both halves from this ONE call, so no
 /// site can pair a span from one object with a file from another.
 fn cfg_anchor<'a>(node: &'a NodeDefinition, key: &str) -> (Option<&'a str>, Span) {
-    match node.config_spans.get(key) {
+    match node.written_span(key) {
         Some(s) => (s.source_file.as_deref(), s.span),
         None => (node.source_file.as_deref(), node.header_span_or_default()),
     }
@@ -1050,6 +1071,18 @@ fn component_root(project: &ProjectDefinition) -> Option<&str> {
 /// The name a diagnostic calls a node: its id, or for a group's
 /// boundary node the group's, since the boundary's own id (`my__in`,
 /// `my__out`) appears nowhere in the source.
+/// Does a written value carry a `@file`/`@asset` marker anywhere (at the
+/// top, or inside a list of them)? The compiler-read fixed rule refuses
+/// those: such a port has to be readable without following a file.
+fn holds_a_marker(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => matches!(crate::file_ref::parse_marker(s), Some(Ok(_))),
+        serde_json::Value::Array(items) => items.iter().any(holds_a_marker),
+        serde_json::Value::Object(map) => map.values().any(holds_a_marker),
+        _ => false,
+    }
+}
+
 fn author_name(node: &weft_core::project::NodeDefinition) -> &str {
     node.group_boundary.as_ref().map(|b| b.group_id.as_str()).unwrap_or(&node.id)
 }
@@ -1227,13 +1260,30 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             .find(|p| Some(p.name.as_str()) == edge.target_handle.as_deref())
         else { continue };
 
-        // An edge onto a non-wireable input is illegal as a whole;
-        // input-not-wireable (check_port_coverage) owns that situation,
-        // and stacking type-level diagnostics on an edge that cannot
-        // exist would bury the real cause.
-        if !tgt_port.exposure.wireable() {
+        // An edge onto a port that takes no wire is illegal as a whole;
+        // input-accepts (check_port_coverage) owns that situation, and
+        // stacking type-level diagnostics on an edge that cannot exist
+        // would bury the real cause.
+        if !tgt_port.accepts.wire {
             continue;
         }
+
+        // What the wire delivers: the source port's type with the
+        // edge's path read off it. A path that does not fit the type
+        // is its own error, and nothing below can say more.
+        let src_label = if edge.path.is_empty() {
+            format!("{}.{}", author_name(src), src_port.name)
+        } else {
+            format!("{}.{}.{}", author_name(src), src_port.name, edge.path.join("."))
+        };
+        let src_type = match weft_core::deref::walk_path(&src_port.port_type, &edge.path) {
+            Ok(t) => t,
+            Err(e) => {
+                push(d, file, span, Severity::Error, "deref-path",
+                    format!("cannot read '{src_label}': {e}"));
+                continue;
+            }
+        };
 
         // A stream source into an unresolved NON-STREAM target: the
         // `generator-into-generic-port` rule (check_generator_wiring)
@@ -1247,7 +1297,7 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // type element-wise, so it falls through here and reports
         // only when the element is genuinely unresolvable (a
         // `Generator[T]` port with nothing concrete upstream).
-        if src_port.port_type.as_generator().is_some()
+        if src_type.as_generator().is_some()
             && tgt_port.port_type.as_generator().is_none()
             && tgt_port.port_type.contains_unresolved_leaf()
         {
@@ -1256,17 +1306,16 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // The mirror direction the same rule owns: a generic source
         // wired into a stream-typed target.
         if tgt_port.port_type.as_generator().is_some()
-            && src_port.port_type.as_generator().is_none()
-            && src_port.port_type.contains_unresolved_leaf()
+            && src_type.as_generator().is_none()
+            && src_type.contains_unresolved_leaf()
         {
             continue;
         }
 
-        if src_port.port_type.is_must_override() {
+        if src_type.is_must_override() {
             push(d, file, span, Severity::Error, "must-override-unmet",
                 format!(
-                    "source port '{}.{}' is MustOverride. Declare a concrete type in weft source.",
-                    author_name(src), src_port.name,
+                    "source port '{src_label}' is MustOverride. Declare a concrete type in weft source.",
                 ));
             continue;
         }
@@ -1281,11 +1330,11 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 
         // A nested unresolved leaf (`A | T`, `List[T]`) is as unusable as a
         // bare one: the runtime gate cannot validate against it.
-        if src_port.port_type.contains_unresolved_leaf() {
+        if src_type.contains_unresolved_leaf() {
             push(d, file, span, Severity::Error, "unresolved-typevar",
                 format!(
-                    "source port '{}.{}' type '{}' unresolved; connect it to something concrete or declare the type",
-                    author_name(src), src_port.name, src_port.port_type,
+                    "source port '{src_label}' type '{}' unresolved; connect it to something concrete or declare the type",
+                    src_type,
                 ));
             continue;
         }
@@ -1298,12 +1347,12 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             continue;
         }
 
-        if !weft_core::weft_type::WeftType::is_compatible(&src_port.port_type, &tgt_port.port_type) {
+        if !weft_core::weft_type::WeftType::is_compatible(&src_type, &tgt_port.port_type) {
             // When the pair is refused as a wire but the Cast table
             // accepts it (a JsonDict claiming a declared type, text
             // that would parse), name the door.
             let cast_hint = if weft_core::weft_type::WeftType::cast_allowed(
-                &src_port.port_type,
+                &src_type,
                 &tgt_port.port_type,
             )
             .is_ok()
@@ -1314,8 +1363,8 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             };
             push(d, file, span, Severity::Error, "type-mismatch",
                 format!(
-                    "cannot connect '{}.{}: {}' to '{}.{}: {}'{cast_hint}",
-                    author_name(src), src_port.name, src_port.port_type,
+                    "cannot connect '{src_label}: {}' to '{}.{}: {}'{cast_hint}",
+                    src_type,
                     author_name(tgt), tgt_port.name, tgt_port.port_type,
                 ));
         }
@@ -1346,43 +1395,20 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // types. (Port-type-override incompatibility is caught upstream by
     // the connection type check on the overridden port.)
     for node in &project.nodes {
-        // Literal values live in TWO stores by written form: wireable
-        // drivers in `port_literals`, `config`-exposure braces values in
-        // `config`. Type-check both against the declared input type.
-        let literal_values = node
-            .port_literals
-            .iter()
-            .map(|(k, v)| (k, v, node.port_literal_spans.get(k)))
-            .chain(
-                node.config
-                    .as_object()
-                    .into_iter()
-                    .flatten()
-                    .map(|(k, v)| (k, v, node.config_spans.get(k))),
-            );
-        for (key, value, span_entry) in literal_values {
+        // Every constant written for a port lives in `port_literals`,
+        // whichever spelling wrote it; type-check each against the
+        // declared input type. A marker counts as the type it declares
+        // (`literal_type`), so `@asset("a.png", Image)` on an Image port
+        // is a match and on a Video port a mismatch.
+        for (key, value) in &node.port_literals {
+            let span_entry = node.port_literal_spans.get(key);
             let Some(input) = node.inputs.iter().find(|p| p.name == *key) else { continue };
-            // Only type-check plain-data literals: braces values on
-            // `all`/`config` inputs. On assignment-only inputs (files,
-            // TypeVars, MustOverride) the written value is a
-            // marker/handle whose inferred JSON shape does not match the
-            // input type by construction.
-            if !input.exposure.allows_braces_literal() { continue }
-            // A widget-shaped handle (a remote_select's `{id, label}`
-            // pick, an access widget's `{id, identity}` connect handle)
-            // is legal on its input by the widget's own contract; the
-            // runtime unwraps it when the input bag is built. Only the
-            // OBJECT form is exempt: a plain value (a pasted raw id
-            // string) still type-checks normally.
-            if value.is_object()
-                && matches!(
-                    input.widget,
-                    Some(weft_core::node::Widget::RemoteSelect { .. })
-                        | Some(weft_core::node::Widget::Access { .. })
-                )
-            {
-                continue;
-            }
+            // A port whose type is still open (`MustOverride`, an
+            // unbound variable) has nothing to check against yet:
+            // `must-override-unmet` and `unresolved-typevar` own it, and
+            // `_should_flow`'s constant has its own rule in the coverage
+            // pass.
+            if input.port_type.is_unresolved() { continue }
             // The culprit is the literal itself; fall back to the node
             // header if the span is missing. The FILE follows the span:
             // an interface-port fill on a boundary node was written in
@@ -1394,7 +1420,27 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     node.source_file.as_deref(),
                 ),
             };
-            let inferred = weft_core::weft_type::WeftType::infer(value);
+            // A widget-shaped handle (a remote_select's `{id, label}`
+            // pick, an access widget's `{id, identity}` connect handle)
+            // is legal on its input by the widget's own contract, and
+            // held to that contract here with the rule the runtime
+            // applies when it builds the bag. Only the OBJECT form is
+            // a handle: a plain value (a pasted raw id string) still
+            // type-checks normally.
+            if value.is_object()
+                && matches!(
+                    input.widget,
+                    Some(weft_core::node::Widget::RemoteSelect { .. })
+                        | Some(weft_core::node::Widget::Access { .. })
+                )
+            {
+                if let Err(why) = input.widget.as_ref().expect("matched above").check_handle_shape(value) {
+                    push(d, file, span, Severity::Error, "config-type-mismatch",
+                        format!("config '{}.{}': {why}", node.id, key));
+                }
+                continue;
+            }
+            let inferred = crate::file_ref::literal_type(value);
             // Enrich already cast every castable literal in place, so a
             // shape still mismatching here is a GENUINE type error iff
             // the cast refuses too; the refusal reason names WHY. A
@@ -1420,9 +1466,11 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 ///   body value).
 /// require-one-of-unmet: each @require_one_of group must have at
 ///   least one port driven.
-/// port-literal-placement: a literal drives a port at a placement the
-///   port forbids (a braces value where only the assignment form is
-///   legal, or any literal on a wires-only port).
+/// input-accepts: a driver the port does not take (a wire on a
+///   literal-only port, a written value on a wire-only port, or a
+///   wire or a marker on a compiler-read port).
+/// should-flow-not-boolean: a written `_should_flow` that is not a
+///   Boolean.
 /// undeclared-port-no-custom: node doesn't support canAddInputPorts
 ///   but config has a key not matching any declared input.
 ///
@@ -1447,28 +1495,26 @@ fn check_port_coverage(
         let span = node.header_span_or_default();
         let file = node.source_file.as_deref();
 
+        let meta = catalog.lookup(&node.node_type);
         for input in &node.inputs {
-            let exposure = input.exposure;
+            let accepts = input.accepts;
             let has_edge = driven.contains(&(node.id.clone(), input.name.clone()));
-            // Body-supplied driving value, normalized by enrich into
-            // port_literals (braces on `all` inputs, assignment
-            // statements on any input).
-            let has_literal = node
+            // The constant the source wrote for this port, whichever
+            // spelling: enrich homed every one in `port_literals`.
+            let literal = node
                 .port_literals
                 .get(&input.name)
-                .map(|v| !v.is_null())
-                .unwrap_or(false);
-            // A `config`-exposure input's braces value stays in `config`.
-            let braces_value = node
-                .config
-                .get(&input.name)
-                .map(|v| !v.is_null())
-                .unwrap_or(false);
-
-            // input-not-wireable: a `config` input is design-time
-            // configuration; no wire (edge, braces endpoint, inline
-            // expression: they all lower to edges) may drive it.
-            if has_edge && !exposure.wireable() {
+                .filter(|v| weft_core::exec::ready::literal_is_data(node, &input.name, v));
+            let has_literal = literal.is_some();
+            // The file follows the span: an interface-port fill's span
+            // lives in the file that wrote it, not the boundary node's.
+            let literal_anchor = || -> (Option<&str>, Span) {
+                match node.port_literal_spans.get(&input.name) {
+                    Some(s) => (s.source_file.as_deref(), s.span),
+                    None => (file, span),
+                }
+            };
+            let edge_anchor = || -> (Option<&str>, Span) {
                 // Anchor on the offending EDGE where it has a span, and
                 // take the edge's own file with it: the wire may be
                 // written in a different file than the node it lands on.
@@ -1477,58 +1523,96 @@ fn check_port_coverage(
                     .iter()
                     .find(|e| e.target == node.id && e.target_handle.as_deref() == Some(&input.name))
                     .filter(|e| e.span.is_some());
-                let (edge_span, edge_file) = match culprit {
-                    Some(e) => (e.span.unwrap(), e.source_file.as_deref()),
-                    None => (span, file),
-                };
+                match culprit {
+                    Some(e) => (e.source_file.as_deref(), e.span.unwrap()),
+                    None => (file, span),
+                }
+            };
+
+            // The compiler-read fixed rule: a port the compiler reads to
+            // build the node (a `portsFromConfig` list, the access
+            // picker) takes an inline typed value only. No wire, no
+            // marker: it has to be readable in the source without
+            // following anything. Nobody writes this and no `accepts`
+            // loosens it.
+            let compiler_read = meta.is_some_and(|m| m.is_compiler_read(&input.name));
+            if compiler_read {
+                let fix = format!(
+                    "input '{}.{}' is read by the compiler to build the node; it takes an \
+                     inline value only (no wire, no @file, no @asset)",
+                    author_name(node), input.name
+                );
+                if has_edge {
+                    let (edge_file, edge_span) = edge_anchor();
+                    push(d, edge_file, edge_span, Severity::Error, "input-accepts", fix.clone());
+                }
+                // A text marker was already read into its value by the
+                // compile; the field's file-ref record is what remains of
+                // it, so the record counts as the marker it came from.
+                if literal.is_some_and(holds_a_marker) || node.file_refs.contains_key(&input.name) {
+                    let (lit_file, lit_span) = literal_anchor();
+                    push(d, lit_file, lit_span, Severity::Error, "input-accepts", fix);
+                }
+            }
+
+            // input-accepts: the port switched this family off. A port
+            // that is BOTH wired and written is one mistake, not two:
+            // double-driven-port owns it ("remove one driver" is the
+            // accurate advice), so the family check stays silent then.
+            if has_edge && !has_literal && !accepts.wire {
+                let (edge_file, edge_span) = edge_anchor();
                 push(
                     d,
                     edge_file,
                     edge_span,
                     Severity::Error,
-                    "input-not-wireable",
+                    "input-accepts",
                     format!(
-                        "input '{}.{}' is configuration-only: it cannot be driven by a \
-                         wire. Set it in the config braces instead",
-                        author_name(node), input.name
+                        "input '{}.{}' cannot be driven by a wire: `{}` accepts: {}",
+                        author_name(node), input.name, input.name, accepts.describe()
+                    ),
+                );
+            }
+            if has_literal && !has_edge && !accepts.literal {
+                let (lit_file, lit_span) = literal_anchor();
+                push(
+                    d,
+                    lit_file,
+                    lit_span,
+                    Severity::Error,
+                    "input-accepts",
+                    format!(
+                        "input '{}.{}' takes no written value: `{}` accepts: {}; wire it from \
+                         another node",
+                        author_name(node), input.name, input.name, accepts.describe()
                     ),
                 );
             }
 
-            // A wires-only input takes no literal in ANY form (this
-            // catches the assignment statement, `id.input = ...`). A
-            // `config` input takes its literal only in the braces, so an
-            // assignment statement on it is misplaced too. When the
-            // input is ALSO wired, double-driven-port owns the situation
-            // (its "remove one driver" message is the accurate one).
-            if has_literal && !has_edge && !exposure.allows_assignment_literal() {
-                // Same file-follows-the-span rule as double-driven-port:
-                // an interface-port fill's span lives in the file that
-                // wrote it, not the boundary node's.
-                let (lit_span, file) = match node.port_literal_spans.get(&input.name) {
-                    // The entry's own file, VERBATIM: None means the
-                    // compiled source, never "borrow the node's file".
-                    Some(s) => (s.span, s.source_file.as_deref()),
-                    None => (span, file),
-                };
-                let message = if exposure.allows_braces_literal() {
-                    format!(
-                        "input '{}.{}' takes a literal only in the config braces: write \
-                         it as {{ {}: ... }} on the node",
-                        author_name(node), input.name, input.name
-                    )
-                } else {
-                    format!(
-                        "input '{}.{}' takes no literal: wire it from another node",
-                        author_name(node), input.name
-                    )
-                };
-                push(d, file, lit_span, Severity::Error, "port-literal-placement", message);
+            // should-flow-not-boolean: `_should_flow` is the language's
+            // gate, and a constant written for it is a Boolean or a type
+            // error (a wire may carry anything; the run reads it).
+            if input.name == SHOULD_FLOW_PORT {
+                if let Some(v) = literal.filter(|v| !v.is_boolean()) {
+                    let (lit_file, lit_span) = literal_anchor();
+                    push(
+                        d,
+                        lit_file,
+                        lit_span,
+                        Severity::Error,
+                        "should-flow-not-boolean",
+                        format!(
+                            "'{}._should_flow: {}' is not a Boolean; written down, `_should_flow` \
+                             is `true` or `false` (a wire may carry any value)",
+                            author_name(node), crate::file_ref::literal_type(v)
+                        ),
+                    );
+                }
             }
 
             // required + default = satisfiable: the runtime supplies the
             // default when nothing else drives the input.
-            if input.required && !has_edge && !has_literal && !braces_value && input.default.is_none() {
+            if input.required && !has_edge && !has_literal && input.default.is_none() {
                 push(
                     d,
                     file,
@@ -1542,85 +1626,30 @@ fn check_port_coverage(
                 );
             }
 
-            // A braces value naming an input whose exposure excludes the
-            // braces form is a mis-aimed literal (it stayed in `config`
-            // because enrich only homes `all`-exposure braces values in
-            // port_literals).
-            if braces_value && !exposure.allows_braces_literal() {
-                let (cfg_file, cfg_span) = cfg_anchor(node, &input.name);
-                let message = if exposure.allows_literal() {
-                    format!(
-                        "input '{}.{}' takes a literal only as an assignment: the braces \
-                         form cannot drive it. Wire it or write {}.{} = ...",
-                        author_name(node), input.name, author_name(node), input.name
-                    )
-                } else {
-                    format!(
-                        "input '{}.{}' takes no literal: wire it from another node",
-                        author_name(node), input.name
-                    )
-                };
-                push(d, cfg_file, cfg_span, Severity::Error, "port-literal-placement", message);
-            }
-
-            // The widget-level literal checks: the value is wherever the
-            // input's written form homed it, read only from a home the
-            // exposure legally allows. A MIS-PLACED literal (a braces
-            // value on an assignment-only input, an assignment on a
-            // config input) already gets port-literal-placement; running
-            // the widget checks on it too would stack a second error on
-            // one mistake.
-            let literal_value = node
-                .port_literals
-                .get(&input.name)
-                .filter(|_| exposure.allows_assignment_literal())
-                .or_else(|| {
-                    node.config
-                        .get(&input.name)
-                        .filter(|_| exposure.allows_braces_literal())
-                });
-            // The file follows the span (an interface-port fill's span
-            // lives in the file that wrote it).
-            let literal_span = || -> (Option<&str>, Span) {
-                match node
-                    .port_literal_spans
-                    .get(&input.name)
-                    .or_else(|| node.config_spans.get(&input.name))
-                {
-                    Some(s) => (s.source_file.as_deref(), s.span),
-                    None => (file, span),
-                }
-            };
-            // literal-out-of-range: a number widget's min/max bound
-            // the literal at compile time (the editor clamps on
-            // blur; this is the backstop for hand-written source).
-            if let Some(weft_core::node::Widget::Number { min, max, .. }) = &input.widget {
+            // The widget-level literal checks read the one home.
+            let literal_value = node.port_literals.get(&input.name);
+            let literal_span = literal_anchor;
+            // literal-out-of-range: the number widget's domain (min,
+            // max, step) bounds the literal at compile time. The rule
+            // itself lives on the widget (`Widget::check_value`), the
+            // same one the runtime holds a WIRED value to, so a source
+            // that compiles cannot be refused at run time.
+            if let Some(widget) = &input.widget {
                 // Range-check the CAST value so a stringified number
                 // in an un-enriched graph is bounded consistently
                 // with the type check. An uncastable value is not
                 // silently passed: config-type-mismatch reports it.
-                let cast_num = literal_value
-                    .and_then(|v| input.port_type.cast_value(v).ok())
-                    .and_then(|v| v.as_f64());
-                if let Some(n) = cast_num {
-                    if min.is_some_and(|m| n < m) || max.is_some_and(|m| n > m) {
-                        let (lit_file, lit_span) = literal_span();
-                        push(
-                            d,
-                            lit_file,
-                            lit_span,
-                            Severity::Error,
-                            "literal-out-of-range",
-                            format!(
-                                "input '{}.{}': {} is outside the allowed range [{}, {}]",
-                                author_name(node),
-                                input.name,
-                                n,
-                                min.map_or("-inf".into(), |m| m.to_string()),
-                                max.map_or("inf".into(), |m| m.to_string()),
-                            ),
-                        );
-                    }
+                let cast = literal_value.and_then(|v| input.port_type.cast_value(v).ok());
+                if let Some(why) = cast.and_then(|v| widget.check_value(&v).err()) {
+                    let (lit_file, lit_span) = literal_span();
+                    push(
+                        d,
+                        lit_file,
+                        lit_span,
+                        Severity::Error,
+                        "literal-out-of-range",
+                        format!("input '{}.{}': {why}", author_name(node), input.name),
+                    );
                 }
             }
         }
@@ -1648,7 +1677,7 @@ fn check_port_coverage(
                 .collect();
             if !unknown.is_empty() {
                 // Every input the check would have accepted, so the
-                // list and the test agree (a config-exposure input is a
+                // list and the test agree (a literal-only input is a
                 // legitimate member of a group).
                 let available: Vec<&str> = node
                     .inputs
@@ -1674,12 +1703,7 @@ fn check_port_coverage(
                 continue;
             }
             let any_met = group.iter().any(|port_name| {
-                driven.contains(&(node.id.clone(), port_name.clone()))
-                    || node
-                        .port_literals
-                        .get(port_name)
-                        .map(|v| !v.is_null())
-                        .unwrap_or(false)
+                driven.contains(&(node.id.clone(), port_name.clone())) || literal_fills(node, port_name)
             });
             if !any_met {
                 push(
@@ -1699,8 +1723,10 @@ fn check_port_coverage(
 
         // undeclared-port-no-custom: if the node can't accept custom
         // inputs (features.can_add_input_ports == false), every
-        // config key must name a declared input or output (literal-
-        // emitter nodes like Text drive their output via config). A
+        // config key must name a declared input; a key naming one of
+        // the node's outputs and no input is `value-on-output` (an
+        // output takes no value, a firing emits on it; a node that
+        // accepts custom inputs gets the same refusal from enrich). A
         // node that derives ports from a config list holds that list
         // under a key it DECLARES as a config input (the catalog load
         // refuses `portsFromConfig` naming an undeclared input), so it
@@ -1732,12 +1758,25 @@ fn check_port_coverage(
                 if weft_core::project::is_internal_config_key(key) {
                     continue;
                 }
-                if known_inputs.contains(key.as_str())
-                    || known_outputs.contains(key.as_str())
-                {
+                if known_inputs.contains(key.as_str()) {
                     continue;
                 }
                 let (key_file, key_span) = cfg_anchor(node, key);
+                if known_outputs.contains(key.as_str()) {
+                    push(
+                        d,
+                        key_file,
+                        key_span,
+                        Severity::Error,
+                        "value-on-output",
+                        format!(
+                            "node '{}': '{}' is an output port, and an output takes no value: \
+                             a firing emits on it. Read it with `{}.{}`",
+                            node.id, key, node.id, key
+                        ),
+                    );
+                    continue;
+                }
                 push(
                     d,
                     key_file,
@@ -1745,7 +1784,7 @@ fn check_port_coverage(
                     Severity::Error,
                     "undeclared-port-no-custom",
                     format!(
-                        "node '{}' does not accept custom inputs; config key '{}' doesn't match any declared input or output",
+                        "node '{}' does not accept custom inputs; config key '{}' names no declared input",
                         node.id, key
                     ),
                 );
@@ -1815,7 +1854,7 @@ fn check_config_derived_ports(
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
         let Some(ports_from_config) = &meta.ports_from_config else { continue };
         let (file, key_span) = cfg_anchor(node, &ports_from_config.field);
-        let Some(raw) = node.config.get(&ports_from_config.field) else { continue };
+        let Some(raw) = node.written_value(&ports_from_config.field) else { continue };
         let Some(entries) = raw.as_array() else {
             push(
                 d,
@@ -2486,6 +2525,14 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         .iter()
         .map(|e| e.source.as_str())
         .collect();
+    // The ports a wire lands on, per target node.
+    let mut wired_ports: std::collections::HashMap<&str, std::collections::HashSet<&str>> =
+        std::collections::HashMap::new();
+    for e in &project.edges {
+        if let Some(port) = e.target_handle.as_deref() {
+            wired_ports.entry(e.target.as_str()).or_default().insert(port);
+        }
+    }
 
     let root = component_root(project);
     for node in &project.nodes {
@@ -2514,15 +2561,12 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         let file = node.source_file.as_deref();
 
         // orphan-outputs: only flag when the node has outputs at all.
-        // Nodes like Debug (no outputs) are terminal and exempt, and so is
-        // any node marked as an output (`_is_output: true`): it is a
-        // declared terminus, its unconsumed ports are the point. An IN
+        // Nodes like Debug (no outputs) are terminal and exempt. An IN
         // boundary's outputs face the inside of its group, so "none
         // consumed" would say the group's outputs go unread when it is
         // the group's INPUTS nobody inside reads; not this warning.
         if !in_boundary
             && !node.outputs.is_empty()
-            && !node.is_output()
             && !source_nodes.contains(node.id.as_str())
         {
             push(
@@ -2534,7 +2578,11 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                 format!("node '{name}' produces outputs but none are consumed by downstream nodes"),
             );
         }
-        if out_boundary {
+        // An In boundary holds every group port as optional by
+        // construction (a closed one reaches the inside as a closure,
+        // and the node that needs it skips there), so the warning below
+        // would fire on every group; it is about nodes.
+        if out_boundary || in_boundary {
             continue;
         }
 
@@ -2543,22 +2591,24 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // node has outputs. Terminal nodes (no outputs) exist
         // explicitly to run on every invocation (Debug, DLQ, audit
         // sinks); we don't flag them.
-        // Only WIREABLE inputs count: a `config`-exposure input is a
-        // design-time setting, not upstream data, so it neither makes
-        // the node "have inputs" nor satisfies the warning. Nor does
-        // `_should_flow`, which every node carries: it is permission,
-        // not the data the warning is about.
-        let wireable: Vec<_> = node
+        // Only inputs a wire actually drives count: the warning is
+        // about upstream values arriving null, and a port fed by a
+        // written constant (or by nothing) has no upstream. So a node
+        // built from constants alone (an inline `LlmParams`) never
+        // warns. Nor does `_should_flow` count, which every node
+        // carries: it is permission, not the data the warning is about.
+        let wired: Vec<_> = node
             .inputs
             .iter()
-            .filter(|p| p.exposure.wireable() && p.name != SHOULD_FLOW_PORT)
+            .filter(|p| p.name != SHOULD_FLOW_PORT)
+            .filter(|p| wired_ports.get(node.id.as_str()).is_some_and(|w| w.contains(p.name.as_str())))
             .collect();
         // A node whose created inputs are optional BY NATURE (a join,
         // which exists to run on whichever branch survived) is the one
         // shape this warning's advice is wrong for.
-        if !wireable.is_empty()
+        if !wired.is_empty()
             && !node.outputs.is_empty()
-            && wireable.iter().all(|p| !p.required)
+            && wired.iter().all(|p| !p.required)
             && !node.features.optional_custom_inputs
             && node.features.one_of_required.is_empty()
         {
@@ -2596,105 +2646,102 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     }
 }
 
-/// no-output / unreachable-node: the project's output set is every
-/// node whose `is_output()` resolves to true (Debug defaults to true,
-/// any node can set `is_output: true` in its config). Emit:
-///   - **Error** if no node resolves as output: the project can
-///     never produce anything.
-///   - **Warning** on every node that isn't upstream of some output
-///     and isn't a trigger (triggers are entry points, not part of
-///     the user-visible output DAG).
-///
-/// Passthroughs (group boundaries) are exempt: they exist to bridge
-/// scopes, not as standalone targets. Trigger nodes are exempt:
-/// they'd otherwise warn even when they're correctly wired into
-/// fire-time subgraphs.
-fn check_output_reachability(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    // A component file (an anonymous top-level Group, used via @include) is
-    // not a standalone runnable project: its outputs are the group's
-    // interface ports, surfaced as the root group's __out Passthrough. Use
-    // that as the output set so the no-output / unreachable rules don't fire
-    // spuriously when the file is opened on its own.
-    let component_out: Option<String> =
-        component_root(project).map(weft_core::project::boundary_out_id);
+/// level-too-large: a level of the graph (the file, or the inside of a
+/// group or loop) holding more than [`LEVEL_WARN_AT`] items, nodes or
+/// groups. A weft program is read as a graph, and a level is what the
+/// reader scans in one look: about six items reads, past fifteen does
+/// not. A warning, never an error: the program still runs, and the
+/// advice is about how it reads. The message names the move the
+/// language has for it (group the nodes cooperating on one job; let
+/// nesting absorb size).
+fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    use weft_core::project::GroupBoundaryRole;
 
-    let outputs: Vec<&str> = if let Some(ref out_pt) = component_out {
-        // The component's output sink: everything upstream of the group's
-        // __out boundary is reachable; no top-level output node is required.
-        vec![out_pt.as_str()]
-    } else {
-        project
-            .nodes
-            .iter()
-            .filter(|n| n.is_output())
-            .map(|n| n.id.as_str())
-            .collect()
-    };
+    /// A level holds more than this many items and the warning fires.
+    /// Six is the readable size the language asks for; fifteen is the
+    /// wall the compiler refuses to stay quiet about.
+    const LEVEL_WARN_AT: usize = 15;
 
-    if outputs.is_empty() {
-        // Project-level diagnostic (no single culprit): a default span renders
-        // it as a file-level problem.
-        push(
-            d,
-            None,
-            Span::default(),
-            Severity::Error,
-            "no-output-node",
-            "project has no output node (Debug, or any node with `_is_output: true`). \
-             The run will have nothing to produce.",
-        );
-        return;
-    }
+    let root = component_root(project);
 
-    // BFS upstream from every output. The result is the set of
-    // nodes that contribute to at least one output.
-    let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut frontier: Vec<&str> = outputs.clone();
-    while let Some(id) = frontier.pop() {
-        if !reached.insert(id) {
-            continue;
-        }
-        for edge in &project.edges {
-            if edge.target == id {
-                frontier.push(edge.source.as_str());
+    // Per level (a scope path; `[]` is the file's top level): the plain
+    // nodes directly in it, plus the groups directly in it. A group's
+    // two boundary halves are its one seat at the parent's table, so
+    // they dedupe by the group they carry (a HashSet, not a count).
+    let mut plain: HashMap<&[String], usize> = HashMap::new();
+    let mut nested: HashMap<&[String], HashSet<&str>> = HashMap::new();
+    // The In half of each group, to anchor its level's warning on the
+    // group's own header line (the boundary's header span IS the
+    // group's, and its `my__in` id appears nowhere in the source).
+    let mut in_half: HashMap<&str, &NodeDefinition> = HashMap::new();
+
+    for node in &project.nodes {
+        match &node.group_boundary {
+            Some(b) => {
+                // A component file's root boundaries are the file's own
+                // interface, not an item at any level.
+                if Some(b.group_id.as_str()) == root {
+                    continue;
+                }
+                nested.entry(&node.scope).or_default().insert(b.group_id.as_str());
+                if b.role == GroupBoundaryRole::In {
+                    in_half.insert(b.group_id.as_str(), node);
+                }
+            }
+            None => {
+                *plain.entry(&node.scope).or_insert(0) += 1;
             }
         }
     }
 
-    for node in &project.nodes {
-        // Group boundaries are plumbing, not user-visible nodes: the
-        // nodes inside an unreachable group are the ones flagged,
-        // and they have lines to point at.
-        if node.group_boundary.is_some() {
+    let mut levels: BTreeSet<&[String]> = plain.keys().copied().collect();
+    levels.extend(nested.keys().copied());
+    for scope in levels {
+        let items = plain.get(scope).copied().unwrap_or(0)
+            + nested.get(scope).map_or(0, |s| s.len());
+        if items <= LEVEL_WARN_AT {
             continue;
         }
-        // Triggers are entry points: they legitimately lack
-        // downstream paths in the setup graph, and fire-time graphs
-        // are computed separately per trigger. Don't warn.
-        if node.features.is_trigger {
+        let (name, anchor) = match scope.last() {
+            Some(gid) => (
+                format!("the inside of '{gid}'"),
+                in_half.get(gid.as_str()).copied(),
+            ),
+            // The file level has no header of its own; the first item
+            // at that level carries the warning.
+            None => ("the top level".to_string(), None),
+        };
+        let Some(anchor) = anchor.or_else(|| {
+            // The level's first item carries a level with no header of
+            // its own (the file's top level): a plain node if it has
+            // one, else the first group sitting there (either boundary
+            // half's header span is that group's own line). A
+            // component file's root boundaries are its interface, not
+            // an item, and never anchor anything.
+            project.nodes.iter().find(|n| {
+                n.scope == *scope
+                    && n.group_boundary
+                        .as_ref()
+                        .is_none_or(|b| Some(b.group_id.as_str()) != root)
+            })
+        }) else {
             continue;
-        }
-        if !reached.contains(node.id.as_str()) {
-            let span = node.header_span_or_default();
-            let file = node.source_file.as_deref();
-            push(
-                d,
-                file,
-                span,
-                Severity::Warning,
-                "unreachable-from-output",
-                format!(
-                    "node '{}' is not upstream of any output. \
-                     Its value won't appear in run results. \
-                     Add an output (e.g. a Debug node) downstream, or \
-                     flip the node's config `is_output: true`.",
-                    author_name(node)
-                ),
-            );
-        }
+        };
+        push(
+            d,
+            anchor.source_file.as_deref(),
+            anchor.header_span_or_default(),
+            Severity::Warning,
+            "level-too-large",
+            format!(
+                "{name} holds {items} items; a level reads at about six and stops reading \
+                 past fifteen: group the nodes cooperating on one job, and nest groups \
+                 rather than widen the level"
+            ),
+        );
     }
 }
-
 
 #[cfg(test)]
 mod validation_mode_wire_tests {

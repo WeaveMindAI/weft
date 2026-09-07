@@ -58,6 +58,40 @@ typed_node!(ConfigField, CONFIG_FIELD);
 typed_node!(LabelField, LABEL_FIELD);
 typed_node!(Connection, CONNECTION);
 typed_node!(Endpoint, ENDPOINT);
+typed_node!(TypeDecl, TYPE_DECL);
+
+impl TypeDecl {
+    /// The declared name: the IDENT after the `type` keyword.
+    pub fn name(&self) -> Option<String> {
+        self.0
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == SyntaxKind::IDENT)
+            .nth(1)
+            .map(|t| t.text().to_string())
+    }
+
+    /// The body: everything after the `=`, comments dropped and whitespace
+    /// runs (line breaks included) folded to one space, since a type has
+    /// no significant whitespace. The lowering hands it to
+    /// `WeftType::parse` under the scope's registry.
+    pub fn body_text(&self) -> String {
+        let mut seen_eq = false;
+        let mut out = String::new();
+        for e in self.0.children_with_tokens() {
+            if !seen_eq {
+                seen_eq = e.as_token().map(|t| t.kind() == SyntaxKind::EQ).unwrap_or(false);
+                continue;
+            }
+            match e.kind() {
+                SyntaxKind::COMMENT => {}
+                SyntaxKind::WHITESPACE => out.push(' '),
+                _ => out.push_str(&e.to_string()),
+            }
+        }
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+}
 typed_node!(GroupDesc, GROUP_DESC);
 
 /// First child node of `parent` with kind `k`, as a raw `SyntaxNode`.
@@ -272,11 +306,20 @@ impl Endpoint {
     /// raw count so callers can reject a malformed 3+-segment ref (`a.b.c`)
     /// loudly instead of this silently keeping only the first two.
     pub fn parts(&self) -> (Option<String>, Option<String>) {
+        let (id, port, _) = self.wire_parts();
+        (id, port)
+    }
+
+    /// `(id, port, path)` of a SOURCE endpoint: `x.profile.wpm` is port
+    /// `profile` of `x` with the keys `["wpm"]` read off the value on
+    /// the way. A target endpoint never has a path (`parts` drops it,
+    /// and the lowering refuses a 3+-segment target).
+    pub fn wire_parts(&self) -> (Option<String>, Option<String>, Vec<String>) {
         let idents = self.segments();
         match idents.len() {
-            0 => (None, None),
-            1 => (Some(idents[0].clone()), None),
-            _ => (Some(idents[0].clone()), Some(idents[1].clone())),
+            0 => (None, None, Vec::new()),
+            1 => (Some(idents[0].clone()), None, Vec::new()),
+            _ => (Some(idents[0].clone()), Some(idents[1].clone()), idents[2..].to_vec()),
         }
     }
 }
@@ -346,6 +389,10 @@ impl<'a> FileView<'a> {
     /// The underlying typed file root, for direct tree mutation by the edit ops.
     pub fn file(&self) -> &'a WeftFile {
         self.file
+    }
+
+    pub fn source_id(&self) -> &'a str {
+        self.source_id
     }
 
     /// Resolve a scoped id (`grp.child`, or a bare local) to its declaration,
@@ -587,7 +634,7 @@ fn scoped_with(prefix: &[String], local: &str) -> String {
 /// (self -> None), the other REWRITES for flatten (self -> the `__in`/`__out`
 /// boundary). The shared rule is pinned by `endpoint_resolution_matches_flatten`
 /// so the two can't silently diverge.
-/// SYNC: endpoint_resolves_to <-> crates/weft-compiler/src/edit/ops.rs require_endpoint, crates/weft-compiler/src/weft_compiler.rs rescope_endpoint
+/// SYNC: endpoint_resolves_to <-> crates/weft-compiler/src/edit/ops.rs require_endpoint, crates/weft-compiler/src/weft_compiler.rs rescope_endpoint, packages/weft-graph/src/webview/lib/projection/apply.ts resolveEndpoint
 fn endpoint_resolves_to(ep: &Endpoint, scope: &[String], all_ids: &std::collections::HashSet<String>) -> Option<String> {
     let (id, _) = ep.parts();
     let id = id?;

@@ -1,7 +1,7 @@
 {
   "type": "TagRun",
   "label": "Tag run",
-  "description": "Put tags on this run so a later run can stop it. Every input wired onto the node is a tag, and a `tags` list works too; the two add up. A tag is letters, digits, `_` and `-`, at most 64 characters. Pair with `StopTagged` when a new event should stop the work already in flight.",
+  "description": "Put tags on this run so a later run can stop it. Every input wired onto the node is a tag, and a `tags` list works too; the two add up. Any string works as a tag: unsafe characters are replaced and a short fingerprint is added, so two different values never share a tag. Pair with `StopTagged` when a new event should stop the work already in flight.",
   "tags": [
     "flow",
     "tag",
@@ -21,15 +21,8 @@
   ],
   "outputs": [
     {
-      "name": "tags",
-      "type": "List[String]",
-      "required": false,
-      "description": "Every tag this node put on the run, for chaining."
-    },
-    {
       "name": "done",
       "type": "Boolean",
-      "required": false,
       "description": "True once the tags are on the run. Wire it into the `_should_flow` of what must happen only after tagging, `StopTagged` first."
     }
   ],

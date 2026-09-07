@@ -1,6 +1,6 @@
 ---
 name: weft-catalog
-description: Finding and reading nodes in this project's catalog (nodes/). Read before picking nodes for a job: how to inspect metadata.json, the exposure and widget vocabulary, access/provider/infra/trigger node families, form field kinds, Switch cases, and where custom nodes go.
+description: Finding and reading nodes in this project's catalog (nodes/). Read before picking nodes for a job: how to inspect metadata.json, the accepts and widget vocabulary, access/provider/infra/trigger node families, form field kinds, Switch cases, and where custom nodes go.
 ---
 
 # The node catalog
@@ -21,7 +21,7 @@ else under `nodes/` is this project's own nodes and packages.
   description). That is the cheap first sweep; `--compact` is the next read
   once you have candidates.
 - `weft describe-nodes --compact` prints the project catalog as the
-  wiring view: resolved ports, exposure, types, features, and config-derived
+  wiring view: resolved ports, what they accept, types, features, and config-derived
   port shapes, with labels, icons, connect recipes, and other authoring
   detail stripped (hidden types omitted, as in every form of this command).
   This is the form to sweep when you are picking nodes; it costs a fraction
@@ -55,23 +55,24 @@ Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`,
 `inputs`, `outputs`, `types`, `requires_infra`, `images`, `publishes`,
 `service`, `portsFromConfig`, `features`, `display`, `validate`.
 
-An input entry: `name`, `type`, `required`, `exposure`, `widget`, `default`,
+An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`,
 `label`, `placeholder`, `description`, and for `Access`-typed inputs
 `requiresScopes` / `requiresValues`. An output entry: `name`, `type`,
-`required`, `description`.
+`description`.
 
-`exposure` decides how the port is filled in source: `all` (braces literal,
-assignment literal, wire), `assignment` (line literal + wire; the default for
-file types), `config` (design-time setting, takes no wire), `wire` (only a
-wire, e.g. an LLM's `provider`, `params`, `history`, `tools`). Exactly one
-driver per port.
+`accepts` is the list of drivers the port takes: `literal` (a value written
+in the source, in the braces or on its own line, `@file`/`@asset` included)
+and `wire` (a value another node produces). Absent means both; `["wire"]`
+means only a real node fills it (an LLM's `provider`, `params`, `history`,
+`tools`; a consumer's `Access` handle). The list named in `portsFromConfig`
+and the access picker are compiler-read: an inline typed value only, never a
+wire, never a marker. Exactly one driver per port.
 
 `widget` is the editor's control (`text`, `textarea`, `code`, `number`,
 `checkbox`, `datetime`, `select`, `multiselect`, `text_list`, `entry_list`,
 `password`, `access`, `file_drop`, `remote_select`). A select widget's `options` are the accepted literals.
 
-`features`: `isTrigger` (starts executions from outside), `isOutputDefault`
-(firing is the deliverable; overridable with `_is_output`), `canAddInputPorts`
+`features`: `isTrigger` (starts executions from outside), `canAddInputPorts`
 / `canAddOutputPorts` (source may add ports, e.g. `ExecPython` both,
 `LlmInference` outputs, `FirstInOrder` inputs), `optionalCustomInputs`,
 `customInputType`, `oneOfRequired` (skip the node when every port in a group
@@ -95,7 +96,7 @@ skill), and what flows on wires is a sealed `Access` handle, never a key.
 
 Orientation, not inventory. The inventory is on disk and grows.
 
-- **basic**: `Text` (literal string), `Debug` (inspect a value, isOutputDefault),
+- **basic**: `Text` (literal string), `Debug` (inspect a value),
   `Cast`, `Range` (number generator for loops), `ExecPython` (author-declared
   ports, Python body), `Format` (a `template` with `{{name}}` holes, filled
   from the input ports you declare inline, emits `text`), and the two timers
@@ -106,10 +107,13 @@ Orientation, not inventory. The inventory is on disk and grows.
 - **ai/llm**: `LlmInference` (buffered completion; `provider` required and
   wire-only; `params`, `history`, `media`, `tools`, `toolCalls`;
   `parseJson: true` plus added output ports extracts JSON keys),
-  `LlmStream`, `ChatHistoryAppend`, `LlmParams`, `LlmTool`, `LlmEmbed`,
-  `LlmRerank`, `LlmModerate`, and the provider nodes `OpenRouterProvider`,
-  `AnthropicProvider`, `OpenAIProvider`, `CustomProvider` (each takes a
-  `connection` and emits `.provider`).
+  `LlmStream`, `ChatHistoryAppend` (`cacheBreakpoint` marks where the
+  prompt cache ends), `LlmParams` (`reasoning` is off unless you set it
+  on; on runs at `low` unless you pick an effort), `LlmTool`, `LlmEmbed`, `LlmRerank`, `LlmModerate`,
+  and the provider nodes `OpenRouterProvider`, `AnthropicProvider`,
+  `OpenAIProvider`, `CustomProvider` (each takes a `connection` and emits
+  `.provider`). For reasoning, `maxTokens`, an empty reply, and caching, go
+  and read the `weft-models` skill.
 - **ai/**: fal (image/video generation and edits), ElevenLabs (voice, music,
   transcription, agents), Mistral (document parsing).
 - **human**: `HumanQuery` (pauses for a person to answer a form),
@@ -119,11 +123,11 @@ Orientation, not inventory. The inventory is on disk and grows.
   `gt`/`gte`/`lt`/`lte`, `between`, `otherwise`; each case names the port it
   opens, `otherwise` last and unique), `FirstInOrder` (its written input
   order decides which branch wins), `TagRun` and `StopTagged` (stopping
-  older runs: every input wired onto either node is a tag, `TagRun` puts
-  the tags on this run, `StopTagged` stops every older run carrying one,
-  `includeSelf: true` stops this run too). Reach for the pair when a new
-  event makes work in flight pointless; the wiring is in the
-  `weft-language` skill.
+  older runs: every input wired onto either node is a tag, any string,
+  cleaned and fingerprinted the same way by both; `TagRun` puts the tags on
+  this run, `StopTagged` stops every older run carrying one, `includeSelf:
+  true` stops this run too). Reach for the pair when a new event makes work
+  in flight pointless; the wiring is in the `weft-language` skill.
 - **live**: `ApiEndpoint` (HTTP), `LiveSocket` (WebSocket). Triggers; a fresh
   execution per request or connection.
 - **triggers**: `Cron` (`cron` expression, SIX fields with seconds first:
@@ -134,7 +138,10 @@ Orientation, not inventory. The inventory is on disk and grows.
   emits `.access`), `PostgresAccess` (external one), `PostgresExecuteQuery`
   (its parameters are its own input ports, declared inline and read by name:
   `PostgresExecuteQuery(user_id: String) { query: "... WHERE id = $user_id" }`;
-  several statements run as a script, which takes no parameters),
+  several statements are a script: with `$name` parameters each statement
+  runs with the ports it names inside one transaction, without any it is
+  sent whole; the last statement's rows come back, and `-> (name: String)`
+  output ports read the first row's columns by name),
   `PostgresInsertRow`,
   `PostgresUpdateRows`.
 - **bailey** (WhatsApp), **telegram**, **slack**, **email**, **google**
@@ -144,7 +151,7 @@ Orientation, not inventory. The inventory is on disk and grows.
   with `scope: "project"` and an `identity` fetches a thing once per
   project: a second fetch of the same identity is the same file, no
   download.
-- **http**: `HttpRequest` (`method` is config, `url`/`body`/`headers` wireable).
+- **http**: `HttpRequest` (`method` a select; `url`/`body`/`headers` take a wire or a literal).
 
 ## Wiring patterns that recur
 
@@ -163,11 +170,19 @@ into any LLM node's `params`.
 WhatsApp bridge and emits `endpointUrl` (wire it into every Bailey consumer);
 `PostgresDatabase` emits `access`. The runtime starts their containers; start
 or stop them with `weft infra start` / `weft infra status`. A run cannot
-start while an infra node it touches is not running.
+start while an infra node it touches is not running. Each node's card in
+the graph has the way out of its stuck states: `BaileyBridge` has
+**Disconnect phone** (drops the pairing, shows a fresh QR code, works in
+every state), `PostgresDatabase` has **Reset password** (then `weft infra
+start` publishes the new connection). Never tell the user to terminate
+the infra to get out of a state; if a node has no button for one, that is
+the bug to report.
 
 **Forms** (`fields` entry list on `HumanQuery` / `HumanTrigger`): kinds and
 their ports: `display` (input `{key}`, read-only), `display_image` (Image
-input), `text_input` / `textarea` (output `{key}: String`), `select` /
+input; the parked spec keeps the stored file, the listing hands the
+consumer its facts `{ mimeType, sizeBytes, filename }`, and the
+signal-token files door mints a fresh link whenever the form is shown), `text_input` / `textarea` (output `{key}: String`), `select` /
 `multi_select` (output, `options` required), `select_input` /
 `multi_select_input` (input `List[String]`, output String or List),
 `editable_text_input` / `editable_textarea` (input and output `{key}`),

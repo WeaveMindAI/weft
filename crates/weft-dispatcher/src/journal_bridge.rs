@@ -274,7 +274,7 @@ async fn process_one_row(
     // PulseEmitted carrying a bus marker yields both BusParticipant
     // edges (source-node + target-node) in addition to the pulse
     // notification itself.
-    for de in to_dispatcher_events(&event, project_id) {
+    for de in project_recorded_event(crate::events::IdentifiedEvent::recorded(id, event), project_id) {
         // Local-only: every dispatcher pod runs this same bridge,
         // so every pod's own subscribers get the event from its
         // own poll. NOTIFY would cause double-delivery.
@@ -352,6 +352,13 @@ pub(crate) async fn try_finish_drain(
         crate::transition::publish_transition_changed(state, id).await;
     }
     Ok(())
+}
+
+pub(crate) fn project_recorded_event(
+    record: crate::events::IdentifiedEvent<ExecEvent>,
+    project_id: String,
+) -> Vec<crate::events::LiveEvent> {
+    record.project(|event| to_dispatcher_events(&event, project_id))
 }
 
 pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<DispatcherEvent> {
@@ -559,6 +566,11 @@ pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<Di
             iter_cap: *iter_cap,
             parallel: *parallel,
         }],
+        // A group body starting is a kick set, not something the
+        // inspector paints: the members it kicked show up through their
+        // own NodeStarted rows, and a gated group through its members'
+        // NodeSkipped rows.
+        ExecEvent::ScopeLaunched { .. } => vec![],
         ExecEvent::LoopIterationLaunched {
             color, group_id, parent_frames, index, body_emissions, at_unix, ..
         } => {

@@ -47,7 +47,7 @@ describe('a weft block', () => {
   });
 
   it('paints a reserved key apart from an ordinary one', () => {
-    for (const key of ['_label', '_tags', '_is_output', '_should_flow']) {
+    for (const key of ['_label', '_tags', '_should_flow']) {
       expect(paint(`n = T { ${key}: "x" }`)).toContain(
         `<span class="hljs-keyword">${key}</span>`,
       );

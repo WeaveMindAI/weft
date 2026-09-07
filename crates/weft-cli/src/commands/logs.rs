@@ -11,6 +11,7 @@
 
 use super::{local_time, resolve_project_id, Ctx};
 
+
 /// The loop iteration a line was written in, as `#3` (or `#3.0` for a
 /// loop inside a loop). Empty at the root.
 fn frames_suffix(entry: &serde_json::Value) -> String {
@@ -30,10 +31,7 @@ fn frames_suffix(entry: &serde_json::Value) -> String {
 
 pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow::Result<()> {
     let color = match target {
-        Some(raw) if uuid::Uuid::parse_str(&raw).is_ok() => raw,
-        Some(other) => {
-            anyhow::bail!("expected a UUID color; got '{other}'. Run with no arg for the cwd project's latest.")
-        }
+        Some(raw) => super::resolve_color(&ctx, &raw).await?,
         None => {
             let project_id = resolve_project_id(&ctx, None)?;
             let resp: serde_json::Value = ctx

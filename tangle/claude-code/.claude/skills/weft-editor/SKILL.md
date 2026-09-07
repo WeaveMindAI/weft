@@ -115,6 +115,11 @@ is how nodes are added by hand.
   empty space opens the palette and completes the wire in one undo step. A
   port already filled by a literal refuses the wire ("'x' is driven by a
   config assignment; unset it first to drive it with an edge.").
+- **Read a key off a wire**: right-click a wire whose value is a record and
+  pick a field, one level at a time ("Up one level", "Read the whole value"
+  to go back). The wire turns dotted with the path at its end; in source it
+  is `t.n = s.out.profile.wpm`. A `JsonDict` or scalar value offers nothing
+  and says to declare the shape or Cast first.
 - **Edit a node's settings**: expand it and edit the fields inline: text,
   selects, checkboxes, code editors, entry lists, file pickers, connection
   pickers. A port-driven field carries a `{ }` / `=` chip toggling whether
@@ -127,7 +132,7 @@ is how nodes are added by hand.
   right-click also shows and changes the role (broadcast, iter, gather,
   carry).
 - **Nodes**: right-click for "Duplicate (Ctrl+D)", "Delete (Del)", "Tags...",
-  and on an output node "Set as target" / "Unset target". On an infra node:
+  and "Set as target" / "Unset target" (any node). On an infra node:
   "Stop this node" (scales to zero, keeps disks) and "Terminate this node"
   (destroys them), both behind a confirmation.
 - **Rename**: double-click a node's label or a group's header.
@@ -145,13 +150,13 @@ select, Ctrl+D duplicate, Del delete, Esc closes the palette and drops a wire yo
 
 ## Running and watching
 
-The Run button runs the pinned project from its output nodes (or the aimed
-targets). Each node glows as it fires, values travel the wires, and the
-Executions list gains the run. Click any node to open the **inspector**:
-status, duration, cost ("$0.0123 (own key)"), the exact inputs and outputs
-of that firing as JSON trees, closed ports shown as "(closed)", skip
-reasons in plain words ("its `_should_flow` said no", "the required input
-'x' closed", "it is outside the part of the graph this execution runs"),
+The Run button runs the pinned project: every root fires, or only the aimed
+targets when some are set. Each node glows as it fires, values travel the
+wires, and the Executions list gains the run. Click any node to open the
+**inspector**: status, duration, cost ("$0.0123 (own key)"), the exact
+inputs and outputs of that firing as JSON trees, closed ports shown as
+"(closed)", skip reasons in plain words ("its `_should_flow` said no", "the
+required input 'x' closed", "the scope 'x' it lives in did not run"),
 error boxes, bus and loop activity panels, and a firing navigator
 ("‹ 2/5 iter 5/2 ›") for nodes that fired several times. The Copy button
 exports the whole inspection.

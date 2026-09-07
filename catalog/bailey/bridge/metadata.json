@@ -14,28 +14,23 @@
   "outputs": [
     {
       "name": "endpointUrl",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "status",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "phoneNumber",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "jid",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "pushName",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ],
   "requires_infra": true,

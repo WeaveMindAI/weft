@@ -10,13 +10,13 @@ CLI.
 | Command | What it does |
 |---|---|
 | `weft new <name>` | scaffold a project: `weft.toml`, `main.weft`, `nodes/` with the standard library seeded in |
-| `weft build` | compile the project to a native binary |
-| `weft run [--detach]` | compile, register, fire one execution, stream its events |
-| `weft run --target <node>` | the same, but run only what these output nodes need. Repeatable, and a non-output target is refused. See [what actually runs](../language/mental-model.md#what-actually-runs). |
+| `weft build` | build the project's worker image; does not register or run it |
+| `weft run [--detach]` | compile, register, fire one execution, stream its events until completion, including across waits. `--detach` returns after starting it. |
+| `weft run --target <node>` | the same, but run only these nodes and what they need, nothing past them and no sibling branch. Repeatable (the union of what each needs), any node. See [what actually runs](../language/mental-model.md#what-actually-runs). |
 | `weft follow <project>` | live event stream for a project |
-| `weft stop <color>` | cancel a running execution |
+| `weft stop <color>` | cancel a running execution. Every command that takes a color also takes the first characters of one (`weft stop 3f2a`), as long as they name a single run |
 | `weft ps` | list registered projects |
-| `weft status` | the runtime's overall state. A project on disk that was never built is told so, and named `weft build`, rather than failing. |
+| `weft status` | the runtime's overall state. If the project is not registered, explains how to run it or activate its triggers. |
 
 ## Executions
 
@@ -25,7 +25,7 @@ CLI.
 | `weft executions [--limit N] [--project <id>] [--phase fire\|trigger_setup\|infra_setup]` | recent executions, newest first, with each run's status, phase, local start time, entry node and the tags it put on itself ([stopping other runs](../nodes/steering-executions.md)). "Has my trigger fired since the change" is `--phase fire`: it hides the setup runs an activate or resync makes. |
 | `weft events <color> [--node <id>] [--kind <kind>] [--full]` | one execution's events in order, one line each: local time, kind, node, and a short summary of the value or error. Values are cut short so a long run stays readable; `--node` keeps one node's events, `--kind` one kind (`node_failed`; a substring works, so `failed` catches both failure kinds), `--full` prints the values whole, and `--json` prints the replay rows the graph view reads. |
 | `weft logs [color]` | the run's log: the lines its nodes wrote, and every failure the journal recorded about it (a node failing, a port refusing a value, the run failing or being cancelled) as `error` and `warn` lines naming the node they are about. The last 1000 lines; `--limit` raises that (up to 20000), and a full page says the run may have written more. |
-| `weft clean [color]` | purge journal data. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images` (reclaim worker images nothing runs any more, scoped to the current project's images; a global sweep of dangling untagged build leftovers rides along. With `--all`: every project's, the kind node's copies, stale `weft-infra-*` tags, and old builder-base images; whatever the dispatcher's referenced set covers survives) and `--build-cache`. `setup.sh` runs `--images --all` after every daemon refresh. |
+| `weft clean [color]` | purge journal data. Asks before deleting runs; pass `--yes` when scripting. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images` (reclaim worker images nothing runs any more, scoped to the current project's images; a global sweep of dangling untagged build leftovers rides along. With `--all`: every project's, the kind node's copies, stale `weft-infra-*` tags, and old builder-base images; whatever the dispatcher's referenced set covers survives) and `--build-cache`. `setup.sh` runs `--images --all` after every daemon refresh. |
 
 ## Triggers
 
@@ -73,6 +73,7 @@ activate` prompts you. To answer up front, pass one of:
 | `weft infra upgrade` | stop then start. On an active project this deactivates the triggers and **leaves them off**, so activate again when you are ready. |
 | `weft infra terminate` | delete every infra resource, disks included unless a node's spec preserves them |
 | `weft infra status` | per-node health and endpoint URLs |
+| `weft infra logs [node] [--tail N] [-f]` | what the infra containers wrote: every infra node of the project, or one node's, each line prefixed with its pod and container. The place a failure inside an image is read from. |
 | `weft infra cancel` | abort an operation in progress |
 | `weft infra node-stop <id> [--force]` | stop one node. `--force` overrides a unit's stop behavior. |
 | `weft infra node-terminate <id>` | terminate one node |
@@ -128,7 +129,7 @@ answers on incomplete source; `validate` is strict.
 | `weft token ls` | list minted tokens |
 | `weft token revoke <id>` | kill one |
 | `weft listener inspect` | what the listener tier is currently holding. Reach for it when a trigger stopped firing: if what it holds disagrees with what the project registered, a cleanup went wrong. |
-| `weft rm [project]` | remove a project. `--journal`, `--local`, `--all`, `--force` |
+| `weft rm [project]` | remove a project: triggers wiped, runs cancelled, infra terminated, stored data reclaimed. Asks first; `--yes` answers it (required when scripting). `--journal`, `--local`, `--all`, `--force` |
 
 `weft token mint` also takes repeatable `--projects` and `--tags` flags that
 narrow what a token can ever see:

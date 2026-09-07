@@ -1,4 +1,5 @@
-import { mkdirSync } from 'fs';
+import { mkdirSync, readdirSync, rmSync } from 'fs';
+import { join } from 'path';
 import NodeCache from '@cacheable/node-cache';
 import pino from 'pino';
 import QRCode from 'qrcode';
@@ -45,7 +46,10 @@ if (HISTORY_SYNC_ON_DEMAND === undefined) {
 export async function createBridge(authDir, webhookManager, messageStore) {
   mkdirSync(authDir, { recursive: true });
 
-  const logger = pino({ level: 'silent' });
+  // `warn` and up reach the pod log: Baileys swallows a failed media
+  // step (a duration or waveform it could not compute) into a warn and
+  // sends anyway, and a silent logger made those drops invisible.
+  const logger = pino({ level: 'warn' });
   const msgRetryCounterCache = new NodeCache();
 
   let sock = null;
@@ -228,14 +232,40 @@ export async function createBridge(authDir, webhookManager, messageStore) {
           });
         }, delay);
       } else {
+        // WhatsApp retired this pairing: the user removed the device,
+        // a pairing died half way, or `logout` below asked for it. The
+        // credentials on disk are dead now, and reconnecting with them
+        // only earns the same refusal, so they are dropped and a fresh
+        // dial starts, which shows a new QR code on `/live`. The chat
+        // history stays: it is the account's, and the same phone can
+        // pair again.
         state.status = 'disconnected';
         state.phoneNumber = null;
         state.jid = null;
         state.pushName = null;
-        console.log('[bridge] Logged out. Need QR re-scan.');
+        console.log('[bridge] Logged out; dropping the pairing and dialling for a new QR code');
         webhookManager.emit('connection.update', { status: 'logged_out' });
+        forgetPairing();
+        state.status = 'connecting';
+        connect().catch((err) => {
+          console.error('[bridge] re-dial after logout failed:', err.message);
+        });
       }
     }
+  }
+
+  /**
+   * Delete the pairing WhatsApp issued (creds.json plus every Signal
+   * key file `useMultiFileAuthState` writes) so the next dial starts
+   * from nothing and gets a QR code. The message store lives in the
+   * same directory and is kept.
+   */
+  function forgetPairing() {
+    for (const name of readdirSync(authDir)) {
+      if (name === 'messages.json') continue;
+      rmSync(join(authDir, name), { recursive: true, force: true });
+    }
+    console.log('[bridge] pairing files removed');
   }
 
   async function onMessagesUpsert({ type, messages }) {
@@ -323,6 +353,47 @@ export async function createBridge(authDir, webhookManager, messageStore) {
       return state.status === 'connected';
     },
     /**
+     * Detach the paired phone, whatever state the bridge is in. Paired
+     * and connected: tell WhatsApp to remove this device, which lands
+     * as a logged-out close that drops the pairing and re-dials. Not
+     * connected (a pairing that died half way, a session WhatsApp
+     * already refused): there is nobody to tell, so the pairing is
+     * dropped here and the dial restarted. Either way `/live` shows a
+     * QR code next.
+     */
+    async unpair() {
+      if (sock && state.status === 'connected') {
+        console.log('[bridge] unpair: logging the device out of WhatsApp');
+        await sock.logout('user asked to disconnect the phone');
+        return;
+      }
+      console.log(`[bridge] unpair while ${state.status}: dropping the pairing and re-dialling`);
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      if (sock) {
+        // Detach every handler (the batched `process` one included)
+        // before ending the half-open socket, so its close event
+        // cannot race the fresh dial below into a second reconnect.
+        try {
+          sock.ev.removeAllListeners();
+          sock.end(undefined);
+        } catch (err) {
+          console.warn('[bridge] unpair: ending the old socket failed:', err.message);
+        }
+        sock = null;
+      }
+      connecting = false;
+      forgetPairing();
+      state.status = 'connecting';
+      state.phoneNumber = null;
+      state.jid = null;
+      state.pushName = null;
+      currentQrBase64 = null;
+      await connect();
+    },
+    /**
      * Request on-demand history sync for a chat. Resolves true when
      * the on-demand sync chunk arrives, false on timeout / error.
      */
@@ -330,10 +401,14 @@ export async function createBridge(authDir, webhookManager, messageStore) {
       if (!sock || !this.isConnected() || !cursorMsg) {
         return Promise.resolve(false);
       }
+      // The socket this request rides. A reconnect swaps the module's
+      // `sock` mid-wait; the listener has to come off the socket it went
+      // on, or it stays on the retired one and the new one is untouched.
+      const asked = sock;
 
       return new Promise((resolve) => {
         const timer = setTimeout(() => {
-          sock.ev.off('messaging-history.set', handler);
+          asked.ev.off('messaging-history.set', handler);
           resolve(false);
         }, timeoutMs);
 
@@ -341,19 +416,19 @@ export async function createBridge(authDir, webhookManager, messageStore) {
           // ON_DEMAND enum value (proto.HistorySync.HistorySyncType).
           if (syncType === HISTORY_SYNC_ON_DEMAND) {
             clearTimeout(timer);
-            sock.ev.off('messaging-history.set', handler);
+            asked.ev.off('messaging-history.set', handler);
             resolve(true);
           }
         };
 
-        sock.ev.on('messaging-history.set', handler);
+        asked.ev.on('messaging-history.set', handler);
 
-        sock
+        asked
           .fetchMessageHistory(count, cursorMsg.key, toNumber(cursorMsg.messageTimestamp))
           .catch((err) => {
             console.error('[bridge] fetchMessageHistory failed:', err.message);
             clearTimeout(timer);
-            sock.ev.off('messaging-history.set', handler);
+            asked.ev.off('messaging-history.set', handler);
             resolve(false);
           });
       });

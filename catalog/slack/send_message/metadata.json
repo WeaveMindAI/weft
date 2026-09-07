@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "chat:write"
@@ -114,29 +114,22 @@
     {
       "name": "ts",
       "type": "String",
-      "required": false,
       "description": "The posted message's timestamp id (empty when scheduled)."
     },
     {
       "name": "channel",
       "type": "String",
-      "required": false,
       "description": "The channel the message landed in (the DM conversation id for user sends)."
     },
     {
       "name": "permalink",
       "type": "String",
-      "required": false,
       "description": "A link to the posted message (empty when scheduled)."
     },
     {
       "name": "scheduledId",
       "type": "String",
-      "required": false,
       "description": "The scheduled message's id when postAt was set."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

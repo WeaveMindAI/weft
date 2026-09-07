@@ -78,6 +78,7 @@ function toV1Edge(e: HostEdge, groupIds: Set<string>): V1Edge {
     target,
     sourceHandle,
     targetHandle,
+    ...(e.path && e.path.length > 0 ? { path: e.path } : {}),
   };
 }
 
@@ -153,15 +154,16 @@ function groupToNodeInstance(g: HostGroup): NodeInstance {
     },
     position: { x: 0, y: 0 },
     parentId,
+    // The line the container was declared on: what autoOrganize keeps
+    // siblings in the order of (the render list sorts groups first).
+    sourceLine: g.headerSpan?.startLine ?? g.span?.startLine,
     // A container's interface-port literals reach the view the same way a
     // node's do, so everything downstream reads one place for both.
     portLiterals: g.portLiterals,
     portLiteralSpans: g.portLiteralSpans,
     inputs: g.inPorts.map(copyPort),
     outputs: g.outPorts.map(copyPort),
-    features: {
-      oneOfRequired: g.oneOfRequired,
-    },
+    features: {},
     scope: parentId ? [parentId] : [],
   };
 }
@@ -174,14 +176,17 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
   // the inline config form.
   const rawConfig = (n.config ?? {}) as Record<string, unknown>;
   const { label: _stripped, ...cleanConfig } = rawConfig;
-  // The Rust parse resolves `@file` to the file's content in config. The
-  // editor's invariant is that config holds the structural `@file` MARKER
-  // ({path, type}), never resolved content, so it serializes safely and
-  // renders file-backed. Put the structural ref back from `fileRefs`; the
-  // resolved content is shown separately via the host's fileContents map.
+  // The Rust parse resolves `@file` to the file's content, and enrich
+  // homes every port's constant in `portLiterals`. The editor's invariant
+  // is that a file-backed port literal holds the structural `@file`
+  // MARKER ({path, type}), never resolved content, so it serializes
+  // safely and renders file-backed. Put the structural ref back from
+  // `fileRefs`; the resolved content is shown separately via the host's
+  // fileContents map.
+  const portLiterals = { ...((n.portLiterals as Record<string, unknown> | undefined) ?? {}) };
   if (n.fileRefs) {
     for (const [key, ref] of Object.entries(n.fileRefs)) {
-      cleanConfig[key] = { __weftFileRef: { path: ref.path, type: ref.type, marker: ref.marker } };
+      portLiterals[key] = { __weftFileRef: { path: ref.path, type: ref.type, marker: ref.marker } };
     }
   }
   const parentId = resolveParentGroup(n, groupIds);
@@ -194,14 +199,17 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     nodeType: n.nodeType,
     label: n.label,
     config: cleanConfig,
-    // Body-set PORT values + their written forms: the two-home twin of
-    // config. Dropping these here was the bug where a port field's value
-    // vanished from the graph the moment a parse round-trip replaced the
-    // truth (the source still had it; only this translation lost it).
-    portLiterals: n.portLiterals,
+    // Every port's written value + its written form. Dropping these here
+    // was the bug where a port field's value vanished from the graph the
+    // moment a parse round-trip replaced the truth (the source still had
+    // it; only this translation lost it).
+    portLiterals,
     portLiteralSpans: n.portLiteralSpans,
     position: n.position,
     parentId,
+    // The declaration line, for autoOrganize's left-to-right order (a
+    // boundary node carries its container's header line).
+    sourceLine: n.headerSpan?.startLine ?? n.span?.startLine,
     inputs: n.inputs.map(copyPort),
     outputs: n.outputs.map(copyPort),
     features: n.features,

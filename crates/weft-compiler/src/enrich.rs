@@ -14,7 +14,8 @@
 use weft_core::exec::skip::SHOULD_FLOW_PORT;
 use weft_core::node::{derive_config_ports, materialize_auto_type_vars, MetadataCatalog, Widget, AUTO_TYPE_VAR};
 use weft_core::project::{InputDefinition, PortDefinition, ProjectDefinition, Span};
-use weft_core::weft_type::{Exposure, WeftType};
+use weft_core::node::Accepts;
+use weft_core::weft_type::WeftType;
 
 use crate::error::{CompileError, CompileResult};
 
@@ -47,32 +48,21 @@ impl PortDirection {
     }
 }
 
-/// Move every body value that DRIVES a wireable input out of `config`
-/// into `port_literals`, now that the full input list is known: a
-/// braces value on an `all`-exposure input, and an assignment statement
-/// (`ConfigOrigin::Connection`) on ANY input (the statement names the
-/// input unambiguously; validate rejects it where the input's exposure
-/// forbids it). After this pass a value has one home per FORM: a
-/// wireable input's driving value lives in `port_literals` (the engine
-/// feeds it onto the input), while a `config`-exposure input's braces
-/// value stays in `config` (it is design-time configuration, merged
-/// into the runtime bag at construction, and edited through the config
-/// home in the editor). A braces value on an assignment-/wire-only
-/// input also stays in `config`, where validate rejects it
-/// (`port-literal-placement`).
+/// Move every constant written for an input port out of `config` into
+/// `port_literals`, now that the full input list is known (catalog
+/// ports, the ports the config list derives, and the ports the source
+/// created). After this pass a constant has ONE home whichever
+/// spelling wrote it: every config key that names an input port moves to
+/// `port_literals` (the engine delivers it as a pulse on the port, the
+/// editor edits it there), and `config` keeps only what is not a port
+/// (the `_`-reserved keys, a loop's knobs, and on a node that takes no
+/// custom inputs the undeclared keys validate reports).
 fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
-    use weft_core::project::ConfigOrigin;
     let Some(cfg) = node.config.as_object_mut() else { return };
     let moved: Vec<String> = node
         .inputs
         .iter()
-        .filter(|input| {
-            let literal_form = node
-                .config_spans
-                .get(&input.name)
-                .is_some_and(|s| s.origin == ConfigOrigin::Connection);
-            cfg.contains_key(&input.name) && (input.exposure == Exposure::All || literal_form)
-        })
+        .filter(|input| cfg.contains_key(&input.name))
         .map(|input| input.name.clone())
         .collect();
     for name in moved {
@@ -87,7 +77,7 @@ fn normalize_port_literals(node: &mut weft_core::project::NodeDefinition) {
 
 /// The wire-port core the input and output merges share. The two
 /// directions genuinely need distinct instance types (an input carries
-/// exposure + editor surface, an output is a bare wire port), but both
+/// accepted drivers + editor surface, an output is a bare wire port), but both
 /// hold one [`PortDefinition`], and the source-vs-catalog merge is one
 /// rule over that struct's fields; this hands the merge that struct so
 /// a new port field never needs a second accessor list.
@@ -320,7 +310,7 @@ pub fn enrich_collecting(
                     synthesized_from_carry: false,
                     declared_type: None,
                 },
-                exposure: spec.effective_exposure(),
+                accepts: spec.effective_accepts(meta.is_compiler_read(&spec.name)),
                 // The DECLARED widget only; the type-derived default is
                 // stamped after TypeVar resolution (see the final pass),
                 // so a `T` input resolved to Image gets a file picker.
@@ -339,7 +329,7 @@ pub fn enrich_collecting(
             .map(|p| PortDefinition {
                 name: p.name.clone(),
                 port_type: p.port_type.clone(),
-                required: p.required,
+                required: true,
                 description: p.description.clone(),
                 synthesized_from_carry: false,
                 declared_type: None,
@@ -358,7 +348,7 @@ pub fn enrich_collecting(
         let mut catalog_inputs = catalog_inputs;
         if let Some(ports_from_config) = &meta.ports_from_config {
             let (derived_inputs, derived_outputs) =
-                derive_config_ports(&node.config, ports_from_config);
+                derive_config_ports(node.written_value(&ports_from_config.field), ports_from_config);
             catalog_inputs.extend(derived_inputs);
             catalog_outputs.extend(derived_outputs);
         }
@@ -388,7 +378,9 @@ pub fn enrich_collecting(
                 synthesized_from_carry: false,
                 declared_type: None,
             },
-            exposure: Exposure::All,
+            // Both, and never switchable: `_should_flow` is the
+            // language's gate, and validate types its constant itself.
+            accepts: Accepts::both(),
             widget: None,
             default: None,
             label: None,
@@ -413,22 +405,19 @@ pub fn enrich_collecting(
             }
         }
 
-        // A header PORT declaration naming a `config`-exposure input is
-        // a collision, not a merge: a config input is not wireable, so
-        // "I declared it as a port" can only mean the user expects to
-        // wire it. Every input name is in ONE namespace now, so this is
-        // the whole collision rule (a custom port can no longer shadow a
-        // config input silently, the hole the old field/port split had).
+        // A header PORT declaration naming a compiler-read input is a
+        // collision, not a merge: the compiler reads that value to build
+        // the node, so "I declared it as a port" can only mean the user
+        // expects to wire it, which it never takes. Every input name is
+        // in ONE namespace, so this is the whole collision rule.
         for wp in &weft_inputs {
-            if let Some(cp) = catalog_inputs.iter().find(|cp| cp.name == wp.name) {
-                if cp.exposure == Exposure::Config {
-                    errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
-                        "node '{}': input '{}' of node type {} is configuration-only \
-                         (exposure `config`); it cannot be declared as a port. Set it in \
-                         the config braces instead",
-                        node.id, wp.name, node.node_type,
-                    )});
-                }
+            if catalog_inputs.iter().any(|cp| cp.name == wp.name) && meta.is_compiler_read(&wp.name) {
+                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                    "node '{}': input '{}' of node type {} is read by the compiler to build \
+                     the node; it takes an inline value only and cannot be declared as a \
+                     port. Write it in the config braces instead",
+                    node.id, wp.name, node.node_type,
+                )});
             }
         }
 
@@ -445,6 +434,8 @@ pub fn enrich_collecting(
                 node,
                 &catalog_inputs,
                 &weft_inputs,
+                &catalog_outputs,
+                &weft_outputs,
                 &meta.features,
                 incoming_wires.get(node.id.as_str()).map(Vec::as_slice).unwrap_or(&[]),
                 &mut errors,
@@ -609,37 +600,22 @@ pub fn enrich_collecting(
 /// what the author wrote). One cast site: validate, the runtime, and
 /// the editor all read the cast value. A value that cannot cast is left
 /// untouched, so validate reports the genuine mismatch
-/// (`config-type-mismatch`). Same gate as validate's literal
-/// type-check: only inputs whose exposure admits a braces literal
-/// (assignment-only inputs hold markers/handles, never castable data).
+/// (`config-type-mismatch`). Every constant is a candidate, whatever
+/// spelling wrote it; a marker's type is the type it declares (see
+/// `file_ref::literal_type`), so a file marker never looks like a
+/// String to cast. A port whose type is still open (`MustOverride`, an
+/// unbound variable) has nothing to cast toward yet.
 fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
     for input in &node.inputs {
-        // Only `all`/`config` inputs carry castable plain data.
-        // Assignment-only inputs (files, TypeVars, MustOverride, or an
-        // author-closed input) hold markers/handles whose written JSON
-        // shape intentionally differs from the input type, so they are
-        // deliberately excluded from casting AND from validate's
-        // type-check (same gate there); the omission is a design
-        // choice, not a gap.
-        if !input.exposure.allows_braces_literal() {
+        if input.port_type.is_unresolved() {
             continue;
         }
-        let stores = [
-            node.port_literals.get(&input.name).cloned(),
-            node.config.get(&input.name).cloned(),
-        ];
-        for (idx, value) in stores.into_iter().enumerate() {
-            let Some(value) = value else { continue };
-            if WeftType::is_compatible(&WeftType::infer(&value), &input.port_type) {
-                continue;
-            }
-            if let Ok(cast) = input.port_type.cast_value(&value) {
-                if idx == 0 {
-                    node.port_literals.insert(input.name.clone(), cast);
-                } else if let Some(cfg) = node.config.as_object_mut() {
-                    cfg.insert(input.name.clone(), cast);
-                }
-            }
+        let Some(value) = node.port_literals.get(&input.name).cloned() else { continue };
+        if WeftType::is_compatible(&crate::file_ref::literal_type(&value), &input.port_type) {
+            continue;
+        }
+        if let Ok(cast) = input.port_type.cast_value(&value) {
+            node.port_literals.insert(input.name.clone(), cast);
         }
     }
 }
@@ -654,12 +630,10 @@ fn resolve_type_vars(project: &mut ProjectDefinition) {
             .filter_map(|edge| {
                 let src_port = edge.source_handle.as_deref()?;
                 let tgt_port = edge.target_handle.as_deref()?;
-                let src_type = project
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == edge.source)
-                    .and_then(|n| n.outputs.iter().find(|p| p.name == src_port))
-                    .map(|p| p.port_type.clone())?;
+                // What the wire DELIVERS: the source port's type with
+                // the edge's path read off it. A path that does not fit
+                // binds nothing; validate names the problem.
+                let src_type = weft_core::deref::wire_source_type(project, edge)?.ok()?;
                 let tgt_type = project
                     .nodes
                     .iter()
@@ -874,10 +848,17 @@ fn incoming_wires_by_node(
 /// A port fed by a LITERAL has no edge to resolve against, so its type
 /// is inferred from the literal; a `null` literal infers nothing and is
 /// refused rather than guessed.
+///
+/// A name that is one of the node's OUTPUTS (catalog or signature) and
+/// no input creates nothing: an output takes no value, a firing emits
+/// on it, so a key or a wire aimed at it is a mistake named as such
+/// rather than a port quietly added beside the output.
 fn created_input_ports(
     node: &weft_core::project::NodeDefinition,
     catalog_inputs: &[InputDefinition],
     weft_inputs: &[InputDefinition],
+    catalog_outputs: &[PortDefinition],
+    weft_outputs: &[PortDefinition],
     features: &weft_core::NodeFeatures,
     incoming: &[IncomingWire],
     errors: &mut Vec<EnrichError>,
@@ -885,12 +866,30 @@ fn created_input_ports(
     let declared = |name: &str| {
         catalog_inputs.iter().any(|p| p.name == name) || weft_inputs.iter().any(|p| p.name == name)
     };
+    let is_output = |name: &str| {
+        catalog_outputs.iter().any(|p| p.name == name) || weft_outputs.iter().any(|p| p.name == name)
+    };
+    let output_takes_no_value = |name: &str| {
+        format!(
+            "node '{}': '{}' is an output port, and an output takes no value: a firing emits \
+             on it. Read it with `{}.{}`; to hand the node a value, declare an input",
+            node.id, name, node.id, name,
+        )
+    };
 
     // (span, name, type) per created port, gathered from the two forms a
     // config key can take, then ordered by where it was written.
     let mut created: Vec<(Span, String, WeftType)> = Vec::new();
     for wire in incoming {
         if declared(&wire.target_port) {
+            continue;
+        }
+        if is_output(&wire.target_port) {
+            errors.push(EnrichError {
+                span: wire.span,
+                file: node.source_file.clone(),
+                message: output_takes_no_value(&wire.target_port),
+            });
             continue;
         }
         let port_type = features
@@ -911,6 +910,10 @@ fn created_input_ports(
                 Some(s) => (s.span, s.source_file.clone()),
                 None => (Span::default(), node.source_file.clone()),
             };
+            if is_output(key) {
+                errors.push(EnrichError { span, file, message: output_takes_no_value(key) });
+                continue;
+            }
             if value.is_null() {
                 errors.push(EnrichError { span, file, message: format!(
                     "node '{}': config key '{}' creates a port, and `null` says nothing about \

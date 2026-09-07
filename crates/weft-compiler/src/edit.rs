@@ -46,8 +46,10 @@ pub enum EditOp {
     /// Remove a node and every connection referencing it.
     RemoveNode { node: String },
     /// Add `target.port = source.port`, replacing any existing driver of the
-    /// same target port (input ports are single-driver).
-    AddEdge { source: String, source_port: String, target: String, target_port: String, scope_group: Option<String> },
+    /// same target port (input ports are single-driver). `path` reads keys
+    /// off the source value on the way (`target.port = source.port.a.b`);
+    /// empty for a plain wire.
+    AddEdge { source: String, source_port: String, target: String, target_port: String, scope_group: Option<String>, #[serde(default, skip_serializing_if = "Vec::is_empty")] path: Vec<String> },
     /// Remove a connection line. `scope_group` is the group whose body the
     /// connection lives in (None = top level), symmetric with `AddEdge`.
     RemoveEdge { source: String, source_port: String, target: String, target_port: String, scope_group: Option<String> },
@@ -132,9 +134,10 @@ pub enum ValueForm {
     Connection,
 }
 
-/// A port in a signature rewrite. `required: false` renders `name: Type?`.
-/// The editor's sig additionally carries a projection-only `rendered`
-/// member, which serde ignores here by design.
+/// A port in a signature rewrite. `required: false` renders `name?: Type`
+/// (inputs only: an output has no optionality and a sig asking for one is
+/// refused). The editor's sig additionally carries a projection-only
+/// `rendered` member, which serde ignores here by design.
 // SYNC: PortSig <-> packages/weft-graph/src/protocol.ts EditPortSig
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,7 +145,7 @@ pub struct PortSig {
     pub name: String,
     /// Required on the wire (the editor always writes it): a missing
     /// flag is refused rather than defaulted, since a default here
-    /// would rewrite an author's `name: Type?` as `name: Type`.
+    /// would rewrite an author's `name?: Type` as `name: Type`.
     pub required: bool,
     /// Required on the wire for the same reason: a default here would
     /// write the `MustOverride` placeholder over the author's declared

@@ -6,7 +6,7 @@
 import type { FieldDefinition, PortDefinition } from '../types';
 import type { Widget } from '../../../protocol';
 import type { SpecField } from './port-specs';
-import { declaredHomeValue, inputExposure } from '../types';
+import { acceptsLiteral, ownValue } from '../types';
 import { SHOULD_FLOW_PORT } from '../../../protocol';
 
 /// A node's rendered input list, read off its data. Every parse and
@@ -32,18 +32,18 @@ function portList(list: unknown, which: 'input' | 'output'): PortDefinition[] {
 	return list as PortDefinition[];
 }
 
-/// The render field for one input. `portDriven` follows the exposure: a
-/// wireable input's literal lives in `portLiterals` (the port home), a
-/// `config`-exposure input's value lives in `config` (the config home).
-/// A locally-added port that has not round-tripped yet has no widget;
-/// it renders as a textarea until the parse stamps the real one.
+/// The render field for one input. Every input's written value lives in
+/// `portLiterals` (the one home a port's constant has), so the field is
+/// port-driven. A locally-added port that has not round-tripped yet has
+/// no widget; it renders as a textarea until the parse stamps the real
+/// one.
 export function fieldForInput(input: PortDefinition): FieldDefinition {
 	const field = fieldFromWidget(
 		input.name,
 		input.label ?? input.name,
 		input.widget ?? { kind: 'textarea' },
 	);
-	field.portDriven = inputExposure(input) !== 'config';
+	field.portDriven = true;
 	if (input.placeholder !== undefined) field.placeholder = input.placeholder;
 	if (input.default !== undefined) field.defaultValue = input.default;
 	if (input.description !== undefined) field.description = input.description;
@@ -66,15 +66,16 @@ export function shouldFlowField(subject: 'node' | 'container'): FieldDefinition 
 	};
 }
 
-/// Does this input get a field in the body? A `wire`-exposure input
-/// never does, a wired one never does (the edge is the value), and
-/// `_should_flow` only does when the source wrote a value for it.
+/// Does this input get a field in the body? An input that takes no
+/// written value (`accepts: ["wire"]`) never does, a wired one never
+/// does (the edge is the value), and `_should_flow` only does when the
+/// source wrote a value for it.
 export function inputRendersField(
 	input: PortDefinition,
 	opts: { wired: boolean; hasWrittenValue: boolean },
 ): boolean {
 	if (input.synthesizedFromCarry) return false; // carry ghost: not editable
-	if (inputExposure(input) === 'wire') return false;
+	if (!acceptsLiteral(input)) return false;
 	if (opts.wired) return false;
 	if (input.name === SHOULD_FLOW_PORT) return opts.hasWrittenValue;
 	return true;
@@ -86,12 +87,12 @@ export function inputRendersField(
 /// it. ONE definition, read by both the node renderer (chevron/toggle)
 /// and the projection's build step (which overlays `expanded` from it),
 /// so the drawn state and the computed sizing can never disagree.
-/// The handle is read from node CONFIG only: an access widget requires
-/// `exposure: config` (the metadata validator refuses anything else),
-/// so a port-literal home for it cannot exist.
+/// The handle is read from the node's port literals: the picker is
+/// compiler-read (an inline value only), and like every port's constant
+/// it lives there.
 export function hasUnpickedAccess(
 	inputs: PortDefinition[],
-	config: unknown,
+	portLiterals: Record<string, unknown> | undefined,
 	wiredInputPorts: ReadonlySet<string>,
 ): boolean {
 	for (const input of inputs) {
@@ -104,7 +105,7 @@ export function hasUnpickedAccess(
 			hasWrittenValue: false,
 		});
 		if (!rendered) continue;
-		if (declaredHomeValue(undefined, config, fieldForInput(input)) == null) return true;
+		if (ownValue(portLiterals, input.name) == null) return true;
 	}
 	return false;
 }
@@ -197,7 +198,9 @@ export const LOOP_CONFIG_FIELDS: FieldDefinition[] = [
 /// control leaves behind, or the empty array a multiselect/text_list
 /// leaves behind): a cleared key is DELETED, so the source goes back to
 /// saying nothing about the port, and no control can ever store a
-/// phantom "" or [] literal. The same emptiness rule commitEntry
+/// phantom "" or [] literal. A null is "cleared" here because the
+/// language has no null constant to write (the grammar refuses a bare
+/// `null`); a null reaches a port over a wire only. The same emptiness rule commitEntry
 /// applies to entry values. Both hosts of a port strip (ProjectNode,
 /// GroupNode) route their writes through this so they cannot disagree.
 export function nextPortLiterals(

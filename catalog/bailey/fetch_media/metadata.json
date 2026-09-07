@@ -28,23 +28,19 @@
     {
       "name": "file",
       "type": "File",
-      "required": false,
       "description": "The message's media, stored."
     },
     {
       "name": "filename",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "mimeType",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "sizeBytes",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ],
   "display": {

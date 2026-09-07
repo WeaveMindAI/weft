@@ -55,7 +55,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -66,7 +65,6 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The Mistral access: wire it into Parse Document."
     }
   ]

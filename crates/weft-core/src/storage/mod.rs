@@ -223,9 +223,9 @@ pub enum StorageScope {
     /// project auto-grants it. Opt-in by naming.
     Shared { name: String },
     /// `asset/<project_id>/`: the project's PUBLISHED ASSETS, the storage
-    /// copies of files the source references via media `@file` refs. Derived
-    /// state owned by the pre-build asset sync (content-hash ids; created and
-    /// deleted only through the control-plane surface). Workers READ this
+    /// copies of files the source references via `@asset`. Current source
+    /// references protect their copies; replaced/removed ones receive the
+    /// default access-renewed TTL (content-hash ids). Workers READ this
     /// scope like project scope; the worker data path refuses writes to it.
     Asset,
 }
@@ -271,11 +271,12 @@ pub struct StoredFileMeta {
     /// terminate sweep. Always false for project/shared files (they
     /// are persistent without a flag).
     pub keep: bool,
-    /// Unix seconds at which a kept file expires (access-bumped).
-    /// `None` = no expiry (project/shared files, `KeepTtl::Never`).
+    /// Unix seconds at which this file expires. Kept execution files and
+    /// retired assets renew on access. `None` = no expiry (project/shared
+    /// files, current source assets, `KeepTtl::Never`).
     #[serde(rename = "expiresAtUnix")]
     pub expires_at_unix: Option<i64>,
-    /// The kept file's TTL in seconds, so an access can recompute
+    /// The file's TTL in seconds, so an access can recompute
     /// `expires_at = now + ttl`. `None` when there is no expiry.
     #[serde(rename = "keepTtlSecs")]
     pub keep_ttl_secs: Option<u64>,
@@ -611,8 +612,9 @@ pub struct KeepRequest {
     pub ttl: KeepTtl,
 }
 
-/// `POST /v1/storage/presign`: mint a presigned GET URL for a stored file (for
-/// handing to an external API), scoped to the one key with a short TTL.
+/// `POST /v1/storage/presign`: mint a temporary link to a stored file, scoped
+/// to the one key with a short TTL: the internet-reachable link when the
+/// install serves one, else one signed for the cluster's own address.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PresignRequest {
     pub key: String,
@@ -723,6 +725,17 @@ pub struct Tenanted<T> {
     pub inner: T,
 }
 
+/// Replace the current set of uploaded files used by one project's source.
+/// Only this project's asset keys are accepted. The dispatcher accepts bare
+/// scope keys and adds the authenticated tenant before forwarding to storage.
+/// An empty set retires every
+/// asset; retirement starts a TTL instead of deleting files old runs need.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetReferencesRequest {
+    pub project: String,
+    pub keys: Vec<String>,
+}
+
 /// `POST /v1/storage/admin/list-prefix`: the files under one scope-boundary
 /// prefix (the pre-build sync's asset diff over `<tenant>/asset/<project>/`).
 /// The broker validates the prefix with the same scope-boundary grammar as a
@@ -748,6 +761,208 @@ pub struct SweepExecResponse {
     /// Completed un-kept files stamped with the post-run linger expiry
     /// (deleted by the expiry sweep once it passes).
     pub lingering: u64,
+}
+
+/// The media type a byte prefix announces itself as, from its signature
+/// (the "magic number"): the common image, video and audio containers,
+/// plus PDF and zip. `None` when the head matches nothing known, which is
+/// what a plain text file or an exotic container look like here; the
+/// caller then falls back on the filename. Pure, on the first bytes only;
+/// SVG is text and its root element may sit behind a long prolog, so hand
+/// in as much of the head as is cheap (the sync keeps a kilobyte aside).
+///
+/// This is the one place the language looks at BYTES to name a type. The
+/// stored MIME of a synced asset comes from here first (a PNG named
+/// `.txt` is still `image/png`), and [`check_declared_kind`] holds an
+/// `@asset` declaration to it; it never picks a marker.
+pub fn sniff_mime(head: &[u8]) -> Option<&'static str> {
+    let starts = |sig: &[u8]| head.starts_with(sig);
+    let at = |offset: usize, sig: &[u8]| head.len() >= offset + sig.len() && &head[offset..offset + sig.len()] == sig;
+    // ISO base media (`....ftyp<brand>`): MP4/MOV/M4A/HEIC share the box,
+    // the brand says which.
+    if at(4, b"ftyp") {
+        let brand = &head[8..head.len().min(12)];
+        return Some(if brand.starts_with(b"M4A ") || brand.starts_with(b"M4B ") {
+            "audio/mp4"
+        } else if brand.starts_with(b"heic") || brand.starts_with(b"heix") || brand.starts_with(b"mif1") {
+            "image/heic"
+        } else if brand.starts_with(b"avif") {
+            "image/avif"
+        } else if brand.starts_with(b"qt  ") {
+            "video/quicktime"
+        } else {
+            "video/mp4"
+        });
+    }
+    if starts(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if starts(b"\xff\xd8\xff") {
+        return Some("image/jpeg");
+    }
+    if starts(b"GIF87a") || starts(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if starts(b"BM") {
+        return Some("image/bmp");
+    }
+    if starts(b"II*\0") || starts(b"MM\0*") {
+        return Some("image/tiff");
+    }
+    if starts(b"\0\0\x01\0") {
+        return Some("image/x-icon");
+    }
+    if starts(b"RIFF") {
+        if at(8, b"WEBP") {
+            return Some("image/webp");
+        }
+        if at(8, b"AVI ") {
+            return Some("video/x-msvideo");
+        }
+        if at(8, b"WAVE") {
+            return Some("audio/wav");
+        }
+    }
+    // SVG is text: an XML prolog or the root element, anywhere in the head.
+    let text_head = match std::str::from_utf8(head) {
+        Ok(text) => text,
+        // The head may end mid-character; read the longest valid prefix.
+        Err(e) => std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or(""),
+    };
+    let trimmed = text_head.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    if trimmed.starts_with("<svg") || (trimmed.starts_with("<?xml") && text_head.contains("<svg")) {
+        return Some("image/svg+xml");
+    }
+    if starts(b"\x1aE\xdf\xa3") {
+        return Some("video/webm");
+    }
+    if starts(b"FLV\x01") {
+        return Some("video/x-flv");
+    }
+    if starts(b"\x30\x26\xb2\x75\x8e\x66\xcf\x11") {
+        return Some("video/x-ms-asf");
+    }
+    if starts(b"ID3") || (head.len() >= 2 && head[0] == 0xff && (head[1] & 0xe0) == 0xe0) {
+        return Some("audio/mpeg");
+    }
+    if starts(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if starts(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if starts(b"FORM") && (at(8, b"AIFF") || at(8, b"AIFC")) {
+        return Some("audio/aiff");
+    }
+    if starts(b"%PDF") {
+        return Some("application/pdf");
+    }
+    if starts(b"PK\x03\x04") {
+        return Some("application/zip");
+    }
+    None
+}
+
+/// The kind of file a byte prefix announces itself as: [`sniff_mime`]
+/// read as a kind, and only for the media kinds (a PDF or a zip has a
+/// signature but is a `Blob`, which no `@asset` declaration is held to).
+pub fn sniff_file_kind(head: &[u8]) -> Option<crate::weft_type::FileKind> {
+    use crate::weft_type::FileKind;
+    match FileKind::from_mime(sniff_mime(head)?) {
+        FileKind::Blob => None,
+        kind => Some(kind),
+    }
+}
+
+/// Hold a file's bytes to the kind its `@asset` declared: an `Image`
+/// declaration over video bytes is a loud error naming the source and
+/// both kinds, and bytes with no known signature cannot be the declared
+/// kind either. `Blob` checks nothing (it is the declaration for "bytes
+/// of any shape"), and so does a declaration that is not a file type.
+pub fn check_declared_kind(
+    declared: &crate::weft_type::WeftType,
+    head: &[u8],
+    source: &str,
+) -> Result<(), String> {
+    use crate::weft_type::FileKind;
+    let Some(kind) = declared.concrete_file_kind() else { return Ok(()) };
+    if kind == FileKind::Blob {
+        return Ok(());
+    }
+    match sniff_file_kind(head) {
+        Some(found) if found == kind => Ok(()),
+        Some(found) => Err(format!(
+            "@asset({source:?}, {declared}): the file's bytes are {}, not {}",
+            found.primitive(),
+            kind.primitive()
+        )),
+        None => Err(format!(
+            "@asset({source:?}, {declared}): the file's bytes carry no {} signature this \
+             weft knows (declare it Blob to skip the check)",
+            kind.primitive()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod sniff_tests {
+    use super::{check_declared_kind, sniff_file_kind, sniff_mime};
+    use crate::weft_type::{FileKind, WeftPrimitive, WeftType};
+
+    #[test]
+    fn signatures_name_their_media_type() {
+        assert_eq!(sniff_mime(b"\x89PNG\r\n\x1a\n...."), Some("image/png"));
+        assert_eq!(sniff_mime(b"\xff\xd8\xff\xe0JFIF"), Some("image/jpeg"));
+        assert_eq!(sniff_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(sniff_mime(b"\0\0\0\x18ftypavif\0\0\x02\0"), Some("image/avif"));
+        assert_eq!(sniff_mime(b"%PDF-1.7"), Some("application/pdf"));
+        assert_eq!(sniff_mime(b"PK\x03\x04"), Some("application/zip"));
+        assert_eq!(sniff_mime(b"just text"), None);
+    }
+
+    #[test]
+    fn an_svg_behind_a_long_prolog_is_still_an_image() {
+        let mut head = b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n".to_vec();
+        head.extend_from_slice(b"<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n");
+        head.extend_from_slice(b"<!-- Generator: a tool that writes a long comment before the root element -->\n");
+        head.extend_from_slice(b"<svg xmlns=\"http://www.w3.org/2000/svg\">");
+        assert!(head.len() > 64, "the case is a prolog longer than the old window");
+        assert_eq!(sniff_mime(&head), Some("image/svg+xml"));
+        // A head cut mid-character still reads.
+        let mut cut = b"<svg>\xe2\x82".to_vec();
+        cut.truncate(7);
+        assert_eq!(sniff_mime(&cut), Some("image/svg+xml"));
+    }
+
+    #[test]
+    fn signatures_name_their_kind() {
+        assert_eq!(sniff_file_kind(b"\x89PNG\r\n\x1a\n...."), Some(FileKind::Image));
+        assert_eq!(sniff_file_kind(b"\xff\xd8\xff\xe0JFIF"), Some(FileKind::Image));
+        assert_eq!(sniff_file_kind(b"RIFF\0\0\0\0WEBPVP8 "), Some(FileKind::Image));
+        assert_eq!(sniff_file_kind(b"<svg xmlns=\"http://www.w3.org/2000/svg\">"), Some(FileKind::Image));
+        assert_eq!(sniff_file_kind(b"\0\0\0\x18ftypisom\0\0\x02\0"), Some(FileKind::Video));
+        assert_eq!(sniff_file_kind(b"\0\0\0\x18ftypM4A \0\0\x02\0"), Some(FileKind::Audio));
+        assert_eq!(sniff_file_kind(b"\0\0\0\x18ftypheic\0\0\x02\0"), Some(FileKind::Image));
+        assert_eq!(sniff_file_kind(b"\x1aE\xdf\xa3\x01"), Some(FileKind::Video));
+        assert_eq!(sniff_file_kind(b"ID3\x04\0\0"), Some(FileKind::Audio));
+        assert_eq!(sniff_file_kind(b"RIFF\0\0\0\0WAVEfmt "), Some(FileKind::Audio));
+        assert_eq!(sniff_file_kind(b"OggS\0\x02"), Some(FileKind::Audio));
+        assert_eq!(sniff_file_kind(b"hello, world"), None);
+        assert_eq!(sniff_file_kind(b""), None);
+    }
+
+    #[test]
+    fn a_declaration_is_held_to_the_bytes() {
+        let image = WeftType::primitive(WeftPrimitive::Image);
+        assert!(check_declared_kind(&image, b"\x89PNG\r\n\x1a\n", "a.png").is_ok());
+        let e = check_declared_kind(&image, b"ID3\x04", "a.png").unwrap_err();
+        assert!(e.contains("are Audio, not Image"), "{e}");
+        let e = check_declared_kind(&image, b"just text", "notes.txt").unwrap_err();
+        assert!(e.contains("no Image signature"), "{e}");
+        // Blob and text declarations check nothing.
+        assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::Blob), b"just text", "x").is_ok());
+        assert!(check_declared_kind(&WeftType::primitive(WeftPrimitive::String), b"ID3", "x").is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -808,6 +1023,15 @@ mod tests {
 
     #[test]
     fn admin_upload_envelopes_round_trip() {
+        let references = Tenanted {
+            tenant: "alice".into(),
+            inner: AssetReferencesRequest { project: "p1".into(), keys: vec![] },
+        };
+        let value = serde_json::to_value(&references).unwrap();
+        assert_eq!(value, json!({"tenant": "alice", "project": "p1", "keys": []}));
+        let back: Tenanted<AssetReferencesRequest> = serde_json::from_value(value).unwrap();
+        assert!(back.inner.keys.is_empty(), "empty retires the last source asset");
+        assert!(serde_json::from_value::<AssetReferencesRequest>(json!({"project": "p1"})).is_err());
         // The `Tenanted<T>` wrapper flattens the inner worker envelope, so the
         // wire shape is one flat object: `{tenant, key, sizes}` for parts, etc.
         let parts = Tenanted {

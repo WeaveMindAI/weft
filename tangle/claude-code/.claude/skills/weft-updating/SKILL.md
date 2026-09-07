@@ -24,6 +24,7 @@ The install records the checkout: `cat ~/.local/share/weft/repo-root`. In a proj
 ## What an update never does
 
 - It never edits the user's projects: not the source, not the connections, not the journal.
+- It leaves a project's infra stopped: after the update, `weft resync` (or `weft run`) says `infra not running for: ...`, and `weft infra start` brings it back.
 - It never destroys data by default. setup.sh's disk hygiene is bounded and conservative: build caches are capped, unreferenced images are reclaimed, and the keep-set preserves every running project's current worker image and every live project's infra images.
 - `--uninstall` and `--purge` are removal operations, not update operations. They are never part of this walk.
 

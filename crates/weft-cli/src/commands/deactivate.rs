@@ -142,21 +142,13 @@ async fn run_inner(
         None => super::resolve_project(ctx)?,
     };
 
-    // Standalone deactivate has its own --json behavior: when no
-    // --mode is given in json mode, default to wipe (preserves
-    // backwards-compat with the extension's existing dispatch
-    // path, which always passes --mode anyway). prompt_trigger_deactivation
-    // would error in json mode without --mode; absorb that here by
-    // pre-filling.
-    let resolved_mode = match mode.as_deref() {
-        Some(m) => Some(m.to_string()),
-        None if ctx.json() => Some("wipe".to_string()),
-        None => None,
-    };
+    // No `--mode` in `--json` is refused by `prompt_trigger_deactivation`
+    // (a script never gets a wipe it did not ask for); on a terminal it
+    // prompts.
     let deactivation = prompt_trigger_deactivation(
         ctx.json(),
         "deactivate",
-        resolved_mode.as_deref(),
+        mode.as_deref(),
         grace,
         running_policy.as_deref(),
         drain_timeout,

@@ -208,6 +208,7 @@ fn field_text(value: &serde_json::Value, full: bool) -> String {
 }
 
 pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Result<()> {
+    let color = super::resolve_color(&ctx, &color).await?;
     let client = ctx.client();
     let resp: serde_json::Value = client
         .get_json(&format!("/executions/{color}/replay"))
@@ -241,6 +242,7 @@ pub async fn clean(
     images: bool,
     build_cache: bool,
     project: Option<String>,
+    yes: bool,
 ) -> anyhow::Result<()> {
     if images || build_cache {
         if images {
@@ -252,6 +254,21 @@ pub async fn clean(
         return Ok(());
     }
 
+    // A journal row deleted is gone for good, so every execution
+    // deletion is confirmed: a terminal is asked, a script says
+    // `--yes`. The sweep says how many rows it is about to take.
+    let confirm = |what: String| -> anyhow::Result<bool> {
+        if yes {
+            return Ok(true);
+        }
+        println!("About to delete {what}.");
+        let ok = crate::prompt::confirm("Type 'yes' to confirm: ", "--yes")?;
+        if !ok {
+            println!("aborted");
+        }
+        Ok(ok)
+    };
+
     let client = ctx.client();
     if let Some(c) = color {
         anyhow::ensure!(
@@ -259,6 +276,10 @@ pub async fn clean(
             "a color names ONE execution, so --project cannot narrow it further: \
              drop one of them"
         );
+        let c = super::resolve_color(&ctx, &c).await?;
+        if !confirm(format!("execution {c}"))? {
+            return Ok(());
+        }
         client.delete(&format!("/executions/{c}")).await?;
         println!("deleted {c}");
         return Ok(());
@@ -284,6 +305,17 @@ pub async fn clean(
         (None, false, false) => Some(30),  // the unnamed sweep's guard
     };
     let cutoff = days.map(|d| now.saturating_sub(d as u64 * 24 * 3600));
+    let scope = match &project {
+        Some(p) => format!(" of project {p}"),
+        None => String::new(),
+    };
+    let subject = match days {
+        Some(d) => format!("every execution{scope} older than {d} days"),
+        None => format!("every execution{scope}"),
+    };
+    if !confirm(subject)? {
+        return Ok(());
+    }
     let mut count = 0usize;
     loop {
         let mut offset = 0u64;
@@ -320,10 +352,6 @@ pub async fn clean(
             break;
         }
     }
-    let scope = match &project {
-        Some(p) => format!(" of project {p}"),
-        None => String::new(),
-    };
     match days {
         Some(d) => println!("deleted {count} executions{scope} older than {d}d"),
         None => println!("deleted {count} executions{scope} (all)"),

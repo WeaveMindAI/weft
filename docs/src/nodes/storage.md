@@ -52,9 +52,21 @@ storage.delete(&handle).await?;
 storage.list().await?;
 
 storage.keep(&handle, KeepTtl::Default).await?;
-storage.presign(&handle, ttl_secs).await?;      // a signed URL, for handing a provider bytes
-storage.public_link(&handle, ttl_secs).await?;  // a token-protected link, Option<String>
+storage.presign(&handle, ttl_secs).await?;      // a temporary link, always fetchable from your body
+storage.public_link(&handle, ttl_secs).await?;  // an internet-reachable link, or None
 ```
+
+A stored file arriving on one of your inputs already carries a `url` inside
+its marker, minted for this firing (an hour): the runtime links every file
+input before your body runs, so a body that hands the value to something
+that only fetches URLs needs no call of its own. The link is the
+internet-reachable one when the install serves one (a public address, or a
+bucket declared public), so a provider can fetch it too. Otherwise it is
+signed for the cluster's own address: your body can fetch it, nothing
+outside can, and a node that hands a file to something outside asks
+`public_link` and inlines the bytes when it answers `None`. It is stripped
+from everything you emit, park, or memoize, so the stored form is what
+travels and the journal never holds a link.
 
 Scope governs writes and lists. Key-addressed verbs act on the key's own
 scope, so reading a handle works regardless of which scope you asked for.
@@ -87,7 +99,7 @@ the run, where a swept file shows up as "media expired". So:
   expose a `keep` boolean config input defaulting to off, and pass
   `keep.then_some(KeepTtl::Default)`, letting the user decide.
 
-The `KeepFile` node extends or pins any stored file's lifetime after the fact.
+The `KeepFile` node extends or pins an execution file's lifetime after the fact.
 
 ## Files from the graph
 
@@ -95,7 +107,7 @@ A user-supplied file arrives as an ordinary typed input.
 
 ```json
 "inputs": [
-  { "name": "image", "type": "Image", "required": true, "exposure": "all" }
+  { "name": "image", "type": "Image", "required": true }
 ]
 ```
 
@@ -112,7 +124,8 @@ send = TelegramSendMedia {
 ```
 
 The [asset sync](../language/files-and-reuse.md#the-asset-sync) runs before
-every build and makes storage mirror what the code references. Your node never
+every build and uploads what the code references. Current source files stay;
+replaced or removed uploads expire after 30 days without access. Your node never
 sees any of it: at run time the value is a normal media value, and `get` and
 `get_bytes` read its bytes whichever handle it carries.
 
@@ -120,6 +133,23 @@ sees any of it: at run time the value is a normal media value, and `get` and
 
 For converting whole typed values at a provider boundary, see
 [Custom types](custom-types.md#media-inside-a-custom-type).
+
+## The marker stays inside weft
+
+The `__weft_image__` / `__weft_audio__` / `__weft_blob__` wrapper is how a
+file travels between nodes: it carries the storage key the runtime reads
+by. Anything you hand to something that is not weft (a provider's request
+body, a bridge's action payload, a form spec a browser renders, a live
+item) gets the plain thing that consumer reads: a URL string, a `data:`
+URL, or a plain `{ url, mimeType, filename }` object. `externalize` does
+this for a typed value, `public_link` and `presign` for one file. Wrapping
+a link in a marker and sending it out puts weft's internal shape in an
+external contract, and the consumer, which reads `value.url`, shows
+nothing. The form image field did exactly that once, and the tasks app
+rendered "(no image)" over a link that worked. A link you hand out also has
+a life, so never store one: a form parks the stored file itself, and the
+person who opens it gets a link minted at that moment through the
+signal-token files door, however long the form waited.
 
 ## Reaching files outside the editor
 

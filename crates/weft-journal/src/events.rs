@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::frames::LoopFrames;
+use weft_core::frames::{FiringLocation, LoopFrames};
 use weft_core::primitive::{
     ExecutionSnapshot, KickedNode, LoopInstanceKey, LoopInstanceSnapshot,
     LoopTerminationReason, SignalSpec, SuspensionInfo,
@@ -51,12 +51,13 @@ pub enum ExecEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         node_test: bool,
         /// The node set this execution is allowed to dispatch, or
-        /// `None` for the whole graph. A manual run aimed at targets
-        /// and every trigger fire journal their computed subgraph
-        /// here, so the engine skips everything outside it
-        /// (`OutsideThisRun`) and a resume rebuilds the same boundary;
-        /// an untargeted manual run and the setup phases carry `None`
-        /// (the setup phases compute their scope engine-side). (Named
+        /// `None` for the whole graph. A trigger fire journals its
+        /// computed program here (the fired trigger's downstream plus
+        /// what that needs), so a pulse into another program's node is
+        /// absorbed and a resume rebuilds the same boundary. A targeted
+        /// manual run also records its selected nodes and dependencies.
+        /// Untargeted manual runs and setup phases carry `None` (setup
+        /// phases compute their scope engine-side). (Named
         /// `subgraph`, not `scope`:
         /// `NodeDefinition.scope` is a node's group-nesting path, a
         /// different thing entirely.)
@@ -290,6 +291,13 @@ pub enum ExecEvent {
         parent_frames: LoopFrames,
         index: u32,
         body_emissions: Vec<LaunchedEmission>,
+        /// The body's own roots (members no wire feeds), kicked at the
+        /// iteration's frames alongside the pulses: everything inside
+        /// a loop runs once per iteration, wired to the loop's edges
+        /// or not. In the same row as the pulses for the same reason
+        /// they are: a launch is one atomic fact.
+        #[serde(default)]
+        roots: Vec<String>,
         /// When this iteration's `over` item came from a STREAM
         /// (`over` on a `Generator[T]` port): the item pulse this
         /// launch consumed, absorbed by the fold in the same atomic
@@ -300,6 +308,24 @@ pub enum ExecEvent {
         /// launch" (which would leave the item pulse un-absorbed and
         /// re-deliver it).
         stream_pulse: Option<String>,
+        at_unix: u64,
+    },
+
+    /// A group's body started at `frames` (its In boundary forwarded),
+    /// and these members, which no wire feeds, are kicked there:
+    /// everything inside a scope runs when the scope starts. The loop
+    /// twin of this row is `LoopIterationLaunched::roots`. When
+    /// `skipped_by` names the scope, the scope was gated off instead
+    /// and every member listed is dispatched straight into a
+    /// `ScopeSkipped` skip, so the journal says of each node inside
+    /// that its scope did not run.
+    ScopeLaunched {
+        color: Color,
+        group_id: String,
+        frames: LoopFrames,
+        roots: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skipped_by: Option<String>,
         at_unix: u64,
     },
 
@@ -661,6 +687,7 @@ impl ExecEvent {
             | Self::PulsesConsumed { color, .. }
             | Self::LoopInstantiated { color, .. }
             | Self::LoopIterationLaunched { color, .. }
+            | Self::ScopeLaunched { color, .. }
             | Self::LoopOutFired { color, .. }
             | Self::LoopStreamEnded { color, .. }
             | Self::LoopTerminated { color, .. }
@@ -701,6 +728,7 @@ impl ExecEvent {
             Self::PulsesConsumed { .. } => "pulses_consumed",
             Self::LoopInstantiated { .. } => "loop_instantiated",
             Self::LoopIterationLaunched { .. } => "loop_iteration_launched",
+            Self::ScopeLaunched { .. } => "scope_launched",
             Self::LoopOutFired { .. } => "loop_out_fired",
             Self::LoopStreamEnded { .. } => "loop_stream_ended",
             Self::LoopTerminated { .. } => "loop_terminated",
@@ -729,7 +757,7 @@ impl ExecEvent {
 
 // ----- Fold: events -> ExecutionSnapshot -----------------------------
 
-pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot {
+pub fn fold_to_snapshot<'a>(color: Color, events: impl IntoIterator<Item = &'a ExecEvent>) -> ExecutionSnapshot {
     use weft_core::exec::{NodeExecution, NodeExecutionStatus, NodeExecutionTable};
     use weft_core::primitive::{CorruptionSite, JournalCorruption};
     use weft_core::pulse::{Pulse, PulseStatus, PulseTable};
@@ -738,7 +766,7 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
     let mut executions: NodeExecutionTable = Default::default();
     let mut suspensions: HashMap<String, SuspensionInfo> = HashMap::new();
     let mut pending_deliveries: HashMap<String, Value> = HashMap::new();
-    let mut kicked: HashMap<String, KickedNode> = HashMap::new();
+    let mut kicked: HashMap<FiringLocation, KickedNode> = HashMap::new();
     let mut loop_instances: HashMap<LoopInstanceKey, LoopInstanceSnapshot> = HashMap::new();
     let mut awaited_sequences: HashMap<
         weft_core::liveness::FiringLocation,
@@ -877,12 +905,26 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 // payload and `dispatched` flag are authoritative; a later
                 // kick carrying a different payload is a writer-level bug
                 // the fold must not paper over by silently merging.
-                kicked.entry(node_id.clone()).or_insert_with(|| KickedNode {
+                kicked.entry(FiringLocation::new(node_id.clone(), Vec::new())).or_insert_with(|| KickedNode {
                     firing: *firing,
                     payload: payload.clone(),
                     port_snapshot: port_snapshot.clone(),
                     dispatched: false,
+                    scope_skipped: None,
                 });
+            }
+            ExecEvent::ScopeLaunched { group_id: _, frames, roots, skipped_by, .. } => {
+                // A scope's body roots are kicks at the scope's frames,
+                // first launch wins like every other kick.
+                for root in roots {
+                    kicked.entry(FiringLocation::new(root.clone(), frames.clone())).or_insert_with(|| KickedNode {
+                        firing: false,
+                        payload: None,
+                        port_snapshot: None,
+                        dispatched: false,
+                        scope_skipped: skipped_by.clone(),
+                    });
+                }
             }
             ExecEvent::PulseEmitted {
                 color: c,
@@ -945,10 +987,8 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                         }
                     }
                 }
-                if frames.is_empty() {
-                    if let Some(k) = kicked.get_mut(node_id) {
-                        k.dispatched = true;
-                    }
+                if let Some(k) = kicked.get_mut(&FiringLocation::new(node_id.clone(), frames.clone())) {
+                    k.dispatched = true;
                 }
                 // Open a new record unless a NON-TERMINAL record already
                 // sits at this (color, frames). Live dispatch opens a new
@@ -1167,8 +1207,24 @@ pub fn fold_to_snapshot(color: Color, events: &[ExecEvent]) -> ExecutionSnapshot
                 }
             }
             ExecEvent::LoopIterationLaunched {
-                color: c, group_id, parent_frames, index, body_emissions, stream_pulse, ..
+                color: c, group_id, parent_frames, index, body_emissions, stream_pulse, roots, ..
             } => {
+                // The body's roots are kicks at the iteration's frames,
+                // in the same atomic row as the pulses.
+                let body_frames = {
+                    let mut f = parent_frames.clone();
+                    f.push(weft_core::frames::LoopIteration { index: *index });
+                    f
+                };
+                for root in roots {
+                    kicked.entry(FiringLocation::new(root.clone(), body_frames.clone())).or_insert_with(|| KickedNode {
+                        firing: false,
+                        payload: None,
+                        port_snapshot: None,
+                        dispatched: false,
+                        scope_skipped: None,
+                    });
+                }
                 // Replay the carried body pulses exactly as the
                 // `PulseEmitted` arm does (same `push_pulse` helper):
                 // marker and pulses are one atomic row, so a fold
@@ -1520,7 +1576,7 @@ mod fold_pulse_tests {
             },
         ];
         let snap = fold_to_snapshot(color(), &events);
-        let kick = snap.kicked.get("trigger").expect("trigger kick survives fold");
+        let kick = snap.kicked.get(&FiringLocation::new("trigger", Vec::new())).expect("trigger kick survives fold");
         assert!(kick.dispatched, "NodeStarted at root frames consumed the kick");
         assert_eq!(
             kick.payload.as_ref(),
@@ -1808,6 +1864,7 @@ mod fold_pulse_tests {
                 group_id: "lp".into(),
                 parent_frames: frames(&[]),
                 index: i,
+                roots: Vec::new(),
                 body_emissions: vec![LaunchedEmission {
                     pulse_id: pid.clone(),
                     source_node: "lp".into(),
@@ -2002,6 +2059,7 @@ mod fold_pulse_tests {
                 group_id: "lp".into(),
                 parent_frames: frames(&[]),
                 index: 1,
+                roots: Vec::new(),
                 body_emissions: vec![LaunchedEmission {
                     pulse_id: pid.clone(),
                     source_node: "lp".into(),
@@ -2504,7 +2562,7 @@ mod fold_pulse_tests {
             },
         ];
         let snap = fold_to_snapshot(color(), &events);
-        let kick = snap.kicked.get("trigger").expect("trigger kick");
+        let kick = snap.kicked.get(&FiringLocation::new("trigger", Vec::new())).expect("trigger kick");
         assert!(kick.payload.is_none(), "first kick's payload (None) is authoritative");
     }
 
@@ -2531,7 +2589,63 @@ mod fold_pulse_tests {
         assert!(*firing, "the explicit flag carries firing-ness");
         assert!(payload.is_none(), "Some(Null) collapses to None over JSON; that is WHY the flag exists");
         let snap = fold_to_snapshot(color(), &[back]);
-        assert!(snap.kicked.get("sock").expect("kick").firing);
+        assert!(snap.kicked.get(&FiringLocation::new("sock", Vec::new())).expect("kick").firing);
+    }
+
+    /// A scope launch is a kick per body root at the scope's frames,
+    /// consumed by a NodeStarted at that exact location; a loop's
+    /// launch row carries its roots the same way, at the iteration's
+    /// frames. A gated scope's members fold as kicks that skip.
+    #[test]
+    fn scope_launches_fold_into_kicks_at_their_frames() {
+        let events = vec![
+            ExecEvent::ScopeLaunched {
+                color: color(),
+                group_id: "g".into(),
+                frames: Vec::new(),
+                roots: vec!["g.seed".into()],
+                skipped_by: None,
+                at_unix: 0,
+            },
+            ExecEvent::LoopIterationLaunched {
+                color: color(),
+                group_id: "l".into(),
+                parent_frames: Vec::new(),
+                index: 2,
+                body_emissions: Vec::new(),
+                roots: vec!["l.seed".into()],
+                stream_pulse: None,
+                at_unix: 0,
+            },
+            ExecEvent::NodeStarted {
+                color: color(),
+                node_id: "l.seed".into(),
+                frames: frames(&[LoopIteration { index: 2 }]),
+                input: json!({}),
+                pulses_absorbed: vec![],
+                closed_ports: vec![],
+                at_unix: 0,
+            },
+            ExecEvent::ScopeLaunched {
+                color: color(),
+                group_id: "off".into(),
+                frames: Vec::new(),
+                roots: vec!["off.a".into()],
+                skipped_by: Some("off".into()),
+                at_unix: 0,
+            },
+        ];
+        let snap = fold_to_snapshot(color(), &events);
+        let seed = snap.kicked.get(&FiringLocation::new("g.seed", Vec::new())).expect("group root kicked");
+        assert!(!seed.dispatched && seed.scope_skipped.is_none());
+        let iter_seed = snap
+            .kicked
+            .get(&FiringLocation::new("l.seed", frames(&[LoopIteration { index: 2 }])))
+            .expect("loop root kicked at the iteration's frames");
+        assert!(iter_seed.dispatched, "the NodeStarted at that location consumed it");
+        assert!(snap.kicked.get(&FiringLocation::new("l.seed", Vec::new())).is_none(), "never at the root frames");
+        let gated = snap.kicked.get(&FiringLocation::new("off.a", Vec::new())).expect("gated member kicked");
+        assert_eq!(gated.scope_skipped.as_deref(), Some("off"));
     }
 
     /// SuspensionResolved and SuspensionRegistered are written by
@@ -2674,7 +2788,7 @@ mod caller_event_wire_tests {
             weft_core::exec::skip::SkipReason::OneOfGroupClosed {
                 ports: vec!["email".into(), "phone".into()],
             },
-            weft_core::exec::skip::SkipReason::OutsideThisRun,
+            weft_core::exec::skip::SkipReason::ScopeSkipped { scope: "g".into() },
         ] {
             let skipped = ExecEvent::NodeSkipped {
                 color: color(),
@@ -2904,6 +3018,7 @@ mod caller_event_wire_tests {
             group_id: "lp".into(),
             parent_frames: vec![],
             index: 3,
+            roots: Vec::new(),
             body_emissions: vec![LaunchedEmission {
                 pulse_id: uuid::Uuid::new_v4().to_string(),
                 source_node: "lp__in".into(),

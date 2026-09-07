@@ -35,9 +35,9 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 /// `BrokerRejected` in the error chain. A 4xx the broker chose is a client-actionable
 /// error, so the CLI user should see it, not an opaque 500. Everything else (a real
 /// dispatcher/transport fault) is a 500.
-fn storage_err(e: anyhow::Error) -> ApiError {
+pub(crate) fn storage_err(e: anyhow::Error) -> ApiError {
     if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() {
-        return (StatusCode::NOT_FOUND, "storage object not found".into());
+        return (StatusCode::NOT_FOUND, format!("{e:#}"));
     }
     if let Some(rejected) = e.downcast_ref::<crate::storage::BrokerRejected>() {
         // Re-map the broker's own 4xx onto our axum StatusCode. Fall back to 500 if
@@ -51,19 +51,14 @@ fn storage_err(e: anyhow::Error) -> ApiError {
     internal(e)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FilesResponse {
-    pub files: Vec<weft_core::storage::StoredFileMeta>,
-}
-
 /// GET /storage/files: every runtime file in the caller's tenant.
 pub async fn list_files(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-) -> Result<Json<FilesResponse>, ApiError> {
+) -> Result<Json<weft_core::storage::ListFilesResponse>, ApiError> {
     let tenant = caller.0;
     let files = crate::storage::tenant_list(&state, tenant.as_str()).await.map_err(storage_err)?;
-    Ok(Json(FilesResponse { files }))
+    Ok(Json(weft_core::storage::ListFilesResponse { files }))
 }
 
 /// GET /storage/usage: the caller's footprint (bytes + file count).
@@ -257,17 +252,34 @@ pub async fn assets_list(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Json(req): Json<AssetsListRequest>,
-) -> Result<Json<FilesResponse>, ApiError> {
+) -> Result<Json<weft_core::storage::ListFilesResponse>, ApiError> {
     let tenant = caller.0;
     let files = crate::storage::asset_list(&state, tenant.as_str(), &req.project)
         .await
         .map_err(storage_err)?;
-    Ok(Json(FilesResponse { files }))
+    Ok(Json(weft_core::storage::ListFilesResponse { files }))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AssetsListRequest {
     pub project: String,
+}
+
+/// Publish the complete asset set of the successfully resolved source.
+/// The broker checks every key against the authenticated tenant and project.
+pub async fn asset_references(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Json(mut req): Json<weft_core::storage::AssetReferencesRequest>,
+) -> Result<StatusCode, ApiError> {
+    req.project.parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "project is not a valid id".to_string()))?;
+    for key in &mut req.keys {
+        *key = ensure_tenant_key(&caller.0, key)?;
+    }
+    crate::storage::set_asset_references(&state, caller.0.as_str(), req)
+        .await.map_err(storage_err)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST /storage/upload/parts: reserve + presign the next parts.
@@ -409,8 +421,11 @@ mod tests {
         // A broker 404 surfaces as 404, a broker 4xx refusal keeps ITS status,
         // and anything else (transport fault) is a 500. This is the branch that
         // decides what the CLI user sees; pin it.
-        let nf = anyhow::Error::new(crate::storage::StorageNotFound).context("x");
-        assert_eq!(storage_err(nf).0, StatusCode::NOT_FOUND);
+        let nf = anyhow::Error::new(crate::storage::StorageNotFound)
+            .context("File expired or was deleted. Upload it again and start a new run.");
+        let (status, message) = storage_err(nf);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(message.contains("expired") && message.contains("start a new run"), "{message}");
         let rejected = anyhow::Error::new(crate::storage::BrokerRejected {
             status: reqwest::StatusCode::FORBIDDEN,
         })

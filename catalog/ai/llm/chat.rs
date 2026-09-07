@@ -68,3 +68,38 @@ pub fn stored_message(
     }
     Ok(message)
 }
+
+/// Whether a stored message carries a cache mark.
+pub fn has_cache_mark(message: &Value) -> bool {
+    message.get("cache_breakpoint").and_then(Value::as_bool) == Some(true)
+}
+
+/// Put a cache mark on a stored message (the lib turns the mark into
+/// the provider's own cache instruction, and caps how many it keeps).
+pub fn mark_cache(message: &mut Value) {
+    message["cache_breakpoint"] = json!(true);
+}
+
+/// The marks `LlmInference`'s `autoCache` puts on a conversation that
+/// carries none of its own: the system message (the stable persona
+/// every call shares) and the last message of the wired history (the
+/// turns before this call's new one, which the next call shares
+/// again). A conversation already carrying a mark is the author's to
+/// place, and is left alone. `new_turn` is how many messages at the
+/// end are this call's own (the user message just appended), so the
+/// history's last message is found under them.
+pub fn auto_cache_marks(stored: &mut [Value], new_turn: usize) {
+    if stored.iter().any(has_cache_mark) {
+        return;
+    }
+    if let Some(system) = stored.first_mut().filter(|m| m.get("role").and_then(Value::as_str) == Some("system")) {
+        mark_cache(system);
+    }
+    let history_len = stored.len().saturating_sub(new_turn);
+    // The last history message, when it is not the system message
+    // already marked above (a history of one system message has only
+    // that to mark).
+    if history_len > 1 {
+        mark_cache(&mut stored[history_len - 1]);
+    }
+}

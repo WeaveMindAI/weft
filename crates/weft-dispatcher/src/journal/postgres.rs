@@ -168,22 +168,22 @@ async fn cancel_terminals_in(
 async fn payload_rows<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     color: Color,
-) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
+) -> anyhow::Result<Vec<(i64, String)>> {
+    let rows = sqlx::query_as(
+        "SELECT id, payload_json FROM exec_event WHERE color = $1 ORDER BY id ASC",
     )
     .bind(color.to_string())
     .fetch_all(executor)
     .await?;
-    Ok(rows.into_iter().map(|(p,)| p).collect())
+    Ok(rows)
 }
 
 /// Strictly decode every row: one undecodable row fails the whole read
 /// (a fold over a partial event list rebuilds a state that never
 /// existed).
-fn decode_all(color: Color, rows: Vec<String>) -> anyhow::Result<Vec<ExecEvent>> {
+fn decode_all(color: Color, rows: Vec<(i64, String)>) -> anyhow::Result<Vec<ExecEvent>> {
     rows.into_iter()
-        .map(|payload| decode_event(color, &payload).map_err(anyhow::Error::msg))
+        .map(|(_, payload)| decode_event(color, &payload).map_err(anyhow::Error::msg))
         .collect()
 }
 
@@ -616,13 +616,13 @@ impl Journal for PostgresJournal {
     async fn events_log_lossy(
         &self,
         color: Color,
-    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)> {
+    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)> {
         let rows = payload_rows(&self.pool, color).await?;
         let mut out = Vec::with_capacity(rows.len());
         let mut bad = Vec::new();
-        for payload in rows {
+        for (id, payload) in rows {
             match decode_event(color, &payload) {
-                Ok(ev) => out.push(ev),
+                Ok(ev) => out.push(crate::events::IdentifiedEvent::recorded(id, ev)),
                 Err(reason) => bad.push(reason),
             }
         }
@@ -970,6 +970,26 @@ impl Journal for PostgresJournal {
             );
         }
         Ok(ExecutionPage { executions, total: total.0.max(0) as u64 })
+    }
+
+    async fn colors_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<Color>> {
+        // `LIKE` on the text form with the prefix escaped: a prefix is
+        // hex and dashes, but the escape keeps a stray `%` or `_` from
+        // widening the match.
+        let pattern = format!(
+            "{}%",
+            prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+        );
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT color FROM execution_color \
+             WHERE tenant_id = $1 AND kind = 'execution' AND color LIKE $2 \
+             ORDER BY started_at_unix DESC LIMIT 2",
+        )
+        .bind(tenant)
+        .bind(pattern)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(|(c,)| c.parse::<Color>().map_err(Into::into)).collect()
     }
 
     async fn execution_summary(
@@ -1354,28 +1374,28 @@ const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
 /// Row shape for signal SELECTs. `FromRow` (not a tuple) because
 /// the row exceeds sqlx's 16-tuple cap.
 #[derive(sqlx::FromRow)]
-struct SignalRow {
-    token: String,
-    tenant_id: String,
-    project_id: String,
-    color: Option<String>,
-    node_id: String,
-    is_resume: bool,
-    spec_json: String,
-    access_id: Option<String>,
-    consumer_kind: Option<String>,
-    tags: Vec<String>,
-    port_snapshot: Option<serde_json::Value>,
-    consumer_payload: Option<String>,
-    surface_kind: String,
-    mount_path: Option<String>,
-    auth_kind: String,
-    auth_config: Option<serde_json::Value>,
-    kind_state: serde_json::Value,
-    kind_state_seq: i64,
+pub(crate) struct SignalRow {
+    pub(crate) token: String,
+    pub(crate) tenant_id: String,
+    pub(crate) project_id: String,
+    pub(crate) color: Option<String>,
+    pub(crate) node_id: String,
+    pub(crate) is_resume: bool,
+    pub(crate) spec_json: String,
+    pub(crate) access_id: Option<String>,
+    pub(crate) consumer_kind: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) port_snapshot: Option<serde_json::Value>,
+    pub(crate) consumer_payload: Option<String>,
+    pub(crate) surface_kind: String,
+    pub(crate) mount_path: Option<String>,
+    pub(crate) auth_kind: String,
+    pub(crate) auth_config: Option<serde_json::Value>,
+    pub(crate) kind_state: serde_json::Value,
+    pub(crate) kind_state_seq: i64,
 }
 
-fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
+pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
     // Distinguish a NULL column (a legitimately absent value) from a NON-NULL value
     // that fails to decode (corrupt state). A resume signal's `color` is matched by
     // the fire/resume path to route the signal to its suspended execution: silently
@@ -1388,11 +1408,30 @@ fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
                 .map_err(|e| anyhow::anyhow!("corrupt signal.color '{s}' for token {}: {e}", row.token))?,
         ),
     };
+    // The payload is the CACHE of what a consumer surface renders,
+    // rebuilt from the spec on every re-register and read by nothing
+    // else. One unreadable cache must not make the row unreadable: this
+    // decoder is on the path that cancels and deletes signals, so
+    // failing here would leave a row nobody can list and nobody can
+    // remove. It is loud in the log and the row keeps its identity.
     let consumer_payload = match row.consumer_payload {
         None => None,
-        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            anyhow::anyhow!("corrupt signal.consumer_payload for token {}: {e}", row.token)
-        })?),
+        Some(s) => match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::error!(
+                    target: "weft_dispatcher::journal",
+                    token = %row.token,
+                    error = %e,
+                    "corrupt signal.consumer_payload: this signal is missing from every \
+                     consumer's list. A trigger's row rebuilds its card the next time the \
+                     project is activated; a row waiting mid-execution never does, so that \
+                     one stays invisible until the execution is cancelled (weft stop, or \
+                     clear-all on the token)."
+                );
+                None
+            }
+        },
     };
     Ok(SignalRegistration {
         token: row.token,

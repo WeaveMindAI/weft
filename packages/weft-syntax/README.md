@@ -60,7 +60,7 @@ does not. What each piece of source actually turns into is checked here, in
 | `"a string"`, and a ` ``` ` block | `string.quoted.*.weft` | `hljs-string` |
 | `@include(...)`, `@file(...)`, `@require_one_of(...)` | `keyword.control.directive.weft` | `hljs-meta` |
 | `Group`, `Loop`, `self` | `keyword.control.weft` | `hljs-keyword` |
-| `_label`, `_tags`, `_is_output` | `keyword.other.reserved.weft` | `hljs-keyword` |
+| `_label`, `_tags`, `_should_flow` | `keyword.other.reserved.weft` | `hljs-keyword` |
 | `String`, `List`, `Access`, every other type | `support.type.weft` | `hljs-type` |
 | A node type, `LlmInference` | `entity.name.type.weft` | `hljs-title` |
 | A config key, left of its colon | `variable.parameter.weft` | `hljs-attr` |

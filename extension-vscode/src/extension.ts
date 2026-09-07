@@ -259,8 +259,9 @@ export function activate(context: vscode.ExtensionContext) {
   /// User clicked Run. Run is just a CLI verb like the others now;
   /// runPinned exists separately only so the keybinding (Ctrl+Enter)
   /// has a stable target name.
-  /// `targets` narrows the run to those output nodes; empty runs every
-  /// output node, which is what the plain Run button does.
+  /// `targets` narrows the run to those nodes and what they need; empty
+  /// kicks every root of the graph, which is what the plain Run button
+  /// does.
   async function runPinned(targets: string[] = []): Promise<void> {
     await runCliVerb('run', targets.flatMap((t) => ['--target', t]));
   }

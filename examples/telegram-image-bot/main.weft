@@ -18,7 +18,7 @@ pg = PostgresDatabase { database: "imagebot" }
 
 ask = TelegramReceiveMessage { account: telegram.access }
 
-credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String?) {
+credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: String) {
   # Take one credit off this telegram account, or say why we cannot.
   # The query reads the sender's id as `$telegram_id`.
   debit = PostgresExecuteQuery(telegram_id: String) {
@@ -28,7 +28,7 @@ credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal: Str
   }
 
   # `refusal` says nothing when the credit was taken
-  read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal: String?) {
+  read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal: String) {
     code: @file("scripts/outcome.py")
     rows: debit.rows
   }
@@ -40,7 +40,6 @@ credit.db = pg.access
 credit.telegramUser = ask.user
 
 sorry = TelegramSendMessage {
-  _is_output: true
   account: telegram.access
   chatId: ask.chatId
   text: credit.refusal
@@ -66,7 +65,6 @@ picture = FalGenerateImage {
 }
 
 reply = TelegramSendMedia {
-  _is_output: true
   kind: "photo"
   account: telegram.access
   chatId: ask.chatId
@@ -97,7 +95,6 @@ table = PostgresExecuteQuery {
 # form's two values, which the SQL reads as `$telegram_id` and
 # `$credits` (an empty credits field enrolls with 5).
 enroll = PostgresExecuteQuery(telegram_id: String, credits: String) {
-  _is_output: true
   _should_flow: table.rows
   query: @file("sql/add_user.sql")
   account: pg.access

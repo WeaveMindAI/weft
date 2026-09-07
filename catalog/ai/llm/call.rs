@@ -39,6 +39,10 @@ pub struct LlmCall {
     pub generator: GeneratorInfo,
     pub params: NodeCompletionParameters,
     pub stored: Vec<Value>,
+    /// Automatic cache placement is request-only. Saved history contains
+    /// the author's marks, so the next call can choose fresh automatic ones.
+    auto_cache: bool,
+    new_turn: usize,
     history_ty: weft::WeftType,
     /// Whether this provider always stamps a finish reason on a
     /// genuinely complete reply (the named services do; a bare
@@ -46,6 +50,27 @@ pub struct LlmCall {
     /// closing the connection). Decides whether a missing finish
     /// reason is proof of truncation.
     announces_finish: bool,
+    /// Reasoning is off (the default): a provider refusing the call is
+    /// then most likely refusing to switch reasoning off, and the
+    /// error says what to change.
+    reasoning_off: bool,
+}
+
+impl LlmCall {
+    /// The error a failed call surfaces. A provider refusing a call
+    /// with reasoning off is told in the author's terms: the model
+    /// always reasons, so the switch has to go on; every other failure
+    /// passes through as it came.
+    pub fn call_error(&self, err: impl std::fmt::Display) -> weft::error::WeftError {
+        let text = err.to_string();
+        if self.reasoning_off && text.to_ascii_lowercase().contains("reason") {
+            return weft::node_error(format!(
+                "llm: {text}. This model always reasons; set `reasoning: true` on its params \
+                 (low effort unless you pick one)"
+            ));
+        }
+        weft::node_error(format!("llm: {text}"))
+    }
 }
 
 /// Read the node's shared inputs (`provider`, `params`, `history`,
@@ -76,6 +101,15 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
     // here ALL auth is the connection's, so the generator's own auth is
     // cleared explicitly rather than relied on to be overridden.
     generator = generator.with_auth(minillmlib::Auth::None);
+    // The generator's own defaults fill every parameter the call leaves
+    // unset, and the lib's carries a `maxTokens`. weft sends one only
+    // when the author wrote it, so the provider's default applies
+    // otherwise (the native Anthropic wire, which requires the field,
+    // fills it itself).
+    generator = generator.with_default_params(CompletionParameters {
+        max_tokens: None,
+        ..CompletionParameters::default()
+    });
 
     // The connection: every provider node embeds the picked Access
     // marker in the object it emits; only a custom endpoint may run
@@ -109,15 +143,19 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
     let reasoning: bool = params.get_or("reasoning", false)?;
     let mut fields = params.object()?.clone();
     fields.remove("reasoning");
+    let wrote_max_tokens = fields.contains_key("maxTokens");
     let mut cp: CompletionParameters =
         serde_json::from_value(Value::Object(fields)).node_err("completion parameters")?;
-    if reasoning {
-        // The checkbox IS the intent to reason; the select only tunes how
-        // hard. Absent, default to a real effort ("medium"), never "none"
-        // (which disables reasoning, silently contradicting the checkbox).
-        let effort = params.get_or("reasoningEffort", "medium".to_string())?;
-        cp = cp.with_reasoning(ReasoningConfig { effort: Some(effort), max_tokens: None, exclude: None });
+    // The lib fills a `maxTokens` of its own for an absent key; weft
+    // sends one only when the author wrote it, so the provider's own
+    // default applies otherwise (a wire that requires the field, the
+    // native Anthropic one, fills it itself).
+    if !wrote_max_tokens {
+        cp.max_tokens = None;
     }
+    let effort: Option<String> = params.opt("reasoningEffort")?;
+    cp = cp.with_reasoning(reasoning_config(reasoning, effort.as_deref()));
+    let reasoning_off = !reasoning;
 
     // OpenRouter routing rides the provider object (it is a fact of
     // WHERE the call is served, not of how the model samples); the lib
@@ -184,20 +222,30 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
     }
     let prompt: Option<String> = ctx.inputs.opt("prompt")?;
     let media: Vec<Value> = ctx.inputs.list("media")?;
+    let mut new_turn = 0;
     if prompt.is_some() || !media.is_empty() {
         stored.push(chat::stored_message("user", prompt.as_deref().unwrap_or(""), &media, None)?);
+        new_turn = 1;
     }
     if stored.is_empty() {
         weft::node_bail!("nothing to send: no prompt, no media, and no wired history");
     }
-
     // Resolved here, before the paid call: a node type without a
     // declared `history` output must fail before money is spent.
     let history_ty = ctx
         .output_type("history")
         .ok_or_else(|| weft::node_error("the history output declares no type"))?;
 
-    Ok(LlmCall { generator, params: ncp, stored, history_ty, announces_finish: kind != "custom" })
+    Ok(LlmCall {
+        generator,
+        params: ncp,
+        stored,
+        auto_cache: ctx.inputs.get_or("autoCache", true)?,
+        new_turn,
+        history_ty,
+        announces_finish: kind != "custom",
+        reasoning_off,
+    })
 }
 
 /// The WIRE form of the stored conversation: media slots become
@@ -207,10 +255,14 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
 /// are identical apart from the media slots. Returns the conversation
 /// leaf the completion runs on.
 pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNode> {
+    let mut request = llm.stored.clone();
+    if llm.auto_cache {
+        chat::auto_cache_marks(&mut request, llm.new_turn);
+    }
     let wire = ctx
         .storage(StorageScope::Project)
         .externalize(
-            &Value::Array(llm.stored.clone()),
+            &Value::Array(request),
             &llm.history_ty,
             // Links preferred where the provider takes them (image /
             // video: the provider fetches the bytes itself, nothing
@@ -225,6 +277,17 @@ pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNo
         serde_json::from_value(wire).node_err("chat history does not fit minillmlib messages")?;
     let (_root, leaf) =
         ChatNode::from_messages(&messages).node_err("building the conversation")?;
+    // The chain builder reads each message's text and role and starts
+    // every node unmarked; the cache marks live on the NODES the wire
+    // reads, so they are put back one by one, leaf to root.
+    let mut node = Some(leaf.clone());
+    for message in messages.iter().rev() {
+        let Some(current) = node else { break };
+        if message.cache_breakpoint {
+            current.cache_breakpoint();
+        }
+        node = current.parent();
+    }
     Ok(leaf)
 }
 
@@ -262,12 +325,28 @@ pub async fn finish(
     Ok(output)
 }
 
+/// What the `reasoning` checkbox sends, in its two states. Off (the
+/// default) sends effort `none`, the lib's spelling for "off", which
+/// every wire translates so that a model that is off stays off and one
+/// that cannot switch off refuses the request loudly; that refusal is
+/// the answer (see [`LlmCall::call_error`]). On sends the chosen
+/// effort, `low` when none was picked: the checkbox IS the intent to
+/// reason, and the cheap, fast effort is the one you get without
+/// asking for more. There is no third state: a model never runs at a
+/// default nobody wrote down.
+pub fn reasoning_config(reasoning: bool, effort: Option<&str>) -> ReasoningConfig {
+    let effort = if reasoning { effort.unwrap_or("low") } else { "none" };
+    ReasoningConfig { effort: Some(effort.to_string()), max_tokens: None, exclude: None }
+}
+
 /// A reply with neither text, nor tool calls, nor media answered
-/// nothing a downstream node can act on: fail loudly. And when the
-/// provider is one that always stamps a finish reason on a genuinely
-/// complete reply, a missing one means the connection dropped
-/// mid-generation: the reply is truncated, fail loudly rather than
-/// chain a half-answer into the conversation. (A bare
+/// nothing a downstream node can act on: fail loudly, and when the
+/// usage says the model spent its whole budget thinking, say so (the
+/// fix is a bigger `maxTokens` or reasoning off, never a retry). And
+/// when the provider is one that always stamps a finish reason on a
+/// genuinely complete reply, a missing one means the connection
+/// dropped mid-generation: the reply is truncated, fail loudly rather
+/// than chain a half-answer into the conversation. (A bare
 /// OpenAI-compatible server may end a complete reply by just closing,
 /// so absence proves nothing there and is accepted.)
 fn ensure_reply_substance(
@@ -278,7 +357,7 @@ fn ensure_reply_substance(
         && response.tool_calls.as_ref().map_or(true, |calls| calls.is_empty())
         && response.media.is_empty()
     {
-        weft::node_bail!("the provider returned an empty response (no text, tool calls, or media)");
+        weft::node_bail!("{}", empty_reply_message(response.usage.as_ref()));
     }
     if announces_finish && response.finish_reason.is_none() {
         weft::node_bail!(
@@ -286,4 +365,17 @@ fn ensure_reply_substance(
         );
     }
     Ok(())
+}
+
+/// The message for a reply with nothing in it. When the usage shows
+/// reasoning tokens and no text, the budget went to thinking: name
+/// the two knobs that change that.
+pub fn empty_reply_message(usage: Option<&minillmlib::Usage>) -> String {
+    match usage.and_then(|u| u.reasoning_tokens).filter(|n| *n > 0) {
+        Some(reasoning) => format!(
+            "the model spent {reasoning} reasoning tokens and answered 0 text tokens: raise \
+             maxTokens so the answer fits after the thinking, or set reasoning off"
+        ),
+        None => "the provider returned an empty response (no text, tool calls, or media)".into(),
+    }
 }

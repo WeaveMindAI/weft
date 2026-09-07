@@ -183,9 +183,9 @@
         drive_scoped(project, catalog, kicks, None, cancellation).await
     }
 
-    /// `drive` with a journaled run subgraph, the shape a manual run
-    /// aimed at targets produces: only the named nodes dispatch, and
-    /// everything else skips with `OutsideThisRun`.
+    /// `drive` with a journaled run subgraph, the shape a trigger fire
+    /// produces: only the named nodes dispatch, and a pulse landing
+    /// anywhere else is absorbed without a row.
     pub(super) async fn drive_scoped(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,

@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Notion access (wire a NotionAccess node)."
     },
@@ -52,11 +52,7 @@
     {
       "name": "appended",
       "type": "Number",
-      "required": false,
       "description": "How many blocks were appended."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

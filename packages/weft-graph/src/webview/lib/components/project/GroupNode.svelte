@@ -38,7 +38,6 @@
 			portLiterals?: Record<string, unknown>;
 			inputs?: PortDefinition[];
 			outputs?: PortDefinition[];
-			features?: { oneOfRequired?: string[][] };
 			onUpdate?: (updates: NodeDataUpdates) => void;
 			executions?: NodeExecution[];
 			executionCount?: number;
@@ -103,11 +102,9 @@
 			: []
 	));
 
-	// One-of-required groups on the group's interface ports: parsed from
-	// `@require_one_of(a, b)` directives in the group signature. Same shape
-	// as regular node features.oneOfRequired.
-	const oneOfRequiredGroups: string[][] = $derived(data.features?.oneOfRequired ?? []);
-	const oneOfRequiredPorts: Set<string> = $derived(new Set(oneOfRequiredGroups.flat()));
+	// A container takes no `@require_one_of` (the directive lives on the
+	// node inside that needs the ports), so no port here is one-of-required.
+	const oneOfRequiredPorts: Set<string> = new Set();
 	const isExpanded = $derived((data.config?.expanded as boolean) ?? true);
 	const groupDescription = $derived((data.config?.description as string) ?? '');
 	let descExpanded = $state(false);
@@ -451,7 +448,7 @@
 				toast.error(`Output port "${trimmed}" already exists.`);
 				return;
 			}
-			currentOutputs.push({ name: trimmed, portType: 'MustOverride', required: false });
+			currentOutputs.push({ name: trimmed, portType: 'MustOverride', required: true });
 		}
 		// Send the port change alone. If the extra port grows the group past its
 		// current height, the min-height `$effect` above fires right after this
@@ -662,7 +659,7 @@
 						type="target"
 						position={Position.Left}
 						id={input.name}
-						title={!input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
+						title={input.name}
 						style={pMarker.style}
 						class={pMarker.class}
 						oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}
@@ -945,7 +942,7 @@
 							type="target"
 							position={Position.Left}
 							id={input.name}
-							title={!input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
+							title={input.name}
 							style="top: 50%; {pMarker.style}"
 							class={pMarker.class}
 							oncontextmenu={(e: MouseEvent) => { e.preventDefault(); e.stopPropagation(); portContextMenu = { portName: input.name, side: 'input', x: e.clientX, y: e.clientY }; }}

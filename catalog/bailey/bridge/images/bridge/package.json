@@ -10,6 +10,7 @@
   "dependencies": {
     "@cacheable/node-cache": "^3.0.1",
     "@hapi/boom": "^10.0.1",
+    "audio-decode": "^2.2.3",
     "baileys": "7.0.0-rc14",
     "express": "^5.2.1",
     "pino": "^10.3.1",

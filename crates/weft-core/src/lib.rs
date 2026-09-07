@@ -14,6 +14,7 @@ pub mod caller_token;
 pub mod cancellation;
 #[cfg(feature = "runtime")]
 pub mod context;
+pub mod deref;
 pub mod error;
 pub mod exec;
 pub mod frames;

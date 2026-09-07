@@ -16,13 +16,12 @@
       "name": "history",
       "type": "ChatHistory",
       "required": false,
-      "exposure": "wire",
+      "accepts": ["wire"],
       "description": "The conversation so far. Unwired, this message starts a new history."
     },
     {
       "name": "role",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "select",
         "options": ["user", "assistant", "system", "tool"]
@@ -48,13 +47,20 @@
       "type": "String",
       "required": false,
       "description": "For role 'tool' only: the id of the tool call this message answers (from an LLM node's toolCalls output)."
+    },
+    {
+      "name": "cacheBreakpoint",
+      "type": "Boolean",
+      "widget": { "kind": "checkbox" },
+      "default": false,
+      "label": "Cache up to here",
+      "description": "Mark this message as a prompt-cache breakpoint: everything up to and including it is cached by providers that support it, and the next call reuses it. Put the stable part of a conversation (persona, reference material) before the mark and the volatile part after. A history carrying any mark of its own turns the LLM node's automatic marks off."
     }
   ],
   "outputs": [
     {
       "name": "history",
-      "type": "ChatHistory",
-      "required": false
+      "type": "ChatHistory"
     }
   ],
   "features": {

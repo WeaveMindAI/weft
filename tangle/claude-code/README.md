@@ -58,10 +58,13 @@ commands are the expert's hand on the same loop.
 | `CLAUDE.md` | every session, automatically | the orchestrator persona: the loop, ground truth discipline, autonomy, hard rules |
 | `.claude/skills/weft-language/` | on demand, before writing weft | the language surface: syntax, types, groups, loops, the pulse model, every error slug |
 | `.claude/skills/weft-catalog/` | on demand, before picking nodes | reading `metadata.json`, node families, the recurring wiring patterns |
+| `.claude/skills/weft-models/` | on demand, before wiring an LLM call | reasoning on or off, `maxTokens`, an empty reply, what a model costs, prompt caching |
+| `.claude/skills/weft-safety/` | on demand, when a program talks to a model or acts on the world | the swiss cheese model, the free layers built by default (a defensive prompt, one more key on the call already being made, limits at the interface), the layers that add a call or a person offered once when the stakes are real, the gate and human-check wiring |
 | `.claude/skills/weft-node-authoring/` | on demand, around dispatches | the dispatch protocol and review checklist for Tangle, and the authoring manual the specialist reads |
 | `.claude/skills/weft-running/` | on demand, when running or debugging | the CLI map, the daemon, journal inspection, the debugging playbook |
 | `.claude/skills/weft-editor/` | on demand, about the VS Code interface | the graph view: toolbar, action bar, palette, gestures, groups and loops, inspector, labels verbatim |
 | `.claude/skills/weft-connections/` | on demand, about accounts | the connect flow door by door, permissions, the browser extension, a public URL |
+| `.claude/skills/weft-consumers/` | on demand, when building a consumer of a program's signals | the api token, the dispatcher doors, the listing and form shapes, how a new kind reaches consumers, the reference extension |
 | `.claude/skills/weft-onboarding/` | on demand, when asked to teach | the guided tour: plain-word vocabulary and the itinerary |
 | `.claude/skills/weft-updating/` | on demand, when weft itself updates | the git pull plus setup.sh walk, what an update touches and preserves, and fixing a failed one |
 | `.claude/commands/` | `/weft-check`, `/weft-run`, `/weft-debug`, `/weft-new-node`, `/weft-live-test` | the expert's hand: the loop's steps on demand, live tests with informed consent |
@@ -69,6 +72,7 @@ commands are the expert's hand on the same loop.
 | `.claude/agents/catalog-scout.md` | when dispatched | research only: sweeps the catalog, reports exact node specs |
 | `.claude/agents/prompt-engineer.md` | when dispatched | writes and overhauls the program's LLM prompts, running the WeaveMind prompt-building playbook verbatim as its mind; its brief carries the job, the model, the data, the output shape |
 | `.claude/agents/run-digger.md` | when dispatched | post-mortem only: walks journals, logs, source, and stored files, compares good runs against bad ones, reports the finding with quoted evidence; read-only, never fixes |
+| `.claude/agents/red-teamer.md` | when dispatched, before handover on a high-stakes program | attack only: reads the program, prompts, and outside edges as an attacker (lying outsiders, hallucination hazards, rogue steps, unguarded stakes, forgeries, stored lies, over-powered deputies, leaks, spend loops), walks every hole from input to consequence, names the layer that closes each; never fixes, never runs |
 | `.claude/agents/node-smith.md` | when dispatched | builds and proves exactly one node, unsupervised, web access for service docs, local test tiers green, live tests written but not run |
 | `.claude/settings.json` | every session | permissions: the working loop runs unimpeded; only the genuinely destructive asks (live-tier tests, deactivations that wipe, terminate, rm, clean, forget). Also `claudeMdExcludes`: the user's personal `~/.claude/CLAUDE.md` and `~/.claude/rules/` are excluded, so Tangle is the only persona that loads and the project is isolated from the user's other assistant setup. Commands and agents are `weft-`-named or project-scoped, so personal same-named ones are unlikely; agents resolve project-over-user, so Tangle's specialists always win. |
 

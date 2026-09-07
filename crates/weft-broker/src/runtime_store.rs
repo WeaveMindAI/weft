@@ -31,7 +31,7 @@ use weft_platform_traits::{ObjectStore, PresignAudience};
 
 use crate::entitlement::{lock_tenant_storage, EntitlementSource};
 
-/// Default TTL of a KEPT execution-scoped file (30 days). Any access bumps
+/// Default TTL of a kept execution file or retired source asset (30 days). Access bumps
 /// the expiry back to now + TTL, so an actively-used survivor never expires.
 /// `KeepTtl::Default` resolves to this.
 pub const DEFAULT_KEEP_TTL_SECS: u64 = 30 * 24 * 3600;
@@ -511,7 +511,15 @@ impl RuntimeStore {
         let key = parsed.to_key();
         let tenant = parsed.tenant.clone();
         let part_size = part_size_for(declared_size);
-        let ttl = keep.and_then(keep_ttl_secs);
+        // An asset starts on the default countdown the moment it completes:
+        // an upload the sync never publishes (the build failed after the
+        // transfer) would otherwise sit with no expiry and nothing to reap
+        // it. Publishing (`set_asset_references`) clears the countdown for
+        // every referenced asset, so a current source asset has no expiry.
+        let ttl = match scope {
+            StorageScope::Asset => Some(DEFAULT_KEEP_TTL_SECS),
+            _ => keep.and_then(keep_ttl_secs),
+        };
 
         // Open the bucket multipart FIRST, with NO lock held and NO row yet, so we
         // have its id (the resume handle) in hand before we write the row. This is
@@ -1573,25 +1581,26 @@ impl RuntimeStore {
             .ok_or_else(|| RuntimeStoreError::NotFound(key))
     }
 
-    /// Bump a kept file's expiry to now + its TTL (an access keeps it alive).
-    /// No-op for files with no expiry (project/shared, KeepTtl::Never).
+    /// Read an active file and renew its expiry from its current TTL.
+    /// Leaves the expiry unchanged for files with no access-renewed TTL.
     /// Never shortens below a live public link's expiry (a minted link is
     /// a promise the bytes stay fetchable for its stated lifetime).
-    async fn bump_expiry(&self, row: &FileRow) -> Result<()> {
-        let Some(ttl) = row.keep_ttl_secs else {
-            return Ok(());
-        };
-        let new_expiry = self.clock.now_unix() + ttl;
-        sqlx::query(&format!(
-            "UPDATE runtime_file SET expires_at_unix = {} WHERE key = $2",
-            expiry_honoring_links("$1")
+    async fn bump_expiry(&self, key: &str) -> Result<Option<FileRow>> {
+        // Read the TTL from the locked row, not an earlier metadata read:
+        // source publication may have protected or retired this asset since
+        // that read. A reaper that already claimed the row wins over access.
+        sqlx::query_as::<_, FileRow>(&format!(
+            "UPDATE runtime_file SET expires_at_unix = CASE \
+                 WHEN keep_ttl_secs IS NULL THEN expires_at_unix ELSE {} END \
+             WHERE key = $2 AND status = 'active' \
+             RETURNING key, mime_type, filename, size_bytes, keep, expires_at_unix, keep_ttl_secs, created_at_unix",
+            expiry_honoring_links("$1 + keep_ttl_secs")
         ))
-        .bind(new_expiry)
-        .bind(&row.key)
-        .execute(&self.pool)
+        .bind(self.clock.now_unix())
+        .bind(key)
+        .fetch_optional(&self.pool)
         .await
-        .context("bump expiry")?;
-        Ok(())
+        .context("bump expiry")
     }
 
     /// Delete a file (object + row). A missing row is a not-found so the caller
@@ -1622,6 +1631,58 @@ impl RuntimeStore {
             .await
             .context("runtime delete row")
             .map_err(RuntimeStoreError::Other)?;
+        Ok(())
+    }
+
+    /// Current source assets have no expiry: publishing clears the countdown
+    /// an upload starts on (`begin_upload`). Removing a reference starts the
+    /// default access-renewed TTL once; repeated syncs never restart it.
+    /// Reintroducing an existing asset clears that countdown. Only asset rows
+    /// in this tenant/project participate; node-created files are untouched.
+    pub async fn set_asset_references(
+        &self,
+        tenant: &str,
+        project: &str,
+        keys: &[String],
+    ) -> StoreResult<()> {
+        let prefix = ParsedKey::asset_prefix(tenant, project).map_err(RuntimeStoreError::Invalid)?;
+        for key in keys {
+            let parsed = weft_core::storage::key::parse_key(key).map_err(RuntimeStoreError::Invalid)?;
+            if !key.starts_with(&prefix) || !weft_core::storage::is_content_hash(&parsed.id) {
+                return Err(RuntimeStoreError::Denied(
+                    "asset references must belong to the acting tenant and project".into(),
+                ));
+            }
+        }
+        let pattern = like_prefix(&prefix);
+        let mut tx = self.pool.begin().await.context("asset references transaction")?;
+        lock_tenant_storage(&mut tx, tenant).await?;
+        // Lock before checking presence so expiry cannot remove a referenced
+        // file between validation and protection. A reaper that won first
+        // makes this update fail without retiring any other assets.
+        let available: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM runtime_file WHERE key LIKE $1 ESCAPE '\\' AND status = 'active' \
+             ORDER BY key FOR UPDATE",
+        ).bind(&pattern).fetch_all(&mut *tx).await.context("lock project assets")?;
+        let available: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
+        if let Some(missing) = keys.iter().find(|key| !available.contains(key.as_str())) {
+            return Err(RuntimeStoreError::NotFound(missing.clone()));
+        }
+        sqlx::query(&format!(
+            "UPDATE runtime_file SET \
+                 expires_at_unix = CASE WHEN key = ANY($2) THEN NULL \
+                     ELSE COALESCE(expires_at_unix, {}) END, \
+                 keep_ttl_secs = CASE WHEN key = ANY($2) THEN NULL \
+                     ELSE COALESCE(keep_ttl_secs, $4) END \
+             WHERE key LIKE $1 ESCAPE '\\' AND status = 'active'",
+            expiry_honoring_links("$3")
+        ))
+        .bind(&pattern)
+        .bind(keys)
+        .bind(self.clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64)
+        .bind(DEFAULT_KEEP_TTL_SECS as i64)
+        .execute(&mut *tx).await.context("update project asset lifetimes")?;
+        tx.commit().await.context("commit project asset lifetimes")?;
         Ok(())
     }
 
@@ -1726,13 +1787,15 @@ impl RuntimeStore {
         row.map(|r| r.to_meta()).ok_or_else(|| RuntimeStoreError::NotFound(key))
     }
 
-    /// Mint a presigned GET URL for a file, valid for a clamped TTL. The
-    /// browser/external caller streams the bytes directly from the bucket; the
-    /// broker never proxies them. Minting counts as access (bumps the expiry),
-    /// and a missing file fails the mint rather than handing out a 404 URL.
+    /// Mint a presigned GET URL signed for the bucket's PUBLIC endpoint, valid
+    /// for a clamped TTL: the browser's download lane, and the direct link when
+    /// the operator declared that endpoint internet-reachable. The caller
+    /// streams the bytes directly from the bucket; the broker never proxies
+    /// them. Minting counts as access (bumps the expiry), and a missing file
+    /// fails the mint rather than handing out a 404 URL. A node body's own
+    /// link is `download_url` with the Internal audience: the public endpoint
+    /// of a local install is the host's loopback, which a pod cannot reach.
     pub async fn presign(&self, parsed: &ParsedKey, ttl_secs: Option<u64>) -> StoreResult<String> {
-        // Handed to an EXTERNAL URL-accepting API (the node's `ctx.storage.presign`),
-        // which streams from the bucket over the public network -> External audience.
         Ok(self.presign_get(parsed, PresignAudience::External, ttl_secs).await?.1)
     }
 
@@ -1844,11 +1907,10 @@ impl RuntimeStore {
     ) -> StoreResult<(StoredFileMeta, String)> {
         let key = parsed.to_key();
         let row = self
-            .row(&key)
+            .bump_expiry(&key)
             .await
             .map_err(RuntimeStoreError::Other)?
             .ok_or_else(|| RuntimeStoreError::NotFound(key.clone()))?;
-        self.bump_expiry(&row).await.map_err(RuntimeStoreError::Other)?;
         let ttl = ttl_secs.unwrap_or(DEFAULT_PRESIGN_TTL_SECS).clamp(1, MAX_PRESIGN_TTL_SECS);
         let url = self
             .bucket
@@ -2064,4 +2126,3 @@ pub fn meta_to_stored_file(meta: &StoredFileMeta) -> StoredFile {
         filename: meta.filename.clone(),
     }
 }
-

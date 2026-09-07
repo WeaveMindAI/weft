@@ -7,6 +7,8 @@
 // WHERE the token goes (spans). The `@file` marker is reconstructed to its
 // `@file("path", Type)` source form (config never carries resolved content).
 
+import { parseWeftType } from '../../protocol';
+
 /** Structural `@file` / `@asset` reference held in a config field. The value
  *  the field resolves to lives elsewhere (host-supplied file content, or the
  *  build's asset resolution); config holds only this marker, so no path can
@@ -22,16 +24,25 @@ export function isFileRefValue(v: unknown): v is WeftFileRefValue {
     && typeof r.type === 'string' && (r.marker === 'file' || r.marker === 'asset');
 }
 
-/** A weft double-quoted string literal: backslash and quote escaped. Used for
- *  both plain string values and the path inside an `@file(...)` marker, so a
- *  path with a `"` can't produce a malformed literal. */
+/** A weft double-quoted string literal. The grammar's string is JSON's, and
+ *  the Rust side writes a marker path with `serde_json::to_string` and reads
+ *  it back with `from_str`, so `JSON.stringify` is the same function on this
+ *  side: a tab, a newline or a non-BMP character survives the round trip
+ *  instead of arriving as the two characters `\` `t`.
+ *  SYNC: quoteString/unquoteString <-> crates/weft-compiler/src/file_ref.rs (marker_text, unquote) */
 function quoteString(s: string): string {
-  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return JSON.stringify(s);
 }
 
-/** Inverse of `quoteString` for the inner (unquoted) body of a literal. */
-function unquoteString(inner: string): string {
-  return inner.replace(/\\(["\\])/g, '$1');
+/** Inverse of `quoteString` for the inner (unquoted) body of a literal.
+ *  Returns null for a body no weft string literal could have held. */
+function unquoteString(inner: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(`"${inner}"`);
+    return typeof parsed === 'string' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /** The one rule for every text-shaped control (text/textarea/password
@@ -75,8 +86,10 @@ function splitTopLevel(inner: string): string[] {
 function formatFileRef(value: WeftFileRefValue): string {
   const { path, type, marker } = value.__weftFileRef;
   const p = quoteString(path);
-  const directive = marker === 'asset' ? '@asset' : '@file';
-  return type === 'String' ? `${directive}(${p})` : `${directive}(${p}, ${type})`;
+  // `@asset` always names its type (the compiler never guesses a kind);
+  // `@file` defaults to String and omits it.
+  if (marker === 'asset') return `@asset(${p}, ${type})`;
+  return type === 'String' ? `@file(${p})` : `@file(${p}, ${type})`;
 }
 
 /** The file ref a `@file(...)` / `@asset(...)` token names, or null when
@@ -85,15 +98,23 @@ function formatFileRef(value: WeftFileRefValue): string {
  *  current files through here. */
 export function fileRefFromToken(token: string): WeftFileRefValue | null {
   // The path group accepts escaped chars so a `"` inside the path round-trips.
-  const m = token.match(/^@(file|asset)\("((?:[^"\\]|\\.)*)"(?:,\s*([A-Za-z][A-Za-z0-9_[\],| ]*))?\)$/);
+  // The type runs to the closing paren and is checked by the type parser
+  // rather than a character class: a named type's wire form (`Name=Body`)
+  // carries `=`, `{`, `:` and parentheses around a union body. Whitespace
+  // inside the arg list is tolerated, as the compiler's own parse tolerates it.
+  // SYNC: fileRefFromToken <-> crates/weft-compiler/src/file_ref.rs (parse_marker, marker_text)
+  const m = token.trim().match(/^@(file|asset)\(\s*"((?:[^"\\]|\\.)*)"\s*(?:,\s*(.+?))?\s*\)$/s);
   if (!m) return null;
-  return {
-    __weftFileRef: {
-      path: unquoteString(m[2]),
-      type: m[3] ?? 'String',
-      marker: m[1] as 'file' | 'asset',
-    },
-  };
+  const marker = m[1] as 'file' | 'asset';
+  // `@asset` never guesses a kind, so a typeless one is not a marker the
+  // compiler would accept; inventing String here showed a value for a token
+  // the server rejects. `@file` defaults to String, as the grammar does.
+  if (marker === 'asset' && m[3] === undefined) return null;
+  const type = m[3]?.trim() ?? 'String';
+  if (parseWeftType(type) === null) return null;
+  const path = unquoteString(m[2]);
+  if (path === null) return null;
+  return { __weftFileRef: { path, type, marker } };
 }
 
 /** Every file a written value names: one for a lone marker, several for a
@@ -198,7 +219,9 @@ export function parseConfigToken(token: string): unknown {
     return token.replace(/^```\n?/, '').replace(/\n?```$/, '').replaceAll('\\```', '```');
   }
   if (token.startsWith('"') && token.endsWith('"') && token.length >= 2) {
-    return unquoteString(token.slice(1, -1));
+    const text = unquoteString(token.slice(1, -1));
+    if (text === null) throw new Error(`not a string literal: ${token.slice(0, 40)}`);
+    return text;
   }
   if (token === 'true') return true;
   if (token === 'false') return false;

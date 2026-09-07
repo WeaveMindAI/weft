@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "agents"
@@ -64,7 +64,6 @@
     {
       "name": "language",
       "type": "String",
-      "exposure": "config",
       "default": "en",
       "label": "Language",
       "description": "The agent's ISO language code."
@@ -74,11 +73,7 @@
     {
       "name": "agentId",
       "type": "String",
-      "required": false,
       "description": "The minted agent's id: what Agent: Place Call takes."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

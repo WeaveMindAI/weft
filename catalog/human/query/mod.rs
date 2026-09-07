@@ -6,7 +6,9 @@ use async_trait::async_trait;
 
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::form_helpers::{build_form, form_specs, map_response_to_ports, parse_form_fields};
+use super::form_helpers::{
+    build_form, form_specs, map_response_to_ports, parse_form_fields,
+};
 
 #[derive(NodeManifest)]
 pub struct HumanQueryNode;
@@ -34,6 +36,9 @@ impl Node for HumanQueryNode {
         for (k, v) in ctx.inputs.custom() {
             input_obj.insert(k.clone(), v.clone());
         }
+        // A stored file among the prefills parks as it is: the listener
+        // hands the consumer its facts, and the files door hands out a
+        // fresh link each time the form is shown.
         let prefill = serde_json::Value::Object(input_obj);
 
         let form = build_form(&ctx.inputs, specs, "human-query", &prefill)?;

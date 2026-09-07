@@ -272,7 +272,7 @@ exactly like one a person connected.
 
 ```json
 "publishes": "postgres",
-"outputs": [{ "name": "access", "type": "Access", "required": false }]
+"outputs": [{ "name": "access", "type": "Access" }]
 ```
 
 ```rust

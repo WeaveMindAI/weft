@@ -40,7 +40,8 @@ impl Node for SlackOnReactionNode {
             "removed" => Predicate::eq("type", "reaction_removed"),
             // Both directions: one anchored pattern instead of two
             // subscriptions.
-            _ => Predicate::regex("type", "^reaction_(added|removed)$"),
+            "both" => Predicate::regex("type", "^reaction_(added|removed)$"),
+            other => weft::node_bail!("direction must be added, removed or both, got {other:?}"),
         }];
         if let Some(c) = channel.filter(|c| !c.trim().is_empty()) {
             filters.push(Predicate::eq("channel", c));

@@ -161,6 +161,14 @@ describe('applyOpsToProject: edges', () => {
     expect(drivers[0].source).toBe('text_2');
   });
 
+  it('addEdge carries the path a dereferencing wire reads', () => {
+    const p = applyOpsToProject(fixture(), ops(
+      { op: 'addEdge', source: 'text_1', sourcePort: 'value', target: 'debug_1', targetPort: 'data', scopeGroup: null, path: ['profile', 'wpm'] },
+    ), catalog);
+    const e = p.edges.find((x) => x.target === 'debug_1');
+    expect(e?.path).toEqual(['profile', 'wpm']);
+  });
+
   it('addEdge with self maps to the group inner handle', () => {
     const base = fixture();
     base.edges = base.edges.filter((e) => e.id !== 'e2');

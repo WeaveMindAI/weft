@@ -35,21 +35,22 @@ it **downstream** of the trigger.
 
 ## What runs on a fire
 
-The fired trigger's reachable outputs, plus everything those outputs depend on,
-stopping at trigger nodes. So sibling branches it cannot reach do not run, and
-neither do the other triggers in that subgraph: their output ports close, and a
-node fed by several triggers proceeds with the firing branch.
+One program: the trigger that fired, everything downstream of it, and
+everything upstream of that, stopping at other triggers on the way up. At
+fire time a trigger's outputs are the event, not a function of its inputs
+(those were read once, at activation), so a node that only feeds a trigger
+has nothing to contribute to a fire. Sibling programs it cannot reach do
+not run: every other trigger in the set is kicked with no payload, which
+closes its outputs, and the skip cascade prunes the branches that belong
+to it.
 
-That set is written into the run itself, so it holds on a resume too, and the
-rest of the file is left alone. A database or a provider shared by two programs
-emits down every wire it has, so on every fire a value does reach the other
-program's first node; the runtime drops it there without a trace, because that
-program is not this run's business. The one node outside the set that does get
-a row is your own: a node the fired trigger reaches but no output depends on
-shows as skipped with "it is outside the part of the graph this execution
-runs". That is the hint that you forgot to mark it as an output.
+That set is written into the run itself, so it holds on a resume too, and
+the rest of the file is left alone. A database or a provider shared by two
+programs emits down every wire it has, so on every fire a value does reach
+the other program's first node; the runtime drops it there without a
+trace, because that program is not this run's business.
 
-Why the runtime picks the subgraph that way, and what it buys you:
+Why the runtime picks the program that way, and what it buys you:
 [What actually runs](mental-model.md#what-actually-runs).
 
 ```mermaid
@@ -106,7 +107,8 @@ existing wire re-checked against the new shape.
 | Error | What it stops |
 |---|---|
 | `graph-cycle` | a cycle in the wire graph. Iterate with a `Loop`; exchange feedback over a bus. |
-| `trigger-in-loop` | a trigger inside a `Loop`. A trigger is an entry point, and an entry point per iteration is meaningless. |
+| `trigger-in-loop` | a trigger inside a `Loop`. A trigger is an entry point, and an entry point per iteration is meaningless. A trigger inside a plain group is fine: it fires there and the run starts from it. |
+| `infra-in-loop` | an infra node inside a `Loop`. Infra is provisioned once for the project, not once per item. |
 | `trigger-into-trigger` | a trigger wired into another trigger. There is no phase in which that delivers. |
 | `trigger-into-infra` | a trigger wired into an infra node. Provisioning happens before any fire exists. |
 

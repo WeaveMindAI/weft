@@ -50,9 +50,8 @@ pub async fn run_and_settle(project: &mut Project) -> Result<SettledRun> {
 }
 
 /// Fire an AIMED run (`weft run --target <node>` per target) and wait
-/// for it to settle. The dispatcher journals the targets' upstream
-/// closure as the run's boundary; everything a pulse reaches outside it
-/// skips with reason `outside_this_run`.
+/// for it to settle. The dispatcher kicks only the roots the targets
+/// need; pulses then run whatever those roots reach.
 pub async fn run_targeted_and_settle(
     project: &mut Project,
     targets: &[&str],

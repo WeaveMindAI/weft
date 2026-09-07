@@ -44,7 +44,6 @@ allowed = FirstInOrder {
 }
 
 reply = BaileySend {
-  _is_output: true
   _should_flow: allowed.value
   endpointUrl: whatsapp.endpointUrl
   to: ask.chatId

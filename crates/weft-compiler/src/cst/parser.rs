@@ -155,6 +155,7 @@ impl<'a> Parser<'a> {
             LineShape::Loop => self.parse_loop_decl(),
             LineShape::Include => self.parse_include_decl(),
             LineShape::Connection => self.parse_connection(),
+            LineShape::TypeDecl => self.parse_type_decl(),
             // Fields/directives are body-only; at top level they're malformed.
             LineShape::Field | LineShape::Directive | LineShape::Unknown => self.parse_error_line(),
         }
@@ -198,6 +199,21 @@ impl<'a> Parser<'a> {
             return LineShape::Unknown;
         }
 
+        // `type Name = <type>`: a scope-level type declaration. The word
+        // `type` is only a keyword in this exact shape (`type = Text {}` is
+        // still a node named `type`), so the check is on the whole head.
+        let head_is_type = self
+            .tokens
+            .get(self.pos + sig[0].0)
+            .map(|t| t.text == "type")
+            .unwrap_or(false);
+        if head_is_type
+            && matches!(sig.get(1), Some((_, K::IDENT)))
+            && matches!(sig.get(2), Some((_, K::EQ)))
+        {
+            return LineShape::TypeDecl;
+        }
+
         // Split LHS (before the first top-level operator) from the operator.
         // Accepted LHS shapes: `IDENT` (decl) or `IDENT . IDENT` (connection).
         let op_idx = sig.iter().position(|(_, k)| matches!(k, K::EQ | K::COLON));
@@ -219,11 +235,14 @@ impl<'a> Parser<'a> {
             K::EQ => match lhs.len() {
                 // `id = <rhs>`: a decl. RHS kind picks node/group/include.
                 1 if lhs[0].1 == K::IDENT || lhs[0].1 == K::KW_GROUP => self.decl_shape(&sig, op_idx),
-                // `target . port = <rhs>`: a connection. Exactly 3 LHS tokens.
-                3 if lhs[0].1 == K::IDENT && lhs[1].1 == K::DOT && lhs[2].1 == K::IDENT => {
-                    LineShape::Connection
-                }
-                // anything else (bare `=`, `a.b.c =`, `a. =`, ...) is malformed.
+                // `target . port = <rhs>`: a connection. A longer dotted
+                // chain on the left (`a.b.c =`) is routed the same way so
+                // the lowering can say what is wrong with it (a value lands
+                // on a port, never inside one).
+                n if n >= 3 && n % 2 == 1 && lhs.iter().enumerate().all(|(i, (_, k))| {
+                    if i % 2 == 0 { *k == K::IDENT } else { *k == K::DOT }
+                }) => LineShape::Connection,
+                // anything else (bare `=`, `a. =`, ...) is malformed.
                 _ => LineShape::Unknown,
             },
             _ => LineShape::Unknown,
@@ -427,11 +446,29 @@ impl<'a> Parser<'a> {
                     }
                     if self.cur() == Some(SyntaxKind::COLON) {
                         self.bump();
-                        // consume the type run up to a top-level comma/paren
+                        // consume the type run up to a top-level comma/paren.
+                        // A record type (`{ wpm: Number, read_delay: Number }`)
+                        // carries commas of its own, so a comma only ends the
+                        // port outside braces; the brace depth is tracked here
+                        // because `{`/`}` lex as structural tokens.
+                        let mut braces = 0usize;
                         loop {
                             match self.cur() {
                                 None => break,
-                                Some(SyntaxKind::COMMA) | Some(SyntaxKind::R_PAREN) => break,
+                                Some(SyntaxKind::L_BRACE) => {
+                                    braces += 1;
+                                    self.bump();
+                                }
+                                Some(SyntaxKind::R_BRACE) if braces > 0 => {
+                                    braces -= 1;
+                                    self.bump();
+                                }
+                                Some(SyntaxKind::R_BRACE) => break, // stray: not ours
+                                Some(SyntaxKind::COMMA) if braces == 0 => break,
+                                // A paren ends the run whatever the brace depth:
+                                // no type carries parens, and an unclosed `{`
+                                // must never swallow the signature's own `)`.
+                                Some(SyntaxKind::R_PAREN) => break,
                                 Some(SyntaxKind::L_PAREN) => break, // nested sig: leave to outer
                                 Some(_) => self.bump(),
                             }
@@ -540,8 +577,50 @@ impl<'a> Parser<'a> {
             LineShape::AnonGroup => self.parse_group_decl(true),
             LineShape::Loop => self.parse_loop_decl(),
             LineShape::Include => self.parse_include_decl(),
+            // Parsed wherever it appears; the lowering refuses one inside a
+            // node's braces (a type lives at the top of a scope).
+            LineShape::TypeDecl => self.parse_type_decl(),
             LineShape::Unknown => self.parse_error_line(),
         }
+    }
+
+    /// `type Name = <type>`: the head tokens, then the type run to the end
+    /// of the logical line. A record type may span lines, so a line break
+    /// only ends the run at brace depth zero (`[...]` is one lexer token
+    /// already). A `}` at depth zero is the enclosing body's close and is
+    /// left in place.
+    fn parse_type_decl(&mut self) {
+        self.builder.start_node(SyntaxKind::TYPE_DECL.into());
+        self.bump_trivia();
+        self.bump(); // `type`
+        self.bump_trivia_inline();
+        self.bump(); // Name
+        self.bump_trivia_inline();
+        self.bump(); // EQ
+        let mut braces = 0usize;
+        loop {
+            match self.cur() {
+                None => break,
+                Some(SyntaxKind::L_BRACE) => {
+                    braces += 1;
+                    self.bump();
+                }
+                Some(SyntaxKind::R_BRACE) if braces > 0 => {
+                    braces -= 1;
+                    self.bump();
+                }
+                Some(SyntaxKind::R_BRACE) => break,
+                Some(SyntaxKind::WHITESPACE)
+                    if braces == 0 && self.tokens[self.pos].text.contains('\n') =>
+                {
+                    break
+                }
+                Some(SyntaxKind::COMMENT) if braces == 0 => break,
+                Some(_) => self.bump(),
+            }
+        }
+        self.bump_trailing_same_line();
+        self.builder.finish_node();
     }
 
     /// A config field `key: value`. `_label`/`label` keys become LABEL_FIELD;
@@ -582,7 +661,7 @@ impl<'a> Parser<'a> {
             // `{ ... }` JSON object value: wrap the balanced brace-run as one
             // JSON_VALUE node (the lexer can't tag `{` as a value brace).
             Some(SyntaxKind::L_BRACE) => self.parse_json_object_value(),
-            // Inline expression: an uppercase Type followed by `(`/`{`/`->`/`.`.
+            // Inline expression: an uppercase Type followed by `(`/`{`/`->`.
             Some(SyntaxKind::IDENT) | Some(SyntaxKind::KW_GROUP) if self.looks_like_inline_expr() => {
                 self.parse_inline_expr();
             }
@@ -625,7 +704,8 @@ impl<'a> Parser<'a> {
     }
 
     /// True if the cursor begins an inline expression: `Type` then (after inline
-    /// trivia) a `(`, `{`, `->`, or `.`.
+    /// trivia) a `(`, `{`, or `->`. A bare `Name.port` is always a wire:
+    /// node identifiers may start uppercase, so a dot cannot prove creation.
     fn looks_like_inline_expr(&self) -> bool {
         // type must be uppercase-leading IDENT or Group keyword
         let is_type = self
@@ -647,7 +727,7 @@ impl<'a> Parser<'a> {
             }
             return matches!(
                 t.kind,
-                SyntaxKind::L_PAREN | SyntaxKind::L_BRACE | SyntaxKind::ARROW | SyntaxKind::DOT
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACE | SyntaxKind::ARROW
             );
         }
         false
@@ -671,18 +751,25 @@ impl<'a> Parser<'a> {
     fn parse_inline_expr(&mut self) {
         self.builder.start_node(SyntaxKind::INLINE_EXPR.into());
         self.bump(); // Type
+        // The signatures wear the same PORT_SIG_IN / PORT_SIG_OUT wrappers a
+        // HEADER gives them, so the one port lowering reads both shapes.
+        // Bare PORT_DECLs under the INLINE_EXPR once left an inline node
+        // with a signature and no ports ("no output port 'text'.
+        // Available: []").
         self.skip_inline_trivia_then(|p| {
             if p.cur() == Some(SyntaxKind::L_PAREN) {
-                p.bump_balanced_parens_as_ports();
+                p.parse_port_sig(SyntaxKind::PORT_SIG_IN);
             }
         });
         self.skip_inline_trivia_then(|p| {
             if p.cur() == Some(SyntaxKind::ARROW) {
+                p.builder.start_node(SyntaxKind::PORT_SIG_OUT.into());
                 p.bump();
                 p.bump_trivia_inline();
                 if p.cur() == Some(SyntaxKind::L_PAREN) {
                     p.bump_balanced_parens_as_ports();
                 }
+                p.builder.finish_node();
             }
         });
         // optional body
@@ -833,6 +920,8 @@ enum LineShape {
     Field,
     /// A leading `@require_one_of(...)` marker (body only).
     Directive,
+    /// `type Name = <type>` (the top of a scope: file level or a group body).
+    TypeDecl,
     /// Fits no accepted form: a malformed line, parsed as one ERROR node.
     Unknown,
 }
@@ -898,9 +987,50 @@ mod tests {
         // description + comments + blank lines
         assert_round_trip("# top comment\n\ng = Group() {\n  # does things\n  x = Text {}  # trailing\n}\n\n");
         // optional port
-        assert_round_trip("g = Group(a: String, b: Int?) -> (out: T) {}\n");
+        assert_round_trip("g = Group(a: String, b?: Int) -> (out: T) {}\n");
         // require_one_of directive
         assert_round_trip("g = Group(a: String) {\n  @require_one_of(a, b)\n}\n");
+        // record types in a signature, one port each
+        assert_round_trip("n = T(a: { x: Number, y: Number }, b: String) -> (o: { k: { m: String } })\n");
+        // type declarations: one line, multi-line record, inside a group
+        assert_round_trip("type Pair = { x: Number, y: Number }\nn = T(p: Pair)\n");
+        assert_round_trip("type Profile = {\n  wpm: Number,\n  delay: Number\n}\n");
+        assert_round_trip("g = Group() {\n  type Inner = List[String]\n  n = T(a: Inner)\n}\n");
+    }
+
+    /// A `type` line parses to a TYPE_DECL wherever it stands; the name and
+    /// body are the lowering's to read. `type = Text {}` is still a node.
+    #[test]
+    fn type_decl_shapes() {
+        let tree = parse("type Pair = {\n  x: Number,\n  y: Number\n}\nn = T(p: Pair)\n");
+        let kinds: Vec<SyntaxKind> = tree.children().map(|c| c.kind()).collect();
+        assert_eq!(kinds, [SyntaxKind::TYPE_DECL, SyntaxKind::NODE_DECL]);
+        let decl = tree.children().next().unwrap();
+        assert_eq!(decl.to_string(), "type Pair = {\n  x: Number,\n  y: Number\n}");
+
+        let tree = parse("g = Group() {\n  type Inner = List[String]\n  n = T(a: Inner)\n}\n");
+        let body = tree.children().next().unwrap().children().find(|c| c.kind() == SyntaxKind::BODY).unwrap();
+        let kinds: Vec<SyntaxKind> = body.children().map(|c| c.kind()).collect();
+        assert_eq!(kinds, [SyntaxKind::TYPE_DECL, SyntaxKind::NODE_DECL]);
+
+        let tree = parse("type = Text { value: \"x\" }\n");
+        assert_eq!(tree.children().next().unwrap().kind(), SyntaxKind::NODE_DECL);
+    }
+
+    /// A record type's own commas stay inside its PORT_DECL: two ports, not
+    /// four.
+    #[test]
+    fn record_type_in_signature_is_one_port_decl() {
+        let tree = parse("n = T(a: { x: Number, y: Number }, b: String)\n");
+        let decl = tree.children().next().unwrap();
+        let header = decl.children().find(|c| c.kind() == SyntaxKind::HEADER).unwrap();
+        let sig = header.children().find(|c| c.kind() == SyntaxKind::PORT_SIG_IN).unwrap();
+        let ports: Vec<String> = sig
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::PORT_DECL)
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(ports, ["a: { x: Number, y: Number }", "b: String"]);
     }
 
     #[test]

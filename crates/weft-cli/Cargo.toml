@@ -44,5 +44,8 @@ open = { workspace = true }
 sha2 = { workspace = true }
 ipnet = { workspace = true }
 
+[dev-dependencies]
+axum = { workspace = true }
+
 [lints]
 workspace = true

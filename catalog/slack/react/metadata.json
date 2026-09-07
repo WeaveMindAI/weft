@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "reactions:write"
@@ -42,7 +42,6 @@
     {
       "name": "remove",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -55,11 +54,7 @@
     {
       "name": "done",
       "type": "Boolean",
-      "required": false,
       "description": "True once the reaction change landed."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

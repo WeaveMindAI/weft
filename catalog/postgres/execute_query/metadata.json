@@ -1,7 +1,7 @@
 {
   "type": "PostgresExecuteQuery",
   "label": "Postgres: Query",
-  "description": "Run SQL against a Postgres database and get the rows back. The query's parameters are the node's own input ports, declared inline and read by name in the SQL: `PostgresExecuteQuery(user_id: String) { query: \"SELECT * FROM users WHERE id = $user_id\" }`. A string binds as text, a boolean as bool, a number to whichever numeric column it meets, null to any column, an object or list as jsonb; cast the placeholder for other types (`$when::timestamptz`). Several statements run as one script (no parameters, cells come back as text).",
+  "description": "Run SQL against a Postgres database and get the rows back. The query's parameters are the node's own input ports, declared inline and read by name in the SQL: `PostgresExecuteQuery(user_id: String) { query: \"SELECT * FROM users WHERE id = $user_id\" }`. A string binds as text, a boolean as bool, a number to whichever numeric column it meets, null to any column, an object or list as jsonb; cast the placeholder for other types (`$when::timestamptz`). Several statements are a script: with `$name` parameters each statement runs with the ports it names, in one transaction; without any, the script is sent whole and cells come back as text. Either way the rows of the last statement come back. Declare output ports (`-> (name: String)`) to read the first row's columns by name.",
   "tags": [
     "postgres",
     "database",
@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
         "host",
@@ -39,16 +39,15 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "required": false,
-      "description": "The answered rows keyed by column name."
+      "description": "The answered rows keyed by column name (the last statement's, for a script)."
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ],
   "features": {
-    "canAddInputPorts": true
+    "canAddInputPorts": true,
+    "canAddOutputPorts": true
   }
 }

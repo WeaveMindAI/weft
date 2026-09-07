@@ -24,7 +24,6 @@
     {
       "name": "count",
       "type": "Number",
-      "exposure": "config",
       "default": 20,
       "description": "How many recent messages to fetch."
     }
@@ -32,17 +31,12 @@
   "outputs": [
     {
       "name": "messages",
-      "type": "List[JsonDict]",
-      "required": false
+      "type": "List[JsonDict]"
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ],
-  "requires_infra": false,
-  "features": {
-    "isOutputDefault": true
-  }
+  "requires_infra": false
 }

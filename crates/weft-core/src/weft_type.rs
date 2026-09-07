@@ -166,62 +166,6 @@ impl FileKind {
 }
 
 
-/// Where a value may come from for an input, the one knob a node author
-/// sets per input. Exposure governs LITERALS: whether a literal may sit
-/// in the config braces (`M { x: 5 }`) and/or as an assignment statement
-/// (`M.x = 5`). Wires (an edge, `M { x: other.y }`, an inline expression)
-/// are a separate axis: every exposure is wireable EXCEPT `Config`, which
-/// is a pure design-time setting the graph never drives.
-// SYNC: Exposure <-> packages/weft-graph/src/protocol.ts Exposure
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Exposure {
-    /// Everything: braces literal, assignment literal, wires.
-    #[default]
-    All,
-    /// A literal only via `node.input = ...`; a braces literal is
-    /// refused. Wireable.
-    Assignment,
-    /// A literal only in the config braces. NOT wireable: the value is
-    /// design-time configuration, never graph data.
-    Config,
-    /// No literal ever: the input is driven by wires alone.
-    Wire,
-}
-
-impl Exposure {
-    /// May a literal sit in the config braces?
-    pub fn allows_braces_literal(self) -> bool {
-        matches!(self, Exposure::All | Exposure::Config)
-    }
-
-    /// May a literal be written as an assignment statement?
-    pub fn allows_assignment_literal(self) -> bool {
-        matches!(self, Exposure::All | Exposure::Assignment)
-    }
-
-    /// May the input be driven by a wire (edge, braces endpoint,
-    /// inline expression)?
-    pub fn wireable(self) -> bool {
-        !matches!(self, Exposure::Config)
-    }
-
-    /// May a literal be written at all (braces or assignment)?
-    pub fn allows_literal(self) -> bool {
-        !matches!(self, Exposure::Wire)
-    }
-
-    /// Stable lowercase tag, matching the serde/wire form.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Exposure::All => "all",
-            Exposure::Assignment => "assignment",
-            Exposure::Config => "config",
-            Exposure::Wire => "wire",
-        }
-    }
-}
-
 /// The sentinel key of the generator handle value the engine places in
 /// a consumer's input bag (`{"__weft_generator__": {"id": "<uuid>"}}`).
 /// Same shape family as the bus / stored-file / access markers. Lives
@@ -237,6 +181,17 @@ pub const GENERATOR_MARKER_KEY: &str = "__weft_generator__";
 pub struct TypeDecl {
     pub body: WeftType,
     pub nominal: bool,
+}
+
+/// What [`TypeRegistry::extended`] does with a declaration whose name the
+/// registry already holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Redeclaration {
+    /// Two packages may ship one shared type: a structurally identical
+    /// body is absorbed, a different one is a loud error.
+    AbsorbIdentical,
+    /// A source scope never redeclares a visible name, identical or not.
+    Refuse,
 }
 
 /// The named-type registry: every type NAME the parser may resolve
@@ -324,12 +279,30 @@ impl TypeRegistry {
     pub fn build(
         declarations: &[(std::string::String, std::string::String, std::string::String)],
     ) -> Result<Self, std::string::String> {
+        Self::builtin().extended(declarations, Redeclaration::AbsorbIdentical)
+    }
+
+    /// This registry plus `declarations`, resolved the way [`build`] does
+    /// (any order, fixed point, loud on a cycle or an unknown name). The
+    /// scope form: a `.weft` file, or a group body, layers its own `type`
+    /// declarations over whatever is visible around it. `policy` says
+    /// what a name already present means: a package pair restating one
+    /// shared type absorbs it, a source scope may never redeclare a name
+    /// it can already see (the metadata table included), so nothing in
+    /// the language shadows.
+    ///
+    /// [`build`]: Self::build
+    pub fn extended(
+        &self,
+        declarations: &[(std::string::String, std::string::String, std::string::String)],
+        policy: Redeclaration,
+    ) -> Result<Self, std::string::String> {
         for (name, _, origin) in declarations {
             Self::check_declarable_name(name)
                 .map_err(|e| format!("{origin}: type `{name}`: {e}"))?;
         }
 
-        let mut registry = Self::builtin();
+        let mut registry = self.clone();
         // Where each name was FIRST declared, so a clash names both
         // sides (blaming only the second sends the author to fix the
         // wrong file half the time).
@@ -364,6 +337,14 @@ impl TypeRegistry {
                             ));
                         }
                         if let Some(existing) = registry.entries.get(name.as_str()) {
+                            if policy == Redeclaration::Refuse {
+                                return Err(format!(
+                                    "{origin}: type `{name}` is already declared as \
+                                     `{}`, and a name that is visible here cannot be \
+                                     declared again; rename one",
+                                    existing.body
+                                ));
+                            }
                             if existing.nominal && existing.body == body {
                                 // Identical redeclaration: absorbed.
                             } else if existing.nominal {
@@ -868,64 +849,6 @@ impl WeftType {
         }
     }
 
-    /// The default `Exposure` for an input of this type. Plain data
-    /// (primitives, lists, dicts, JsonDict, unions of those) takes a
-    /// literal anywhere and wires (`All`), so users can paste values into
-    /// the config braces instead of wiring a separate Text node. Stored
-    /// files (alone or in containers) take a literal only as an assignment
-    /// (`n.p = @asset(..)`: nobody can hand-type a file marker into a
-    /// config field), as do TypeVar and MustOverride inputs (their
-    /// concrete type is unknown until overridden). A Bus is a live runtime
-    /// handle: wires alone. Node authors override per input via
-    /// `InputSpec::exposure` (including the `Config` mode, which no type
-    /// defaults to).
-    pub fn default_exposure(&self) -> Exposure {
-        match self {
-            WeftType::Primitive(_) => {
-                if self.references_file() { Exposure::Assignment } else { Exposure::All }
-            }
-            WeftType::List(inner) => inner.default_exposure(),
-            WeftType::Dict(_, v) => v.default_exposure(),
-            // A union is as restrictive as its most restrictive member.
-            // Only the three type-derived levels can occur here (`Config`
-            // is author-only), so the fold is: any wires-only member makes
-            // the union wires-only, else any assignment-only member makes
-            // it assignment-only, else it stays open.
-            WeftType::Union(types) => {
-                let members: Vec<Exposure> =
-                    types.iter().map(|t| t.default_exposure()).collect();
-                if members.contains(&Exposure::Wire) {
-                    Exposure::Wire
-                } else if members.contains(&Exposure::Assignment) {
-                    Exposure::Assignment
-                } else {
-                    Exposure::All
-                }
-            }
-            WeftType::JsonDict => Exposure::All,
-            // A record is as restrictive as its most restrictive field
-            // (same fold as a union's members).
-            WeftType::Record(fields) => {
-                let members: Vec<Exposure> =
-                    fields.iter().map(|f| f.ty.default_exposure()).collect();
-                if members.contains(&Exposure::Wire) {
-                    Exposure::Wire
-                } else if members.contains(&Exposure::Assignment) {
-                    Exposure::Assignment
-                } else {
-                    Exposure::All
-                }
-            }
-            WeftType::Named { body, .. } => body.default_exposure(),
-            WeftType::Bus => Exposure::Wire,
-            WeftType::Access => Exposure::Wire,
-            // A stream is a live edge between two running bodies:
-            // wires alone, like a Bus.
-            WeftType::Generator(_) => Exposure::Wire,
-            WeftType::TypeVar(_) => Exposure::Assignment,
-            WeftType::MustOverride => Exposure::Assignment,
-        }
-    }
 
     /// True when this type names a stored file as a WHOLE value: a bare
     /// file primitive, or a union whose every member is one (the
@@ -951,6 +874,11 @@ impl WeftType {
     pub fn file_control(&self) -> Option<FileControl> {
         if self.is_file_valued() {
             return Some(FileControl { file_type: self.clone(), multiple: false });
+        }
+        // A declared name over a list or a union of files offers what
+        // its body offers (`type Attachments = List[Media]`).
+        if let WeftType::Named { body, .. } = self {
+            return body.file_control();
         }
         if let WeftType::List(inner) = self {
             if inner.is_file_valued() {
@@ -1636,11 +1564,10 @@ impl WeftType {
                 }
                 for field in fields {
                     match map.get(&field.name) {
-                        // An absent key (or a present null) is fine for
-                        // an optional field, and for a field whose type
-                        // itself admits null.
-                        Some(Value::Null) | None
-                            if field.optional || field.ty.contains_null() => {}
+                        // Optional fields may be absent or null. A required
+                        // nullable field must still be present; its value
+                        // is checked against the declared type below.
+                        Some(Value::Null) | None if field.optional => {}
                         Some(v) => {
                             let len = path.len();
                             let _ = write!(path, ".{}", field.name);
@@ -1801,7 +1728,7 @@ impl WeftType {
     /// Unify a list of types into a single type.
     /// If all are identical, return that type. Otherwise, return a Union (deduplicated).
     // SYNC: unify_types <-> packages/weft-graph/src/webview/lib/types/index.ts unifyTypes
-    fn unify_types(types: &[WeftType]) -> WeftType {
+    pub fn unify_types(types: &[WeftType]) -> WeftType {
         if types.is_empty() {
             return WeftType::Primitive(WeftPrimitive::Empty);
         }
@@ -1872,6 +1799,8 @@ impl WeftType {
     /// cast must name a concrete type.
     pub fn cast_text(&self, text: &str) -> Result<serde_json::Value, std::string::String> {
         match self {
+            WeftType::Named { body, .. } => body.cast_text(text)
+                .map_err(|error| format!("{self}: {error}")),
             WeftType::Primitive(WeftPrimitive::String) => {
                 Ok(serde_json::Value::String(text.to_string()))
             }

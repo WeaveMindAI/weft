@@ -99,4 +99,4 @@ export type {
   NodeTemplate,
 } from './webview/lib/types';
 export { fieldForInput, LOOP_CONFIG_FIELDS } from './webview/lib/utils/input-field';
-export { inputExposure, isLoopNodeType } from './webview/lib/types';
+export { acceptsLiteral, acceptsWire, isLoopNodeType } from './webview/lib/types';

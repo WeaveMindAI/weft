@@ -44,6 +44,9 @@ const CREDENTIAL_PORT: u16 = 8099;
 const STORE_PATH: &str = "/store";
 const DATA_PATH: &str = "/store/pgdata";
 const SECRET_PATH: &str = "/store/secret";
+/// Where the Postgres image puts its unix socket; the credential
+/// container mounts the same directory.
+const SOCKET_PATH: &str = "/var/run/postgresql";
 /// The role Postgres creates on first boot, and the only one weft uses.
 const ADMIN_USER: &str = "weft";
 /// The group the shared disk belongs to, so the container that mints
@@ -53,7 +56,8 @@ const ADMIN_USER: &str = "weft";
 /// base image means a different number.
 const POSTGRES_GID: i64 = 70;
 // SYNC: credential routes <-> catalog/postgres/database/images/credential/bootstrap.py
-//       CREDENTIAL_PATH / CREDENTIAL_STORED_PATH / HEALTH_PATH
+//       CREDENTIAL_PATH / CREDENTIAL_STORED_PATH / HEALTH_PATH (the container's
+//       /live and /action are the dispatcher's, named by features.liveEndpoint)
 const CREDENTIAL_PATH: &str = "/credential";
 const CREDENTIAL_STORED_PATH: &str = "/credential/stored";
 const HEALTH_PATH: &str = "/health";
@@ -108,7 +112,22 @@ fn credential_env() -> Vec<EnvEntry> {
             name: "WEFT_CREDENTIAL_PORT".into(),
             value: CREDENTIAL_PORT.to_string(),
         },
+        EnvEntry::Literal { name: "WEFT_SOCKET_DIR".into(), value: SOCKET_PATH.into() },
+        EnvEntry::Literal { name: "WEFT_ADMIN_USER".into(), value: ADMIN_USER.into() },
     ]
+}
+
+/// Postgres's unix socket, shared between it and the credential
+/// container. It is the one door into the database that needs no
+/// password (initdb trusts local socket connections; only TCP asks
+/// for one), and it is how a password nobody holds any more gets
+/// replaced from the graph instead of by hand on the disk.
+fn socket_mount() -> Mount {
+    Mount {
+        volume: "socket".into(),
+        path: SOCKET_PATH.into(),
+        ..Default::default()
+    }
 }
 
 /// The file the password lives in. Named HERE and handed to both the
@@ -186,7 +205,7 @@ impl Node for PostgresDatabaseNode {
                         memory_limit: Some("2Gi".into()),
                         ..Default::default()
                     })
-                    .with_mounts(vec![store_mount()])
+                    .with_mounts(vec![store_mount(), socket_mount()])
                     // Postgres accepts TCP while it is still starting up
                     // and refuses every connection, so the port being
                     // bound is not readiness. Ask it the question it
@@ -220,7 +239,7 @@ impl Node for PostgresDatabaseNode {
                             memory_limit: Some("64Mi".into()),
                             ..Default::default()
                         })
-                        .with_mounts(vec![secret_mount()])
+                        .with_mounts(vec![secret_mount(), socket_mount()])
                         .with_readiness(
                             Probe::http(HEALTH_PATH, CREDENTIAL_PORT).with_initial_delay(2),
                         ),
@@ -234,14 +253,18 @@ impl Node for PostgresDatabaseNode {
                 },
                 ..Default::default()
             }],
-            volumes: vec![Volume {
-                name: "store".into(),
-                kind: VolumeKind::Persistent {
-                    size: storage,
-                    storage_class: None,
-                    access_modes: vec![AccessMode::ReadWriteOnce],
+            volumes: vec![
+                Volume {
+                    name: "store".into(),
+                    kind: VolumeKind::Persistent {
+                        size: storage,
+                        storage_class: None,
+                        access_modes: vec![AccessMode::ReadWriteOnce],
+                    },
                 },
-            }],
+                // The socket lives and dies with the pod.
+                Volume { name: "socket".into(), kind: VolumeKind::EmptyDir { size_limit: None } },
+            ],
             // Both cluster-internal. The credential endpoint in
             // particular is never published outside the project.
             endpoints: vec![
@@ -376,8 +399,9 @@ async fn password_from_database(
     }
     weft::node_bail!(
         "this database handed its password over once already, and no connection holds it \
-         now, so nothing can sign in to it. The data is still on its disk; recovering it \
-         means connecting to that disk yourself. Starting over instead means \
-         `weft infra terminate`, which DELETES the disk and everything on it."
+         now, so nothing can sign in to it. The data is still on its disk. Press \
+         `Reset password` on this node in the graph (the database mints a new one), then \
+         `weft infra start`: this run reads the new password and publishes a fresh \
+         connection."
     )
 }

@@ -32,13 +32,11 @@
   "outputs": [
     {
       "name": "embeddings",
-      "type": "List[List[Number]]",
-      "required": false
+      "type": "List[List[Number]]"
     },
     {
       "name": "dimensions",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

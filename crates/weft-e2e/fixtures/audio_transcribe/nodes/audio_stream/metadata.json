@@ -16,7 +16,6 @@
       "name": "audio",
       "type": "Audio",
       "required": true,
-      "exposure": "all",
       "description": "The WAV file to stream (16-bit PCM, mono)."
     }
   ],
@@ -24,13 +23,11 @@
     {
       "name": "stream",
       "type": "Bus",
-      "required": false,
       "description": "The live audio: a bytes Bus of raw 16-bit PCM frames ('audio' messages), its metadata declaring sample_rate and encoding; closed when the file ends."
     },
     {
       "name": "done",
       "type": "Boolean",
-      "required": false,
       "description": "True once the whole file has been streamed."
     }
   ],

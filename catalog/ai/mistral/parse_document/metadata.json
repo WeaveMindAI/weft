@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Mistral access (wire a MistralAccess node)."
     },
@@ -26,19 +26,16 @@
   "outputs": [
     {
       "name": "markdown",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "pages",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each page: index and markdown."
     },
     {
       "name": "pageCount",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

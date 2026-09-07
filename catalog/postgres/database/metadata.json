@@ -1,7 +1,7 @@
 {
   "type": "PostgresDatabase",
   "label": "Postgres: Database",
-  "description": "Run a Postgres database inside your project. Weft brings it up, keeps its disk across restarts, and hands you a connection to wire into the query and write nodes. The database makes its own password and weft never sees it twice. Terminating this node's infra deletes the disk and everything on it.",
+  "description": "Run a Postgres database inside your project. Weft brings it up, keeps its disk across restarts, and hands you a connection to wire into the query and write nodes. The database makes its own password and weft never sees it twice; if the connection holding it is ever lost, the node's card has a Reset password button. Terminating this node's infra deletes the disk and everything on it.",
   "tags": [
     "postgres",
     "database",
@@ -11,6 +11,9 @@
   "icon": "Database",
   "color": "#336791",
   "requires_infra": true,
+  "features": {
+    "liveEndpoint": "credential"
+  },
   "images": [
     "images/credential"
   ],
@@ -20,7 +23,6 @@
       "name": "database",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "default": "app",
       "label": "Database name",
       "description": "The database created the first time this node starts. Changing it later creates nothing: the connection would then name a database that does not exist."
@@ -29,7 +31,6 @@
       "name": "storage",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "default": "10Gi",
       "label": "Disk size",
       "description": "How much disk the database gets, read once when it is first created. Changing it here later has no effect; growing a live volume is a manual operation on it, and shrinking one is not possible."
@@ -38,7 +39,6 @@
       "name": "version",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "default": "17",
       "label": "Postgres version",
       "description": "The major version to run. Changing it on an existing database will NOT migrate the data: Postgres refuses to start on a data directory written by another major version."
@@ -48,7 +48,6 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The database's access: wire it into the Postgres query and write nodes, exactly like a PostgresAccess node's."
     }
   ]

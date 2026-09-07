@@ -71,6 +71,7 @@ pub enum SyntaxKind {
     DIRECTIVE,    // standalone @require_one_of(...) line inside a body
     LABEL_FIELD,  // _label: "..." / label: "..." (promoted to node.label)
     GROUP_DESC,   // plain `# ...` comment as the FIRST body line of a group
+    TYPE_DECL,    // `type Name = <type>` at the top of a scope
 
     #[doc(hidden)]
     __LAST,
@@ -103,7 +104,7 @@ const ALL_KINDS: &[SyntaxKind] = {
         QUESTION, IDENT, STRING, NUMBER, HEREDOC, JSON_VALUE, MARKER, KW_GROUP, KW_LOOP, ERROR,
         WEFT_FILE, NODE_DECL, GROUP_DECL, LOOP_DECL, INCLUDE_DECL, HEADER, PORT_SIG_IN, PORT_SIG_OUT,
         PORT_DECL, BODY, CONFIG_FIELD, CONNECTION, ENDPOINT, INLINE_EXPR, DIRECTIVE, LABEL_FIELD,
-        GROUP_DESC,
+        GROUP_DESC, TYPE_DECL,
     ]
 };
 

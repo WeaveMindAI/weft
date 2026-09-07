@@ -46,8 +46,8 @@ errors loudly.
 
 That is the **config-node pattern**, and the engine does nothing special for
 it: the config node emits one plain object, the consuming node declares an
-ordinary object-typed input (usually `exposure: "wire"`, so a real node must
-be wired), and reads that object itself. No input name triggers hidden
+ordinary object-typed input (usually `"accepts": ["wire"]`, so a real node
+must be wired), and reads that object itself. No input name triggers hidden
 behavior, and an object wired to an input always arrives as that object.
 
 ### Iterating

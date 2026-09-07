@@ -66,7 +66,7 @@ pub trait Journal: Send + Sync {
     async fn events_log_lossy(
         &self,
         color: Color,
-    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)>;
+    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)>;
 
     /// The same log for STATE-REBUILDING (the cancel writers, stall
     /// re-folds): a row that no longer decodes fails the WHOLE read,
@@ -76,7 +76,7 @@ pub trait Journal: Send + Sync {
         let (events, bad) = self.events_log_lossy(color).await?;
         match bad.into_iter().next() {
             Some(reason) => Err(anyhow::Error::msg(reason)),
-            None => Ok(events),
+            None => Ok(events.into_iter().map(|record| record.event).collect()),
         }
     }
 
@@ -235,6 +235,13 @@ pub trait Journal: Send + Sync {
         &self,
         color: Color,
     ) -> anyhow::Result<Option<ExecutionSummary>>;
+
+    /// Every execution color of `tenant`'s that starts with `prefix`
+    /// (the first characters of a uuid, as a person types them). At most
+    /// two come back: the caller only needs to know whether the prefix
+    /// names one execution, none, or several. Node-test colors never
+    /// match, the way they never list.
+    async fn colors_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<Color>>;
 
     /// Every color belonging to `project_id` whose journal has no
     /// terminal event yet, narrowed to one `phase` when given (the

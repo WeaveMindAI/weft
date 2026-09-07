@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/calendar.events"
@@ -66,16 +66,11 @@
   "outputs": [
     {
       "name": "eventId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "link",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

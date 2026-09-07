@@ -55,8 +55,8 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
             add_decl(view, parent_group.as_deref(), id, &format!("{id} = {node_type} {{}}"))
         }
         RemoveNode { node } => remove_node(view, node),
-        AddEdge { source, source_port, target, target_port, scope_group } => {
-            add_edge(view, scope_group.as_deref(), source, source_port, target, target_port)
+        AddEdge { source, source_port, target, target_port, scope_group, path } => {
+            add_edge(view, scope_group.as_deref(), source, source_port, target, target_port, path)
         }
         RemoveEdge { source, source_port, target, target_port, scope_group } => {
             remove_edge(view, scope_group.as_deref(), source, source_port, target, target_port)
@@ -162,10 +162,9 @@ fn validate_ident(what: &str, s: &str) -> Result<(), EditError> {
 fn validate_port_type(what: &str, ty: &str) -> Result<(), EditError> {
     // The STRUCTURAL gate runs on every spelling, parseable or not: a
     // legal weft type can still be one the header lexer cannot carry
-    // (it nests on `[...]` alone, so a two-field record `{a: String,
-    // b: T}` or a parenthesized union splits into phantom ports on
-    // reparse, verified against the real parser). Parseability decides
-    // nothing about that.
+    // (it nests on `[...]` and `{...}` only, so a parenthesized union
+    // splits into phantom ports on reparse, verified against the real
+    // parser). Parseability decides nothing about that.
     structurally_header_safe(what, ty)?;
     if weft_core::WeftType::parse(ty).is_some() {
         return Ok(());
@@ -177,10 +176,10 @@ fn validate_port_type(what: &str, ty: &str) -> Result<(), EditError> {
     // holds a typo, and dropping it would erase the author's text. Only a
     // string the header cannot carry is refused, and that was checked
     // above. A colon or a `?` INSIDE the spelling round-trips (the port
-    // parser splits on the first colon and strips one trailing `?`
-    // only), so they are allowed; a TRAILING `?` is refused because the
-    // parser would read it as the optional marker and the spelling could
-    // not come back as written.
+    // parser splits on the first colon), so they are allowed; a
+    // TRAILING `?` is refused because the port parser refuses the
+    // `name: Type?` spelling outright (`?` sits on the name), so the
+    // header could never be read back.
     if ty.trim_end().ends_with('?') {
         return Err(EditError::InvalidArgument(format!("{what} {ty:?} is not a valid type")));
     }
@@ -188,32 +187,31 @@ fn validate_port_type(what: &str, ty: &str) -> Result<(), EditError> {
 }
 
 /// What the HEADER lexer can carry as one port's type, regardless of
-/// whether it parses as a type. It nests on `[...]` ALONE: outside
-/// brackets a comma or a paren ends the port (a record with two fields,
-/// or a parenthesized union, splits into phantom ports on reparse,
-/// verified against the real parser). Braces themselves are ordinary
-/// tokens to it: `Rec={a: String}` stays one port, and only the comma a
-/// second field would bring is what breaks it, which the comma rule
-/// catches. A newline, a comment marker, a quote or a backtick would
-/// end or swallow the header. An `=` is fine: `Name=Body` is the alias
-/// form the catalog itself spells, and the header parser reads it as
-/// one type.
+/// whether it parses as a type. It nests on `[...]` and `{...}`: outside
+/// them a comma or a paren ends the port (a parenthesized union splits
+/// into phantom ports on reparse, verified against the real parser), so
+/// a record with any number of fields is one port. A newline, a comment
+/// marker, a quote or a backtick would end or swallow the header. An `=`
+/// is fine: `Name=Body` is the alias form the catalog itself spells, and
+/// the header parser reads it as one type.
 fn structurally_header_safe(what: &str, ty: &str) -> Result<(), EditError> {
     let refuse = || Err(EditError::InvalidArgument(format!("{what} {ty:?} is not a valid type")));
-    let mut depth = 0i32;
+    // A stack, not a counter: `[` must close with `]` and `{` with `}`, or
+    // the header lexer's balanced scan for the other bracket runs to end
+    // of file.
+    let mut open: Vec<char> = Vec::new();
     for c in ty.chars() {
         match c {
-            '[' => depth += 1,
-            ']' => depth -= 1,
-            ',' | '(' | ')' if depth == 0 => return refuse(),
+            '[' | '{' => open.push(c),
+            ']' if open.pop() != Some('[') => return refuse(),
+            '}' if open.pop() != Some('{') => return refuse(),
+            ']' | '}' => {}
+            ',' | '(' | ')' if open.is_empty() => return refuse(),
             '\n' | '\r' | '#' | '"' | '`' => return refuse(),
             _ => {}
         }
-        if depth < 0 {
-            return refuse();
-        }
     }
-    if depth != 0 || ty.trim().is_empty() {
+    if !open.is_empty() || ty.trim().is_empty() {
         return refuse();
     }
     Ok(())
@@ -509,9 +507,19 @@ fn body_owner_indent(body: &Body) -> String {
 }
 
 /// Append `elements` at the end of the file root (after the last child).
+/// Append `elements` as new lines at the end of the file. A file whose
+/// last byte is not a newline (`}` on the final line, no trailing
+/// newline) gets one first, so the appended statement never fuses onto
+/// that line (`}out.data = ...`).
 fn append_to_file(file: &WeftFile, elements: Vec<SyntaxElement>) {
     let count = file.syntax().children_with_tokens().count();
-    file.syntax().splice_children(count..count, elements);
+    let text = file.syntax().text().to_string();
+    let mut all = Vec::with_capacity(elements.len() + 1);
+    if !text.is_empty() && !text.ends_with('\n') {
+        all.extend(raw_token_elements(&[(SyntaxKind::WHITESPACE, "\n")]));
+    }
+    all.extend(elements);
+    file.syntax().splice_children(count..count, all);
 }
 
 /// Detach a node and the contiguous whitespace token that immediately precedes
@@ -887,13 +895,6 @@ fn remove_node(view: &FileView, node_id: &str) -> Result<(), EditError> {
     Ok(())
 }
 
-/// True if a CONNECTION node has an endpoint whose id equals `local`.
-fn connection_touches_local(conn: &SyntaxNode, local: &str) -> bool {
-    conn.children()
-        .filter(|n| n.kind() == SyntaxKind::ENDPOINT)
-        .any(|ep| ep_parts(&ep).0.as_deref() == Some(local))
-}
-
 /// (id, port) of an ENDPOINT node, via the typed view's single extractor.
 fn ep_parts(ep: &SyntaxNode) -> (Option<String>, Option<String>) {
     crate::cst::nodes::Endpoint::cast(ep.clone()).map(|e| e.parts()).unwrap_or((None, None))
@@ -919,9 +920,35 @@ fn remove_loop(view: &FileView, loop_id: &str) -> Result<(), EditError> {
 }
 
 fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditError> {
-    let local = decl.local_id().unwrap_or_default();
+    let before = source_meaning(view);
+    let scoped = view.scoped_id_of(&decl).ok_or_else(|| EditError::ContainerNotFound(id.into()))?;
     let body = decl.body().ok_or_else(|| EditError::ContainerNotFound(id.to_string()))?;
     let decl_syntax = decl.syntax();
+
+    // Reuse the scope-aware references for every spelling and every scope.
+    // The container's own `self` bindings disappear as well, including ones
+    // in a child's braces. Nested containers keep their own `self`.
+    let boundary_refs = decl_syntax.descendants().filter(|node| {
+        matches!(node.kind(), SyntaxKind::CONNECTION | SyntaxKind::CONFIG_FIELD)
+            && connection_is_boundary(node)
+            && node.ancestors().find(|ancestor| matches!(ancestor.kind(), SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL))
+                .is_some_and(|owner| owner == *decl_syntax)
+    });
+    let mut references: Vec<_> = view.connections_referencing(&decl).into_iter()
+        .chain(view.endpoint_fields_referencing(&decl)).chain(boundary_refs).collect();
+    let mut seen = std::collections::HashSet::new();
+    references.retain(|reference| seen.insert(reference.clone()));
+    // Clear inner references before an enclosing inline is serialized into
+    // a named orphan, so serialization cannot revive a deleted wire.
+    references.sort_by_key(|reference| std::cmp::Reverse(reference.ancestors().count()));
+    for reference in references {
+        if reference.parent().is_none() { continue; }
+        if let Some(inline) = reference.children().find_map(InlineExpr::cast) {
+            extract_inline(view, &inline, false)?;
+        } else {
+            detach_body_member(&reference);
+        }
+    }
 
     let group_indent = leading_indent(decl_syntax);
     let inner_indent = format!("{group_indent}  ");
@@ -929,7 +956,7 @@ fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditErr
     let mut moved_src = String::new();
     for child in body.syntax().children() {
         match child.kind() {
-            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL | SyntaxKind::INCLUDE_DECL => {
+            SyntaxKind::NODE_DECL | SyntaxKind::GROUP_DECL | SyntaxKind::LOOP_DECL | SyntaxKind::INCLUDE_DECL | SyntaxKind::TYPE_DECL => {
                 moved_src.push_str(&dedent_block(&child.to_string(), &inner_indent));
                 moved_src.push('\n');
             }
@@ -945,13 +972,6 @@ fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditErr
         }
     }
     let parent = decl_syntax.parent().unwrap_or_else(|| view.file().syntax().clone());
-    let external: Vec<SyntaxNode> = parent
-        .children()
-        .filter(|n| n.kind() == SyntaxKind::CONNECTION && connection_touches_local(n, &local))
-        .collect();
-    for c in external {
-        detach_with_leading_ws(&c);
-    }
     // Replace the group with the ungrouped children, in the SLOT the group
     // occupied (children stay where the group was, not appended at the end like
     // `move_scope` does, so order relative to siblings is preserved). The children
@@ -976,14 +996,13 @@ fn remove_container(view: &FileView, decl: Decl, id: &str) -> Result<(), EditErr
     if !moved_src.is_empty() {
         parent.splice_children(start..start, snippet_elements(&format!("{lead_breaks}{moved_src}")));
     }
-    Ok(())
+    check_scope_meaning(view, &before, &scoped, None)
 }
 
 /// True if a connection INSIDE the group body is boundary wiring, i.e. it has a
 /// `self` endpoint (`self.x = ...` / `... = self.x`). A connection is the only
-/// internal boundary form; the EXTERNAL legs (parent-scope connections that name
-/// the group's port) are detached separately by the caller via
-/// `connection_touches_local`. We must NOT also drop an inner connection that
+/// internal boundary form; external legs are found by the scope-aware
+/// FileView reference queries. We must NOT also drop an inner connection that
 /// merely names the group's local id: inside the body that id resolves to a
 /// CHILD of the same name (Weft's same-scope rule), so a real wire between two
 /// children where one shadows the group name would be wrongly discarded.
@@ -1841,6 +1860,7 @@ fn add_edge(
     source_port: &str,
     target: &str,
     target_port: &str,
+    path: &[String],
 ) -> Result<(), EditError> {
     // An endpoint naming an INLINE node (fan-out from its output, a wire
     // into one of its inputs) de-inlines it first, keeping its existing
@@ -1848,6 +1868,8 @@ fn add_edge(
     let source = deinline_endpoint(view, scope_group, source)?;
     let target = deinline_endpoint(view, scope_group, target)?;
     let (source, target) = (source.as_str(), target.as_str());
+    // Validate the scope even when an in-place rewire needs no insertion.
+    let insertion_target = target_body(view, scope_group)?;
     // Both endpoints must exist (or be `self`). Refs are SCOPE-LOCAL: `x`
     // inside scope `G` means `G.x`, not a file-wide `x`.
     require_endpoint(view, scope_group, source)?;
@@ -1857,10 +1879,48 @@ fn add_edge(
     // would carry structure into the connection line and inject source.
     validate_ident("source port", source_port)?;
     validate_ident("target port", target_port)?;
+    for key in path {
+        validate_ident("path key", key)?;
+    }
+    let mut rhs = format!("{source}.{source_port}");
+    for key in path {
+        rhs.push('.');
+        rhs.push_str(key);
+    }
+    // A port already driven by a plain wire keeps the spelling it was
+    // written in: the statement's right-hand side, or the braces
+    // field's value, is swapped in place (a rewire, a key read off the
+    // same source). Anything else (an inline driver, an unwired port)
+    // clears the driver and writes a fresh statement.
+    let is_plain_wire = |n: &SyntaxNode| {
+        n.children().any(|c| c.kind() == SyntaxKind::ENDPOINT)
+            && !n.children().any(|c| c.kind() == SyntaxKind::INLINE_EXPR)
+    };
+    let literal_driver_error = || EditError::InvalidArgument(format!(
+        "cannot wire '{target}.{target_port}': it has an explicit literal; clear the value first"
+    ));
+    if let Ok(conn) = find_connection(view, scope_group, target, target_port, None, None) {
+        if crate::cst::nodes::connection_is_config_origin(&conn, None, None) {
+            return Err(literal_driver_error());
+        }
+        if is_plain_wire(&conn) {
+            return replace_connection_rhs(&conn, &rhs);
+        }
+    }
+    if let Some(decl) = resolve_in_scope(view, scope_group, target) {
+        for field in find_fields(&decl, target_port) {
+            if is_plain_wire(&field) {
+                return replace_value_after(&field, SyntaxKind::COLON, &rhs);
+            }
+            if !field.children().any(|child| child.kind() == SyntaxKind::INLINE_EXPR) {
+                return Err(literal_driver_error());
+            }
+        }
+    }
     // Remove the existing driver of this target port in the same scope.
     remove_driver(view, scope_group, target, target_port)?;
-    let conn = format!("{target}.{target_port} = {source}.{source_port}");
-    match target_body(view, scope_group)? {
+    let conn = format!("{target}.{target_port} = {rhs}");
+    match insertion_target {
         InsertTarget::FileRoot(f) => {
             append_to_file(&f, snippet_elements(&format!("{conn}\n")));
             Ok(())
@@ -1883,7 +1943,8 @@ fn add_edge(
 /// in an UNRELATED scope; the two-probe rule is scope-local, immediate match
 /// winning.
 /// SYNC: require_endpoint <-> crates/weft-compiler/src/weft_compiler.rs
-/// rescope_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to
+/// rescope_endpoint, crates/weft-compiler/src/cst/nodes.rs endpoint_resolves_to,
+/// packages/weft-graph/src/webview/lib/projection/apply.ts resolveEndpoint
 fn require_endpoint(view: &FileView, scope_group: Option<&str>, id: &str) -> Result<(), EditError> {
     // An anon inline-node id (`host__key`; `__` is reserved in source
     // identifiers, so nothing else carries it) cannot be an endpoint:
@@ -2181,7 +2242,8 @@ fn rename_container(
     // "references this decl" means). An endpoint resolving to the container
     // has its head IDENT (the old LOCAL label) replaced. Collect the
     // connection handles first (resolve-then-mutate), then rewrite.
-    let refs = view.connections_referencing(&decl);
+    let refs: Vec<_> = view.connections_referencing(&decl).into_iter()
+        .chain(view.endpoint_fields_referencing(&decl)).collect();
     replace_token_text(&id_tok, new_label);
     for c in refs {
         for ep in c.children().filter(|n| n.kind() == SyntaxKind::ENDPOINT) {
@@ -2344,8 +2406,97 @@ fn value_elements(value: &str) -> Result<Vec<SyntaxElement>, EditError> {
     Ok(raw_token_elements(&pairs))
 }
 
+/// Use the compiler's actual name/type resolution for scope edits. No file I/O
+/// is needed; unresolved external files remain the same diagnostics on both
+/// sides. Reimplementing an alias resolver in the editor would drift.
+fn source_meaning(view: &FileView) -> (weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::CompileError>) {
+    crate::weft_compiler::compile_lenient(
+        &view.file().syntax().to_string(), uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::none(), crate::weft_compiler::IncludeMode::Full,
+        Some(view.source_id()),
+    )
+}
+
+fn check_scope_meaning(
+    view: &FileView,
+    before: &(weft_core::project::ProjectDefinition, Vec<crate::weft_compiler::CompileError>),
+    from: &str,
+    to: Option<&str>,
+) -> Result<(), EditError> {
+    let after = source_meaning(view);
+    let mut prior_errors = std::collections::HashMap::<&str, usize>::new();
+    for error in &before.1 { *prior_errors.entry(&error.message).or_default() += 1; }
+    for error in &after.1 {
+        if let Some(count) = prior_errors.get_mut(error.message.as_str()) {
+            if *count > 0 { *count -= 1; continue; }
+        }
+        return Err(EditError::InvalidArgument(format!(
+            "scope change would make the source invalid: {}", error.message
+        )));
+    }
+    let after_nodes: std::collections::HashMap<_, _> = after.0.nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let parent = from.rsplit_once('.').map(|(parent, _)| parent).unwrap_or("");
+    for node in &before.0.nodes {
+        let next_id = match node.id.strip_prefix(from) {
+            Some(suffix) if suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with("__") => {
+                match to {
+                    Some(target) => format!("{target}{suffix}"),
+                    None if suffix.starts_with('.') => {
+                        if parent.is_empty() { suffix[1..].to_string() } else { format!("{parent}{suffix}") }
+                    }
+                    None => continue, // the removed container's own boundary nodes
+                }
+            }
+            _ => node.id.clone(),
+        };
+        let Some(next) = after_nodes.get(next_id.as_str()) else {
+            // Extracting an anonymous inline changes its generated identity.
+            // Named children must survive a move or an ungroup unchanged.
+            if node.id.contains("__") { continue; }
+            return Err(EditError::InvalidArgument(format!("scope change would lose node '{}'", node.id)));
+        };
+        let next_ports: std::collections::HashMap<_, _> = port_contracts(next)
+            .map(|(side, port)| ((side, port.name.as_str()), port)).collect();
+        for (side, port) in port_contracts(node) {
+                if port.port_type == weft_core::WeftType::MustOverride { continue; }
+                if !next_ports.get(&(side, port.name.as_str()))
+                    .is_some_and(|new| new.port_type == port.port_type && new.required == port.required) {
+                    return Err(EditError::InvalidArgument(format!(
+                        "scope change would change {side} '{}.{}' ({}); keep its type declaration in scope",
+                        node.id, port.name, port.port_type.wire_string(),
+                    )));
+                }
+        }
+        let marker_counts = |definition: &weft_core::project::NodeDefinition| {
+            let mut counts = std::collections::HashMap::<String, usize>::new();
+            for value in definition.config.as_object().into_iter().flat_map(|map| map.values())
+                .chain(definition.port_literals.values()) {
+                for reference in crate::file_ref::refs_in_value(value) {
+                    *counts.entry(reference.resolution_key()).or_default() += 1;
+                }
+            }
+            counts
+        };
+        let next_refs = marker_counts(next);
+        for (reference, count) in marker_counts(node) {
+            if next_refs.get(&reference).copied().unwrap_or(0) < count {
+                return Err(EditError::InvalidArgument(format!(
+                    "scope change would change a file reference's declared type on '{}'; keep its type declaration in scope", node.id,
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn port_contracts(node: &weft_core::project::NodeDefinition)
+    -> impl Iterator<Item = (&'static str, &weft_core::project::PortDefinition)> {
+    node.inputs.iter().map(|input| ("input", &input.port))
+        .chain(node.outputs.iter().map(|output| ("output", output)))
+}
+
 /// Move a node/group into a target scope (None = file root). Detach the decl's
-/// subtree (as text, re-indented) and re-insert it in the target.
+/// subtree (as text, re-indented) and re-insert it without changing its bindings.
 fn move_scope(
     view: &FileView,
     id: &str,
@@ -2402,6 +2553,10 @@ fn move_scope(
     // (would make two same-id decls), before mutating anything.
     reject_if_taken(view, target_group, &local)?;
 
+    let before = source_meaning(view);
+    let previous_id = scoped.as_deref().ok_or_else(|| EditError::NodeNotFound(id.into()))?;
+    let next_id = target_group.map(|parent| format!("{parent}.{local}")).unwrap_or_else(|| local.clone());
+
     // The node's connection-origin config fields (`x.style = "v"`, separate
     // CONNECTION lines in the CURRENT scope) belong to the node and travel with
     // it; collect them first.
@@ -2417,11 +2572,23 @@ fn move_scope(
     let blocking: Vec<SyntaxNode> = view.connections_referencing(&decl)
         .into_iter()
         .filter(|c| !origin_fields.iter().any(|o| o == c))
+        .chain(view.endpoint_fields_referencing(&decl))
         .collect();
-    if !blocking.is_empty() {
+    // A plain node also owns implicit-target wires in its braces (including
+    // nested inline nodes). Containers carry their body wiring with them.
+    let incoming = if matches!(decl, Decl::Node(_)) {
+        decl.body().map(|body| body.syntax().descendants().filter(|node| {
+            match node.kind() {
+                SyntaxKind::CONFIG_FIELD => node.children().any(|n| n.kind() == SyntaxKind::ENDPOINT),
+                SyntaxKind::CONNECTION => node.children().filter(|n| n.kind() == SyntaxKind::ENDPOINT).count() > 1,
+                _ => false,
+            }
+        }).count()).unwrap_or(0)
+    } else { 0 };
+    if !blocking.is_empty() || incoming != 0 {
         return Err(EditError::InvalidArgument(format!(
             "cannot move '{id}': it is wired by {} connection(s) that would cross the scope boundary; disconnect them first",
-            blocking.len()
+            blocking.len() + incoming
         )));
     }
     // Each origin field's text owns its leading newline trivia; trim block edges
@@ -2449,13 +2616,13 @@ fn move_scope(
     match target_body(view, target_group)? {
         InsertTarget::FileRoot(f) => {
             append_to_file(&f, snippet_elements(&format!("\n{combined}\n")));
-            Ok(())
         }
         InsertTarget::GroupBody { body, indent } => {
             let reindented = indent_block(&combined, &indent);
-            insert_before_close(&body, snippet_elements(&format!("{reindented}\n")))
+            insert_before_close(&body, snippet_elements(&format!("{reindented}\n")))?;
         }
     }
+    check_scope_meaning(view, &before, previous_id, Some(&next_id))
 }
 
 /// The connection-origin config fields (`{local}.key = value` CONNECTION lines)
@@ -2625,9 +2792,23 @@ fn update_node_ports(
 /// then reparsed, so both are validated at the door: the NAME must be a
 /// single identifier, and the TYPE must actually parse as a type.
 fn validate_port_sigs(inputs: &[PortSig], outputs: &[PortSig]) -> Result<(), EditError> {
-    for p in inputs.iter().chain(outputs.iter()) {
-        validate_ident("port name", &p.name)?;
-        validate_port_type("port type", &p.port_type)?;
+    for (side, ports) in [("input", inputs), ("output", outputs)] {
+        let mut names = std::collections::HashSet::new();
+        for p in ports {
+            validate_ident("port name", &p.name)?;
+            validate_port_type("port type", &p.port_type)?;
+            if !names.insert(&p.name) {
+                return Err(EditError::InvalidArgument(format!("duplicate {side} port '{}'", p.name)));
+            }
+        }
+    }
+    // An output has no optionality, so the header never carries `?` on
+    // one; a sig asking for it would author a line the parser refuses.
+    if let Some(p) = outputs.iter().find(|p| !p.required) {
+        return Err(EditError::InvalidArgument(format!(
+            "output port {:?} cannot be optional: an output carries no `?`",
+            p.name
+        )));
     }
     Ok(())
 }
@@ -2841,7 +3022,7 @@ fn build_signature(inputs: &[PortSig], outputs: &[PortSig]) -> String {
     let fmt = |p: &PortSig| {
         let ty = p.port_type.as_str();
         let opt = if p.required { "" } else { "?" };
-        format!("{}: {ty}{opt}", p.name)
+        format!("{}{opt}: {ty}", p.name)
     };
     let ins: Vec<String> = inputs.iter().map(fmt).collect();
     let outs: Vec<String> = outputs.iter().map(fmt).collect();

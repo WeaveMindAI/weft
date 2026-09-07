@@ -1,2868 +1,2828 @@
 {
- "id": "2c65676f-ac18-496c-8e61-2d4a170d2f00",
- "nodes": [
-  {
-   "id": "telegram",
-   "nodeType": "TelegramAccess",
-   "label": null,
-   "config": {},
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
+  "id": "2c65676f-ac18-496c-8e61-2d4a170d2f00",
+  "nodes": [
     {
-     "name": "account",
-     "portType": "Access",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "access",
-      "service": "telegram"
-     },
-     "label": "Bot",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "access",
-     "portType": "Access",
-     "required": false,
-     "description": "The bot's access: wire it into Telegram action nodes."
-    }
-   ],
-   "features": {},
-   "requiresInfra": false,
-   "span": {
-    "startLine": 14,
-    "startColumn": 0,
-    "endLine": 14,
-    "endColumn": 25
-   },
-   "headerSpan": {
-    "startLine": 14,
-    "startColumn": 0,
-    "endLine": 14,
-    "endColumn": 25
-   }
-  },
-  {
-   "id": "fal",
-   "nodeType": "FalAccess",
-   "label": null,
-   "config": {},
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "access",
-      "service": "fal"
-     },
-     "label": "Account",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "access",
-     "portType": "Access",
-     "required": false,
-     "description": "The fal access: wire it into the media nodes."
-    }
-   ],
-   "features": {},
-   "requiresInfra": false,
-   "span": {
-    "startLine": 15,
-    "startColumn": 0,
-    "endLine": 15,
-    "endColumn": 15
-   },
-   "headerSpan": {
-    "startLine": 15,
-    "startColumn": 0,
-    "endLine": 15,
-    "endColumn": 15
-   }
-  },
-  {
-   "id": "pg",
-   "nodeType": "PostgresDatabase",
-   "label": null,
-   "config": {
-    "database": "imagebot"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "database",
-     "portType": "String",
-     "required": false,
-     "description": "The database created the first time this node starts. Changing it later creates nothing: the connection would then name a database that does not exist.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text"
-     },
-     "default": "app",
-     "label": "Database name",
-     "fromSpec": true
-    },
-    {
-     "name": "storage",
-     "portType": "String",
-     "required": false,
-     "description": "How much disk the database gets, read once when it is first created. Changing it here later has no effect; growing a live volume is a manual operation on it, and shrinking one is not possible.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text"
-     },
-     "default": "10Gi",
-     "label": "Disk size",
-     "fromSpec": true
-    },
-    {
-     "name": "version",
-     "portType": "String",
-     "required": false,
-     "description": "The major version to run. Changing it on an existing database will NOT migrate the data: Postgres refuses to start on a data directory written by another major version.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text"
-     },
-     "default": "17",
-     "label": "Postgres version",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "access",
-     "portType": "Access",
-     "required": false,
-     "description": "The database's access: wire it into the Postgres query and write nodes, exactly like a PostgresAccess node's."
-    }
-   ],
-   "features": {},
-   "requiresInfra": true,
-   "images": [
-    "images/credential"
-   ],
-   "publishedService": {
-    "service": "postgres",
-    "label": "Postgres",
-    "grants": "coexisting",
-    "acquisition": {
-     "kind": "static",
-     "fields": [
-      {
-       "name": "host",
-       "label": "Host",
-       "secret": false,
-       "placeholder": "db.example.com"
+      "id": "telegram",
+      "nodeType": "TelegramAccess",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
       },
-      {
-       "name": "port",
-       "label": "Port",
-       "optional": true,
-       "secret": false,
-       "placeholder": "5432"
-      },
-      {
-       "name": "database",
-       "label": "Database",
-       "secret": false,
-       "placeholder": "postgres"
-      },
-      {
-       "name": "user",
-       "label": "User",
-       "secret": false,
-       "placeholder": "postgres"
-      },
-      {
-       "name": "password",
-       "label": "Password",
-       "secret": true
-      },
-      {
-       "name": "sslmode",
-       "label": "TLS",
-       "optional": true,
-       "secret": false,
-       "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
-      }
-     ]
-    },
-    "auth": [],
-    "identity": "{user}@{host}/{database}"
-   },
-   "span": {
-    "startLine": 17,
-    "startColumn": 0,
-    "endLine": 17,
-    "endColumn": 46
-   },
-   "headerSpan": {
-    "startLine": 17,
-    "startColumn": 0,
-    "endLine": 17,
-    "endColumn": 22
-   },
-   "configSpans": {
-    "database": {
-     "span": {
-      "startLine": 17,
-      "startColumn": 24,
-      "endLine": 17,
-      "endColumn": 45
-     },
-     "origin": "inline"
-    }
-   }
-  },
-  {
-   "id": "ask",
-   "nodeType": "TelegramReceiveMessage",
-   "label": null,
-   "config": {},
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": true,
-     "description": "The Telegram bot access (wire a TelegramAccess node).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "chatId",
-     "portType": "String",
-     "required": false,
-     "description": "Only fire on messages in this chat. Empty = every chat the bot is in.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text"
-     },
-     "label": "Chat id",
-     "fromSpec": true
-    },
-    {
-     "name": "keyword",
-     "portType": "String",
-     "required": false,
-     "description": "Only fire when the text contains this.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text"
-     },
-     "label": "Contains",
-     "fromSpec": true
-    },
-    {
-     "name": "intervalSecs",
-     "portType": "Number",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": null,
-      "max": null,
-      "step": null
-     },
-     "default": 5,
-     "label": "Check every (seconds)",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "text",
-     "portType": "String",
-     "required": false
-    },
-    {
-     "name": "chatId",
-     "portType": "String",
-     "required": false
-    },
-    {
-     "name": "user",
-     "portType": "String",
-     "required": false,
-     "description": "The sender's username."
-    },
-    {
-     "name": "messageId",
-     "portType": "Number",
-     "required": false
-    },
-    {
-     "name": "message",
-     "portType": "JsonDict",
-     "required": false,
-     "description": "The full Telegram message object."
-    }
-   ],
-   "features": {
-    "isTrigger": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 19,
-    "startColumn": 0,
-    "endLine": 19,
-    "endColumn": 57
-   },
-   "headerSpan": {
-    "startLine": 19,
-    "startColumn": 0,
-    "endLine": 19,
-    "endColumn": 29
-   }
-  },
-  {
-   "id": "sorry",
-   "nodeType": "TelegramSendMessage",
-   "label": null,
-   "config": {
-    "_is_output": true
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": true,
-     "description": "The Telegram bot access (wire a TelegramAccess node).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "chatId",
-     "portType": "String",
-     "required": true,
-     "description": "The chat/channel to send to (the bot must be a member).",
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     },
-     "label": "Chat ID",
-     "placeholder": "123456789 or @channelname",
-     "fromSpec": true
-    },
-    {
-     "name": "text",
-     "portType": "String",
-     "required": true,
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "label": "Text",
-     "fromSpec": true
-    },
-    {
-     "name": "parseMode",
-     "portType": "String",
-     "required": false,
-     "description": "How Telegram renders the text.",
-     "exposure": "config",
-     "widget": {
-      "kind": "select",
-      "options": [
-       "plain",
-       "MarkdownV2",
-       "HTML"
-      ]
-     },
-     "default": "plain",
-     "label": "Formatting",
-     "fromSpec": true
-    },
-    {
-     "name": "buttons",
-     "portType": "List[JsonDict]",
-     "required": false,
-     "description": "Link buttons under the message: [{\"label\": \"Open\", \"url\": \"https://...\"}].",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "label": "Link buttons",
-     "fromSpec": true
-    },
-    {
-     "name": "replyTo",
-     "portType": "Number",
-     "required": false,
-     "exposure": "all",
-     "widget": {
-      "kind": "number",
-      "min": null,
-      "max": null,
-      "step": null
-     },
-     "label": "Reply to message id",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "messageId",
-     "portType": "Number",
-     "required": false,
-     "description": "The sent message's id."
-    }
-   ],
-   "features": {
-    "isOutputDefault": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 46,
-    "startColumn": 0,
-    "endLine": 51,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 46,
-    "startColumn": 0,
-    "endLine": 46,
-    "endColumn": 28
-   },
-   "configSpans": {
-    "_is_output": {
-     "span": {
-      "startLine": 47,
-      "startColumn": 2,
-      "endLine": 47,
-      "endColumn": 18
-     },
-     "origin": "inline"
-    }
-   }
-  },
-  {
-   "id": "picture",
-   "nodeType": "FalGenerateImage",
-   "label": null,
-   "config": {
-    "imageSize": "square_hd",
-    "model": "fal-ai/flux/dev"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": true,
-     "description": "The fal access (wire a FalAccess node).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "prompt",
-     "portType": "String",
-     "required": true,
-     "description": "What the image should show.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "model",
-     "portType": "String",
-     "required": false,
-     "description": "The fal model route (fal.ai/models).",
-     "exposure": "config",
-     "widget": {
-      "kind": "remote_select",
-      "access": "account",
-      "sources": [
-       {
-        "kind": "list",
-        "get": "https://api.fal.ai/v1/models?status=active&category=text-to-image&q={query}",
-        "items": "models",
-        "label": "endpoint_id",
-        "value": "endpoint_id",
-        "page": {
-         "cursor_param": "cursor",
-         "cursor_path": "next_cursor"
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "access",
+            "service": "telegram"
+          },
+          "label": "Bot",
+          "fromSpec": true
         },
-        "public": true
-       }
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
       ],
-      "free_text": true
-     },
-     "default": "fal-ai/flux/dev",
-     "label": "Model",
-     "placeholder": "Pick a model, or paste a fal route",
-     "fromSpec": true
-    },
-    {
-     "name": "imageSize",
-     "portType": "String",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "select",
-      "options": [
-       "square_hd",
-       "square",
-       "portrait_4_3",
-       "portrait_16_9",
-       "landscape_4_3",
-       "landscape_16_9"
-      ]
-     },
-     "default": "landscape_4_3",
-     "label": "Image size",
-     "fromSpec": true
-    },
-    {
-     "name": "count",
-     "portType": "Number",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": 1.0,
-      "max": 8.0,
-      "step": 1.0
-     },
-     "default": 1,
-     "label": "Images",
-     "fromSpec": true
-    },
-    {
-     "name": "seed",
-     "portType": "Number",
-     "required": false,
-     "description": "Fixed seed for reproducible output.",
-     "exposure": "all",
-     "widget": {
-      "kind": "number",
-      "min": null,
-      "max": null,
-      "step": null
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "params",
-     "portType": "JsonDict",
-     "required": false,
-     "description": "Model-specific extras merged into the request (guidance_scale, num_inference_steps, ...). Declared knobs win.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "images",
-     "portType": "List[Image]",
-     "required": false,
-     "description": "Every generated image."
-    },
-    {
-     "name": "image",
-     "portType": "Image",
-     "required": false,
-     "description": "The first generated image."
-    }
-   ],
-   "features": {
-    "isOutputDefault": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 65,
-    "startColumn": 0,
-    "endLine": 70,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 65,
-    "startColumn": 0,
-    "endLine": 65,
-    "endColumn": 27
-   },
-   "configSpans": {
-    "imageSize": {
-     "span": {
-      "startLine": 67,
-      "startColumn": 2,
-      "endLine": 67,
-      "endColumn": 24
-     },
-     "origin": "inline"
-    },
-    "model": {
-     "span": {
-      "startLine": 66,
-      "startColumn": 2,
-      "endLine": 66,
-      "endColumn": 26
-     },
-     "origin": "inline"
-    }
-   }
-  },
-  {
-   "id": "reply",
-   "nodeType": "TelegramSendMedia",
-   "label": null,
-   "config": {
-    "_is_output": true,
-    "kind": "photo"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": true,
-     "description": "The Telegram bot access (wire a TelegramAccess node).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "chatId",
-     "portType": "String",
-     "required": true,
-     "description": "The chat to address (a user's or group's id; the receive trigger emits it).",
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     },
-     "label": "Chat id",
-     "fromSpec": true
-    },
-    {
-     "name": "file",
-     "portType": "File",
-     "required": true,
-     "exposure": "assignment",
-     "widget": {
-      "kind": "file_drop",
-      "accept": null,
-      "type": "File"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "kind",
-     "portType": "String",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "select",
-      "options": [
-       "photo",
-       "document",
-       "voice",
-       "video",
-       "audio"
-      ]
-     },
-     "default": "document",
-     "label": "Send as",
-     "fromSpec": true
-    },
-    {
-     "name": "caption",
-     "portType": "String",
-     "required": false,
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "label": "Caption",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "messageId",
-     "portType": "Number",
-     "required": false
-    }
-   ],
-   "features": {
-    "isOutputDefault": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 72,
-    "startColumn": 0,
-    "endLine": 79,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 72,
-    "startColumn": 0,
-    "endLine": 72,
-    "endColumn": 26
-   },
-   "configSpans": {
-    "_is_output": {
-     "span": {
-      "startLine": 73,
-      "startColumn": 2,
-      "endLine": 73,
-      "endColumn": 18
-     },
-     "origin": "inline"
-    },
-    "kind": {
-     "span": {
-      "startLine": 74,
-      "startColumn": 2,
-      "endLine": 74,
-      "endColumn": 15
-     },
-     "origin": "inline"
-    }
-   }
-  },
-  {
-   "id": "join",
-   "nodeType": "HumanTrigger",
-   "label": null,
-   "config": {
-    "fields": [
-     {
-      "key": "telegramId",
-      "kind": "text_input",
-      "label": "Telegram id"
-     },
-     {
-      "key": "credits",
-      "kind": "text_input",
-      "label": "Starting credits"
-     }
-    ],
-    "title": "Add a user"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "title",
-     "portType": "String",
-     "required": false,
-     "description": "Title the user sees at the top of the form.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text"
-     },
-     "label": "Title",
-     "placeholder": "Submit",
-     "fromSpec": true
-    },
-    {
-     "name": "description",
-     "portType": "String",
-     "required": false,
-     "description": "Description shown under the title.",
-     "exposure": "config",
-     "widget": {
-      "kind": "textarea"
-     },
-     "label": "Description",
-     "fromSpec": true
-    },
-    {
-     "name": "fields",
-     "portType": "List[JsonDict]",
-     "required": true,
-     "description": "Each field contributes an output port per its kind (see the node's portsFromConfig).",
-     "exposure": "config",
-     "widget": {
-      "kind": "entry_list"
-     },
-     "label": "Form fields",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "telegramId",
-     "portType": "String",
-     "required": false
-    },
-    {
-     "name": "credits",
-     "portType": "String",
-     "required": false
-    }
-   ],
-   "features": {
-    "isTrigger": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 85,
-    "startColumn": 0,
-    "endLine": 91,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 85,
-    "startColumn": 0,
-    "endLine": 85,
-    "endColumn": 20
-   },
-   "configSpans": {
-    "fields": {
-     "span": {
-      "startLine": 87,
-      "startColumn": 2,
-      "endLine": 90,
-      "endColumn": 3
-     },
-     "origin": "inline"
-    },
-    "title": {
-     "span": {
-      "startLine": 86,
-      "startColumn": 2,
-      "endLine": 86,
-      "endColumn": 21
-     },
-     "origin": "inline"
-    }
-   }
-  },
-  {
-   "id": "table",
-   "nodeType": "PostgresExecuteQuery",
-   "label": null,
-   "config": {},
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": true,
-     "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true,
-     "requiresValues": [
-      "host",
-      "database",
-      "user",
-      "password"
-     ]
-    },
-    {
-     "name": "query",
-     "portType": "String",
-     "required": true,
-     "exposure": "all",
-     "widget": {
-      "kind": "code",
-      "language": "sql"
-     },
-     "label": "SQL",
-     "placeholder": "SELECT * FROM users WHERE email = $1",
-     "fromSpec": true
-    },
-    {
-     "name": "params",
-     "portType": "List[String | Number | Boolean | Null | JsonDict]",
-     "required": false,
-     "description": "Values for $1, $2, ... A string binds as text, a number to whichever numeric column it meets, null to any column, an object as jsonb; cast in the SQL for other types.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "rows",
-     "portType": "List[JsonDict]",
-     "required": false,
-     "description": "The answered rows keyed by column name."
-    },
-    {
-     "name": "count",
-     "portType": "Number",
-     "required": false
-    }
-   ],
-   "features": {},
-   "requiresInfra": false,
-   "span": {
-    "startLine": 95,
-    "startColumn": 0,
-    "endLine": 98,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 95,
-    "startColumn": 0,
-    "endLine": 95,
-    "endColumn": 29
-   },
-   "portLiterals": {
-    "query": "create table if not exists users (\n  telegram_id text primary key,\n  credits     integer not null default 0\n)\n"
-   },
-   "portLiteralSpans": {
-    "query": {
-     "span": {
-      "startLine": 96,
-      "startColumn": 2,
-      "endLine": 96,
-      "endColumn": 38
-     },
-     "origin": "inline"
-    }
-   },
-   "fileRefs": {
-    "query": {
-     "path": "sql/create_users.sql",
-     "type": "String",
-     "marker": "file"
-    }
-   }
-  },
-  {
-   "id": "signup",
-   "nodeType": "ExecPython",
-   "label": null,
-   "config": {
-    "code": "# `ready` arriving means the table exists; the form's two values become\n# the insert's parameter list. An empty credits field enrolls with 5.\nreturn {\"params\": [telegramId, credits or \"5\"]}\n"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "code",
-     "portType": "String",
-     "required": true,
-     "exposure": "config",
-     "widget": {
-      "kind": "code",
-      "language": "python"
-     },
-     "label": "Python code",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "ready",
-     "portType": "List[JsonDict]",
-     "required": true,
-     "declaredType": "List[JsonDict]",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     }
-    },
-    {
-     "name": "telegramId",
-     "portType": "String",
-     "required": true,
-     "declaredType": "String",
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     }
-    },
-    {
-     "name": "credits",
-     "portType": "String",
-     "required": true,
-     "declaredType": "String",
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "params",
-     "portType": "List[String]",
-     "required": true,
-     "declaredType": "List[String]"
-    }
-   ],
-   "features": {
-    "canAddInputPorts": true,
-    "canAddOutputPorts": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 102,
-    "startColumn": 0,
-    "endLine": 107,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 102,
-    "startColumn": 0,
-    "endLine": 102,
-    "endColumn": 105
-   },
-   "configSpans": {
-    "code": {
-     "span": {
-      "startLine": 103,
-      "startColumn": 2,
-      "endLine": 103,
-      "endColumn": 41
-     },
-     "origin": "inline"
-    }
-   },
-   "fileRefs": {
-    "code": {
-     "path": "scripts/signup_params.py",
-     "type": "String",
-     "marker": "file"
-    }
-   }
-  },
-  {
-   "id": "enroll",
-   "nodeType": "PostgresExecuteQuery",
-   "label": null,
-   "config": {
-    "_is_output": true
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": true,
-     "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true,
-     "requiresValues": [
-      "host",
-      "database",
-      "user",
-      "password"
-     ]
-    },
-    {
-     "name": "query",
-     "portType": "String",
-     "required": true,
-     "exposure": "all",
-     "widget": {
-      "kind": "code",
-      "language": "sql"
-     },
-     "label": "SQL",
-     "placeholder": "SELECT * FROM users WHERE email = $1",
-     "fromSpec": true
-    },
-    {
-     "name": "params",
-     "portType": "List[String | Number | Boolean | Null | JsonDict]",
-     "required": false,
-     "description": "Values for $1, $2, ... A string binds as text, a number to whichever numeric column it meets, null to any column, an object as jsonb; cast in the SQL for other types.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "rows",
-     "portType": "List[JsonDict]",
-     "required": false,
-     "description": "The answered rows keyed by column name."
-    },
-    {
-     "name": "count",
-     "portType": "Number",
-     "required": false
-    }
-   ],
-   "features": {},
-   "requiresInfra": false,
-   "span": {
-    "startLine": 109,
-    "startColumn": 0,
-    "endLine": 114,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 109,
-    "startColumn": 0,
-    "endLine": 109,
-    "endColumn": 30
-   },
-   "configSpans": {
-    "_is_output": {
-     "span": {
-      "startLine": 110,
-      "startColumn": 2,
-      "endLine": 110,
-      "endColumn": 18
-     },
-     "origin": "inline"
-    }
-   },
-   "portLiterals": {
-    "query": "insert into users (telegram_id, credits)\nvalues ($1, $2::integer)\non conflict (telegram_id)\n  do update set credits = users.credits + excluded.credits\nreturning telegram_id, credits\n"
-   },
-   "portLiteralSpans": {
-    "query": {
-     "span": {
-      "startLine": 111,
-      "startColumn": 2,
-      "endLine": 111,
-      "endColumn": 34
-     },
-     "origin": "inline"
-    }
-   },
-   "fileRefs": {
-    "query": {
-     "path": "sql/add_user.sql",
-     "type": "String",
-     "marker": "file"
-    }
-   }
-  },
-  {
-   "id": "credit__in",
-   "nodeType": "Passthrough",
-   "label": "credit (in)",
-   "config": {
-    "parentId": "credit"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": {
-    "groupId": "credit",
-    "role": "In"
-   },
-   "inputs": [
-    {
-     "name": "db",
-     "portType": "Access",
-     "required": true,
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     }
-    },
-    {
-     "name": "telegramUser",
-     "portType": "String",
-     "required": true,
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     }
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn.",
-     "exposure": "assignment",
-     "widget": {
-      "kind": "textarea"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "db",
-     "portType": "Access",
-     "required": false
-    },
-    {
-     "name": "telegramUser",
-     "portType": "String",
-     "required": false
-    }
-   ],
-   "features": {},
-   "requiresInfra": false
-  },
-  {
-   "id": "credit__out",
-   "nodeType": "Passthrough",
-   "label": "credit (out)",
-   "config": {
-    "parentId": "credit"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": {
-    "groupId": "credit",
-    "role": "Out"
-   },
-   "inputs": [
-    {
-     "name": "paid",
-     "portType": "Boolean",
-     "required": false,
-     "exposure": "all",
-     "widget": {
-      "kind": "checkbox"
-     }
-    },
-    {
-     "name": "refusal",
-     "portType": "String",
-     "required": false,
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "paid",
-     "portType": "Boolean",
-     "required": false
-    },
-    {
-     "name": "refusal",
-     "portType": "String",
-     "required": false
-    }
-   ],
-   "features": {},
-   "requiresInfra": false
-  },
-  {
-   "id": "credit.who",
-   "nodeType": "ExecPython",
-   "label": null,
-   "config": {
-    "code": "# The query takes its parameters as a list; the sender's id arrives as\n# one string. Wrap it.\nreturn {\"params\": [user]}\n",
-    "parentId": "credit"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [
-    "credit"
-   ],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "code",
-     "portType": "String",
-     "required": true,
-     "exposure": "config",
-     "widget": {
-      "kind": "code",
-      "language": "python"
-     },
-     "label": "Python code",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "user",
-     "portType": "String",
-     "required": true,
-     "declaredType": "String",
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "params",
-     "portType": "List[String]",
-     "required": true,
-     "declaredType": "List[String]"
-    }
-   ],
-   "features": {
-    "canAddInputPorts": true,
-    "canAddOutputPorts": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 23,
-    "startColumn": 2,
-    "endLine": 26,
-    "endColumn": 3
-   },
-   "headerSpan": {
-    "startLine": 23,
-    "startColumn": 2,
-    "endLine": 23,
-    "endColumn": 58
-   },
-   "configSpans": {
-    "code": {
-     "span": {
-      "startLine": 24,
-      "startColumn": 4,
-      "endLine": 24,
-      "endColumn": 43
-     },
-     "origin": "inline"
-    }
-   },
-   "fileRefs": {
-    "code": {
-     "path": "scripts/lookup_params.py",
-     "type": "String",
-     "marker": "file"
-    }
-   }
-  },
-  {
-   "id": "credit.debit",
-   "nodeType": "PostgresExecuteQuery",
-   "label": null,
-   "config": {
-    "parentId": "credit"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [
-    "credit"
-   ],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "account",
-     "portType": "Access",
-     "required": true,
-     "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true,
-     "requiresValues": [
-      "host",
-      "database",
-      "user",
-      "password"
-     ]
-    },
-    {
-     "name": "query",
-     "portType": "String",
-     "required": true,
-     "exposure": "all",
-     "widget": {
-      "kind": "code",
-      "language": "sql"
-     },
-     "label": "SQL",
-     "placeholder": "SELECT * FROM users WHERE email = $1",
-     "fromSpec": true
-    },
-    {
-     "name": "params",
-     "portType": "List[String | Number | Boolean | Null | JsonDict]",
-     "required": false,
-     "description": "Values for $1, $2, ... A string binds as text, a number to whichever numeric column it meets, null to any column, an object as jsonb; cast in the SQL for other types.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "rows",
-     "portType": "List[JsonDict]",
-     "required": false,
-     "description": "The answered rows keyed by column name."
-    },
-    {
-     "name": "count",
-     "portType": "Number",
-     "required": false
-    }
-   ],
-   "features": {},
-   "requiresInfra": false,
-   "span": {
-    "startLine": 28,
-    "startColumn": 2,
-    "endLine": 32,
-    "endColumn": 3
-   },
-   "headerSpan": {
-    "startLine": 28,
-    "startColumn": 2,
-    "endLine": 28,
-    "endColumn": 31
-   },
-   "portLiterals": {
-    "query": "with account as (\n  select 1 from users where telegram_id = $1\n),\nspent as (\n  update users set credits = credits - 1\n  where telegram_id = $1 and credits > 0\n  returning telegram_id\n)\nselect\n  case\n    when not exists (select 1 from account) then 'this Telegram account is not linked to an account'\n    when not exists (select 1 from spent) then 'you have no credits left'\n  end as refusal\n"
-   },
-   "portLiteralSpans": {
-    "query": {
-     "span": {
-      "startLine": 29,
-      "startColumn": 4,
-      "endLine": 29,
-      "endColumn": 40
-     },
-     "origin": "inline"
-    }
-   },
-   "fileRefs": {
-    "query": {
-     "path": "sql/spend_credit.sql",
-     "type": "String",
-     "marker": "file"
-    }
-   }
-  },
-  {
-   "id": "credit.read",
-   "nodeType": "ExecPython",
-   "label": null,
-   "config": {
-    "code": "# The query returns one row: user_id when the credit was taken, refusal\n# when it was not. Returning no \"refusal\" key closes that port, which is\n# what skips the apology message downstream.\nrow = rows[0]\nif row.get(\"refusal\"):\n    return {\"paid\": False, \"refusal\": row[\"refusal\"]}\nreturn {\"paid\": True}\n",
-    "parentId": "credit"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [
-    "credit"
-   ],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "code",
-     "portType": "String",
-     "required": true,
-     "exposure": "config",
-     "widget": {
-      "kind": "code",
-      "language": "python"
-     },
-     "label": "Python code",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "rows",
-     "portType": "List[JsonDict]",
-     "required": true,
-     "declaredType": "List[JsonDict]",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "paid",
-     "portType": "Boolean",
-     "required": true,
-     "declaredType": "Boolean"
-    },
-    {
-     "name": "refusal",
-     "portType": "String",
-     "required": false,
-     "declaredType": "String"
-    }
-   ],
-   "features": {
-    "canAddInputPorts": true,
-    "canAddOutputPorts": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 35,
-    "startColumn": 2,
-    "endLine": 38,
-    "endColumn": 3
-   },
-   "headerSpan": {
-    "startLine": 35,
-    "startColumn": 2,
-    "endLine": 35,
-    "endColumn": 78
-   },
-   "configSpans": {
-    "code": {
-     "span": {
-      "startLine": 36,
-      "startColumn": 4,
-      "endLine": 36,
-      "endColumn": 37
-     },
-     "origin": "inline"
-    }
-   },
-   "fileRefs": {
-    "code": {
-     "path": "scripts/outcome.py",
-     "type": "String",
-     "marker": "file"
-    }
-   }
-  },
-  {
-   "id": "brief__in",
-   "nodeType": "Passthrough",
-   "label": "brief (in)",
-   "config": {
-    "parentId": "brief"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": {
-    "groupId": "brief",
-    "role": "In"
-   },
-   "inputs": [
-    {
-     "name": "request",
-     "portType": "String",
-     "required": true,
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     }
-    },
-    {
-     "name": "_should_flow",
-     "portType": "Boolean",
-     "required": false,
-     "description": "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn.",
-     "exposure": "assignment",
-     "widget": {
-      "kind": "checkbox"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "request",
-     "portType": "String",
-     "required": false
-    }
-   ],
-   "features": {},
-   "requiresInfra": false
-  },
-  {
-   "id": "brief__out",
-   "nodeType": "Passthrough",
-   "label": "brief (out)",
-   "config": {
-    "parentId": "brief"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [],
-   "groupBoundary": {
-    "groupId": "brief",
-    "role": "Out"
-   },
-   "inputs": [
-    {
-     "name": "prompt",
-     "portType": "String",
-     "required": false,
-     "exposure": "all",
-     "widget": {
-      "kind": "text"
-     }
-    }
-   ],
-   "outputs": [
-    {
-     "name": "prompt",
-     "portType": "String",
-     "required": false
-    }
-   ],
-   "features": {},
-   "requiresInfra": false
-  },
-  {
-   "id": "brief.write",
-   "nodeType": "LlmInference",
-   "label": null,
-   "config": {
-    "parentId": "brief"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [
-    "brief"
-   ],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "prompt",
-     "portType": "String",
-     "required": false,
-     "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone).",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "history",
-     "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
-     "required": false,
-     "description": "The conversation so far (a Chat Message chain or a previous call's history output).",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "media",
-     "portType": "Image | Video | Audio | List[Media]",
-     "required": false,
-     "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them.",
-     "exposure": "assignment",
-     "widget": {
-      "kind": "file_drop",
-      "accept": null,
-      "type": "Media",
-      "multiple": true
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "provider",
-     "portType": "LlmProvider=JsonDict",
-     "required": true,
-     "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends.",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "params",
-     "portType": "Dict[String, String | Number | Boolean | List[String]]",
-     "required": false,
-     "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply.",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "tools",
-     "portType": "JsonDict | List[JsonDict]",
-     "required": false,
-     "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them.",
-     "exposure": "wire",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    },
-    {
-     "name": "toolChoice",
-     "portType": "String",
-     "required": false,
-     "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one.",
-     "exposure": "config",
-     "widget": {
-      "kind": "select",
-      "options": [
-       "auto",
-       "required",
-       "none"
-      ]
-     },
-     "default": "auto",
-     "label": "Tool choice",
-     "fromSpec": true
-    },
-    {
-     "name": "parseJson",
-     "portType": "Boolean",
-     "required": false,
-     "description": "Parse and repair JSON from the response (changes output to Dict).",
-     "exposure": "config",
-     "widget": {
-      "kind": "checkbox"
-     },
-     "default": false,
-     "label": "Parse JSON",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "response",
-     "portType": "String",
-     "required": true,
-     "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly.",
-     "declaredType": "String"
-    },
-    {
-     "name": "history",
-     "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
-     "required": false,
-     "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
-    },
-    {
-     "name": "toolCalls",
-     "portType": "List[ToolCall={id: String, name: String, arguments: String}]",
-     "required": false,
-     "description": "The tool calls the model made, if any (each with the raw JSON text of its arguments). Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
-    }
-   ],
-   "features": {
-    "oneOfRequired": [
-     [
-      "prompt",
-      "history",
-      "media"
-     ]
-    ],
-    "canAddOutputPorts": true
-   },
-   "requiresInfra": false,
-   "span": {
-    "startLine": 55,
-    "startColumn": 2,
-    "endLine": 59,
-    "endColumn": 3
-   },
-   "headerSpan": {
-    "startLine": 55,
-    "startColumn": 2,
-    "endLine": 55,
-    "endColumn": 44
-   }
-  },
-  {
-   "id": "brief.write__provider",
-   "nodeType": "OpenRouterProvider",
-   "label": null,
-   "config": {
-    "model": "anthropic/claude-sonnet-4.5",
-    "parentId": "brief"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [
-    "brief"
-   ],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "connection",
-     "portType": "Access",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "access",
-      "service": "openrouter"
-     },
-     "label": "Connection",
-     "fromSpec": true
-    },
-    {
-     "name": "model",
-     "portType": "String",
-     "required": true,
-     "exposure": "config",
-     "widget": {
-      "kind": "remote_select",
-      "access": "connection",
-      "sources": [
-       {
-        "kind": "list",
-        "get": "https://openrouter.ai/api/v1/models",
-        "items": "data",
-        "label": "id",
-        "value": "id",
-        "public": true
-       }
+      "outputs": [
+        {
+          "name": "access",
+          "portType": "Access",
+          "required": false,
+          "description": "The bot's access: wire it into Telegram action nodes."
+        }
       ],
-      "free_text": true
-     },
-     "label": "Model",
-     "placeholder": "deepseek/deepseek-v4-flash-0731",
-     "fromSpec": true
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 14,
+        "startColumn": 0,
+        "endLine": 14,
+        "endColumn": 25
+      },
+      "headerSpan": {
+        "startLine": 14,
+        "startColumn": 0,
+        "endLine": 14,
+        "endColumn": 25
+      }
     },
     {
-     "name": "servingProvider",
-     "portType": "String",
-     "required": false,
-     "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text"
-     },
-     "label": "Serving provider",
-     "placeholder": "(any)",
-     "fromSpec": true
+      "id": "fal",
+      "nodeType": "FalAccess",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "access",
+            "service": "fal"
+          },
+          "label": "Account",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "access",
+          "portType": "Access",
+          "required": false,
+          "description": "The fal access: wire it into the media nodes."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 15,
+        "startColumn": 0,
+        "endLine": 15,
+        "endColumn": 15
+      },
+      "headerSpan": {
+        "startLine": 15,
+        "startColumn": 0,
+        "endLine": 15,
+        "endColumn": 15
+      }
     },
     {
-     "name": "providerFallbacks",
-     "portType": "Boolean",
-     "required": false,
-     "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top-ranked choice) is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else.",
-     "exposure": "config",
-     "widget": {
-      "kind": "checkbox"
-     },
-     "label": "Allow provider fallbacks",
-     "fromSpec": true
+      "id": "pg",
+      "nodeType": "PostgresDatabase",
+      "label": null,
+      "config": {
+        "database": "imagebot"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "database",
+          "portType": "String",
+          "required": false,
+          "description": "The database created the first time this node starts. Changing it later creates nothing: the connection would then name a database that does not exist.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "default": "app",
+          "label": "Database name",
+          "fromSpec": true
+        },
+        {
+          "name": "storage",
+          "portType": "String",
+          "required": false,
+          "description": "How much disk the database gets, read once when it is first created. Changing it here later has no effect; growing a live volume is a manual operation on it, and shrinking one is not possible.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "default": "10Gi",
+          "label": "Disk size",
+          "fromSpec": true
+        },
+        {
+          "name": "version",
+          "portType": "String",
+          "required": false,
+          "description": "The major version to run. Changing it on an existing database will NOT migrate the data: Postgres refuses to start on a data directory written by another major version.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "default": "17",
+          "label": "Postgres version",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "access",
+          "portType": "Access",
+          "required": false,
+          "description": "The database's access: wire it into the Postgres query and write nodes, exactly like a PostgresAccess node's."
+        }
+      ],
+      "features": {},
+      "requiresInfra": true,
+      "images": [
+        "images/credential"
+      ],
+      "publishedService": {
+        "service": "postgres",
+        "label": "Postgres",
+        "grants": "coexisting",
+        "acquisition": {
+          "kind": "static",
+          "fields": [
+            {
+              "name": "host",
+              "label": "Host",
+              "secret": false,
+              "placeholder": "db.example.com"
+            },
+            {
+              "name": "port",
+              "label": "Port",
+              "optional": true,
+              "secret": false,
+              "placeholder": "5432"
+            },
+            {
+              "name": "database",
+              "label": "Database",
+              "secret": false,
+              "placeholder": "postgres"
+            },
+            {
+              "name": "user",
+              "label": "User",
+              "secret": false,
+              "placeholder": "postgres"
+            },
+            {
+              "name": "password",
+              "label": "Password",
+              "secret": true
+            },
+            {
+              "name": "sslmode",
+              "label": "TLS",
+              "optional": true,
+              "secret": false,
+              "placeholder": "require (or verify-ca / verify-full; disable turns TLS off)"
+            }
+          ]
+        },
+        "auth": [],
+        "identity": "{user}@{host}/{database}"
+      },
+      "span": {
+        "startLine": 17,
+        "startColumn": 0,
+        "endLine": 17,
+        "endColumn": 46
+      },
+      "headerSpan": {
+        "startLine": 17,
+        "startColumn": 0,
+        "endLine": 17,
+        "endColumn": 22
+      },
+      "configSpans": {
+        "database": {
+          "span": {
+            "startLine": 17,
+            "startColumn": 24,
+            "endLine": 17,
+            "endColumn": 45
+          },
+          "origin": "inline"
+        }
+      }
     },
     {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
+      "id": "ask",
+      "nodeType": "TelegramReceiveMessage",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": true,
+          "description": "The Telegram bot access (wire a TelegramAccess node).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "chatId",
+          "portType": "String",
+          "required": false,
+          "description": "Only fire on messages in this chat. Empty = every chat the bot is in.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Chat id",
+          "fromSpec": true
+        },
+        {
+          "name": "keyword",
+          "portType": "String",
+          "required": false,
+          "description": "Only fire when the text contains this.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Contains",
+          "fromSpec": true
+        },
+        {
+          "name": "intervalSecs",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": null,
+            "max": null,
+            "step": null
+          },
+          "default": 5,
+          "label": "Check every (seconds)",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "text",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "chatId",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "user",
+          "portType": "String",
+          "required": false,
+          "description": "The sender's username."
+        },
+        {
+          "name": "messageId",
+          "portType": "Number",
+          "required": false
+        },
+        {
+          "name": "message",
+          "portType": "JsonDict",
+          "required": false,
+          "description": "The full Telegram message object."
+        }
+      ],
+      "features": {
+        "isTrigger": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 19,
+        "startColumn": 0,
+        "endLine": 19,
+        "endColumn": 57
+      },
+      "headerSpan": {
+        "startLine": 19,
+        "startColumn": 0,
+        "endLine": 19,
+        "endColumn": 29
+      }
+    },
+    {
+      "id": "sorry",
+      "nodeType": "TelegramSendMessage",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": true,
+          "description": "The Telegram bot access (wire a TelegramAccess node).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "chatId",
+          "portType": "String",
+          "required": true,
+          "description": "The chat/channel to send to (the bot must be a member).",
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Chat ID",
+          "placeholder": "123456789 or @channelname",
+          "fromSpec": true
+        },
+        {
+          "name": "text",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Text",
+          "fromSpec": true
+        },
+        {
+          "name": "parseMode",
+          "portType": "String",
+          "required": false,
+          "description": "How Telegram renders the text.",
+          "exposure": "config",
+          "widget": {
+            "kind": "select",
+            "options": [
+              "plain",
+              "MarkdownV2",
+              "HTML"
+            ]
+          },
+          "default": "plain",
+          "label": "Formatting",
+          "fromSpec": true
+        },
+        {
+          "name": "buttons",
+          "portType": "List[JsonDict]",
+          "required": false,
+          "description": "Link buttons under the message: [{\"label\": \"Open\", \"url\": \"https://...\"}].",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Link buttons",
+          "fromSpec": true
+        },
+        {
+          "name": "replyTo",
+          "portType": "Number",
+          "required": false,
+          "exposure": "all",
+          "widget": {
+            "kind": "number",
+            "min": null,
+            "max": null,
+            "step": null
+          },
+          "label": "Reply to message id",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "messageId",
+          "portType": "Number",
+          "required": false,
+          "description": "The sent message's id."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 46,
+        "startColumn": 0,
+        "endLine": 51,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 46,
+        "startColumn": 0,
+        "endLine": 46,
+        "endColumn": 28
+      },
+      "configSpans": {}
+    },
+    {
+      "id": "picture",
+      "nodeType": "FalGenerateImage",
+      "label": null,
+      "config": {
+        "imageSize": "square_hd",
+        "model": "fal-ai/flux/dev"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": true,
+          "description": "The fal access (wire a FalAccess node).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "prompt",
+          "portType": "String",
+          "required": true,
+          "description": "What the image should show.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "model",
+          "portType": "String",
+          "required": false,
+          "description": "The fal model route (fal.ai/models).",
+          "exposure": "config",
+          "widget": {
+            "kind": "remote_select",
+            "access": "account",
+            "sources": [
+              {
+                "kind": "list",
+                "get": "https://api.fal.ai/v1/models?status=active&category=text-to-image&q={query}",
+                "items": "models",
+                "label": "endpoint_id",
+                "value": "endpoint_id",
+                "page": {
+                  "cursor_param": "cursor",
+                  "cursor_path": "next_cursor"
+                },
+                "public": true
+              }
+            ],
+            "free_text": true
+          },
+          "default": "fal-ai/flux/dev",
+          "label": "Model",
+          "placeholder": "Pick a model, or paste a fal route",
+          "fromSpec": true
+        },
+        {
+          "name": "imageSize",
+          "portType": "String",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "select",
+            "options": [
+              "square_hd",
+              "square",
+              "portrait_4_3",
+              "portrait_16_9",
+              "landscape_4_3",
+              "landscape_16_9"
+            ]
+          },
+          "default": "landscape_4_3",
+          "label": "Image size",
+          "fromSpec": true
+        },
+        {
+          "name": "count",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 1.0,
+            "max": 8.0,
+            "step": 1.0
+          },
+          "default": 1,
+          "label": "Images",
+          "fromSpec": true
+        },
+        {
+          "name": "seed",
+          "portType": "Number",
+          "required": false,
+          "description": "Fixed seed for reproducible output.",
+          "exposure": "all",
+          "widget": {
+            "kind": "number",
+            "min": null,
+            "max": null,
+            "step": null
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "params",
+          "portType": "JsonDict",
+          "required": false,
+          "description": "Model-specific extras merged into the request (guidance_scale, num_inference_steps, ...). Declared knobs win.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "images",
+          "portType": "List[Image]",
+          "required": false,
+          "description": "Every generated image."
+        },
+        {
+          "name": "image",
+          "portType": "Image",
+          "required": false,
+          "description": "The first generated image."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 65,
+        "startColumn": 0,
+        "endLine": 70,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 65,
+        "startColumn": 0,
+        "endLine": 65,
+        "endColumn": 27
+      },
+      "configSpans": {
+        "imageSize": {
+          "span": {
+            "startLine": 67,
+            "startColumn": 2,
+            "endLine": 67,
+            "endColumn": 24
+          },
+          "origin": "inline"
+        },
+        "model": {
+          "span": {
+            "startLine": 66,
+            "startColumn": 2,
+            "endLine": 66,
+            "endColumn": 26
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "reply",
+      "nodeType": "TelegramSendMedia",
+      "label": null,
+      "config": {
+        "kind": "photo"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": true,
+          "description": "The Telegram bot access (wire a TelegramAccess node).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "chatId",
+          "portType": "String",
+          "required": true,
+          "description": "The chat to address (a user's or group's id; the receive trigger emits it).",
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Chat id",
+          "fromSpec": true
+        },
+        {
+          "name": "file",
+          "portType": "File",
+          "required": true,
+          "exposure": "assignment",
+          "widget": {
+            "kind": "file_drop",
+            "accept": null,
+            "type": "File"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "kind",
+          "portType": "String",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "select",
+            "options": [
+              "photo",
+              "document",
+              "voice",
+              "video",
+              "audio"
+            ]
+          },
+          "default": "document",
+          "label": "Send as",
+          "fromSpec": true
+        },
+        {
+          "name": "caption",
+          "portType": "String",
+          "required": false,
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Caption",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "messageId",
+          "portType": "Number",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 72,
+        "startColumn": 0,
+        "endLine": 79,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 72,
+        "startColumn": 0,
+        "endLine": 72,
+        "endColumn": 26
+      },
+      "configSpans": {
+        "kind": {
+          "span": {
+            "startLine": 74,
+            "startColumn": 2,
+            "endLine": 74,
+            "endColumn": 15
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "join",
+      "nodeType": "HumanTrigger",
+      "label": null,
+      "config": {
+        "fields": [
+          {
+            "key": "telegramId",
+            "kind": "text_input",
+            "label": "Telegram id"
+          },
+          {
+            "key": "credits",
+            "kind": "text_input",
+            "label": "Starting credits"
+          }
+        ],
+        "title": "Add a user"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "title",
+          "portType": "String",
+          "required": false,
+          "description": "Title the user sees at the top of the form.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Title",
+          "placeholder": "Submit",
+          "fromSpec": true
+        },
+        {
+          "name": "description",
+          "portType": "String",
+          "required": false,
+          "description": "Description shown under the title.",
+          "exposure": "config",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Description",
+          "fromSpec": true
+        },
+        {
+          "name": "fields",
+          "portType": "List[JsonDict]",
+          "required": true,
+          "description": "Each field contributes an output port per its kind (see the node's portsFromConfig).",
+          "exposure": "config",
+          "widget": {
+            "kind": "entry_list"
+          },
+          "label": "Form fields",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "telegramId",
+          "portType": "String",
+          "required": false
+        },
+        {
+          "name": "credits",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "features": {
+        "isTrigger": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 85,
+        "startColumn": 0,
+        "endLine": 91,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 85,
+        "startColumn": 0,
+        "endLine": 85,
+        "endColumn": 20
+      },
+      "configSpans": {
+        "fields": {
+          "span": {
+            "startLine": 87,
+            "startColumn": 2,
+            "endLine": 90,
+            "endColumn": 3
+          },
+          "origin": "inline"
+        },
+        "title": {
+          "span": {
+            "startLine": 86,
+            "startColumn": 2,
+            "endLine": 86,
+            "endColumn": 21
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "table",
+      "nodeType": "PostgresExecuteQuery",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": true,
+          "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true,
+          "requiresValues": [
+            "host",
+            "database",
+            "user",
+            "password"
+          ]
+        },
+        {
+          "name": "query",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "code",
+            "language": "sql"
+          },
+          "label": "SQL",
+          "placeholder": "SELECT * FROM users WHERE email = $1",
+          "fromSpec": true
+        },
+        {
+          "name": "params",
+          "portType": "List[String | Number | Boolean | Null | JsonDict]",
+          "required": false,
+          "description": "Values for $1, $2, ... A string binds as text, a number to whichever numeric column it meets, null to any column, an object as jsonb; cast in the SQL for other types.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "rows",
+          "portType": "List[JsonDict]",
+          "required": false,
+          "description": "The answered rows keyed by column name."
+        },
+        {
+          "name": "count",
+          "portType": "Number",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 95,
+        "startColumn": 0,
+        "endLine": 98,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 95,
+        "startColumn": 0,
+        "endLine": 95,
+        "endColumn": 29
+      },
+      "portLiterals": {
+        "query": "create table if not exists users (\n  telegram_id text primary key,\n  credits     integer not null default 0\n)\n"
+      },
+      "portLiteralSpans": {
+        "query": {
+          "span": {
+            "startLine": 96,
+            "startColumn": 2,
+            "endLine": 96,
+            "endColumn": 38
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "query": {
+          "path": "sql/create_users.sql",
+          "type": "String",
+          "marker": "file"
+        }
+      }
+    },
+    {
+      "id": "signup",
+      "nodeType": "ExecPython",
+      "label": null,
+      "config": {
+        "code": "# `ready` arriving means the table exists; the form's two values become\n# the insert's parameter list. An empty credits field enrolls with 5.\nreturn {\"params\": [telegramId, credits or \"5\"]}\n"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "code",
+          "portType": "String",
+          "required": true,
+          "exposure": "config",
+          "widget": {
+            "kind": "code",
+            "language": "python"
+          },
+          "label": "Python code",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "ready",
+          "portType": "List[JsonDict]",
+          "required": true,
+          "declaredType": "List[JsonDict]",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          }
+        },
+        {
+          "name": "telegramId",
+          "portType": "String",
+          "required": true,
+          "declaredType": "String",
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "credits",
+          "portType": "String",
+          "required": true,
+          "declaredType": "String",
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "params",
+          "portType": "List[String]",
+          "required": true,
+          "declaredType": "List[String]"
+        }
+      ],
+      "features": {
+        "canAddInputPorts": true,
+        "canAddOutputPorts": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 102,
+        "startColumn": 0,
+        "endLine": 107,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 102,
+        "startColumn": 0,
+        "endLine": 102,
+        "endColumn": 105
+      },
+      "configSpans": {
+        "code": {
+          "span": {
+            "startLine": 103,
+            "startColumn": 2,
+            "endLine": 103,
+            "endColumn": 41
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "code": {
+          "path": "scripts/signup_params.py",
+          "type": "String",
+          "marker": "file"
+        }
+      }
+    },
+    {
+      "id": "enroll",
+      "nodeType": "PostgresExecuteQuery",
+      "label": null,
+      "config": {},
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": true,
+          "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true,
+          "requiresValues": [
+            "host",
+            "database",
+            "user",
+            "password"
+          ]
+        },
+        {
+          "name": "query",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "code",
+            "language": "sql"
+          },
+          "label": "SQL",
+          "placeholder": "SELECT * FROM users WHERE email = $1",
+          "fromSpec": true
+        },
+        {
+          "name": "params",
+          "portType": "List[String | Number | Boolean | Null | JsonDict]",
+          "required": false,
+          "description": "Values for $1, $2, ... A string binds as text, a number to whichever numeric column it meets, null to any column, an object as jsonb; cast in the SQL for other types.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "rows",
+          "portType": "List[JsonDict]",
+          "required": false,
+          "description": "The answered rows keyed by column name."
+        },
+        {
+          "name": "count",
+          "portType": "Number",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 109,
+        "startColumn": 0,
+        "endLine": 114,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 109,
+        "startColumn": 0,
+        "endLine": 109,
+        "endColumn": 30
+      },
+      "configSpans": {},
+      "portLiterals": {
+        "query": "insert into users (telegram_id, credits)\nvalues ($1, $2::integer)\non conflict (telegram_id)\n  do update set credits = users.credits + excluded.credits\nreturning telegram_id, credits\n"
+      },
+      "portLiteralSpans": {
+        "query": {
+          "span": {
+            "startLine": 111,
+            "startColumn": 2,
+            "endLine": 111,
+            "endColumn": 34
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "query": {
+          "path": "sql/add_user.sql",
+          "type": "String",
+          "marker": "file"
+        }
+      }
+    },
+    {
+      "id": "credit__in",
+      "nodeType": "Passthrough",
+      "label": "credit (in)",
+      "config": {
+        "parentId": "credit"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": {
+        "groupId": "credit",
+        "role": "In"
+      },
+      "inputs": [
+        {
+          "name": "db",
+          "portType": "Access",
+          "required": true,
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          }
+        },
+        {
+          "name": "telegramUser",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn.",
+          "exposure": "assignment",
+          "widget": {
+            "kind": "textarea"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "db",
+          "portType": "Access",
+          "required": false
+        },
+        {
+          "name": "telegramUser",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false
+    },
+    {
+      "id": "credit__out",
+      "nodeType": "Passthrough",
+      "label": "credit (out)",
+      "config": {
+        "parentId": "credit"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": {
+        "groupId": "credit",
+        "role": "Out"
+      },
+      "inputs": [
+        {
+          "name": "paid",
+          "portType": "Boolean",
+          "required": false,
+          "exposure": "all",
+          "widget": {
+            "kind": "checkbox"
+          }
+        },
+        {
+          "name": "refusal",
+          "portType": "String",
+          "required": false,
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "paid",
+          "portType": "Boolean",
+          "required": false
+        },
+        {
+          "name": "refusal",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false
+    },
+    {
+      "id": "credit.who",
+      "nodeType": "ExecPython",
+      "label": null,
+      "config": {
+        "code": "# The query takes its parameters as a list; the sender's id arrives as\n# one string. Wrap it.\nreturn {\"params\": [user]}\n",
+        "parentId": "credit"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [
+        "credit"
+      ],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "code",
+          "portType": "String",
+          "required": true,
+          "exposure": "config",
+          "widget": {
+            "kind": "code",
+            "language": "python"
+          },
+          "label": "Python code",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "user",
+          "portType": "String",
+          "required": true,
+          "declaredType": "String",
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "params",
+          "portType": "List[String]",
+          "required": true,
+          "declaredType": "List[String]"
+        }
+      ],
+      "features": {
+        "canAddInputPorts": true,
+        "canAddOutputPorts": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 23,
+        "startColumn": 2,
+        "endLine": 26,
+        "endColumn": 3
+      },
+      "headerSpan": {
+        "startLine": 23,
+        "startColumn": 2,
+        "endLine": 23,
+        "endColumn": 58
+      },
+      "configSpans": {
+        "code": {
+          "span": {
+            "startLine": 24,
+            "startColumn": 4,
+            "endLine": 24,
+            "endColumn": 43
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "code": {
+          "path": "scripts/lookup_params.py",
+          "type": "String",
+          "marker": "file"
+        }
+      }
+    },
+    {
+      "id": "credit.debit",
+      "nodeType": "PostgresExecuteQuery",
+      "label": null,
+      "config": {
+        "parentId": "credit"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [
+        "credit"
+      ],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "account",
+          "portType": "Access",
+          "required": true,
+          "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true,
+          "requiresValues": [
+            "host",
+            "database",
+            "user",
+            "password"
+          ]
+        },
+        {
+          "name": "query",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "code",
+            "language": "sql"
+          },
+          "label": "SQL",
+          "placeholder": "SELECT * FROM users WHERE email = $1",
+          "fromSpec": true
+        },
+        {
+          "name": "params",
+          "portType": "List[String | Number | Boolean | Null | JsonDict]",
+          "required": false,
+          "description": "Values for $1, $2, ... A string binds as text, a number to whichever numeric column it meets, null to any column, an object as jsonb; cast in the SQL for other types.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "rows",
+          "portType": "List[JsonDict]",
+          "required": false,
+          "description": "The answered rows keyed by column name."
+        },
+        {
+          "name": "count",
+          "portType": "Number",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 28,
+        "startColumn": 2,
+        "endLine": 32,
+        "endColumn": 3
+      },
+      "headerSpan": {
+        "startLine": 28,
+        "startColumn": 2,
+        "endLine": 28,
+        "endColumn": 31
+      },
+      "portLiterals": {
+        "query": "with account as (\n  select 1 from users where telegram_id = $1\n),\nspent as (\n  update users set credits = credits - 1\n  where telegram_id = $1 and credits > 0\n  returning telegram_id\n)\nselect\n  case\n    when not exists (select 1 from account) then 'this Telegram account is not linked to an account'\n    when not exists (select 1 from spent) then 'you have no credits left'\n  end as refusal\n"
+      },
+      "portLiteralSpans": {
+        "query": {
+          "span": {
+            "startLine": 29,
+            "startColumn": 4,
+            "endLine": 29,
+            "endColumn": 40
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "query": {
+          "path": "sql/spend_credit.sql",
+          "type": "String",
+          "marker": "file"
+        }
+      }
+    },
+    {
+      "id": "credit.read",
+      "nodeType": "ExecPython",
+      "label": null,
+      "config": {
+        "code": "# The query returns one row: user_id when the credit was taken, refusal\n# when it was not. Returning no \"refusal\" key closes that port, which is\n# what skips the apology message downstream.\nrow = rows[0]\nif row.get(\"refusal\"):\n    return {\"paid\": False, \"refusal\": row[\"refusal\"]}\nreturn {\"paid\": True}\n",
+        "parentId": "credit"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [
+        "credit"
+      ],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "code",
+          "portType": "String",
+          "required": true,
+          "exposure": "config",
+          "widget": {
+            "kind": "code",
+            "language": "python"
+          },
+          "label": "Python code",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "rows",
+          "portType": "List[JsonDict]",
+          "required": true,
+          "declaredType": "List[JsonDict]",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "paid",
+          "portType": "Boolean",
+          "required": true,
+          "declaredType": "Boolean"
+        },
+        {
+          "name": "refusal",
+          "portType": "String",
+          "required": false,
+          "declaredType": "String"
+        }
+      ],
+      "features": {
+        "canAddInputPorts": true,
+        "canAddOutputPorts": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 35,
+        "startColumn": 2,
+        "endLine": 38,
+        "endColumn": 3
+      },
+      "headerSpan": {
+        "startLine": 35,
+        "startColumn": 2,
+        "endLine": 35,
+        "endColumn": 78
+      },
+      "configSpans": {
+        "code": {
+          "span": {
+            "startLine": 36,
+            "startColumn": 4,
+            "endLine": 36,
+            "endColumn": 37
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "code": {
+          "path": "scripts/outcome.py",
+          "type": "String",
+          "marker": "file"
+        }
+      }
+    },
+    {
+      "id": "brief__in",
+      "nodeType": "Passthrough",
+      "label": "brief (in)",
+      "config": {
+        "parentId": "brief"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": {
+        "groupId": "brief",
+        "role": "In"
+      },
+      "inputs": [
+        {
+          "name": "request",
+          "portType": "String",
+          "required": true,
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          }
+        },
+        {
+          "name": "_should_flow",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Whether this group runs. A `false` value or a closed input skips it, and everything inside it closes in turn.",
+          "exposure": "assignment",
+          "widget": {
+            "kind": "checkbox"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "request",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false
+    },
+    {
+      "id": "brief__out",
+      "nodeType": "Passthrough",
+      "label": "brief (out)",
+      "config": {
+        "parentId": "brief"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [],
+      "groupBoundary": {
+        "groupId": "brief",
+        "role": "Out"
+      },
+      "inputs": [
+        {
+          "name": "prompt",
+          "portType": "String",
+          "required": false,
+          "exposure": "all",
+          "widget": {
+            "kind": "text"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "prompt",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "features": {},
+      "requiresInfra": false
+    },
+    {
+      "id": "brief.write",
+      "nodeType": "LlmInference",
+      "label": null,
+      "config": {
+        "parentId": "brief"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [
+        "brief"
+      ],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "prompt",
+          "portType": "String",
+          "required": false,
+          "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone).",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "history",
+          "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
+          "required": false,
+          "description": "The conversation so far (a Chat Message chain or a previous call's history output).",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "media",
+          "portType": "Image | Video | Audio | List[Media]",
+          "required": false,
+          "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them.",
+          "exposure": "assignment",
+          "widget": {
+            "kind": "file_drop",
+            "accept": null,
+            "type": "Media",
+            "multiple": true
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "provider",
+          "portType": "LlmProvider=JsonDict",
+          "required": true,
+          "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends.",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "params",
+          "portType": "Dict[String, String | Number | Boolean | List[String]]",
+          "required": false,
+          "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply.",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "tools",
+          "portType": "JsonDict | List[JsonDict]",
+          "required": false,
+          "description": "Tool declarations the model may call: one LLM Tool node's output, or a list of them.",
+          "exposure": "wire",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        },
+        {
+          "name": "toolChoice",
+          "portType": "String",
+          "required": false,
+          "description": "Only used when tools are wired: auto lets the model decide, required forces a call, none forbids one.",
+          "exposure": "config",
+          "widget": {
+            "kind": "select",
+            "options": [
+              "auto",
+              "required",
+              "none"
+            ]
+          },
+          "default": "auto",
+          "label": "Tool choice",
+          "fromSpec": true
+        },
+        {
+          "name": "parseJson",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Parse and repair JSON from the response (changes output to Dict).",
+          "exposure": "config",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "default": false,
+          "label": "Parse JSON",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "response",
+          "portType": "String",
+          "required": true,
+          "description": "LLM response. Declare type in Weft: String without parseJson, or Dict/JsonDict with parseJson. With parseJson, you can also add custom output ports to extract specific JSON keys directly.",
+          "declaredType": "String"
+        },
+        {
+          "name": "history",
+          "portType": "ChatHistory=List[ChatMessage={role: String, content: String | List[ChatContentPart={type: String, text?: String, image_url?: {url: Image, detail?: String, width?: Number, height?: Number}, input_audio?: {data: Audio, format?: String, duration_secs?: Number}, video_url?: {url: Video, duration_secs?: Number, width?: Number, height?: Number}}], name?: String, tool_call_id?: String, tool_calls?: List[ToolCall={id: String, name: String, arguments: String}], cache_breakpoint?: Boolean}]",
+          "required": false,
+          "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
+        },
+        {
+          "name": "toolCalls",
+          "portType": "List[ToolCall={id: String, name: String, arguments: String}]",
+          "required": false,
+          "description": "The tool calls the model made, if any (each with the raw JSON text of its arguments). Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
+        }
+      ],
+      "features": {
+        "oneOfRequired": [
+          [
+            "prompt",
+            "history",
+            "media"
+          ]
+        ],
+        "canAddOutputPorts": true
+      },
+      "requiresInfra": false,
+      "span": {
+        "startLine": 55,
+        "startColumn": 2,
+        "endLine": 59,
+        "endColumn": 3
+      },
+      "headerSpan": {
+        "startLine": 55,
+        "startColumn": 2,
+        "endLine": 55,
+        "endColumn": 44
+      }
+    },
+    {
+      "id": "brief.write__provider",
+      "nodeType": "OpenRouterProvider",
+      "label": null,
+      "config": {
+        "model": "anthropic/claude-sonnet-4.5",
+        "parentId": "brief"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [
+        "brief"
+      ],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "connection",
+          "portType": "Access",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "access",
+            "service": "openrouter"
+          },
+          "label": "Connection",
+          "fromSpec": true
+        },
+        {
+          "name": "model",
+          "portType": "String",
+          "required": true,
+          "exposure": "config",
+          "widget": {
+            "kind": "remote_select",
+            "access": "connection",
+            "sources": [
+              {
+                "kind": "list",
+                "get": "https://openrouter.ai/api/v1/models",
+                "items": "data",
+                "label": "id",
+                "value": "id",
+                "public": true
+              }
+            ],
+            "free_text": true
+          },
+          "label": "Model",
+          "placeholder": "deepseek/deepseek-v4-flash-0731",
+          "fromSpec": true
+        },
+        {
+          "name": "servingProvider",
+          "portType": "String",
+          "required": false,
+          "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text"
+          },
+          "label": "Serving provider",
+          "placeholder": "(any)",
+          "fromSpec": true
+        },
+        {
+          "name": "providerFallbacks",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top-ranked choice) is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else.",
+          "exposure": "config",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "label": "Allow provider fallbacks",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "provider",
+          "portType": "LlmProvider=JsonDict",
+          "required": false,
+          "description": "The provider value: wire it into an LLM node's provider input."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 57,
+        "startColumn": 14,
+        "endLine": 57,
+        "endColumn": 82
+      },
+      "configSpans": {
+        "model": {
+          "span": {
+            "startLine": 57,
+            "startColumn": 35,
+            "endLine": 57,
+            "endColumn": 72
+          },
+          "origin": "inline"
+        }
+      }
+    },
+    {
+      "id": "brief.write__params",
+      "nodeType": "LlmParams",
+      "label": null,
+      "config": {
+        "parentId": "brief",
+        "systemPrompt": "Turn the user's message into one prompt for an image generation model.\n\nWrite a single paragraph describing the picture: subject, setting, style,\nlighting, mood. Be concrete and visual; keep everything the user asked for\nand add nothing that contradicts it. Output only the prompt, no preamble\nand no quotes.\n"
+      },
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "scope": [
+        "brief"
+      ],
+      "groupBoundary": null,
+      "inputs": [
+        {
+          "name": "systemPrompt",
+          "portType": "String",
+          "required": false,
+          "description": "System prompt for every LLM node wired to these params. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node.",
+          "exposure": "config",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "System Prompt",
+          "placeholder": "You are a helpful assistant.",
+          "fromSpec": true
+        },
+        {
+          "name": "maxTokens",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 1.0,
+            "max": null,
+            "step": 1.0
+          },
+          "label": "Max Tokens",
+          "placeholder": "4096",
+          "fromSpec": true
+        },
+        {
+          "name": "temperature",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 0.0,
+            "max": 2.0,
+            "step": 0.1
+          },
+          "label": "Temperature",
+          "placeholder": "0.7",
+          "fromSpec": true
+        },
+        {
+          "name": "topP",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.05
+          },
+          "label": "Top P",
+          "placeholder": "1.0",
+          "fromSpec": true
+        },
+        {
+          "name": "topK",
+          "portType": "Number",
+          "required": false,
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": 1.0,
+            "max": null,
+            "step": 1.0
+          },
+          "label": "Top K",
+          "fromSpec": true
+        },
+        {
+          "name": "frequencyPenalty",
+          "portType": "Number",
+          "required": false,
+          "description": "-2.0 to 2.0",
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.1
+          },
+          "label": "Frequency Penalty",
+          "placeholder": "0.0",
+          "fromSpec": true
+        },
+        {
+          "name": "presencePenalty",
+          "portType": "Number",
+          "required": false,
+          "description": "-2.0 to 2.0",
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": -2.0,
+            "max": 2.0,
+            "step": 0.1
+          },
+          "label": "Presence Penalty",
+          "placeholder": "0.0",
+          "fromSpec": true
+        },
+        {
+          "name": "stop",
+          "portType": "List[String]",
+          "required": false,
+          "description": "Generation stops when the model produces any of these strings.",
+          "exposure": "config",
+          "widget": {
+            "kind": "text_list"
+          },
+          "label": "Stop sequences",
+          "fromSpec": true
+        },
+        {
+          "name": "reasoning",
+          "portType": "Boolean",
+          "required": false,
+          "description": "Enable extended thinking for supported models",
+          "exposure": "config",
+          "widget": {
+            "kind": "checkbox"
+          },
+          "label": "Enable Reasoning",
+          "fromSpec": true
+        },
+        {
+          "name": "reasoningEffort",
+          "portType": "String",
+          "required": false,
+          "description": "Only used when reasoning is enabled",
+          "exposure": "config",
+          "widget": {
+            "kind": "select",
+            "options": [
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "label": "Reasoning Effort",
+          "fromSpec": true
+        },
+        {
+          "name": "forcePrepend",
+          "portType": "String",
+          "required": false,
+          "description": "Force the model's reply to start with this exact text (constrained generation).",
+          "exposure": "config",
+          "widget": {
+            "kind": "textarea"
+          },
+          "label": "Force response prefix",
+          "fromSpec": true
+        },
+        {
+          "name": "seed",
+          "portType": "Number",
+          "required": false,
+          "description": "For reproducible outputs",
+          "exposure": "config",
+          "widget": {
+            "kind": "number",
+            "min": null,
+            "max": null,
+            "step": null
+          },
+          "label": "Seed",
+          "placeholder": "Leave empty for random",
+          "fromSpec": true
+        },
+        {
+          "name": "_should_flow",
+          "portType": "T__should_flow",
+          "required": false,
+          "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
+          "exposure": "all",
+          "widget": {
+            "kind": "textarea"
+          },
+          "fromSpec": true
+        }
+      ],
+      "outputs": [
+        {
+          "name": "params",
+          "portType": "Dict[String, String | Number | Boolean | List[String]]",
+          "required": false,
+          "description": "The parameters object, fed into one or more LLM nodes."
+        }
+      ],
+      "features": {},
+      "requiresInfra": false,
+      "span": {
+        "startLine": 58,
+        "startColumn": 12,
+        "endLine": 58,
+        "endColumn": 78
+      },
+      "configSpans": {
+        "systemPrompt": {
+          "span": {
+            "startLine": 58,
+            "startColumn": 24,
+            "endLine": 58,
+            "endColumn": 70
+          },
+          "origin": "inline"
+        }
+      },
+      "fileRefs": {
+        "systemPrompt": {
+          "path": "prompts/image_brief.md",
+          "type": "String",
+          "marker": "file"
+        }
+      }
     }
-   ],
-   "outputs": [
+  ],
+  "edges": [
     {
-     "name": "provider",
-     "portType": "LlmProvider=JsonDict",
-     "required": false,
-     "description": "The provider value: wire it into an LLM node's provider input."
+      "id": "e-pg-access-credit-db",
+      "source": "pg",
+      "target": "credit__in",
+      "sourceHandle": "access",
+      "targetHandle": "db",
+      "span": {
+        "startLine": 43,
+        "startColumn": 0,
+        "endLine": 43,
+        "endColumn": 21
+      }
+    },
+    {
+      "id": "e-ask-user-credit-telegramUser",
+      "source": "ask",
+      "target": "credit__in",
+      "sourceHandle": "user",
+      "targetHandle": "telegramUser",
+      "span": {
+        "startLine": 44,
+        "startColumn": 0,
+        "endLine": 44,
+        "endColumn": 30
+      }
+    },
+    {
+      "id": "e-ask-text-brief-request",
+      "source": "ask",
+      "target": "brief__in",
+      "sourceHandle": "text",
+      "targetHandle": "request",
+      "span": {
+        "startLine": 62,
+        "startColumn": 0,
+        "endLine": 62,
+        "endColumn": 24
+      }
+    },
+    {
+      "id": "e-credit-paid-brief-_should_flow",
+      "source": "credit__out",
+      "target": "brief__in",
+      "sourceHandle": "paid",
+      "targetHandle": "_should_flow",
+      "span": {
+        "startLine": 63,
+        "startColumn": 0,
+        "endLine": 63,
+        "endColumn": 32
+      }
+    },
+    {
+      "id": "e-telegram-access-ask-account",
+      "source": "telegram",
+      "target": "ask",
+      "sourceHandle": "access",
+      "targetHandle": "account",
+      "span": {
+        "startLine": 19,
+        "startColumn": 31,
+        "endLine": 19,
+        "endColumn": 56
+      }
+    },
+    {
+      "id": "e-telegram-access-sorry-account",
+      "source": "telegram",
+      "target": "sorry",
+      "sourceHandle": "access",
+      "targetHandle": "account",
+      "span": {
+        "startLine": 48,
+        "startColumn": 2,
+        "endLine": 48,
+        "endColumn": 26
+      }
+    },
+    {
+      "id": "e-ask-chatId-sorry-chatId",
+      "source": "ask",
+      "target": "sorry",
+      "sourceHandle": "chatId",
+      "targetHandle": "chatId",
+      "span": {
+        "startLine": 49,
+        "startColumn": 2,
+        "endLine": 49,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "e-credit-refusal-sorry-text",
+      "source": "credit__out",
+      "target": "sorry",
+      "sourceHandle": "refusal",
+      "targetHandle": "text",
+      "span": {
+        "startLine": 50,
+        "startColumn": 2,
+        "endLine": 50,
+        "endColumn": 22
+      }
+    },
+    {
+      "id": "e-fal-access-picture-account",
+      "source": "fal",
+      "target": "picture",
+      "sourceHandle": "access",
+      "targetHandle": "account",
+      "span": {
+        "startLine": 68,
+        "startColumn": 2,
+        "endLine": 68,
+        "endColumn": 21
+      }
+    },
+    {
+      "id": "e-brief-prompt-picture-prompt",
+      "source": "brief__out",
+      "target": "picture",
+      "sourceHandle": "prompt",
+      "targetHandle": "prompt",
+      "span": {
+        "startLine": 69,
+        "startColumn": 2,
+        "endLine": 69,
+        "endColumn": 22
+      }
+    },
+    {
+      "id": "e-telegram-access-reply-account",
+      "source": "telegram",
+      "target": "reply",
+      "sourceHandle": "access",
+      "targetHandle": "account",
+      "span": {
+        "startLine": 75,
+        "startColumn": 2,
+        "endLine": 75,
+        "endColumn": 26
+      }
+    },
+    {
+      "id": "e-ask-chatId-reply-chatId",
+      "source": "ask",
+      "target": "reply",
+      "sourceHandle": "chatId",
+      "targetHandle": "chatId",
+      "span": {
+        "startLine": 76,
+        "startColumn": 2,
+        "endLine": 76,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "e-picture-image-reply-file",
+      "source": "picture",
+      "target": "reply",
+      "sourceHandle": "image",
+      "targetHandle": "file",
+      "span": {
+        "startLine": 77,
+        "startColumn": 2,
+        "endLine": 77,
+        "endColumn": 21
+      }
+    },
+    {
+      "id": "e-brief-prompt-reply-caption",
+      "source": "brief__out",
+      "target": "reply",
+      "sourceHandle": "prompt",
+      "targetHandle": "caption",
+      "span": {
+        "startLine": 78,
+        "startColumn": 2,
+        "endLine": 78,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "e-pg-access-table-account",
+      "source": "pg",
+      "target": "table",
+      "sourceHandle": "access",
+      "targetHandle": "account",
+      "span": {
+        "startLine": 97,
+        "startColumn": 2,
+        "endLine": 97,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "e-table-rows-signup-ready",
+      "source": "table",
+      "target": "signup",
+      "sourceHandle": "rows",
+      "targetHandle": "ready",
+      "span": {
+        "startLine": 104,
+        "startColumn": 2,
+        "endLine": 104,
+        "endColumn": 19
+      }
+    },
+    {
+      "id": "e-join-telegramId-signup-telegramId",
+      "source": "join",
+      "target": "signup",
+      "sourceHandle": "telegramId",
+      "targetHandle": "telegramId",
+      "span": {
+        "startLine": 105,
+        "startColumn": 2,
+        "endLine": 105,
+        "endColumn": 29
+      }
+    },
+    {
+      "id": "e-join-credits-signup-credits",
+      "source": "join",
+      "target": "signup",
+      "sourceHandle": "credits",
+      "targetHandle": "credits",
+      "span": {
+        "startLine": 106,
+        "startColumn": 2,
+        "endLine": 106,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "e-pg-access-enroll-account",
+      "source": "pg",
+      "target": "enroll",
+      "sourceHandle": "access",
+      "targetHandle": "account",
+      "span": {
+        "startLine": 112,
+        "startColumn": 2,
+        "endLine": 112,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "e-signup-params-enroll-params",
+      "source": "signup",
+      "target": "enroll",
+      "sourceHandle": "params",
+      "targetHandle": "params",
+      "span": {
+        "startLine": 113,
+        "startColumn": 2,
+        "endLine": 113,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "e-credit__in-telegramUser-credit.who-user",
+      "source": "credit__in",
+      "target": "credit.who",
+      "sourceHandle": "telegramUser",
+      "targetHandle": "user",
+      "span": {
+        "startLine": 25,
+        "startColumn": 4,
+        "endLine": 25,
+        "endColumn": 27
+      }
+    },
+    {
+      "id": "e-credit__in-db-credit.debit-account",
+      "source": "credit__in",
+      "target": "credit.debit",
+      "sourceHandle": "db",
+      "targetHandle": "account",
+      "span": {
+        "startLine": 30,
+        "startColumn": 4,
+        "endLine": 30,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "e-credit.who-params-credit.debit-params",
+      "source": "credit.who",
+      "target": "credit.debit",
+      "sourceHandle": "params",
+      "targetHandle": "params",
+      "span": {
+        "startLine": 31,
+        "startColumn": 4,
+        "endLine": 31,
+        "endColumn": 22
+      }
+    },
+    {
+      "id": "e-credit.debit-rows-credit.read-rows",
+      "source": "credit.debit",
+      "target": "credit.read",
+      "sourceHandle": "rows",
+      "targetHandle": "rows",
+      "span": {
+        "startLine": 37,
+        "startColumn": 4,
+        "endLine": 37,
+        "endColumn": 20
+      }
+    },
+    {
+      "id": "e-credit.read-paid-credit__out-paid",
+      "source": "credit.read",
+      "target": "credit__out",
+      "sourceHandle": "paid",
+      "targetHandle": "paid",
+      "span": {
+        "startLine": 40,
+        "startColumn": 2,
+        "endLine": 40,
+        "endColumn": 23
+      }
+    },
+    {
+      "id": "e-credit.read-refusal-credit__out-refusal",
+      "source": "credit.read",
+      "target": "credit__out",
+      "sourceHandle": "refusal",
+      "targetHandle": "refusal",
+      "span": {
+        "startLine": 41,
+        "startColumn": 2,
+        "endLine": 41,
+        "endColumn": 29
+      }
+    },
+    {
+      "id": "e-brief__in-request-brief.write-prompt",
+      "source": "brief__in",
+      "target": "brief.write",
+      "sourceHandle": "request",
+      "targetHandle": "prompt",
+      "span": {
+        "startLine": 56,
+        "startColumn": 4,
+        "endLine": 56,
+        "endColumn": 24
+      }
+    },
+    {
+      "id": "e-brief.write__provider-provider-brief.write-provider",
+      "source": "brief.write__provider",
+      "target": "brief.write",
+      "sourceHandle": "provider",
+      "targetHandle": "provider",
+      "span": {
+        "startLine": 57,
+        "startColumn": 14,
+        "endLine": 57,
+        "endColumn": 82
+      }
+    },
+    {
+      "id": "e-brief.write__params-params-brief.write-params",
+      "source": "brief.write__params",
+      "target": "brief.write",
+      "sourceHandle": "params",
+      "targetHandle": "params",
+      "span": {
+        "startLine": 58,
+        "startColumn": 12,
+        "endLine": 58,
+        "endColumn": 78
+      }
+    },
+    {
+      "id": "e-brief.write-response-brief__out-prompt",
+      "source": "brief.write",
+      "target": "brief__out",
+      "sourceHandle": "response",
+      "targetHandle": "prompt",
+      "span": {
+        "startLine": 60,
+        "startColumn": 2,
+        "endLine": 60,
+        "endColumn": 30
+      }
     }
-   ],
-   "features": {},
-   "requiresInfra": false,
-   "span": {
-    "startLine": 57,
-    "startColumn": 14,
-    "endLine": 57,
-    "endColumn": 82
-   },
-   "configSpans": {
-    "model": {
-     "span": {
-      "startLine": 57,
-      "startColumn": 35,
-      "endLine": 57,
-      "endColumn": 72
-     },
-     "origin": "inline"
+  ],
+  "groups": [
+    {
+      "id": "credit",
+      "kind": "group",
+      "label": null,
+      "inPorts": [
+        {
+          "name": "db",
+          "portType": "Access",
+          "required": true
+        },
+        {
+          "name": "telegramUser",
+          "portType": "String",
+          "required": true
+        }
+      ],
+      "outPorts": [
+        {
+          "name": "paid",
+          "portType": "Boolean",
+          "required": false
+        },
+        {
+          "name": "refusal",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "oneOfRequired": [],
+      "parentGroupId": null,
+      "childGroupIds": [],
+      "nodeIds": [
+        "credit.who",
+        "credit.debit",
+        "credit.read"
+      ],
+      "anonymous": false,
+      "span": {
+        "startLine": 21,
+        "startColumn": 0,
+        "endLine": 42,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 21,
+        "startColumn": 0,
+        "endLine": 21,
+        "endColumn": 85
+      },
+      "description": "Take one credit off this telegram account, or say why we cannot",
+      "portLiterals": {},
+      "portLiteralSpans": {}
+    },
+    {
+      "id": "brief",
+      "kind": "group",
+      "label": null,
+      "inPorts": [
+        {
+          "name": "request",
+          "portType": "String",
+          "required": true
+        }
+      ],
+      "outPorts": [
+        {
+          "name": "prompt",
+          "portType": "String",
+          "required": false
+        }
+      ],
+      "oneOfRequired": [],
+      "parentGroupId": null,
+      "childGroupIds": [],
+      "nodeIds": [
+        "brief.write",
+        "brief.write__provider",
+        "brief.write__params"
+      ],
+      "anonymous": false,
+      "span": {
+        "startLine": 53,
+        "startColumn": 0,
+        "endLine": 61,
+        "endColumn": 1
+      },
+      "headerSpan": {
+        "startLine": 53,
+        "startColumn": 0,
+        "endLine": 53,
+        "endColumn": 50
+      },
+      "description": "Turn what they typed into an image prompt",
+      "portLiterals": {},
+      "portLiteralSpans": {}
     }
-   }
-  },
-  {
-   "id": "brief.write__params",
-   "nodeType": "LlmParams",
-   "label": null,
-   "config": {
-    "parentId": "brief",
-    "systemPrompt": "Turn the user's message into one prompt for an image generation model.\n\nWrite a single paragraph describing the picture: subject, setting, style,\nlighting, mood. Be concrete and visual; keep everything the user asked for\nand add nothing that contradicts it. Output only the prompt, no preamble\nand no quotes.\n"
-   },
-   "position": {
-    "x": 0.0,
-    "y": 0.0
-   },
-   "scope": [
-    "brief"
-   ],
-   "groupBoundary": null,
-   "inputs": [
-    {
-     "name": "systemPrompt",
-     "portType": "String",
-     "required": false,
-     "description": "System prompt for every LLM node wired to these params. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node.",
-     "exposure": "config",
-     "widget": {
-      "kind": "textarea"
-     },
-     "label": "System Prompt",
-     "placeholder": "You are a helpful assistant.",
-     "fromSpec": true
-    },
-    {
-     "name": "maxTokens",
-     "portType": "Number",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": 1.0,
-      "max": null,
-      "step": 1.0
-     },
-     "label": "Max Tokens",
-     "placeholder": "4096",
-     "fromSpec": true
-    },
-    {
-     "name": "temperature",
-     "portType": "Number",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": 0.0,
-      "max": 2.0,
-      "step": 0.1
-     },
-     "label": "Temperature",
-     "placeholder": "0.7",
-     "fromSpec": true
-    },
-    {
-     "name": "topP",
-     "portType": "Number",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": 0.0,
-      "max": 1.0,
-      "step": 0.05
-     },
-     "label": "Top P",
-     "placeholder": "1.0",
-     "fromSpec": true
-    },
-    {
-     "name": "topK",
-     "portType": "Number",
-     "required": false,
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": 1.0,
-      "max": null,
-      "step": 1.0
-     },
-     "label": "Top K",
-     "fromSpec": true
-    },
-    {
-     "name": "frequencyPenalty",
-     "portType": "Number",
-     "required": false,
-     "description": "-2.0 to 2.0",
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": -2.0,
-      "max": 2.0,
-      "step": 0.1
-     },
-     "label": "Frequency Penalty",
-     "placeholder": "0.0",
-     "fromSpec": true
-    },
-    {
-     "name": "presencePenalty",
-     "portType": "Number",
-     "required": false,
-     "description": "-2.0 to 2.0",
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": -2.0,
-      "max": 2.0,
-      "step": 0.1
-     },
-     "label": "Presence Penalty",
-     "placeholder": "0.0",
-     "fromSpec": true
-    },
-    {
-     "name": "stop",
-     "portType": "List[String]",
-     "required": false,
-     "description": "Generation stops when the model produces any of these strings.",
-     "exposure": "config",
-     "widget": {
-      "kind": "text_list"
-     },
-     "label": "Stop sequences",
-     "fromSpec": true
-    },
-    {
-     "name": "reasoning",
-     "portType": "Boolean",
-     "required": false,
-     "description": "Enable extended thinking for supported models",
-     "exposure": "config",
-     "widget": {
-      "kind": "checkbox"
-     },
-     "label": "Enable Reasoning",
-     "fromSpec": true
-    },
-    {
-     "name": "reasoningEffort",
-     "portType": "String",
-     "required": false,
-     "description": "Only used when reasoning is enabled",
-     "exposure": "config",
-     "widget": {
-      "kind": "select",
-      "options": [
-       "low",
-       "medium",
-       "high"
-      ]
-     },
-     "label": "Reasoning Effort",
-     "fromSpec": true
-    },
-    {
-     "name": "forcePrepend",
-     "portType": "String",
-     "required": false,
-     "description": "Force the model's reply to start with this exact text (constrained generation).",
-     "exposure": "config",
-     "widget": {
-      "kind": "textarea"
-     },
-     "label": "Force response prefix",
-     "fromSpec": true
-    },
-    {
-     "name": "seed",
-     "portType": "Number",
-     "required": false,
-     "description": "For reproducible outputs",
-     "exposure": "config",
-     "widget": {
-      "kind": "number",
-      "min": null,
-      "max": null,
-      "step": null
-     },
-     "label": "Seed",
-     "placeholder": "Leave empty for random",
-     "fromSpec": true
-    },
-    {
-     "name": "_should_flow",
-     "portType": "T__should_flow",
-     "required": false,
-     "description": "Whether this node runs. A `false` value or a closed input skips it, and everything downstream closes in turn.",
-     "exposure": "all",
-     "widget": {
-      "kind": "textarea"
-     },
-     "fromSpec": true
-    }
-   ],
-   "outputs": [
-    {
-     "name": "params",
-     "portType": "Dict[String, String | Number | Boolean | List[String]]",
-     "required": false,
-     "description": "The parameters object, fed into one or more LLM nodes."
-    }
-   ],
-   "features": {},
-   "requiresInfra": false,
-   "span": {
-    "startLine": 58,
-    "startColumn": 12,
-    "endLine": 58,
-    "endColumn": 78
-   },
-   "configSpans": {
-    "systemPrompt": {
-     "span": {
-      "startLine": 58,
-      "startColumn": 24,
-      "endLine": 58,
-      "endColumn": 70
-     },
-     "origin": "inline"
-    }
-   },
-   "fileRefs": {
-    "systemPrompt": {
-     "path": "prompts/image_brief.md",
-     "type": "String",
-     "marker": "file"
-    }
-   }
-  }
- ],
- "edges": [
-  {
-   "id": "e-pg-access-credit-db",
-   "source": "pg",
-   "target": "credit__in",
-   "sourceHandle": "access",
-   "targetHandle": "db",
-   "span": {
-    "startLine": 43,
-    "startColumn": 0,
-    "endLine": 43,
-    "endColumn": 21
-   }
-  },
-  {
-   "id": "e-ask-user-credit-telegramUser",
-   "source": "ask",
-   "target": "credit__in",
-   "sourceHandle": "user",
-   "targetHandle": "telegramUser",
-   "span": {
-    "startLine": 44,
-    "startColumn": 0,
-    "endLine": 44,
-    "endColumn": 30
-   }
-  },
-  {
-   "id": "e-ask-text-brief-request",
-   "source": "ask",
-   "target": "brief__in",
-   "sourceHandle": "text",
-   "targetHandle": "request",
-   "span": {
-    "startLine": 62,
-    "startColumn": 0,
-    "endLine": 62,
-    "endColumn": 24
-   }
-  },
-  {
-   "id": "e-credit-paid-brief-_should_flow",
-   "source": "credit__out",
-   "target": "brief__in",
-   "sourceHandle": "paid",
-   "targetHandle": "_should_flow",
-   "span": {
-    "startLine": 63,
-    "startColumn": 0,
-    "endLine": 63,
-    "endColumn": 32
-   }
-  },
-  {
-   "id": "e-telegram-access-ask-account",
-   "source": "telegram",
-   "target": "ask",
-   "sourceHandle": "access",
-   "targetHandle": "account",
-   "span": {
-    "startLine": 19,
-    "startColumn": 31,
-    "endLine": 19,
-    "endColumn": 56
-   }
-  },
-  {
-   "id": "e-telegram-access-sorry-account",
-   "source": "telegram",
-   "target": "sorry",
-   "sourceHandle": "access",
-   "targetHandle": "account",
-   "span": {
-    "startLine": 48,
-    "startColumn": 2,
-    "endLine": 48,
-    "endColumn": 26
-   }
-  },
-  {
-   "id": "e-ask-chatId-sorry-chatId",
-   "source": "ask",
-   "target": "sorry",
-   "sourceHandle": "chatId",
-   "targetHandle": "chatId",
-   "span": {
-    "startLine": 49,
-    "startColumn": 2,
-    "endLine": 49,
-    "endColumn": 20
-   }
-  },
-  {
-   "id": "e-credit-refusal-sorry-text",
-   "source": "credit__out",
-   "target": "sorry",
-   "sourceHandle": "refusal",
-   "targetHandle": "text",
-   "span": {
-    "startLine": 50,
-    "startColumn": 2,
-    "endLine": 50,
-    "endColumn": 22
-   }
-  },
-  {
-   "id": "e-fal-access-picture-account",
-   "source": "fal",
-   "target": "picture",
-   "sourceHandle": "access",
-   "targetHandle": "account",
-   "span": {
-    "startLine": 68,
-    "startColumn": 2,
-    "endLine": 68,
-    "endColumn": 21
-   }
-  },
-  {
-   "id": "e-brief-prompt-picture-prompt",
-   "source": "brief__out",
-   "target": "picture",
-   "sourceHandle": "prompt",
-   "targetHandle": "prompt",
-   "span": {
-    "startLine": 69,
-    "startColumn": 2,
-    "endLine": 69,
-    "endColumn": 22
-   }
-  },
-  {
-   "id": "e-telegram-access-reply-account",
-   "source": "telegram",
-   "target": "reply",
-   "sourceHandle": "access",
-   "targetHandle": "account",
-   "span": {
-    "startLine": 75,
-    "startColumn": 2,
-    "endLine": 75,
-    "endColumn": 26
-   }
-  },
-  {
-   "id": "e-ask-chatId-reply-chatId",
-   "source": "ask",
-   "target": "reply",
-   "sourceHandle": "chatId",
-   "targetHandle": "chatId",
-   "span": {
-    "startLine": 76,
-    "startColumn": 2,
-    "endLine": 76,
-    "endColumn": 20
-   }
-  },
-  {
-   "id": "e-picture-image-reply-file",
-   "source": "picture",
-   "target": "reply",
-   "sourceHandle": "image",
-   "targetHandle": "file",
-   "span": {
-    "startLine": 77,
-    "startColumn": 2,
-    "endLine": 77,
-    "endColumn": 21
-   }
-  },
-  {
-   "id": "e-brief-prompt-reply-caption",
-   "source": "brief__out",
-   "target": "reply",
-   "sourceHandle": "prompt",
-   "targetHandle": "caption",
-   "span": {
-    "startLine": 78,
-    "startColumn": 2,
-    "endLine": 78,
-    "endColumn": 23
-   }
-  },
-  {
-   "id": "e-pg-access-table-account",
-   "source": "pg",
-   "target": "table",
-   "sourceHandle": "access",
-   "targetHandle": "account",
-   "span": {
-    "startLine": 97,
-    "startColumn": 2,
-    "endLine": 97,
-    "endColumn": 20
-   }
-  },
-  {
-   "id": "e-table-rows-signup-ready",
-   "source": "table",
-   "target": "signup",
-   "sourceHandle": "rows",
-   "targetHandle": "ready",
-   "span": {
-    "startLine": 104,
-    "startColumn": 2,
-    "endLine": 104,
-    "endColumn": 19
-   }
-  },
-  {
-   "id": "e-join-telegramId-signup-telegramId",
-   "source": "join",
-   "target": "signup",
-   "sourceHandle": "telegramId",
-   "targetHandle": "telegramId",
-   "span": {
-    "startLine": 105,
-    "startColumn": 2,
-    "endLine": 105,
-    "endColumn": 29
-   }
-  },
-  {
-   "id": "e-join-credits-signup-credits",
-   "source": "join",
-   "target": "signup",
-   "sourceHandle": "credits",
-   "targetHandle": "credits",
-   "span": {
-    "startLine": 106,
-    "startColumn": 2,
-    "endLine": 106,
-    "endColumn": 23
-   }
-  },
-  {
-   "id": "e-pg-access-enroll-account",
-   "source": "pg",
-   "target": "enroll",
-   "sourceHandle": "access",
-   "targetHandle": "account",
-   "span": {
-    "startLine": 112,
-    "startColumn": 2,
-    "endLine": 112,
-    "endColumn": 20
-   }
-  },
-  {
-   "id": "e-signup-params-enroll-params",
-   "source": "signup",
-   "target": "enroll",
-   "sourceHandle": "params",
-   "targetHandle": "params",
-   "span": {
-    "startLine": 113,
-    "startColumn": 2,
-    "endLine": 113,
-    "endColumn": 23
-   }
-  },
-  {
-   "id": "e-credit__in-telegramUser-credit.who-user",
-   "source": "credit__in",
-   "target": "credit.who",
-   "sourceHandle": "telegramUser",
-   "targetHandle": "user",
-   "span": {
-    "startLine": 25,
-    "startColumn": 4,
-    "endLine": 25,
-    "endColumn": 27
-   }
-  },
-  {
-   "id": "e-credit__in-db-credit.debit-account",
-   "source": "credit__in",
-   "target": "credit.debit",
-   "sourceHandle": "db",
-   "targetHandle": "account",
-   "span": {
-    "startLine": 30,
-    "startColumn": 4,
-    "endLine": 30,
-    "endColumn": 20
-   }
-  },
-  {
-   "id": "e-credit.who-params-credit.debit-params",
-   "source": "credit.who",
-   "target": "credit.debit",
-   "sourceHandle": "params",
-   "targetHandle": "params",
-   "span": {
-    "startLine": 31,
-    "startColumn": 4,
-    "endLine": 31,
-    "endColumn": 22
-   }
-  },
-  {
-   "id": "e-credit.debit-rows-credit.read-rows",
-   "source": "credit.debit",
-   "target": "credit.read",
-   "sourceHandle": "rows",
-   "targetHandle": "rows",
-   "span": {
-    "startLine": 37,
-    "startColumn": 4,
-    "endLine": 37,
-    "endColumn": 20
-   }
-  },
-  {
-   "id": "e-credit.read-paid-credit__out-paid",
-   "source": "credit.read",
-   "target": "credit__out",
-   "sourceHandle": "paid",
-   "targetHandle": "paid",
-   "span": {
-    "startLine": 40,
-    "startColumn": 2,
-    "endLine": 40,
-    "endColumn": 23
-   }
-  },
-  {
-   "id": "e-credit.read-refusal-credit__out-refusal",
-   "source": "credit.read",
-   "target": "credit__out",
-   "sourceHandle": "refusal",
-   "targetHandle": "refusal",
-   "span": {
-    "startLine": 41,
-    "startColumn": 2,
-    "endLine": 41,
-    "endColumn": 29
-   }
-  },
-  {
-   "id": "e-brief__in-request-brief.write-prompt",
-   "source": "brief__in",
-   "target": "brief.write",
-   "sourceHandle": "request",
-   "targetHandle": "prompt",
-   "span": {
-    "startLine": 56,
-    "startColumn": 4,
-    "endLine": 56,
-    "endColumn": 24
-   }
-  },
-  {
-   "id": "e-brief.write__provider-provider-brief.write-provider",
-   "source": "brief.write__provider",
-   "target": "brief.write",
-   "sourceHandle": "provider",
-   "targetHandle": "provider",
-   "span": {
-    "startLine": 57,
-    "startColumn": 14,
-    "endLine": 57,
-    "endColumn": 82
-   }
-  },
-  {
-   "id": "e-brief.write__params-params-brief.write-params",
-   "source": "brief.write__params",
-   "target": "brief.write",
-   "sourceHandle": "params",
-   "targetHandle": "params",
-   "span": {
-    "startLine": 58,
-    "startColumn": 12,
-    "endLine": 58,
-    "endColumn": 78
-   }
-  },
-  {
-   "id": "e-brief.write-response-brief__out-prompt",
-   "source": "brief.write",
-   "target": "brief__out",
-   "sourceHandle": "response",
-   "targetHandle": "prompt",
-   "span": {
-    "startLine": 60,
-    "startColumn": 2,
-    "endLine": 60,
-    "endColumn": 30
-   }
-  }
- ],
- "groups": [
-  {
-   "id": "credit",
-   "kind": "group",
-   "label": null,
-   "inPorts": [
-    {
-     "name": "db",
-     "portType": "Access",
-     "required": true
-    },
-    {
-     "name": "telegramUser",
-     "portType": "String",
-     "required": true
-    }
-   ],
-   "outPorts": [
-    {
-     "name": "paid",
-     "portType": "Boolean",
-     "required": false
-    },
-    {
-     "name": "refusal",
-     "portType": "String",
-     "required": false
-    }
-   ],
-   "oneOfRequired": [],
-   "parentGroupId": null,
-   "childGroupIds": [],
-   "nodeIds": [
-    "credit.who",
-    "credit.debit",
-    "credit.read"
-   ],
-   "anonymous": false,
-   "span": {
-    "startLine": 21,
-    "startColumn": 0,
-    "endLine": 42,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 21,
-    "startColumn": 0,
-    "endLine": 21,
-    "endColumn": 85
-   },
-   "description": "Take one credit off this telegram account, or say why we cannot",
-   "portLiterals": {},
-   "portLiteralSpans": {}
-  },
-  {
-   "id": "brief",
-   "kind": "group",
-   "label": null,
-   "inPorts": [
-    {
-     "name": "request",
-     "portType": "String",
-     "required": true
-    }
-   ],
-   "outPorts": [
-    {
-     "name": "prompt",
-     "portType": "String",
-     "required": false
-    }
-   ],
-   "oneOfRequired": [],
-   "parentGroupId": null,
-   "childGroupIds": [],
-   "nodeIds": [
-    "brief.write",
-    "brief.write__provider",
-    "brief.write__params"
-   ],
-   "anonymous": false,
-   "span": {
-    "startLine": 53,
-    "startColumn": 0,
-    "endLine": 61,
-    "endColumn": 1
-   },
-   "headerSpan": {
-    "startLine": 53,
-    "startColumn": 0,
-    "endLine": 53,
-    "endColumn": 50
-   },
-   "description": "Turn what they typed into an image prompt",
-   "portLiterals": {},
-   "portLiteralSpans": {}
-  }
- ],
- "createdAt": "2026-09-03T11:13:44.163389748Z",
- "updatedAt": "2026-09-03T11:13:44.163389748Z"
+  ],
+  "createdAt": "2026-09-03T11:13:44.163389748Z",
+  "updatedAt": "2026-09-03T11:13:44.163389748Z"
 }

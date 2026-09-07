@@ -21,38 +21,40 @@
     {
       "name": "intervalSecs",
       "type": "Number",
-      "exposure": "config",
       "default": 300,
       "label": "Check every (seconds)",
-      "description": "How often the feed is checked."
+      "description": "How often the feed is checked.",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
     }
   ],
   "outputs": [
     {
       "name": "title",
-      "type": "String",
-      "required": false
+      "type": "String | Null",
+      "description": "Null when the entry gives none."
     },
     {
       "name": "link",
-      "type": "String",
-      "required": false
+      "type": "String | Null",
+      "description": "The entry's first link. Null when it has none."
     },
     {
       "name": "summary",
-      "type": "String",
-      "required": false
+      "type": "String | Null",
+      "description": "Null when the feed gives none."
     },
     {
       "name": "published",
-      "type": "String",
-      "required": false,
-      "description": "The entry's publish time (RFC 3339)."
+      "type": "String | Null",
+      "description": "The entry's publish time (RFC 3339). Null when the feed gives none."
     },
     {
       "name": "entry",
       "type": "JsonDict",
-      "required": false,
       "description": "The whole parsed entry (id, title, link, summary, published, author)."
     }
   ],

@@ -15,7 +15,7 @@
 // follows (the user picks a different past execution in the
 // sidebar) disposes the current EventSource and spins a new one.
 
-import * as vscode from 'vscode';
+import type * as vscode from 'vscode';
 
 import type { DispatcherClient } from './dispatcher';
 import type {
@@ -29,8 +29,13 @@ import type {
   SkipReason,
 } from '../../packages/weft-graph/src/protocol';
 
+// A replay may stall while live updates keep arriving. Bound the waiting
+// data by bytes, since a single node result can be much larger than a status.
+export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
+
 // SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
-export type DispatcherEvent =
+// SYNC: event_id <-> crates/weft-dispatcher/src/events.rs IdentifiedEvent
+export type DispatcherEvent = { event_id: string } & (
   | { kind: 'execution_started'; color: string; entry_node: string; project_id: string; at_unix: number }
   | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; project_id: string; at_unix: number }
   | { kind: 'node_suspended'; color: string; node: string; frames: LoopIteration[]; token: string; project_id: string; at_unix: number }
@@ -118,13 +123,23 @@ export type DispatcherEvent =
   // Emitted one-shot at replay time per affected row. The webview
   // groups by color and renders a muted "N journal rows corrupted"
   // collapsed disclosure in the inspector; not a banner, not red.
-  | { kind: 'journal_corruption'; color: string; project_id: string; site: CorruptionSite; reason: string };
+  | { kind: 'journal_corruption'; color: string; project_id: string; site: CorruptionSite; reason: string });
+
+function identifiedEvent(value: unknown): DispatcherEvent {
+  if (!value || typeof value !== 'object' || !('event_id' in value)
+      || typeof value.event_id !== 'string' || value.event_id.length === 0) {
+    throw new Error('Execution event has no delivery identity');
+  }
+  return value as DispatcherEvent;
+}
 
 export type PostFn = (msg: HostMessage) => void;
 
 export class ExecutionFollower implements vscode.Disposable {
   private eventSource: { close: () => void } | undefined;
-  private currentColor: string | undefined;
+  private generation = 0;
+  private cancelStart: (() => void) | undefined;
+  private historyAbort: AbortController | undefined;
 
   constructor(
     private readonly client: DispatcherClient,
@@ -142,35 +157,65 @@ export class ExecutionFollower implements vscode.Disposable {
    *  buffering live events, THEN run the replay GET, THEN drain the
    *  buffer. This closes the gap where an event that fired between
    *  "replay GET returned" and "subscribe attached" was dropped
-   *  forever. Re-applying an event that appears in BOTH the replay and
-   *  the buffer is harmless: node executions are keyed by
-   *  (nodeId, framesKey) and updated in place (idempotent), and bus +
-   *  loop logs are deduped at append time in App.svelte (bus by
-   *  (busId, offset); loop by (groupId, kind, parentFrames, index)). */
+   *  forever. Stable event identities remove the overlap without
+   *  comparing payloads or assuming that repeated updates are harmless. */
   private async start(color: string): Promise<void> {
     this.stop();
-    this.currentColor = color;
+    const generation = this.generation;
+    const historyAbort = new AbortController();
+    this.historyAbort = historyAbort;
+    const isCurrent = () => this.generation === generation;
     this.post({ kind: 'execReset' });
+
+    let opened!: (ready: boolean) => void;
+    const ready = new Promise<boolean>((resolve) => { opened = resolve; });
+    this.cancelStart = () => opened(false);
+    const lost = (reason: 'closed' | 'error') => {
+      if (!isCurrent()) return;
+      this.stop();
+      this.post({ kind: 'followLost', color, reason });
+    };
 
     // Buffer live events until the replay has been applied,
     // so live events never overtake their historical context.
     let buffering = true;
     const buffer: DispatcherEvent[] = [];
+    let bufferedBytes = 0;
+    // Track only the initial history. This cannot grow with a long-running
+    // live stream, and also covers history the bridge has not delivered yet.
+    const historyIds = new Set<string>();
+    const applyLive = (event: DispatcherEvent) => {
+      if (!historyIds.has(event.event_id)) this.apply(event);
+    };
     const onData = (data: string) => {
+      if (!isCurrent()) return;
+      if (buffering) {
+        bufferedBytes += Buffer.byteLength(data, 'utf8');
+        if (bufferedBytes > MAX_REPLAY_BUFFER_BYTES) {
+          console.warn('[weft/execFollower] live updates exceeded the replay buffer; reopen the run to reload its history');
+          lost('error');
+          return;
+        }
+      }
       let event: DispatcherEvent;
       try {
-        event = JSON.parse(data) as DispatcherEvent;
+        event = identifiedEvent(JSON.parse(data));
       } catch (err) {
         console.warn('[weft/execFollower] bad SSE payload', err);
+        lost('error');
         return;
       }
-      if (buffering) buffer.push(event);
-      else this.apply(event);
+      if (buffering) {
+        buffer.push(event);
+      } else applyLive(event);
     };
     this.eventSource = this.client.subscribe(
       `/events/execution/${color}`,
       (ev) => onData(ev.data),
       {
+        // Starting fetch is not enough: history must be read only once
+        // the server has attached the live subscription.
+        onOpen: () => opened(true),
         // The dispatcher's per-execution stream stays open (keep-alive)
         // for the life of the project channel, so a clean close or an
         // error both mean the live link is GONE, not "execution done"
@@ -178,23 +223,32 @@ export class ExecutionFollower implements vscode.Disposable {
         // stream). Surface it so the UI stops presenting the run as
         // live instead of leaving it stuck "running" forever.
         onClosed: () => {
-          if (this.currentColor === color) this.post({ kind: 'followLost', color, reason: 'closed' });
+          lost('closed');
         },
         onError: (err) => {
           console.warn('[weft/execFollower] live follow lost', err);
-          if (this.currentColor === color) this.post({ kind: 'followLost', color, reason: 'error' });
+          lost('error');
         },
       },
     );
 
+    if (!await ready || !isCurrent()) return;
+    this.cancelStart = undefined;
+
     {
       try {
-        const events = await this.client.get<DispatcherEvent[]>(`/executions/${color}/replay`);
+        const events = await this.client.get<DispatcherEvent[]>(`/executions/${color}/replay`, historyAbort.signal);
         // A follow switch may have landed while the GET was in flight.
-        if (this.currentColor !== color) return;
-        for (const e of events) this.apply(e);
+        if (!isCurrent()) return;
+        for (const raw of events) {
+          const event = identifiedEvent(raw);
+          if (!historyIds.has(event.event_id)) {
+            historyIds.add(event.event_id);
+            this.apply(event);
+          }
+        }
       } catch (err) {
-        if (this.currentColor !== color) return;
+        if (!isCurrent()) return;
         // The history failed to load. `followLost` tells the webview the
         // follow is dead (Stop button hidden, "re-open to reconnect"
         // toast), so the follow MUST actually be dead: tear down the SSE
@@ -213,15 +267,19 @@ export class ExecutionFollower implements vscode.Disposable {
       }
       // Drain anything that arrived during the replay, then go live.
       buffering = false;
-      for (const e of buffer) this.apply(e);
+      for (const e of buffer) applyLive(e);
       buffer.length = 0;
     }
   }
 
   stop(): void {
+    this.generation++;
+    this.cancelStart?.();
+    this.cancelStart = undefined;
+    this.historyAbort?.abort();
+    this.historyAbort = undefined;
     this.eventSource?.close();
     this.eventSource = undefined;
-    this.currentColor = undefined;
   }
 
   dispose(): void {

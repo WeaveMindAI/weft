@@ -14,7 +14,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "agents"
@@ -87,17 +87,12 @@
     {
       "name": "conversationId",
       "type": "String",
-      "required": false,
       "description": "The conversation's id: what Get Conversation takes."
     },
     {
       "name": "callSid",
       "type": "String",
-      "required": false,
       "description": "The telephony call id (Twilio numbers)."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

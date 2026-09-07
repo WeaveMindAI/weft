@@ -16,7 +16,9 @@
 //!   - a stop reaches a run whose node is in flight, not only a parked one;
 //!   - `includeSelf` reaches everything, the asker included when it
 //!     carries the tag and not when it does not;
-//!   - a bad tag fails the run loudly at the node;
+//!   - any string is a tag: an unsafe sender is cleaned and fingerprinted
+//!     the same way by both nodes, so it still stops its own earlier runs
+//!     and never a lookalike's;
 //!   - a stop never crosses a project;
 //!   - the tags show on the run everywhere a person looks for them.
 #![cfg(feature = "e2e")]
@@ -388,22 +390,33 @@ async fn abort_takes_the_asker_down_too() -> anyhow::Result<()> {
     rig.finish().await
 }
 
-/// A tag outside `[A-Za-z0-9_-]` fails at the node, naming the character,
-/// before anything is written: the run fails, nothing is tagged.
+/// A sender outside `[A-Za-z0-9_-]` (a phone number with `+` and spaces)
+/// is still a tag: both nodes clean it the same way and append a
+/// fingerprint of the original, so the run is tagged, a second message
+/// from the same sender stops it, and a lookalike sender (same once
+/// cleaned, different original) does not.
 #[tokio::test]
-async fn a_bad_tag_fails_the_run_loudly() -> anyhow::Result<()> {
+async fn an_unsafe_sender_is_cleaned_and_still_steers() -> anyhow::Result<()> {
     let mut rig = Rig::up().await?;
 
-    let color = rig.fire("go", "+33 6 12").await?;
-    let settled = SettledRun::observe(&rig.disp, color).await?;
-    settled.failed_with("invalid character '+'")?;
-    anyhow::ensure!(
-        settled.replay().first_kind("execution_tagged").is_none(),
-        "a rejected tag must write nothing: {:?}",
-        settled.replay().events
-    );
-    let summary = rig.summary(color).await?;
-    assert_eq!(summary["tags"], json!([]), "{summary}");
+    let first = rig.fire("go", "+33 6 12").await?;
+    rig.parked(first).await?;
+    let summary = rig.summary(first).await?;
+    let tag = summary["tags"][0].as_str().unwrap_or("").to_string();
+    anyhow::ensure!(tag.starts_with("_33_6_12-") && tag.len() == "_33_6_12-".len() + 16, "{summary}");
+    assert_eq!(summary["tags"][1], json!("everyone"), "{summary}");
+
+    // A lookalike (same readable part, different original) is another tag.
+    let lookalike = rig.fire("go", "+33.6.12").await?;
+    rig.parked(lookalike).await?;
+    assert_eq!(run::status_of(&rig.disp, first).await?, "waiting_for_input");
+
+    // The same sender again stops the first run, with the cleaned tag named.
+    let second = rig.fire("go", "+33 6 12").await?;
+    let first_settled = SettledRun::observe(&rig.disp, first).await?;
+    assert_stopped_by(&first_settled, second, &tag)?;
+    rig.parked(second).await?;
+    assert_eq!(run::status_of(&rig.disp, lookalike).await?, "waiting_for_input");
 
     rig.finish().await
 }

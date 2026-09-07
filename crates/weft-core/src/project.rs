@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::weft_type::{Exposure, WeftType};
+use crate::node::Accepts;
+use crate::weft_type::WeftType;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
@@ -69,9 +70,6 @@ pub struct GroupDefinition {
     /// External output ports.
     #[serde(rename = "outPorts", default)]
     pub out_ports: Vec<PortDefinition>,
-    /// @require_one_of groups declared on the interface.
-    #[serde(rename = "oneOfRequired", default)]
-    pub one_of_required: Vec<Vec<String>>,
     /// Parent group id for nested groups. None for top-level groups.
     #[serde(rename = "parentGroupId", default)]
     pub parent_group_id: Option<String>,
@@ -160,6 +158,7 @@ pub enum ConfigOrigin {
 /// Source range of one config field plus how it was written. The editor edits
 /// a single field surgically using `span`, and uses `origin` to reconstruct
 /// the correct line prefix.
+// SYNC: ConfigFieldSpan <-> packages/weft-graph/src/protocol.ts ConfigFieldSpan
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigFieldSpan {
     pub span: Span,
@@ -184,11 +183,11 @@ impl ConfigFieldSpan {
 }
 
 /// True for config keys owned by the compiler/editor rather than the
-/// node: `_`-reserved per-instance keys (`_label`, `_is_output`,
-/// `_tags`) and the `parentId` boundary pointer merged in at flatten
-/// time. These co-reside in `NodeDefinition.config` but are never node
-/// input data: the input bag skips them so node bodies only ever see
-/// their own inputs.
+/// node: `_`-reserved per-instance keys (`_label`, `_tags`) and the
+/// `parentId` boundary pointer merged in at flatten time. These
+/// co-reside in `NodeDefinition.config` but are never node input data:
+/// the input bag skips them so node bodies only ever see their own
+/// inputs.
 pub fn is_internal_config_key(key: &str) -> bool {
     key.starts_with('_') || key == "parentId"
 }
@@ -263,13 +262,13 @@ pub struct NodeDefinition {
     /// config block.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "configSpans")]
     pub config_spans: std::collections::BTreeMap<String, ConfigFieldSpan>,
-    /// Literal values that DRIVE WIREABLE INPUTS, keyed by input name:
-    /// the value behind `n.x = 5` (the assignment form) or `M { x: 5 }`
-    /// (the braces form, where the input's exposure allows it). Moved
-    /// out of `config` by the enrich normalization the moment the full
-    /// input list is known, so each name has ONE home: a wireable
-    /// input's literal lives here (the engine feeds it onto the input),
-    /// a `config`-exposure input's braces value stays in `config`.
+    /// Every constant written for an INPUT PORT, keyed by input name:
+    /// the value behind `n.x = 5` (the statement form) or `M { x: 5 }`
+    /// (the braces form), a `@file`/`@asset` marker included. Moved out
+    /// of `config` by the enrich normalization the moment the full input
+    /// list is known, so a constant has ONE home whichever spelling wrote
+    /// it: the engine delivers it as a pulse on the port. `config` keeps
+    /// only what is not a port (the `_`-reserved keys, a loop's knobs).
     // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts NodeDefinition.portLiterals
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty", rename = "portLiterals")]
     pub port_literals: std::collections::BTreeMap<String, Value>,
@@ -331,7 +330,11 @@ impl FileMarker {
 
 /// A `@file("path", Type)` / `@asset("path", Type)` reference attached to a
 /// config field: where the value comes from, the type it carries, and which
-/// directive (edit contract) declared it. Serializes as
+/// directive (edit contract) declared it. A disk `path` is relative to the
+/// project root (the compiled file's directory) whichever file wrote the
+/// marker: a ref from an included file is respelled under the root by the
+/// compiler, so the editor, the asset sync and the build all resolve it
+/// against the same anchor. Serializes as
 /// `{ "path": "...", "type": "String", "marker": "file" }`. Lives in
 /// weft-core because it flows on the parse wire to the editor.
 /// SYNC: FileRef <-> packages/weft-graph/src/protocol.ts FileRef
@@ -341,6 +344,19 @@ pub struct FileRef {
     #[serde(rename = "type")]
     pub ty: WeftType,
     pub marker: FileMarker,
+}
+
+impl FileRef {
+    /// What a build resolves this ref BY: the path AND the declared type.
+    /// The type picks the marker kind and is what the bytes are held
+    /// to, so one path declared `Audio` in one place and `Image` in
+    /// another is two refs, checked and resolved separately (keyed by
+    /// path alone, the second would ride the first's check and value).
+    pub fn resolution_key(&self) -> String {
+        // Scoped aliases may have the same display name but different bodies.
+        // The portable spelling preserves the complete declared contract.
+        format!("{}\u{0}{}", self.path, self.ty.wire_string())
+    }
 }
 
 fn default_config() -> Value {
@@ -356,20 +372,18 @@ impl NodeDefinition {
         self.header_span.unwrap_or_default()
     }
 
-    /// Resolved `_is_output` for this node instance. Reads
-    /// `config._is_output` (explicit author override) if set, else
-    /// falls back to `features.is_output_default` (node-type default).
-    ///
-    /// Load-bearing: the dispatcher collects every `is_output()` node
-    /// when computing the run subgraph (see docs/v2-design.md section
-    /// 3.0). Flipping this bit changes what the runtime considers a
-    /// "production target" of a run.
-    // SYNC: is_output <-> packages/weft-graph/src/webview/lib/run-targets.ts isOutputNode
-    pub fn is_output(&self) -> bool {
-        if let Some(v) = self.config.get("_is_output").and_then(|v| v.as_bool()) {
-            return v;
-        }
-        self.features.is_output_default
+    /// The constant written for `key`, wherever it lives right now: a
+    /// port's constant sits in `port_literals` once enrich has homed it,
+    /// and in `config` before that (or when the key is not a port at
+    /// all, a loop's knob say). One lookup, so a reader that runs before
+    /// and after the normalization reads the same value.
+    pub fn written_value(&self, key: &str) -> Option<&Value> {
+        self.port_literals.get(key).or_else(|| self.config.get(key))
+    }
+
+    /// The source entry of `written_value`'s home, same two-home rule.
+    pub fn written_span(&self, key: &str) -> Option<&ConfigFieldSpan> {
+        self.port_literal_spans.get(key).or_else(|| self.config_spans.get(key))
     }
 
     /// Tags from `_tags` config. Used for token-scoped enumeration
@@ -418,7 +432,7 @@ pub struct GroupBoundary {
 }
 
 /// One INPUT on a NODE INSTANCE, enriched: TypeVars resolved, derived
-/// inputs materialized, exposure resolved, and the editor surface
+/// inputs materialized, accepted drivers resolved, and the editor surface
 /// (widget/default/label/placeholder) stamped from the metadata so the
 /// editor never re-derives any of it. The instance twin of the
 /// metadata's `InputSpec`; outputs use the slim [`PortDefinition`].
@@ -431,11 +445,11 @@ pub struct InputDefinition {
     /// `Deref` impls below let readers keep writing `input.name`.
     #[serde(flatten)]
     pub port: PortDefinition,
-    /// Where this input's value may come from (resolved from the
-    /// metadata's explicit level or the type default).
-    // SYNC: InputDefinition.exposure <-> packages/weft-graph/src/protocol.ts InputDefinition.exposure
-    #[serde(default)]
-    pub exposure: Exposure,
+    /// Which drivers this input takes (resolved: the compiler-read fixed
+    /// rule, else the metadata's list, else the type's own answer).
+    // SYNC: InputDefinition.accepts <-> packages/weft-graph/src/protocol.ts InputDefinition.accepts
+    #[serde(default = "Accepts::both")]
+    pub accepts: Accepts,
     /// The input's effective editor widget (declared, else derived from
     /// the RESOLVED instance type after TypeVar substitution). Always
     /// present after enrich.
@@ -489,11 +503,11 @@ pub struct InputDefinition {
 
 impl InputDefinition {
     /// An input for a pure WIRE port (a boundary passthrough side, a
-    /// source-declared custom port): exposure from the type, no editor
+    /// source-declared custom port): drivers from the type, no editor
     /// surface beyond what enrich later stamps.
     pub fn from_wire_port(port: PortDefinition) -> Self {
         Self {
-            exposure: port.port_type.default_exposure(),
+            accepts: Accepts::for_type(&port.port_type),
             port,
             widget: None,
             default: None,
@@ -529,6 +543,10 @@ pub struct PortDefinition {
     pub name: String,
     #[serde(rename = "portType")]
     pub port_type: WeftType,
+    /// Whether the node waits for a value here (a closed pulse on a
+    /// required input skips it). Meaningful on inputs only: an output
+    /// carries no optionality and is always `true` here (a firing that
+    /// emits nothing on it closes it, whatever this says).
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -566,6 +584,15 @@ pub struct Edge {
     pub source_handle: Option<String>,
     #[serde(rename = "targetHandle")]
     pub target_handle: Option<String>,
+    /// The keys read off the source value before it lands, in order
+    /// (`w.seconds = x.profile.wpm` carries `["wpm"]` off port
+    /// `profile`). Empty for a plain wire. Each key names a field of
+    /// the record type at that level (`deref::walk_path` checks it at
+    /// compile time), and the projection happens right before delivery,
+    /// once per wire (`deref::project_value`): five wires off one port
+    /// are five independent projections.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
     /// Source range of the connection line (`target.port = source.port`).
     /// Used by tooling to remove or rewrite the edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -633,12 +660,7 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
 /// `weft-core` is the only one: neither side maintains a mirror.
 pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
     let edge_idx = EdgeIndex::build(project);
-    let triggers: Vec<String> = project
-        .nodes
-        .iter()
-        .filter(|n| n.features.is_trigger)
-        .map(|n| n.id.clone())
-        .collect();
+    let triggers = trigger_ids(project);
     let mut out: Vec<(String, String)> = Vec::new();
     for trigger in &triggers {
         let upstream = upstream_closure(project, &edge_idx, std::slice::from_ref(trigger));
@@ -677,6 +699,160 @@ pub fn downstream_closure(
         }
     }
     seen
+}
+
+/// The scope (group or loop) `node` lives directly in, or `None` at
+/// the top level. A boundary node lives in the scope that holds its
+/// container (its `scope` is the container's parent chain), so a
+/// nested group's In boundary is a member of the enclosing body.
+pub fn direct_scope_of(node: &NodeDefinition) -> Option<&str> {
+    node.scope.last().map(String::as_str)
+}
+
+/// Every node inside scope `group_id`, however deep: its direct members
+/// (nested containers' boundaries among them) and everything inside
+/// those. What a gated scope takes down with it.
+pub fn scope_members<'a>(project: &'a ProjectDefinition, group_id: &str) -> Vec<&'a NodeDefinition> {
+    project
+        .nodes
+        .iter()
+        .filter(|n| n.scope.iter().any(|g| g == group_id))
+        .collect()
+}
+
+/// The nodes a scope launcher kicks when scope `group_id` starts: its
+/// DIRECT members that no wire feeds (a nested container's In boundary
+/// counts as a member; its Out boundary too, so a body that wires
+/// nothing to `self.out` still closes its outputs). Triggers are never
+/// among them: a trigger is kicked by its fire, or payload-less by a
+/// manual run, never by the scope it sits in. Everything else inside
+/// the scope is reached by pulses once these run. The ONE definition of
+/// "what starts with a scope", read by the group launcher and the loop
+/// launcher alike.
+pub fn scope_body_roots(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    group_id: &str,
+) -> Vec<String> {
+    project
+        .nodes
+        .iter()
+        .filter(|n| direct_scope_of(n) == Some(group_id))
+        .filter(|n| !n.features.is_trigger)
+        .filter(|n| edge_idx.get_incoming(project, &n.id).is_empty())
+        .map(|n| n.id.clone())
+        .collect()
+}
+
+/// Close `set` over scope membership: a node inside a scope brings the
+/// whole scope with it (everything inside runs when the scope starts),
+/// and a scope's In boundary brings the scope. Without this closure a
+/// body's unwired root would fall outside the set and never start.
+///
+/// Only the In boundary brings its scope, and that asymmetry is
+/// deliberate: In is where a scope STARTS, so wanting it means wanting
+/// the body. An Out boundary is reached from inside, by which point the
+/// body is already in the set through its own nodes, and treating Out as
+/// an entrance would drag a whole group in behind any wire that merely
+/// reads its result.
+fn scope_closure(project: &ProjectDefinition, set: &mut std::collections::HashSet<String>) {
+    loop {
+        let mut scopes: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for node in project.nodes.iter().filter(|n| set.contains(&n.id)) {
+            scopes.extend(node.scope.iter().map(String::as_str));
+            if let Some(b) = node.group_boundary.as_ref().filter(|b| b.role == GroupBoundaryRole::In) {
+                scopes.insert(b.group_id.as_str());
+            }
+        }
+        let before = set.len();
+        for node in &project.nodes {
+            let inside = node.scope.iter().any(|g| scopes.contains(g.as_str()))
+                || node.group_boundary.as_ref().is_some_and(|b| scopes.contains(b.group_id.as_str()));
+            if inside {
+                set.insert(node.id.clone());
+            }
+        }
+        if set.len() == before {
+            return;
+        }
+    }
+}
+
+/// The ids of the project's trigger nodes (`features.is_trigger`).
+pub fn trigger_ids(project: &ProjectDefinition) -> Vec<String> {
+    project.nodes.iter().filter(|n| n.features.is_trigger).map(|n| n.id.clone()).collect()
+}
+
+/// The ids of the project's infra nodes (`requires_infra`).
+pub fn infra_ids(project: &ProjectDefinition) -> Vec<String> {
+    project.nodes.iter().filter(|n| n.requires_infra).map(|n| n.id.clone()).collect()
+}
+
+/// The nodes a run aimed at `seeds` dispatches: everything the seeds
+/// depend on by wire (a node in `stop_at` is included and not walked
+/// through, see [`upstream_closure_stop_at`]), every scope one of those
+/// sits in, and then whatever THOSE need, until nothing new arrives. A
+/// scope's In boundary is fed by wires like any node, so bringing a
+/// scope in brings the sources of its inputs too; leaving them out
+/// would kick the boundary as a root with inputs that never come.
+///
+/// The ONE definition of "what runs", shared by a targeted manual run,
+/// a trigger fire, and both setup phases (the dispatcher kicks its
+/// roots, the engine absorbs pulses outside it).
+pub fn run_subgraph(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    seeds: &[String],
+    stop_at: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut set = upstream_closure_stop_at(project, edge_idx, seeds, stop_at);
+    loop {
+        let before = set.len();
+        scope_closure(project, &mut set);
+        if set.len() == before {
+            return set;
+        }
+        let seeds: Vec<String> = set.iter().cloned().collect();
+        set = upstream_closure_stop_at(project, edge_idx, &seeds, stop_at);
+    }
+}
+
+/// The nodes of `in_subgraph` a fresh run kicks: those with no
+/// in-subgraph parent that sit outside every scope (a node inside a
+/// group or loop is the scope launcher's to start, at the scope's
+/// frames, when the scope starts), plus every node in `force_roots`
+/// whatever its parents or scope. A fire forces its triggers: at fire
+/// time a trigger's outputs are the event, not a function of its
+/// inputs, and a trigger inside a group is still kicked by its fire.
+pub fn subgraph_roots(
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    in_subgraph: &std::collections::HashSet<String>,
+    force_roots: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut roots = Vec::new();
+    for node_id in in_subgraph {
+        if force_roots.contains(node_id) {
+            roots.push(node_id.clone());
+            continue;
+        }
+        let inside_a_scope = project
+            .nodes
+            .iter()
+            .find(|n| &n.id == node_id)
+            .is_some_and(|n| !n.scope.is_empty());
+        if inside_a_scope {
+            continue;
+        }
+        let has_in_subgraph_parent = edge_idx
+            .get_incoming(project, node_id)
+            .iter()
+            .any(|e| in_subgraph.contains(&e.source));
+        if !has_in_subgraph_parent {
+            roots.push(node_id.clone());
+        }
+    }
+    roots
 }
 
 /// Every node `seeds` depend on by following wires backward, seeds
@@ -767,7 +943,7 @@ mod project_wire_tests {
                 synthesized_from_carry: false,
                 declared_type: None,
             },
-            exposure: crate::weft_type::Exposure::Assignment,
+            accepts: Accepts::wire_only(),
             widget: None,
             default: None,
             label: None,
@@ -806,7 +982,6 @@ mod project_wire_tests {
             label: None,
             in_ports: vec![input.port.clone()],
             out_ports: vec![],
-            one_of_required: vec![],
             parent_group_id: None,
             child_group_ids: vec![],
             node_ids: vec!["g.n".into()],
@@ -824,6 +999,7 @@ mod project_wire_tests {
             source_handle: Some("out".into()),
             target: "g.m".into(),
             target_handle: Some("in".into()),
+            path: Vec::new(),
             span: None,
             source_file: None,
         };
@@ -840,11 +1016,11 @@ mod project_wire_tests {
         // The renamed keys the TS side depends on:
         assert!(v["nodes"][0].get("nodeType").is_some(), "nodeType key: {v}");
         assert!(v["nodes"][0]["inputs"][0].get("portType").is_some(), "portType key: {v}");
-        // An instance input's resolved surface: `exposure` always
-        // serializes (lowercase tag), the optional members are OMITTED
+        // An instance input's resolved surface: `accepts` always
+        // serializes (the list form), the optional members are OMITTED
         // when absent (never `null`, which the TS optional types don't
         // model).
-        assert_eq!(v["nodes"][0]["inputs"][0]["exposure"], "assignment", "exposure tag: {v}");
+        assert_eq!(v["nodes"][0]["inputs"][0]["accepts"], serde_json::json!(["wire"]), "accepts list: {v}");
         for absent in ["widget", "default", "label", "placeholder", "description", "declaredType"] {
             assert!(
                 v["nodes"][0]["inputs"][0].get(absent).is_none(),
@@ -923,5 +1099,171 @@ mod project_wire_tests {
             node_with_infra("c", true),
         ]);
         assert!(has_infra(&with_infra), "one infra node flips it true");
+    }
+}
+
+#[cfg(test)]
+mod run_subgraph_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// (id, is_trigger, requires_infra, scope chain) plus the wires. A
+    /// `{g}__in` / `{g}__out` id is a boundary of scope `g`, the way
+    /// the compiler flattens one.
+    fn project(nodes: &[(&str, bool, bool, &[&str])], edges: &[(&str, &str)]) -> ProjectDefinition {
+        let n_json: Vec<serde_json::Value> = nodes
+            .iter()
+            .map(|(id, is_trigger, requires_infra, scope)| {
+                let boundary = id.rsplit_once("__").map(|(group, role)| {
+                    serde_json::json!({ "groupId": group, "role": if role == "in" { "In" } else { "Out" } })
+                });
+                serde_json::json!({
+                    "id": id,
+                    "nodeType": "T",
+                    "label": null,
+                    "config": {},
+                    "position": { "x": 0, "y": 0 },
+                    "scope": scope,
+                    "groupBoundary": boundary,
+                    "features": { "isTrigger": is_trigger },
+                    "requiresInfra": requires_infra,
+                })
+            })
+            .collect();
+        let e_json: Vec<serde_json::Value> = edges
+            .iter()
+            .map(|(s, t)| serde_json::json!({
+                "id": format!("e_{s}_{t}"), "source": s, "sourcePort": "out", "target": t, "targetPort": "in",
+            }))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "nodes": n_json, "edges": e_json, "groups": []
+        }))
+        .expect("valid test project")
+    }
+
+    fn sorted(set: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut v: Vec<String> = set.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_scope_brought_in_by_a_member_brings_the_sources_of_its_inputs() {
+        // cfg ──► g__in ──► g.a ──► g__out
+        //         g.seed (unwired body root)
+        // Aiming at the unwired seed brings the scope, and the scope's
+        // In boundary is fed by `cfg`, which has to run first.
+        let p = project(
+            &[
+                ("cfg", false, false, &[]),
+                ("g__in", false, false, &[]),
+                ("g.a", false, false, &["g"]),
+                ("g.seed", false, false, &["g"]),
+                ("g__out", false, false, &[]),
+                ("other", false, false, &[]),
+            ],
+            &[("cfg", "g__in"), ("g__in", "g.a"), ("g.a", "g__out")],
+        );
+        let edge_idx = EdgeIndex::build(&p);
+        let set = run_subgraph(&p, &edge_idx, &strs(&["g.seed"]), &HashSet::new());
+        assert_eq!(sorted(set.clone()), strs(&["cfg", "g.a", "g.seed", "g__in", "g__out"]));
+        // The run kicks `cfg`, never the boundary the wire feeds, and never a body node.
+        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &HashSet::new())), strs(&["cfg"]));
+    }
+
+    #[test]
+    fn the_walk_alternates_wires_and_scopes_until_nothing_new_arrives() {
+        // h.x (in scope h) ──► g__in ──► g.a ; aiming at g.a brings g,
+        // then g's input source h.x, then h whole, then h's own input.
+        let p = project(
+            &[
+                ("root", false, false, &[]),
+                ("h__in", false, false, &[]),
+                ("h.x", false, false, &["h"]),
+                ("h__out", false, false, &[]),
+                ("g__in", false, false, &[]),
+                ("g.a", false, false, &["g"]),
+                ("g__out", false, false, &[]),
+            ],
+            &[("root", "h__in"), ("h__in", "h.x"), ("h.x", "h__out"), ("h__out", "g__in"), ("g__in", "g.a"), ("g.a", "g__out")],
+        );
+        let edge_idx = EdgeIndex::build(&p);
+        let set = run_subgraph(&p, &edge_idx, &strs(&["g.a"]), &HashSet::new());
+        assert_eq!(sorted(set.clone()), strs(&["g.a", "g__in", "g__out", "h.x", "h__in", "h__out", "root"]));
+        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &HashSet::new())), strs(&["root"]));
+    }
+
+    #[test]
+    fn a_trigger_is_included_and_not_walked_through() {
+        let p = project(
+            &[("setup", false, false, &[]), ("trig", true, false, &[]), ("out", false, false, &[])],
+            &[("setup", "trig"), ("trig", "out")],
+        );
+        let edge_idx = EdgeIndex::build(&p);
+        let stop: HashSet<String> = trigger_ids(&p).into_iter().collect();
+        let set = run_subgraph(&p, &edge_idx, &strs(&["out"]), &stop);
+        assert_eq!(sorted(set.clone()), strs(&["out", "trig"]));
+        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &stop)), strs(&["trig"]));
+    }
+
+    #[test]
+    fn an_unwired_infra_node_inside_a_group_is_reached_through_its_scope() {
+        // The setup phase seeds every infra node; one that sits unwired
+        // inside a group is started by the group, so the kick is the
+        // group's In boundary, not nothing.
+        let p = project(
+            &[
+                ("g__in", false, false, &[]),
+                ("g.db", false, true, &["g"]),
+                ("g__out", false, false, &[]),
+            ],
+            &[],
+        );
+        let edge_idx = EdgeIndex::build(&p);
+        let set = run_subgraph(&p, &edge_idx, &infra_ids(&p), &HashSet::new());
+        assert_eq!(sorted(set.clone()), strs(&["g.db", "g__in", "g__out"]));
+        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &HashSet::new())), strs(&["g__in", "g__out"]));
+    }
+
+    #[test]
+    fn a_setup_phase_runs_its_seeds_and_what_feeds_them_only() {
+        // text ──► compute ──► infra ──► trigger ──► reply
+        // cfg ──► infra_b
+        let p = project(
+            &[
+                ("text", false, false, &[]),
+                ("compute", false, false, &[]),
+                ("infra", false, true, &[]),
+                ("trigger", true, false, &[]),
+                ("reply", false, false, &[]),
+                ("cfg", false, false, &[]),
+                ("infra_b", false, true, &[]),
+            ],
+            &[("text", "compute"), ("compute", "infra"), ("infra", "trigger"), ("trigger", "reply"), ("cfg", "infra_b")],
+        );
+        let edge_idx = EdgeIndex::build(&p);
+        let infra = run_subgraph(&p, &edge_idx, &infra_ids(&p), &HashSet::new());
+        assert_eq!(sorted(infra), strs(&["cfg", "compute", "infra", "infra_b", "text"]));
+        let triggers = run_subgraph(&p, &edge_idx, &trigger_ids(&p), &HashSet::new());
+        assert_eq!(sorted(triggers), strs(&["compute", "infra", "text", "trigger"]));
+        let none = project(&[("a", false, false, &[]), ("b", false, false, &[])], &[("a", "b")]);
+        assert!(run_subgraph(&none, &EdgeIndex::build(&none), &infra_ids(&none), &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_forced_root_is_kicked_wherever_it_sits() {
+        let p = project(
+            &[("g__in", false, false, &[]), ("g.trig", true, false, &["g"]), ("g__out", false, false, &[])],
+            &[],
+        );
+        let edge_idx = EdgeIndex::build(&p);
+        let force: HashSet<String> = trigger_ids(&p).into_iter().collect();
+        let set = run_subgraph(&p, &edge_idx, &strs(&["g.trig"]), &force);
+        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &force)), strs(&["g.trig", "g__in", "g__out"]));
     }
 }

@@ -14,7 +14,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "agents"
@@ -30,7 +30,6 @@
     {
       "name": "waitUntilDone",
       "type": "Boolean",
-      "exposure": "config",
       "default": true,
       "widget": {
         "kind": "checkbox"
@@ -41,7 +40,6 @@
     {
       "name": "includeAudio",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -54,43 +52,36 @@
     {
       "name": "status",
       "type": "String",
-      "required": false,
       "description": "done, failed, or the in-flight state when not waiting."
     },
     {
       "name": "transcript",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each turn: role (agent/user) and message."
     },
     {
       "name": "text",
       "type": "String",
-      "required": false,
       "description": "The whole transcript as role-prefixed lines."
     },
     {
       "name": "summary",
       "type": "String",
-      "required": false,
       "description": "The analysis's transcript summary."
     },
     {
       "name": "successful",
       "type": "String",
-      "required": false,
       "description": "The analysis's call outcome (success / failure / unknown)."
     },
     {
       "name": "conversation",
       "type": "JsonDict",
-      "required": false,
       "description": "The whole conversation object."
     },
     {
       "name": "audio",
       "type": "Audio",
-      "required": false,
       "description": "The call recording (when Download the recording is on)."
     }
   ],

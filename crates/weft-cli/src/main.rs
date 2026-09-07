@@ -42,7 +42,7 @@ enum Cmd {
     New {
         name: String,
         /// Install the Tangle persona for this AI coding assistant
-        /// (e.g. `claude-code`, shorthand `cc`), symlinked from the weft
+        /// (e.g. `claude-code`/`cc` or `kilo-code`/`kc`), symlinked from the weft
         /// checkout so updating weft updates Tangle. Repeatable, and
         /// remembered as the default for future projects; `none` opts out.
         #[arg(long = "assistant", value_name = "NAME")]
@@ -148,7 +148,7 @@ enum Cmd {
         target: Option<String>,
     },
     /// Run the current project via the dispatcher. Streams logs until
-    /// completion or suspension unless `--detach` is set.
+    /// completion, including across waits, unless `--detach` is set.
     ///
     /// Rebuilding while executions are in flight is non-disruptive:
     /// in-flight work finishes on workers baked from its own image,
@@ -156,10 +156,11 @@ enum Cmd {
     Run {
         #[arg(long)]
         detach: bool,
-        /// Run only what this output node needs (repeatable). A run
-        /// normally starts from every output node and walks upstream;
-        /// this narrows that set, so a project's other branches stay
-        /// untouched. A node that is not an output is refused.
+        /// Run only this node and what it needs (repeatable: several
+        /// targets run the union of what each needs). A run normally
+        /// kicks every root of the graph; an aimed run is held to the
+        /// targets' upstream, so a root shared with another branch
+        /// never drags that branch in. Any node can be a target.
         #[arg(long, value_name = "node-id")]
         target: Vec<String>,
     },
@@ -253,6 +254,12 @@ enum Cmd {
         /// and the user wants the project gone NOW.
         #[arg(long)]
         force: bool,
+        /// Answer the confirmation. Required when there is no terminal
+        /// to ask on: removing a project wipes its triggers, cancels
+        /// its runs, terminates its infra and reclaims its stored
+        /// data, so nothing does that on a bare command.
+        #[arg(long)]
+        yes: bool,
     },
     /// Tail logs. No arg → latest execution of the cwd project.
     /// UUID arg → that specific execution.
@@ -448,6 +455,12 @@ enum Cmd {
         /// Prune docker BuildKit cache (heavy: invalidates cargo dep cache).
         #[arg(long, default_value_t = false)]
         build_cache: bool,
+        /// Answer the confirmation a journal deletion asks for.
+        /// Required when there is no terminal to ask on. Image and
+        /// build-cache sweeps ask nothing: the next build re-makes
+        /// what they drop.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -578,6 +591,20 @@ enum InfraAction {
     /// retry per-node from where it stopped. 412 if nothing is in
     /// flight.
     Cancel,
+    /// Print what the project's infra containers wrote: every unit of
+    /// every infra node, or one node's. Lines are prefixed with the pod
+    /// and container they came from.
+    Logs {
+        /// The infra node to read; unset reads every infra node of the project.
+        #[arg(value_name = "node_id")]
+        node_id: Option<String>,
+        /// Number of lines to print, counted from the end.
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
+        /// Keep streaming new lines as the containers write them.
+        #[arg(long, short = 'f', default_value_t = false)]
+        follow: bool,
+    },
     /// Per-node stop. Targets one infra node by id, leaves the rest
     /// of the project's infra untouched. Used from the graph's per-
     /// node menu (the trash icon's siblings).
@@ -724,6 +751,10 @@ impl InfraAction {
                 commands::infra::InfraAction::NodeTerminate { node_id },
                 Default::default(),
             ),
+            InfraAction::Logs { node_id, tail, follow } => (
+                commands::infra::InfraAction::Logs { node_id, tail, follow },
+                Default::default(),
+            ),
         }
     }
 }
@@ -859,10 +890,10 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::Ps => commands::ps::run(ctx).await,
-        Cmd::Rm { project, journal, local, all, force } => {
+        Cmd::Rm { project, journal, local, all, force, yes } => {
             commands::rm::run(
                 ctx,
-                commands::rm::RmArgs { project, journal, local, all, force },
+                commands::rm::RmArgs { project, journal, local, all, force, yes },
             )
             .await
         }
@@ -906,9 +937,9 @@ async fn main() -> anyhow::Result<()> {
             FilesAction::Rm { target, yes } => commands::files::rm(ctx, target, yes).await,
             FilesAction::Usage => commands::files::usage(ctx).await,
         },
-        Cmd::Clean { color, keep_days, all, images, build_cache, project } => {
+        Cmd::Clean { color, keep_days, all, images, build_cache, project, yes } => {
             commands::executions::clean(
-                ctx, color, keep_days, all, images, build_cache, project,
+                ctx, color, keep_days, all, images, build_cache, project, yes,
             )
             .await
         }

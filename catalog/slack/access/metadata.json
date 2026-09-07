@@ -395,7 +395,6 @@
     {
       "name": "account",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -406,7 +405,6 @@
     {
       "name": "access",
       "type": "Access",
-      "required": false,
       "description": "The workspace's access: wire it into Slack action nodes."
     }
   ]

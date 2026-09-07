@@ -4,11 +4,10 @@
 //! fixtures/two_programs/main.weft). Firing one journals the fire's
 //! subgraph on `ExecutionStarted`, so the shared node's pulse into the
 //! other program is absorbed without a trace and the run completes,
-//! while the fired program's own dangling node (no output asks for it)
-//! journals one `outside_this_run` skip. The regression this pins: fires
-//! used to journal no boundary, so that pulse parked on a partial input
-//! set forever and every fire of a two-trigger project ended as a stuck
-//! failure.
+//! while every node the fired trigger reaches runs, a leaf nothing
+//! reads included. The regression this pins: fires used to journal no
+//! boundary, so that pulse parked on a partial input set forever and
+//! every fire of a two-trigger project ended as a stuck failure.
 #![cfg(feature = "e2e")]
 
 use std::time::Duration;
@@ -36,9 +35,9 @@ async fn a_fire_runs_its_own_program_and_skips_the_other() -> anyhow::Result<()>
     settled.assert_completed("gate_x")?;
     settled.assert_completed("out_x")?;
     settled.assert_input("out_x", "data", &json!("shared"))?;
-    // The fired program's own dangling node journals exactly one skip
-    // saying why: it is reachable from the trigger, no output wants it.
-    settled.assert_skip_reason("side_x", "outside_this_run")?;
+    // The fired program's own leaf runs too: reachable from the trigger
+    // is all it takes.
+    settled.assert_completed("side_x")?;
     // The other program: not a trace. The shared pulse into `gate_y` is
     // absorbed silently, its trigger was not kicked, its output never
     // heard of this run.

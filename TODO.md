@@ -554,6 +554,14 @@ no-suspension-while-open rule keeps the gap honest until then.
 [Update Notice Warning] If we touch the BusCoordinator, implement
 Generator[T], or rework await_signal journaling, revisit this entry.
 
+## Concurrent builds have no order for the asset reference set
+Every build publishes "the files this project uses now". Two builds of one
+project at once can land in either order, so a slow older build can
+overwrite a newer one's set: the newer files get a 30-day expiry countdown
+they should not have, which the next successful build clears. Fixing it
+needs a version on builds to compare against, and the publish happens
+before the definition is registered, so nothing carries one yet.
+
 ## A time type?
 `Cron` takes a cron string plus a `timezone`, `WaitUntil` an ISO-8601
 string, `Wait` a number of seconds: three spellings of "a moment" with
@@ -687,6 +695,23 @@ it should be able to stand up an extension host as well as a webview.
   decides how much it may cost.
 
 Not now: it is a real piece of infrastructure, not an afternoon.
+
+## Type rules in metadata: an output typed from the node's other ports
+
+Two nodes want an output whose type the metadata cannot write down as a
+single type, and today each fakes it: `FirstInOrder` emits whichever
+branch survived, so its output is really the UNION of what its created
+inputs carry, and `LlmInference.response` is a `String` without
+`parseJson` and a record or `JsonDict` with it. Both are `MustOverride`
+or a type variable now, and the author restates the type in the
+signature every time.
+
+The feature is a small rule language in `metadata.json` (an output typed
+as "the union of these inputs", "this type when that input is true"),
+read by enrich the way `portsFromConfig` is. Nothing of it exists in the
+code on purpose: it is the whole feature or nothing, since a half rule
+would send the editor, the validator and the runtime three different
+answers about one port. Design it before writing the first rule.
 
 ## Fire-on-arrival: should a node be able to run before all its inputs are in?
 

@@ -54,10 +54,20 @@ impl Node for GmailSendNode {
                 "gmail: read the replied-to message",
             )
             .await?;
-            if let Some(mid) = header(&orig["payload"], "Message-ID") {
-                reply_headers.push(("In-Reply-To".to_string(), mid.to_string()));
-                reply_headers.push(("References".to_string(), mid.to_string()));
-            }
+            // No Message-ID means the reply cannot thread. Sending it
+            // anyway looks like a success and lands as a loose message
+            // in the recipient's inbox, so say what happened instead.
+            let mid = header(&orig["payload"], "Message-ID").ok_or_else(|| {
+                weft::node_error(format!(
+                    "gmail: message {orig_id} carries no Message-ID header, so this reply \
+                     cannot be threaded onto it. If the account connection was made before \
+                     replies were used, reconnect it on the access node and tick \
+                     'Read mail headers'; otherwise send this as a new message instead of \
+                     a reply."
+                ))
+            })?;
+            reply_headers.push(("In-Reply-To".to_string(), mid.to_string()));
+            reply_headers.push(("References".to_string(), mid.to_string()));
             thread_id = orig["threadId"].as_str().map(str::to_string);
         }
 

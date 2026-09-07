@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "files:read"
@@ -28,7 +28,6 @@
     {
       "name": "keep",
       "type": "Boolean",
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -41,23 +40,19 @@
     {
       "name": "file",
       "type": "File",
-      "required": false,
       "description": "The stored file reference."
     },
     {
       "name": "filename",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "mimeType",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "sizeBytes",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     }
   ]
 }

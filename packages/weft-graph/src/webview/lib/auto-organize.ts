@@ -5,7 +5,7 @@
 
 import ELK from 'elkjs/lib/elk.bundled.js';
 import type { NodeInstance, Edge } from './types';
-import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, inputExposure } from './types';
+import { isContainerNodeType, isLoopNodeType, containerHasConfigStrip, acceptsLiteral } from './types';
 import { CONFIG_STRIP_BAR_PX, configStripOpenPx } from './constants/container-layout';
 import { LOOP_CONFIG_FIELDS } from './utils/input-field';
 import { SHOULD_FLOW_PORT } from '../../protocol';
@@ -172,7 +172,7 @@ export async function autoOrganize(
 	function isHookupEdge(e: Edge): boolean {
 		const input = nodeById.get(e.target)?.inputs?.find(i => i.name === e.targetHandle);
 		if (!input) return false;
-		return String(input.portType) === 'Access' || inputExposure(input) === 'wire';
+		return String(input.portType) === 'Access' || !acceptsLiteral(input);
 	}
 	/** Cached path split of one scope's children (plumbing-blind, the
 	 *  same split the banding uses). */

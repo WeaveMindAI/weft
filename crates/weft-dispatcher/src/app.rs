@@ -359,7 +359,15 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         control_plane_namespace,
         broker_url,
         broker_token_path,
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder()
+            // Every peer this client talks to (the broker's admin surface,
+            // an infra container's `/live` and `/action`) answers in place;
+            // a redirect is a peer trying to send the dispatcher somewhere
+            // else (a container pointing at another tenant's endpoint),
+            // so none is followed.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a default reqwest client builds"),
         kube,
         caller_token_secret,
         gateway_base_url,

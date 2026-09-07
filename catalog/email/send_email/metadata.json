@@ -11,7 +11,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
         "smtp_host",
@@ -61,11 +61,7 @@
     {
       "name": "messageId",
       "type": "String",
-      "required": false,
       "description": "The sent message's Message-ID header."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

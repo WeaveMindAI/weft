@@ -38,7 +38,6 @@
       "name": "voiceNote",
       "type": "Boolean",
       "required": false,
-      "exposure": "config",
       "default": false,
       "widget": {
         "kind": "checkbox"
@@ -50,12 +49,8 @@
   "outputs": [
     {
       "name": "messageId",
-      "type": "String",
-      "required": false
+      "type": "String"
     }
   ],
-  "requires_infra": false,
-  "features": {
-    "isOutputDefault": true
-  }
+  "requires_infra": false
 }

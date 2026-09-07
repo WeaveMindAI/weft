@@ -8,12 +8,18 @@ export interface Span {
   endColumn: number;
 }
 
-/// Where an input's value may come from. Exposure governs LITERALS:
-/// 'all' = braces or assignment plus wires, 'assignment' = statement
-/// only plus wires, 'config' = braces only and NOT wireable (a pure
-/// design-time setting), 'wire' = wires alone.
-// SYNC: Exposure <-> crates/weft-core/src/weft_type.rs Exposure
-export type Exposure = 'all' | 'assignment' | 'config' | 'wire';
+/// One of the two things that can drive an input: a constant written in
+/// the source (any spelling: braces, statement, `@file`, `@asset`), or a
+/// value another node produces at run time (an edge, a dotted value in
+/// the braces, an inline node).
+// SYNC: AcceptedForm <-> crates/weft-core/src/node.rs AcceptedForm
+export type AcceptedForm = 'literal' | 'wire';
+
+/// Which drivers an input takes, as the list of accepted forms. Absent
+/// on an input means both. A port never adds a form; it only removes
+/// one, and the compiler resolves the list onto every instance input.
+// SYNC: Accepts <-> crates/weft-core/src/node.rs Accepts
+export type Accepts = AcceptedForm[];
 
 /// A pure WIRE port on a node instance's output side or a group/loop
 /// interface. Inputs are the richer `InputDefinition`.
@@ -21,6 +27,8 @@ export type Exposure = 'all' | 'assignment' | 'config' | 'wire';
 export interface PortDefinition {
   name: string;
   portType: string;
+  /// Whether the node waits for a value here. Inputs only: an output
+  /// carries no optionality and is always `true` here.
   required: boolean;
   description?: string;
   /// True iff this port was auto-synthesized by the loop-lowering pass
@@ -40,15 +48,15 @@ export interface PortDefinition {
   declaredType?: string;
 }
 
-/// One INPUT on a node instance, enriched: exposure resolved and the
-/// editor surface (widget/default/label/placeholder) stamped by the
+/// One INPUT on a node instance, enriched: accepted drivers resolved and
+/// the editor surface (widget/default/label/placeholder) stamped by the
 /// compiler, so the editor never re-derives any of it. The optional
 /// members are only absent on a locally-added port that has not
 /// round-tripped through a parse yet.
 // SYNC: InputDefinition <-> crates/weft-core/src/project.rs InputDefinition
 export interface InputDefinition extends PortDefinition {
-  // SYNC: InputDefinition.exposure <-> crates/weft-core/src/project.rs InputDefinition.exposure
-  exposure?: Exposure;
+  // SYNC: InputDefinition.accepts <-> crates/weft-core/src/project.rs InputDefinition.accepts
+  accepts?: Accepts;
   // SYNC: InputDefinition.widget <-> crates/weft-core/src/project.rs InputDefinition.widget
   widget?: Widget;
   default?: unknown;
@@ -76,7 +84,8 @@ export interface InputDefinition extends PortDefinition {
 /// Source span of one config field plus how it was written. `origin` tells
 /// the editor how to rewrite the field in place: an inline field
 /// (`n = Type { k: v }`) becomes `k: v`; a connection-line field (`n.k = v`)
-/// keeps its `n.k = ` prefix. Matches the Rust `ConfigFieldSpan`.
+/// keeps its `n.k = ` prefix.
+// SYNC: ConfigFieldSpan <-> crates/weft-core/src/project.rs ConfigFieldSpan
 export interface ConfigFieldSpan {
   span: Span;
   origin: 'inline' | 'connection';
@@ -514,11 +523,6 @@ export interface NodeFeaturesWire {
   canAddOutputPorts?: boolean;
   isTrigger?: boolean;
   showDebugPreview?: boolean;
-  /// This node type's firing is the deliverable, so a run started from
-  /// the outputs reaches it. The editor reads it to know which nodes a
-  /// run can be aimed at; a project overrides it per instance with
-  /// `_is_output` in the node's config.
-  isOutputDefault?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for TCP-only infra (Postgres, Redis)
   /// so the panel doesn't show a broken eye.
@@ -542,13 +546,13 @@ export interface NodeDefinition {
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
-  /// Body values that DRIVE INPUT PORTS, keyed by port name (braces or
-  /// statement form, per the port's literal placement). One home per
-  /// name: a port's value lives here, a config field's value lives in
-  /// `config`, so a braces-closed port and a same-named field coexist. The paired spans carry each entry's
-  /// source range + written form (`origin`: 'inline' = braces,
-  /// 'connection' = statement), which is what the editor's form toggle
-  /// rewrites.
+  /// Every constant written for an INPUT PORT, keyed by port name,
+  /// whichever spelling wrote it (braces or statement, a `@file`/`@asset`
+  /// marker included). The one home for a port's value; `config` keeps
+  /// only what is not a port (the `_` keys, a loop's knobs). The paired
+  /// spans carry each entry's source range + written form (`origin`:
+  /// 'inline' = braces, 'connection' = statement), which is what the
+  /// editor's form toggle rewrites.
   // SYNC: portLiterals/portLiteralSpans <-> crates/weft-core/src/project.rs NodeDefinition.port_literals/port_literal_spans
   portLiterals?: Record<string, unknown>;
   portLiteralSpans?: Record<string, ConfigFieldSpan>;
@@ -564,12 +568,18 @@ export interface NodeDefinition {
   sourceFile?: string;
 }
 
+// SYNC: Edge <-> crates/weft-core/src/project.rs Edge
 export interface Edge {
   id: string;
   source: string;
   target: string;
   sourceHandle: string | null;
   targetHandle: string | null;
+  /// The keys read off the source value before it lands
+  /// (`w.seconds = x.profile.wpm` carries `["wpm"]`). Absent or empty
+  /// for a plain wire. The graph draws such a wire dotted with the
+  /// path at its target end.
+  path?: string[];
   span?: Span;
   /// The file the span lives in; absent = the compiled source.
   sourceFile?: string;
@@ -595,7 +605,6 @@ export interface GroupDefinition {
   label: string | null;
   inPorts: PortDefinition[];
   outPorts: PortDefinition[];
-  oneOfRequired: string[][];
   parentGroupId: string | null;
   childGroupIds: string[];
   nodeIds: string[];
@@ -748,15 +757,15 @@ export type Widget =
   | { kind: 'file_drop'; accept?: string | null; type: string; multiple?: boolean };
 
 // One declared INPUT of a node type, as authored in metadata.json and
-// RESOLVED by the CLI before it ships (exposure + widget always filled
+// RESOLVED by the CLI before it ships (accepts + widget always filled
 // with their effective values on this wire).
 // SYNC: InputSpec <-> crates/weft-core/src/node.rs InputSpec
 export interface InputSpec {
   name: string;
   type: string;
   required?: boolean;
-  // SYNC: InputSpec.exposure <-> crates/weft-core/src/node.rs InputSpec.exposure
-  exposure?: Exposure;
+  // SYNC: InputSpec.accepts <-> crates/weft-core/src/node.rs InputSpec.accepts
+  accepts?: Accepts;
   widget?: Widget;
   default?: unknown;
   label?: string;
@@ -777,7 +786,6 @@ export interface InputSpec {
 export interface OutputSpec {
   name: string;
   type: string;
-  required?: boolean;
   description?: string;
 }
 
@@ -1061,7 +1069,7 @@ export type SkipReason =
   | { kind: 'required_input_closed'; port: string }
   | { kind: 'every_input_closed' }
   | { kind: 'one_of_group_closed'; ports: string[] }
-  | { kind: 'outside_this_run' };
+  | { kind: 'scope_skipped'; scope: string };
 
 /// Why an execution was cancelled: a person, a sibling run's
 /// `ctx.stop_tagged` (naming the run and the tag), the live caller
@@ -1312,11 +1320,13 @@ export interface LiveDataItem {
   label: string;
   data: string | number;
   /// Optional action button rendered next to the item. Click
-  /// posts a `signalAction` message; the host routes through
-  /// `/projects/{id}/signals/{node_id}/action`. The listener's
-  /// kind impl owns the action's payload schema. Use for
-  /// regenerate-api-key, future "rotate", etc. Generic so node
-  /// authors can add buttons without changing the inspector.
+  /// posts a `signalAction` message; the host routes it to
+  /// `/projects/{id}/infra/nodes/{node_id}/action` for an infra
+  /// node (the container behind `/live` serves `/action`) and to
+  /// `/projects/{id}/signals/{node_id}/action` for a trigger (the
+  /// listener's kind impl). Whoever serves the action owns its
+  /// payload schema. Generic so node authors can add buttons
+  /// without changing the inspector.
   action?: {
     label: string;
     actionKind: string;
@@ -2108,7 +2118,7 @@ export type EditOp =
   | { op: 'setLabel'; node: string; label: string | null }
   | { op: 'addNode'; id: string; nodeType: string; parentGroup: string | null }
   | { op: 'removeNode'; node: string }
-  | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
+  | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null; path?: string[] }
   | { op: 'removeEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null }
   | { op: 'addGroup'; label: string; parentGroup: string | null }
   | { op: 'removeGroup'; group: string }

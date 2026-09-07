@@ -19,6 +19,14 @@ Two jobs, one script, chosen by argv:
          still this database's password", which is how a caller finds
          out its disk was replaced underneath it.
 
+         It also serves the graph: `/live` says whether the password
+         is still readable, and its one button, `/action` with
+         `reset_password`, mints a new password, sets it on the
+         database over the unix socket (which needs no password), and
+         makes it readable again. That is the way out when the
+         connection that held the password is gone: press it, then
+         `weft infra start`, and the node publishes a fresh one.
+
 Where the files live and which port to serve on come from the node
 that declares this container, so the two sides cannot drift.
 """
@@ -27,14 +35,18 @@ import http.server
 import json
 import os
 import secrets
+import subprocess
 import sys
 
 SECRET_DIR = os.environ.get("WEFT_SECRET_DIR")
 PASSWORD_FILE = os.environ.get("WEFT_PASSWORD_FILE")
 PORT = os.environ.get("WEFT_CREDENTIAL_PORT")
-if not SECRET_DIR or not PASSWORD_FILE or not PORT:
+SOCKET_DIR = os.environ.get("WEFT_SOCKET_DIR")
+ADMIN_USER = os.environ.get("WEFT_ADMIN_USER")
+if not SECRET_DIR or not PASSWORD_FILE or not PORT or not SOCKET_DIR or not ADMIN_USER:
     sys.exit(
-        "WEFT_SECRET_DIR, WEFT_PASSWORD_FILE and WEFT_CREDENTIAL_PORT must be set by the node"
+        "WEFT_SECRET_DIR, WEFT_PASSWORD_FILE, WEFT_CREDENTIAL_PORT, WEFT_SOCKET_DIR and "
+        "WEFT_ADMIN_USER must be set by the node"
     )
 PORT = int(PORT)
 SEALED_FILE = os.path.join(SECRET_DIR, "sealed")
@@ -44,6 +56,10 @@ SEALED_FILE = os.path.join(SECRET_DIR, "sealed")
 CREDENTIAL_PATH = "/credential"
 CREDENTIAL_STORED_PATH = "/credential/stored"
 HEALTH_PATH = "/health"
+# The dispatcher's routes (features.liveEndpoint names this container).
+LIVE_PATH = "/live"
+ACTION_PATH = "/action"
+RESET_ACTION = "reset_password"
 
 
 def mint() -> None:
@@ -56,8 +72,16 @@ def mint() -> None:
     os.makedirs(SECRET_DIR, mode=0o750, exist_ok=True)
     if os.path.exists(PASSWORD_FILE):
         return
-    # url-safe: the value travels in a connection string.
-    password = secrets.token_urlsafe(32)
+    write_password(new_password())
+
+
+def new_password() -> str:
+    # url-safe: the value travels in a connection string, and it is
+    # quoted into SQL by the reset below, so no quote can be in it.
+    return secrets.token_urlsafe(32)
+
+
+def write_password(password: str) -> None:
     # Written under a temporary name and renamed once complete AND on
     # disk, so neither a crash mid-write nor a node reboot can leave a
     # half password, or lose one Postgres has already adopted.
@@ -80,6 +104,39 @@ def mint() -> None:
 
 def sealed() -> bool:
     return os.path.exists(SEALED_FILE)
+
+
+def reset_password() -> str | None:
+    """Mint a new password, set it on the database, make it readable again.
+
+    The database is told first, over its unix socket, which trusts a
+    local connection without a password: a file that named a password
+    the database did not have would lock every sign-in out. Returns
+    the refusal text when the database would not take it, so the
+    caller sees exactly what psql said."""
+    password = new_password()
+    # `psql` variables interpolate with quoting (`:'name'`), so the
+    # password never touches the SQL text itself.
+    run = subprocess.run(
+        [
+            "psql", "-h", SOCKET_DIR, "-U", ADMIN_USER, "-d", "postgres",
+            "-v", "ON_ERROR_STOP=1", "-v", f"user={ADMIN_USER}", "-v", f"password={password}",
+            "-c", "ALTER USER :\"user\" PASSWORD :'password'",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if run.returncode != 0:
+        detail = (run.stderr or run.stdout).strip() or f"psql exited {run.returncode}"
+        sys.stderr.write(f"credential: reset refused by the database: {detail}\n")
+        return detail
+    write_password(password)
+    try:
+        os.remove(SEALED_FILE)
+    except FileNotFoundError:
+        pass
+    sys.stderr.write("credential: password reset; readable again until a run stores it\n")
+    return None
 
 
 def stored_password() -> str | None:
@@ -109,6 +166,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == HEALTH_PATH:
             self._send(200, {"ok": True})
             return
+        if self.path == LIVE_PATH:
+            self._send(200, {"items": live_items()})
+            return
         if self.path != CREDENTIAL_PATH:
             self._send(404, {"error": "no such path"})
             return
@@ -122,7 +182,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # it as an opaque transport failure instead.
         self._send(200, {"sealed": True} if sealed() else {"password": password})
 
+    def _body(self) -> dict:
+        try:
+            # Clamped at BOTH ends, because the length is the caller's
+            # claim: above, because no body here is near this size;
+            # below, because a negative length means "read to the end"
+            # and a client that trickles forever would take the whole
+            # container's memory with it.
+            length = max(0, min(int(self.headers.get("Content-Length", "0")), 4096))
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return {}
+        return body if isinstance(body, dict) else {}
+
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == ACTION_PATH:
+            self._action(self._body())
+            return
         if self.path != CREDENTIAL_STORED_PATH:
             self._send(404, {"error": "no such path"})
             return
@@ -130,16 +206,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if password is None:
             self._send(503, {"error": "no password on the shared volume yet"})
             return
-        try:
-            # Clamped at BOTH ends, because the length is the caller's
-            # claim: above, because a password is never near this size;
-            # below, because a negative length means "read to the end"
-            # and a client that trickles forever would take the whole
-            # container's memory with it.
-            length = max(0, min(int(self.headers.get("Content-Length", "0")), 4096))
-            sent = json.loads(self.rfile.read(length) or b"{}").get("password", "")
-        except (ValueError, json.JSONDecodeError):
-            sent = ""
+        sent = self._body().get("password", "")
         # Only a caller that actually holds the password may retire it.
         # Compared as BYTES: comparing str refuses non-ASCII outright,
         # which would escape as a crash rather than a refusal.
@@ -157,9 +224,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f.write("stored")
         self._send(200, {"stored": True})
 
+    def _action(self, body: dict) -> None:
+        # The graph's button, in the dispatcher's envelope: a refusal
+        # travels as `result.error`, which the user reads as it is.
+        # SYNC: the /action envelope <-> crates/weft-dispatcher/src/api/infra.rs (infra_action_result), catalog/bailey/bridge/images/bridge/src/actions.js
+        action = body.get("action")
+        if action != RESET_ACTION:
+            self._send(200, {"result": {"error": f"no such action: {action!r}"}})
+            return
+        refused = reset_password()
+        if refused is not None:
+            self._send(200, {"result": {"error": f"the database refused the new password: {refused}"}})
+            return
+        self._send(200, {"result": {"reset": True}})
+
     def log_message(self, fmt: str, *args: object) -> None:
         # One line per request on stderr, never the response body.
         sys.stderr.write("credential: %s\n" % (fmt % args))
+
+
+def live_items() -> list:
+    """What the node's card shows: whether a run can still read the
+    password, and the one button that makes it readable again."""
+    if stored_password() is None:
+        state = "not minted yet"
+    elif sealed():
+        state = "handed over to a connection"
+    else:
+        state = "readable; the next run stores it"
+    return [
+        {
+            "type": "text",
+            "label": "Password",
+            "data": state,
+            "action": {
+                "label": "Reset password",
+                "actionKind": RESET_ACTION,
+                "confirm": (
+                    "Give the database a new password? Every connection holding the "
+                    "old one stops working; run `weft infra start` afterwards so this "
+                    "node publishes the new one."
+                ),
+            },
+        }
+    ]
 
 
 def serve() -> None:

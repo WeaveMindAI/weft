@@ -14,8 +14,7 @@
     {
       "name": "file",
       "type": "File",
-      "required": true,
-      "exposure": "all"
+      "required": true
     }
   ],
   "outputs": [

@@ -41,12 +41,12 @@ describe('autoOrganize', () => {
 describe('satellites and side paths', () => {
 	it('a single-consumer feeder parks under its consumer instead of layer zero', async () => {
 		// provider -> llm <- upstream ; provider has no inputs and feeds only
-		// the llm's wire-exposure hookup input.
+		// the llm's wire-only hookup input.
 		const llmNode = {
 			...node('llm'),
 			inputs: [
 				{ name: 'value', type: 'String' },
-				{ name: 'provider', portType: 'LlmProvider', exposure: 'wire' },
+				{ name: 'provider', portType: 'LlmProvider', accepts: ['wire'] },
 			],
 		};
 		const nodes = [node('upstream'), llmNode, node('provider')] as any;

@@ -22,7 +22,6 @@
     {
       "name": "done",
       "type": "Boolean",
-      "required": false,
       "description": "Fires true once the conversation ends (caller closed or went idle)."
     }
   ],

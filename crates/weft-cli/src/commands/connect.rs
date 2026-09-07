@@ -938,8 +938,72 @@ impl Connecting<'_> {
             self.registry.clone(),
         )
         .map_err(|e| anyhow::anyhow!("write the pick onto {node}.{input}: {e}"))?;
-        std::fs::write(file, edited).with_context(|| format!("write {}", file.display()))?;
+        std::fs::write(file, &edited).with_context(|| format!("write {}", file.display()))?;
+        // Say what changed, the way an edit tool reports it, so a model
+        // driving this command updates its picture of the file without
+        // re-reading it.
+        if !self.json {
+            if let Some(block) = edit_diff_block(&self.target.rel_file, &source, &edited) {
+                println!("{block}");
+            }
+        }
         Ok(())
+    }
+}
+
+/// The lines an edit changed, as a before/after block: the file and
+/// the first changed line (`main.weft:15`), then every removed line
+/// with `- ` and every added line with `+ `. Lines the edit left
+/// alone are not shown. `None` when nothing changed.
+pub(crate) fn edit_diff_block(rel_file: &str, before: &str, after: &str) -> Option<String> {
+    let old: Vec<&str> = before.lines().collect();
+    let new: Vec<&str> = after.lines().collect();
+    let common_start = old.iter().zip(new.iter()).take_while(|(a, b)| a == b).count();
+    let mut common_end = 0;
+    while common_end < old.len() - common_start
+        && common_end < new.len() - common_start
+        && old[old.len() - 1 - common_end] == new[new.len() - 1 - common_end]
+    {
+        common_end += 1;
+    }
+    let removed = &old[common_start..old.len() - common_end];
+    let added = &new[common_start..new.len() - common_end];
+    if removed.is_empty() && added.is_empty() {
+        return None;
+    }
+    let mut block = format!("{rel_file}:{}", common_start + 1);
+    for line in removed {
+        block.push_str(&format!("\n- {line}"));
+    }
+    for line in added {
+        block.push_str(&format!("\n+ {line}"));
+    }
+    Some(block)
+}
+
+#[cfg(test)]
+mod diff_block_tests {
+    use super::edit_diff_block;
+
+    #[test]
+    fn a_changed_line_shows_as_before_and_after_at_its_number() {
+        let before = "a = Text {}\nb = Slack {\n  account: old\n}\n";
+        let after = "a = Text {}\nb = Slack {\n  account: new\n}\n";
+        assert_eq!(
+            edit_diff_block("main.weft", before, after).as_deref(),
+            Some("main.weft:3\n-   account: old\n+   account: new")
+        );
+    }
+
+    #[test]
+    fn an_inserted_line_shows_only_the_addition_and_no_change_shows_nothing() {
+        let before = "b = Slack {\n}\n";
+        let after = "b = Slack {\n  account: new\n}\n";
+        assert_eq!(
+            edit_diff_block("main.weft", before, after).as_deref(),
+            Some("main.weft:2\n+   account: new")
+        );
+        assert_eq!(edit_diff_block("main.weft", before, before), None);
     }
 }
 

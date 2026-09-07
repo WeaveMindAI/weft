@@ -61,7 +61,7 @@
         { className: 'meta', begin: '@[A-Za-z_][A-Za-z0-9_]*' },
 
         // The four keys the language reserves.
-        { className: 'keyword', begin: '\\b(_label|_tags|_is_output|_should_flow)\\b(?=\\s*:)' },
+        { className: 'keyword', begin: '\\b(_label|_tags|_should_flow)\\b(?=\\s*:)' },
 
         // A config field key, left of its colon.
         { className: 'attr', begin: '\\b' + IDENT + '\\b(?=\\s*:)' },
@@ -69,7 +69,7 @@
         // The port half of `node.port`.
         { className: 'symbol', begin: '(?<=\\.)' + IDENT },
 
-        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|Passthrough|self)\\b' },
+        { className: 'keyword', begin: '\\b(Group|Loop|LoopIn|LoopOut|Passthrough|self|type)\\b' },
 
         {
           className: 'type',

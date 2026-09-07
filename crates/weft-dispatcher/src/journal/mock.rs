@@ -379,7 +379,7 @@ impl Journal for MockJournal {
     async fn events_log_lossy(
         &self,
         color: Color,
-    ) -> anyhow::Result<(Vec<ExecEvent>, Vec<String>)> {
+    ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)> {
         // In-memory events are typed, so nothing can fail to decode.
         let events = self
             .inner
@@ -388,7 +388,10 @@ impl Journal for MockJournal {
             .events
             .iter()
             .filter(|e| e.color() == color)
-            .cloned()
+            .enumerate()
+            .map(|(index, event)| crate::events::IdentifiedEvent {
+                event_id: format!("mock:{color}:{index}"), event: event.clone(),
+            })
             .collect();
         Ok((events, Vec::new()))
     }
@@ -524,6 +527,21 @@ impl Journal for MockJournal {
         color: Color,
     ) -> anyhow::Result<Option<ExecutionSummary>> {
         Ok(self.summary_for_color(color))
+    }
+
+    async fn colors_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<Color>> {
+        let g = self.inner.lock().unwrap();
+        let mut out: Vec<Color> = g
+            .execution_colors
+            .iter()
+            .filter(|(c, row)| {
+                row.tenant_id == tenant && row.kind == "execution" && c.to_string().starts_with(prefix)
+            })
+            .map(|(c, _)| *c)
+            .collect();
+        out.sort();
+        out.truncate(2);
+        Ok(out)
     }
 
     async fn list_non_terminal_colors_for_project(

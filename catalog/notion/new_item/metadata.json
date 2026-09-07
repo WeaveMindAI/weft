@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Notion access (wire a NotionAccess node)."
     },
@@ -60,33 +60,33 @@
     {
       "name": "intervalSecs",
       "type": "Number",
-      "exposure": "config",
       "default": 30,
       "label": "Check every (seconds)",
-      "description": "How often the database is checked for new rows."
+      "description": "How often the database is checked for new rows.",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
     }
   ],
   "outputs": [
     {
       "name": "page",
       "type": "JsonDict",
-      "required": false,
       "description": "The new row, the raw Notion page object."
     },
     {
       "name": "pageId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "url",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "properties",
       "type": "JsonDict",
-      "required": false,
       "description": "The row's property values."
     }
   ],

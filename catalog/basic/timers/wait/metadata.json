@@ -24,7 +24,7 @@
       "name": "value",
       "type": "T",
       "required": false,
-      "exposure": "wire",
+      "accepts": ["wire"],
       "label": "Value",
       "description": "Passed through unchanged once the wait is over. Optional: the node also works as a pure delay on `_should_flow`."
     }
@@ -33,13 +33,11 @@
     {
       "name": "value",
       "type": "T",
-      "required": false,
       "description": "The `value` that came in, emitted once the wait is over."
     },
     {
       "name": "wokeAt",
       "type": "String",
-      "required": false,
       "description": "ISO-8601 time the wait ended."
     }
   ],

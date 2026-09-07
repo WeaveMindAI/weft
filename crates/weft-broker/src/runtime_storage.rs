@@ -99,6 +99,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/upload/abort", post(admin_upload_abort))
         .route("/v1/storage/admin/tenant-list", post(admin_tenant_list))
         .route("/v1/storage/admin/list-prefix", post(admin_list_prefix))
+        .route("/v1/storage/admin/asset-references", post(admin_asset_references))
         .route("/v1/storage/admin/tenant-usage", post(admin_tenant_usage))
         .route("/v1/storage/admin/files/{*key}", delete(admin_delete_file))
         .route("/v1/storage/admin/presign", post(admin_presign))
@@ -120,7 +121,7 @@ const INTERNAL_STORAGE_ERROR_BODY: &str = "internal storage error";
 
 fn map_err(e: RuntimeStoreError) -> ApiError {
     match e {
-        RuntimeStoreError::NotFound(m) => (StatusCode::NOT_FOUND, format!("file not found: {m}")),
+        RuntimeStoreError::NotFound(key) => (StatusCode::NOT_FOUND, unavailable_file_message(&key)),
         RuntimeStoreError::Denied(m) => (StatusCode::FORBIDDEN, m),
         RuntimeStoreError::Invalid(m) => (StatusCode::BAD_REQUEST, m),
         RuntimeStoreError::QuotaExceeded(m) => (StatusCode::PAYLOAD_TOO_LARGE, m),
@@ -130,6 +131,33 @@ fn map_err(e: RuntimeStoreError) -> ApiError {
             (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string())
         }
     }
+}
+
+fn unavailable_file_message(key: &str) -> String {
+    let is_asset =
+        key::parse_key(key).is_ok_and(|p| matches!(p.scope, key::KeyScope::Asset { .. }));
+    // Expiry and explicit deletion both remove the row. Do not invent which
+    // happened once that evidence is gone; explain both and name the recovery.
+    // The recovery differs by scope: an asset is uploaded by the build from
+    // the project's own source, so rebuilding puts it back and clears its
+    // countdown. Keep File is for a file a NODE made, and the store refuses
+    // it on anything but execution scope, so naming it here would send the
+    // reader after a knob this file does not have.
+    if is_asset {
+        return format!(
+            "File '{key}' is no longer available: it may have expired or been deleted. \
+             A file the project uploads expires after {} days once nothing in the \
+             workflow references it any more, even if an older run is still waiting. \
+             Build and deploy the project again to upload it back, then start a new run.",
+            crate::runtime_store::DEFAULT_KEEP_TTL_SECS / 86400
+        );
+    }
+    format!(
+        "File '{key}' is no longer available: it may have expired or been deleted. \
+         Files can expire according to their keep duration, even while a run is \
+         waiting. Create the file again and start a new run; to keep a file longer \
+         next time, put a Keep File node after the one that made it, or raise its days."
+    )
 }
 
 fn map_anyhow(e: anyhow::Error) -> ApiError {
@@ -412,6 +440,11 @@ async fn keep_file(
     Ok(Json(store.keep(&parsed, req.ttl).await.map_err(map_err)?))
 }
 
+/// `POST /v1/storage/presign`: the link a node body hands out for a stored
+/// file, and the `url` the runtime puts on every file marker before a body
+/// runs. The internet-reachable link when the install serves one (so a
+/// provider can fetch it too), else a URL signed for the cluster's own
+/// address: the node body can fetch that one, nothing outside can.
 async fn presign(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
@@ -420,19 +453,22 @@ async fn presign(
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
     let parsed = wall(&caller, &req.key)?;
-    Ok(Json(PresignResponse { url: store.presign(&parsed, req.ttl_secs).await.map_err(map_err)? }))
+    let url = match public_link_url(&state, store, &parsed, req.ttl_secs).await? {
+        Some(url) => url,
+        None => {
+            store
+                .download_url(&parsed, PresignAudience::Internal, req.ttl_secs)
+                .await
+                .map_err(map_err)?
+                .1
+        }
+    };
+    Ok(Json(PresignResponse { url }))
 }
 
-/// Mint a URL the OPEN INTERNET can fetch the file from, or `url: None`
-/// when no internet-reachable address is configured; the worker then
-/// inlines the bytes instead. Three configurations, one rule each:
-/// - the bucket's public endpoint is a declared internet host
-///   (`WEFT_OBJECT_STORE_PUBLIC_INTERNET`): the bucket's own presigned
-///   URL, zero relay hops;
-/// - an internet-reachable base exists (a public tunnel, a real
-///   ingress): a relay link under it, resolved by the public
-///   `/public/files/{token}` route;
-/// - neither: no public link exists, answer `None`.
+/// `POST /v1/storage/public-link`: a URL the OPEN INTERNET can fetch the
+/// file from, or `url: None` when no internet-reachable address is
+/// configured; the worker then inlines the bytes instead.
 async fn public_link(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
@@ -441,40 +477,58 @@ async fn public_link(
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
     let parsed = wall(&caller, &req.key)?;
-    let url = match public_link_route(state.object_store_public_internet, state.internet_base()) {
-        PublicLinkRoute::DirectPresign => {
-            Some(store.presign(&parsed, req.ttl_secs).await.map_err(map_err)?)
-        }
-        PublicLinkRoute::Relay(base) => {
-            let token = store.mint_public_link(&parsed, req.ttl_secs).await.map_err(map_err)?;
-            Some(format!("{}/public/files/{token}", base.trim_end_matches('/')))
-        }
-        PublicLinkRoute::Unsupported => None,
-    };
+    let url = public_link_url(&state, store, &parsed, req.ttl_secs).await?;
     Ok(Json(weft_core::storage::PublicLinkResponse { url }))
 }
 
-/// Which way a public file link is served, decided from two configured
-/// facts alone: the operator's declaration that the bucket's public
-/// endpoint is a real internet host, and whether an internet-reachable
-/// base exists at all.
+/// Mint the internet-reachable link for a file, or `None` when the
+/// install has none. Three configurations, one rule each:
+/// - the bucket's public endpoint is a declared internet host
+///   (`WEFT_OBJECT_STORE_PUBLIC_INTERNET`): the bucket's own presigned
+///   URL, zero relay hops;
+/// - an internet-reachable base exists (a public tunnel, a real
+///   ingress): a relay link under it, resolved by the public
+///   `/public/files/{token}` route;
+/// - neither: no public link exists.
+async fn public_link_url(
+    state: &BrokerState,
+    store: &RuntimeStore,
+    parsed: &key::ParsedKey,
+    ttl_secs: Option<u64>,
+) -> Result<Option<String>, ApiError> {
+    Ok(match link_route(state.object_store_public_internet, state.internet_base()) {
+        LinkRoute::DirectPresign => Some(store.presign(parsed, ttl_secs).await.map_err(map_err)?),
+        LinkRoute::Relay(base) => {
+            let token = store.mint_public_link(parsed, ttl_secs).await.map_err(map_err)?;
+            Some(format!("{}/public/files/{token}", base.trim_end_matches('/')))
+        }
+        LinkRoute::ClusterOnly => None,
+    })
+}
+
+/// Which way a file link is served, decided from two configured facts
+/// alone: the operator's declaration that the bucket's public endpoint
+/// is a real internet host, and whether an internet-reachable base
+/// exists at all.
 #[derive(Debug, PartialEq, Eq)]
-enum PublicLinkRoute<'a> {
+enum LinkRoute<'a> {
     /// The bucket's own presigned URL, zero relay hops.
     DirectPresign,
     /// A relay link under the internet base.
     Relay(&'a str),
-    /// No public link exists; the caller inlines the bytes.
-    Unsupported,
+    /// No internet-reachable link exists: a node body gets a link signed
+    /// for the cluster's own address, and an outside consumer gets the
+    /// bytes inline.
+    ClusterOnly,
 }
 
-fn public_link_route(bucket_internet: bool, internet_base: Option<&str>) -> PublicLinkRoute<'_> {
+fn link_route(bucket_internet: bool, internet_base: Option<&str>) -> LinkRoute<'_> {
     if bucket_internet {
-        PublicLinkRoute::DirectPresign
+        LinkRoute::DirectPresign
     } else if let Some(base) = internet_base {
-        PublicLinkRoute::Relay(base)
+        LinkRoute::Relay(base)
     } else {
-        PublicLinkRoute::Unsupported
+        LinkRoute::ClusterOnly
     }
 }
 
@@ -560,6 +614,17 @@ async fn admin_upload_begin(
             UploadBeginResponse { key, part_size: 0, already_stored: true }
         }
     }))
+}
+
+async fn admin_asset_references(
+    State(state): State<Arc<BrokerState>>,
+    headers: HeaderMap,
+    Json(req): Json<Tenanted<weft_core::storage::AssetReferencesRequest>>,
+) -> Result<StatusCode, ApiError> {
+    control_plane(&state, &headers).await?;
+    store(&state)?.set_asset_references(&req.tenant, &req.inner.project, &req.inner.keys)
+        .await.map_err(map_err)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn admin_upload_parts(
@@ -811,24 +876,46 @@ async fn admin_sweep_exec(
 }
 
 #[cfg(test)]
-mod public_link_route_tests {
-    use super::{public_link_route, PublicLinkRoute};
+mod link_route_tests {
+    use super::{link_route, map_err, LinkRoute, RuntimeStoreError, StatusCode};
+
+    #[test]
+    fn unavailable_uploaded_file_explains_expiry_and_how_to_recover() {
+        let key = format!("tenant/asset/project/{}", "a".repeat(64));
+        let (status, message) = map_err(RuntimeStoreError::NotFound(key.clone()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        for text in [
+            &key,
+            "expired or been deleted",
+            "30 days",
+            "older run is still waiting",
+            "Build and deploy the project again",
+            "start a new run",
+        ] {
+            assert!(message.contains(text), "missing {text:?}: {message}");
+        }
+        // Keep File is refused on anything but execution scope, so it is
+        // not the recovery for an uploaded file and must not be offered.
+        assert!(!message.contains("Keep File"), "{message}");
+    }
+
+    #[test]
+    fn unavailable_generated_file_does_not_claim_a_fixed_thirty_day_lifetime() {
+        let (_, message) = map_err(RuntimeStoreError::NotFound("tenant/exec/color/file".into()));
+        assert!(message.contains("keep duration"), "{message}");
+        assert!(!message.contains("30 days"), "{message}");
+    }
 
     #[test]
     fn route_follows_the_configured_facts() {
         // Internet-declared bucket wins outright (even with a base up:
         // the direct URL is the no-hop path).
-        assert_eq!(public_link_route(true, None), PublicLinkRoute::DirectPresign);
-        assert_eq!(
-            public_link_route(true, Some("https://x.example")),
-            PublicLinkRoute::DirectPresign
-        );
+        assert_eq!(link_route(true, None), LinkRoute::DirectPresign);
+        assert_eq!(link_route(true, Some("https://x.example")), LinkRoute::DirectPresign);
         // Private bucket + internet base: relay under the base.
-        assert_eq!(
-            public_link_route(false, Some("https://x.example")),
-            PublicLinkRoute::Relay("https://x.example")
-        );
-        // Neither: no public link, callers inline.
-        assert_eq!(public_link_route(false, None), PublicLinkRoute::Unsupported);
+        assert_eq!(link_route(false, Some("https://x.example")), LinkRoute::Relay("https://x.example"));
+        // Neither: no internet link; a node body gets the cluster
+        // address, an outside consumer the bytes.
+        assert_eq!(link_route(false, None), LinkRoute::ClusterOnly);
     }
 }

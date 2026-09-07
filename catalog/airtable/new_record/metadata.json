@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "data.records:read"
@@ -83,7 +83,6 @@
     {
       "name": "createdField",
       "type": "String",
-      "exposure": "config",
       "default": "Created",
       "label": "Created time column",
       "description": "The table's Created time column, sorted on to spot new records."
@@ -91,28 +90,29 @@
     {
       "name": "intervalSecs",
       "type": "Number",
-      "exposure": "config",
       "default": 30,
       "label": "Check every (seconds)",
-      "description": "How often the table is checked for new records."
+      "description": "How often the table is checked for new records.",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
     }
   ],
   "outputs": [
     {
       "name": "record",
       "type": "JsonDict",
-      "required": false,
       "description": "The new record (id, createdTime, fields)."
     },
     {
       "name": "recordId",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "fields",
       "type": "JsonDict",
-      "required": false,
       "description": "The new record's fields keyed by column name."
     }
   ],

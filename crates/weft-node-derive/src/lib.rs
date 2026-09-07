@@ -102,18 +102,22 @@ fn manifest_paths(
     let source = ident_span
         .local_file()
         .ok_or("derive(NodeManifest): the compiler did not expose the invoking source file")?;
+    manifest_paths_for_source(&source)
+}
+
+fn manifest_paths_for_source(
+    source: &std::path::Path,
+) -> Result<(std::path::PathBuf, Option<std::path::PathBuf>), String> {
     let dir = source
         .parent()
         .ok_or("derive(NodeManifest): invoking source file has no parent directory")?;
-    // No-follow, like the catalog: a symlinked member metadata.json is not part
-    // of a unit (the staging copy and the hash walk both drop it), so the derive
-    // must not resolve one either, or the runtime node would exist while the
-    // catalog skips it.
+    // Follow file links like catalog discovery and build staging. Local
+    // node tests read the original tree rather than the staged copy.
     let member_path = dir.join("metadata.json");
-    if !is_real_file(&member_path) {
+    if !member_path.is_file() {
         return Err(format!(
-            "derive(NodeManifest): no metadata.json next to {} (a symlink does not count). \
-             Every node ships a real metadata.json in its own directory.",
+            "derive(NodeManifest): no metadata.json next to {}. \
+             Every node ships a readable metadata.json in its own directory.",
             source.display()
         ));
     }
@@ -123,9 +127,9 @@ fn manifest_paths(
 
     let package_defaults = dir
         .parent()
-        .filter(|parent| is_real_file(&parent.join("package.toml")))
+        .filter(|parent| parent.join("package.toml").is_file())
         .map(|parent| parent.join("metadata.json"))
-        .filter(|defaults| is_real_file(defaults))
+        .filter(|defaults| defaults.is_file())
         .map(|defaults| {
             std::fs::canonicalize(&defaults).map_err(|e| {
                 format!(
@@ -137,15 +141,6 @@ fn manifest_paths(
         .transpose()?;
 
     Ok((member, package_defaults))
-}
-
-/// A real (non-symlink) file at `path`. The catalog decides a node's shape from
-/// a NO-FOLLOW view of the tree (a symlinked file is not part of a unit, since
-/// the staging copy and the hash walk both drop it), so the derive must see the
-/// same thing: a followed symlink here would make the runtime metadata and the
-/// catalog's disagree about what the package declares.
-fn is_real_file(path: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// Keys a package root's partial `metadata.json` may never supply as a default
@@ -215,4 +210,33 @@ fn validate_manifest(path: &std::path::Path) -> Result<(), String> {
 
 fn compile_error(msg: &str) -> TokenStream {
     quote! { compile_error!(#msg); }.into()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn linked_metadata_and_package_markers_match_catalog_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("package");
+        let member = package.join("node");
+        std::fs::create_dir_all(&member).unwrap();
+        let member_metadata = root.path().join("member.json");
+        let defaults = root.path().join("defaults.json");
+        let marker = root.path().join("package.toml");
+        std::fs::write(&member_metadata, r#"{"type":"Example"}"#).unwrap();
+        std::fs::write(&defaults, r#"{"tags":["shared"]}"#).unwrap();
+        std::fs::write(&marker, "").unwrap();
+        symlink(&member_metadata, member.join("metadata.json")).unwrap();
+        symlink(&defaults, package.join("metadata.json")).unwrap();
+        symlink(&marker, package.join("package.toml")).unwrap();
+
+        let (actual_member, actual_defaults) = manifest_paths_for_source(&member.join("mod.rs")).unwrap();
+        assert_eq!(actual_member, member_metadata.canonicalize().unwrap());
+        assert_eq!(actual_defaults, Some(defaults.canonicalize().unwrap()));
+        validate_manifest(&actual_member).unwrap();
+        validate_defaults(actual_defaults.as_ref().unwrap()).unwrap();
+    }
 }

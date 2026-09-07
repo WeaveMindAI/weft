@@ -178,6 +178,26 @@ impl Ctx {
 /// name-vs-uuid: the dispatcher's endpoints accept uuids, so name
 /// lookups would need a `/projects/by-name` round-trip; today we
 /// pass the raw arg through and the dispatcher rejects non-uuids.
+/// The full color an execution argument names. A whole uuid is taken
+/// as it is; anything shorter is the start of one, and the dispatcher
+/// answers the single execution of yours it starts (or says it starts
+/// none, or several). Every command that takes a color goes through
+/// here, so `weft events 3f2a` works the way `weft stop 3f2a` does.
+pub async fn resolve_color(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
+    if uuid::Uuid::parse_str(input).is_ok() {
+        return Ok(input.to_string());
+    }
+    let resp: serde_json::Value = ctx
+        .client()
+        .get_json(&format!("/executions/resolve/{input}"))
+        .await
+        .map_err(|e| anyhow::anyhow!("'{input}' names no execution: {e}"))?;
+    resp.get("color")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("dispatcher response missing color: {resp}"))
+}
+
 pub fn resolve_project_id(ctx: &Ctx, explicit: Option<String>) -> anyhow::Result<String> {
     if let Some(raw) = explicit {
         return Ok(raw);

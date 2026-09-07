@@ -3,7 +3,7 @@
 #   shared ─┬─► gate_x ─► out_x     (fired by start_x)
 #           └─► gate_y ─► out_y     (fired by start_y)
 #
-#   gate_x ─► side_x                (mine, but no output asks for it)
+#   gate_x ─► side_x                (a leaf of program x, read by nothing)
 #
 # `shared` feeds both programs. A fire of `start_x` runs its own program
 # and has to leave the other alone: `shared` still emits down every wire
@@ -11,9 +11,9 @@
 # comes from `start_y`, which did not fire). The rig asserts that pulse
 # leaves NO trace on `gate_y` (another program is not this run's
 # business) and the run completes instead of parking forever and ending
-# stuck. `side_x` is different: it is in the fired program, reachable
-# from `start_x`, but no output depends on it, so it journals exactly one
-# `outside_this_run` skip, the hint that its author forgot `_is_output`.
+# stuck. `side_x` is in the fired program, reachable from `start_x`, so
+# it runs like everything else the fire reaches: nothing reading a node's
+# outputs is no reason not to run it.
 
 shared = Text { value: "shared" }
 

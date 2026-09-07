@@ -16,17 +16,19 @@ there.
 | Slug | Meaning |
 |---|---|
 | `type-mismatch` | a connection's source type is not compatible with its target. The message names both. |
+| `deref-path` | a wire reads a key off its value (`t.n = s.out.profile.wpm`) that the source type does not have: the message names the keys that exist, or, when the type has no keys at all (`JsonDict`, a scalar), says to declare the shape on the source port or `Cast` first. |
 | `required-port-unmet` | a required input has no wire and no literal. Wire it, give it a literal, or mark it optional with `?`. |
 | `unknown-source-node` | the left side of a connection names a node that does not exist in this scope. |
 | `unknown-target-node` | the right side names a node that does not exist in this scope. |
 | `unknown-source-port` | the node exists; that output port does not. |
 | `unknown-target-port` | the node exists; that input port does not. |
 | `double-driven-port` | one input has two drivers: two wires, or a wire and a literal. An input has exactly one source. |
-| `input-not-wireable` | a wire lands on an input declared `exposure: "config"`, which is a design-time setting and takes no wire. |
+| `input-accepts` | a driver the port does not take: a wire on a port whose `accepts` is `["literal"]`, a written value on one whose `accepts` is `["wire"]`, or a wire or a `@file`/`@asset` on a port the compiler reads to build the node. The message reads the list back. |
 | `duplicate-input-port` | the same input name declared twice on one node. |
 | `duplicate-node-id` | two nodes share an id in one scope. |
-| `port-literal-placement` | a value in a position that cannot take one: a port whose `exposure` refuses that form, or a group's own output written from inside (`self.result = "lit"`). |
+| `should-flow-not-boolean` | a `_should_flow` written down that is not `true` or `false`. A wire may carry any value; a constant is a Boolean. |
 | `undeclared-port-no-custom` | a port was referenced that the node neither declares nor allows you to add. |
+| `value-on-output` | a value was written on one of the node's output ports. An output takes no value: a firing emits on it, and you read it as `node.port`. |
 
 ## Types
 
@@ -47,8 +49,7 @@ there.
 | `graph-cycle` | a cycle in the wire graph. Iterate with a `Loop`; exchange feedback over a bus. |
 | `scope-reachability` | a connection reaches across a group boundary. Children reach each other and `self`, nothing else. |
 | `orphan-outputs` | a node's outputs go nowhere and nothing depends on it. |
-| `unreachable-from-output` | nothing that runs can reach this node. |
-| `no-output-node` | the project declares no output node, so a run would have nothing to produce. Set `_is_output: true` on the node whose firing is the deliverable. |
+| `level-too-large` | **a warning.** A level of the graph (the file, or the inside of a group or loop) holds more than fifteen items, nodes or groups. About six per level is what reads; group the nodes cooperating on one job, and nest groups rather than widen the level. The program still runs: this is advice about how it reads. |
 | `loop-boundary-unpaired` | a loop's internal boundary nodes do not line up. This is an internal invariant; hitting it is a compiler bug worth reporting. |
 
 ## Triggers
@@ -56,6 +57,7 @@ there.
 | Slug | Meaning |
 |---|---|
 | `trigger-in-loop` | a trigger inside a `Loop`. An entry point per iteration is meaningless. |
+| `infra-in-loop` | an infra node inside a `Loop`. Infra is provisioned once for the project, not once per item. |
 | `trigger-into-trigger` | a trigger wired into another trigger. No phase delivers that. |
 | `trigger-into-infra` | a trigger wired into an infra node. Provisioning happens before any fire exists. |
 | `duplicate-port` | two ports on the node share a name on one side, which config-derived ports are the usual way to reach. Give them different names. |
@@ -116,7 +118,8 @@ one producer and one taker.
 | Slug | Meaning |
 |---|---|
 | `require-one-of-unmet` | an `@require_one_of` group where nothing is satisfied. |
-| `no-required-skip` | **a warning.** Every wireable input on this node is optional and there is no `@require_one_of`, so the node runs even when everything upstream is dead. Usually not what you want; add `@require_one_of`. |
+| `unknown-type` | **a warning.** A declared node type is not in the project's catalog: a typo, or the node was never built. The message names the type. |
+| `no-required-skip` | **a warning.** Every input a wire feeds on this node is optional and there is no `@require_one_of`, so the node runs even when everything upstream is dead. Usually not what you want; add `@require_one_of`. A node built from written constants alone has no upstream and never gets this. |
 | `rule-structural` | a node's own declarative validation rule failed at compile time. The message is the node author's. |
 | `rule-runtime` | a node's own rule flagged something checkable only at run time. The language writes one of these itself: every access node requires a connection picked (unless its recipe declares `connection_optional`), with no rule in its metadata. |
 

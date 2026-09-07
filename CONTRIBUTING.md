@@ -116,10 +116,9 @@ A few things we look for in review:
   [a connection](https://weavemindai.github.io/weft/connections/using-a-connection.html).
 - **Make it user friendly to use** You can go read
   [which widget when](https://weavemindai.github.io/weft/nodes/metadata.html#widget).
-- **Decide `isOutputDefault`** rather than letting it default. There is no safe
-  answer, and you can go and read   for the fields, and
+- **Say what it shows.** You can go and read
   [what your node shows in the graph](https://weavemindai.github.io/weft/nodes/showing-things-in-the-graph.html)
-  for what it can put on its own body. [how to choose](https://weavemindai.github.io/weft/nodes/metadata.html#isoutputdefault).
+  for what it can put on its own body.
 - **Ship a `fake` test**, in a `tests.rs` beside your `mod.rs`. And if it talks
   to a provider, a `live` one on the cheapest path that still exercises the real
   thing.

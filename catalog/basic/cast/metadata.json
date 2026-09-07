@@ -16,15 +16,14 @@
       "name": "value",
       "type": "T",
       "required": true,
-      "exposure": "wire",
+      "accepts": ["wire"],
       "label": "Value"
     }
   ],
   "outputs": [
     {
       "name": "value",
-      "type": "MustOverride",
-      "required": false
+      "type": "MustOverride"
     }
   ],
   "features": {

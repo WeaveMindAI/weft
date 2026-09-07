@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "voice_lab"
@@ -43,11 +43,7 @@
     {
       "name": "voiceId",
       "type": "String",
-      "required": false,
       "description": "The minted voice's id: what the speak nodes take."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

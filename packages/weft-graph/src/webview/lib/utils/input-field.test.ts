@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { fieldForInput, clampToRange, hasUnpickedAccess, inputRendersField, nextPortLiterals, shouldFlowField } from './input-field';
 import { SHOULD_FLOW_PORT } from '../../../protocol';
-import { inputExposure } from '../types';
+import { acceptsLiteral, acceptsWire } from '../types';
 import type { PortDefinition } from '../types';
 
 /** The regression class this file pins: an input's resolved widget is
@@ -13,7 +13,7 @@ describe('fieldForInput', () => {
 		name: 'x',
 		portType: 'String',
 		required: false,
-		exposure: 'all',
+		accepts: ['literal', 'wire'],
 		widget: { kind: 'textarea' },
 		...over,
 	});
@@ -37,10 +37,10 @@ describe('fieldForInput', () => {
 		expect(drop.accept).toBe('image/png');
 	});
 
-	it('routes the value home by exposure', () => {
-		expect(fieldForInput(base({ exposure: 'all' })).portDriven).toBe(true);
-		expect(fieldForInput(base({ exposure: 'assignment' })).portDriven).toBe(true);
-		expect(fieldForInput(base({ exposure: 'config' })).portDriven).toBe(false);
+	it('every input field edits the port literal, the one home a port has', () => {
+		expect(fieldForInput(base({ accepts: ['literal', 'wire'] })).portDriven).toBe(true);
+		expect(fieldForInput(base({ accepts: ['literal'] })).portDriven).toBe(true);
+		expect(fieldForInput(base({ accepts: undefined })).portDriven).toBe(true);
 	});
 
 	it('carries default, label, and placeholder', () => {
@@ -57,11 +57,11 @@ describe('fieldForInput', () => {
 
 	it('flattens the access widget with its compiler-stamped service', () => {
 		const f = fieldForInput(
-			base({ exposure: 'config', widget: { kind: 'access', service: 'slack' } }),
+			base({ accepts: ['literal'], widget: { kind: 'access', service: 'slack' } }),
 		);
 		expect(f.type).toBe('access');
 		expect(f.service).toBe('slack');
-		expect(f.portDriven).toBe(false);
+		expect(f.portDriven).toBe(true);
 	});
 
 	it('flattens the remote_select widget with its sources and parents', () => {
@@ -88,12 +88,25 @@ describe('fieldForInput', () => {
 	});
 });
 
-describe('inputExposure', () => {
-	it('trusts the resolved exposure and only falls back for local placeholders', () => {
-		expect(inputExposure({ name: 'a', portType: 'String', required: false, exposure: 'config' })).toBe('config');
-		// A locally-added port pre-round-trip: MustOverride implies assignment.
-		expect(inputExposure({ name: 'a', portType: 'MustOverride', required: false })).toBe('assignment');
-		expect(inputExposure({ name: 'a', portType: 'String', required: false })).toBe('all');
+describe('accepts', () => {
+	it('trusts the resolved list and reads an absent one as both', () => {
+		const wireOnly = { name: 'a', portType: 'String', required: false, accepts: ['wire'] as const };
+		expect(acceptsWire(wireOnly)).toBe(true);
+		expect(acceptsLiteral(wireOnly)).toBe(false);
+		const literalOnly = { name: 'a', portType: 'String', required: false, accepts: ['literal'] as const };
+		expect(acceptsWire(literalOnly)).toBe(false);
+		expect(acceptsLiteral(literalOnly)).toBe(true);
+		// A locally-added port pre-round-trip carries no list: both.
+		const fresh = { name: 'a', portType: 'MustOverride', required: false };
+		expect(acceptsWire(fresh)).toBe(true);
+		expect(acceptsLiteral(fresh)).toBe(true);
+	});
+
+	it('an input that takes no written value renders no field', () => {
+		const wireOnly = { name: 'a', portType: 'String', required: false, accepts: ['wire'] as const };
+		expect(inputRendersField(wireOnly, { wired: false, hasWrittenValue: false })).toBe(false);
+		const both = { name: 'a', portType: 'String', required: false };
+		expect(inputRendersField(both, { wired: false, hasWrittenValue: false })).toBe(true);
 	});
 });
 
@@ -139,7 +152,7 @@ describe('inputRendersField', () => {
 		expect(inputRendersField(input({}), { wired: false, hasWrittenValue: false })).toBe(true);
 		expect(inputRendersField(input({}), { wired: true, hasWrittenValue: false })).toBe(false);
 		expect(
-			inputRendersField(input({ exposure: 'wire' }), { wired: false, hasWrittenValue: true }),
+			inputRendersField(input({ accepts: ['wire'] }), { wired: false, hasWrittenValue: true }),
 		).toBe(false);
 		expect(
 			inputRendersField(input({ synthesizedFromCarry: true }), { wired: false, hasWrittenValue: false }),
@@ -180,10 +193,9 @@ describe('hasUnpickedAccess', () => {
 		name: 'connection',
 		portType: 'Access',
 		required: false,
-		// Real access inputs declare `exposure: "config"` (the handle
-		// lives in node config); the port-driven variant is exercised
-		// explicitly below.
-		exposure: 'config',
+		// The picker is compiler-read: an inline value only, homed in
+		// the port literals like every port's constant.
+		accepts: ['literal'],
 		widget: { kind: 'access', service: 'openrouter' },
 		...over,
 	});
@@ -193,8 +205,8 @@ describe('hasUnpickedAccess', () => {
 	});
 
 	it('unlocks once a connection handle is stored', () => {
-		const config = { connection: { id: 'g-1', identity: 'Quentin' } };
-		expect(hasUnpickedAccess([access()], config, none)).toBe(false);
+		const literals = { connection: { id: 'g-1', identity: 'Quentin' } };
+		expect(hasUnpickedAccess([access()], literals, none)).toBe(false);
 	});
 
 	it('never pins an optional connection (the node runs without one)', () => {
@@ -212,16 +224,15 @@ describe('hasUnpickedAccess', () => {
 
 	it('ignores nodes with no access field at all', () => {
 		const plain: PortDefinition = {
-			name: 'prompt', portType: 'String', required: false, exposure: 'all',
+			name: 'prompt', portType: 'String', required: false, accepts: ['literal', 'wire'],
 			widget: { kind: 'textarea' },
 		};
 		expect(hasUnpickedAccess([plain], {}, none)).toBe(false);
 	});
 
-	it('access fields are always config-homed (the metadata validator enforces it)', () => {
-		// The invariant the predicate's config-only read leans on:
-		// `exposure: config` makes the field non-port-driven, so the
-		// handle can only ever live in node config.
-		expect(fieldForInput(access()).portDriven).toBe(false);
+	it('the picker field edits the port literal like every input', () => {
+		// The invariant the predicate's read leans on: a port's constant
+		// has one home, so the handle can only ever live there.
+		expect(fieldForInput(access()).portDriven).toBe(true);
 	});
 });

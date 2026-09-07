@@ -30,7 +30,6 @@
       "name": "method",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "select",
         "options": [
@@ -48,18 +47,15 @@
   "outputs": [
     {
       "name": "status",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     },
     {
       "name": "body",
-      "type": "JsonDict | String",
-      "required": false
+      "type": "JsonDict | String"
     },
     {
       "name": "ok",
-      "type": "Boolean",
-      "required": false
+      "type": "Boolean"
     }
   ],
   "requires_infra": false

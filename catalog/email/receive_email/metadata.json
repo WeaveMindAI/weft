@@ -15,7 +15,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresValues": [
         "imap_host",
@@ -27,7 +27,6 @@
       "name": "fromContains",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "From contains",
       "placeholder": "Only fire when the sender contains this",
       "description": "Only fire on messages whose From header contains this text. Leave empty for any sender."
@@ -36,7 +35,6 @@
       "name": "subjectContains",
       "type": "String",
       "required": false,
-      "exposure": "config",
       "label": "Subject contains",
       "placeholder": "Only fire when the subject contains this",
       "description": "Only fire on messages whose subject contains this text. Leave empty for any subject."
@@ -45,39 +43,32 @@
   "outputs": [
     {
       "name": "from",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "to",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "subject",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "body",
-      "type": "String",
-      "required": false
+      "type": "String"
     },
     {
       "name": "messageId",
       "type": "String",
-      "required": false,
       "description": "The message's Message-ID header: hand it to SendEmail's replyToMessageId to answer in the same thread."
     },
     {
       "name": "count",
-      "type": "Number",
-      "required": false
+      "type": "Number"
     },
     {
       "name": "messages",
-      "type": "List[JsonDict]",
-      "required": false
+      "type": "List[JsonDict]"
     }
   ]
 }

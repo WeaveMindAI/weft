@@ -20,10 +20,10 @@ up.
 The flow is two steps:
 
 ```bash
-weft new hello --assistant claude-code     # shorthand: --assistant cc
+weft new hello --assistant kilo-code       # shorthand: --assistant kc
 ```
 
-then open the `hello` folder in that assistant (Claude Code, here). Tangle
+then open the `hello` folder in that assistant (Kilo Code, here). Tangle
 loads on its own, with its method, its node reference, and its commands
 already in place. You describe what you want, in plain words; it shapes the
 program, picks or writes the nodes, runs it, and shows you what happened.
@@ -32,7 +32,8 @@ The flag's value is the assistant you use, so the same command covers every
 assistant weft supports as more arrive (repeat the flag to install for
 several at once). And the choice is remembered: your next `weft new`
 installs the same assistant with no flag at all, until you pass
-`--assistant <name>` to change it or `--assistant none` to stop.
+`--assistant <name>` to change it or `--assistant none` to stop. Claude Code
+is also available as `--assistant claude-code` (shorthand `cc`).
 
 Tangle is deliberately symlinked from your weft checkout rather than
 copied, so updating weft (`git pull` + `./setup.sh` in the checkout)

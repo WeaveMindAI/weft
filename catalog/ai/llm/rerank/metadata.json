@@ -39,13 +39,11 @@
     {
       "name": "documents",
       "type": "List[String]",
-      "required": false,
       "description": "The documents, best match first."
     },
     {
       "name": "scores",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Each entry: the original index and its relevance score, best first."
     }
   ]

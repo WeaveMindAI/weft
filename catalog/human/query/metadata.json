@@ -15,7 +15,6 @@
     {
       "name": "title",
       "type": "String",
-      "exposure": "config",
       "widget": {
         "kind": "text"
       },
@@ -27,7 +26,6 @@
       "name": "description",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "exposure": "config",
       "label": "Description",
       "placeholder": "What you want the reviewer to do.",
       "description": "Description shown under the title."
@@ -36,7 +34,6 @@
       "name": "fields",
       "type": "List[JsonDict]",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "entry_list"
       },

@@ -41,7 +41,8 @@ use bytes::Bytes;
 /// to the same URL, so this stays a no-op there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresignAudience {
-    /// A caller OUTSIDE the cluster (a browser, an external API): sign for the
+    /// A caller OUTSIDE the cluster (the browser; the open internet when the
+    /// operator declared the endpoint internet-reachable): sign for the
     /// public endpoint (`WEFT_OBJECT_STORE_PUBLIC_ENDPOINT`).
     External,
     /// A caller INSIDE the cluster (a worker running node code): sign for the

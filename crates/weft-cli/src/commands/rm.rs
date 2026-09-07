@@ -1,4 +1,4 @@
-//! `weft rm [project] [--journal] [--local] [--all] [--force]`:
+//! `weft rm [project] [--journal] [--local] [--all] [--force] [--yes]`:
 //! multi-level project cleanup.
 //!
 //! Levels, cheapest to most-destructive:
@@ -33,6 +33,8 @@ pub struct RmArgs {
     pub all: bool,
     /// `weft rm --force`: skip the supervisor terminate-wait window.
     pub force: bool,
+    /// `weft rm --yes`: the confirmation, answered up front.
+    pub yes: bool,
 }
 
 pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
@@ -42,6 +44,7 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         mut local,
         all,
         force,
+        yes,
     } = args;
     if all {
         journal = true;
@@ -60,10 +63,29 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         );
     }
 
+    // The base verb is already the big one: triggers wiped, runs
+    // cancelled, infra pods terminated, stored data reclaimed. Nothing
+    // that irreversible runs on a bare command: a terminal is asked,
+    // and a script has to say `--yes`.
+    let project_id = resolve_project_id(&ctx, project)?;
+    if !yes {
+        let mut levels = vec!["unregister it (triggers wiped, runs cancelled, infra terminated, stored data reclaimed)"];
+        if journal {
+            levels.push("drop its execution and log rows");
+        }
+        if local {
+            levels.push("wipe .weft/target/ here");
+        }
+        println!("About to remove project {project_id}: {}.", levels.join("; "));
+        if !crate::prompt::confirm("Type 'yes' to confirm: ", "--yes")? {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Rm, |progress| async move {
         let ctx = ctx_inner;
-        let project_id = resolve_project_id(&ctx, project)?;
         let client = ctx.client();
 
         // Journal rows BEFORE unregistering: deleting a color is

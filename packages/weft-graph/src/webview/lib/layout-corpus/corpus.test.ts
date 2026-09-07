@@ -58,7 +58,7 @@ function bigPipeline(): ProjectDefinition {
 	const edge = (source: string, sourceHandle: string, target: string, targetHandle: string) => {
 		edges.push({ id: `${source}.${sourceHandle}->${target}.${targetHandle}`, source, target, sourceHandle, targetHandle });
 	};
-	node('db', 'PostgresDatabase', [], [{ name: 'access', portType: 'Access', required: false }], [], { features: { requiresInfra: true } });
+	node('db', 'PostgresDatabase', [], [{ name: 'access', portType: 'Access', required: false }], [], { requiresInfra: true });
 	node('llm', 'OpenRouterProvider', [], [{ name: 'provider', portType: 'LlmProvider', required: false }]);
 	node('params', 'LlmParams', [], [{ name: 'params', portType: 'Dict[String, String]', required: false }]);
 	node('bot_name', 'Text', [], [str('value', false)]);
@@ -75,7 +75,7 @@ function bigPipeline(): ProjectDefinition {
 			prev = id; prevPort = 'rows';
 		}
 		const g = `${program}_think`;
-		groups.push({ id: g, kind: 'group', label: null, anonymous: false, oneOfRequired: [], inPorts: [str('text'), access('db'), { name: 'provider', portType: 'LlmProvider', required: true }, { name: 'params', portType: 'Dict[String, String]', required: true }, str('botName')], outPorts: [str('answer', false)], parentGroupId: null, childGroupIds: [], nodeIds: ['history', 'interrupted', 'rendered', 'analyst_prompt', 'analyst', 'persona_prompt', 'persona'].map(l => `${g}.${l}`) });
+		groups.push({ id: g, kind: 'group', label: null, anonymous: false, inPorts: [str('text'), access('db'), { name: 'provider', portType: 'LlmProvider', required: true }, { name: 'params', portType: 'Dict[String, String]', required: true }, str('botName')], outPorts: [str('answer', false)], parentGroupId: null, childGroupIds: [], nodeIds: ['history', 'interrupted', 'rendered', 'analyst_prompt', 'analyst', 'persona_prompt', 'persona'].map(l => `${g}.${l}`) });
 		node(`${g}__in`, 'Passthrough', [str('text'), access('db'), { name: 'provider', portType: 'LlmProvider', required: true }, { name: 'params', portType: 'Dict[String, String]', required: true }, str('botName')], [str('text', false), { name: 'db', portType: 'Access', required: false }, { name: 'provider', portType: 'LlmProvider', required: false }, { name: 'params', portType: 'Dict[String, String]', required: false }, str('botName', false)], [], { groupBoundary: { groupId: g, role: 'In' } });
 		node(`${g}__out`, 'Passthrough', [str('answer', false)], [str('answer', false)], [], { groupBoundary: { groupId: g, role: 'Out' } });
 		edge(prev, prevPort, `${g}__in`, 'text');
@@ -118,7 +118,7 @@ function bigPipeline(): ProjectDefinition {
 			edge(prev, prevPort, id, i % 2 ? 'query' : 'text');
 			prev = id; prevPort = 'rows';
 		}
-		node(`${program}_out`, 'Debug', [{ name: 'data', portType: 'T', required: true }], [], [], { features: { isOutputDefault: true } });
+		node(`${program}_out`, 'Debug', [{ name: 'data', portType: 'T', required: true }], [], []);
 		edge(prev, prevPort, `${program}_out`, 'data');
 	}
 	return { id: 'big-pipeline', nodes, edges, groups } as unknown as ProjectDefinition;

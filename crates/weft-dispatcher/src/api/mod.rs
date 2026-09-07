@@ -98,6 +98,8 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/projects/{id}/infra/status", get(infra::status))
         .route("/projects/{id}/infra/commands/{cmd_id}", get(infra::command_status))
         .route("/projects/{id}/infra/nodes/{node_id}/live", get(infra::live))
+        .route("/projects/{id}/infra/nodes/{node_id}/action", post(infra::action))
+        .route("/executions/resolve/{prefix}", get(execution::resolve_color))
         .route("/executions/{color}/cancel", post(execution::cancel))
         .route("/executions/{color}/logs", get(execution::list_logs))
         .route("/executions/{color}/replay", get(execution::replay))
@@ -131,6 +133,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/storage/upload/begin", post(storage::upload_begin))
         // The pre-build asset sync's diff input: the project's published assets.
         .route("/storage/assets/list", post(storage::assets_list))
+        .route("/storage/assets/references", post(storage::asset_references))
         .route("/storage/upload/parts", post(storage::upload_parts))
         .route("/storage/upload/part-done", post(storage::upload_part_done))
         .route("/storage/upload/complete", post(storage::upload_complete))
@@ -200,6 +203,12 @@ fn outside_caller_routes() -> Router<DispatcherState> {
         .route(
             "/signal-token/signals",
             get(signal::list_signals_for_token).delete(signal::clear_all_signals),
+        )
+        // The files door: a fresh link for a stored file a listed form
+        // shows, scoped like the listing (see signal_file_for_token).
+        .route(
+            "/signal-token/signals/{signal_token}/files/{field}",
+            get(signal::signal_file_for_token),
         )
         .route("/signal-token/health", get(signal::signal_token_health))
         // The public file relay: an external consumer fetches a minted

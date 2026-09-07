@@ -1124,12 +1124,6 @@ pub enum EmitKind {
 pub(crate) const TASK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Journal write stamped with this Pod's name for fencing. Logs the
-/// error instead of propagating (most call sites are teardown paths
-/// that cannot fail), BUT the drive's journal client is wrapped in
-/// `PoisonOnWriteFailure`, so the failure latches a flag the drive
-/// loop checks every iteration: the worker exits instead of driving
-/// on top of a journal that no longer matches its live state.
 /// The runtime output-type gate: a node may only emit on a port a value
 /// its declared type accepts (`WeftType::accepts_runtime_value`: a
 /// declared named/record shape validates the value against its
@@ -1139,6 +1133,8 @@ fn type_accepts(declared: &WeftType, value: &Value) -> bool {
     declared.accepts_runtime_value(value)
 }
 
+/// Journal write for teardown paths that cannot propagate errors.
+/// `PoisonOnWriteFailure` also marks the drive for exit on failure.
 pub async fn record_from_pod(journal: &dyn JournalClient, event: ExecEvent, pod_name: &str) {
     if let Err(e) = journal.record_event(&event, Some(pod_name)).await {
         tracing::error!(
@@ -2103,9 +2099,8 @@ impl ContextHandle for RunnerHandle {
         // call_index is the value run_step returned, passed in so
         // run_step and run_record agree on the index explicitly
         // rather than via a shared counter both sides read.
-        record_from_pod(
-            self.clients.journal.as_ref(),
-            ExecEvent::RunOutput {
+        self.clients.journal.record_event(
+            &ExecEvent::RunOutput {
                 color: self.color,
                 node_id: self.node_id.clone(),
                 frames: self.node_frames.clone(),
@@ -2114,10 +2109,14 @@ impl ContextHandle for RunnerHandle {
                 value: value.clone(),
                 at_unix: now_unix(),
             },
-            &self.pod_name,
+            Some(&self.pod_name),
         )
-        .await;
-        Ok(())
+        .await
+        .map_err(|error| WeftError::NodeExecution(format!(
+            "could not save result of '{name}' for node '{}': {error}. \
+             The action may already have happened; inspect this run before repeating it.",
+            self.node_id,
+        )))
     }
 
     async fn storage_put(
@@ -3078,6 +3077,7 @@ mod type_check_tests {
 #[cfg(test)]
 mod replay_tests {
     use super::*;
+    use super::test_journal::CaptureJournal;
     use weft_core::context::ContextHandle;
     use weft_core::primitive::{AwaitedEntry, AwaitedEntryKind};
 
@@ -3115,6 +3115,38 @@ mod replay_tests {
             false,
         )
         .with_awaited_sequence(seq)
+    }
+
+    #[tokio::test]
+    async fn run_refuses_to_return_an_unsaved_result() {
+        let journal = Arc::new(CaptureJournal::default());
+        *journal.fail_count.lock().unwrap() = 1;
+        let mut handle = handle_with_sequence(Vec::new());
+        handle.clients.journal = journal.clone();
+        let ctx = ctx_over(handle);
+        let mut reached_followup = false;
+        let result: WeftResult<()> = async {
+            ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await?;
+            reached_followup = true;
+            Ok(())
+        }.await;
+        assert!(!reached_followup, "a caller must not act on an unsaved result");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("request-id"), "{error}");
+        assert!(error.contains("simulated journal failure"), "{error}");
+        assert!(journal.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_returns_a_result_after_recording_it() {
+        let journal = Arc::new(CaptureJournal::default());
+        let mut handle = handle_with_sequence(Vec::new());
+        handle.clients.journal = journal.clone();
+        let ctx = ctx_over(handle);
+        let result = ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await.unwrap();
+        let events = journal.events.lock().unwrap();
+        assert!(matches!(events.as_slice(), [ExecEvent::RunOutput { name, value, call_index: 0, .. }]
+            if name == "request-id" && *value == result));
     }
 
     /// Same rig as `handle_with_sequence` but with a caller-supplied
@@ -3944,7 +3976,8 @@ pub async fn apply_via_supervisor(
     let cmd_id = infra_state
         .enqueue_apply(project_id, node_id, spec_json)
         .await?;
-    let deadline = clock.now() + TASK_WAIT_TIMEOUT;
+    let started = clock.now();
+    let mut next_report = started + Duration::from_secs(30);
     loop {
         let resp = infra_state.wait_apply(project_id, cmd_id).await?;
         if resp.completed {
@@ -3981,13 +4014,63 @@ pub async fn apply_via_supervisor(
                 }
             }
         }
-        if clock.now() >= deadline {
-            anyhow::bail!(
-                "supervisor did not complete apply command {cmd_id} within {}s",
-                TASK_WAIT_TIMEOUT.as_secs()
+        if clock.now() >= next_report {
+            tracing::info!(
+                project_id, node_id, command_id = cmd_id,
+                elapsed_secs = clock.now().duration_since(started).as_secs(),
+                "infrastructure apply is still running; inspect it with `weft infra status`"
             );
+            next_report = clock.now() + Duration::from_secs(30);
         }
         clock.sleep(TASK_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod infra_apply_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use weft_broker_client::protocol::{InfraWaitApplyResponse, LifecycleOutcome};
+    use weft_platform_traits::clock::FakeClock;
+
+    struct ApplyState {
+        clock: Arc<FakeClock>,
+        responses: std::sync::Mutex<VecDeque<InfraWaitApplyResponse>>,
+    }
+
+    #[async_trait]
+    impl InfraStateClient for ApplyState {
+        async fn enqueue_apply(&self, _: &str, _: &str, _: Value) -> anyhow::Result<i64> {
+            Ok(42)
+        }
+        async fn wait_apply(&self, _: &str, id: i64) -> anyhow::Result<InfraWaitApplyResponse> {
+            assert_eq!(id, 42);
+            self.clock.advance(Duration::from_secs(3600));
+            Ok(self.responses.lock().unwrap().pop_front().expect("unexpected extra poll"))
+        }
+    }
+
+    #[tokio::test]
+    async fn infrastructure_apply_waits_for_completion_even_after_hours() {
+        let clock = FakeClock::new();
+        let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
+            InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
+            InfraWaitApplyResponse { completed: false, outcome: None, outcome_message: None },
+            InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Succeeded), outcome_message: None },
+        ])) };
+        apply_via_supervisor(&state, clock.as_ref(), "project", "database", &Default::default()).await.unwrap();
+        assert!(clock.elapsed() >= Duration::from_secs(3 * 3600));
+        assert!(state.responses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn infrastructure_apply_still_reports_an_actual_failure() {
+        let clock = FakeClock::new();
+        let state = ApplyState { clock: clock.clone(), responses: std::sync::Mutex::new(VecDeque::from([
+            InfraWaitApplyResponse { completed: true, outcome: Some(LifecycleOutcome::Failed), outcome_message: Some("image cannot start".into()) },
+        ])) };
+        let error = apply_via_supervisor(&state, clock.as_ref(), "project", "database", &Default::default()).await.unwrap_err();
+        assert!(error.to_string().contains("image cannot start"));
     }
 }
 
@@ -4008,22 +4091,19 @@ pub async fn apply_via_supervisor(
 //      serializes both with the `closed` flag.
 
 #[cfg(test)]
-mod bus_pump_tests {
+mod test_journal {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
-    use weft_core::bus::{BusOptions, SendError};
     use weft_journal::ExecEvent;
 
     /// Capturing journal client. Stores every `record_event` payload
-    /// so tests can assert on the bus events the pump shipped.
-    /// Optionally throws on every Nth call to exercise the degraded
-    /// path; `fail_next` set to `Some(N)` fails the Nth following
-    /// call exactly once, then resets.
+    /// so context and bus tests can assert what was saved. `fail_count`
+    /// rejects that many following writes before accepting them again.
     #[derive(Default)]
-    struct CaptureJournal {
-        events: StdMutex<Vec<ExecEvent>>,
-        fail_count: StdMutex<usize>,
+    pub(super) struct CaptureJournal {
+        pub(super) events: StdMutex<Vec<ExecEvent>>,
+        pub(super) fail_count: StdMutex<usize>,
     }
     #[async_trait]
     impl weft_journal::JournalClient for CaptureJournal {
@@ -4048,6 +4128,13 @@ mod bus_pump_tests {
             Ok(false)
         }
     }
+}
+
+#[cfg(test)]
+mod bus_pump_tests {
+    use super::*;
+    use super::test_journal::CaptureJournal;
+    use weft_core::bus::{BusOptions, SendError};
 
     fn spawn_pump(
         coordinator: &Arc<BusCoordinator>,

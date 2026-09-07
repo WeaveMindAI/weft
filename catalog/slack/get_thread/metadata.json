@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "requiresScopes": [
         "channels:history"
@@ -38,13 +38,11 @@
     {
       "name": "messages",
       "type": "List[JsonDict]",
-      "required": false,
       "description": "Every message in the thread (parent first), as Slack returns them: text, user, ts, reactions, ..."
     },
     {
       "name": "count",
       "type": "Number",
-      "required": false,
       "description": "How many messages the thread holds (parent included)."
     }
   ]

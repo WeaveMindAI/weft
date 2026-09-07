@@ -1933,6 +1933,24 @@ fn cast_value_validates_into_named_and_record_types() {
 }
 
 #[test]
+fn required_nullable_fields_allow_null_but_must_be_present() {
+    let required = WeftType::parse("{ value: Number | Null }").unwrap();
+    for value in [serde_json::json!({ "value": null }), serde_json::json!({ "value": 3 })] {
+        assert!(required.validate_value(&value).is_ok());
+        assert_eq!(required.cast_value(&value).unwrap(), value);
+    }
+    let absent = serde_json::json!({});
+    assert!(required.validate_value(&absent).unwrap_err().contains("missing required field"));
+    assert!(required.cast_value(&absent).unwrap_err().contains("missing required field"));
+
+    let optional = WeftType::parse("{ value?: Number }").unwrap();
+    for value in [absent, serde_json::json!({ "value": null })] {
+        assert!(optional.validate_value(&value).is_ok());
+        assert!(optional.cast_value(&value).is_ok());
+    }
+}
+
+#[test]
 fn installed_registry_is_idempotent_for_identical_content_only() {
     // `install` is process-global; this test only checks the content
     // rule through fresh threads' current() view being scope-driven.
@@ -1987,7 +2005,7 @@ fn generator_compatibility_is_invariant_and_never_decays() {
 #[test]
 fn generator_is_wire_only_with_no_literal_no_default_no_cast() {
     let g = WeftType::parse("Generator[Number]").unwrap();
-    assert_eq!(g.default_exposure(), Exposure::Wire, "a live edge takes no literal");
+    assert_eq!(crate::node::Accepts::for_type(&g), crate::node::Accepts::wire_only(), "a live edge takes no literal");
     assert_eq!(g.zero_value(), serde_json::Value::Null, "no honest zero for a stream");
     assert!(g.cast_value(&serde_json::json!([1, 2, 3])).is_err(), "nothing casts into a stream");
     assert!(WeftType::cast_allowed(&WeftType::parse("List[Number]").unwrap(), &g).is_err());
@@ -2085,4 +2103,19 @@ fn a_nullable_file_union_still_offers_the_file_picker() {
     let control = nullable.file_control().expect("nullable file keeps its picker");
     assert!(!control.multiple);
     assert!(WeftType::parse("Image | String").expect("parses").file_control().is_none());
+}
+
+/// A declared name over a list (or union) of files offers what its
+/// body offers: `type Attachments = List[Media]` is a multi-file
+/// picker, never the JSON textarea the bare name would fall to.
+#[test]
+fn a_named_alias_over_files_still_offers_the_file_picker() {
+    let attachments = WeftType::parse("Attachments=List[Image | Audio]").expect("parses");
+    let control = attachments.file_control().expect("the alias peels to its body");
+    assert!(control.multiple);
+    assert_eq!(control.file_type, WeftType::parse("Image | Audio").expect("parses"));
+    let single = WeftType::parse("Pic=Image").expect("parses");
+    let control = single.file_control().expect("a named file primitive keeps its name");
+    assert_eq!(control.file_type, single, "the written type keeps the alias");
+    assert!(WeftType::parse("Row=List[String]").expect("parses").file_control().is_none());
 }

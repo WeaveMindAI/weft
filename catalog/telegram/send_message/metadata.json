@@ -12,7 +12,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access", "accepts": ["wire"],
       "required": true,
       "description": "The Telegram bot access (wire a TelegramAccess node)."
     },
@@ -34,7 +34,6 @@
     {
       "name": "parseMode",
       "type": "String",
-      "exposure": "config",
       "default": "plain",
       "widget": {
         "kind": "select",
@@ -65,11 +64,7 @@
     {
       "name": "messageId",
       "type": "Number",
-      "required": false,
       "description": "The sent message's id."
     }
-  ],
-  "features": {
-    "isOutputDefault": true
-  }
+  ]
 }

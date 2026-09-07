@@ -74,6 +74,20 @@ app.get('/live', (_req, res) => {
   } else {
     items.push({ type: 'text', label: 'Status', data: state.status });
   }
+  // The one way out of any pairing state without tearing the infra
+  // down: the phone paired to this bridge is detached and a fresh QR
+  // code takes its place. Offered in every state, because the state
+  // that needs it most is the one where nothing else works.
+  items.push({
+    type: 'text',
+    label: 'Phone',
+    data: state.status === 'connected' ? 'paired' : 'not paired',
+    action: {
+      label: 'Disconnect phone',
+      actionKind: 'unpair',
+      confirm: 'Detach the paired phone from this bridge and show a new QR code? Messages already stored are kept.',
+    },
+  });
 
   res.json({ items });
 });

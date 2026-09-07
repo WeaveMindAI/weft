@@ -58,7 +58,6 @@
     {
       "name": "connection",
       "type": "Access",
-      "exposure": "config",
       "widget": {
         "kind": "access"
       },
@@ -68,7 +67,6 @@
       "name": "model",
       "type": "String",
       "required": true,
-      "exposure": "config",
       "widget": {
         "kind": "remote_select",
         "access": "connection",
@@ -91,7 +89,6 @@
     {
       "name": "provider",
       "type": "LlmProvider",
-      "required": false,
       "description": "The provider value: wire it into an LLM node's provider input."
     }
   ],

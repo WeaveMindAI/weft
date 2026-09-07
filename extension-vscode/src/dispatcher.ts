@@ -107,8 +107,8 @@ export class DispatcherClient {
     this.baseUrl = url;
   }
 
-  async get<T>(path: string): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`);
+  async get<T>(path: string, signal?: AbortSignal): Promise<T> {
+    const res = await fetch(`${this.baseUrl}${path}`, { signal });
     if (!res.ok) throw await httpError('GET', path, res);
     return (await res.json()) as T;
   }

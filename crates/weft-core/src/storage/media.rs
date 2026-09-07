@@ -159,6 +159,53 @@ pub fn substitute_media(
         .unwrap_or_else(|| value.clone())
 }
 
+/// Put a fetchable link on every key-backed media slot named in
+/// `links` (keyed by the slot value's serialized form, as
+/// [`media_slots`] deduped it): the marker keeps its `key` and gains a
+/// `url`, so a Rust node still reads the bytes through storage and a
+/// body that only speaks URLs (Python, a provider) reads the link. The
+/// inverse is [`strip_links`].
+pub fn with_links(value: &Value, ty: &WeftType, links: &HashMap<String, String>) -> Value {
+    walk(value, ty, &mut |slot| {
+        let url = links.get(&slot.to_string())?;
+        let mut linked = slot.clone();
+        let obj = linked.as_object_mut()?;
+        let kind = FileKind::from_marker_obj(obj)?;
+        let payload = obj.get_mut(kind.marker_key())?.as_object_mut()?;
+        if !payload.contains_key("key") {
+            return None;
+        }
+        payload.insert("url".into(), Value::String(url.clone()));
+        Some(linked)
+    })
+    .unwrap_or_else(|| value.clone())
+}
+
+/// Take every link [`with_links`] put on off a value, wherever a
+/// key-backed marker sits in it: a link is minted for one firing and
+/// expires, so nothing that leaves the node (a pulse, a journal row, a
+/// parked form) carries one. A url-backed marker (no `key`) is the
+/// value itself and stays. Type-free: it finds markers by their
+/// sentinel, so it needs no declared shape.
+pub fn strip_links(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            if let Some(kind) = FileKind::from_marker_obj(map) {
+                let mut out = map.clone();
+                if let Some(payload) = out.get_mut(kind.marker_key()).and_then(Value::as_object_mut) {
+                    if payload.contains_key("key") {
+                        payload.remove("url");
+                    }
+                }
+                return Value::Object(out);
+            }
+            Value::Object(map.iter().map(|(k, v)| (k.clone(), strip_links(v))).collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(strip_links).collect()),
+        other => other.clone(),
+    }
+}
+
 /// The one traversal both verbs share. `f` sees every media slot's
 /// value and answers an optional replacement; the walk answers a
 /// rebuilt value when anything changed underneath (None = subtree
@@ -356,5 +403,39 @@ mod tests {
             }
             other => panic!("expected DataUrl, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn stored(key: &str) -> Value {
+        json!({ "__weft_image__": { "key": key, "mimeType": "image/png", "sizeBytes": 3, "filename": "p.png" } })
+    }
+
+    #[test]
+    fn a_link_rides_beside_the_key_and_strips_back_off() {
+        let ty = WeftType::parse("{ pic: Image, pics: List[Image] }").unwrap();
+        let value = json!({ "pic": stored("k1"), "pics": [stored("k2")] });
+        let links: HashMap<String, String> = [
+            (stored("k1").to_string(), "https://s/k1".to_string()),
+            (stored("k2").to_string(), "https://s/k2".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let linked = with_links(&value, &ty, &links);
+        assert_eq!(linked["pic"]["__weft_image__"]["url"], json!("https://s/k1"));
+        assert_eq!(linked["pic"]["__weft_image__"]["key"], json!("k1"), "the key stays");
+        assert_eq!(linked["pics"][0]["__weft_image__"]["url"], json!("https://s/k2"));
+        assert_eq!(strip_links(&linked), value, "stripping gives the stored form back");
+    }
+
+    #[test]
+    fn a_url_backed_marker_keeps_its_url_when_stripped() {
+        let external = json!({ "__weft_image__": { "url": "https://x/p.png", "mimeType": "image/png" } });
+        let wrapped = json!({ "a": [external.clone()], "n": 1 });
+        assert_eq!(strip_links(&wrapped), wrapped);
     }
 }

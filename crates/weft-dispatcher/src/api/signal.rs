@@ -1027,6 +1027,135 @@ pub async fn cancel_signal(
 }
 
 /// `GET /signal-token/signals` (signal token in `Authorization: Bearer`).
+/// `GET /signal-token/signals/{signal token}/files/{field}`: the link a
+/// consumer fetches a form's stored file through, made at the moment it
+/// asks. The consumer payload carries a stored file as its facts only
+/// (`FormSchema::for_consumer`), so a form answered a month after it
+/// parked still shows its image: the link is never stored, it is minted
+/// on every read and lives an hour. A file that is gone answers 410 in
+/// the consumer's own terms (the store's own message names the storage
+/// key, which is exactly what this door keeps in); a store that cannot
+/// be reached answers 502, because "your file is gone" is a claim a
+/// timeout does not support.
+///
+/// Scoped exactly like the listing: the bearer is the api token, the
+/// signal must be one that token sees (same tenant, allowed projects and
+/// tags, project visibility), the field is one the signal's kind names a
+/// file for (`Signal::stored_file`, asked through the kind inventory so
+/// this door knows no kind), and the file must belong to the signal (its
+/// project, its execution, or the tenant's shared space). Anything else
+/// is 404, so a token learns nothing about signals or files it cannot see.
+pub async fn signal_file_for_token(
+    State(state): State<DispatcherState>,
+    headers: HeaderMap,
+    Path((signal_token, field)): Path<(String, String)>,
+) -> Result<Json<SignalFileLink>, (StatusCode, String)> {
+    let api_token = bearer_token(&headers)?;
+    let scope = require_scoped_signal_token(&state, &api_token).await?;
+    let not_found = || (StatusCode::NOT_FOUND, "no such signal file".to_string());
+    let visible = scope
+        .visible_signals(&state)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("filter: {e}")))?;
+    // The same row set the listing serves. A row is listed only when
+    // its kind rendered a consumer payload (a form does; a socket or a
+    // poll returns nothing to show), so a row with none is not a
+    // consumer's to read files from either.
+    let sig = visible
+        .into_iter()
+        .find(|s| s.token == signal_token && s.consumer_payload.is_some())
+        .ok_or_else(not_found)?;
+    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&sig.spec_json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt signal spec: {e}")))?;
+    // A field that holds no file is a 404; a field whose file cannot be
+    // read is the signal being broken, and says so.
+    let file = weft_core::signal::stored_file(&spec, &field)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(not_found)?;
+    let parsed = weft_core::storage::key::parse_key(&file.key).map_err(|_| not_found())?;
+    if !file_belongs_to_signal(&parsed, &sig) {
+        return Err(not_found());
+    }
+    // The store's own message names the storage key, and this door
+    // exists so a consumer never sees one. Say what happened in the
+    // consumer's terms and keep the store's text for the operator log.
+    let link = crate::storage::download_link(&state, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS))
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                target: "weft_dispatcher::api::signal",
+                key = %file.key,
+                error = format!("{e:#}"),
+                "a signal's file could not be linked"
+            );
+            // Only a store that says the file is gone means it is gone.
+            // A timeout or a refused credential is the store being
+            // unreachable, and telling the consumer their file is
+            // permanently lost (and to re-run the workflow, which costs
+            // real calls) would be a claim this never established.
+            if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() {
+                (
+                    StatusCode::GONE,
+                    format!(
+                        "the file behind '{field}' is no longer available: it expired or was \
+                         deleted. Run the workflow again to make it afresh."
+                    ),
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("the file behind '{field}' could not be reached just now; try again"),
+                )
+            }
+        })?;
+    // The facts come from the signal's own value, not from the link:
+    // they describe the file the form is showing, and the mime (which
+    // the store's answer does not carry) has to come from there anyway,
+    // so taking all four from one source keeps them consistent.
+    Ok(Json(SignalFileLink {
+        url: link.url,
+        mime_type: file.mime_type,
+        size_bytes: file.size_bytes,
+        filename: file.filename,
+    }))
+}
+
+/// What the files door answers: a link that lives an hour, plus the
+/// facts a consumer needs to render the file without fetching it.
+// SYNC: SignalFileLink <-> extension-browser/src/lib/api.ts TaskFileLink, crates/weft-core/src/signal/form.rs consumer_file_value (the URL-backed arm publishes the same four keys)
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalFileLink {
+    pub url: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub filename: String,
+}
+
+/// How long a link the files door hands out lives: the same hour a
+/// node's own inputs get, long enough to look at, short enough that a
+/// leaked link is soon worthless. A consumer asks again when it renders.
+const SIGNAL_FILE_LINK_TTL_SECS: u64 = 3600;
+
+/// May a signal's consumer be handed this file: the file sits in the
+/// signal's own tenant, and in the signal's project (a project file or
+/// asset), its execution (a file the run made), or the tenant's shared
+/// space. A file of another project or run is not the form's to show.
+fn file_belongs_to_signal(
+    parsed: &weft_core::storage::key::ParsedKey,
+    sig: &crate::journal::SignalRegistration,
+) -> bool {
+    use weft_core::storage::key::KeyScope;
+    if parsed.tenant != sig.tenant_id {
+        return false;
+    }
+    match &parsed.scope {
+        KeyScope::Project { project_id } | KeyScope::Asset { project_id } => *project_id == sig.project_id,
+        KeyScope::Exec { color } => sig.color.is_some_and(|c| c.to_string() == *color),
+        KeyScope::Shared { .. } => true,
+    }
+}
+
 /// Scoped enumeration. Filters by
 /// the signal token's allowed_projects, allowed_tags AND
 /// by project visibility (`fires_visible_to_consumers = TRUE`):
@@ -1235,8 +1364,10 @@ impl TokenScope {
         &self,
         state: &DispatcherState,
     ) -> anyhow::Result<Vec<crate::journal::SignalRegistration>> {
-        use sqlx::Row;
-        let rows = sqlx::query(
+        // One decoder for a signal row, shared with the journal
+        // (`row_to_signal`): the SELECT differs (a join and the
+        // consumer filters), the decoding must not.
+        let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(
             "SELECT s.token, s.tenant_id, s.project_id, s.color, s.node_id, s.is_resume, \
                     s.spec_json, s.access_id, s.consumer_kind, s.tags, s.port_snapshot, \
                     s.consumer_payload, \
@@ -1261,42 +1392,7 @@ impl TokenScope {
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            // Color parse fails loud: a corrupt `color` would silently
-            // reclassify a resume signal as an entry signal, and
-            // `clear_all_signals` would then DELETE it instead of
-            // cancelling its execution. (consumer_payload stays
-            // best-effort: it's display-only enumeration data.)
-            let color_str: Option<String> = r.try_get("color")?;
-            let color = match color_str {
-                Some(s) => Some(
-                    s.parse::<weft_core::Color>()
-                        .map_err(|e| anyhow::anyhow!("corrupt signal.color '{s}': {e}"))?,
-                ),
-                None => None,
-            };
-            let payload_str: Option<String> = r.try_get("consumer_payload")?;
-            let consumer_payload =
-                payload_str.and_then(|s| serde_json::from_str(&s).ok());
-            out.push(crate::journal::SignalRegistration {
-                token: r.try_get("token")?,
-                tenant_id: r.try_get("tenant_id")?,
-                project_id: r.try_get("project_id")?,
-                color,
-                node_id: r.try_get("node_id")?,
-                is_resume: r.try_get("is_resume")?,
-                spec_json: r.try_get("spec_json")?,
-                access_id: r.try_get("access_id")?,
-                consumer_kind: r.try_get("consumer_kind")?,
-                tags: r.try_get("tags")?,
-                port_snapshot: r.try_get("port_snapshot")?,
-                consumer_payload,
-                surface_kind: r.try_get("surface_kind")?,
-                mount_path: r.try_get("mount_path")?,
-                auth_kind: r.try_get("auth_kind")?,
-                auth_config: r.try_get("auth_config")?,
-                kind_state: r.try_get("kind_state")?,
-                kind_state_seq: r.try_get("kind_state_seq")?,
-            });
+            out.push(crate::journal::postgres::row_to_signal(r)?);
         }
         Ok(out)
     }
@@ -2447,5 +2543,54 @@ mod can_cancel_tests {
             !a.can_cancel_within_tenant(&sig),
             "a tag-scoped token can never cancel (403)"
         );
+    }
+}
+
+#[cfg(test)]
+mod signal_file_scope_tests {
+    use super::file_belongs_to_signal;
+    use crate::journal::SignalRegistration;
+    use weft_core::storage::key::parse_key;
+
+    fn signal(color: Option<&str>) -> SignalRegistration {
+        SignalRegistration {
+            token: "tok-1".into(),
+            tenant_id: "t".into(),
+            project_id: "p".into(),
+            color: color.map(|c| c.parse().expect("a uuid")),
+            node_id: "n".into(),
+            is_resume: color.is_some(),
+            spec_json: "{}".into(),
+            access_id: None,
+            consumer_kind: None,
+            tags: vec![],
+            port_snapshot: None,
+            consumer_payload: None,
+            surface_kind: "task_callback".into(),
+            mount_path: None,
+            auth_kind: "none".into(),
+            auth_config: None,
+            kind_state: serde_json::Value::Object(Default::default()),
+            kind_state_seq: 0,
+        }
+    }
+
+    /// A form may show its own project's files, its own run's files,
+    /// and the tenant's shared files; nothing of another tenant,
+    /// project or run.
+    #[test]
+    fn a_file_is_the_forms_to_show_only_inside_its_own_walls() {
+        let color = "11111111-1111-1111-1111-111111111111";
+        let sig = signal(Some(color));
+        let ok = |key: &str| file_belongs_to_signal(&parse_key(key).expect(key), &sig);
+        assert!(ok("t/project/p/cat"));
+        assert!(ok("t/asset/p/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+        assert!(ok(&format!("t/exec/{color}/cat")));
+        assert!(ok("t/shared/pool/cat"));
+        assert!(!ok("other/project/p/cat"), "another tenant");
+        assert!(!ok("t/project/q/cat"), "another project");
+        assert!(!ok("t/exec/22222222-2222-2222-2222-222222222222/cat"), "another run");
+        let entry = signal(None);
+        assert!(!file_belongs_to_signal(&parse_key(&format!("t/exec/{color}/cat")).unwrap(), &entry), "an entry signal has no run");
     }
 }

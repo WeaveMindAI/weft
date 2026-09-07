@@ -19,6 +19,18 @@ preprocessor.raw = input.value
 output.data = preprocessor.result
 ```
 
+## The readable size
+
+A weft program is read as a graph, and a level (the file, or the inside
+of a group or loop) is what the reader scans in one look. The readable
+size is about six items, nodes or groups; past fifteen the compiler warns
+(`level-too-large`), because by then the level has stopped being something
+a person can scan. Groups are the tool for staying readable: when a level
+grows past six, the nodes cooperating on one job become a group of their
+own. And because groups nest, depth absorbs size: growing work goes down
+into a nested group, never wide across a level. A group whose inside holds
+another group or two is the normal shape, not a special one.
+
 ## `self`
 
 Inside a group, `self` is the group's own boundary.
@@ -64,9 +76,25 @@ escalation = Group(question: String) -> (answer: String) {
 }
 ```
 
-A group that does not run closes its outputs, so everything inside it and
-everything behind it closes in turn, however deeply nested. For what counts
-as a no, go and read [How a weft program runs](mental-model.md).
+A group that does not run closes its outputs, so everything behind it closes
+in turn, and every node inside it, however deeply nested, is marked skipped
+with the group's name as the reason. For what counts as a no, go and read
+[How a weft program runs](mental-model.md).
+
+That is the only way a group as a whole stops. A group input that arrives
+closed does not stop it: the closure passes through the boundary to the
+nodes inside that read that port, those skip, and the rest of the group
+runs. If you want the whole group to depend on one input, wire the group's
+`_should_flow` from whatever decides that input. For the same reason
+`@require_one_of` is refused on a group; put it on the node inside that
+needs one of the ports.
+
+## What starts inside
+
+When a group starts, every node inside it that no wire feeds is started
+too, at the same moment. A group can hold a source of its own, a fixed
+`Text` or a node that reads the clock, and it fires once per start of the
+group: once for a plain group, once per iteration for a loop body.
 
 ## The description line
 

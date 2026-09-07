@@ -23,8 +23,5 @@
   "display": {
     "kind": "link",
     "input": "file"
-  },
-  "features": {
-    "isOutputDefault": true
   }
 }

@@ -72,11 +72,40 @@ Validation is strict. A value carrying a key the record does not declare is
 **refused**. A record is a contract, so declare every field the real values
 carry.
 
+## Reading a key off a wire
+
+If a node gives you a record and the next node wants one field of it, write
+the field on the wire:
+
+```weft
+reader = ExecPython() -> (profile: { stats: { wpm: Number, name?: String } }) { ... }
+speed  = ExecPython(wpm: Number) -> (out: Number) {
+  wpm: reader.profile.stats.wpm
+}
+```
+
+The compiler walks the keys against the record type: each one has to be a
+field of the record at that level, and the wire's type is the last field's
+type, so `wpm: Number` above type-checks like any other wire. A type with no
+fields to walk, a `JsonDict` or a scalar, is refused with `deref-path` and the
+fix in the message: declare the shape on the source port, or `Cast` first.
+
+At run time the value is read right before it lands, once per wire. Five wires
+off one port are five separate reads, and none of them changes what the
+others get. A `?` key that turns out absent (or `null`) closes that wire
+alone, and the port on the other end decides what a closure means to it:
+a required port skips the node, an optional one fires with the value missing.
+A required key that is absent is a value that broke its declared type, and
+that fails the firing rather than turning into a `null`.
+
+In the graph, such a wire is drawn dotted with the path written at its end.
+Right-click any wire whose value is a record to pick a key.
+
 ## Named custom types
 
-Any node's `metadata.json` can declare named types, and once declared anywhere
-in the project the name is usable in every port type and every inline
-signature.
+A type gets a name in one of two places. Any node's `metadata.json` can
+declare named types, and once declared anywhere in the project the name is
+usable in every port type and every inline signature.
 
 ```json
 "types": {
@@ -84,6 +113,31 @@ signature.
   "ChatMessage": "{ role: String, content: String | List[Part], name?: String }"
 }
 ```
+
+Or the `.weft` source declares one itself, at the top of a scope:
+
+```weft
+type Profile = {
+  wpm: Number,          # words per minute
+  read_delay: Number
+}
+type Names = List[String]
+
+typing = ExecPython(p: Profile, who: Names) -> (delay: Number) { ... }
+```
+
+The right-hand side is any type the language has, over as many lines as it
+needs, and it may name other declared types. Where you write it decides who
+sees it: a declaration at file level is visible to every header in the file,
+one directly inside a group or loop body is visible in that body and every
+body nested in it, and nowhere else. The group's own signature sits outside
+its braces, so a type declared inside cannot name the group's ports. Order
+within a scope does not matter. A node's braces hold its values, so a `type`
+line inside them is refused, and a name that is already visible (from an
+outer scope, from a metadata `types` block, or a builtin like `Media`)
+cannot be declared again: nothing shadows. An included file sees the
+catalog's types and its own declarations, never the including file's, so a
+component compiles the same on its own as spliced in.
 
 Named types are **nominal**: the name is the contract, not the shape.
 
@@ -109,24 +163,29 @@ in the graph, and one that is not is rejected as `unresolved-typevar`.
 ## `MustOverride`
 
 A node whose metadata cannot know a port's type declares it `MustOverride`,
-and the `.weft` author has to pin it with an inline port signature. Any
-`MustOverride` still standing at compile time is an error.
+and the `.weft` author has to pin it with an inline port signature. A
+`MustOverride` port that is wired and still unpinned at compile time is an
+error (`must-override-unmet`); one nothing reads or writes is left alone.
 
 `Cast` is the main user of this: its output type is whatever you say it is.
 
 ## The `?` marker
 
-A trailing `?` on an **input** port lets it accept a closed pulse. Without it,
-a required input that receives closure skips the node and cascades that closure
-downstream. See [How a weft program runs](mental-model.md#the-closed-pulse).
+`?` after a name means "may be absent", and it goes on the name in every
+place it can appear: an input port (`here?: String`) and a record field
+(`{ role: String, name?: String }`). On an input port it lets the port accept
+a closed pulse; without it, a required input that receives closure skips the
+node and cascades that closure downstream. See [How a weft program
+runs](mental-model.md#the-closed-pulse). On a config key that creates a port
+(`notes?: review.notes`) it marks that created port. See [wires in the
+braces](syntax.md#wires-in-the-braces).
 
-On an **output** port it records that the port may emit nothing, which is what
-`Switch` does on every case it did not take. Nothing enforces it, so it is
-there to say what the node means, and it should match what the node's metadata
-declares.
+`name: String?` is refused, and the message spells the accepted form. An
+output port takes no `?` at all: a firing that emits nothing on it closes it,
+and there is nothing for a marker to add.
 
-A trailing `?` on a CONFIG KEY is a third thing: it says the port that key
-CREATES is optional. See [wires in the braces](syntax.md#wires-in-the-braces).
+`Number | Null` is a different thing: `null` is a value that arrives, `?` is a
+value that does not.
 
 ## The wired-only types
 
