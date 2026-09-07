@@ -1,7 +1,9 @@
 # Weft for VS Code
 
-The editor side of [Weft](https://github.com/WeaveMindAI/weft), an
-open-source language and runtime for AI workflows. Open a `.weft` file
+The editor side of [Weft](https://weavemindai.github.io/weft/), an
+open-source language and runtime for AI workflows (the source is on
+the [`mvp` branch](https://github.com/WeaveMindAI/weft/tree/mvp), where
+the rebuild lives; `main` is the old proof of concept). Open a `.weft` file
 and the extension shows it as a live graph; run it, and the graph
 lights up with the execution as it happens.
 

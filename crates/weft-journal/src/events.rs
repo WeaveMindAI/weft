@@ -2643,7 +2643,7 @@ mod fold_pulse_tests {
             .get(&FiringLocation::new("l.seed", frames(&[LoopIteration { index: 2 }])))
             .expect("loop root kicked at the iteration's frames");
         assert!(iter_seed.dispatched, "the NodeStarted at that location consumed it");
-        assert!(snap.kicked.get(&FiringLocation::new("l.seed", Vec::new())).is_none(), "never at the root frames");
+        assert!(!snap.kicked.contains_key(&FiringLocation::new("l.seed", Vec::new())), "never at the root frames");
         let gated = snap.kicked.get(&FiringLocation::new("off.a", Vec::new())).expect("gated member kicked");
         assert_eq!(gated.scope_skipped.as_deref(), Some("off"));
     }
