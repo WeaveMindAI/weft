@@ -420,19 +420,14 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
-      - run: pnpm dlx @vscode/vsce@3.9.2 publish --packagePath "$GITHUB_WORKSPACE/weft-vscode.vsix" --azure-credential
-      - name: record the published version
-        env:
-          # The EXACT tag the probe checked (the composite is the one
-          # place the tag format exists), so probe and recorder can
-          # never drift into re-publishing an existing version.
-          TAG: ${{ fromJSON(needs.vsix.outputs.tags).marketplace }}
-        run: |
-          set -euo pipefail
-          { git tag "$TAG" && git push origin "$TAG"; } || {
-            echo "::error::published to the Marketplace but could not record $TAG; create it by hand (git tag $TAG ${GITHUB_SHA} && git push origin $TAG) or the next run will re-publish an existing version and fail"
-            exit 1
-          }
+      # The tag is the EXACT string the probe checked (the composite is
+      # the one place the format exists), so probe and recorder can
+      # never drift into re-publishing an existing version.
+      - uses: ./.github/actions/publish-and-record
+        with:
+          store: the VS Code Marketplace
+          run: pnpm dlx @vscode/vsce@3.9.2 publish --packagePath "$GITHUB_WORKSPACE/weft-vscode.vsix" --azure-credential
+          tag: ${{ fromJSON(needs.vsix.outputs.tags).marketplace }}
 
   publish-openvsx:
     name: publish to Open VSX
@@ -462,18 +457,13 @@ jobs:
           out="$(pnpm dlx ovsx@1.1.1 create-namespace weavemind -p "$OVSX_PAT" 2>&1)" \
             || { grep -qi "already exists" <<<"$out" || { printf '%s\n' "$out" >&2; exit 1; }; }
           printf '%s\n' "$out"
-      - env:
-          OVSX_PAT: ${{ secrets.OVSX_PAT }}
-        run: pnpm dlx ovsx@1.1.1 publish "$GITHUB_WORKSPACE/weft-vscode.vsix"
-      - name: record the published version
+      - uses: ./.github/actions/publish-and-record
         env:
-          TAG: ${{ fromJSON(needs.vsix.outputs.tags).openvsx }}
-        run: |
-          set -euo pipefail
-          { git tag "$TAG" && git push origin "$TAG"; } || {
-            echo "::error::published to Open VSX but could not record $TAG; create it by hand (git tag $TAG ${GITHUB_SHA} && git push origin $TAG) or the next run will re-publish an existing version and fail"
-            exit 1
-          }
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        with:
+          store: Open VSX
+          run: pnpm dlx ovsx@1.1.1 publish "$GITHUB_WORKSPACE/weft-vscode.vsix"
+          tag: ${{ fromJSON(needs.vsix.outputs.tags).openvsx }}
 
   publish-browser:
     name: publish to ${{ matrix.store }}
@@ -502,9 +492,23 @@ jobs:
         with:
           name: browser-zips
           path: extension-browser/build
-      - name: submit
+      # The per-store zip arguments live here because only this job
+      # knows which zips the packaging step wrote; the publish itself
+      # and its record go through the shared action.
+      - id: args
         env:
           STORE: ${{ matrix.store }}
+        run: |
+          set -euo pipefail
+          case "$STORE" in
+            chrome)  args="--chrome-zip build/weft-extension-chrome.zip" ;;
+            firefox) args="--firefox-zip build/weft-extension-firefox.zip --firefox-sources-zip build/weft-extension-sources.zip" ;;
+            edge)    args="--edge-zip build/weft-extension-edge.zip" ;;
+            *) echo "::error::no submit shape for store '$STORE'"; exit 1 ;;
+          esac
+          echo "value=$args" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/publish-and-record
+        env:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
           CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
@@ -520,25 +524,10 @@ jobs:
           EDGE_PRODUCT_ID: ${{ secrets.EDGE_PRODUCT_ID }}
           EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
           EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
-        # `exec` (not a bare command): pnpm only keeps -C for builtins
-        # and package scripts; an unknown bare command re-parses argv
-        # and dies on "extension-browser" as a command name.
-        run: |
-          set -euo pipefail
-          case "$STORE" in
-            chrome)  args="--chrome-zip build/weft-extension-chrome.zip" ;;
-            firefox) args="--firefox-zip build/weft-extension-firefox.zip --firefox-sources-zip build/weft-extension-sources.zip" ;;
-            edge)    args="--edge-zip build/weft-extension-edge.zip" ;;
-            *) echo "::error::no submit shape for store '$STORE'"; exit 1 ;;
-          esac
-          pnpm -C extension-browser exec wxt submit $args
-      - name: record the published version
-        env:
-          STORE: ${{ matrix.store }}
-          TAG: ${{ fromJSON(needs.browser.outputs.tags)[matrix.store] }}
-        run: |
-          set -euo pipefail
-          { git tag "$TAG" && git push origin "$TAG"; } || {
-            echo "::error::published to ${STORE} but could not record $TAG; create it by hand (git tag $TAG ${GITHUB_SHA} && git push origin $TAG) or the next run will re-publish an existing version and fail"
-            exit 1
-          }
+        with:
+          store: ${{ matrix.store }}
+          # `exec` (not a bare command): pnpm only keeps -C for builtins
+          # and package scripts; an unknown bare command re-parses argv
+          # and dies on "extension-browser" as a command name.
+          run: pnpm -C extension-browser exec wxt submit ${{ steps.args.outputs.value }}
+          tag: ${{ fromJSON(needs.browser.outputs.tags)[matrix.store] }}

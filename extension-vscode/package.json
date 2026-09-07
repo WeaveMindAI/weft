@@ -1,8 +1,8 @@
 {
   "name": "weft-vscode",
   "displayName": "Weft",
-  "description": "Weft language support: project management against the local dispatcher, live graph view for .weft files, AI streaming edits.",
-  "version": "0.2.238",
+  "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics, runs and executions in the editor.",
+  "version": "0.2.239",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -13,6 +13,23 @@
   "bugs": {
     "url": "https://github.com/WeaveMindAI/weft/issues"
   },
+  "keywords": [
+    "weft",
+    "workflow",
+    "orchestration",
+    "ai",
+    "llm",
+    "agents",
+    "graph",
+    "visual programming",
+    "automation"
+  ],
+  "galleryBanner": {
+    "color": "#1e1b2e",
+    "theme": "dark"
+  },
+  "pricing": "Free",
+  "qna": "https://github.com/WeaveMindAI/weft/issues",
   "packageManager": "pnpm@10.32.1",
   "engines": {
     "vscode": "^1.90.0"

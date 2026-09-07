@@ -1,0 +1,68 @@
+# Publish to one store and record it, with the store's own answer as
+# the authority on what "already published" means.
+#
+# The record tag (`<prefix>-<store>-v<version>`, written by
+# `store-publish-state`) is what stops the next run re-publishing a
+# version a store already carries. It is written AFTER a successful
+# publish, so a publish that succeeds and a tag push that does not
+# leaves the repo believing the store still owes a publish. The next
+# run then submits the same version again and the store refuses it,
+# which is where this stalls: a store that already has the version can
+# never accept it, so nothing but a hand-made tag ever clears it.
+#
+# So a refusal that says the version is already there counts as
+# published, and the tag gets written. That is the same answer the
+# repo was trying to record in the first place, and it is the store
+# saying it, not us guessing. Every other failure still fails the job.
+name: publish-and-record
+description: >-
+  Run a store's publish command and record the version with the tag the
+  probe checked, treating "this version is already there" as published.
+inputs:
+  store:
+    description: The store's name, for the messages
+    required: true
+  run:
+    description: The publish command, run with bash
+    required: true
+  tag:
+    description: >-
+      The record tag, taken from `store-publish-state`'s `tags` output so
+      the probe and the recorder read the same string.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: publish to ${{ inputs.store }}
+      env:
+        STORE: ${{ inputs.store }}
+        PUBLISH: ${{ inputs.run }}
+        TAG: ${{ inputs.tag }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        # The output is wanted whichever way this goes: on success it is
+        # the log, on failure it is the evidence for the check below.
+        out="$(bash -c "$PUBLISH" 2>&1)"
+        code=$?
+        printf '%s\n' "$out"
+        if [ "$code" -ne 0 ]; then
+          # Narrow on purpose. A pattern that matched loosely would
+          # record a tag for a publish that never happened, and that
+          # store would then be skipped forever: the failure this whole
+          # action exists to avoid, pointed the other way. Every store
+          # spells this refusal as "already exists" or "already
+          # published" (AMO puts the version first, ovsx puts it in the
+          # middle, so the version's position is not something to match
+          # on). No other failure any store returns says "already".
+          if grep -qiE 'already (exists|published|been published)' <<<"$out"; then
+            echo "::notice::${STORE} already carries this version, so there was nothing to publish; recording ${TAG}"
+          else
+            echo "::error::publishing to ${STORE} failed"
+            exit "$code"
+          fi
+        fi
+        { git tag "$TAG" && git push origin "$TAG"; } || {
+          echo "::error::${STORE} carries this version but ${TAG} could not be recorded; create it by hand (git tag ${TAG} ${GITHUB_SHA} && git push origin ${TAG}), or the next run will submit a version the store already has"
+          exit 1
+        }
