@@ -32,7 +32,7 @@ happens in it is journaled, node by node, with the values on the wires.
 | `weft activate` / `weft deactivate` | turn triggers on / off. They ask on a terminal; you have no terminal, so pass the answer: `weft deactivate --mode <wipe\|hibernate\|park>` (required without a terminal on an active project; `--running-policy <wait\|cancel>` defaults to `wait`) (see The three modes below) |
 | `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. On an active project it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
 | `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` | the project's long-running infra (Postgres, bridges) |
-| `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension |
+| `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension. `mint` prints the connect URL, then the bare token on its own line for a script |
 | `weft daemon start` / `status` / `logs` | the local runtime |
 | `weft catalog update` | re-sync `nodes/base_catalog/` to the installed weft's stdlib |
 | `weft describe-nodes --list` | one line per node type, which is how you find one |
@@ -44,13 +44,25 @@ happens in it is journaled, node by node, with the values on the wires.
 
 How a run picks which nodes execute is in the `weft-language` skill. A
 trigger only fires on its event once the project is activated. `--json` is a
-global flag: every command prints machine-readable output under it.
+global flag, and it means two things. The long commands (`build`, `run`,
+`activate`, `deactivate`, `resync`, `infra`, `rm`, the cancels) stream
+progress as one JSON object per line. The readers (`status`, `ps`,
+`executions`, `events`, `logs`, `files`, `listener inspect`, `token`,
+`stop`, `connect`) print what the dispatcher answered, which is what you
+want for `jq` instead of parsing the human columns, and `test-node`
+prints its reports as one JSON array. `new`, `follow`, `daemon`,
+`catalog`, `clean` and `update` ignore it.
 
 When you wait on something long (a build, the daemon coming up, a run
-settling), wait on the condition, never a timer: loop on the actual check
-(`until <check>; do sleep 5; done`, run with a generous timeout) so you
-return the moment it flips. A bare `sleep <N>` followed by a check is the
-wrong shape: too short and you churn, too long and you idle.
+settling), never sit in a loop you cannot leave. Start the long thing
+detached (`weft run --detach`, the build in the background), then check
+its state yourself between other steps: `weft executions --json` for a
+run, `weft status --json` for a build or the daemon. A run parked on a
+timer or a person is not going to finish on its own, and an open-ended
+`until` loop on it hangs you until somebody kills it, which has happened.
+If you do loop on a check, cap it: `timeout 30 bash -c 'until <check>; do
+sleep 5; done'`, and when the cap trips, read the state and say what it
+is waiting on rather than looping again.
 
 ## The build and run flow
 

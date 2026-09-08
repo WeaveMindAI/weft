@@ -49,8 +49,9 @@ global flag, and it means two things. The long commands (`build`, `run`,
 progress as one JSON object per line. The readers (`status`, `ps`,
 `executions`, `events`, `logs`, `files`, `listener inspect`, `token`,
 `stop`, `connect`) print what the dispatcher answered, which is what you
-want for `jq` instead of parsing the human columns. `new`, `test-node`,
-`follow`, `daemon`, `catalog`, `clean` and `update` ignore it.
+want for `jq` instead of parsing the human columns, and `test-node`
+prints its reports as one JSON array. `new`, `follow`, `daemon`,
+`catalog`, `clean` and `update` ignore it.
 
 When you wait on something long (a build, the daemon coming up, a run
 settling), never sit in a loop you cannot leave. Start the long thing
