@@ -306,8 +306,9 @@ pub enum DispatcherEvent {
         at_unix: u64,
     },
     /// Graph-level participation: a node was wired to a bus. Derived
-    /// from `PulseEmitted` events whose payload carries a bus marker
-    /// on a `Bus` port: both source and target nodes are participants.
+    /// from the pulses the fold puts on the wires whose value carries a
+    /// bus marker on a `Bus` port: both source and target nodes are
+    /// participants.
     /// `ephemeral` is sniffed from the marker JSON itself (which
     /// encodes the bus's mode) so the inspector can render a mode
     /// badge in the panel header without a separate journal event.

@@ -88,9 +88,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // command that leaves it. The marked 404 is how the dispatcher says
     // "no project I know under this id" (as opposed to a missing route).
     let Some(data) = ctx.client().get_json_if_found(&path).await? else {
-        if ctx.json() {
-            println!("{}", serde_json::json!({ "registered": false, "project_id": project_id }));
-        } else {
+        if !ctx.json_out(&serde_json::json!({ "registered": false, "project_id": project_id }))? {
             println!(
                 "project: {} ({project_id})\n  not registered with the dispatcher yet: \
                  use `weft run` to run it, or `weft activate` to enable its triggers",
@@ -100,9 +98,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         return Ok(());
     };
 
-    if ctx.json() {
-        // One JSON object on stdout; the extension reads it.
-        println!("{data}");
+    // One JSON object on stdout; the extension reads it.
+    if ctx.json_out(&data)? {
         return Ok(());
     }
 

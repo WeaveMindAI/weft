@@ -10,7 +10,7 @@
     //! works end to end through the engine.
 
     use super::*;
-    use super::engine_test_rig::{test_manifest, MemJournal, NoopInfra, NoopInfraState, NoopProject, NoopSteering, NoopTasks};
+    use super::engine_test_rig::{clients, run_checked, test_manifest, MemJournal, NoopTasks};
     use std::sync::Mutex as StdMutex;
     use async_trait::async_trait;
     use serde_json::json;
@@ -182,35 +182,14 @@
             .await
             .unwrap();
 
-        let clients = EngineClients {
-            journal: journal.clone(),
-            tasks: Arc::new(NoopTasks),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            steering: Arc::new(NoopSteering),
-        };
+        let clients = clients(journal.clone());
 
-        let outcome = run_one_execution(
-            Arc::new(project),
-            catalog,
-            color,
-            clients,
-            "pod-test".into(),
-            "tenant-test".into(),
-            "ns-test".into(),
-            CancellationFlag::new_arc(),
-            None,
-        )
-        .await
-        .expect("run_one_execution ok");
+        let outcome = run_checked(Arc::new(project), catalog, color, journal.clone(), clients, CancellationFlag::new_arc(), None)
+            .await
+            .expect("run_one_execution ok");
 
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "execution should complete, got {outcome:?}"
         );
 
@@ -229,7 +208,7 @@
         // Bus events MUST be journaled so the inspector replays the
         // conversation. After the node_id reshape the bus events
         // carry only (bus_id, name) / (bus_id, from, payload): node
-        // attribution is derived from PulseEmitted at the dispatcher
+        // attribution is derived from the emitted pulses at the dispatcher
         // bridge, not stamped on the bus stream. Here we assert the
         // raw protocol shape: both names registered, three messages
         // arrived in order with the producer's name stamped on each.
@@ -329,25 +308,11 @@
             color, node_id: "waiter".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
 
-        let clients = EngineClients {
-            journal: journal.clone(),
-            tasks: Arc::new(NoopTasks),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            steering: Arc::new(NoopSteering),
-        };
+        let clients = clients(journal.clone());
         let cancel = CancellationFlag::new_arc();
 
-        let run = tokio::spawn(run_one_execution(
-            Arc::new(project), catalog, color, clients,
-            "pod".into(), "tenant".into(), "ns".into(),
-            cancel.clone(),
-            None,
+        let run = tokio::spawn(run_checked(
+            Arc::new(project), catalog, color, journal, clients, cancel.clone(), None,
         ));
         // Let the waiter reach its cursor wait, then cancel.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -367,7 +332,7 @@
             .expect("run ok");
         match outcome {
             ExecutionOutcome::Cancelled { .. } => {} // cancel won the race
-            ExecutionOutcome::Completed { .. } => {} // dead-end closed the bus, Waiter exited cleanly
+            ExecutionOutcome::Completed => {} // dead-end closed the bus, Waiter exited cleanly
             other => panic!("expected Cancelled or Completed via dead-end, got {other:?}"),
         }
     }
@@ -594,25 +559,12 @@
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: creator.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
-        let clients = EngineClients {
-            journal: journal.clone(),
-            tasks: Arc::new(NoopTasks),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            steering: Arc::new(NoopSteering),
-        };
+        let clients = clients(journal.clone());
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_one_execution(
-                Arc::new(project), configurable_catalog(), color, clients,
-                "pod".into(), "tenant".into(), "ns".into(),
-                CancellationFlag::new_arc(),
-                None,
+            run_checked(
+                Arc::new(project), configurable_catalog(), color, journal, clients,
+                CancellationFlag::new_arc(), None,
             ),
         )
         .await
@@ -644,7 +596,7 @@
         assert!(
             matches!(
                 outcome,
-                ExecutionOutcome::Failed { .. } | ExecutionOutcome::Completed { .. }
+                ExecutionOutcome::Failed { .. } | ExecutionOutcome::Completed
             ),
             "panicking node must terminate the execution, got {outcome:?}"
         );
@@ -695,7 +647,7 @@
         })));
         let outcome = run_test(project, "creator").await;
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "hole 1: peer registers in time, execution completes; got {outcome:?}"
         );
     }
@@ -783,7 +735,7 @@
         })));
         let outcome = run_test(project, "producer").await;
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "hole 3: holder does not affect the wait; got {outcome:?}"
         );
     }
@@ -1105,24 +1057,10 @@
                 "sk-platform",
                 weft_core::CredentialOwner::Ours,
             );
-            let clients = EngineClients {
-                journal: journal.clone(),
-                tasks: Arc::new(NoopTasks),
-                infra: Arc::new(NoopInfra),
-                infra_state: Arc::new(NoopInfraState),
-                project: Arc::new(NoopProject),
-                clock: Arc::new(weft_platform_traits::clock::SystemClock),
-                storage: crate::storage::FakeWorkerStorage::new(),
-                access_broker: fake_access_broker.clone(),
-                pending_costs: crate::metering::PendingCostRecords::new(),
-                steering: Arc::new(NoopSteering),
-            };
+            let clients = EngineClients { access_broker: fake_access_broker.clone(), ..clients(journal.clone()) };
             let cancel = CancellationFlag::new_arc();
-            let run = tokio::spawn(run_one_execution(
-                Arc::new(project), configurable_catalog(), color, clients,
-                "pod".into(), "tenant".into(), "ns".into(),
-                cancel.clone(),
-                None,
+            let run = tokio::spawn(run_checked(
+                Arc::new(project), configurable_catalog(), color, journal, clients, cancel.clone(), None,
             ));
             ready_rx.await.expect("payer must reach its opened-access state");
             cancel.cancel_because(weft_core::exec::CancelCause::User);
@@ -1373,30 +1311,9 @@
                 .await
                 .unwrap();
             }
-            let clients = EngineClients {
-                journal: j,
-                tasks,
-                infra: Arc::new(NoopInfra),
-                infra_state: Arc::new(NoopInfraState),
-                project: Arc::new(NoopProject),
-                clock: Arc::new(weft_platform_traits::clock::SystemClock),
-                storage: crate::storage::FakeWorkerStorage::new(),
-                access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            steering: Arc::new(NoopSteering),
-            };
-            run_one_execution(
-                Arc::new(project),
-                configurable_catalog(),
-                color,
-                clients,
-                "pod".into(),
-                "tenant".into(),
-                "ns".into(),
-                CancellationFlag::new_arc(),
-                None,
-            )
-            .await
+            let clients = EngineClients { tasks, ..clients(j.clone()) };
+            run_checked(Arc::new(project), configurable_catalog(), color, j, clients, CancellationFlag::new_arc(), None)
+                .await
         });
         (handle, color)
     }
@@ -1552,7 +1469,7 @@
             .expect("join")
             .expect("run ok");
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "the resume must happen in process on the bus-held worker and complete; got {outcome:?}"
         );
         // The journal must show the WAITER resumed (NodeResumed), proving
@@ -1698,7 +1615,7 @@
             .expect("join")
             .expect("run ok");
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "both resumes must land in process and the execution complete; got {outcome:?}"
         );
         // Exactly TWO NodeResumed for the waiter: one per await. A single
@@ -1905,7 +1822,7 @@
             .expect("join")
             .expect("run ok");
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "both resumes must land in process and the execution complete; got {outcome:?}"
         );
         let events = journal.events.lock().unwrap().clone();
@@ -2068,14 +1985,19 @@
                 matches!(e, ExecEvent::NodeSkipped { node_id, .. } if node_id == "consumer")
             });
             assert!(!consumer_skipped, "iter {i}: consumer was skipped (its emitted input was wrongly closed)");
-            // And the consumer's firing must have seen the value on `in`.
-            let consumer_got_value = events.iter().any(|e| match e {
-                ExecEvent::NodeStarted { node_id, input, .. } if node_id == "consumer" => {
-                    input.get("in").and_then(|v| v.as_str()) == Some("payload")
-                }
-                _ => false,
-            });
-            assert!(consumer_got_value, "iter {i}: consumer never received the producer's value on `in`");
+            // And the consumer's firing must have seen the value on `in`:
+            // what it received is the pulses it absorbed, read back
+            // through the fold.
+            let mut fold = weft_journal::Fold::new(color, Arc::new(producer_consumer_project()));
+            for e in &events {
+                fold.apply(e);
+            }
+            let view = fold.firing_view("consumer", &vec![]).expect("consumer fired");
+            assert_eq!(
+                view.input.get("in").and_then(|v| v.as_str()),
+                Some("payload"),
+                "iter {i}: consumer never received the producer's value on `in`"
+            );
         }
     }
 
@@ -2162,31 +2084,10 @@
         caller: Option<Arc<dyn CallerConnection>>,
         tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     ) -> ExecutionOutcome {
-        let clients = EngineClients {
-            journal,
-            tasks,
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            steering: Arc::new(NoopSteering),
-        };
-        run_one_execution(
-            Arc::new(project),
-            catalog,
-            color,
-            clients,
-            "pod-test".into(),
-            "tenant-test".into(),
-            "ns-test".into(),
-            CancellationFlag::new_arc(),
-            caller,
-        )
-        .await
-        .expect("run_one_execution ok")
+        let clients = EngineClients { tasks, ..clients(journal.clone()) };
+        run_checked(Arc::new(project), catalog, color, journal, clients, CancellationFlag::new_arc(), caller)
+            .await
+            .expect("run_one_execution ok")
     }
 
     /// A single-node project for `node_type` with no inputs and a `done`
@@ -2405,7 +2306,7 @@
             project, catalog, journal.clone(), color,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
 
         let msgs: Vec<i64> = journal.events.lock().unwrap().iter().flat_map(|e| match e {
             ExecEvent::BusWindow { messages, .. } => messages
@@ -2485,7 +2386,7 @@
             project, catalog, journal, color,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
 
         let got = seen.lock().unwrap().clone();
         let a_count = got.iter().filter(|(l, _)| *l == "A").count();
@@ -2510,7 +2411,7 @@
             project, catalog, journal, color,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
 
         // The node both wrote a chunk and terminated with the final body.
         use weft_core::caller::CallerCall;
@@ -2559,7 +2460,7 @@
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "a survives run continues past a gone caller; got {outcome:?}"
         );
     }
@@ -2701,7 +2602,7 @@
             project, catalog, journal, color,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         use weft_core::caller::CallerCall;
         assert!(
             fake.calls().iter().any(|c| matches!(c, CallerCall::SendChunk(_))),
@@ -2843,7 +2744,7 @@
             project, catalog, journal, color,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
 
         // One gathered entry per iteration, and every entry is a real
         // message read from the caller. The point: `ctx.caller()` resolved

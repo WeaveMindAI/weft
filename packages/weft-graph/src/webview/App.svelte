@@ -712,7 +712,7 @@
         return;
       }
       if (msg.kind === 'busParticipant') {
-        // Add the (busId, nodeId) edge if new. Idempotent: PulseEmitted
+        // Add the (busId, nodeId) edge if new. Idempotent: emitted pulses
         // fires once per source/target on a per-pulse basis, so we may
         // see the same edge multiple times when a producer emits
         // several values on the same bus port. The first edge for a

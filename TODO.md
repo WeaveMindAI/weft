@@ -45,9 +45,11 @@ mechanisms today:
    **Why this is incomplete:** skip-and-continue is correct for DEAD
    history (a corrupt row in a long-settled branch only degrades the
    replay view), but the SAME skip runs when the corrupt row is on the
-   RESUME FRONTIER (a `PulseEmitted` feeding a suspended node's input,
-   a `NodeResumed`'s absorbed-pulse list); there it silently rebuilds
-   the suspended node's state wrong and resumes on garbage.
+   RESUME FRONTIER (a `PortEmitted` feeding a suspended node's input,
+   a `NodeResumed` for it); there it would rebuild the suspended
+   node's state wrong. The worker now refuses to resume over ANY
+   corruption (it journals `ExecutionFailed` naming the rows and `weft
+   clean`); the display read still skips and marks.
 
 Both (1) and (2) are the SAME underlying thing: **the journal has a
 HOLE at some position** (a missing event, or an unusable one). The only

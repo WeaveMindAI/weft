@@ -58,8 +58,7 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
     let limit = logs["limit"]
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("/executions/{color}/logs returned no limit: {logs}"))?;
-    if ctx.json() {
-        println!("{logs}");
+    if ctx.json_out(&logs)? {
         return Ok(());
     }
     if arr.is_empty() {

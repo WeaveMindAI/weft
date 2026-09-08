@@ -77,7 +77,7 @@ pub enum TryNext<T> {
 /// until the take absorbs it.
 #[derive(Clone)]
 pub struct StreamBuffer {
-    queue: VecDeque<(Uuid, Value)>,
+    queue: VecDeque<(Uuid, Arc<Value>)>,
     end: Option<StreamEnd>,
 }
 
@@ -90,7 +90,7 @@ impl StreamBuffer {
     /// bug in whoever feeds this buffer (a producer cannot emit past
     /// its close); it is refused loudly and NOT recorded, so a re-pass
     /// repeats the same loud error instead of silently succeeding.
-    pub fn push(&mut self, pulse_id: Uuid, value: Value) -> Result<(), String> {
+    pub fn push(&mut self, pulse_id: Uuid, value: Arc<Value>) -> Result<(), String> {
         if self.end.is_some() {
             return Err("an item arrived after the stream's end".into());
         }
@@ -118,12 +118,12 @@ impl StreamBuffer {
     /// still queued never terminates anything), so a reinstated item
     /// is always taken before the end is. Live arrival order stays
     /// guarded by [`Self::push`].
-    pub fn reinstate(&mut self, pulse_id: Uuid, value: Value) {
+    pub fn reinstate(&mut self, pulse_id: Uuid, value: Arc<Value>) {
         self.queue.push_back((pulse_id, value));
     }
 
     /// Take the oldest buffered item, if any.
-    pub fn pop(&mut self) -> Option<(Uuid, Value)> {
+    pub fn pop(&mut self) -> Option<(Uuid, Arc<Value>)> {
         self.queue.pop_front()
     }
 
@@ -225,7 +225,7 @@ impl GeneratorFeed {
     /// Ingest one item pulse. An item arriving after the end is an
     /// engine ordering bug (a producer cannot emit past its close); it
     /// is refused loudly, and a re-pass repeats the same error.
-    pub fn push(&self, pulse_id: Uuid, value: Value) -> WeftResult<()> {
+    pub fn push(&self, pulse_id: Uuid, value: Arc<Value>) -> WeftResult<()> {
         let mut st = self.lock();
         st.buf.push(pulse_id, value).map_err(|e| {
             WeftError::NodeExecution(format!(
@@ -299,10 +299,14 @@ impl WaitSource for GeneratorFeed {
     }
 }
 
+/// One buffered item as a pull sees it: the pulse that carried it and
+/// its shared value.
+type PulledItem = Option<(Uuid, Arc<Value>)>;
+
 /// One evaluation of the pull condition, under the feed lock. `Some` =
 /// resolved (an item, the clean end, or the failure); `None` = nothing
 /// yet, keep waiting.
-fn evaluate_pull(feed: &GeneratorFeed) -> Option<WeftResult<Option<(Uuid, Value)>>> {
+fn evaluate_pull(feed: &GeneratorFeed) -> Option<WeftResult<PulledItem>> {
     let mut st = feed.lock();
     if let Some((id, v)) = st.buf.pop() {
         return Some(Ok(Some((id, v))));
@@ -338,12 +342,15 @@ impl<T> std::fmt::Debug for Generator<T> {
 }
 
 impl<T: DeserializeOwned> Generator<T> {
-    fn convert(&self, id: Uuid, value: Value) -> WeftResult<T> {
+    fn convert(&self, id: Uuid, value: Arc<Value>) -> WeftResult<T> {
         // The take is reported BEFORE conversion: the item left the
         // buffer either way, and the producer's delivery wait is about
         // the taking, not about whether the consumer can parse it.
         (self.feed.on_taken)(id);
-        serde_json::from_value(value).map_err(|e| {
+        // The buffered item is the pulse's shared value; the consumer's
+        // typed copy is deserialized straight off it, so the only
+        // owned copy is the one the body receives.
+        serde::Deserialize::deserialize(&*value).map_err(|e| {
             WeftError::Input(format!(
                 "stream '{}': item does not deserialize into {}: {e}",
                 self.feed.port,
@@ -518,8 +525,8 @@ mod tests {
     #[tokio::test]
     async fn items_then_clean_end_read_in_order() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!(1)).unwrap();
-        f.push(Uuid::new_v4(), json!(2)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(1))).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(2))).unwrap();
         f.close(StreamEnd::Finished);
         let g = handle(&f);
         assert_eq!(g.next().await.unwrap(), Some(1));
@@ -547,7 +554,7 @@ mod tests {
             // Under the multi-thread stress runs the push lands before,
             // during, and after the pull's park; every ordering must
             // deliver the item.
-            f.push(Uuid::new_v4(), json!(7)).unwrap();
+            f.push(Uuid::new_v4(), Arc::new(json!(7))).unwrap();
             assert_eq!(pull.await.unwrap().unwrap(), Some(7));
             unregister_feed(id);
         }
@@ -556,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn failed_end_errors_and_drain_returns_no_partial_list() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!(1)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(1))).unwrap();
         f.close(StreamEnd::Failed { error: "boom".into() });
         let g = handle(&f);
         // The buffered item still comes through; the failure lands
@@ -570,7 +577,7 @@ mod tests {
         let f = feed();
         let g = handle(&f);
         assert_eq!(g.try_next().unwrap(), TryNext::Empty);
-        f.push(Uuid::new_v4(), json!(5)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(5))).unwrap();
         assert_eq!(g.try_next().unwrap(), TryNext::Item(5));
         f.close(StreamEnd::Finished);
         assert_eq!(g.try_next().unwrap(), TryNext::Finished);
@@ -579,13 +586,13 @@ mod tests {
     #[test]
     fn push_after_end_is_refused_every_time() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!(1)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(1))).unwrap();
         f.close(StreamEnd::Finished);
-        assert!(f.push(Uuid::new_v4(), json!(2)).is_err(), "no item lands after the end");
+        assert!(f.push(Uuid::new_v4(), Arc::new(json!(2))).is_err(), "no item lands after the end");
         // The refusal must repeat: a refused item is not recorded, so
         // a routing re-pass hits the same loud error instead of
         // silently succeeding.
-        assert!(f.push(Uuid::new_v4(), json!(2)).is_err());
+        assert!(f.push(Uuid::new_v4(), Arc::new(json!(2))).is_err());
     }
 
     #[test]
@@ -599,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn discard_poisons_stragglers_instead_of_reading_a_clean_end() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!(1)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(1))).unwrap();
         f.close(StreamEnd::Finished);
         let g = handle(&f);
         let ids = f.abandon();
@@ -614,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn discard_after_a_fully_drained_clean_end_stays_clean() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!(1)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(1))).unwrap();
         f.close(StreamEnd::Finished);
         let g = handle(&f);
         assert_eq!(g.next().await.unwrap(), Some(1));
@@ -625,7 +632,7 @@ mod tests {
     #[tokio::test]
     async fn abandon_keeps_a_drained_failed_end_over_the_generic_teardown_message() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!(1)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(1))).unwrap();
         f.close(StreamEnd::Failed { error: "producer boom".into() });
         let g = handle(&f);
         assert_eq!(g.next().await.unwrap(), Some(1));
@@ -639,7 +646,7 @@ mod tests {
     #[tokio::test]
     async fn abandon_with_items_lost_reports_both_the_loss_and_the_upstream_failure() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!(1)).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!(1))).unwrap();
         f.close(StreamEnd::Failed { error: "producer boom".into() });
         let g = handle(&f);
         let ids = f.abandon();
@@ -652,7 +659,7 @@ mod tests {
     #[test]
     fn wrong_typed_item_errors_loudly_naming_the_port() {
         let f = feed();
-        f.push(Uuid::new_v4(), json!("not a number")).unwrap();
+        f.push(Uuid::new_v4(), Arc::new(json!("not a number"))).unwrap();
         let g = handle(&f);
         let err = g.try_next().unwrap_err().to_string();
         assert!(err.contains("rows"), "{err}");

@@ -20,11 +20,11 @@ use crate::journal::{
 struct MockState {
     events: Vec<ExecEvent>,
     signal_tokens: HashMap<String, SignalToken>,
-    signals: HashMap<String, SignalRegistration>,
-    /// Placement (holder pod + generation) recorded WITH each signal,
-    /// mirroring the real `signal.listener_pod` / `placement_generation`
-    /// columns, so a test can assert what a fresh insert stamped.
-    signal_placements: HashMap<String, crate::journal::SignalPlacement>,
+    /// One entry per `signal` row: the row (its holder on
+    /// `listener_pod`, as the column) plus the placement generation the
+    /// insert stamped, so the two die together exactly as one Postgres
+    /// row does and no path can leave a placement behind a deleted row.
+    signals: HashMap<String, StoredSignal>,
     dedup_keys: std::collections::HashSet<String>,
     /// Mirror of the Postgres `execution_color` denormalization:
     /// seeded on `ExecutionStarted` with `(project_id, tenant_id)`,
@@ -50,6 +50,13 @@ struct MockState {
     /// existing pair keeping its seq like the real ON CONFLICT.
     execution_tags: HashMap<(Color, String), i64>,
     next_tag_seq: i64,
+}
+
+/// A mock `signal` row: the registration as a read hands it back, and
+/// the `placement_generation` column beside it.
+struct StoredSignal {
+    row: SignalRegistration,
+    placement_generation: i64,
 }
 
 #[derive(Default)]
@@ -169,7 +176,16 @@ impl MockJournal {
     /// test assert the placement-born-with-row invariant: the holder is
     /// stamped WITH the row, never left NULL for a later write.
     pub fn signal_placement(&self, token: &str) -> Option<crate::journal::SignalPlacement> {
-        self.inner.lock().unwrap().signal_placements.get(token).cloned()
+        let g = self.inner.lock().unwrap();
+        let stored = g.signals.get(token)?;
+        Some(crate::journal::SignalPlacement {
+            listener_pod: stored
+                .row
+                .listener_pod
+                .clone()
+                .expect("the mock stamps every stored row with its holder"),
+            generation: stored.placement_generation,
+        })
     }
 
     /// Register a project's owning tenant, mirroring the `project` table the
@@ -316,6 +332,7 @@ impl Journal for MockJournal {
     async fn cancel_never_claimed_execution(
         &self,
         color: Color,
+        _program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome> {
         // Dumb: the mock has no 'claimed' state, so the outcome is always
@@ -341,6 +358,7 @@ impl Journal for MockJournal {
     async fn cancel_execution(
         &self,
         color: Color,
+        _program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<crate::journal::CancelWrite> {
         let mut g = self.inner.lock().unwrap();
@@ -349,11 +367,11 @@ impl Journal for MockJournal {
         let keys: Vec<String> = g
             .signals
             .iter()
-            .filter(|(_, s)| s.color == Some(color))
+            .filter(|(_, s)| s.row.color == Some(color))
             .map(|(k, _)| k.clone())
             .collect();
         let removed: Vec<SignalRegistration> =
-            keys.into_iter().filter_map(|k| g.signals.remove(&k)).collect();
+            keys.into_iter().filter_map(|k| g.signals.remove(&k).map(|s| s.row)).collect();
         let mut write = crate::journal::CancelWrite { removed, ..Default::default() };
         if g.execution_colors.contains_key(&color) {
             let has_terminal = g.events.iter().any(|e| {
@@ -396,16 +414,13 @@ impl Journal for MockJournal {
         Ok((events, Vec::new()))
     }
 
-    async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool> {
+    async fn consume_suspension(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
         // Mirror the postgres impl: drop the signal row for a
         // single-use resume token. Entry-trigger rows stay.
         let mut g = self.inner.lock().unwrap();
         match g.signals.get(token) {
-            Some(s) if s.is_resume => {
-                g.signals.remove(token);
-                Ok(true)
-            }
-            _ => Ok(false),
+            Some(s) if s.row.is_resume => Ok(g.signals.remove(token).map(|s| s.row)),
+            _ => Ok(None),
         }
     }
 
@@ -599,7 +614,7 @@ impl Journal for MockJournal {
     async fn delete_execution(&self, color: Color) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         g.events.retain(|e| e.color() != color);
-        g.signals.retain(|_, s| s.color != Some(color));
+        g.signals.retain(|_, s| s.row.color != Some(color));
         g.execution_colors.remove(&color);
         g.execution_tags.retain(|(c, _), _| *c != color);
         Ok(())
@@ -644,7 +659,7 @@ impl Journal for MockJournal {
         // rejects it. Resume rows (per-suspension tokens) are exempt, matching the
         // index's `WHERE is_resume = FALSE`.
         if !sig.is_resume {
-            let collides = inner.signals.values().any(|existing| {
+            let collides = inner.signals.values().map(|s| &s.row).any(|existing| {
                 !existing.is_resume
                     && existing.project_id == sig.project_id
                     && existing.node_id == sig.node_id
@@ -664,21 +679,23 @@ impl Journal for MockJournal {
         // (a reactivate must never rewind an in-flight cursor write),
         // and the row keeps the higher seq either way.
         let mut fenced = sig.clone();
-        if let Some(existing) = inner.signals.get(&fenced.token) {
+        // The stored row names its holder, as `signal.listener_pod` does.
+        fenced.listener_pod = Some(placement.listener_pod.clone());
+        if let Some(existing) = inner.signals.get(&fenced.token).map(|s| &s.row) {
             if existing.kind_state_seq > fenced.kind_state_seq {
                 fenced.kind_state = existing.kind_state.clone();
             }
             fenced.kind_state_seq = existing.kind_state_seq.max(fenced.kind_state_seq);
         }
-        inner.signals.insert(fenced.token.clone(), fenced);
-        inner
-            .signal_placements
-            .insert(sig.token.clone(), placement.clone());
+        inner.signals.insert(
+            fenced.token.clone(),
+            StoredSignal { row: fenced, placement_generation: placement.generation },
+        );
         Ok(())
     }
 
     async fn signal_get(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
-        Ok(self.inner.lock().unwrap().signals.get(token).cloned())
+        Ok(self.inner.lock().unwrap().signals.get(token).map(|s| s.row.clone()))
     }
 
     async fn signal_update_kind_state(
@@ -689,17 +706,11 @@ impl Journal for MockJournal {
         placement_generation: i64,
     ) -> anyhow::Result<bool> {
         let mut g = self.inner.lock().unwrap();
-        // Read the placement generation BEFORE taking the mutable
-        // signal borrow (both live on `g`).
-        let row_generation = g
-            .signal_placements
-            .get(token)
-            .map(|p| p.generation)
-            .unwrap_or(0);
-        if row_generation > placement_generation {
+        let Some(stored) = g.signals.get_mut(token) else { return Ok(false) };
+        if stored.placement_generation > placement_generation {
             return Ok(false);
         }
-        let Some(sig) = g.signals.get_mut(token) else { return Ok(false) };
+        let sig = &mut stored.row;
         if sig.kind_state_seq >= seq {
             return Ok(false);
         }
@@ -715,8 +726,8 @@ impl Journal for MockJournal {
         let mut g = self.inner.lock().unwrap();
         let mut out = Vec::new();
         for t in tokens {
-            if let Some(sig) = g.signals.remove(t) {
-                out.push(sig);
+            if let Some(stored) = g.signals.remove(t) {
+                out.push(stored.row);
             }
         }
         Ok(out)
@@ -732,6 +743,7 @@ impl Journal for MockJournal {
             .unwrap()
             .signals
             .values()
+            .map(|s| &s.row)
             .filter(|s| s.project_id == project_id)
             .cloned()
             .collect())
@@ -749,12 +761,12 @@ impl Journal for MockJournal {
         let keys: Vec<String> = g
             .signals
             .iter()
-            .filter(|(_, s)| s.color == Some(color))
+            .filter(|(_, s)| s.row.color == Some(color))
             .map(|(k, _)| k.clone())
             .collect();
         Ok(keys
             .into_iter()
-            .filter_map(|k| g.signals.remove(&k))
+            .filter_map(|k| g.signals.remove(&k).map(|s| s.row))
             .collect())
     }
 
@@ -766,12 +778,12 @@ impl Journal for MockJournal {
         let keys: Vec<String> = g
             .signals
             .iter()
-            .filter(|(_, s)| s.project_id == project_id)
+            .filter(|(_, s)| s.row.project_id == project_id)
             .map(|(k, _)| k.clone())
             .collect();
         Ok(keys
             .into_iter()
-            .filter_map(|k| g.signals.remove(&k))
+            .filter_map(|k| g.signals.remove(&k).map(|s| s.row))
             .collect())
     }
 }
@@ -801,6 +813,7 @@ mod tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            listener_pod: None,
         }
     }
 
@@ -823,8 +836,40 @@ mod tests {
         assert_eq!(placement.listener_pod, "listener-abc");
         assert_eq!(placement.generation, 3);
         // The signal itself is also present (holder + registration land
-        // together, not in separate steps).
-        assert!(j.signal_get("tok-1").await.unwrap().is_some());
+        // together, not in separate steps), and a read names the holder.
+        let row = j.signal_get("tok-1").await.unwrap().expect("row present");
+        assert_eq!(row.listener_pod.as_deref(), Some("listener-abc"));
+    }
+
+    /// Consuming a resume token hands back the deleted row WITH its
+    /// holder: the row is gone by then, so the unregister that follows
+    /// has nothing else to learn the pod from.
+    #[tokio::test]
+    async fn consume_suspension_hands_back_the_row_and_its_holder() {
+        let j = MockJournal::new();
+        let mut resume = registration("tok-r");
+        resume.is_resume = true;
+        j.signal_insert(
+            &resume,
+            &SignalPlacement { listener_pod: "listener-abc".into(), generation: 1 },
+        )
+        .await
+        .unwrap();
+        let consumed = j.consume_suspension("tok-r").await.unwrap().expect("the resume row");
+        assert_eq!(consumed.listener_pod.as_deref(), Some("listener-abc"));
+        assert!(j.signal_get("tok-r").await.unwrap().is_none(), "single use");
+        assert!(j.signal_placement("tok-r").is_none(), "the placement dies with the row");
+        assert!(j.consume_suspension("tok-r").await.unwrap().is_none(), "already consumed");
+
+        // An entry row is never consumed this way.
+        j.signal_insert(
+            &registration("tok-e"),
+            &SignalPlacement { listener_pod: "listener-abc".into(), generation: 1 },
+        )
+        .await
+        .unwrap();
+        assert!(j.consume_suspension("tok-e").await.unwrap().is_none());
+        assert!(j.signal_get("tok-e").await.unwrap().is_some(), "entry rows stay");
     }
 
     /// The kind_state conflict fence mirrors Postgres: a re-insert
@@ -914,7 +959,7 @@ mod tests {
         j.record_event(&started(done, "p")).await.unwrap();
         j.record_event(&started(live, "p")).await.unwrap();
         // Only `done` gets a terminal event.
-        j.record_event(&ExecEvent::ExecutionCompleted { color: done, outputs: serde_json::Value::Null, at_unix: 1 })
+        j.record_event(&ExecEvent::ExecutionCompleted { color: done, at_unix: 1 })
             .await
             .unwrap();
 
@@ -969,7 +1014,7 @@ mod tests {
         let c = weft_core::Color::new_v4();
         j.set_project_tenant("p", "t");
         j.record_event(&started_at(c, "p", 100)).await.unwrap();
-        j.record_event(&ExecEvent::ExecutionCompleted { color: c, outputs: serde_json::Value::Null, at_unix: 150 })
+        j.record_event(&ExecEvent::ExecutionCompleted { color: c, at_unix: 150 })
             .await
             .unwrap();
 

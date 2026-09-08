@@ -1059,13 +1059,20 @@ fn enclosing_scope_hint(
 /// The root anonymous group of a component file (one used through
 /// `@include`), whose boundaries are the file's own interface: there is
 /// no outer scope to wire from, and nothing inside consumes its outputs
-/// by construction. `None` for a runnable project.
+/// by construction. `None` for a runnable project, including one that
+/// puts an anonymous group beside loose nodes: an include refuses that
+/// file, so it is a program and the group is one more of its items.
+/// One answer per file, so every rule reads the same root.
 fn component_root(project: &ProjectDefinition) -> Option<&str> {
-    project
+    let root = project
         .groups
         .iter()
         .find(|g| g.parent_group_id.is_none() && g.anonymous)
-        .map(|g| g.id.as_str())
+        .map(|g| g.id.as_str())?;
+    let alone = project.nodes.iter().all(|n| {
+        !n.scope.is_empty() || n.group_boundary.as_ref().is_some_and(|b| b.group_id == root)
+    });
+    alone.then_some(root)
 }
 
 /// The name a diagnostic calls a node: its id, or for a group's
@@ -2619,100 +2626,221 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     }
 }
 
-/// level-too-large: a level of the graph (the file, or the inside of a
-/// group or loop) holding more than [`LEVEL_WARN_AT`] items, nodes or
-/// groups. A weft program is read as a graph, and a level is what the
-/// reader scans in one look: about six items reads, past fifteen does
-/// not. A warning, never an error: the program still runs, and the
-/// advice is about how it reads. The message names the move the
-/// language has for it (group the nodes cooperating on one job; let
-/// nesting absorb size).
+/// level-too-large: a level of the graph holding more than
+/// [`LEVEL_WARN_AT`] items, nodes or groups. A weft program is read as a
+/// graph, and a level is what the reader scans in one look: about six
+/// items reads, past fifteen does not. A warning, never an error: the
+/// program still runs, and the advice is about how it reads. The message
+/// names the move the language has for it (group the nodes cooperating
+/// on one job; let nesting absorb size).
+///
+/// The file's top level is measured per BRANCH: the items one wire walk
+/// reaches, where a plain infra node at that level ends the walk (a
+/// database both branches talk to joins nothing; a group holding one is
+/// an item like any other). A branch counts its own items plus the
+/// infra nodes it touches, so two unrelated pipelines sharing one file
+/// each answer for their own width. The inside of a group or loop is
+/// one job by construction, so it is measured whole.
 fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    use std::collections::{BTreeSet, HashMap, HashSet};
-    use weft_core::project::GroupBoundaryRole;
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     /// A level holds more than this many items and the warning fires.
     /// Six is the readable size the language asks for; fifteen is the
     /// wall the compiler refuses to stay quiet about.
     const LEVEL_WARN_AT: usize = 15;
 
+    // The file's top level: scope `[]` in a program file. A component
+    // file's members all live under its root group, whose boundaries
+    // are the file's own interface rather than an item, so THAT scope
+    // is the component's top level and is measured the same way.
+    // Either way every node's scope starts with `top`, which the rest
+    // relies on (`component_root` reads a file with loose nodes beside
+    // its anonymous group as a program).
     let root = component_root(project);
+    let top: Vec<String> = root.map(|r| vec![r.to_string()]).unwrap_or_default();
 
-    // Per level (a scope path; `[]` is the file's top level): the plain
-    // nodes directly in it, plus the groups directly in it. A group's
+    // Per level (a scope path): each item directly in it, keyed by the
+    // id an edge names it by. A plain node is its own item; a group's
     // two boundary halves are its one seat at the parent's table, so
-    // they dedupe by the group they carry (a HashSet, not a count).
-    let mut plain: HashMap<&[String], usize> = HashMap::new();
-    let mut nested: HashMap<&[String], HashSet<&str>> = HashMap::new();
-    // The In half of each group, to anchor its level's warning on the
-    // group's own header line (the boundary's header span IS the
-    // group's, and its `my__in` id appears nowhere in the source).
-    let mut in_half: HashMap<&str, &NodeDefinition> = HashMap::new();
+    // both map to the group's id. Sorted into source order below (the
+    // flattened node list puts a scope's plain nodes before its
+    // groups), so a level's first item is the one the author wrote
+    // first.
+    let mut items: BTreeMap<&[String], Vec<&str>> = BTreeMap::new();
+    let mut seated: HashSet<(&[String], &str)> = HashSet::new();
+    let mut item_of: HashMap<&str, &str> = HashMap::new();
+    // The node a diagnostic about an item lands on: a plain node itself;
+    // for a group either boundary half, whose header span IS the group's
+    // own header line (the `my__in` id appears nowhere in the source).
+    let mut anchor_of: HashMap<&str, &NodeDefinition> = HashMap::new();
+    // Every node's item AT THE TOP LEVEL: itself (or its group) when it
+    // sits there, else the ancestor group holding it that does. A wire
+    // reaching into a group from outside names the inner node, and the
+    // branch walk has to see that as the group joining.
+    let mut top_item_of: HashMap<&str, &str> = HashMap::new();
+    let mut infra: HashSet<&str> = HashSet::new();
 
     for node in &project.nodes {
-        match &node.group_boundary {
+        let item = match &node.group_boundary {
             Some(b) => {
                 // A component file's root boundaries are the file's own
-                // interface, not an item at any level.
+                // interface, not an item at any level, and a wire from
+                // them joins nothing (as a literal joins nothing).
                 if Some(b.group_id.as_str()) == root {
                     continue;
                 }
-                nested.entry(&node.scope).or_default().insert(b.group_id.as_str());
-                if b.role == GroupBoundaryRole::In {
-                    in_half.insert(b.group_id.as_str(), node);
-                }
+                b.group_id.as_str()
             }
             None => {
-                *plain.entry(&node.scope).or_insert(0) += 1;
+                // Only a plain infra node AT the top level ends the walk;
+                // a group holding one is an item like any other.
+                if node.requires_infra && node.scope == top {
+                    infra.insert(node.id.as_str());
+                }
+                node.id.as_str()
             }
+        };
+        let scope = node.scope.as_slice();
+        if seated.insert((scope, item)) {
+            items.entry(scope).or_default().push(item);
+        }
+        anchor_of.entry(item).or_insert(node);
+        item_of.insert(node.id.as_str(), item);
+        if scope == top.as_slice() {
+            top_item_of.insert(node.id.as_str(), item);
+        } else {
+            let ancestor = scope.get(top.len()).expect("every node's scope starts with `top`");
+            top_item_of.insert(node.id.as_str(), ancestor.as_str());
         }
     }
 
-    let mut levels: BTreeSet<&[String]> = plain.keys().copied().collect();
-    levels.extend(nested.keys().copied());
-    for scope in levels {
-        let items = plain.get(scope).copied().unwrap_or(0)
-            + nested.get(scope).map_or(0, |s| s.len());
-        if items <= LEVEL_WARN_AT {
-            continue;
+    // Sort each level into the order the author reads it. An item's
+    // position is its header line, or for a node lowered from an
+    // inline expression (which has no header of its own) the
+    // expression's span, which starts after its host's header. Items
+    // spliced in from another file (an `@include`d group keeps its own
+    // file and coordinates) come after the level's own, then by file;
+    // a node with no position at all sorts last. So the first item is
+    // never something the author did not write on this level's page.
+    for (scope, level_items) in items.iter_mut() {
+        let level_file = scope
+            .last()
+            .and_then(|gid| anchor_of.get(gid.as_str()))
+            .and_then(|n| n.source_file.as_deref());
+        level_items.sort_by_key(|item| {
+            let node = anchor_of[item];
+            let file = node.source_file.as_deref();
+            let span = node.header_span.or(node.span);
+            (
+                span.is_none(),
+                file != level_file,
+                file,
+                span.map_or((0, 0), |s| (s.start_line, s.start_column)),
+            )
+        });
+    }
+
+    for (scope, level_items) in &items {
+        // Each entry is one measured unit: its items in source order.
+        // Every sub level is one unit; the top level splits by branch.
+        let is_top = *scope == top.as_slice();
+        let units: Vec<Vec<&str>> = if is_top {
+            branches(level_items, &infra, &top_item_of, project)
+        } else {
+            vec![level_items.clone()]
+        };
+        for unit in units {
+            let count = unit.len();
+            if count <= LEVEL_WARN_AT {
+                continue;
+            }
+            let (name, anchor) = if is_top {
+                // The top level has no header of its own; the branch's
+                // first item carries the warning.
+                let first = unit.first().expect("a crowded branch has a first item");
+                ("one connected branch at the top level".to_string(), anchor_of[first])
+            } else {
+                // A sub level is a group's inside, and the group is an
+                // item of its parent level: its header carries the warning.
+                let gid = scope.last().expect("a sub level is a group's scope");
+                (format!("the inside of '{gid}'"), anchor_of[gid.as_str()])
+            };
+            push(
+                d,
+                anchor.source_file.as_deref(),
+                anchor.header_span_or_default(),
+                Severity::Warning,
+                "level-too-large",
+                format!(
+                    "{name} holds {count} items; a level reads at about six and stops reading \
+                     past fifteen: group the nodes cooperating on one job, and nest groups \
+                     rather than widen the level"
+                ),
+            );
         }
-        let (name, anchor) = match scope.last() {
-            Some(gid) => (
-                format!("the inside of '{gid}'"),
-                in_half.get(gid.as_str()).copied(),
-            ),
-            // The file level has no header of its own; the first item
-            // at that level carries the warning.
-            None => ("the top level".to_string(), None),
-        };
-        let Some(anchor) = anchor.or_else(|| {
-            // The level's first item carries a level with no header of
-            // its own (the file's top level): a plain node if it has
-            // one, else the first group sitting there (either boundary
-            // half's header span is that group's own line). A
-            // component file's root boundaries are its interface, not
-            // an item, and never anchor anything.
-            project.nodes.iter().find(|n| {
-                n.scope == *scope
-                    && n.group_boundary
-                        .as_ref()
-                        .is_none_or(|b| Some(b.group_id.as_str()) != root)
+    }
+
+    /// The top level's items split into branches: the items one wire
+    /// walk reaches without passing through an infra node, each branch
+    /// listed in source order with the infra nodes it touches appended.
+    /// An infra node wired to nothing counts nowhere. `top_item_of`
+    /// maps every node id an edge may name to its item at this level,
+    /// so a wire into a group's inside joins the group.
+    fn branches<'a>(
+        level_items: &[&'a str],
+        infra: &HashSet<&'a str>,
+        top_item_of: &HashMap<&'a str, &'a str>,
+        project: &'a ProjectDefinition,
+    ) -> Vec<Vec<&'a str>> {
+        // Union-find over the level's non-infra items, by position in
+        // `level_items` so branches come out in source order.
+        let index: HashMap<&str, usize> =
+            level_items.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut parent: Vec<usize> = (0..level_items.len()).collect();
+        fn find(parent: &mut [usize], i: usize) -> usize {
+            let mut i = i;
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        // An edge joins its ends when both are items of this level and
+        // neither is infra; an edge onto an infra node only marks the
+        // touch, resolved to the branch once every join is in.
+        let mut touches: Vec<(usize, &str)> = Vec::new();
+        for edge in &project.edges {
+            let ends =
+                (top_item_of.get(edge.source.as_str()), top_item_of.get(edge.target.as_str()));
+            let (Some(&a), Some(&b)) = ends else { continue };
+            let (Some(&ia), Some(&ib)) = (index.get(a), index.get(b)) else { continue };
+            match (infra.contains(a), infra.contains(b)) {
+                (false, false) => {
+                    let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
+                    parent[ra.max(rb)] = ra.min(rb);
+                }
+                (true, false) => touches.push((ib, a)),
+                (false, true) => touches.push((ia, b)),
+                (true, true) => {}
+            }
+        }
+        let mut members: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
+        for (i, id) in level_items.iter().enumerate() {
+            if !infra.contains(id) {
+                members.entry(find(&mut parent, i)).or_default().push(id);
+            }
+        }
+        let mut touched: BTreeMap<usize, BTreeSet<&str>> = BTreeMap::new();
+        for (i, infra_id) in touches {
+            touched.entry(find(&mut parent, i)).or_default().insert(infra_id);
+        }
+        members
+            .into_iter()
+            .map(|(root, mut branch)| {
+                branch.extend(touched.remove(&root).into_iter().flatten());
+                branch
             })
-        }) else {
-            continue;
-        };
-        push(
-            d,
-            anchor.source_file.as_deref(),
-            anchor.header_span_or_default(),
-            Severity::Warning,
-            "level-too-large",
-            format!(
-                "{name} holds {items} items; a level reads at about six and stops reading \
-                 past fifteen: group the nodes cooperating on one job, and nest groups \
-                 rather than widen the level"
-            ),
-        );
+            .collect()
     }
 }
 

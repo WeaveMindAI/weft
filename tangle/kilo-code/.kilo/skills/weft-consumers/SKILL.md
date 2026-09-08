@@ -25,6 +25,8 @@ weft token mint --name "reviewer" --projects <id> --tags approvals
 It prints, once, an address of the form
 `http://host:port/signal-token/<token>`: the part before `/signal-token/`
 is the dispatcher the client talks to, the last segment is the token. The
+bare token follows on the second line, so a script takes `tail -n 1`
+(or `--json` for the whole answer). The
 server keeps a hash only, so a lost token is revoked (`weft token ls`,
 `weft token revoke <id>`) and a new one minted. A token with no scope sees
 every task of the tenant; `--projects` and `--tags` narrow it, both repeat.

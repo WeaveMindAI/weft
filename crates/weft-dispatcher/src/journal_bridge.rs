@@ -1,26 +1,36 @@
 //! Bridge between the journal's `exec_event` table and the
 //! dispatcher's `EventBus` SSE fanout.
 //!
-//! Polls `exec_event` on a tick, picks up newly-inserted rows,
-//! converts each `ExecEvent` into the matching `DispatcherEvent`,
-//! publishes to `EventBus` so SSE consumers (CLI follow, VS Code
-//! execution view) see the live event.
+//! Polls `exec_event` on a tick, picks up newly-inserted rows, folds
+//! each row into its execution's live projection
+//! (`crate::projection::ExecutionProjector`, one per open color on
+//! this pod), and publishes the `DispatcherEvent`s it paints to
+//! `EventBus` so SSE consumers (CLI follow, VS Code execution view)
+//! see the live event.
 //!
-//! Why a converter instead of broadcasting `ExecEvent` directly:
+//! Why a projection instead of broadcasting `ExecEvent` directly:
 //! the SSE wire format is `DispatcherEvent` and several consumers
-//! depend on it. The journal is the durable shape; DispatcherEvent
-//! is the user-facing shape. They're allowed to diverge.
+//! depend on it, and the journal rows no longer carry what the
+//! screen shows (a firing's input, its output, a group boundary
+//! running). The journal is the durable shape; DispatcherEvent is the
+//! user-facing shape, derived by folding the rows over the program.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use sqlx::Row;
 
 use weft_journal::ExecEvent;
 
-use crate::events::DispatcherEvent;
+use crate::projection::{execution_program, ExecutionProjector, ProgramLookup};
 use crate::state::DispatcherState;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A projection that has seen no row for this long is dropped: a run
+/// parked on a form for days would otherwise hold its whole fold in
+/// this pod's RAM. The next row for the color rebuilds it from the
+/// journal, the same path a pod that boots mid-run takes.
+const PROJECTION_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Single-row table key. We only ever have one cursor for the
 /// whole dispatcher fleet; rows are keyed by this constant so any
 /// Pod's UPDATE targets the same row.
@@ -48,6 +58,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 #[derive(Default)]
 struct Cursor {
     last_id: i64,
+    /// One live projection per execution this pod has seen rows for
+    /// recently and that has not reached its terminal. A color first
+    /// seen mid-flight (this pod booted after the run started, or the
+    /// projection was evicted idle) rebuilds its projection from the
+    /// rows before the cursor. RAM only: any pod rebuilds any of them
+    /// from Postgres.
+    projectors: HashMap<weft_core::Color, LiveProjection>,
     /// Stall legibility: the inserting xid that last blocked the cursor
     /// (the gap-safety guard stopping at an unsettled row), and how many
     /// consecutive ticks it has blocked. The xmin guard correctly waits
@@ -57,6 +74,23 @@ struct Cursor {
     /// not invisible. Reset when the cursor advances.
     blocked_on_xid: Option<i64>,
     blocked_ticks: u32,
+}
+
+struct LiveProjection {
+    projector: ExecutionProjector,
+    last_row_at: Instant,
+}
+
+impl Cursor {
+    /// Drop the projections that have folded nothing for a while. One
+    /// that does not fold at all (a run with no program to read) holds
+    /// no RAM worth freeing, and reopening it would republish its
+    /// corruption, so it stays until its terminal.
+    fn evict_idle_projections(&mut self, now: Instant) {
+        self.projectors.retain(|_, live| {
+            !live.projector.folds() || now.duration_since(live.last_row_at) < PROJECTION_IDLE_TTL
+        });
+    }
 }
 
 /// Long-running task. Spawn one per dispatcher Pod.
@@ -75,6 +109,7 @@ pub async fn run(state: DispatcherState) {
                 "drain failed; will retry"
             );
         }
+        cursor.evict_idle_projections(Instant::now());
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
@@ -172,7 +207,7 @@ async fn drain_new_rows(
             }
             break;
         }
-        process_one_row(state, &row, id).await?;
+        process_one_row(state, cursor, &row, id).await?;
         cursor.last_id = id;
         max_id_processed = id;
     }
@@ -209,6 +244,7 @@ async fn drain_new_rows(
 /// so the cursor stays put and the next tick retries.
 async fn process_one_row(
     state: &DispatcherState,
+    cursor: &mut Cursor,
     row: &sqlx::postgres::PgRow,
     id: i64,
 ) -> anyhow::Result<()> {
@@ -270,17 +306,152 @@ async fn process_one_row(
         }
         _ => {}
     }
-    // One ExecEvent can project to MULTIPLE DispatcherEvents: a
-    // PulseEmitted carrying a bus marker yields both BusParticipant
-    // edges (source-node + target-node) in addition to the pulse
-    // notification itself.
-    for de in project_recorded_event(crate::events::IdentifiedEvent::recorded(id, event), project_id) {
+    // One ExecEvent can project to MULTIPLE DispatcherEvents: a row
+    // that fires a group boundary paints the boundary's start and end,
+    // and a value carrying a bus marker yields BusParticipant edges.
+    let projected = if let Some(live) = cursor.projectors.get_mut(&color) {
+        live.last_row_at = Instant::now();
+        live.projector.project(&event)
+    } else if !matches!(event, ExecEvent::ExecutionStarted { .. })
+        && !event.is_execution_terminal()
+        && ExecutionProjector::paints_without_program(&event)
+    {
+        // A row that paints the same with or without the program (a
+        // cost record landing after the terminal, a tag, a log line)
+        // on a color this pod holds no projection for is painted as it
+        // is: opening a projection would refold the whole log for
+        // nothing. Two exceptions open one: the birth row (the run's
+        // node rows will need it) and a terminal (its completion
+        // carries the run's outputs, which only a fold knows).
+        ExecutionProjector::new(color, ProgramLookup::NoProgram, project_id.clone()).project(&event)
+    } else {
+        let live = open_projection(state, cursor, color, project_id.clone(), id, &event).await?;
+        live.projector.project(&event)
+    };
+    for de in crate::events::IdentifiedEvent::recorded(id, ()).project(|()| projected) {
         // Local-only: every dispatcher pod runs this same bridge,
         // so every pod's own subscribers get the event from its
         // own poll. NOTIFY would cause double-delivery.
         state.events.publish_local(de).await;
     }
+    // A terminal ends the projection: nothing more lands for the color.
+    if event.is_execution_terminal() {
+        cursor.projectors.remove(&color);
+    }
     Ok(())
+}
+
+/// Open the execution's live projection on this pod: on its birth row,
+/// or rebuilt from every earlier row when the pod first sees the color
+/// mid-flight. Only the database itself is a hard error (the cursor
+/// stays put and the next tick retries). Anything permanent about ONE
+/// color (its program cannot be found, an earlier row no longer
+/// decodes) degrades that color's projection to the program-free
+/// painting and publishes the corruption, so the cursor (fleet-wide)
+/// moves on.
+async fn open_projection<'c>(
+    state: &DispatcherState,
+    cursor: &'c mut Cursor,
+    color: weft_core::Color,
+    project_id: String,
+    row_id: i64,
+    event: &ExecEvent,
+) -> anyhow::Result<&'c mut LiveProjection> {
+    let program = match execution_program(state, color).await? {
+        ProgramLookup::Unreadable(reason) => {
+            publish_unreadable(state, color, &project_id, reason).await;
+            ProgramLookup::Unreadable(String::new())
+        }
+        found => found,
+    };
+    let projector = if matches!(event, ExecEvent::ExecutionStarted { .. }) {
+        ExecutionProjector::new(color, program, project_id)
+    } else {
+        match rows_before(&state.pg_pool, color, row_id).await? {
+            CatchUp::Rows(earlier) => {
+                let mut projector = ExecutionProjector::new(color, program, project_id);
+                for row in &earlier {
+                    projector.project(row);
+                }
+                projector
+            }
+            CatchUp::Undecodable { row_id, reason } => {
+                publish_unreadable(
+                    state,
+                    color,
+                    &project_id,
+                    format!("row {row_id} of this execution no longer decodes: {reason}"),
+                )
+                .await;
+                ExecutionProjector::new(color, ProgramLookup::Unreadable(reason), project_id)
+            }
+        }
+    };
+    // The caller found no projection for the color; a stale one here
+    // would mean two folds of one run on this pod, which nothing does.
+    let replaced = cursor.projectors.insert(color, LiveProjection { projector, last_row_at: Instant::now() });
+    assert!(replaced.is_none(), "a projection for color {color} was already open on this pod");
+    Ok(cursor.projectors.get_mut(&color).expect("inserted just above"))
+}
+
+/// A color whose journal cannot be read back: logged, and published
+/// as the same corruption event the replay read publishes, so the
+/// screen shows the run as unreadable and names `weft clean`.
+async fn publish_unreadable(
+    state: &DispatcherState,
+    color: weft_core::Color,
+    project_id: &str,
+    reason: String,
+) {
+    tracing::error!(
+        target: "weft_dispatcher::journal_bridge",
+        %color, %reason,
+        "this execution's journal cannot be read back; its live projection paints only what \
+         needs no program. `weft clean` removes the execution."
+    );
+    let corruption = crate::events::IdentifiedEvent::transient(
+        crate::events::DispatcherEvent::JournalCorruption {
+            color,
+            project_id: project_id.to_string(),
+            site: weft_core::primitive::CorruptionSite::UndecodableRow,
+            reason,
+        },
+    );
+    state.events.publish_local(corruption).await;
+}
+
+/// What a projection opened mid-flight replays to catch up.
+enum CatchUp {
+    /// Every earlier row of the color, in journal order.
+    Rows(Vec<ExecEvent>),
+    /// A row that no longer decodes: a projection built over a partial
+    /// log would paint a run that never existed, so the caller paints
+    /// the color without a program instead.
+    Undecodable { row_id: i64, reason: String },
+}
+
+/// Every row of `color` below `before_id`, in journal order. `Err`
+/// only for the database itself (the cursor stays put and retries).
+async fn rows_before(
+    pool: &sqlx::PgPool,
+    color: weft_core::Color,
+    before_id: i64,
+) -> anyhow::Result<CatchUp> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, payload_json FROM exec_event WHERE color = $1 AND id < $2 ORDER BY id ASC",
+    )
+    .bind(color.to_string())
+    .bind(before_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (row_id, payload) in rows {
+        match weft_journal::decode_event(color, &payload) {
+            Ok(event) => out.push(event),
+            Err(reason) => return Ok(CatchUp::Undecodable { row_id, reason }),
+        }
+    }
+    Ok(CatchUp::Rows(out))
 }
 
 async fn terminal_cleanup(state: &DispatcherState, color: weft_core::Color) -> anyhow::Result<()> {
@@ -352,379 +523,4 @@ pub(crate) async fn try_finish_drain(
         crate::transition::publish_transition_changed(state, id).await;
     }
     Ok(())
-}
-
-pub(crate) fn project_recorded_event(
-    record: crate::events::IdentifiedEvent<ExecEvent>,
-    project_id: String,
-) -> Vec<crate::events::LiveEvent> {
-    record.project(|event| to_dispatcher_events(&event, project_id))
-}
-
-pub(crate) fn to_dispatcher_events(ev: &ExecEvent, project_id: String) -> Vec<DispatcherEvent> {
-    match ev {
-        ExecEvent::ExecutionStarted { color, entry_node, at_unix, .. } => {
-            vec![DispatcherEvent::ExecutionStarted {
-                color: *color, at_unix: *at_unix,
-                entry_node: entry_node.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::NodeStarted { color, node_id, frames, input, closed_ports, at_unix, .. } => {
-            vec![DispatcherEvent::NodeStarted {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                input: input.clone(),
-                closed_ports: closed_ports.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::NodeCompleted { color, node_id, frames, output, at_unix, .. } => {
-            vec![DispatcherEvent::NodeCompleted {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                output: output.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::NodeFailed { color, node_id, frames, error, at_unix, .. } => {
-            vec![DispatcherEvent::NodeFailed {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                error: error.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::NodeSkipped { color, node_id, frames, closed_ports, reason, at_unix, .. } => {
-            vec![DispatcherEvent::NodeSkipped {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                closed_ports: closed_ports.clone(),
-                reason: reason.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::PortTypeMismatch { color, node_id, frames, port, expected, actual, at_unix, .. } => {
-            vec![DispatcherEvent::PortTypeMismatch {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                port: port.clone(),
-                expected: expected.clone(),
-                actual: actual.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::NodeSuspended { color, node_id, frames, token, at_unix, .. } => {
-            vec![DispatcherEvent::NodeSuspended {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                token: token.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::NodeResumed { color, node_id, frames, token, value, at_unix, .. } => {
-            vec![DispatcherEvent::NodeResumed {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                token: token.clone(),
-                value: value.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::NodeCancelled { color, node_id, frames, reason, at_unix, .. } => {
-            vec![DispatcherEvent::NodeCancelled {
-                color: *color, at_unix: *at_unix,
-                node: node_id.clone(),
-                frames: frames.clone(),
-                reason: reason.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::ExecutionCompleted { color, outputs, at_unix, .. } => {
-            vec![DispatcherEvent::ExecutionCompleted {
-                color: *color, at_unix: *at_unix,
-                outputs: outputs.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::ExecutionFailed { color, error, at_unix, .. } => {
-            // No truncation: journal_bridge fans out via
-            // `publish_local` (no NOTIFY hop); the full error is
-            // what the operator wants for debugging. Truncation
-            // belongs at NOTIFY producer sites (api/project.rs,
-            // infra_event_bridge.rs), not here.
-            vec![DispatcherEvent::ExecutionFailed {
-                color: *color, at_unix: *at_unix,
-                error: error.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::ExecutionCancelled { color, reason, cause, at_unix, .. } => {
-            vec![DispatcherEvent::ExecutionCancelled {
-                color: *color, at_unix: *at_unix,
-                reason: reason.clone(),
-                cause: cause.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::ExecutionTagged { color, tags, at_unix, .. } => {
-            vec![DispatcherEvent::ExecutionTagged {
-                color: *color, at_unix: *at_unix,
-                tags: tags.clone(),
-                project_id,
-            }]
-        }
-        ExecEvent::CostReported {
-            color, node_id, frames, cost_id, service, amount_usd, origin, at_unix, ..
-        } => {
-            vec![DispatcherEvent::CostReported {
-                color: *color, at_unix: *at_unix,
-                project_id,
-                node_id: node_id.clone(),
-                frames: frames.clone(),
-                cost_id: cost_id.clone(),
-                service: service.clone(),
-                amount_usd: *amount_usd,
-                origin: *origin,
-            }]
-        }
-        // Bus events: surfaced so the inspector renders a live IRC-style
-        // log per bus. The webview groups by `bus_id` and renders ONE
-        // panel per bus on every node listed as a `BusParticipant`.
-        ExecEvent::BusJoined { color, bus_id, offset, name, at_unix } => {
-            vec![DispatcherEvent::BusJoined {
-                color: *color,
-                project_id,
-                bus_id: bus_id.clone(),
-                offset: *offset,
-                name: name.clone(),
-                at_unix: *at_unix,
-            }]
-        }
-        ExecEvent::BusLeft { color, bus_id, offset, name, at_unix } => {
-            vec![DispatcherEvent::BusLeft {
-                color: *color,
-                project_id,
-                bus_id: bus_id.clone(),
-                offset: *offset,
-                name: name.clone(),
-                at_unix: *at_unix,
-            }]
-        }
-        ExecEvent::BusWindow {
-            color, bus_id, first_offset, last_offset, messages, totals, at_unix,
-        } => {
-            vec![DispatcherEvent::BusWindow {
-                color: *color,
-                project_id,
-                bus_id: bus_id.clone(),
-                first_offset: *first_offset,
-                last_offset: *last_offset,
-                messages: messages.clone(),
-                totals: totals.clone(),
-                at_unix: *at_unix,
-            }]
-        }
-        ExecEvent::BusClosed { color, bus_id, offset, at_unix } => {
-            vec![DispatcherEvent::BusClosed {
-                color: *color,
-                project_id,
-                bus_id: bus_id.clone(),
-                offset: *offset,
-                at_unix: *at_unix,
-            }]
-        }
-        // Bus participation is derived from PulseEmitted: a pulse
-        // whose value carries a bus marker means BOTH the producer
-        // node AND the consumer node touched that bus, so we emit a
-        // BusParticipant edge for each end. The webview unions these
-        // into a per-bus participant set; each participant gets the
-        // inspector's IRC panel for that bus.
-        //
-        // Counter-perspective: a pulse routed through a passthrough /
-        // group boundary will also stamp the boundary node as a
-        // participant. That's intentional: a Group's inspector
-        // SHOULD show the bus conversation flowing through it. The
-        // alternative ("only stamp leaf nodes") would hide the
-        // signal at the group level for no real benefit.
-        ExecEvent::PulseEmitted {
-            color, source_node, target_node, value, closed, ..
-        } => sniff_bus_participants(*color, &project_id, source_node, target_node, value, *closed),
-        ExecEvent::LoopInstantiated {
-            color, group_id, parent_frames, iter_cap, parallel, at_unix, ..
-        } => vec![DispatcherEvent::LoopInstantiated {
-            color: *color, at_unix: *at_unix, project_id,
-            group_id: group_id.clone(),
-            parent_frames: parent_frames.clone(),
-            iter_cap: *iter_cap,
-            parallel: *parallel,
-        }],
-        // A group body starting is a kick set, not something the
-        // inspector paints: the members it kicked show up through their
-        // own NodeStarted rows, and a gated group through its members'
-        // NodeSkipped rows.
-        ExecEvent::ScopeLaunched { .. } => vec![],
-        ExecEvent::LoopIterationLaunched {
-            color, group_id, parent_frames, index, body_emissions, at_unix, ..
-        } => {
-            // The body pulses ride INSIDE this row (atomic marker+pulses),
-            // so the bus-participant sniff must run over them here, just
-            // as it does for standalone PulseEmitted rows; otherwise a bus
-            // marker pulsed into a loop body never registers its consumer
-            // as a participant (the agent-swarm pattern).
-            let mut out = vec![DispatcherEvent::LoopIterationLaunched {
-                color: *color, at_unix: *at_unix, project_id: project_id.clone(),
-                group_id: group_id.clone(),
-                parent_frames: parent_frames.clone(),
-                index: *index,
-            }];
-            for e in body_emissions {
-                out.extend(sniff_bus_participants(
-                    *color, &project_id, &e.source_node, &e.target_node, &e.value, e.closed,
-                ));
-            }
-            out
-        }
-        ExecEvent::LoopOutFired {
-            color, group_id, parent_frames, index, done_vote, at_unix, ..
-        } => vec![DispatcherEvent::LoopOutFired {
-            color: *color, at_unix: *at_unix, project_id,
-            group_id: group_id.clone(),
-            parent_frames: parent_frames.clone(),
-            index: *index,
-            done_vote: *done_vote,
-        }],
-        ExecEvent::LoopTerminated {
-            color, group_id, parent_frames, reason, outward_emissions, at_unix, ..
-        } => {
-            // Outward pulses ride INSIDE this row; sniff them for bus
-            // markers too (a loop exporting a bus handle outward through a
-            // gather/carry port must register its downstream consumer as a
-            // participant).
-            let mut out = vec![DispatcherEvent::LoopTerminated {
-                color: *color, at_unix: *at_unix, project_id: project_id.clone(),
-                group_id: group_id.clone(),
-                parent_frames: parent_frames.clone(),
-                reason: *reason,
-            }];
-            for e in outward_emissions {
-                out.extend(sniff_bus_participants(
-                    *color, &project_id, &e.source_node, &e.target_node, &e.value, e.closed,
-                ));
-            }
-            out
-        }
-        // Caller events: surfaced 1:1 so the inspector replays the live
-        // caller exchange (connected / inbound / outbound / errored /
-        // disconnected) the same way it replays a bus. Payloads carry
-        // the same tagged `WirePayload` shape as a bus window's
-        // messages.
-        ExecEvent::CallerConnected { color, offset, protocol, at_unix } => {
-            vec![DispatcherEvent::CallerConnected {
-                color: *color, project_id, offset: *offset,
-                protocol: protocol.clone(), at_unix: *at_unix,
-            }]
-        }
-        ExecEvent::CallerInbound {
-            color, offset, payload, payload_byte_size, at_unix,
-        } => {
-            vec![DispatcherEvent::CallerInbound {
-                color: *color, project_id, offset: *offset,
-                payload: payload.clone(),
-                payload_byte_size: *payload_byte_size,
-                at_unix: *at_unix,
-            }]
-        }
-        ExecEvent::CallerOutbound {
-            color, offset, payload, payload_byte_size, terminal, at_unix,
-        } => {
-            vec![DispatcherEvent::CallerOutbound {
-                color: *color, project_id, offset: *offset,
-                payload: payload.clone(),
-                payload_byte_size: *payload_byte_size,
-                terminal: *terminal,
-                at_unix: *at_unix,
-            }]
-        }
-        ExecEvent::CallerErrored { color, offset, message, at_unix } => {
-            vec![DispatcherEvent::CallerErrored {
-                color: *color, project_id, offset: *offset,
-                message: message.clone(), at_unix: *at_unix,
-            }]
-        }
-        ExecEvent::CallerDisconnected { color, offset, reason, at_unix } => {
-            vec![DispatcherEvent::CallerDisconnected {
-                color: *color, project_id, offset: *offset,
-                reason: reason.clone(), at_unix: *at_unix,
-            }]
-        }
-        // SuspensionRegistered / SuspensionResolved / LogLine /
-        // RunOutput / NodeKicked: not surfaced through DispatcherEvent.
-        // SSE consumers don't need them for live UI; they read the
-        // journal directly when they want full detail.
-        _ => Vec::new(),
-    }
-}
-
-/// Derive `BusParticipant` events from one emitted pulse if its value
-/// carries a bus marker. Shared by the standalone `PulseEmitted` arm and
-/// the loop arms whose pulses ride INSIDE the marker row
-/// (`LoopIterationLaunched.body_emissions`,
-/// `LoopTerminated.outward_emissions`), so the rule stays "any journaled
-/// pulse, however it rides, derives participants".
-fn sniff_bus_participants(
-    color: uuid::Uuid,
-    project_id: &str,
-    source_node: &str,
-    target_node: &str,
-    value: &serde_json::Value,
-    closed: bool,
-) -> Vec<DispatcherEvent> {
-    // Closure pulses are structural markers (`value: Null`) and can never
-    // carry a bus marker. Bail before the sniff so a future change that
-    // puts non-null payloads on closures can't synthesise spurious edges.
-    if closed {
-        return Vec::new();
-    }
-    let Some(bus_id) = weft_core::weft_type::WeftType::bus_marker_id(value) else {
-        return Vec::new();
-    };
-    let bus_id = bus_id.to_string();
-    // A `None` mode means the marker carries an id but no recognised mode
-    // (malformed: every `BusHandle::marker()` always sets both). Log loud
-    // and skip rather than defaulting to journaled, which would mislabel
-    // the inspector and hide the corruption.
-    let Some(mode) = weft_core::weft_type::WeftType::bus_marker_mode(value) else {
-        tracing::warn!(
-            target: "weft_dispatcher::journal_bridge",
-            bus_id, %color, marker = %value,
-            "skip BusParticipant: marker has id but no recognised mode"
-        );
-        return Vec::new();
-    };
-    let ephemeral = mode == weft_core::bus::BusMode::Ephemeral;
-    let mut out = vec![DispatcherEvent::BusParticipant {
-        color,
-        project_id: project_id.to_string(),
-        bus_id: bus_id.clone(),
-        node_id: source_node.to_string(),
-        ephemeral,
-    }];
-    if target_node != source_node {
-        out.push(DispatcherEvent::BusParticipant {
-            color,
-            project_id: project_id.to_string(),
-            bus_id,
-            node_id: target_node.to_string(),
-            ephemeral,
-        });
-    }
-    out
 }

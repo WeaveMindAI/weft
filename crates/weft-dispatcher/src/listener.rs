@@ -1013,46 +1013,66 @@ impl ListenerPool {
         Ok(())
     }
 
-    /// Best-effort bulk unregister: for each token, resolve its holder
-    /// and POST `/unregister` (drop the in-RAM registry entry only).
-    /// Does NOT touch `signal.listener_pod` or delete the `signal` row;
-    /// what the caller does with the durable rows is the caller's choice:
-    ///   - delete/cancel callers (delete_signals, project-delete, cancel)
-    ///     delete the `signal` rows themselves, which removes the
-    ///     placement with them;
+    /// Best-effort bulk unregister: POST `/unregister` to the pod each
+    /// signal names as its holder (drop the in-RAM registry entry only).
+    /// The holder comes off the registration, never off a fresh row
+    /// lookup: most callers hand in rows a DELETE ... RETURNING just
+    /// removed, so there is no row left to look up. Does NOT touch
+    /// `signal.listener_pod` or delete the `signal` row; what the caller
+    /// does with the durable rows is the caller's choice:
+    ///   - delete/cancel/consume callers (delete_signals, project-delete,
+    ///     cancel, a resume fire) delete the `signal` rows themselves,
+    ///     which removes the placement with them;
     ///   - the hibernate/park caller deliberately KEEPS the rows (the DB
     ///     is canonical; reactivate re-rehydrates them), clearing only the
     ///     in-RAM registry.
     /// Either way this function's job is solely the in-RAM unregister.
-    /// Holders already reaped are skipped (their registry is gone; the
-    /// durable signal row is the source of truth).
+    /// Unplaced signals and holders already reaped are skipped (their
+    /// registry is gone; the durable signal row is the source of truth).
     pub async fn unregister_many(
         &self,
         pg_pool: &PgPool,
         signals: &[crate::journal::SignalRegistration],
     ) {
         for sig in signals {
-            let handle = match self.resolve_signal(&sig.token, pg_pool).await {
-                Ok(h) => h,
+            let Some(pod_name) = sig.listener_pod.as_deref() else {
+                tracing::debug!(
+                    target: "weft_dispatcher::listener",
+                    token = %sig.token,
+                    "unregister sweep: signal has no holder (waiting to be re-placed); nothing to tell"
+                );
+                continue;
+            };
+            let handle = match self.pod_handle(pod_name, pg_pool).await {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    tracing::debug!(
+                        target: "weft_dispatcher::listener",
+                        token = %sig.token,
+                        pod = pod_name,
+                        "unregister sweep: holder already reaped; its registry is gone with it"
+                    );
+                    continue;
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "weft_dispatcher::listener",
                         token = %sig.token,
+                        pod = pod_name,
                         error = %e,
-                        "resolve_signal failed during unregister sweep; token may remain registered"
+                        "pod lookup failed during unregister sweep; token may remain registered"
                     );
                     continue;
                 }
             };
-            if let Some(handle) = handle {
-                if let Err(e) = unregister_signal(&handle, &sig.token).await {
-                    tracing::warn!(
-                        target: "weft_dispatcher::listener",
-                        token = %sig.token,
-                        error = %e,
-                        "unregister_signal failed (sweep); listener pod may carry stale state"
-                    );
-                }
+            if let Err(e) = unregister_signal(&handle, &sig.token).await {
+                tracing::warn!(
+                    target: "weft_dispatcher::listener",
+                    token = %sig.token,
+                    pod = pod_name,
+                    error = %e,
+                    "unregister_signal failed (sweep); listener pod may carry stale state"
+                );
             }
         }
     }

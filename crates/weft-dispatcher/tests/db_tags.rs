@@ -36,14 +36,25 @@ async fn setup(pool: &PgPool) -> (PostgresJournal, weft_dispatcher::ProjectStore
     (journal, projects)
 }
 
-fn empty_project(id: Uuid) -> ProjectDefinition {
-    serde_json::from_value(json!({ "id": id, "nodes": [], "edges": [] }))
-        .expect("minimal ProjectDefinition")
+/// The program every execution here runs: one node, `wait`, the one a
+/// parked run is found on. The cancel's per-node terminals come off a
+/// fold over this program, so the node has to exist in it.
+fn rig_project(id: Uuid) -> ProjectDefinition {
+    serde_json::from_value(json!({
+        "id": id,
+        "nodes": [{
+            "id": "wait", "nodeType": "Wait", "label": null, "config": null,
+            "position": { "x": 0.0, "y": 0.0 }, "inputs": [], "outputs": [],
+            "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+        }],
+        "edges": []
+    }))
+    .expect("rig ProjectDefinition")
 }
 
 async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
     projects
-        .register_with_hashes(empty_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None)
+        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None)
         .await
         .expect("register project");
 }
@@ -149,7 +160,7 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: PgPool) 
     tag(&pool, b, &["user_7"], 4).await;
     tag(&pool, probe, &["user_7"], 5).await;
     journal
-        .record_event(&ExecEvent::ExecutionCompleted { color: done, outputs: json!({}), at_unix: 5 })
+        .record_event(&ExecEvent::ExecutionCompleted { color: done, at_unix: 5 })
         .await
         .unwrap();
 
@@ -191,9 +202,6 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
             color: victim,
             node_id: "wait".into(),
             frames: vec![],
-            input: json!({}),
-            closed_ports: vec![],
-            pulses_absorbed: vec![],
             at_unix: 2,
         })
         .await
@@ -211,7 +219,8 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
         .unwrap();
 
     let cause = CancelCause::Execution { by, tag: "user_7".into() };
-    let write = journal.cancel_execution(victim, &cause).await.unwrap();
+    let program = rig_project(project);
+    let write = journal.cancel_execution(victim, Some(&program), &cause).await.unwrap();
     assert_eq!(write.removed.len(), 1, "the parked run's form is gone: {write:?}");
     assert_eq!(write.removed[0].token, "form-victim");
     assert_eq!(write.node_cancellations, Some(1), "{write:?}");
@@ -242,7 +251,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
     assert!(live_tagged_executions(&pool, &project.to_string(), "user_7").await.unwrap().is_empty());
 
     // A second cancel finds the terminal and writes nothing new.
-    let again = journal.cancel_execution(victim, &CancelCause::User).await.unwrap();
+    let again = journal.cancel_execution(victim, Some(&program), &CancelCause::User).await.unwrap();
     assert!(again.removed.is_empty() && again.node_cancellations.is_none(), "{again:?}");
     assert_eq!(journal.events_log(victim).await.unwrap().len(), after.len());
 
@@ -264,11 +273,12 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_color(pool: 
 
     let done = start_execution(&journal, project, false).await;
     journal
-        .record_event(&ExecEvent::ExecutionCompleted { color: done, outputs: json!({}), at_unix: 5 })
+        .record_event(&ExecEvent::ExecutionCompleted { color: done, at_unix: 5 })
         .await
         .unwrap();
     let before = journal.events_log(done).await.unwrap();
-    let write = journal.cancel_execution(done, &CancelCause::User).await.unwrap();
+    let program = rig_project(project);
+    let write = journal.cancel_execution(done, Some(&program), &CancelCause::User).await.unwrap();
     assert!(write.removed.is_empty() && write.node_cancellations.is_none() && !write.task_enqueued, "{write:?}");
     assert_eq!(journal.events_log(done).await.unwrap().len(), before.len(), "a finished run keeps its terminal");
     assert_eq!(journal.execution_summary(done).await.unwrap().unwrap().status, "completed");
@@ -277,7 +287,7 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_color(pool: 
     // and no journal is opened for it.
     let ghost = weft_core::Color::new_v4();
     journal.signal_insert(&resume_signal("form-ghost", project, ghost), &placement).await.unwrap();
-    let write = journal.cancel_execution(ghost, &CancelCause::User).await.unwrap();
+    let write = journal.cancel_execution(ghost, None, &CancelCause::User).await.unwrap();
     assert_eq!(write.removed.len(), 1, "{write:?}");
     assert!(write.node_cancellations.is_none() && !write.task_enqueued, "{write:?}");
     assert!(journal.events_log(ghost).await.unwrap().is_empty());
@@ -304,6 +314,7 @@ fn resume_signal(token: &str, project_id: Uuid, color: weft_core::Color) -> Sign
         kind_state_seq: 0,
         access_id: None,
         port_snapshot: None,
+        listener_pod: None,
     }
 }
 

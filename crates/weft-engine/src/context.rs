@@ -749,8 +749,9 @@ impl Drop for BusCoordinator {
 // the bus shares it with every other in-process wait source
 // (generator pulls, emission-delivery waits).
 
-/// Bus-journal pump. One task per execution, spawned by the loop
-/// driver before the first node dispatches. Awaits the per-execution
+/// Bus-journal pump. One task per execution, spawned by
+/// `run_one_execution` around the whole drive and shut down after it,
+/// whether the drive ended in an outcome or an error. Awaits the per-execution
 /// notify; on every wake, walks every live bus, drains its
 /// unjournaled tail, ships the entries to the journal, and ack-bumps
 /// the per-bus `journaled_through` cursor.
@@ -1112,11 +1113,13 @@ pub enum NodeTaskOutcome {
 pub enum EmitKind {
     /// A `pulse_downstream` call: emit values on every port in `output`.
     Values(NodeOutput),
-    /// A `close_port` call: emit a CLOSURE on `port`. The downstream
-    /// subgraph attached to that port at this frame stack learns nothing's
-    /// coming, exactly the same shape as the termination-time sweep
-    /// for an unmentioned port.
-    Close(String),
+    /// A CLOSURE on `port`: a `close_port` call (`refused: None`), or
+    /// a `pulse_downstream` value the port's declared type refused
+    /// (`refused: Some`, the warning the record and the journal keep).
+    /// The downstream subgraph attached to that port at this frame
+    /// stack learns nothing's coming, exactly the same shape as the
+    /// termination-time sweep for an unmentioned port.
+    Close { port: String, refused: Option<weft_core::exec::PortWarning> },
 }
 
 /// Round-trip timeout for control-plane tasks. Generous because
@@ -1153,11 +1156,9 @@ pub async fn record_from_pod(journal: &dyn JournalClient, event: ExecEvent, pod_
 /// worker believes happened. Continuing to drive on that divergence
 /// makes every later refold (stall refetch, crash resume) rebuild a
 /// different world: a body whose `NodeStarted` was lost but whose
-/// `PulseEmitted` rows landed re-runs and double-spends. The drive
-/// loop checks the flag every iteration and exits the worker, so a
-/// respawned worker refolds from the journal's consistent prefix
-/// (re-running the lost suffix, which is the same at-least-once
-/// semantics as a crash).
+/// `PortEmitted` rows landed re-runs and double-spends. The drive
+/// loop checks the flag every iteration and stops with an error,
+/// which `run_one_execution` journals as the run's Failed terminal.
 ///
 /// The bus pump deliberately keeps the UNwrapped client: bus rows are
 /// the inspector's replay trail, and their failures already degrade
@@ -1715,71 +1716,38 @@ impl RunnerHandle {
         })?;
         Ok(())
     }
-
-    /// Journal a non-terminal output-type mismatch for `port`: the node
-    /// tried to emit `value` on a port declared `declared`, the types are
-    /// incompatible, so the engine closed the port instead. Folds into the
-    /// node execution's `port_warnings` and surfaces as a UI warning.
-    /// Does not change the node's status.
-    async fn record_port_type_mismatch(&self, port: &str, declared: &WeftType, value: &Value) {
-        record_from_pod(
-            self.clients.journal.as_ref(),
-            ExecEvent::PortTypeMismatch {
-                color: self.color,
-                node_id: self.node_id.clone(),
-                frames: self.node_frames.clone(),
-                port: port.to_string(),
-                expected: declared.to_string(),
-                actual: WeftType::infer(value).to_string(),
-                at_unix: now_unix(),
-            },
-            &self.pod_name,
-        )
-        .await;
-    }
 }
 
 /// Ship the lifecycle event for a fresh dispatch of (node, frames):
 /// `NodeResumed` if this dispatch is resuming a prior firing (either
-/// suspension-resolved with a token/value, or crashed-Running recovery
-/// with both None), otherwise `NodeStarted`. The audit's load-bearing
-/// job in both cases is journaling `pulses_absorbed` so a later
-/// crashed-Running un-absorb sees every pulse this dispatch consumed
-/// (the fold rebuilds the record's `pulses_absorbed` from journaled
-/// events; without this event, resume-time absorbs leak).
+/// suspension-resolved with a token, or crashed-Running recovery with
+/// none), otherwise `NodeStarted`. The row's load-bearing job in both
+/// cases is marking the point at which the fold absorbs every pulse
+/// pending at the location, so a later crashed-Running un-absorb sees
+/// every pulse this dispatch consumed.
 ///
-/// Invalid combo (is_resume=false AND resume_token_value=Some) panics
-/// in debug: a caller flipping one but not the other would silently
-/// write a NodeStarted while discarding a resume value.
-#[allow(clippy::too_many_arguments)]
+/// Invalid combo (is_resume=false AND resume_token=Some) panics in
+/// debug: a caller flipping one but not the other would silently
+/// write a NodeStarted while discarding a resume token.
 pub async fn ship_node_lifecycle(
     journal: &dyn JournalClient,
     pod_name: &str,
     color: Color,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
-    input: &serde_json::Value,
-    closed_ports: &[String],
-    pulses_absorbed: &[uuid::Uuid],
-    resume_token_value: Option<&(String, serde_json::Value)>,
+    resume_token: Option<&str>,
     is_resume: bool,
 ) {
     debug_assert!(
-        is_resume || resume_token_value.is_none(),
-        "ship_node_lifecycle: resume_token_value passed with is_resume=false"
+        is_resume || resume_token.is_none(),
+        "ship_node_lifecycle: resume_token passed with is_resume=false"
     );
     let event = if is_resume {
-        let (token, value) = match resume_token_value {
-            Some((t, v)) => (Some(t.clone()), Some(v.clone())),
-            None => (None, None),
-        };
         ExecEvent::NodeResumed {
             color,
             node_id: node_id.to_string(),
             frames: frames.clone(),
-            token,
-            value,
-            pulses_absorbed: pulses_absorbed.iter().map(|u| u.to_string()).collect(),
+            token: resume_token.map(str::to_string),
             at_unix: now_unix(),
         }
     } else {
@@ -1787,9 +1755,6 @@ pub async fn ship_node_lifecycle(
             color,
             node_id: node_id.to_string(),
             frames: frames.clone(),
-            input: input.clone(),
-            closed_ports: closed_ports.to_vec(),
-            pulses_absorbed: pulses_absorbed.iter().map(|u| u.to_string()).collect(),
             at_unix: now_unix(),
         }
     };
@@ -1818,18 +1783,15 @@ pub async fn ship_node_suspended(
     .await;
 }
 
-/// Ship a terminal NodeCompleted carrying its unmentioned-port closures
-/// atomically (see `NodeFailed.closure_emissions` in weft-journal): the
-/// marker and the closures fold as one unit, so a crash between them
-/// can't lose the closures and strand downstream consumers.
+/// Ship a firing's terminal row. The closures it implies (every
+/// output port it never mentioned) are not on the row: the fold
+/// derives them from the program, exactly as the live sweep did.
 pub async fn ship_node_completed(
     journal: &dyn JournalClient,
     pod_name: &str,
     color: Color,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
-    output: &serde_json::Value,
-    closures: Vec<weft_core::exec::PulseEmission>,
 ) {
     record_from_pod(
         journal,
@@ -1837,8 +1799,6 @@ pub async fn ship_node_completed(
             color,
             node_id: node_id.to_string(),
             frames: frames.clone(),
-            output: output.clone(),
-            closure_emissions: closures.into_iter().map(Into::into).collect(),
             at_unix: now_unix(),
         },
         pod_name,
@@ -1853,7 +1813,6 @@ pub async fn ship_node_failed(
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
     error: &str,
-    closures: Vec<weft_core::exec::PulseEmission>,
 ) {
     record_from_pod(
         journal,
@@ -1862,7 +1821,6 @@ pub async fn ship_node_failed(
             node_id: node_id.to_string(),
             frames: frames.clone(),
             error: error.to_string(),
-            closure_emissions: closures.into_iter().map(Into::into).collect(),
             at_unix: now_unix(),
         },
         pod_name,
@@ -1876,9 +1834,7 @@ pub async fn ship_node_skipped(
     color: Color,
     node_id: &str,
     frames: &weft_core::frames::LoopFrames,
-    closed_ports: &[String],
     reason: &weft_core::exec::skip::SkipReason,
-    closures: Vec<weft_core::exec::PulseEmission>,
 ) {
     record_from_pod(
         journal,
@@ -1886,9 +1842,7 @@ pub async fn ship_node_skipped(
             color,
             node_id: node_id.to_string(),
             frames: frames.clone(),
-            closed_ports: closed_ports.to_vec(),
-            reason: Some(reason.clone()),
-            closure_emissions: closures.into_iter().map(Into::into).collect(),
+            reason: reason.clone(),
             at_unix: now_unix(),
         },
         pod_name,
@@ -1896,35 +1850,73 @@ pub async fn ship_node_skipped(
     .await;
 }
 
-/// Ship every pulse the engine just emitted by writing one journal
-/// event per emission. Order is preserved because journal rows have
-/// monotonic ids; the fold replays them in insertion order.
-pub async fn ship_pulse_emissions(
+/// Ship what one `pulse_downstream` call handed out: one `PortEmitted`
+/// row per port, all under the emission's id, each carrying the port's
+/// shared value (the row and the pulses point at one allocation). The
+/// fold fans each row out over the program.
+pub async fn ship_port_emissions(
     journal: &dyn JournalClient,
     pod_name: &str,
-    emissions: Vec<weft_core::exec::PulseEmission>,
+    color: Color,
+    emission_id: uuid::Uuid,
+    node_id: &str,
+    frames: &weft_core::frames::LoopFrames,
+    bag: &weft_core::exec::OutputBag,
 ) {
-    for e in emissions {
-        let p = e.pulse;
+    for (port, value) in bag {
         record_from_pod(
             journal,
-            ExecEvent::PulseEmitted {
-                color: p.color,
-                pulse_id: p.id.to_string(),
-                source_node: e.source_node,
-                source_port: e.source_port,
-                target_node: p.target_node,
-                target_port: p.target_port,
-                frames: p.frames,
-                value: p.value,
-                closed: p.closed,
-                close_error: p.close_error,
+            ExecEvent::PortEmitted {
+                color,
+                emission_id,
+                node_id: node_id.to_string(),
+                frames: frames.clone(),
+                port: port.clone(),
+                value: value.clone(),
                 at_unix: now_unix(),
             },
             pod_name,
         )
         .await;
     }
+}
+
+/// Ship a port a running firing closed: the body's own `close_port`
+/// (`refused: None`), or a value the port's declared type refused
+/// (`refused: Some`, which the fold also books as the record's
+/// warning).
+#[allow(clippy::too_many_arguments)]
+pub async fn ship_port_closed(
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    color: Color,
+    emission_id: uuid::Uuid,
+    node_id: &str,
+    frames: &weft_core::frames::LoopFrames,
+    port: &str,
+    refused: Option<&weft_core::exec::PortWarning>,
+) {
+    let event = match refused {
+        Some(warning) => ExecEvent::PortTypeMismatch {
+            color,
+            emission_id,
+            node_id: node_id.to_string(),
+            frames: frames.clone(),
+            port: port.to_string(),
+            expected: warning.expected.clone(),
+            actual: warning.actual.clone(),
+            at_unix: now_unix(),
+        },
+        None => ExecEvent::PortClosed {
+            color,
+            emission_id,
+            node_id: node_id.to_string(),
+            frames: frames.clone(),
+            port: port.to_string(),
+            at_unix: now_unix(),
+        },
+    };
+    record_from_pod(journal, event, pod_name).await;
 }
 
 #[async_trait]
@@ -2682,8 +2674,12 @@ impl ContextHandle for RunnerHandle {
                 .declared_outputs
                 .get(&port)
                 .expect("classified above from this same map");
-            self.record_port_type_mismatch(&port, declared, &value).await;
-            self.send_emission(EmitKind::Close(port), None)?;
+            let refused = weft_core::exec::PortWarning {
+                port: port.clone(),
+                expected: declared.to_string(),
+                actual: WeftType::infer(&value).to_string(),
+            };
+            self.send_emission(EmitKind::Close { port, refused: Some(refused) }, None)?;
         }
         if !wait_delivered {
             if !kept.outputs.is_empty() {
@@ -2765,7 +2761,7 @@ impl ContextHandle for RunnerHandle {
         } else {
             self.mention_or_err(std::slice::from_ref(&port))?;
         }
-        self.send_emission(EmitKind::Close(port), None)
+        self.send_emission(EmitKind::Close { port, refused: None }, None)
     }
 
     fn create_bus(&self, opts: BusOptions) -> WeftResult<(BusHandle, Value)> {

@@ -2,28 +2,38 @@
 //!
 //! The journal records one event per state change reported by the
 //! worker (plus a few dispatcher-side events like NodeKicked at
-//! fresh-run time). Folding the event log reconstructs a complete
-//! `ExecutionSnapshot`: pulses, executions, active suspensions. This
-//! replaces periodic snapshots. Replay is the source of truth; an
-//! explicit snapshot blob is just a materialized view of the fold.
-
-use std::collections::HashMap;
+//! fresh-run time). Folding the event log over the program rebuilds a
+//! complete `ExecutionSnapshot` (see `crate::fold`): pulses,
+//! executions, loops, active suspensions. Replay is the source of
+//! truth.
+//!
+//! THE RULE every row is judged by: the journal records facts the
+//! engine learned from OUTSIDE (a trigger payload, a node body's
+//! emission, a person's answer, a log line, a cost, a stream take, a
+//! cancellation). Everything the engine computed from those facts plus
+//! the program is recomputed on read: which wires a value fanned out
+//! on, which ports a firing closed, what a group boundary forwarded,
+//! what a loop iteration received. A value therefore lives in the
+//! journal exactly once, on the `PortEmitted` row of the emission that
+//! produced it. A small derived fact may ride a row for the screen
+//! (`NodeSkipped.reason`), but the resume never reads it.
+//!
+//! There is no compatibility decoding: a journal row written to an
+//! older shape does not decode, the read that hits it fails naming
+//! the color, and `weft clean` removes the execution.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::frames::{FiringLocation, LoopFrames};
-use weft_core::primitive::{
-    ExecutionSnapshot, KickedNode, LoopInstanceKey, LoopInstanceSnapshot,
-    LoopTerminationReason, SignalSpec, SuspensionInfo,
-};
+use weft_core::frames::LoopFrames;
+use weft_core::primitive::{LoopTerminationReason, SignalSpec};
 use weft_core::Color;
 
 /// One event in the execution log. Append-only; events are never
 /// edited or deleted by the dispatcher. User-initiated cleanup
 /// (`weft clean`) is the only path that removes them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecEvent {
     ExecutionStarted {
         color: Color,
@@ -84,66 +94,54 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
-    /// A node was absorbed into a dispatch (ready group picked up,
-    /// pulses marked Absorbed, NodeExecution::Running created).
+    /// A node was absorbed into a dispatch: the pending pulses at its
+    /// location marked Absorbed, a Running `NodeExecution` opened. What
+    /// the firing received is not on the row: it is the pulses the
+    /// fold absorbs at this point (every pending pulse at the node and
+    /// frames, minus the items on its generator ports, which its live
+    /// feed takes one by one).
     NodeStarted {
         color: Color,
         node_id: String,
         frames: LoopFrames,
-        input: Value,
-        closed_ports: Vec<String>,
-        pulses_absorbed: Vec<String>,
         at_unix: u64,
     },
 
+    /// The firing's body returned. What it handed out is its
+    /// `PortEmitted` rows; every declared output port it never
+    /// mentioned closes at this point (the fold sweeps them, deriving
+    /// the closures from the program), and a generator output's
+    /// closure is the stream's clean end.
     NodeCompleted {
         color: Color,
         node_id: String,
         frames: LoopFrames,
-        output: Value,
-        /// Emissions this terminal firing is responsible for delivering
-        /// ATOMICALLY with the marker (see `NodeFailed.closure_emissions`).
-        /// Usually just the unmentioned-port CLOSURES; for a synchronous
-        /// Passthrough it ALSO carries the forwarded VALUES (push_pulse
-        /// materializes each by its `closed` flag, so values and closures
-        /// both fold correctly). The field name is kept for cross-event
-        /// symmetry; "closures" is the common case, not the only one.
-        closure_emissions: Vec<LaunchedEmission>,
         at_unix: u64,
     },
 
+    /// The firing failed with `error`. Ports already emitted keep their
+    /// values; every other output closes, a generator output's closure
+    /// carrying the error as a FAILED stream end.
     NodeFailed {
         color: Color,
         node_id: String,
         frames: LoopFrames,
         error: String,
-        /// Closure pulses on this firing's unmentioned output ports,
-        /// carried in THIS row so the terminal marker and the closures it
-        /// implies are one atomic journal write. A crash between two
-        /// separate writes would lose the closures: downstream consumers
-        /// then neither fire nor skip and the execution refolds Stuck.
-        /// Same discipline as `LoopTerminated.outward_emissions`.
-        closure_emissions: Vec<LaunchedEmission>,
         at_unix: u64,
     },
 
+    /// The firing did not run its body: every output closes. `reason`
+    /// says WHY: the author's `_should_flow` said no, or an input it
+    /// needed never arrived. A decision and a consequence look the same
+    /// on the graph without it. The fold never needs it to rebuild the
+    /// execution (the closures are the same either way); it is kept for
+    /// the screen. A `ScopeSkipped` skip closes nothing: the scope's In
+    /// boundary already closed the scope's outward surface.
     NodeSkipped {
         color: Color,
         node_id: String,
         frames: LoopFrames,
-        closed_ports: Vec<String>,
-        /// WHY the node did not run: the author's `_should_flow` said
-        /// no, or an input it needed never arrived. A decision and a
-        /// consequence look the same on the graph without this.
-        /// Optional on the WIRE only, because journal rows are frozen
-        /// history: a row written before this field existed reads as
-        /// `None` and renders as "reason not recorded". Every writer
-        /// journals `Some`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<weft_core::exec::skip::SkipReason>,
-        /// See `NodeFailed.closure_emissions`: the skip's unmentioned-port
-        /// closures ride here atomically with the terminal marker.
-        closure_emissions: Vec<LaunchedEmission>,
+        reason: weft_core::exec::skip::SkipReason,
         at_unix: u64,
     },
 
@@ -160,25 +158,22 @@ pub enum ExecEvent {
         node_id: String,
         frames: LoopFrames,
         /// Resume cause:
-        /// - `Some((token, value))`: the firing was Suspended and a
-        ///   `SuspensionResolved` arrived. The fold clears the
-        ///   `suspensions` and `pending_deliveries` entries for
-        ///   `token`.
+        /// - `Some(token)`: the firing was Suspended and a
+        ///   `SuspensionResolved` for `token` arrived (its value is on
+        ///   that row). The fold clears the `suspensions` and
+        ///   `pending_deliveries` entries for `token`.
         /// - `None`: crashed-Running recovery (the firing was
         ///   Running when the worker crashed; a fresh worker is
-        ///   re-driving it). No suspension token to clear; the audit
-        ///   event exists so `pulses_absorbed` lands in the journal.
+        ///   re-driving it). No suspension token to clear.
+        /// Either way the fold absorbs every pulse pending at the
+        /// location, as it does for a `NodeStarted`: a resume can
+        /// absorb fresh pulses that arrived while the firing was
+        /// waiting, and the un-absorb path on a later crashed-Running
+        /// recovery needs every absorbed pulse, not just the original
+        /// dispatch's. Always written (`null` for a crash recovery): a
+        /// missing field is a truncated row and fails to decode.
+        #[serde(deserialize_with = "present")]
         token: Option<String>,
-        value: Option<Value>,
-        /// Pulse IDs (hex-encoded UUIDs, same format as NodeStarted)
-        /// this resume dispatch absorbed. A resume can absorb fresh
-        /// pulses that arrived while the firing was Waiting OR a
-        /// crashed-Running recovery can absorb pulses the dispatcher
-        /// queued while the worker was down; the un-absorb path on
-        /// a later crashed-Running recovery needs every absorbed-
-        /// pulse ID, not just the ones from the original NodeStarted,
-        /// or the resume-time pulses stay stuck in Absorbed forever.
-        pulses_absorbed: Vec<String>,
         at_unix: u64,
     },
 
@@ -187,30 +182,58 @@ pub enum ExecEvent {
         node_id: String,
         frames: LoopFrames,
         reason: String,
-        /// See `NodeFailed.closure_emissions`: a cancelled firing's
-        /// outward closures ride here atomically with the terminal marker.
-        closure_emissions: Vec<LaunchedEmission>,
         at_unix: u64,
     },
 
-    /// A downstream pulse the engine produced during postprocess.
-    PulseEmitted {
+    /// A node body emitted `value` on `port`. THE only row in the
+    /// journal that carries a wire value, and it carries it once: the
+    /// fold puts the pulses on every outgoing wire of the port itself
+    /// (the program has the edges, and a wire's key path is read off
+    /// the value at delivery), with ids derived from `emission_id`, so
+    /// every later row that names a pulse (a stream take, a loop's item
+    /// launch) resolves the same live and on replay. One row per port
+    /// per `pulse_downstream` call; a stream item is one row.
+    PortEmitted {
         color: Color,
-        pulse_id: String,
-        source_node: String,
-        source_port: String,
-        target_node: String,
-        target_port: String,
+        emission_id: uuid::Uuid,
+        node_id: String,
         frames: LoopFrames,
-        value: Value,
-        closed: bool,
-        /// Only ever `Some` on a closure targeting a generator port:
-        /// the stream ended because its producer FAILED with this
-        /// error (see `Pulse::close_error`). Always written (a `None`
-        /// serializes as `null`): a missing field must fail
-        /// deserialization as the truncated row it is, never silently
-        /// read as "no error".
-        close_error: Option<String>,
+        port: String,
+        /// Shared with the pulses the live engine put on the wires, so
+        /// writing the row copies nothing (serde reads through the
+        /// `Arc`).
+        value: std::sync::Arc<Value>,
+        at_unix: u64,
+    },
+
+    /// A node body closed `port` mid-firing (`ctx.close_port`): every
+    /// wire off the port carries a closure from here on, the same
+    /// shape the termination sweep would produce; on a generator
+    /// output this is the stream's early end. A fact the body decided,
+    /// so it has its own row; the termination sweep's closures do not.
+    PortClosed {
+        color: Color,
+        emission_id: uuid::Uuid,
+        node_id: String,
+        frames: LoopFrames,
+        port: String,
+        at_unix: u64,
+    },
+
+    /// A node tried to emit a value on `port` whose inferred type is not
+    /// compatible with the port's declared type. The engine refused the
+    /// value and closed the port instead (downstream sees null); this
+    /// row IS that closure. NON-terminal: the node keeps running and its
+    /// other ports emit normally. Folds into the matching
+    /// `NodeExecution.port_warnings`.
+    PortTypeMismatch {
+        color: Color,
+        emission_id: uuid::Uuid,
+        node_id: String,
+        frames: LoopFrames,
+        port: String,
+        expected: String,
+        actual: String,
         at_unix: u64,
     },
 
@@ -222,7 +245,7 @@ pub enum ExecEvent {
     /// taken item as Pending beside a terminal consumer record (which
     /// would re-dispatch the consumer, a double run).
     ///
-    /// TODO: every stream item costs one `PulseEmitted` + one of these
+    /// TODO: every stream item costs one `PortEmitted` + one of these
     /// (a journal write each); a multi-million-item stream needs
     /// windowed writes (the bus already batches its appends this way)
     /// before that volume is real.
@@ -236,117 +259,52 @@ pub enum ExecEvent {
     },
 
     /// A `Loop` instance was created at `parent_frames` when `LoopIn`
-    /// first fired for the loop. Carries the resolved iteration cap
-    /// (after zip-trim and `max_iters` cap; `None` means uncapped)
-    /// and the config snapshot.
+    /// first fired for the loop. Everything about the instance (its
+    /// config, its iteration cap, its outer input, its carry seeds) is
+    /// a function of the LoopIn's own firing, which the fold rebuilds
+    /// from the LoopIn's absorbed pulses plus the program.
     LoopInstantiated {
         color: Color,
         group_id: String,
         parent_frames: LoopFrames,
-        iter_cap: Option<u32>,
-        parallel: bool,
-        max_iters: Option<u32>,
-        /// Iter-input port names. Persisted because the rehydrate
-        /// path needs to slice `outer_input` by port to launch later
-        /// iterations. NOT optional: a journal row whose writer
-        /// omitted this field is corrupt, not legacy.
-        over: Vec<String>,
-        /// Carry-port names. Persisted so the rehydrate path knows
-        /// which `LoopOut` inputs are carry-writes vs gather-writes
-        /// without re-reading the project definition.
-        carry: Vec<String>,
-        /// Zip mode at instantiation time.
-        trim_on_mismatch: bool,
-        /// Outer input bag captured from the LoopIn firing. Persists
-        /// so a resumed worker can launch later iterations without
-        /// reading from the (already-absorbed) LoopIn pulse bucket.
-        outer_input: HashMap<String, Value>,
-        /// Initial carry values seeded at instantiation time (from the
-        /// outer-input bag if the user wired a value to the carry
-        /// port, otherwise from `weft_type_zero`). Persists so a
-        /// resume between instantiation and the first LoopOutFired
-        /// rebuilds `carry_values` with the seed instead of an empty
-        /// map (which would emit nothing on the body's carry input
-        /// for the very first iteration).
-        initial_carry: HashMap<String, Value>,
         at_unix: u64,
     },
 
     /// The engine launched body work for iteration `index` of the loop
     /// at `parent_frames`. For parallel loops, all N are launched
-    /// upfront; for sequential, one per fire of `LoopOut`.
-    ///
-    /// Carries the iteration's body pulses inline (instead of
-    /// separate `PulseEmitted` rows) so the launch marker and the
-    /// pulses land in ONE journal row. Two rows would open a crash
-    /// window with no correct ordering: pulses-then-marker replays
-    /// the body twice on resume (marker missing -> `launched` lacks
-    /// the index -> LaunchNext re-ships the pulses), and
-    /// marker-then-pulses hangs (index in `launched` but no body
-    /// pulses to run). NOT optional: a row missing this field is
-    /// corrupt, not legacy.
+    /// upfront; for sequential, one per fire of `LoopOut`. The body's
+    /// pulses (the `over` slice, the broadcast inputs, the carries as
+    /// they stand, the implicit `index`) and the body's roots are what
+    /// the instance and the program say they are at this point; the
+    /// fold puts them on the wires from this row.
     LoopIterationLaunched {
         color: Color,
         group_id: String,
         parent_frames: LoopFrames,
         index: u32,
-        body_emissions: Vec<LaunchedEmission>,
-        /// The body's own roots (members no wire feeds), kicked at the
-        /// iteration's frames alongside the pulses: everything inside
-        /// a loop runs once per iteration, wired to the loop's edges
-        /// or not. In the same row as the pulses for the same reason
-        /// they are: a launch is one atomic fact.
-        #[serde(default)]
-        roots: Vec<String>,
         /// When this iteration's `over` item came from a STREAM
         /// (`over` on a `Generator[T]` port): the item pulse this
         /// launch consumed, absorbed by the fold in the same atomic
-        /// row as the launch marker. `None` for list-driven and
-        /// done-driven loops. Always written (`null` for the non-
-        /// stream sources): a missing field must fail
-        /// deserialization, never silently fold as "not a stream
-        /// launch" (which would leave the item pulse un-absorbed and
-        /// re-deliver it).
+        /// row as the launch marker (the item's value comes off that
+        /// pulse). `None` for list-driven and done-driven loops. Always
+        /// written (`null` for the non-stream sources): a missing field
+        /// must fail deserialization, never silently fold as "not a
+        /// stream launch" (which would leave the item pulse un-absorbed
+        /// and re-deliver it).
+        #[serde(deserialize_with = "present")]
         stream_pulse: Option<String>,
         at_unix: u64,
     },
 
-    /// A group's body started at `frames` (its In boundary forwarded),
-    /// and these members, which no wire feeds, are kicked there:
-    /// everything inside a scope runs when the scope starts. The loop
-    /// twin of this row is `LoopIterationLaunched::roots`. When
-    /// `skipped_by` names the scope, the scope was gated off instead
-    /// and every member listed is dispatched straight into a
-    /// `ScopeSkipped` skip, so the journal says of each node inside
-    /// that its scope did not run.
-    ScopeLaunched {
-        color: Color,
-        group_id: String,
-        frames: LoopFrames,
-        roots: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        skipped_by: Option<String>,
-        at_unix: u64,
-    },
-
-    /// `LoopOut` fired for iteration `index`. `gather_writes` holds the
-    /// values the body wrote to each gather port (`Closed` on closure
-    /// → null at index). `carry_writes` holds the carry-port updates
-    /// (`Closed` → keep previous). `done_vote` is the body's
-    /// `self.done` value (None on closure → treated as false).
-    /// `Option<Value>` is NOT usable here because default serde
-    /// collapses `Some(Value::Null)` and `None` to the same JSON, so
-    /// a body that legitimately writes JSON null on a gather/carry
-    /// port becomes indistinguishable from "closed the port" after a
-    /// journal round-trip.
+    /// `LoopOut` fired for iteration `index`. What the body wrote to
+    /// each gather and carry port, and its `done` vote, are the pulses
+    /// the LoopOut firing absorbed; the fold reads them off that
+    /// record.
     LoopOutFired {
         color: Color,
         group_id: String,
         parent_frames: LoopFrames,
         index: u32,
-        gather_writes: HashMap<String, weft_core::primitive::LoopWrite>,
-        carry_writes: HashMap<String, weft_core::primitive::LoopWrite>,
-        done_vote: Option<bool>,
         at_unix: u64,
     },
 
@@ -355,7 +313,7 @@ pub enum ExecEvent {
     /// routes, so without this row a crash between "stream ended" and
     /// "loop terminated" (an iteration still in flight) would resume a
     /// loop that waits forever for a close that can never arrive
-    /// again. Folds into the instance snapshot's `stream_end`.
+    /// again. Folds onto the instance's stream source.
     LoopStreamEnded {
         color: Color,
         group_id: String,
@@ -364,23 +322,16 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
-    /// The loop emitted outwardly: all launched iterations fired their
-    /// `LoopOut` AND a termination condition was satisfied.
+    /// The loop ended: all launched iterations fired their `LoopOut`
+    /// AND a termination condition was satisfied, or it was cancelled
+    /// or failed. On a clean end the loop's outward pulses (assembled
+    /// gather lists + final carries) go on the wires from this row; on
+    /// a failed or cancelled end its outward ports close instead.
     LoopTerminated {
         color: Color,
         group_id: String,
         parent_frames: LoopFrames,
         reason: LoopTerminationReason,
-        /// The loop's outward pulses (assembled gather lists + final
-        /// carries on success, or port closures on a failed/abnormal
-        /// end), carried in THIS row so the marker and the pulses are
-        /// one atomic journal write. Without this, a crash between
-        /// shipping the outward pulses and journaling LoopTerminated
-        /// leaves the pulses pending with `terminated: None` on refold:
-        /// the LoopOut re-fires and emits the loop's outputs a SECOND
-        /// time downstream. Same fix as `LoopIterationLaunched`'s
-        /// `body_emissions`.
-        outward_emissions: Vec<LaunchedEmission>,
         at_unix: u64,
     },
 
@@ -442,22 +393,20 @@ pub enum ExecEvent {
         color: Color,
         /// The node that wrote it, and the iteration it was in: a log
         /// line is about one firing, and a graph where ten nodes log
-        /// is unreadable without it. `default` so the rows written
-        /// before the field existed still decode (they read as an
-        /// empty id, which the log renders as a run-level line).
-        #[serde(default)]
+        /// is unreadable without it. An empty id is a run-level line.
         node_id: String,
-        #[serde(default)]
         frames: LoopFrames,
         level: String,
         message: String,
         /// The worker's clock at the write, in milliseconds (`at_unix`
         /// is its seconds), and the line's place among its firing's
-        /// side effects. Absent on rows written before they were
-        /// carried, which read at the end of their second.
-        #[serde(default)]
+        /// side effects. `None` when the writer had neither (a line
+        /// that did not come off a worker's clock reads at the end of
+        /// its second); always written, so a row lacking the field is
+        /// a truncated row and fails to decode.
+        #[serde(deserialize_with = "present")]
         at_unix_ms: Option<u64>,
-        #[serde(default)]
+        #[serde(deserialize_with = "present")]
         seq: Option<u64>,
         at_unix: u64,
     },
@@ -473,25 +422,11 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
-    /// A node tried to emit a value on `port` whose inferred type is not
-    /// compatible with the port's declared type. The engine refused the
-    /// value and closed the port instead (downstream sees null). This is
-    /// NON-terminal: the node keeps running and its other ports emit
-    /// normally; this row is the visible record that one port's value was
-    /// dropped. Folds into the matching `NodeExecution.port_warnings`.
-    PortTypeMismatch {
-        color: Color,
-        node_id: String,
-        frames: LoopFrames,
-        port: String,
-        expected: String,
-        actual: String,
-        at_unix: u64,
-    },
-
+    /// The execution ran to its end. The run's outputs are what its
+    /// nodes emitted (the `PortEmitted` rows); the row is the terminal
+    /// marker and nothing else.
     ExecutionCompleted {
         color: Color,
-        outputs: Value,
         at_unix: u64,
     },
 
@@ -504,13 +439,13 @@ pub enum ExecEvent {
     ExecutionCancelled {
         color: Color,
         /// The cause in words, what a person reads (`cause.to_string()`
-        /// when `cause` is set). Kept as its own field because rows
-        /// written before `cause` existed carry only this.
+        /// when `cause` is set).
         reason: String,
-        /// The structured cause: who or what stopped the run. `None`
-        /// only on a row written before the field existed (the UI then
-        /// has only `reason`); every live writer sets it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// The structured cause: who or what stopped the run. Every
+        /// live writer sets it; `None` is a cancel with only its words.
+        /// Always written (`null` counts): a row lacking the field is a
+        /// truncated row and fails to decode.
+        #[serde(deserialize_with = "present")]
         cause: Option<weft_core::exec::CancelCause>,
         at_unix: u64,
     },
@@ -618,42 +553,15 @@ pub enum ExecEvent {
     },
 }
 
-/// One body pulse carried inline in `LoopIterationLaunched`. Same
-/// fields as a `PulseEmitted` row minus `color`/`at_unix` (the
-/// carrying event's apply). The fold replays each entry through the
-/// same `push_pulse` helper as the `PulseEmitted` arm, so the
-/// reconstructed pulse table is byte-identical to what individual
-/// `PulseEmitted` rows would have produced.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LaunchedEmission {
-    pub pulse_id: String,
-    pub source_node: String,
-    pub source_port: String,
-    pub target_node: String,
-    pub target_port: String,
-    pub frames: LoopFrames,
-    pub value: Value,
-    pub closed: bool,
-    /// See `PulseEmitted::close_error` (always written, same
-    /// truncated-row posture).
-    pub close_error: Option<String>,
-}
-
-impl From<weft_core::exec::PulseEmission> for LaunchedEmission {
-    fn from(e: weft_core::exec::PulseEmission) -> Self {
-        let p = e.pulse;
-        Self {
-            pulse_id: p.id.to_string(),
-            source_node: e.source_node,
-            source_port: e.source_port,
-            target_node: p.target_node,
-            target_port: p.target_port,
-            frames: p.frames,
-            value: p.value,
-            closed: p.closed,
-            close_error: p.close_error,
-        }
-    }
+/// An optional field that must be PRESENT on the row (`null` counts):
+/// serde would otherwise read a missing `Option` as `None`, turning a
+/// truncated row into a row that quietly says the other thing.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl ExecEvent {
@@ -683,11 +591,12 @@ impl ExecEvent {
             | Self::NodeSuspended { color, .. }
             | Self::NodeResumed { color, .. }
             | Self::NodeCancelled { color, .. }
-            | Self::PulseEmitted { color, .. }
+            | Self::PortEmitted { color, .. }
+            | Self::PortClosed { color, .. }
+            | Self::PortTypeMismatch { color, .. }
             | Self::PulsesConsumed { color, .. }
             | Self::LoopInstantiated { color, .. }
             | Self::LoopIterationLaunched { color, .. }
-            | Self::ScopeLaunched { color, .. }
             | Self::LoopOutFired { color, .. }
             | Self::LoopStreamEnded { color, .. }
             | Self::LoopTerminated { color, .. }
@@ -697,7 +606,6 @@ impl ExecEvent {
             | Self::CostReported { color, .. }
             | Self::LogLine { color, .. }
             | Self::ExecutionTagged { color, .. }
-            | Self::PortTypeMismatch { color, .. }
             | Self::ExecutionCompleted { color, .. }
             | Self::ExecutionFailed { color, .. }
             | Self::ExecutionCancelled { color, .. }
@@ -713,6 +621,48 @@ impl ExecEvent {
         }
     }
 
+    /// The journal's stamp on the row.
+    pub fn at_unix(&self) -> u64 {
+        match self {
+            Self::ExecutionStarted { at_unix, .. }
+            | Self::NodeKicked { at_unix, .. }
+            | Self::NodeStarted { at_unix, .. }
+            | Self::NodeCompleted { at_unix, .. }
+            | Self::NodeFailed { at_unix, .. }
+            | Self::NodeSkipped { at_unix, .. }
+            | Self::NodeSuspended { at_unix, .. }
+            | Self::NodeResumed { at_unix, .. }
+            | Self::NodeCancelled { at_unix, .. }
+            | Self::PortEmitted { at_unix, .. }
+            | Self::PortClosed { at_unix, .. }
+            | Self::PortTypeMismatch { at_unix, .. }
+            | Self::PulsesConsumed { at_unix, .. }
+            | Self::LoopInstantiated { at_unix, .. }
+            | Self::LoopIterationLaunched { at_unix, .. }
+            | Self::LoopOutFired { at_unix, .. }
+            | Self::LoopStreamEnded { at_unix, .. }
+            | Self::LoopTerminated { at_unix, .. }
+            | Self::SuspensionRegistered { at_unix, .. }
+            | Self::SuspensionResolved { at_unix, .. }
+            | Self::RunOutput { at_unix, .. }
+            | Self::CostReported { at_unix, .. }
+            | Self::LogLine { at_unix, .. }
+            | Self::ExecutionTagged { at_unix, .. }
+            | Self::ExecutionCompleted { at_unix, .. }
+            | Self::ExecutionFailed { at_unix, .. }
+            | Self::ExecutionCancelled { at_unix, .. }
+            | Self::BusJoined { at_unix, .. }
+            | Self::BusLeft { at_unix, .. }
+            | Self::BusWindow { at_unix, .. }
+            | Self::BusClosed { at_unix, .. }
+            | Self::CallerConnected { at_unix, .. }
+            | Self::CallerInbound { at_unix, .. }
+            | Self::CallerOutbound { at_unix, .. }
+            | Self::CallerErrored { at_unix, .. }
+            | Self::CallerDisconnected { at_unix, .. } => *at_unix,
+        }
+    }
+
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::ExecutionStarted { .. } => "execution_started",
@@ -724,11 +674,12 @@ impl ExecEvent {
             Self::NodeSuspended { .. } => "node_suspended",
             Self::NodeResumed { .. } => "node_resumed",
             Self::NodeCancelled { .. } => "node_cancelled",
-            Self::PulseEmitted { .. } => "pulse_emitted",
+            Self::PortEmitted { .. } => "port_emitted",
+            Self::PortClosed { .. } => "port_closed",
+            Self::PortTypeMismatch { .. } => "port_type_mismatch",
             Self::PulsesConsumed { .. } => "pulses_consumed",
             Self::LoopInstantiated { .. } => "loop_instantiated",
             Self::LoopIterationLaunched { .. } => "loop_iteration_launched",
-            Self::ScopeLaunched { .. } => "scope_launched",
             Self::LoopOutFired { .. } => "loop_out_fired",
             Self::LoopStreamEnded { .. } => "loop_stream_ended",
             Self::LoopTerminated { .. } => "loop_terminated",
@@ -738,7 +689,6 @@ impl ExecEvent {
             Self::CostReported { .. } => "cost_reported",
             Self::LogLine { .. } => "log_line",
             Self::ExecutionTagged { .. } => "execution_tagged",
-            Self::PortTypeMismatch { .. } => "port_type_mismatch",
             Self::ExecutionCompleted { .. } => "execution_completed",
             Self::ExecutionFailed { .. } => "execution_failed",
             Self::ExecutionCancelled { .. } => "execution_cancelled",
@@ -755,2365 +705,262 @@ impl ExecEvent {
     }
 }
 
-// ----- Fold: events -> ExecutionSnapshot -----------------------------
-
-pub fn fold_to_snapshot<'a>(color: Color, events: impl IntoIterator<Item = &'a ExecEvent>) -> ExecutionSnapshot {
-    use weft_core::exec::{NodeExecution, NodeExecutionStatus, NodeExecutionTable};
-    use weft_core::primitive::{CorruptionSite, JournalCorruption};
-    use weft_core::pulse::{Pulse, PulseStatus, PulseTable};
-
-    let mut pulses: PulseTable = Default::default();
-    let mut executions: NodeExecutionTable = Default::default();
-    let mut suspensions: HashMap<String, SuspensionInfo> = HashMap::new();
-    let mut pending_deliveries: HashMap<String, Value> = HashMap::new();
-    let mut kicked: HashMap<FiringLocation, KickedNode> = HashMap::new();
-    let mut loop_instances: HashMap<LoopInstanceKey, LoopInstanceSnapshot> = HashMap::new();
-    let mut awaited_sequences: HashMap<
-        weft_core::liveness::FiringLocation,
-        Vec<weft_core::primitive::AwaitedEntry>,
-    > = HashMap::new();
-    let mut corruptions: Vec<JournalCorruption> = Vec::new();
-
-    fn report_corruption(
-        corruptions: &mut Vec<JournalCorruption>,
-        color: Color,
-        site: CorruptionSite,
-        reason: String,
-    ) {
-        tracing::error!(
-            target: "weft_journal::fold",
-            %color, ?site, reason = %reason,
-            "skip row during fold (journal corruption)"
-        );
-        corruptions.push(JournalCorruption { site, reason });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn push_pulse(
-        pulses: &mut PulseTable,
-        corruptions: &mut Vec<JournalCorruption>,
-        site: CorruptionSite,
-        pulse_id: &str,
-        color: Color,
-        frames: LoopFrames,
-        target_node: &str,
-        target_port: &str,
-        value: Value,
-        closed: bool,
-        close_error: Option<String>,
-    ) {
-        let id = match pulse_id.parse::<uuid::Uuid>() {
-            Ok(id) => id,
-            Err(e) => {
-                report_corruption(
-                    corruptions,
-                    color,
-                    site,
-                    format!("pulse_id={pulse_id:?} unparseable: {e}"),
-                );
-                return;
-            }
-        };
-        let pulse = match Pulse::from_journal_emit(
-            id,
-            color,
-            frames,
-            target_node.to_string(),
-            target_port.to_string(),
-            value,
-            closed,
-            close_error,
-        ) {
-            Ok(p) => p,
-            Err(reason) => {
-                report_corruption(
-                    corruptions,
-                    color,
-                    site,
-                    format!("pulse_id={pulse_id} invariant violated: {reason}"),
-                );
-                return;
-            }
-        };
-        // Idempotent replay guard, same stance as the `launched` /
-        // `out_fired` / `kicked` folds: pulse ids are minted once per
-        // emission, so a second row with the same id is a replayed
-        // duplicate, never a second pulse. First row wins.
-        let bucket = pulses.entry(target_node.to_string()).or_default();
-        if bucket.iter().any(|existing| existing.id == id) {
-            return;
-        }
-        bucket.push(pulse);
-    }
-
-    /// Replay the closure pulses a terminal event (NodeCompleted /
-    /// NodeFailed / NodeSkipped / NodeCancelled) carries, via the same
-    /// `push_pulse` helper as PulseEmitted, so the terminal marker and
-    /// its closures fold as one atomic unit.
-    fn replay_terminal_closures(
-        pulses: &mut PulseTable,
-        corruptions: &mut Vec<JournalCorruption>,
-        site: CorruptionSite,
-        color: Color,
-        emissions: &[LaunchedEmission],
-    ) {
-        for e in emissions {
-            push_pulse(
-                pulses,
-                corruptions,
-                site,
-                &e.pulse_id,
-                color,
-                e.frames.clone(),
-                &e.target_node,
-                &e.target_port,
-                e.value.clone(),
-                e.closed,
-                e.close_error.clone(),
-            );
-        }
-    }
-
-    fn parse_absorbed_ids(
-        ids: &[String],
-        corruptions: &mut Vec<JournalCorruption>,
-        site: CorruptionSite,
-        color: Color,
-    ) -> Vec<uuid::Uuid> {
-        ids.iter()
-            .filter_map(|s| match s.parse::<uuid::Uuid>() {
-                Ok(id) => Some(id),
-                Err(e) => {
-                    report_corruption(
-                        corruptions,
-                        color,
-                        site,
-                        format!("absorbed_pulse_id={s:?} unparseable: {e}"),
-                    );
-                    None
-                }
-            })
-            .collect()
-    }
-
-    for ev in events {
-        match ev {
-            ExecEvent::ExecutionStarted { .. } => {}
-            ExecEvent::NodeKicked { node_id, firing, payload, port_snapshot, .. } => {
-                // First kick wins; further kicks on the same node id are a
-                // true no-op (the documented contract). The first kick's
-                // payload and `dispatched` flag are authoritative; a later
-                // kick carrying a different payload is a writer-level bug
-                // the fold must not paper over by silently merging.
-                kicked.entry(FiringLocation::new(node_id.clone(), Vec::new())).or_insert_with(|| KickedNode {
-                    firing: *firing,
-                    payload: payload.clone(),
-                    port_snapshot: port_snapshot.clone(),
-                    dispatched: false,
-                    scope_skipped: None,
-                });
-            }
-            ExecEvent::ScopeLaunched { group_id: _, frames, roots, skipped_by, .. } => {
-                // A scope's body roots are kicks at the scope's frames,
-                // first launch wins like every other kick.
-                for root in roots {
-                    kicked.entry(FiringLocation::new(root.clone(), frames.clone())).or_insert_with(|| KickedNode {
-                        firing: false,
-                        payload: None,
-                        port_snapshot: None,
-                        dispatched: false,
-                        scope_skipped: skipped_by.clone(),
-                    });
-                }
-            }
-            ExecEvent::PulseEmitted {
-                color: c,
-                pulse_id,
-                target_node,
-                target_port,
-                frames,
-                value,
-                closed,
-                close_error,
-                ..
-            } => {
-                push_pulse(
-                    &mut pulses,
-                    &mut corruptions,
-                    CorruptionSite::PulseEmitted,
-                    pulse_id,
-                    *c,
-                    frames.clone(),
-                    target_node,
-                    target_port,
-                    value.clone(),
-                    *closed,
-                    close_error.clone(),
-                );
-            }
-            ExecEvent::PulsesConsumed { color: c, node_id, pulse_ids, .. } => {
-                // The take path's durability: REMOVE the consumed
-                // pulses from the table, byte-identical to what the
-                // live driver does (`consume_stream_pulses` removes,
-                // never tombstones: a long stream would otherwise grow
-                // the bucket by one spent entry per item, turning
-                // every per-pass scan of a REFOLDED worker quadratic
-                // where the live worker's is not). Safe because
-                // consumed stream pulses are never un-absorb targets
-                // (a stream consumer is never re-run). Deliberately
-                // NOT recorded on the consuming record's
-                // `pulses_absorbed`: that list exists for the
-                // resume-time un-absorb, which never applies here, and
-                // a long stream would grow the record by one uuid per
-                // item forever.
-                let ids = parse_absorbed_ids(
-                    pulse_ids,
-                    &mut corruptions,
-                    CorruptionSite::PulsesConsumed,
-                    *c,
-                );
-                if let Some(bucket) = pulses.get_mut(node_id) {
-                    bucket.retain(|p| !ids.contains(&p.id));
-                }
-            }
-            ExecEvent::NodeStarted { node_id, frames, input, pulses_absorbed, at_unix, color: c, closed_ports: _ } => {
-                let absorbed_uuids = parse_absorbed_ids(pulses_absorbed, &mut corruptions, CorruptionSite::NodeStarted, *c);
-                if !absorbed_uuids.is_empty() {
-                    if let Some(bucket) = pulses.get_mut(node_id) {
-                        for p in bucket.iter_mut() {
-                            if absorbed_uuids.contains(&p.id) && p.status == PulseStatus::Pending {
-                                p.status = PulseStatus::Absorbed;
-                            }
-                        }
-                    }
-                }
-                if let Some(k) = kicked.get_mut(&FiringLocation::new(node_id.clone(), frames.clone())) {
-                    k.dispatched = true;
-                }
-                // Open a new record unless a NON-TERMINAL record already
-                // sits at this (color, frames). Live dispatch opens a new
-                // record per firing whenever no non-terminal one exists
-                // (it ships NodeResumed, never a second NodeStarted, to
-                // continue a non-terminal record). So a NodeStarted whose
-                // latest same-key record is TERMINAL is a legitimate second
-                // firing (e.g. a streaming/bus node fired its consumer
-                // twice); collapsing it onto the terminal record would
-                // silently drop the second firing's work on refold. A
-                // NodeStarted whose latest same-key record is non-terminal
-                // can only be a corruption-dedup replay; skip it.
-                let has_non_terminal = executions
-                    .get(node_id)
-                    .map(|v| {
-                        v.iter()
-                            .rev()
-                            .find(|e| e.color == *c && &e.frames == frames)
-                            .map(|e| !e.status.is_terminal())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if !has_non_terminal {
-                    let record = NodeExecution {
-                        id: uuid::Uuid::new_v4(),
-                        node_id: node_id.clone(),
-                        status: NodeExecutionStatus::Running,
-                        pulses_absorbed: absorbed_uuids,
-                        dispatch_pulse: uuid::Uuid::new_v4(),
-                        error: None,
-                        callback_id: None,
-                        started_at: *at_unix,
-                        completed_at: None,
-                        input: Some(input.clone()),
-                        output: None,
-                        cost_usd: 0.0,
-                        logs: Vec::new(),
-                        port_warnings: Vec::new(),
-                        color: *c,
-                        frames: frames.clone(),
-                    };
-                    executions.entry(node_id.clone()).or_default().push(record);
-                }
-            }
-            ExecEvent::NodeSuspended { node_id, frames, token, color: c, .. } => {
-                if let Some(execs) = executions.get_mut(node_id) {
-                    if let Some(e) = execs
-                        .iter_mut()
-                        .rev()
-                        .find(|e| e.color == *c && &e.frames == frames)
-                    {
-                        e.status = NodeExecutionStatus::WaitingForInput;
-                        e.callback_id = Some(token.clone());
-                    }
-                }
-            }
-            ExecEvent::NodeResumed { node_id, frames, token, pulses_absorbed, color: c, .. } => {
-                let absorbed_uuids = parse_absorbed_ids(
-                    pulses_absorbed,
-                    &mut corruptions,
-                    CorruptionSite::NodeResumed,
-                    *c,
-                );
-                // Flip these pulses to Absorbed in the pulse table, exactly
-                // as the NodeStarted arm does. The live resume dispatch
-                // absorbs them in RAM and journals them here; if the fold
-                // leaves them Pending, a refold on a fresh worker has the
-                // node's record terminal (Completed) yet a Pending pulse at
-                // its (node, frames) location, and `find_ready_nodes` (which
-                // keys purely on Pending pulses, ignoring the record) re-fires
-                // the node: double execution on every respawn. The un-absorb
-                // path (`redispatch_locations`) also assumes resume-time
-                // pulses were folded Absorbed before it flips them back.
-                if !absorbed_uuids.is_empty() {
-                    if let Some(bucket) = pulses.get_mut(node_id) {
-                        for p in bucket.iter_mut() {
-                            if absorbed_uuids.contains(&p.id) && p.status == PulseStatus::Pending {
-                                p.status = PulseStatus::Absorbed;
-                            }
-                        }
-                    }
-                }
-                if let Some(execs) = executions.get_mut(node_id) {
-                    if let Some(e) = execs
-                        .iter_mut()
-                        .rev()
-                        .find(|e| e.color == *c && &e.frames == frames)
-                    {
-                        e.status = NodeExecutionStatus::Running;
-                        e.callback_id = None;
-                        // Extend with newly-absorbed pulse IDs so the
-                        // crashed-Running un-absorb path (lookup by
-                        // ID set in apply_snapshot) restores every
-                        // pulse this resume dispatch consumed, not
-                        // just the originals from NodeStarted.
-                        for id in absorbed_uuids {
-                            if !e.pulses_absorbed.contains(&id) {
-                                e.pulses_absorbed.push(id);
-                            }
-                        }
-                    }
-                }
-                // Only clear suspension state when this resume was
-                // suspension-driven (token present). Crashed-Running
-                // recovery has no token to remove.
-                if let Some(t) = token {
-                    suspensions.remove(t);
-                    pending_deliveries.remove(t);
-                }
-            }
-            ExecEvent::NodeCancelled { node_id, frames, reason, closure_emissions, at_unix, color: c } => {
-                replay_terminal_closures(&mut pulses, &mut corruptions, CorruptionSite::NodeCancelled, *c, closure_emissions);
-                if let Some(execs) = executions.get_mut(node_id) {
-                    if let Some(e) = execs
-                        .iter_mut()
-                        .rev()
-                        .find(|e| e.color == *c && &e.frames == frames)
-                    {
-                        e.status = NodeExecutionStatus::Cancelled;
-                        e.completed_at = Some(*at_unix);
-                        e.error = Some(reason.clone());
-                        e.callback_id = None;
-                    }
-                }
-            }
-            ExecEvent::NodeCompleted { node_id, frames, output, closure_emissions, at_unix, color: c } => {
-                replay_terminal_closures(&mut pulses, &mut corruptions, CorruptionSite::NodeCompleted, *c, closure_emissions);
-                if let Some(execs) = executions.get_mut(node_id) {
-                    if let Some(e) = execs
-                        .iter_mut()
-                        .rev()
-                        .find(|e| e.color == *c && &e.frames == frames)
-                    {
-                        e.status = NodeExecutionStatus::Completed;
-                        e.completed_at = Some(*at_unix);
-                        e.set_output(output);
-                        e.callback_id = None;
-                    }
-                }
-            }
-            ExecEvent::NodeFailed { node_id, frames, error, closure_emissions, at_unix, color: c } => {
-                replay_terminal_closures(&mut pulses, &mut corruptions, CorruptionSite::NodeFailed, *c, closure_emissions);
-                if let Some(execs) = executions.get_mut(node_id) {
-                    if let Some(e) = execs
-                        .iter_mut()
-                        .rev()
-                        .find(|e| e.color == *c && &e.frames == frames)
-                    {
-                        e.status = NodeExecutionStatus::Failed;
-                        e.completed_at = Some(*at_unix);
-                        e.error = Some(error.clone());
-                    }
-                }
-            }
-            ExecEvent::NodeSkipped { node_id, frames, at_unix, color: c, closed_ports: _, reason: _, closure_emissions } => {
-                replay_terminal_closures(&mut pulses, &mut corruptions, CorruptionSite::NodeSkipped, *c, closure_emissions);
-                if let Some(execs) = executions.get_mut(node_id) {
-                    if let Some(e) = execs
-                        .iter_mut()
-                        .rev()
-                        .find(|e| e.color == *c && &e.frames == frames)
-                    {
-                        e.status = NodeExecutionStatus::Skipped;
-                        e.completed_at = Some(*at_unix);
-                    }
-                }
-            }
-            ExecEvent::LoopInstantiated {
-                color: c, group_id, parent_frames, iter_cap, parallel, max_iters,
-                over, carry, trim_on_mismatch, outer_input, initial_carry, ..
-            } => {
-                let key = LoopInstanceKey {
-                    group_id: group_id.clone(),
-                    parent_frames: parent_frames.clone(),
-                    color: *c,
-                };
-                loop_instances
-                    .entry(key)
-                    .or_insert_with(|| LoopInstanceSnapshot {
-                        iter_cap: *iter_cap,
-                        parallel: *parallel,
-                        max_iters: *max_iters,
-                        over: over.clone(),
-                        carry: carry.clone(),
-                        trim_on_mismatch: *trim_on_mismatch,
-                        launched: Vec::new(),
-                        out_fired: Vec::new(),
-                        gather_lists: HashMap::new(),
-                        // Seed the carry slot at instantiation time so a
-                        // resume between LoopInstantiated and the first
-                        // LoopOutFired keeps the initial carry visible
-                        // to the body's first iteration.
-                        carry_values: initial_carry.clone(),
-                        outer_input: outer_input.clone(),
-                        terminated: None,
-                        stream_end: None,
-                    });
-            }
-            ExecEvent::LoopStreamEnded { color: c, group_id, parent_frames, end, .. } => {
-                let key = LoopInstanceKey {
-                    group_id: group_id.clone(),
-                    parent_frames: parent_frames.clone(),
-                    color: *c,
-                };
-                match loop_instances.get_mut(&key) {
-                    Some(inst) => inst.stream_end = Some(end.clone()),
-                    None => report_corruption(
-                        &mut corruptions,
-                        *c,
-                        CorruptionSite::LoopStreamEnded,
-                        format!(
-                            "LoopStreamEnded at group_id={group_id} parent_frames={parent_frames:?} \
-                             with no prior LoopInstantiated"
-                        ),
-                    ),
-                }
-            }
-            ExecEvent::LoopIterationLaunched {
-                color: c, group_id, parent_frames, index, body_emissions, stream_pulse, roots, ..
-            } => {
-                // The body's roots are kicks at the iteration's frames,
-                // in the same atomic row as the pulses.
-                let body_frames = {
-                    let mut f = parent_frames.clone();
-                    f.push(weft_core::frames::LoopIteration { index: *index });
-                    f
-                };
-                for root in roots {
-                    kicked.entry(FiringLocation::new(root.clone(), body_frames.clone())).or_insert_with(|| KickedNode {
-                        firing: false,
-                        payload: None,
-                        port_snapshot: None,
-                        dispatched: false,
-                        scope_skipped: None,
-                    });
-                }
-                // Replay the carried body pulses exactly as the
-                // `PulseEmitted` arm does (same `push_pulse` helper):
-                // marker and pulses are one atomic row, so a fold
-                // either sees both (index in `launched` AND the body
-                // pulses pending) or neither.
-                for e in body_emissions {
-                    push_pulse(
-                        &mut pulses,
-                        &mut corruptions,
-                        CorruptionSite::LoopIterationLaunched,
-                        &e.pulse_id,
-                        *c,
-                        e.frames.clone(),
-                        &e.target_node,
-                        &e.target_port,
-                        e.value.clone(),
-                        e.closed,
-                        e.close_error.clone(),
-                    );
-                }
-                // A stream-driven launch consumed one item pulse; it is
-                // consumed in the SAME atomic row as the launch marker,
-                // so a refold never re-delivers a launched item. The
-                // pulse targets exactly the loop's LoopIn bucket
-                // (`{group_id}__in`, the compiler's boundary id), and
-                // it is REMOVED to match the live table byte for byte
-                // (see the `PulsesConsumed` arm). O(one bucket), not a
-                // scan of every node's pulses per launched iteration.
-                if let Some(sp) = stream_pulse {
-                    match sp.parse::<uuid::Uuid>() {
-                        Ok(id) => {
-                            let loop_in_id = weft_core::project::boundary_in_id(group_id);
-                            match pulses.get_mut(&loop_in_id) {
-                                Some(bucket) => bucket.retain(|p| p.id != id),
-                                None => report_corruption(
-                                    &mut corruptions,
-                                    *c,
-                                    CorruptionSite::LoopIterationLaunched,
-                                    format!(
-                                        "stream_pulse={sp} names a pulse but LoopIn \
-                                         '{loop_in_id}' has no pulse bucket"
-                                    ),
-                                ),
-                            }
-                        }
-                        Err(e) => report_corruption(
-                            &mut corruptions,
-                            *c,
-                            CorruptionSite::LoopIterationLaunched,
-                            format!("stream_pulse={sp:?} unparseable: {e}"),
-                        ),
-                    }
-                }
-                let key = LoopInstanceKey {
-                    group_id: group_id.clone(),
-                    parent_frames: parent_frames.clone(),
-                    color: *c,
-                };
-                match loop_instances.get_mut(&key) {
-                    Some(inst) => {
-                        if !inst.launched.contains(index) {
-                            inst.launched.push(*index);
-                        }
-                    }
-                    None => report_corruption(
-                        &mut corruptions,
-                        *c,
-                        CorruptionSite::LoopIterationLaunched,
-                        format!(
-                            "LoopIterationLaunched at group_id={group_id} parent_frames={parent_frames:?} index={index} with no prior LoopInstantiated"
-                        ),
-                    ),
-                }
-            }
-            ExecEvent::LoopOutFired {
-                color: c, group_id, parent_frames, index, gather_writes, carry_writes, ..
-            } => {
-                let key = LoopInstanceKey {
-                    group_id: group_id.clone(),
-                    parent_frames: parent_frames.clone(),
-                    color: *c,
-                };
-                match loop_instances.get_mut(&key) {
-                    Some(inst) => {
-                        if !inst.out_fired.contains(index) {
-                            inst.out_fired.push(*index);
-                        }
-                        for (port, slot) in gather_writes {
-                            inst.gather_lists
-                                .entry(port.clone())
-                                .or_default()
-                                .insert(*index, slot.clone());
-                        }
-                        // Carry: only Value updates; Closed means
-                        // "keep previous" per the LoopWrite contract.
-                        for (port, slot) in carry_writes {
-                            if let weft_core::primitive::LoopWrite::Value(v) = slot {
-                                inst.carry_values.insert(port.clone(), v.clone());
-                            }
-                        }
-                    }
-                    None => report_corruption(
-                        &mut corruptions,
-                        *c,
-                        CorruptionSite::LoopOutFired,
-                        format!(
-                            "LoopOutFired at group_id={group_id} parent_frames={parent_frames:?} index={index} with no prior LoopInstantiated"
-                        ),
-                    ),
-                }
-            }
-            ExecEvent::LoopTerminated {
-                color: c, group_id, parent_frames, reason, outward_emissions, ..
-            } => {
-                // Replay the carried outward pulses (same atomic
-                // marker+pulses discipline as LoopIterationLaunched):
-                // a fold sees both `terminated` set AND the outward
-                // pulses, or neither, so a crash-resume never re-emits
-                // the loop's outputs.
-                for e in outward_emissions {
-                    push_pulse(
-                        &mut pulses,
-                        &mut corruptions,
-                        CorruptionSite::LoopTerminated,
-                        &e.pulse_id,
-                        *c,
-                        e.frames.clone(),
-                        &e.target_node,
-                        &e.target_port,
-                        e.value.clone(),
-                        e.closed,
-                        e.close_error.clone(),
-                    );
-                }
-                let key = LoopInstanceKey {
-                    group_id: group_id.clone(),
-                    parent_frames: parent_frames.clone(),
-                    color: *c,
-                };
-                match loop_instances.get_mut(&key) {
-                    Some(inst) => inst.terminated = Some(*reason),
-                    None => report_corruption(
-                        &mut corruptions,
-                        *c,
-                        CorruptionSite::LoopTerminated,
-                        format!(
-                            "LoopTerminated at group_id={group_id} parent_frames={parent_frames:?} reason={reason:?} with no prior LoopInstantiated"
-                        ),
-                    ),
-                }
-            }
-            ExecEvent::SuspensionRegistered {
-                node_id, frames, token, spec, call_index, at_unix, ..
-            } => {
-                suspensions.insert(
-                    token.clone(),
-                    SuspensionInfo {
-                        node_id: node_id.clone(),
-                        frames: frames.clone(),
-                        spec: spec.clone(),
-                        created_at_unix: *at_unix,
-                        call_index: *call_index,
-                    },
-                );
-                let key =
-                    weft_core::liveness::FiringLocation::new(node_id.clone(), frames.clone());
-                // Close the out-of-order window: a fire can journal
-                // SuspensionResolved BEFORE the register executor journals
-                // SuspensionRegistered (the two are written by independent
-                // dispatcher paths with no ordering between them). If the
-                // resolution already landed, `pending_deliveries` holds its
-                // value; stamp it now so the entry is born resolved.
-                // Without this, the SuspensionResolved arm found no entry to
-                // mark (not registered yet), the entry lands `resolved:
-                // None`, and the await never resumes (permanent hang, fire
-                // consumed). Making the fold order-insensitive for the
-                // Registered/Resolved pair is the right invariant.
-                let resolved = pending_deliveries.get(token).cloned();
-                awaited_sequences
-                    .entry(key)
-                    .or_default()
-                    .push(weft_core::primitive::AwaitedEntry {
-                        call_index: *call_index,
-                        kind: weft_core::primitive::AwaitedEntryKind::Await {
-                            token: token.clone(),
-                            resolved,
-                        },
-                    });
-            }
-            ExecEvent::RunOutput {
-                node_id, frames, call_index, name, value, ..
-            } => {
-                let key =
-                    weft_core::liveness::FiringLocation::new(node_id.clone(), frames.clone());
-                awaited_sequences
-                    .entry(key)
-                    .or_default()
-                    .push(weft_core::primitive::AwaitedEntry {
-                        call_index: *call_index,
-                        kind: weft_core::primitive::AwaitedEntryKind::Run {
-                            name: name.clone(),
-                            value: value.clone(),
-                        },
-                    });
-            }
-            ExecEvent::SuspensionResolved { token, value, .. } => {
-                pending_deliveries.insert(token.clone(), value.clone());
-                for entries in awaited_sequences.values_mut() {
-                    for entry in entries.iter_mut() {
-                        if let weft_core::primitive::AwaitedEntryKind::Await {
-                            token: t, resolved,
-                        } = &mut entry.kind
-                        {
-                            if t == token {
-                                *resolved = Some(value.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            ExecEvent::PortTypeMismatch { node_id, frames, port, expected, actual, color: c, .. } => {
-                if let Some(execs) = executions.get_mut(node_id) {
-                    if let Some(e) = execs
-                        .iter_mut()
-                        .rev()
-                        .find(|e| e.color == *c && &e.frames == frames)
-                    {
-                        e.port_warnings.push(weft_core::exec::PortWarning {
-                            port: port.clone(),
-                            expected: expected.clone(),
-                            actual: actual.clone(),
-                        });
-                    }
-                }
-            }
-            // A metered call's cost record: the cost of a firing belongs on
-            // its execution record. A record may already be terminal when
-            // the cost lands (a durable RecordCost task journals on its own
-            // timeline); the fold still books it onto the matching
-            // (color, frames) record. An unknown amount (`None`) adds
-            // nothing here (the sum is a number); the honest unknown lives
-            // in the event's own row.
-            ExecEvent::CostReported { color: c, node_id, frames, amount_usd, .. } => {
-                if let Some(amount) = amount_usd {
-                    if let Some(execs) = executions.get_mut(node_id) {
-                        if let Some(e) = execs
-                            .iter_mut()
-                            .rev()
-                            .find(|e| e.color == *c && &e.frames == frames)
-                        {
-                            e.cost_usd += amount;
-                        }
-                    }
-                }
-            }
-            // Observability-only events: they carry no state the resume
-            // fold needs. Bus replay and caller-exchange replay are read
-            // straight from the row stream by the inspector, not from the
-            // snapshot. Caller events are additionally non-durable by
-            // design (a live connection dies with its worker), so they
-            // never contribute to a resumed run's state.
-            ExecEvent::LogLine { .. }
-            | ExecEvent::ExecutionTagged { .. }
-            | ExecEvent::ExecutionCompleted { .. }
-            | ExecEvent::ExecutionFailed { .. }
-            | ExecEvent::ExecutionCancelled { .. }
-            | ExecEvent::BusJoined { .. }
-            | ExecEvent::BusLeft { .. }
-            | ExecEvent::BusWindow { .. }
-            | ExecEvent::BusClosed { .. }
-            | ExecEvent::CallerConnected { .. }
-            | ExecEvent::CallerInbound { .. }
-            | ExecEvent::CallerOutbound { .. }
-            | ExecEvent::CallerErrored { .. }
-            | ExecEvent::CallerDisconnected { .. } => {}
-        }
-    }
-
-    for entries in awaited_sequences.values_mut() {
-        entries.sort_by_key(|e| e.call_index);
-    }
-    ExecutionSnapshot {
-        color,
-        pulses,
-        executions,
-        suspensions,
-        kicked,
-        pending_deliveries,
-        awaited_sequences,
-        loop_instances,
-        corruptions,
-    }
-}
 
 #[cfg(test)]
-mod fold_pulse_tests {
+mod wire_tests {
     use super::*;
     use serde_json::json;
     use uuid::Uuid;
-    use weft_core::frames::{LoopFrames, LoopIteration};
-    use weft_core::pulse::PulseStatus;
 
     fn color() -> Color {
         Uuid::nil()
     }
 
-    fn pulse_id() -> String {
-        Uuid::new_v4().to_string()
+    fn round_trip(ev: ExecEvent) -> Value {
+        let s = serde_json::to_string(&ev).expect("serialize");
+        let back: ExecEvent = serde_json::from_str(&s).expect("deserialize");
+        let again = serde_json::to_string(&back).expect("re-serialize");
+        assert_eq!(s, again, "round trip is stable");
+        serde_json::from_str(&s).expect("json")
     }
 
-    fn frame(index: u32) -> LoopIteration {
-        LoopIteration { index }
-    }
-
-    fn frames(fs: &[LoopIteration]) -> LoopFrames {
-        fs.to_vec()
-    }
-
+    /// Every reshaped row round-trips, and its kind tag is what the
+    /// SQL readers filter on.
     #[test]
-    fn kicked_payload_survives_dispatch_for_resume() {
-        let payload = json!({"body": "hello"});
-        let events = vec![
+    fn reshaped_rows_round_trip() {
+        let frames = vec![weft_core::frames::LoopIteration { index: 2 }];
+        let emission = Uuid::new_v4();
+        let rows = vec![
+            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
+            ExecEvent::NodeCompleted { color: color(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
+            ExecEvent::NodeFailed { color: color(), node_id: "n".into(), frames: frames.clone(), error: "e".into(), at_unix: 1 },
+            ExecEvent::NodeSkipped {
+                color: color(),
+                node_id: "n".into(),
+                frames: frames.clone(),
+                reason: weft_core::exec::skip::SkipReason::ScopeSkipped { scope: "g".into() },
+                at_unix: 1,
+            },
+            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: frames.clone(), token: None, at_unix: 1 },
+            ExecEvent::NodeCancelled { color: color(), node_id: "n".into(), frames: frames.clone(), reason: "r".into(), at_unix: 1 },
+            ExecEvent::PortEmitted {
+                color: color(),
+                emission_id: emission,
+                node_id: "n".into(),
+                frames: frames.clone(),
+                port: "out".into(),
+                value: std::sync::Arc::new(json!({ "nested": { "deep": [1, 2, { "k": null }] } })),
+                at_unix: 1,
+            },
+            ExecEvent::PortClosed { color: color(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), at_unix: 1 },
+            ExecEvent::PortTypeMismatch {
+                color: color(),
+                emission_id: emission,
+                node_id: "n".into(),
+                frames: frames.clone(),
+                port: "out".into(),
+                expected: "String".into(),
+                actual: "Number".into(),
+                at_unix: 1,
+            },
+            ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), at_unix: 1 },
+            ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
+            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, at_unix: 1 },
+            ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
+            ExecEvent::LoopStreamEnded { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), end: weft_core::generator::StreamEnd::Failed { error: "e".into() }, at_unix: 1 },
+            ExecEvent::PulsesConsumed { color: color(), node_id: "n".into(), frames: frames.clone(), pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
+            ExecEvent::ExecutionCompleted { color: color(), at_unix: 1 },
+        ];
+        for row in rows {
+            let kind = row.kind_str();
+            let json = round_trip(row);
+            assert_eq!(json["kind"], kind);
+        }
+    }
+
+    /// A `null` stream pulse is written, so a row that lacks the field
+    /// fails to decode instead of reading as a list launch.
+    #[test]
+    fn a_launch_row_always_carries_its_stream_pulse_field() {
+        let row = ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 0, stream_pulse: None, at_unix: 1 };
+        let json = round_trip(row);
+        assert!(json.get("stream_pulse").is_some_and(Value::is_null));
+        let mut without = json.clone();
+        without.as_object_mut().unwrap().remove("stream_pulse");
+        assert!(serde_json::from_value::<ExecEvent>(without).is_err());
+    }
+
+    /// A resume row always carries its token field (`null` for a
+    /// crash re-run), so a row that lacks it is a truncated row and
+    /// fails to decode instead of reading as a crash re-run.
+    #[test]
+    fn a_resume_row_always_carries_its_token_field() {
+        let row = ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 };
+        let json = round_trip(row);
+        assert!(json.get("token").is_some_and(Value::is_null));
+        let mut without = json.clone();
+        without.as_object_mut().unwrap().remove("token");
+        assert!(serde_json::from_value::<ExecEvent>(without).is_err());
+        let with = ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 };
+        assert_eq!(round_trip(with)["token"], json!("t"));
+    }
+
+    /// A row written to the old shape (a value copy on a lifecycle row,
+    /// a row kind that no longer exists) does not decode: there is no
+    /// compatibility path, the read fails naming the color.
+    #[test]
+    fn old_shapes_are_refused() {
+        let old_started = json!({
+            "kind": "node_started", "color": color(), "node_id": "n", "frames": [],
+            "input": { "in": 1 }, "closed_ports": [], "pulses_absorbed": [], "at_unix": 1
+        });
+        assert!(serde_json::from_value::<ExecEvent>(old_started).is_err(), "a copied input is refused");
+        let old_pulse = json!({
+            "kind": "pulse_emitted", "color": color(), "pulse_id": "x", "source_node": "a", "source_port": "o",
+            "target_node": "b", "target_port": "i", "frames": [], "value": 1, "closed": false, "close_error": null, "at_unix": 1
+        });
+        assert!(serde_json::from_value::<ExecEvent>(old_pulse).is_err(), "the per-wire row is gone");
+        let old_scope = json!({ "kind": "scope_launched", "color": color(), "group_id": "g", "frames": [], "roots": [], "at_unix": 1 });
+        assert!(serde_json::from_value::<ExecEvent>(old_scope).is_err(), "boundaries are never journaled");
+        let err = crate::decode_event(color(), &old_started_text()).unwrap_err();
+        assert!(err.contains("weft clean"), "{err}");
+    }
+
+    fn old_started_text() -> String {
+        json!({ "kind": "node_started", "color": color(), "node_id": "n", "frames": [], "input": {}, "at_unix": 1 }).to_string()
+    }
+
+    /// Every row round-trips, and carries the kind tag the SQL readers
+    /// filter on. The list is checked against the enum: a variant with
+    /// no row here fails the count below.
+    #[test]
+    fn every_row_round_trips() {
+        use weft_core::bus::WirePayload;
+        let spec = weft_core::signal::to_spec(weft_core::signal::Form {
+            form_type: "human_query".into(),
+            schema: weft_core::signal::FormSchema { fields: Vec::new() },
+            title: None,
+            description: None,
+            consumer_kind: None,
+        });
+        let rows = vec![
             ExecEvent::ExecutionStarted {
                 color: color(),
                 project_id: "p".into(),
                 entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::Fire,
-                definition_hash: Some("test-hash".into()),
+                definition_hash: Some("h".into()),
                 node_test: false,
+                subgraph: Some(vec!["out".into(), "src".into()]),
+                at_unix: 7,
+            },
+            ExecEvent::ExecutionStarted {
+                color: color(),
+                project_id: "p".into(),
+                entry_node: "node-test:MyNode::my_test".into(),
+                phase: weft_core::context::Phase::Fire,
+                definition_hash: None,
+                node_test: true,
                 subgraph: None,
-                at_unix: 0,
+                at_unix: 7,
             },
-            ExecEvent::NodeKicked {
+            ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
+            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::LoopIteration { index: 2 }], at_unix: 1 },
+            ExecEvent::NodeCompleted { color: color(), node_id: "n".into(), frames: vec![], at_unix: 1 },
+            ExecEvent::NodeFailed { color: color(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
+            ExecEvent::NodeSkipped { color: color(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into() }, at_unix: 1 },
+            ExecEvent::NodeSuspended { color: color(), node_id: "n".into(), frames: vec![], token: "t".into(), at_unix: 1 },
+            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
+            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
+            ExecEvent::NodeCancelled { color: color(), node_id: "n".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
+            ExecEvent::PortEmitted { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), at_unix: 1 },
+            ExecEvent::PortClosed { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), at_unix: 1 },
+            ExecEvent::PortTypeMismatch { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), expected: "String".into(), actual: "Number".into(), at_unix: 1 },
+            ExecEvent::PulsesConsumed { color: color(), node_id: "n".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
+            ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: vec![], at_unix: 1 },
+            ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
+            ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: None, at_unix: 1 },
+            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: vec![weft_core::frames::LoopIteration { index: 0 }], index: 3, at_unix: 1 },
+            ExecEvent::LoopStreamEnded { color: color(), group_id: "lp".into(), parent_frames: vec![], end: weft_core::primitive::StreamEnd::Failed { error: "upstream".into() }, at_unix: 1 },
+            ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
+            ExecEvent::ExecutionCompleted { color: color(), at_unix: 1 },
+            ExecEvent::SuspensionRegistered { color: color(), node_id: "n".into(), frames: vec![], token: "t".into(), spec, call_index: 2, at_unix: 1 },
+            ExecEvent::SuspensionResolved { color: color(), token: "t".into(), value: json!("v"), at_unix: 1 },
+            ExecEvent::RunOutput { color: color(), node_id: "n".into(), frames: vec![], call_index: 1, name: "decide".into(), value: json!("go-left"), at_unix: 1 },
+            ExecEvent::CostReported {
                 color: color(),
-                node_id: "trigger".into(),
-                firing: true,
-                payload: Some(payload.clone()),
-                port_snapshot: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "trigger".into(),
-                frames: Vec::new(),
-                input: json!({}),
-                pulses_absorbed: vec![],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let kick = snap.kicked.get(&FiringLocation::new("trigger", Vec::new())).expect("trigger kick survives fold");
-        assert!(kick.dispatched, "NodeStarted at root frames consumed the kick");
-        assert_eq!(
-            kick.payload.as_ref(),
-            Some(&payload),
-            "wake payload preserved so resume can replay it into the wake bag"
-        );
-    }
-
-    #[test]
-    fn a_sink_that_emitted_nothing_folds_to_no_output() {
-        // Live, a firing that hands out nothing never writes an output
-        // on its record. The completion row still carries the (empty)
-        // bag, so the fold must land on the same `None`, or a replayed
-        // run holds an explicit "nothing" where the live run held no
-        // note at all.
-        let events = vec![
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "debug".into(),
-                frames: frames(&[]),
-                input: json!({"data": []}),
-                pulses_absorbed: vec![],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::NodeCompleted {
-                color: color(),
-                node_id: "debug".into(),
-                frames: frames(&[]),
-                output: Value::Null,
-                closure_emissions: vec![],
+                node_id: "n".into(),
+                frames: vec![],
+                cost_id: "c".into(),
+                service: "llm".into(),
+                model: Some("m".into()),
+                amount_usd: Some(0.5),
+                billed: true,
+                origin: weft_core::CredentialOwner::TheirOwn,
+                metadata: json!({}),
                 at_unix: 1,
             },
+            ExecEvent::LogLine { color: color(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "hi".into(), at_unix_ms: None, seq: None, at_unix: 1 },
+            ExecEvent::ExecutionTagged { color: color(), tags: vec!["user_1".into()], at_unix: 3 },
+            ExecEvent::ExecutionFailed { color: color(), error: "boom".into(), at_unix: 1 },
+            ExecEvent::ExecutionCancelled { color: color(), reason: "stopped".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 1 },
+            ExecEvent::ExecutionCancelled { color: color(), reason: "stopped".into(), cause: None, at_unix: 1 },
+            ExecEvent::BusJoined { color: color(), bus_id: "b".into(), offset: 0, name: "a".into(), at_unix: 1 },
+            ExecEvent::BusLeft { color: color(), bus_id: "b".into(), offset: 1, name: "a".into(), at_unix: 1 },
+            ExecEvent::BusWindow {
+                color: color(),
+                bus_id: "b".into(),
+                first_offset: 0,
+                last_offset: 1,
+                messages: vec![],
+                totals: Default::default(),
+                at_unix: 1,
+            },
+            ExecEvent::BusClosed { color: color(), bus_id: "b".into(), offset: 2, at_unix: 1 },
+            ExecEvent::CallerConnected { color: color(), offset: 0, protocol: "websocket".into(), at_unix: 7 },
+            ExecEvent::CallerInbound { color: color(), offset: 1, payload: WirePayload::Json(json!({"q": "hi"})), payload_byte_size: 10, at_unix: 8 },
+            ExecEvent::CallerInbound { color: color(), offset: 2, payload: WirePayload::Json(Value::Null), payload_byte_size: 4, at_unix: 9 },
+            ExecEvent::CallerOutbound { color: color(), offset: 3, payload: WirePayload::Json(json!("chunk")), payload_byte_size: 5, terminal: true, at_unix: 10 },
+            ExecEvent::CallerErrored { color: color(), offset: 4, message: "node blew up".into(), at_unix: 11 },
+            ExecEvent::CallerDisconnected { color: color(), offset: 5, reason: "response complete".into(), at_unix: 12 },
         ];
-        let snap = fold_to_snapshot(color(), &events);
-        let execs = snap.executions.get("debug").expect("debug execs");
-        assert_eq!(execs[0].status, weft_core::exec::NodeExecutionStatus::Completed);
-        assert_eq!(execs[0].output, None, "an empty bag is no output, not Some(Null)");
-        assert_eq!(execs[0].input, Some(json!({"data": []})), "the value it received is still on the record");
-    }
-
-    #[test]
-    fn single_emit_then_absorb() {
-        let pid = pulse_id();
-        let events = vec![
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: pid.clone(),
-                source_node: "a".into(),
-                source_port: "out".into(),
-                target_node: "b".into(),
-                target_port: "in".into(),
-                frames: frames(&[]),
-                value: json!(1),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "b".into(),
-                frames: frames(&[]),
-                input: json!({"in": 1}),
-                pulses_absorbed: vec![pid.clone()],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let bucket = snap.pulses.get("b").expect("bucket b");
-        assert_eq!(bucket.len(), 1);
-        assert_eq!(bucket[0].id.to_string(), pid);
-        assert_eq!(bucket[0].status, PulseStatus::Absorbed);
-    }
-
-    #[test]
-    fn lifecycle_one_record_per_frames() {
-        use weft_core::exec::NodeExecutionStatus;
-
-        let pid = pulse_id();
-        let token = "tok-1".to_string();
-        let events = vec![
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: pid.clone(),
-                source_node: "src".into(),
-                source_port: "out".into(),
-                target_node: "review".into(),
-                target_port: "in".into(),
-                frames: frames(&[]),
-                value: json!(42),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                input: json!({"in": 42}),
-                pulses_absorbed: vec![pid],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::NodeSuspended {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                token: token.clone(),
-                at_unix: 0,
-            },
-            ExecEvent::NodeResumed {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                token: Some(token.clone()),
-                value: Some(json!("approved")),
-                pulses_absorbed: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::NodeCompleted {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                output: json!({"decision_approved": true}),
-                closure_emissions: vec![],
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let execs = snap.executions.get("review").expect("review execs");
-        assert_eq!(execs.len(), 1, "one record per (node, frames)");
-        assert_eq!(execs[0].status, NodeExecutionStatus::Completed);
-        assert!(execs[0].output.is_some());
-        assert!(snap.suspensions.is_empty(), "suspensions cleared after resume+complete");
-        assert!(snap.pending_deliveries.is_empty());
-    }
-
-    #[test]
-    fn partial_resume_across_loop_iterations() {
-        use weft_core::exec::NodeExecutionStatus;
-        use weft_core::signal::{to_spec, Form, FormSchema};
-
-        let mut events = Vec::new();
-        let mut tokens = Vec::new();
-        for i in 0..5 {
-            let pid = pulse_id();
-            let body_frames = frames(&[frame(i as u32)]);
-            events.push(ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: pid.clone(),
-                source_node: "loop_in".into(),
-                source_port: "doubled".into(),
-                target_node: "review".into(),
-                target_port: "total".into(),
-                frames: body_frames.clone(),
-                value: json!(i * 8),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            });
-            events.push(ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "review".into(),
-                frames: body_frames.clone(),
-                input: json!({"total": i * 8}),
-                pulses_absorbed: vec![pid],
-                closed_ports: vec![],
-                at_unix: 0,
-            });
-            let tok = format!("tok-{i}");
-            tokens.push(tok.clone());
-            events.push(ExecEvent::NodeSuspended {
-                color: color(),
-                node_id: "review".into(),
-                frames: body_frames.clone(),
-                token: tok.clone(),
-                at_unix: 0,
-            });
-            let spec = to_spec(Form {
-                form_type: "human_query".into(),
-                schema: FormSchema { fields: Vec::new() },
-                title: None,
-                description: None,
-                consumer_kind: None,
-            });
-            events.push(ExecEvent::SuspensionRegistered {
-                color: color(),
-                node_id: "review".into(),
-                frames: body_frames,
-                token: tok,
-                spec,
-                call_index: 0,
-                at_unix: 0,
-            });
+        let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.kind_str()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(kinds.len(), 36, "a variant has no row above: {kinds:?}");
+        for row in rows {
+            let kind = row.kind_str();
+            let json = round_trip(row);
+            assert_eq!(json["kind"], kind);
         }
-        events.push(ExecEvent::SuspensionResolved {
+    }
+
+    /// The fields that are legitimately `None` are still always
+    /// written: a cancel's structured cause and a log line's clock and
+    /// sequence. A row lacking one is a truncated row, and a row
+    /// written before the field existed is an old row; neither decodes.
+    #[test]
+    fn present_optional_fields_are_required_on_the_row() {
+        let cancelled = round_trip(ExecEvent::ExecutionCancelled { color: color(), reason: "r".into(), cause: None, at_unix: 1 });
+        assert!(cancelled.get("cause").is_some_and(Value::is_null));
+        let mut without = cancelled.clone();
+        without.as_object_mut().unwrap().remove("cause");
+        assert!(serde_json::from_value::<ExecEvent>(without).is_err(), "an old cancel row without its cause is refused");
+        let line = round_trip(ExecEvent::LogLine { color: color(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "m".into(), at_unix_ms: None, seq: None, at_unix: 1 });
+        for field in ["node_id", "frames", "at_unix_ms", "seq"] {
+            let mut without = line.clone();
+            without.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<ExecEvent>(without).is_err(), "a log row without '{field}' is refused");
+        }
+        let mut old_skip = round_trip(ExecEvent::NodeSkipped {
             color: color(),
-            token: tokens[2].clone(),
-            value: json!("approved"),
-            at_unix: 0,
-        });
-        events.push(ExecEvent::NodeResumed {
-            color: color(),
-            node_id: "review".into(),
-            frames: frames(&[frame(2)]),
-            token: Some(tokens[2].clone()),
-            value: Some(json!("approved")),
-            pulses_absorbed: vec![],
-            at_unix: 0,
-        });
-        events.push(ExecEvent::NodeCompleted {
-            color: color(),
-            node_id: "review".into(),
-            frames: frames(&[frame(2)]),
-            output: json!({"decision": "approved"}),
-            closure_emissions: vec![],
-            at_unix: 0,
-        });
-
-        let snap = fold_to_snapshot(color(), &events);
-        let execs = snap.executions.get("review").expect("review execs");
-        assert_eq!(execs.len(), 5, "exactly 5 records, one per iteration");
-
-        let by_index: std::collections::HashMap<u32, &weft_core::exec::NodeExecution> = execs
-            .iter()
-            .map(|e| (e.frames[0].index, e))
-            .collect();
-        for i in 0u32..5 {
-            let e = by_index.get(&i).expect("iteration present");
-            if i == 2 {
-                assert_eq!(e.status, NodeExecutionStatus::Completed);
-                assert!(e.callback_id.is_none(), "resolved iteration has no callback");
-            } else {
-                assert_eq!(
-                    e.status,
-                    NodeExecutionStatus::WaitingForInput,
-                    "iteration {i} still parked"
-                );
-                assert!(e.callback_id.is_some());
-            }
-        }
-        assert_eq!(snap.suspensions.len(), 4);
-        assert!(snap.pending_deliveries.is_empty());
-    }
-
-    /// Parallel-loop human-in-the-loop: a `parallel: true` loop launches
-    /// all N lanes upfront, each lane's body node suspends on its OWN
-    /// token at its OWN frame, the signals resolve OUT OF ORDER, and each
-    /// lane resumes independently keyed by exact `(node_id, frames)`. The
-    /// sibling of `partial_resume_across_loop_iterations` for the parallel
-    /// drive mode: this is the path a 5-lane parallel form-wait takes, and
-    /// the one the worker-kill/respawn refold has to reconstruct exactly.
-    /// Pins that resolving lane 3 then lane 0 leaves lanes 1, 2, 4 parked
-    /// at their precise frames, and that the loop instance saw all 5 lanes
-    /// launched (so termination can later fire once all resolve).
-    #[test]
-    fn parallel_loop_lanes_resume_independently_out_of_order() {
-        use weft_core::exec::NodeExecutionStatus;
-        use weft_core::signal::{to_spec, Form, FormSchema};
-
-        let mut events = vec![ExecEvent::LoopInstantiated {
-            color: color(),
-            group_id: "lp".into(),
-            parent_frames: frames(&[]),
-            iter_cap: Some(5),
-            parallel: true,
-            max_iters: None,
-            over: vec!["items".into()],
-            carry: vec![],
-            trim_on_mismatch: true,
-            outer_input: HashMap::from([("items".into(), json!([0, 1, 2, 3, 4]))]),
-            initial_carry: HashMap::new(),
-            at_unix: 0,
-        }];
-
-        let mut tokens = Vec::new();
-        for i in 0u32..5 {
-            let pid = pulse_id();
-            let body_frames = frames(&[frame(i)]);
-            // Each lane is launched atomically with the pulse that wakes
-            // its body node (the parallel-loop launch path).
-            events.push(ExecEvent::LoopIterationLaunched {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                index: i,
-                roots: Vec::new(),
-                body_emissions: vec![LaunchedEmission {
-                    pulse_id: pid.clone(),
-                    source_node: "lp".into(),
-                    source_port: "items".into(),
-                    target_node: "review".into(),
-                    target_port: "total".into(),
-                    frames: body_frames.clone(),
-                    value: json!(i),
-                    closed: false,
-                    close_error: None,
-                }],
-                stream_pulse: None,
-                at_unix: 0,
-            });
-            events.push(ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "review".into(),
-                frames: body_frames.clone(),
-                input: json!({ "total": i }),
-                pulses_absorbed: vec![pid],
-                closed_ports: vec![],
-                at_unix: 0,
-            });
-            let tok = format!("tok-{i}");
-            tokens.push(tok.clone());
-            events.push(ExecEvent::NodeSuspended {
-                color: color(),
-                node_id: "review".into(),
-                frames: body_frames.clone(),
-                token: tok.clone(),
-                at_unix: 0,
-            });
-            let spec = to_spec(Form {
-                form_type: "human_query".into(),
-                schema: FormSchema { fields: Vec::new() },
-                title: None,
-                description: None,
-                consumer_kind: None,
-            });
-            events.push(ExecEvent::SuspensionRegistered {
-                color: color(),
-                node_id: "review".into(),
-                frames: body_frames,
-                token: tok,
-                spec,
-                call_index: 0,
-                at_unix: 0,
-            });
-        }
-
-        // Snapshot the journal length BEFORE any resolution: this prefix
-        // is exactly what a worker that crashed while all 5 lanes were
-        // parked would refold from.
-        let parked_prefix_len = events.len();
-
-        // Signals arrive out of order: lane 3 first, then lane 0. Lanes
-        // 1, 2, 4 never resolve and must stay parked at their frames.
-        for lane in [3u32, 0u32] {
-            events.push(ExecEvent::SuspensionResolved {
-                color: color(),
-                token: tokens[lane as usize].clone(),
-                value: json!("approved"),
-                at_unix: 0,
-            });
-            events.push(ExecEvent::NodeResumed {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[frame(lane)]),
-                token: Some(tokens[lane as usize].clone()),
-                value: Some(json!("approved")),
-                pulses_absorbed: vec![],
-                at_unix: 0,
-            });
-            events.push(ExecEvent::NodeCompleted {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[frame(lane)]),
-                output: json!({ "decision": "approved" }),
-                closure_emissions: vec![],
-                at_unix: 0,
-            });
-        }
-
-        let assert_shape = |snap: &ExecutionSnapshot| {
-            let execs = snap.executions.get("review").expect("review execs");
-            assert_eq!(execs.len(), 5, "exactly 5 records, one per lane");
-            let by_index: std::collections::HashMap<u32, &weft_core::exec::NodeExecution> =
-                execs.iter().map(|e| (e.frames[0].index, e)).collect();
-            for i in 0u32..5 {
-                let e = by_index.get(&i).expect("lane present");
-                if i == 0 || i == 3 {
-                    assert_eq!(
-                        e.status,
-                        NodeExecutionStatus::Completed,
-                        "resolved lane {i} completed"
-                    );
-                    assert!(e.callback_id.is_none(), "resolved lane {i} has no callback");
-                } else {
-                    assert_eq!(
-                        e.status,
-                        NodeExecutionStatus::WaitingForInput,
-                        "unresolved lane {i} still parked at its own frame"
-                    );
-                    assert!(e.callback_id.is_some(), "parked lane {i} keeps its callback");
-                }
-            }
-            // 3 lanes (1, 2, 4) remain suspended; 2 resolved.
-            assert_eq!(snap.suspensions.len(), 3, "three lanes still awaiting input");
-            let key = LoopInstanceKey {
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                color: color(),
-            };
-            let inst = snap.loop_instances.get(&key).expect("loop instance");
-            assert_eq!(inst.launched.len(), 5, "all 5 lanes launched");
-            assert!(
-                inst.terminated.is_none(),
-                "loop cannot terminate while lanes still wait"
-            );
-            assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        };
-
-        let snap = fold_to_snapshot(color(), &events);
-        assert_shape(&snap);
-
-        // Worker-respawn path, meaningfully: fold only the PREFIX (before
-        // any resolution), exactly what a fresh worker rebuilds when the
-        // crash happened with all 5 lanes parked. All 5 must reconstruct
-        // as WaitingForInput at their own frames, and the loop must not
-        // be terminated, so the late resolutions can then land on the
-        // right lanes.
-        let prefix_snap = fold_to_snapshot(color(), &events[..parked_prefix_len]);
-        let prefix_execs = prefix_snap.executions.get("review").expect("review execs");
-        assert_eq!(prefix_execs.len(), 5, "all 5 lanes reconstructed");
-        for e in prefix_execs {
-            assert_eq!(
-                e.status,
-                NodeExecutionStatus::WaitingForInput,
-                "lane {} parked in the pre-resolution prefix",
-                e.frames[0].index
-            );
-            assert!(e.callback_id.is_some(), "parked lane keeps its callback");
-        }
-        assert_eq!(prefix_snap.suspensions.len(), 5, "all 5 lanes awaiting input");
-        let key = LoopInstanceKey {
-            group_id: "lp".into(),
-            parent_frames: frames(&[]),
-            color: color(),
-        };
-        assert!(
-            prefix_snap.loop_instances.get(&key).unwrap().terminated.is_none(),
-            "loop not terminated while every lane is parked"
-        );
-    }
-
-    /// Crash-replay atomicity: `LoopIterationLaunched` carries its
-    /// body pulses in the same row, so a fold sees the index in
-    /// `launched` AND the body pulses together (or neither). Pins
-    /// that the carried pulses materialize exactly once and that
-    /// re-folding the same journal is idempotent (the duplicate-row
-    /// guard in `push_pulse` and the `launched.contains` check).
-    #[test]
-    fn loop_iteration_launched_carries_body_pulses_atomically() {
-        let pid = pulse_id();
-        let events = vec![
-            ExecEvent::LoopInstantiated {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                iter_cap: Some(3),
-                parallel: false,
-                max_iters: None,
-                over: vec!["items".into()],
-                carry: vec![],
-                trim_on_mismatch: true,
-                outer_input: HashMap::from([("items".into(), json!([1, 2, 3]))]),
-                initial_carry: HashMap::new(),
-                at_unix: 0,
-            },
-            ExecEvent::LoopOutFired {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                index: 0,
-                gather_writes: HashMap::new(),
-                carry_writes: HashMap::new(),
-                done_vote: None,
-                at_unix: 0,
-            },
-            ExecEvent::LoopIterationLaunched {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                index: 1,
-                roots: Vec::new(),
-                body_emissions: vec![LaunchedEmission {
-                    pulse_id: pid.clone(),
-                    source_node: "lp".into(),
-                    source_port: "items".into(),
-                    target_node: "body".into(),
-                    target_port: "item".into(),
-                    frames: frames(&[frame(1)]),
-                    value: json!(2),
-                    closed: false,
-                    close_error: None,
-                }],
-                stream_pulse: None,
-                at_unix: 0,
-            },
-        ];
-        let assert_shape = |snap: &ExecutionSnapshot| {
-            let bucket = snap.pulses.get("body").expect("body bucket");
-            assert_eq!(bucket.len(), 1, "carried body pulse materializes exactly once");
-            assert_eq!(bucket[0].id.to_string(), pid);
-            assert_eq!(bucket[0].status, PulseStatus::Pending);
-            assert_eq!(bucket[0].frames, frames(&[frame(1)]));
-            let key = LoopInstanceKey {
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                color: color(),
-            };
-            let inst = snap.loop_instances.get(&key).expect("loop instance");
-            assert_eq!(inst.launched, vec![1], "marker landed with the pulses");
-            assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        };
-        let snap = fold_to_snapshot(color(), &events);
-        assert_shape(&snap);
-        // Re-fold over a journal containing the row twice (the worst
-        // a crash-replayed writer could produce): still one pulse,
-        // still one launched entry.
-        let mut doubled = events.clone();
-        doubled.push(events[2].clone());
-        let snap2 = fold_to_snapshot(color(), &doubled);
-        assert_shape(&snap2);
-    }
-
-    #[test]
-    fn loop_terminated_carries_outward_pulses_atomically() {
-        // Mirror of the launch test for the TERMINATION crash window:
-        // the loop's outward pulses ride inside the LoopTerminated row,
-        // so a fold sees both `terminated` set AND the outward pulses
-        // (or neither). A crash that left the outward pulses without the
-        // terminal row would otherwise re-fire LoopOut and double-emit.
-        let pid = pulse_id();
-        let events = vec![
-            ExecEvent::LoopInstantiated {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                iter_cap: Some(1),
-                parallel: false,
-                max_iters: None,
-                over: vec!["items".into()],
-                carry: vec![],
-                trim_on_mismatch: true,
-                outer_input: HashMap::from([("items".into(), json!([1]))]),
-                initial_carry: HashMap::new(),
-                at_unix: 0,
-            },
-            ExecEvent::LoopTerminated {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                reason: weft_core::primitive::LoopTerminationReason::OverExhausted,
-                outward_emissions: vec![LaunchedEmission {
-                    pulse_id: pid.clone(),
-                    source_node: "lp__out".into(),
-                    source_port: "results".into(),
-                    target_node: "sink".into(),
-                    target_port: "in".into(),
-                    frames: frames(&[]),
-                    value: json!([10]),
-                    closed: false,
-                    close_error: None,
-                }],
-                at_unix: 0,
-            },
-        ];
-        let assert_shape = |snap: &ExecutionSnapshot| {
-            let bucket = snap.pulses.get("sink").expect("sink bucket");
-            assert_eq!(bucket.len(), 1, "outward pulse materializes exactly once");
-            assert_eq!(bucket[0].id.to_string(), pid);
-            assert_eq!(bucket[0].status, PulseStatus::Pending);
-            let key = LoopInstanceKey {
-                group_id: "lp".into(),
-                parent_frames: frames(&[]),
-                color: color(),
-            };
-            let inst = snap.loop_instances.get(&key).expect("loop instance");
-            assert!(inst.terminated.is_some(), "terminated landed with the pulses");
-            assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        };
-        let snap = fold_to_snapshot(color(), &events);
-        assert_shape(&snap);
-        // Double the terminal row (worst a crash-replay could produce):
-        // still one outward pulse, still terminated.
-        let mut doubled = events.clone();
-        doubled.push(events[1].clone());
-        let snap2 = fold_to_snapshot(color(), &doubled);
-        assert_shape(&snap2);
-    }
-
-    #[test]
-    fn node_failed_carries_closure_pulses_atomically() {
-        use weft_core::exec::NodeExecutionStatus;
-        // A failed firing's unmentioned-port closures ride inside the
-        // NodeFailed row, so a fold sees the terminal AND the closures
-        // (or neither). Without this, a crash between two writes loses
-        // the closures and downstream refolds Stuck.
-        let pid = pulse_id();
-        let events = vec![
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "n".into(),
-                frames: frames(&[]),
-                input: json!({}),
-                pulses_absorbed: vec![],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::NodeFailed {
-                color: color(),
-                node_id: "n".into(),
-                frames: frames(&[]),
-                error: "boom".into(),
-                closure_emissions: vec![LaunchedEmission {
-                    pulse_id: pid.clone(),
-                    source_node: "n".into(),
-                    source_port: "out".into(),
-                    target_node: "downstream".into(),
-                    target_port: "in".into(),
-                    frames: frames(&[]),
-                    value: json!(null),
-                    closed: true,
-                    close_error: None,
-                }],
-                at_unix: 0,
-            },
-        ];
-        let assert_shape = |snap: &ExecutionSnapshot| {
-            let bucket = snap.pulses.get("downstream").expect("downstream bucket");
-            assert_eq!(bucket.len(), 1, "closure pulse materializes exactly once");
-            assert_eq!(bucket[0].id.to_string(), pid);
-            assert!(bucket[0].closed, "closure pulse is closed");
-            let rec = &snap.executions.get("n").expect("n record")[0];
-            assert_eq!(rec.status, NodeExecutionStatus::Failed);
-            assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        };
-        assert_shape(&fold_to_snapshot(color(), &events));
-        // Double the terminal row: still one closure, still Failed.
-        let mut doubled = events.clone();
-        doubled.push(events[1].clone());
-        assert_shape(&fold_to_snapshot(color(), &doubled));
-    }
-
-    fn make_spec() -> SignalSpec {
-        use weft_core::signal::{to_spec, Form, FormSchema};
-        to_spec(Form {
-            form_type: "human_query".into(),
-            schema: FormSchema { fields: Vec::new() },
-            title: None,
-            description: None,
-            consumer_kind: None,
-        })
-    }
-
-    /// Mid-suspension snapshot: a (node, frames) is parked. The
-    /// fold should leave the record in WaitingForInput, with the
-    /// suspension info preserved in `suspensions`. No completed_at.
-    #[test]
-    fn lifecycle_mid_suspension_state() {
-        use weft_core::exec::NodeExecutionStatus;
-
-        let pid = pulse_id();
-        let token = "tok-park".to_string();
-        let events = vec![
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: pid.clone(),
-                source_node: "src".into(),
-                source_port: "out".into(),
-                target_node: "review".into(),
-                target_port: "in".into(),
-                frames: frames(&[]),
-                value: json!(7),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                input: json!({"in": 7}),
-                pulses_absorbed: vec![pid],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::NodeSuspended {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                token: token.clone(),
-                at_unix: 0,
-            },
-            ExecEvent::SuspensionRegistered {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                token: token.clone(),
-                spec: make_spec(),
-                call_index: 0,
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let execs = snap.executions.get("review").expect("review execs");
-        assert_eq!(execs.len(), 1);
-        assert_eq!(execs[0].status, NodeExecutionStatus::WaitingForInput);
-        assert_eq!(execs[0].callback_id.as_deref(), Some(token.as_str()));
-        assert!(execs[0].completed_at.is_none());
-        assert_eq!(snap.suspensions.len(), 1);
-    }
-
-    /// A node firing journals a SEQUENCE of awaits/runs:
-    ///   await_signal #0 -> (resolved with "first")
-    ///   ctx.run #1 ("decide") -> journaled "go-left"
-    ///   await_signal #2 -> (still pending, the live tail)
-    /// should produce a per-(node, frames) sequence with 3 entries
-    /// in call_index order, two flagged as resolved/run-output and
-    /// the tail as pending await.
-    #[test]
-    fn multi_await_replay_sequence() {
-        use weft_core::primitive::AwaitedEntryKind;
-
-        let token0 = "tok-0".to_string();
-        let token2 = "tok-2".to_string();
-        let f = frames(&[]);
-        let events = vec![
-            ExecEvent::SuspensionRegistered {
-                color: color(),
-                node_id: "review".into(),
-                frames: f.clone(),
-                token: token0.clone(),
-                spec: make_spec(),
-                call_index: 0,
-                at_unix: 0,
-            },
-            ExecEvent::SuspensionResolved {
-                color: color(),
-                token: token0.clone(),
-                value: json!("first"),
-                at_unix: 0,
-            },
-            ExecEvent::RunOutput {
-                color: color(),
-                node_id: "review".into(),
-                frames: f.clone(),
-                call_index: 1,
-                name: "decide".into(),
-                value: json!("go-left"),
-                at_unix: 0,
-            },
-            ExecEvent::SuspensionRegistered {
-                color: color(),
-                node_id: "review".into(),
-                frames: f.clone(),
-                token: token2.clone(),
-                spec: make_spec(),
-                call_index: 2,
-                at_unix: 0,
-            },
-        ];
-
-        let snap = fold_to_snapshot(color(), &events);
-        let key = weft_core::liveness::FiringLocation::new("review", f.clone());
-        let seq = snap
-            .awaited_sequences
-            .get(&key)
-            .expect("sequence for (review, frames)");
-        assert_eq!(seq.len(), 3, "three observable points journaled");
-
-        // Entry 0: await resolved with "first".
-        assert_eq!(seq[0].call_index, 0);
-        match &seq[0].kind {
-            AwaitedEntryKind::Await { token, resolved } => {
-                assert_eq!(token, &token0);
-                assert_eq!(resolved.as_ref().expect("resolved"), &json!("first"));
-            }
-            other => panic!("expected Await at 0, got {other:?}"),
-        }
-        // Entry 1: run output journaled.
-        assert_eq!(seq[1].call_index, 1);
-        match &seq[1].kind {
-            AwaitedEntryKind::Run { name, value } => {
-                assert_eq!(name, "decide");
-                assert_eq!(value, &json!("go-left"));
-            }
-            other => panic!("expected Run at 1, got {other:?}"),
-        }
-        // Entry 2: await still pending (resolved=None, the tail).
-        assert_eq!(seq[2].call_index, 2);
-        match &seq[2].kind {
-            AwaitedEntryKind::Await { token, resolved } => {
-                assert_eq!(token, &token2);
-                assert!(resolved.is_none(), "tail entry not yet resolved");
-            }
-            other => panic!("expected Await at 2, got {other:?}"),
-        }
-
-        // suspensions map still tracks both tokens (only NodeResumed
-        // clears one); pending_deliveries holds token0's value.
-        assert_eq!(snap.suspensions.len(), 2);
-        assert!(snap.suspensions.contains_key(&token0));
-        assert!(snap.suspensions.contains_key(&token2));
-        assert_eq!(snap.pending_deliveries.get(&token0), Some(&json!("first")));
-    }
-
-    /// Pulses absorbed by a resume dispatch must fold to Absorbed.
-    /// The bug left resume-time pulses Pending after a refold, so a
-    /// fresh worker's `find_ready_nodes` (which keys purely on
-    /// Pending pulses) re-fired an already-completed node on every
-    /// respawn: double execution.
-    #[test]
-    fn node_resumed_absorbs_pulses() {
-        let p1 = pulse_id();
-        let p2 = pulse_id();
-        let token = "tok-resume".to_string();
-        let events = vec![
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: p1.clone(),
-                source_node: "src".into(),
-                source_port: "out".into(),
-                target_node: "review".into(),
-                target_port: "in".into(),
-                frames: frames(&[]),
-                value: json!(1),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                input: json!({"in": 1}),
-                pulses_absorbed: vec![p1],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::NodeSuspended {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                token: token.clone(),
-                at_unix: 0,
-            },
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: p2.clone(),
-                source_node: "other".into(),
-                source_port: "out".into(),
-                target_node: "review".into(),
-                target_port: "extra".into(),
-                frames: frames(&[]),
-                value: json!(2),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeResumed {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                token: Some(token),
-                value: Some(json!("approved")),
-                pulses_absorbed: vec![p2],
-                at_unix: 0,
-            },
-            ExecEvent::NodeCompleted {
-                color: color(),
-                node_id: "review".into(),
-                frames: frames(&[]),
-                output: json!({"done": true}),
-                closure_emissions: vec![],
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let bucket = snap.pulses.get("review").expect("review pulse bucket");
-        assert_eq!(bucket.len(), 2);
-        for p in bucket {
-            assert_eq!(
-                p.status,
-                PulseStatus::Absorbed,
-                "pulse on port '{}' must fold Absorbed, not stay Pending",
-                p.target_port
-            );
-        }
-    }
-
-    /// A second NodeStarted at the same (node, frames) AFTER a
-    /// terminal record is a legitimate second firing and must open a
-    /// NEW record. The bug collapsed it onto the terminal record,
-    /// silently dropping the second firing's work on refold.
-    #[test]
-    fn node_started_after_terminal_opens_new_record() {
-        use weft_core::exec::NodeExecutionStatus;
-
-        let p1 = pulse_id();
-        let p2 = pulse_id();
-        let events = vec![
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: p1.clone(),
-                source_node: "src".into(),
-                source_port: "out".into(),
-                target_node: "consumer".into(),
-                target_port: "in".into(),
-                frames: frames(&[]),
-                value: json!(1),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "consumer".into(),
-                frames: frames(&[]),
-                input: json!({"in": 1}),
-                pulses_absorbed: vec![p1],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::NodeCompleted {
-                color: color(),
-                node_id: "consumer".into(),
-                frames: frames(&[]),
-                output: json!({"n": 1}),
-                closure_emissions: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: p2.clone(),
-                source_node: "src".into(),
-                source_port: "out".into(),
-                target_node: "consumer".into(),
-                target_port: "in".into(),
-                frames: frames(&[]),
-                value: json!(2),
-                closed: false,
-                close_error: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "consumer".into(),
-                frames: frames(&[]),
-                input: json!({"in": 2}),
-                pulses_absorbed: vec![p2],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let execs = snap.executions.get("consumer").expect("consumer execs");
-        assert_eq!(execs.len(), 2, "second firing opens a second record");
-        assert_eq!(execs[0].status, NodeExecutionStatus::Completed);
-        assert_eq!(execs[1].status, NodeExecutionStatus::Running);
-    }
-
-    /// First kick wins; a second NodeKicked on the same node is a
-    /// true no-op. The bug filled the entry's payload from the
-    /// second kick, papering over a writer-level double-kick.
-    #[test]
-    fn node_kicked_second_kick_is_noop() {
-        let events = vec![
-            ExecEvent::NodeKicked {
-                color: color(),
-                node_id: "trigger".into(),
-                firing: false,
-                payload: None,
-                port_snapshot: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeKicked {
-                color: color(),
-                node_id: "trigger".into(),
-                firing: true,
-                payload: Some(json!({"body": "late"})),
-                port_snapshot: None,
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let kick = snap.kicked.get(&FiringLocation::new("trigger", Vec::new())).expect("trigger kick");
-        assert!(kick.payload.is_none(), "first kick's payload (None) is authoritative");
-    }
-
-    /// Regression: a fire whose body is EMPTY journals `"payload": null`,
-    /// which `Option<Value>` reads back as `None`. The firing-ness must
-    /// survive the JSON round trip via the explicit flag, or the firing
-    /// trigger is mistaken for an idle one and closed instead of run
-    /// (the live-WebSocket echo bug).
-    #[test]
-    fn a_null_payload_fire_survives_the_wire_round_trip() {
-        let ev = ExecEvent::NodeKicked {
-            color: color(),
-            node_id: "sock".into(),
-            firing: true,
-            payload: Some(Value::Null),
-            port_snapshot: None,
-            at_unix: 0,
-        };
-        let back: ExecEvent =
-            serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
-        let ExecEvent::NodeKicked { firing, payload, .. } = &back else {
-            panic!("wrong variant: {back:?}");
-        };
-        assert!(*firing, "the explicit flag carries firing-ness");
-        assert!(payload.is_none(), "Some(Null) collapses to None over JSON; that is WHY the flag exists");
-        let snap = fold_to_snapshot(color(), &[back]);
-        assert!(snap.kicked.get(&FiringLocation::new("sock", Vec::new())).expect("kick").firing);
-    }
-
-    /// A scope launch is a kick per body root at the scope's frames,
-    /// consumed by a NodeStarted at that exact location; a loop's
-    /// launch row carries its roots the same way, at the iteration's
-    /// frames. A gated scope's members fold as kicks that skip.
-    #[test]
-    fn scope_launches_fold_into_kicks_at_their_frames() {
-        let events = vec![
-            ExecEvent::ScopeLaunched {
-                color: color(),
-                group_id: "g".into(),
-                frames: Vec::new(),
-                roots: vec!["g.seed".into()],
-                skipped_by: None,
-                at_unix: 0,
-            },
-            ExecEvent::LoopIterationLaunched {
-                color: color(),
-                group_id: "l".into(),
-                parent_frames: Vec::new(),
-                index: 2,
-                body_emissions: Vec::new(),
-                roots: vec!["l.seed".into()],
-                stream_pulse: None,
-                at_unix: 0,
-            },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "l.seed".into(),
-                frames: frames(&[LoopIteration { index: 2 }]),
-                input: json!({}),
-                pulses_absorbed: vec![],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
-            ExecEvent::ScopeLaunched {
-                color: color(),
-                group_id: "off".into(),
-                frames: Vec::new(),
-                roots: vec!["off.a".into()],
-                skipped_by: Some("off".into()),
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let seed = snap.kicked.get(&FiringLocation::new("g.seed", Vec::new())).expect("group root kicked");
-        assert!(!seed.dispatched && seed.scope_skipped.is_none());
-        let iter_seed = snap
-            .kicked
-            .get(&FiringLocation::new("l.seed", frames(&[LoopIteration { index: 2 }])))
-            .expect("loop root kicked at the iteration's frames");
-        assert!(iter_seed.dispatched, "the NodeStarted at that location consumed it");
-        assert!(!snap.kicked.contains_key(&FiringLocation::new("l.seed", Vec::new())), "never at the root frames");
-        let gated = snap.kicked.get(&FiringLocation::new("off.a", Vec::new())).expect("gated member kicked");
-        assert_eq!(gated.scope_skipped.as_deref(), Some("off"));
-    }
-
-    /// SuspensionResolved and SuspensionRegistered are written by
-    /// independent dispatcher paths with no ordering between them.
-    /// When the resolution lands FIRST, the awaited entry must still
-    /// be born resolved (the bug left it `resolved: None`: the await
-    /// never resumed, permanent hang with the fire consumed).
-    #[test]
-    fn suspension_resolved_before_registered_still_resolves() {
-        use weft_core::primitive::AwaitedEntryKind;
-
-        let token = "tok-early".to_string();
-        let f = frames(&[]);
-        let events = vec![
-            ExecEvent::SuspensionResolved {
-                color: color(),
-                token: token.clone(),
-                value: json!("early-value"),
-                at_unix: 0,
-            },
-            ExecEvent::SuspensionRegistered {
-                color: color(),
-                node_id: "review".into(),
-                frames: f.clone(),
-                token: token.clone(),
-                spec: make_spec(),
-                call_index: 0,
-                at_unix: 0,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        let key = weft_core::liveness::FiringLocation::new("review", f);
-        let seq = snap.awaited_sequences.get(&key).expect("awaited sequence");
-        assert_eq!(seq.len(), 1);
-        match &seq[0].kind {
-            AwaitedEntryKind::Await { token: t, resolved } => {
-                assert_eq!(t, &token);
-                assert_eq!(
-                    resolved.as_ref().expect("entry born resolved despite out-of-order journal"),
-                    &json!("early-value")
-                );
-            }
-            other => panic!("expected Await, got {other:?}"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod caller_event_wire_tests {
-    use super::*;
-    use uuid::Uuid;
-    use weft_core::bus::WirePayload;
-
-    fn color() -> Color {
-        Uuid::nil()
-    }
-
-    /// Every caller event round-trips through JSON unchanged. This is the
-    /// cross-process wire contract (worker writes the journal, dispatcher
-    /// folds and projects it); a renamed field would silently break
-    /// inspector replay.
-    fn round_trip(ev: ExecEvent) {
-        let json = serde_json::to_string(&ev).expect("serialize");
-        let back: ExecEvent = serde_json::from_str(&json).expect("deserialize");
-        // Compare via re-serialization (ExecEvent isn't PartialEq).
-        assert_eq!(
-            serde_json::to_value(&ev).unwrap(),
-            serde_json::to_value(&back).unwrap(),
-            "round-trip changed the shape: {json}"
-        );
-    }
-
-    /// A cancel carries WHO: the structured cause rides the wire beside
-    /// the text, and a row written before the field existed (text only)
-    /// still decodes with `cause: None`, so old journals stay readable.
-    #[test]
-    fn execution_cancelled_round_trips_its_cause_and_reads_old_rows() {
-        let color = Color::new_v4();
-        let by = Color::new_v4();
-        round_trip(ExecEvent::ExecutionCancelled {
-            color,
-            reason: "Stopped by execution".into(),
-            cause: Some(weft_core::exec::CancelCause::Execution { by, tag: "user_1".into() }),
-            at_unix: 7,
-        });
-        let old_row = serde_json::json!({
-            "kind": "execution_cancelled",
-            "color": color,
-            "reason": "Cancelled by user",
-            "at_unix": 7
-        });
-        let decoded: ExecEvent = serde_json::from_value(old_row).expect("old row decodes");
-        match decoded {
-            ExecEvent::ExecutionCancelled { cause, reason, .. } => {
-                assert_eq!(cause, None);
-                assert_eq!(reason, "Cancelled by user");
-            }
-            other => panic!("decoded as {other:?}"),
-        }
-        // A cause-less row does not grow a `cause: null` on the wire.
-        let json = serde_json::to_value(ExecEvent::ExecutionCancelled {
-            color,
-            reason: "x".into(),
-            cause: None,
+            node_id: "n".into(),
+            frames: vec![],
+            reason: weft_core::exec::skip::SkipReason::DidNotFlow,
             at_unix: 1,
-        })
-        .unwrap();
-        assert!(json.get("cause").is_none(), "{json}");
-    }
-
-    /// Tagging is a journaled act with its own kind, and it is NOT
-    /// execution state: the fold ignores it.
-    #[test]
-    fn execution_tagged_round_trips_and_does_not_fold() {
-        let color = Color::new_v4();
-        let ev = ExecEvent::ExecutionTagged {
-            color,
-            tags: vec!["user_1".into(), "exp_7".into()],
-            at_unix: 3,
-        };
-        assert_eq!(ev.kind_str(), "execution_tagged");
-        assert_eq!(ev.color(), color);
-        round_trip(ev.clone());
-        let snapshot = fold_to_snapshot(color, &[ev]);
-        assert!(snapshot.executions.is_empty());
-        assert!(snapshot.corruptions.is_empty());
-    }
-
-    /// A skip carries WHY, and the reason survives the wire with its
-    /// payload: the inspector reads `did_not_flow` (a decision) apart
-    /// from `required_input_closed` (a consequence), and the port name
-    /// rides along.
-    #[test]
-    fn node_skipped_round_trips_its_reason() {
-        for reason in [
-            weft_core::exec::skip::SkipReason::DidNotFlow,
-            weft_core::exec::skip::SkipReason::FlowClosed,
-            weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "answer".into() },
-            weft_core::exec::skip::SkipReason::EveryInputClosed,
-            weft_core::exec::skip::SkipReason::OneOfGroupClosed {
-                ports: vec!["email".into(), "phone".into()],
-            },
-            weft_core::exec::skip::SkipReason::ScopeSkipped { scope: "g".into() },
-        ] {
-            let skipped = ExecEvent::NodeSkipped {
-                color: color(),
-                node_id: "reply".into(),
-                frames: Vec::new(),
-                closed_ports: vec!["answer".into()],
-                reason: Some(reason.clone()),
-                closure_emissions: Vec::new(),
-                at_unix: 3,
-            };
-            let json = serde_json::to_value(&skipped).unwrap();
-            assert!(
-                json["reason"]["kind"].is_string(),
-                "the reason is tagged by `kind` so a reader can switch on it: {json}"
-            );
-            round_trip(skipped);
-        }
-
-        // The payload survives, not just the tag.
-        let with_port = serde_json::to_value(ExecEvent::NodeSkipped {
-            color: color(),
-            node_id: "reply".into(),
-            frames: Vec::new(),
-            closed_ports: Vec::new(),
-            reason: Some(weft_core::exec::skip::SkipReason::RequiredInputClosed {
-                port: "answer".into(),
-            }),
-            closure_emissions: Vec::new(),
-            at_unix: 3,
-        })
-        .unwrap();
-        assert_eq!(with_port["reason"]["kind"], "required_input_closed");
-        assert_eq!(with_port["reason"]["port"], "answer");
-
-        // A row from before the field existed (no `reason` key) still
-        // decodes: journal rows are frozen history.
-        let old = serde_json::json!({
-            "kind": "node_skipped",
-            "color": color(),
-            "node_id": "reply",
-            "frames": [],
-            "closed_ports": [],
-            "closure_emissions": [],
-            "at_unix": 3,
         });
-        let decoded: ExecEvent = serde_json::from_value(old).expect("old row decodes");
-        assert!(matches!(decoded, ExecEvent::NodeSkipped { reason: None, .. }));
-    }
-
-    /// `ExecutionStarted` in both shapes: a project run (hash present,
-    /// `node_test` omitted from the wire since it is false) and a node
-    /// self-test (no hash, `node_test: true` on the wire).
-    #[test]
-    fn execution_started_round_trips_both_kinds() {
-        let started = ExecEvent::ExecutionStarted {
-            color: color(),
-            project_id: "p".into(),
-            entry_node: "trigger".into(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: Some("h".into()),
-            node_test: false,
-            subgraph: None,
-            at_unix: 7,
-        };
-        let json = serde_json::to_value(&started).unwrap();
-        assert!(json.get("node_test").is_none(), "false is omitted from the wire: {json}");
-        assert!(json.get("subgraph").is_none(), "no subgraph is omitted from the wire: {json}");
-        round_trip(started);
-
-        // A manual run aimed at targets journals its subgraph as scope.
-        let scoped = ExecEvent::ExecutionStarted {
-            color: color(),
-            project_id: "p".into(),
-            entry_node: "src".into(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: Some("h".into()),
-            node_test: false,
-            subgraph: Some(vec!["out".into(), "src".into()]),
-            at_unix: 7,
-        };
-        round_trip(scoped);
-
-        let test_started = ExecEvent::ExecutionStarted {
-            color: color(),
-            project_id: "p".into(),
-            entry_node: "node-test:MyNode::my_test".into(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: None,
-            node_test: true,
-            subgraph: None,
-            at_unix: 7,
-        };
-        let json = serde_json::to_value(&test_started).unwrap();
-        assert_eq!(json["node_test"], true, "{json}");
-        assert_eq!(json["definition_hash"], serde_json::Value::Null, "{json}");
-        round_trip(test_started);
-    }
-
-    #[test]
-    fn connected_round_trips() {
-        round_trip(ExecEvent::CallerConnected {
-            color: color(),
-            offset: 0,
-            protocol: "websocket".into(),
-            at_unix: 7,
-        });
-    }
-
-    #[test]
-    fn inbound_json_and_null_round_trip() {
-        round_trip(ExecEvent::CallerInbound {
-            color: color(),
-            offset: 1,
-            payload: WirePayload::Json(serde_json::json!({"q": "hi"})),
-            payload_byte_size: 10,
-            at_unix: 8,
-        });
-        // A literal JSON null payload is a real value and must survive
-        // the round trip (the tagged wire shape keeps it explicit).
-        round_trip(ExecEvent::CallerInbound {
-            color: color(),
-            offset: 2,
-            payload: WirePayload::Json(serde_json::Value::Null),
-            payload_byte_size: 4,
-            at_unix: 9,
-        });
-    }
-
-    #[test]
-    fn outbound_terminal_flag_round_trips() {
-        round_trip(ExecEvent::CallerOutbound {
-            color: color(),
-            offset: 3,
-            payload: WirePayload::Json(serde_json::json!("chunk")),
-            payload_byte_size: 5,
-            terminal: true,
-            at_unix: 10,
-        });
-    }
-
-    #[test]
-    fn errored_and_disconnected_round_trip() {
-        round_trip(ExecEvent::CallerErrored {
-            color: color(),
-            offset: 4,
-            message: "node blew up".into(),
-            at_unix: 11,
-        });
-        round_trip(ExecEvent::CallerDisconnected {
-            color: color(),
-            offset: 5,
-            reason: "response complete".into(),
-            at_unix: 12,
-        });
-    }
-
-    #[test]
-    fn kind_str_is_stable_for_caller_events() {
-        // The kind string is the durable DB discriminant; a drift would
-        // orphan existing rows.
-        assert_eq!(
-            ExecEvent::CallerConnected {
-                color: color(), offset: 0, protocol: "http".into(), at_unix: 0,
-            }
-            .kind_str(),
-            "caller_connected"
-        );
-        assert_eq!(
-            ExecEvent::CallerDisconnected {
-                color: color(), offset: 0, reason: String::new(), at_unix: 0,
-            }
-            .kind_str(),
-            "caller_disconnected"
-        );
-    }
-
-    #[test]
-    fn caller_events_are_observability_only_in_fold() {
-        // Folding a stream of caller events must not panic and must not
-        // synthesize node/pulse state (they are non-durable, replay-only).
-        let events = vec![
-            ExecEvent::CallerConnected {
-                color: color(), offset: 0, protocol: "http".into(), at_unix: 0,
-            },
-            ExecEvent::CallerInbound {
-                color: color(), offset: 1,
-                payload: WirePayload::Json(serde_json::json!("hi")),
-                payload_byte_size: 4, at_unix: 1,
-            },
-            ExecEvent::CallerDisconnected {
-                color: color(), offset: 2, reason: "done".into(), at_unix: 2,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        assert!(snap.executions.is_empty(), "caller events create no node state");
-        assert!(snap.corruptions.is_empty(), "caller events fold cleanly");
-    }
-
-    /// The stream wire shapes round-trip with their INTERESTING states
-    /// populated: a failed stream close, a stream-driven launch, a
-    /// consume row, and the durable stream end. Fixtures elsewhere use
-    /// `None` everywhere, which never exercises the field's encoding.
-    #[test]
-    fn stream_wire_shapes_round_trip() {
-        round_trip(ExecEvent::PulsesConsumed {
-            color: color(),
-            node_id: "consumer".into(),
-            frames: vec![],
-            pulse_ids: vec![uuid::Uuid::new_v4().to_string()],
-            at_unix: 7,
-        });
-        round_trip(ExecEvent::PulseEmitted {
-            color: color(),
-            pulse_id: uuid::Uuid::new_v4().to_string(),
-            source_node: "producer".into(),
-            source_port: "rows".into(),
-            target_node: "consumer".into(),
-            target_port: "in".into(),
-            frames: vec![],
-            value: serde_json::Value::Null,
-            closed: true,
-            close_error: Some("boom".into()),
-            at_unix: 7,
-        });
-        round_trip(ExecEvent::LoopIterationLaunched {
-            color: color(),
-            group_id: "lp".into(),
-            parent_frames: vec![],
-            index: 3,
-            roots: Vec::new(),
-            body_emissions: vec![LaunchedEmission {
-                pulse_id: uuid::Uuid::new_v4().to_string(),
-                source_node: "lp__in".into(),
-                source_port: "item".into(),
-                target_node: "body".into(),
-                target_port: "n".into(),
-                frames: vec![weft_core::frames::LoopIteration { index: 3 }],
-                value: serde_json::json!(42),
-                closed: false,
-                close_error: None,
-            }],
-            stream_pulse: Some(uuid::Uuid::new_v4().to_string()),
-            at_unix: 7,
-        });
-        round_trip(ExecEvent::LoopStreamEnded {
-            color: color(),
-            group_id: "lp".into(),
-            parent_frames: vec![],
-            end: weft_core::primitive::StreamEnd::Failed { error: "upstream broke".into() },
-            at_unix: 7,
-        });
-        round_trip(ExecEvent::LoopStreamEnded {
-            color: color(),
-            group_id: "lp".into(),
-            parent_frames: vec![],
-            end: weft_core::primitive::StreamEnd::Finished,
-            at_unix: 8,
-        });
-    }
-
-    /// `PulsesConsumed` folds as REMOVAL, byte-identical to the live
-    /// table (a refolded long stream must not carry a tombstone per
-    /// spent item), and the durable `LoopStreamEnded` lands on the
-    /// instance snapshot so a resumed loop knows its stream ended.
-    #[test]
-    fn pulses_consumed_removes_and_loop_stream_end_is_durable() {
-        let pid = uuid::Uuid::new_v4();
-        let events = vec![
-            ExecEvent::LoopInstantiated {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: vec![],
-                iter_cap: None,
-                parallel: false,
-                max_iters: None,
-                over: vec!["rows".into()],
-                carry: vec![],
-                trim_on_mismatch: true,
-                outer_input: HashMap::new(),
-                initial_carry: HashMap::new(),
-                at_unix: 0,
-            },
-            ExecEvent::PulseEmitted {
-                color: color(),
-                pulse_id: pid.to_string(),
-                source_node: "producer".into(),
-                source_port: "rows".into(),
-                target_node: "consumer".into(),
-                target_port: "in".into(),
-                frames: vec![],
-                value: serde_json::json!(1),
-                closed: false,
-                close_error: None,
-                at_unix: 1,
-            },
-            ExecEvent::PulsesConsumed {
-                color: color(),
-                node_id: "consumer".into(),
-                frames: vec![],
-                pulse_ids: vec![pid.to_string()],
-                at_unix: 2,
-            },
-            ExecEvent::LoopStreamEnded {
-                color: color(),
-                group_id: "lp".into(),
-                parent_frames: vec![],
-                end: weft_core::primitive::StreamEnd::Finished,
-                at_unix: 3,
-            },
-        ];
-        let snap = fold_to_snapshot(color(), &events);
-        assert!(
-            snap.pulses.get("consumer").map(|b| b.is_empty()).unwrap_or(true),
-            "a consumed stream pulse is REMOVED, not tombstoned"
-        );
-        let key = weft_core::primitive::LoopInstanceKey {
-            group_id: "lp".into(),
-            parent_frames: vec![],
-            color: color(),
-        };
-        assert_eq!(
-            snap.loop_instances.get(&key).and_then(|i| i.stream_end.clone()),
-            Some(weft_core::primitive::StreamEnd::Finished),
-            "the stream's end survives the fold"
-        );
-        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        old_skip.as_object_mut().unwrap().remove("reason");
+        assert!(serde_json::from_value::<ExecEvent>(old_skip).is_err(), "a skip without its reason is refused");
     }
 }
+

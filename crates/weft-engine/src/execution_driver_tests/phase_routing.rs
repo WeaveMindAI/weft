@@ -3,7 +3,7 @@
     //! pure `node_body_for` rule; layer 3 drives real executions through
     //! `run_one_execution` and asserts which methods actually ran.
 
-    use super::engine_test_rig::{test_manifest, MemJournal, NoopInfra, NoopInfraState, NoopProject, NoopSteering, NoopTasks};
+    use super::engine_test_rig::{clients, run_checked, test_manifest, MemJournal};
     use super::*;
     use std::sync::Mutex as StdMutex;
     use async_trait::async_trait;
@@ -12,7 +12,6 @@
     use weft_core::node::{Node, NodeOutput};
     use weft_core::{ExecutionContext, NodeCatalog, ProjectDefinition};
     use weft_journal::{ExecEvent, JournalClient};
-    use crate::context::EngineClients;
 
     #[test]
     fn node_body_for_routes_by_phase_and_manifest() {
@@ -145,21 +144,6 @@
         .expect("routing project")
     }
 
-    fn clients(journal: Arc<MemJournal>) -> EngineClients {
-        EngineClients {
-            journal,
-            tasks: Arc::new(NoopTasks),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            steering: Arc::new(NoopSteering),
-        }
-    }
-
     async fn seed(journal: &MemJournal, project: &ProjectDefinition, color: Color, phase: weft_core::context::Phase, kicks: &[&str]) {
         journal
             .record_event(
@@ -213,16 +197,9 @@
         let color = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         seed(&journal, &project, color, phase, kicks).await;
-        let outcome = run_one_execution(
-            Arc::new(project),
-            catalog,
-            color,
-            clients(journal.clone()),
-            "pod-test".into(),
-            "tenant-test".into(),
-            "ns-test".into(),
-            CancellationFlag::new_arc(),
-            None,
+        let outcome = run_checked(
+            Arc::new(project), catalog, color, journal.clone(), clients(journal.clone()),
+            CancellationFlag::new_arc(), None,
         )
         .await
         .expect("run_one_execution ok");
@@ -240,7 +217,7 @@
             &["src"],
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         assert_eq!(*calls.lock().unwrap(), vec!["src:run", "trig:setup_trigger"]);
     }
 
@@ -293,7 +270,7 @@
             &["src"],
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         let events = journal.events.lock().unwrap();
         assert!(
             !events.iter().any(|e| matches!(e, ExecEvent::NodeSkipped { .. })),
@@ -317,7 +294,7 @@
             &["trig"],
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         assert_eq!(*calls.lock().unwrap(), vec!["trig:run"]);
     }
 
@@ -381,7 +358,7 @@
             &["src", "trig"],
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         assert!(
             !calls.lock().unwrap().contains(&"trig:run"),
             "an idle trigger's body must not run: {:?}",
@@ -404,7 +381,7 @@
             &["trig", "src"],
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         let calls = calls.lock().unwrap();
         let trig_runs = calls.iter().filter(|c| **c == "trig:run").count();
         assert_eq!(trig_runs, 1, "the firing trigger runs exactly once: {calls:?}");
@@ -468,19 +445,12 @@
             )
             .await
             .unwrap();
-        let outcome = run_one_execution(
-            Arc::new(project),
-            catalog,
-            color,
-            clients(journal),
-            "pod-test".into(),
-            "tenant-test".into(),
-            "ns-test".into(),
-            CancellationFlag::new_arc(),
-            None,
+        let outcome = run_checked(
+            Arc::new(project), catalog, color, journal.clone(), clients(journal),
+            CancellationFlag::new_arc(), None,
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         assert_eq!(*calls.lock().unwrap(), vec!["snap:http://bridge:m-7".to_string()]);
     }

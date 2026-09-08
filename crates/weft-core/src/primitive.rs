@@ -201,44 +201,38 @@ pub struct SignalRouting {
 }
 
 // ----- Execution snapshot ---------------------------------------------
-//
-// Written by the worker when it stalls (all firings either terminal or
-// waiting). The dispatcher stores this in the journal and hands it to
-// the next worker invocation so the run continues exactly where it
-// left off. See docs/v2-design.md §3.5.
 
-/// Durable snapshot of an execution's in-progress state. Contains
-/// everything a new worker needs to resume: the pulse table, the
-/// per-node execution records, and the active suspensions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An execution's state as the journal fold rebuilds it: the pulse
+/// table, the per-node execution records, the loop instances, the
+/// kicks, and the active suspensions. Everything a fresh worker needs
+/// to resume; the fold is the only writer, and a resume never reads
+/// anything the fold did not derive from the journal's rows plus the
+/// program. Never persisted: replay is the source of truth.
+#[cfg(feature = "runtime")]
+#[derive(Debug, Clone)]
 pub struct ExecutionSnapshot {
     pub color: Color,
     pub pulses: crate::pulse::PulseTable,
     pub executions: crate::exec::NodeExecutionTable,
     pub suspensions: HashMap<String, SuspensionInfo>,
-    /// Live `LoopInstance`s rebuilt from `LoopInstantiated` /
-    /// `LoopIterationLaunched` / `LoopOutFired` / `LoopTerminated`
-    /// events. A fresh worker reads these to rehydrate its engine's
-    /// per-loop state on resume.
-    #[serde(default)]
-    pub loop_instances: HashMap<LoopInstanceKey, LoopInstanceSnapshot>,
+    /// Every loop instance, as the fold drove it from the loop rows.
+    /// A resumed worker takes it over as its own runtime.
+    pub loop_runtime: crate::exec::loop_runtime::LoopRuntime,
     /// Nodes kicked into this execution, keyed by where they fire. The
     /// scheduler dispatches a kicked node once even when it has no
     /// wired pending inputs (it IS an entry point). Folded from
-    /// `ExecEvent::NodeKicked` (the run's roots, at frames `[]`),
-    /// `ExecEvent::ScopeLaunched` (a group body's roots, at the group's
-    /// frames) and `ExecEvent::LoopIterationLaunched::roots` (a loop
+    /// `ExecEvent::NodeKicked` (the run's roots, at frames `[]`), from
+    /// a group's In boundary firing (the body's roots, at the group's
+    /// frames) and from `ExecEvent::LoopIterationLaunched` (a loop
     /// body's roots, at the iteration's frames). `dispatched=true` once
     /// the engine has consumed the kick (the node started at that
     /// location; further kicks at the same location are a no-op).
-    #[serde(default)]
     pub kicked: HashMap<crate::frames::FiringLocation, KickedNode>,
     /// Fires that arrived for live suspensions but haven't been
     /// consumed by a worker's node completion yet. The worker
     /// seeds these into its link on startup so every waiting node
     /// finds its value when re-dispatched. Survives worker restarts
     /// because it's derived from journal events, not slot queues.
-    #[serde(default)]
     pub pending_deliveries: HashMap<String, Value>,
     /// Per-(node, frames) ordered sequence of past `await_signal`
     /// calls. Each entry has the call_index (0-based ordinal of
@@ -251,15 +245,14 @@ pub struct ExecutionSnapshot {
     /// pops the next entry and either returns its resolved value
     /// instantly OR re-suspends if pending. This is what makes
     /// multiple sequential awaits within one node body work.
-    #[serde(default)]
     pub awaited_sequences: HashMap<crate::frames::FiringLocation, Vec<AwaitedEntry>>,
     /// Journal rows the fold could not apply because they were
-    /// corrupted (unparseable UUID, broken invariants, etc.). Empty
-    /// in the normal case. Surfaced to the inspector so the user sees
-    /// "row N corrupted" instead of a silently missing pulse. The
-    /// fold ALSO logs each corruption at `error!` level for ops
-    /// observability; this list is the user-visible counterpart.
-    #[serde(default)]
+    /// corrupted (unparseable UUID, broken invariants, a row the
+    /// program cannot make sense of). Empty in the normal case.
+    /// Surfaced to the inspector so the user sees "row N corrupted"
+    /// instead of a silently missing pulse; the engine refuses to
+    /// resume over any of them. The fold ALSO logs each corruption at
+    /// `error!` level for ops observability.
     pub corruptions: Vec<JournalCorruption>,
 }
 
@@ -286,43 +279,37 @@ pub struct JournalCorruption {
 // SYNC: CorruptionSite <-> packages/weft-graph/src/protocol.ts CorruptionSite
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CorruptionSite {
-    /// `ExecEvent::PulseEmitted` fold path (`push_pulse` UUID parse
-    /// or `Pulse::from_journal_emit` invariant check).
-    PulseEmitted,
+    /// `ExecEvent::PortEmitted` could not be put on the wires (the
+    /// program has no such node or port, or a wire cannot read the
+    /// value).
+    PortEmitted,
+    /// `ExecEvent::PortClosed` / `ExecEvent::PortTypeMismatch` names
+    /// a port the program does not declare.
+    PortClosed,
     /// `ExecEvent::PulsesConsumed` fold path (`parse_absorbed_ids` on
     /// `pulse_ids`).
     PulsesConsumed,
+    /// A node lifecycle row (`NodeStarted`, a terminal) names a node
+    /// the program does not have, or a firing the fold has no record
+    /// for.
+    NodeLifecycle,
+    /// `ExecEvent::LoopInstantiated` arrived for a LoopIn the program
+    /// does not have, or its config and inputs do not make a loop.
+    LoopInstantiated,
     /// `ExecEvent::LoopStreamEnded` arrived for a `LoopInstanceKey`
     /// with no preceding `LoopInstantiated`. Writer-order bug or row
     /// loss.
     LoopStreamEnded,
-    /// `ExecEvent::NodeStarted` fold path (`parse_absorbed_ids` on
-    /// `pulses_absorbed`).
-    NodeStarted,
-    /// `ExecEvent::NodeResumed` fold path (`parse_absorbed_ids` on
-    /// `pulses_absorbed`).
-    NodeResumed,
     /// `LoopIterationLaunched` arrived for a `LoopInstanceKey` with no
-    /// preceding `LoopInstantiated`. Writer-order bug or row loss.
+    /// preceding `LoopInstantiated`, or the launch cannot be rebuilt.
     LoopIterationLaunched,
     /// `LoopOutFired` arrived for a `LoopInstanceKey` with no preceding
-    /// `LoopInstantiated`. Writer-order bug or row loss.
+    /// `LoopInstantiated`, or its writes cannot be read off the LoopOut
+    /// firing.
     LoopOutFired,
     /// `LoopTerminated` arrived for a `LoopInstanceKey` with no preceding
-    /// `LoopInstantiated`. Writer-order bug or row loss.
+    /// `LoopInstantiated`, or its outward emit cannot be rebuilt.
     LoopTerminated,
-    /// `ExecEvent::NodeCompleted` fold path (`push_pulse` on a carried
-    /// closure emission).
-    NodeCompleted,
-    /// `ExecEvent::NodeFailed` fold path (`push_pulse` on a carried
-    /// closure emission).
-    NodeFailed,
-    /// `ExecEvent::NodeSkipped` fold path (`push_pulse` on a carried
-    /// closure emission).
-    NodeSkipped,
-    /// `ExecEvent::NodeCancelled` fold path (`push_pulse` on a carried
-    /// closure emission).
-    NodeCancelled,
     /// A journal row whose JSON no longer decodes to any `ExecEvent`
     /// at all (the display read surfaces it; state-rebuilding reads
     /// refuse the whole log instead).
@@ -432,94 +419,6 @@ pub struct LoopInstanceKey {
     pub color: Color,
 }
 
-/// One body-side write to a `LoopOut` inward-in port at a single
-/// iteration. The tag distinguishes "wrote a value (which MAY be JSON
-/// null)" from "closed the port". Default serde on `Option<Value>`
-/// collapses `Some(Value::Null)` and `None` to the same JSON form, so
-/// we cannot use `Option<Value>` here without losing the closure
-/// signal on journal round-trip. Carry semantics treat `Closed` as
-/// "keep previous"; gather semantics treat `Closed` as "null slot at
-/// index".
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum LoopWrite {
-    Value(Value),
-    Closed,
-}
-
-impl LoopWrite {
-    pub fn into_option(self) -> Option<Value> {
-        match self {
-            LoopWrite::Value(v) => Some(v),
-            LoopWrite::Closed => None,
-        }
-    }
-
-    pub fn as_value(&self) -> Option<&Value> {
-        match self {
-            LoopWrite::Value(v) => Some(v),
-            LoopWrite::Closed => None,
-        }
-    }
-}
-
-/// Folded view of one live `LoopInstance`. The engine reads this on
-/// resume to rehydrate its per-loop state. The full `LoopConfig`
-/// `over` / `carry` / `trim_on_mismatch` ride along because the
-/// snapshot may outlive the project version the loop was instantiated
-/// under, and the engine has no other source of truth for the
-/// instance's resolved config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoopInstanceSnapshot {
-    /// Effective iteration CAP (never "how many ran"; that is
-    /// `launched.len()`): the zip-trimmed, max-capped count for a
-    /// list-driven loop, the `max_iters` cap for done-driven and
-    /// stream-driven ones. `None` means uncapped.
-    pub iter_cap: Option<u32>,
-    pub parallel: bool,
-    pub max_iters: Option<u32>,
-    /// Iter-input port names, in declared order. NOT optional: a
-    /// snapshot whose `LoopInstantiated` writer omitted this field
-    /// is corrupt, not legitimately legacy. Pre-prod fresh DB on
-    /// every rebuild means a missing field is never a valid state.
-    pub over: Vec<String>,
-    /// Carry-port names, in declared order. Same rationale as
-    /// `over`: required, never defaulted.
-    pub carry: Vec<String>,
-    /// Zip mode for mismatched iter-input lengths. Required.
-    pub trim_on_mismatch: bool,
-    /// Iterations the engine has launched body work for. Required,
-    /// like every field below: the one writer (the journal fold)
-    /// always emits all of them, so a missing field is a truncated /
-    /// corrupt row that must FAIL deserialization (landing in the
-    /// fold's corruption surface) instead of silently rehydrating an
-    /// empty loop instance.
-    pub launched: Vec<u32>,
-    /// Iterations whose `LoopOut` has fired.
-    pub out_fired: Vec<u32>,
-    /// Per gather-port, the per-index slot. `Closed` means the body
-    /// closed that port at that iteration (assembled outward list
-    /// gets `null` there).
-    pub gather_lists: HashMap<String, HashMap<u32, LoopWrite>>,
-    /// Current carry-port values. A LoopOut firing whose carry-write
-    /// port was closed does NOT update this map (previous value kept).
-    pub carry_values: HashMap<String, Value>,
-    /// Outer input bag captured at LoopIn first-fire. Used by the
-    /// sequential drive mode to launch iteration N+1 after the
-    /// LoopIn's outer-in pulses have already been absorbed by the
-    /// first dispatch.
-    pub outer_input: HashMap<String, Value>,
-    /// `Some(reason)` once `LoopTerminated` has been recorded.
-    pub terminated: Option<LoopTerminationReason>,
-    /// For a stream-driven loop, the stream's END once it arrived
-    /// (`LoopStreamEnded` row). DURABLE on purpose: the end's close
-    /// pulse is consumed the moment it routes, so a crash between
-    /// "stream ended" and "loop terminated" would otherwise resume a
-    /// loop that waits forever for a close that can never come again.
-    /// `None` for non-stream loops and while the stream is open.
-    pub stream_end: Option<StreamEnd>,
-}
-
 /// Why a stream ended: the wire vocabulary shared by the generator
 /// runtime (`crate::generator` re-exports it), the journal's loop
 /// snapshots, and the fold. `Finished` is the clean end; `Failed`
@@ -545,56 +444,3 @@ pub enum LoopTerminationReason {
     /// ports and terminated the instance.
     Failed,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `LoopWrite::Value(Value::Null)` and `LoopWrite::Closed` MUST
-    /// stay distinguishable across a JSON round-trip. The whole point
-    /// of the tagged enum is preserving "body wrote JSON null" vs
-    /// "body closed the port" through the journal. A regression
-    /// here (e.g. someone adds `#[serde(untagged)]`) silently
-    /// collapses the two, restoring the exact bug the enum exists
-    /// to prevent.
-    #[test]
-    fn loop_write_value_null_vs_closed_distinguishable_in_json() {
-        let v_null = LoopWrite::Value(Value::Null);
-        let closed = LoopWrite::Closed;
-        let j_null = serde_json::to_string(&v_null).expect("serialize value(null)");
-        let j_closed = serde_json::to_string(&closed).expect("serialize closed");
-        assert_ne!(
-            j_null, j_closed,
-            "LoopWrite::Value(Null) and LoopWrite::Closed must serialize differently",
-        );
-        let back_null: LoopWrite =
-            serde_json::from_str(&j_null).expect("deserialize value(null)");
-        let back_closed: LoopWrite =
-            serde_json::from_str(&j_closed).expect("deserialize closed");
-        assert_eq!(back_null, v_null);
-        assert_eq!(back_closed, closed);
-    }
-
-    /// Within a HashMap-valued field (matching the journal event
-    /// shape), the tag still distinguishes the two cases on round
-    /// trip. The default serde behavior for `HashMap<String,
-    /// Option<Value>>` collapsed both `Some(Null)` and `None` to
-    /// JSON null; this test pins that `HashMap<String, LoopWrite>`
-    /// does NOT collapse.
-    #[test]
-    fn loop_write_in_hashmap_round_trip_preserves_distinction() {
-        use std::collections::HashMap;
-        let mut m: HashMap<String, LoopWrite> = HashMap::new();
-        m.insert("written_null".into(), LoopWrite::Value(Value::Null));
-        m.insert("closed".into(), LoopWrite::Closed);
-        m.insert("real".into(), LoopWrite::Value(serde_json::json!(42)));
-        let s = serde_json::to_string(&m).expect("serialize");
-        let back: HashMap<String, LoopWrite> =
-            serde_json::from_str(&s).expect("deserialize");
-        assert_eq!(back["written_null"], LoopWrite::Value(Value::Null));
-        assert_eq!(back["closed"], LoopWrite::Closed);
-        assert_eq!(back["real"], LoopWrite::Value(serde_json::json!(42)));
-        assert_ne!(back["written_null"], back["closed"]);
-    }
-}
-

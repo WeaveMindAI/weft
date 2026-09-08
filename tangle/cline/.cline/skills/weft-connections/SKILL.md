@@ -117,9 +117,9 @@ reaches people through the **weft browser extension**:
    temporary add-on from `about:debugging`, or the signed `.xpi` when
    signing was left on.
 3. Connect it: `weft token mint --name "my laptop"` prints a connect URL
-   exactly once (the server stores only a hash; lost means mint another
-   and `weft token revoke` the old one). Paste it into the extension's
-   popup.
+   exactly once, and the bare token on the line after it (the server
+   stores only a hash; lost means mint another and `weft token revoke`
+   the old one). Paste the URL into the extension's popup.
 
 A token with no scope sees every task of the tenant. Handing one to
 somebody else: `weft token mint --name "reviewer" --projects <id> --tags

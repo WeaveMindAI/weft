@@ -78,7 +78,7 @@ aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-smithy-types = "1"
 
 # serialization
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "0.8"
 

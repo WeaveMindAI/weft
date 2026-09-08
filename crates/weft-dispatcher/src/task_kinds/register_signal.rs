@@ -361,6 +361,8 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 // at, so the insert's fence lets any newer in-flight
                 // cursor write win instead of being rewound.
                 kind_state_seq: prior_seq,
+                // Read-side field: the insert stamps the placement below.
+                listener_pod: None,
             },
             // Born with its holder + generation so the row is never
             // committed with a NULL holder while the pod already holds it

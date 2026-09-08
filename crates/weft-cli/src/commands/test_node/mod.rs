@@ -391,8 +391,7 @@ fn run_binary(binary: &PathBuf, args: &[&str]) -> Result<BinaryOutput> {
 }
 
 fn render(ctx: &Ctx, reports: &[TestReport]) -> Result<()> {
-    if ctx.json() {
-        println!("{}", serde_json::to_string(reports).expect("reports serialize"));
+    if ctx.json_out(&reports)? {
         return Ok(());
     }
     // Per-test lines for the LOCAL tiers only: a live test already

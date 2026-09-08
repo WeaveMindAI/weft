@@ -3020,28 +3020,21 @@ t = ExecPython -> (r: Number) {
     assert!(!codes(&d).contains(&"unresolved-typevar"), "{d:?}");
 }
 
-/// level-too-large: 16 nodes flat on the file's top level warn once,
-/// anchored on the first item of that level (the level has no header
-/// of its own); the same work as three groups of six warns nothing,
-/// because the warning is about what one LEVEL holds, not node count.
+/// Sixteen wired-together nodes at the top level warn once, anchored on
+/// the first of them (the level has no header of its own); the same
+/// work as three groups of six warns nothing, because the warning is
+/// about what one LEVEL holds, not node count.
 #[test]
 fn a_level_past_fifteen_warns_and_a_grouped_one_does_not() {
-    let mut flat = String::from("\n");
-    for i in 0..16 {
-        flat.push_str(&format!("t{i} = Debug {{ data: \"{i}\" }}\n"));
-    }
-    let d = validate(&parse_enrich(&flat), &catalog());
-    let warned: Vec<&Diagnostic> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("level-too-large"))
-        .collect();
+    let d = validate(&parse_enrich(&chain("t", 16, None)), &catalog());
+    let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "one warning for the one crowded level: {d:?}");
     assert!(
-        warned[0].message.contains("the top level holds 16 items"),
+        warned[0].message.contains("one connected branch at the top level holds 16 items"),
         "{}",
         warned[0].message
     );
-    assert_eq!(warned[0].line, 2, "anchored on the level's first item: {warned:?}");
+    assert_eq!(warned[0].line, 2, "anchored on the branch's first item: {warned:?}");
 
     let mut grouped = String::from("\n");
     for g in 0..3 {
@@ -3058,26 +3051,219 @@ fn a_level_past_fifteen_warns_and_a_grouped_one_does_not() {
     );
 }
 
-/// A group takes ONE seat at its parent's table: its In and Out
-/// boundary halves dedupe, so 15 plain nodes plus a group is 16 items
-/// and warns, while the group's own inside (one node) stays quiet.
+/// The top level is measured per branch: sixteen nodes as two chains
+/// of eight that never touch are two levels of eight to the reader,
+/// and warn nothing.
 #[test]
-fn a_group_counts_as_one_item_and_its_two_halves_dedupe() {
-    let mut src = String::from("\n");
-    for i in 0..15 {
-        src.push_str(&format!("t{i} = Debug {{ data: \"{i}\" }}\n"));
+fn two_unconnected_branches_answer_for_their_own_width() {
+    let src = format!("{}{}", chain("a", 8, None), chain("b", 8, None).trim_start_matches('\n'));
+    let d = validate(&parse_enrich(&src), &catalog());
+    assert!(!codes(&d).contains(&"level-too-large"), "{d:?}");
+}
+
+/// An infra node joins nothing: two chains that both read one
+/// database are still two branches, each counting the database once.
+/// Eight plus the database and seven plus the database stay quiet;
+/// fifteen plus the database is sixteen, and warns.
+#[test]
+fn an_infra_node_ends_the_walk_and_counts_on_each_branch_it_touches() {
+    let quiet = format!(
+        "\ndb = Debug {{ data: \"shared\" }}\n{}{}",
+        chain("a", 8, Some("db.data")).trim_start_matches('\n'),
+        chain("b", 7, Some("db.data")).trim_start_matches('\n')
+    );
+    let mut project = parse_enrich(&quiet);
+    mark_infra(&mut project, "db");
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"level-too-large"), "9 and 8 with the database: {d:?}");
+
+    let crowded = format!(
+        "\ndb = Debug {{ data: \"shared\" }}\n{}",
+        chain("a", 15, Some("db.data")).trim_start_matches('\n')
+    );
+    let mut project = parse_enrich(&crowded);
+    mark_infra(&mut project, "db");
+    let d = validate(&project, &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(
+        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+    assert_eq!(warned[0].line, 3, "anchored on the branch's first node, not the database: {warned:?}");
+}
+
+/// The database counts on EACH branch it touches: two chains of fifteen
+/// both reading one infra node are two branches of sixteen, and warn
+/// twice, each anchored on its own first node.
+#[test]
+fn a_shared_infra_node_counts_once_per_branch() {
+    let src = format!(
+        "\ndb = Debug {{ data: \"shared\" }}\n{}{}",
+        chain("a", 15, Some("db.data")).trim_start_matches('\n'),
+        chain("b", 15, Some("db.data")).trim_start_matches('\n')
+    );
+    let mut project = parse_enrich(&src);
+    mark_infra(&mut project, "db");
+    let d = validate(&project, &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 2, "two branches of 16: {d:?}");
+    for w in &warned {
+        assert!(
+            w.message.contains("one connected branch at the top level holds 16 items"),
+            "{}",
+            w.message
+        );
     }
+    let lines: Vec<usize> = warned.iter().map(|w| w.line).collect();
+    assert_eq!(lines, vec![3, 18], "anchored on each branch's first node: {warned:?}");
+}
+
+/// The flattened node list puts a scope's plain nodes before its
+/// groups, and the warning still lands where the author's eye starts:
+/// a branch that begins with a group anchors on the group's line.
+#[test]
+fn a_branch_starting_with_a_group_anchors_on_the_group() {
+    let mut src = String::from(
+        "\nfirst = Group(x: String) -> (out: String) {\n  q = Text { value: self.x }\n  self.out = q.value\n}\nfirst.x = \"seed\"\n",
+    );
+    src.push_str(chain("t", 16, Some("first.out")).trim_start_matches('\n'));
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "17 connected items: {d:?}");
+    assert!(warned[0].message.contains("holds 17 items"), "{}", warned[0].message);
+    assert_eq!(warned[0].line, 2, "anchored on the group, the branch's first item: {warned:?}");
+}
+
+/// A node lowered from an inline expression has no header line of its
+/// own and must not sort ahead of the nodes the author wrote: the
+/// branch still anchors on its first written node, never on line 0.
+#[test]
+fn an_inline_expression_node_never_anchors_the_warning() {
+    let mut src = chain("t", 15, None);
+    src.push_str("last = Debug { data: Text { value: t14.data }.value }\n");
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(warned[0].message.contains("holds 17 items"), "{}", warned[0].message);
+    assert_eq!(warned[0].line, 2, "anchored on the first written node: {warned:?}");
+}
+
+/// A file with an anonymous group beside loose nodes is a program, and
+/// the anonymous group is one more item of its top level: sixteen
+/// chained loose nodes plus the group they feed warn once, with 17.
+#[test]
+fn an_anonymous_group_beside_loose_nodes_is_an_ordinary_item() {
+    let mut src = chain("z", 16, None);
+    src.push_str("Group(raw: String) -> (out: String) {\n  q = Text { value: self.raw }\n  self.out = q.value\n}\n");
+    let mut project = parse_enrich(&src);
+    // Wire the last loose node into the anonymous group by its id.
+    let root = project
+        .groups
+        .iter()
+        .find(|g| g.anonymous)
+        .map(|g| g.id.clone())
+        .expect("the anonymous group");
+    project.edges.push(weft_core::project::Edge {
+        id: "z15-root".into(),
+        source: "z15".into(),
+        target: weft_core::project::boundary_in_id(&root),
+        source_handle: Some("data".into()),
+        target_handle: Some("raw".into()),
+        path: Vec::new(),
+        span: None,
+        source_file: None,
+    });
+    let d = validate(&project, &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(warned[0].message.contains("holds 17 items"), "{}", warned[0].message);
+    assert_eq!(warned[0].line, 2, "{warned:?}");
+}
+
+/// An infra node inside a group ends nothing: the group is an item, and
+/// two chains that both reach a database through it are one branch.
+#[test]
+fn an_infra_node_inside_a_group_does_not_end_the_walk() {
+    let src = format!(
+        "\nwrap = Group -> (out: String) {{\n  db = Debug {{ data: \"shared\" }}\n  self.out = db.data\n}}\n{}{}",
+        chain("a", 8, Some("wrap.out")).trim_start_matches('\n'),
+        chain("b", 8, Some("wrap.out")).trim_start_matches('\n')
+    );
+    let mut project = parse_enrich(&src);
+    mark_infra(&mut project, "wrap.db");
+    let d = validate(&project, &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "one branch of 17 through the group: {d:?}");
+    assert!(warned[0].message.contains("holds 17 items"), "{}", warned[0].message);
+}
+
+/// A wire reaching INTO a group from the outside (a member reading an
+/// outer node directly rather than through `self`) joins the group to
+/// that node's branch: 15 chained nodes plus the group whose inside
+/// reads the last of them is one branch of 16.
+#[test]
+fn a_wire_into_a_group_joins_the_group_to_the_branch() {
+    let mut src = chain("t", 15, None);
     src.push_str(
-        "one = Group -> (out: String) {\n  inner = Text { value: \"x\" }\n  self.out = inner.value\n}\n",
+        "one = Group -> (out: String) {\n  inner = Text { value: t14.data }\n  self.out = inner.value\n}\n",
     );
     let d = validate(&parse_enrich(&src), &catalog());
-    let warned: Vec<&Diagnostic> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("level-too-large"))
-        .collect();
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "16 connected items at the top level: {d:?}");
+    assert!(
+        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+}
+
+/// A component file's members live under its root group, and that IS
+/// the file's top level: measured per branch and anchored on the
+/// branch's first node, the same as a program file. Sixteen chained
+/// members warn; two chains of eight fed from the file's own input do
+/// not, because the interface joins nothing.
+#[test]
+fn a_component_files_top_level_is_measured_per_branch() {
+    let crowded = format!(
+        "\nGroup(raw: String) -> (out: String) {{\n{}  self.out = t15.data\n}}\n",
+        chain("t", 16, Some("self.raw")).trim_start_matches('\n')
+    );
+    let d = validate(&parse_enrich(&crowded), &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(
+        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        "{}",
+        warned[0].message
+    );
+    assert_eq!(warned[0].line, 3, "anchored on the branch's first member: {warned:?}");
+
+    let split = format!(
+        "\nGroup(raw: String) -> (out: String) {{\n{}{}  self.out = b7.data\n}}\n",
+        chain("a", 8, Some("self.raw")).trim_start_matches('\n'),
+        chain("b", 8, Some("self.raw")).trim_start_matches('\n')
+    );
+    let d = validate(&parse_enrich(&split), &catalog());
+    assert!(!codes(&d).contains(&"level-too-large"), "two branches of eight: {d:?}");
+}
+
+/// A group takes ONE seat at its parent's table: its In and Out
+/// boundary halves dedupe, so 15 wired nodes plus the group they feed
+/// is 16 items and warns, while the group's own inside (one node)
+/// stays quiet.
+#[test]
+fn a_group_counts_as_one_item_and_its_two_halves_dedupe() {
+    let mut src = chain("t", 15, None);
+    src.push_str(
+        "one = Group(x: String) -> (out: String) {\n  inner = Text { value: self.x }\n  self.out = inner.value\n}\none.x = t14.data\n",
+    );
+    let d = validate(&parse_enrich(&src), &catalog());
+    let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "16 items at the top level: {d:?}");
     assert!(
-        warned[0].message.contains("the top level holds 16 items"),
+        warned[0].message.contains("one connected branch at the top level holds 16 items"),
         "{}",
         warned[0].message
     );
@@ -3085,7 +3271,9 @@ fn a_group_counts_as_one_item_and_its_two_halves_dedupe() {
 
 /// The rule reaches the inside of every group, and the warning names
 /// which inside it is and lands on that group's own header line, not
-/// on the file: 16 direct members of `big`.
+/// on the file: 16 direct members of `big`. The inside is measured
+/// whole: these members are not wired to each other and still count
+/// together, because a group is one job by construction.
 #[test]
 fn a_group_inside_past_fifteen_warns_naming_the_group() {
     let mut src = String::from("big = Group(x: String) -> (out: String) {\n");
@@ -3094,10 +3282,7 @@ fn a_group_inside_past_fifteen_warns_naming_the_group() {
     }
     src.push_str("  last = Text { value: self.x }\n  self.out = last.value\n}\nbig.x = \"seed\"\n");
     let d = validate(&parse_enrich(&src), &catalog());
-    let warned: Vec<&Diagnostic> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("level-too-large"))
-        .collect();
+    let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "{d:?}");
     assert!(
         warned[0].message.contains("the inside of 'big' holds 16 items"),
@@ -3107,29 +3292,28 @@ fn a_group_inside_past_fifteen_warns_naming_the_group() {
     assert_eq!(warned[0].line, 1, "anchored on the group's own header line: {warned:?}");
 }
 
-/// A level made only of groups still counts its items: 16 groups on
-/// the top level with no plain node among them warn, anchored on the
-/// first group's line (the level's first item).
+/// A level made only of groups still counts its items: 16 groups
+/// chained on the top level with no plain node among them warn,
+/// anchored on the first group's line (the branch's first item).
 #[test]
 fn a_top_level_of_only_groups_warns_too() {
     let mut src = String::from("\n");
     for g in 0..16 {
         src.push_str(&format!(
-            "g{g} = Group -> (out: String) {{\n  inner = Text {{ value: \"x\" }}\n  self.out = inner.value\n}}\n"
+            "g{g} = Group(x: String) -> (out: String) {{\n  inner = Text {{ value: self.x }}\n  self.out = inner.value\n}}\n"
         ));
+        let feed = if g == 0 { "\"seed\"".to_string() } else { format!("g{}.out", g - 1) };
+        src.push_str(&format!("g{g}.x = {feed}\n"));
     }
     let d = validate(&parse_enrich(&src), &catalog());
-    let warned: Vec<&Diagnostic> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("level-too-large"))
-        .collect();
+    let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "each group holds one node; only the top level is crowded: {d:?}");
     assert!(
-        warned[0].message.contains("the top level holds 16 items"),
+        warned[0].message.contains("one connected branch at the top level holds 16 items"),
         "{}",
         warned[0].message
     );
-    assert_eq!(warned[0].line, 2, "anchored on the level's first item: {warned:?}");
+    assert_eq!(warned[0].line, 2, "anchored on the branch's first item: {warned:?}");
 }
 
 /// Every level answers for itself, each on its own line: one file with
@@ -3139,7 +3323,8 @@ fn a_top_level_of_only_groups_warns_too() {
 fn crowded_levels_warn_each_on_its_own_line() {
     let mut lines: Vec<String> = vec![String::new()];
     for i in 0..15 {
-        lines.push(format!("a{i} = Debug {{ data: \"{i}\" }}"));
+        let feed = if i == 0 { "\"0\"".to_string() } else { format!("a{}.data", i - 1) };
+        lines.push(format!("a{i} = Debug {{ data: {feed} }}"));
     }
     let wrap_line = lines.len() + 1;
     lines.push("wrap = Group(x: String) -> (out: String) {".to_string());
@@ -3149,14 +3334,11 @@ fn crowded_levels_warn_each_on_its_own_line() {
     lines.push("  last = Text { value: self.x }".to_string());
     lines.push("  self.out = last.value".to_string());
     lines.push("}".to_string());
-    lines.push("wrap.x = \"seed\"".to_string());
+    lines.push("wrap.x = a14.data".to_string());
     let src = lines.join("\n");
 
     let d = validate(&parse_enrich(&src), &catalog());
-    let warned: Vec<&Diagnostic> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("level-too-large"))
-        .collect();
+    let warned = level_warnings(&d);
     assert_eq!(warned.len(), 2, "two crowded levels, two warnings: {d:?}");
     let top = warned
         .iter()
@@ -3182,10 +3364,7 @@ fn a_loop_body_past_fifteen_warns_naming_the_loop() {
     }
     src.push_str("  last = Text { value: \"x\" }\n  self.results = last.value\n}\nl.items = [\"a\"]\n");
     let d = validate(&parse_enrich(&src), &catalog());
-    let warned: Vec<&Diagnostic> = d
-        .iter()
-        .filter(|x| x.code.as_deref() == Some("level-too-large"))
-        .collect();
+    let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "{d:?}");
     assert!(
         warned[0].message.contains("the inside of 'l' holds 16 items"),
@@ -3193,6 +3372,37 @@ fn a_loop_body_past_fifteen_warns_naming_the_loop() {
         warned[0].message
     );
     assert_eq!(warned[0].line, 1, "anchored on the loop's own header line: {warned:?}");
+}
+
+/// `n` Debug nodes named `<prefix>0..n`, each fed by the one before
+/// it, after a leading blank line so the first sits on line 2. The
+/// first reads `head` when given, else a literal.
+fn chain(prefix: &str, n: usize, head: Option<&str>) -> String {
+    let mut src = String::from("\n");
+    for i in 0..n {
+        let feed = match (i, head) {
+            (0, Some(head)) => head.to_string(),
+            (0, None) => "\"0\"".to_string(),
+            (i, _) => format!("{prefix}{}.data", i - 1),
+        };
+        src.push_str(&format!("{prefix}{i} = Debug {{ data: {feed} }}\n"));
+    }
+    src
+}
+
+/// No stdlib infra node takes or gives a wire, so tests mark one by
+/// hand; the rule reads the flag, not the node type.
+fn mark_infra(project: &mut weft_core::ProjectDefinition, id: &str) {
+    project
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == id)
+        .expect("the node is present")
+        .requires_infra = true;
+}
+
+fn level_warnings(d: &[Diagnostic]) -> Vec<&Diagnostic> {
+    d.iter().filter(|x| x.code.as_deref() == Some("level-too-large")).collect()
 }
 
 /// A `null` constant is data only on a port whose type admits Null.
@@ -3272,3 +3482,11 @@ ws = SlackAccess { account: {"identity": 42} }
     let hit = d.iter().find(|e| e.code.as_deref() == Some("config-type-mismatch"));
     assert!(hit.is_some_and(|e| e.message.contains("string `id`")), "{d:?}");
 }
+
+
+
+
+
+
+
+

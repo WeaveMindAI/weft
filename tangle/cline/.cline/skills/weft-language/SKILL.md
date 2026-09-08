@@ -390,7 +390,10 @@ A group is the unit of readable size, the thing [the level rule] asks
 for: every level of the graph, the file and the inside of every group,
 holds at most about six items, nodes or groups, and past fifteen the
 compiler warns `level-too-large`, because a level is what a reader scans
-in one look and a sixteenth item ends that. When a level grows past six,
+in one look and a sixteenth item ends that. At the file's top level the
+count is per connected branch, the items one wire walk reaches plus the
+infra nodes it touches: two pipelines that only share a database each
+answer for their own width. When a level grows past six,
 the nodes cooperating on one job become a group of their own, and because
 groups nest, depth absorbs size: growing work goes down into a nested
 group, never wide across a level, and a group's inside holding another

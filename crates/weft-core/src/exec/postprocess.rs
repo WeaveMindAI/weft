@@ -2,36 +2,32 @@
 //! runtime calls this to emit pulses on each outgoing edge. No type
 //! checking here: type enforcement is the consumer's input boundary's
 //! job (`ready::check_input`).
+//!
+//! Every function here takes the EMISSION id of the act it serves
+//! (see `exec::emission`): pulse ids derive from it, so the journal
+//! fold, replaying the same emission over the same program, puts the
+//! same pulses in the table. Values are shared (`Arc`), never copied
+//! per wire; a wire with a key path gets its own projected value.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::error::{WeftError, WeftResult};
-use crate::exec::emission::PulseEmission;
+use crate::exec::emission::{pulse_id, PulseEmission};
 use crate::frames::LoopFrames;
 use crate::project::{Edge, EdgeIndex, ProjectDefinition};
 use crate::pulse::{Pulse, PulseTable};
 use crate::Color;
 
-/// Whether `edge` lands on a `Generator[T]` input port. Generator ports
-/// deliberately step outside the one-pulse-per-key reasoning: their
-/// consumer fires once and then PULLS, taking items in arrival order,
-/// so successive pulses at the same key are never ambiguous to it. The
-/// fan-in collision checks and the same-value dedup below therefore do
-/// not apply to them (two equal items are two items), and a closure
-/// (the stream's end) coexists with still-buffered items instead of
-/// being dropped against them.
-fn edge_targets_generator(project: &ProjectDefinition, edge: &Edge) -> bool {
-    let handle = edge.target_handle.as_deref().unwrap_or("default");
-    project
-        .nodes
-        .iter()
-        .find(|n| n.id == edge.target)
-        .and_then(|n| n.inputs.iter().find(|p| p.name == handle))
-        .is_some_and(|p| p.port_type.as_generator().is_some())
-}
 
+/// What a firing hands out on its ports: one shared value per port. A
+/// node body's emission wraps its owned values once; a boundary
+/// forwards the shared values it received; a loop shares its
+/// broadcast inputs across every iteration.
+pub type OutputBag = BTreeMap<String, Arc<Value>>;
 
 /// Process a node's output: emit pulses ONLY for the output ports the
 /// node mentioned in `output`. Ports the node didn't mention this call
@@ -40,9 +36,11 @@ fn edge_targets_generator(project: &ProjectDefinition, edge: &Edge) -> bool {
 /// (see `close_unmentioned_downstream`).
 ///
 /// Returns the set of port names actually emitted on this call.
+#[allow(clippy::too_many_arguments)]
 pub fn postprocess_output(
     node_id: &str,
-    output: &Value,
+    output: &OutputBag,
+    emission_id: Uuid,
     color: Color,
     frames: &LoopFrames,
     project: &ProjectDefinition,
@@ -58,29 +56,20 @@ pub fn postprocess_output(
         )));
     };
 
-    let Some(output_obj) = output.as_object() else {
-        // The engine always hands postprocess an object (node bodies
-        // build maps; the loop emitters construct maps). Anything else
-        // is an engine bug; silently treating it as "emitted nothing"
-        // would auto-close every declared port at termination.
-        return Err(WeftError::NodeExecution(format!(
-            "node '{node_id}' postprocess received a non-object output bag; engine bug",
-        )));
-    };
-
     let outgoing = edge_idx.get_outgoing(project, node_id);
 
     // What each wire DELIVERS, worked out BEFORE any pulse mutation. A
-    // wire with a path reads its keys off the value right here, once
-    // per wire, so five wires off one port are five independent
-    // projections; a `?` key found absent makes that wire deliver a
-    // closure. A value that breaks its declared contract (a required
-    // key missing) fails the firing, and doing all of it up front means
-    // a failing firing leaves no partial state behind: the caller drops
-    // `emissions` on Err, so a pulse committed before a later failure
-    // would have no journal row and replay would diverge.
+    // plain wire shares the emitted value (one `Arc` per port, however
+    // many wires leave it); a wire with a path reads its keys off the
+    // value right here, once per wire, so five wires off one port are
+    // five independent projections; a `?` key found absent makes that
+    // wire deliver a closure. A value that breaks its declared contract
+    // (a required key missing) fails the firing, and doing all of it up
+    // front means a failing firing leaves no partial state behind: the
+    // caller drops `emissions` on Err, so a pulse committed before a
+    // later failure would have no journal row and replay would diverge.
     let mut deliveries: Vec<Delivery<'_>> = Vec::new();
-    for (port_name, value) in output_obj {
+    for (port_name, value) in output {
         // An undeclared port means the value would silently vanish
         // (downstream never fires AND never receives a closure): fail
         // the firing instead. Node-author emissions are caught earlier
@@ -98,7 +87,7 @@ pub fn postprocess_output(
                 Some(value.clone())
             } else {
                 match crate::deref::project_value(value, &port.port_type, &edge.path) {
-                    Ok(crate::deref::Projection::Value(v)) => Some(v),
+                    Ok(crate::deref::Projection::Value(v)) => Some(Arc::new(v)),
                     Ok(crate::deref::Projection::Closed { .. }) => None,
                     Err(e) => {
                         return Err(WeftError::NodeExecution(format!(
@@ -114,53 +103,40 @@ pub fn postprocess_output(
         }
     }
 
-    // Fan-in collisions, on what the wires deliver. A closure is never
-    // a collision: a data pulse outranks it.
+    // A single-shot input port holds one value per firing of its
+    // consumer. The compiler's `duplicate-input-port` rule gives every
+    // input exactly one wire (it keys on the edge's target port, and
+    // the compiler names one on every edge it builds), so the only
+    // way a second, different
+    // value can reach a port with one already pending is the SAME
+    // producer firing again at the same location before the consumer
+    // took the first: refused before anything is committed. An equal
+    // value dedups in `emit_value_on_edge`; a closure is never a
+    // collision (a data pulse outranks it); a generator target takes
+    // repeated pulses by design (see `edge_targets_generator`).
     for d in &deliveries {
         let Some(value) = &d.value else { continue };
-        // Generator targets take repeated pulses by design; the
-        // fan-in collision reasoning below is about single-shot
-        // ports and does not apply (see `edge_targets_generator`).
-        if edge_targets_generator(project, d.edge) {
+        if super::ready::edge_targets_generator(project, d.edge) {
             continue;
         }
         let target_handle = d.edge.target_handle.as_deref().unwrap_or("default");
-        // Cross-firing collision: another in-flight data pulse at
-        // the same fan-in key with a DIFFERENT value.
-        let cross_firing_conflict = pulses.get(&d.edge.target).and_then(|ps| {
-            ps.iter().find(|p| {
+        let earlier_value_pending = pulses.get(&d.edge.target).is_some_and(|ps| {
+            ps.iter().any(|p| {
                 p.status.is_pending()
                     && p.color == color
                     && &p.frames == frames
                     && p.target_port == target_handle
                     && !p.closed
-                    && p.value != *value
+                    && !same_value(&p.value, value)
             })
         });
-        if cross_firing_conflict.is_some() {
+        if earlier_value_pending {
             return Err(WeftError::NodeExecution(format!(
-                "fan-in collision on '{target}.{target_port}' at frames {frames:?}: \
-                 another upstream producer wired to the same input already emitted a \
-                 DIFFERENT value. Rewire so only one source feeds this port.",
-                target = d.edge.target,
-                target_port = target_handle,
-            )));
-        }
-        // Within-firing collision: a sibling output of the SAME
-        // firing also wires to the same fan-in target with a
-        // different value.
-        let within_firing_conflict = deliveries.iter().any(|other| {
-            other.port != d.port
-                && other.edge.target == d.edge.target
-                && other.edge.target_handle.as_deref().unwrap_or("default") == target_handle
-                && other.value.as_ref().is_some_and(|v| v != value)
-        });
-        if within_firing_conflict {
-            return Err(WeftError::NodeExecution(format!(
-                "fan-in collision on '{target}.{target_port}' at frames {frames:?}: \
-                 two output ports of node '{node_id}' are wired to the same input and \
-                 emitted DIFFERENT values in one firing. Rewire so only one source \
-                 feeds this port.",
+                "'{node_id}.{port}' emitted a value onto '{target}.{target_port}' at frames \
+                 {frames:?} while a DIFFERENT value from an earlier firing of '{node_id}' is \
+                 still pending there; a consumer takes one value per firing, so the earlier \
+                 one has to be consumed before the next lands",
+                port = d.port,
                 target = d.edge.target,
                 target_port = target_handle,
             )));
@@ -171,11 +147,22 @@ pub fn postprocess_output(
     for d in deliveries {
         mentioned.insert(d.port.to_string());
         match d.value {
-            Some(value) => emit_value_on_edge(project, node_id, d.edge, d.port, value, color, frames, pulses, emissions),
-            None => emit_closure_on_edge(project, node_id, d.edge, d.port, color, frames, None, pulses, emissions),
+            Some(value) => emit_value_on_edge(
+                project, node_id, d.edge, d.port, value, emission_id, color, frames, pulses, emissions,
+            ),
+            None => emit_closure_on_edge(
+                project, node_id, d.edge, d.port, emission_id, color, frames, None, pulses, emissions,
+            ),
         }
     }
     Ok(mentioned)
+}
+
+/// Two shared values are the same when they are one allocation or
+/// compare equal; the pointer check makes the common fan-in case (one
+/// emission reaching one port over two wires) free.
+fn same_value(a: &Arc<Value>, b: &Arc<Value>) -> bool {
+    Arc::ptr_eq(a, b) || **a == **b
 }
 
 /// One wire's share of an emission: the edge, the port it leaves from,
@@ -184,7 +171,7 @@ pub fn postprocess_output(
 struct Delivery<'a> {
     edge: &'a Edge,
     port: &'a str,
-    value: Option<Value>,
+    value: Option<Arc<Value>>,
 }
 
 /// Put a value on ONE edge. Fan-in policy:
@@ -196,36 +183,45 @@ struct Delivery<'a> {
 /// - Generator target: append unconditionally. Repeated pulses are the
 ///   port's contract, and two EQUAL items are two items (the dedup
 ///   would silently drop one).
+/// - The pulse's id already in the bucket: the same emission on the
+///   same wire replayed (a journal row applied twice); one pulse,
+///   never two. The id names the wire end to end, so two output ports
+///   of one emission into one input port are two ids.
 #[allow(clippy::too_many_arguments)]
 fn emit_value_on_edge(
     project: &ProjectDefinition,
     source_node: &str,
     edge: &Edge,
     port: &str,
-    value: Value,
+    value: Arc<Value>,
+    emission_id: Uuid,
     color: Color,
     frames: &LoopFrames,
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
     let target_handle = edge.target_handle.as_deref().unwrap_or("default");
+    let id = pulse_id(emission_id, port, &edge.target, target_handle, false);
 
-    let already_present_same_value = !edge_targets_generator(project, edge)
-        && pulses.get(&edge.target).map(|ps| {
-            ps.iter().any(|p| {
-                p.status.is_pending()
-                    && p.color == color
-                    && &p.frames == frames
-                    && p.target_port == target_handle
-                    && !p.closed
-                    && p.value == value
-            })
-        }).unwrap_or(false);
+    let bucket = pulses.entry(edge.target.clone()).or_default();
+    if bucket.iter().any(|p| p.id == id) {
+        return;
+    }
+    let already_present_same_value = !super::ready::edge_targets_generator(project, edge)
+        && bucket.iter().any(|p| {
+            p.status.is_pending()
+                && p.color == color
+                && &p.frames == frames
+                && p.target_port == target_handle
+                && !p.closed
+                && same_value(&p.value, &value)
+        });
     if already_present_same_value {
         return;
     }
 
     let pulse = Pulse::new(
+        id,
         color,
         frames.clone(),
         edge.target.clone(),
@@ -237,7 +233,7 @@ fn emit_value_on_edge(
         source_node: source_node.to_string(),
         source_port: port.to_string(),
     });
-    pulses.entry(edge.target.clone()).or_default().push(pulse);
+    bucket.push(pulse);
 }
 
 /// Emit a CLOSURE marker on every output port the node never
@@ -259,9 +255,11 @@ fn emit_value_on_edge(
 /// clean finish over a truncated stream. Ordinary ports never carry
 /// it: their consumers act on the closure itself (skip / missing
 /// input).
+#[allow(clippy::too_many_arguments)]
 pub fn close_unmentioned_downstream(
     node_id: &str,
     mentioned: &HashSet<String>,
+    emission_id: Uuid,
     color: Color,
     frames: &LoopFrames,
     project: &ProjectDefinition,
@@ -281,14 +279,14 @@ pub fn close_unmentioned_downstream(
     };
     let outgoing = edge_idx.get_outgoing(project, node_id);
     for port in &node.outputs {
-        let is_generator = port.port_type.as_generator().is_some();
+        let is_generator = port.is_generator();
         if mentioned.contains(&port.name) && !is_generator {
             continue;
         }
         let close_error = if is_generator { failure } else { None };
         emit_closure_on_outgoing(
-            project, node_id, &port.name, color, frames, close_error, &outgoing, pulses,
-            emissions,
+            project, node_id, &port.name, emission_id, color, frames, close_error, &outgoing,
+            pulses, emissions,
         );
     }
     Ok(())
@@ -298,9 +296,11 @@ pub fn close_unmentioned_downstream(
 /// Shared primitive for the termination-time sweep
 /// (`close_unmentioned_downstream`, port-by-port) and the mid-firing
 /// `ctx.close_port` call.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_port_closure(
     node_id: &str,
     port_name: &str,
+    emission_id: Uuid,
     color: Color,
     frames: &LoopFrames,
     project: &ProjectDefinition,
@@ -331,7 +331,7 @@ pub fn emit_port_closure(
     }
     let outgoing = edge_idx.get_outgoing(project, node_id);
     emit_closure_on_outgoing(
-        project, node_id, port_name, color, frames, None, &outgoing, pulses, emissions,
+        project, node_id, port_name, emission_id, color, frames, None, &outgoing, pulses, emissions,
     );
     Ok(())
 }
@@ -342,6 +342,7 @@ fn emit_closure_on_outgoing(
     project: &ProjectDefinition,
     node_id: &str,
     port_name: &str,
+    emission_id: Uuid,
     color: Color,
     frames: &LoopFrames,
     close_error: Option<&str>,
@@ -353,7 +354,10 @@ fn emit_closure_on_outgoing(
         .iter()
         .filter(|e| e.source_handle.as_deref() == Some(port_name))
     {
-        emit_closure_on_edge(project, node_id, edge, port_name, color, frames, close_error, pulses, emissions);
+        emit_closure_on_edge(
+            project, node_id, edge, port_name, emission_id, color, frames, close_error, pulses,
+            emissions,
+        );
     }
 }
 
@@ -362,13 +366,15 @@ fn emit_closure_on_outgoing(
 /// outranks it forever; a closure is single-shot). On a GENERATOR
 /// target port, buffered items and the closure coexist (the items are
 /// taken first, then the end); only a closure already pending dedups a
-/// second one.
+/// second one. A closure whose id is already in the bucket is the same
+/// emission replayed, and dedups like the value case.
 #[allow(clippy::too_many_arguments)]
 fn emit_closure_on_edge(
     project: &ProjectDefinition,
     node_id: &str,
     edge: &Edge,
     port_name: &str,
+    emission_id: Uuid,
     color: Color,
     frames: &LoopFrames,
     close_error: Option<&str>,
@@ -376,25 +382,26 @@ fn emit_closure_on_edge(
     emissions: &mut Vec<PulseEmission>,
 ) {
     let target_handle = edge.target_handle.as_deref().unwrap_or("default");
-    let generator_target = edge_targets_generator(project, edge);
+    let generator_target = super::ready::edge_targets_generator(project, edge);
+    let id = pulse_id(emission_id, port_name, &edge.target, target_handle, true);
 
-    let already_present = pulses
-        .get(&edge.target)
-        .map(|ps| {
-            ps.iter().any(|p| {
-                p.status.is_pending()
-                    && p.color == color
-                    && &p.frames == frames
-                    && p.target_port == target_handle
-                    && (!generator_target || p.closed)
-            })
-        })
-        .unwrap_or(false);
+    let bucket = pulses.entry(edge.target.clone()).or_default();
+    if bucket.iter().any(|p| p.id == id) {
+        return;
+    }
+    let already_present = bucket.iter().any(|p| {
+        p.status.is_pending()
+            && p.color == color
+            && &p.frames == frames
+            && p.target_port == target_handle
+            && (!generator_target || p.closed)
+    });
     if already_present {
         return;
     }
 
     let pulse = Pulse::closure_with_error(
+        id,
         color,
         frames.clone(),
         edge.target.clone(),
@@ -406,7 +413,7 @@ fn emit_closure_on_edge(
         source_node: node_id.to_string(),
         source_port: port_name.to_string(),
     });
-    pulses.entry(edge.target.clone()).or_default().push(pulse);
+    bucket.push(pulse);
 }
 
 #[cfg(test)]
@@ -444,6 +451,10 @@ mod fan_in_tests {
         }
     }
 
+    fn emission() -> Uuid {
+        Uuid::new_v4()
+    }
+
     #[test]
     fn same_value_fan_in_dedups_silently() {
         let outgoing = [edge("out", "consumer", "in")];
@@ -454,8 +465,8 @@ mod fan_in_tests {
         let frames: LoopFrames = Vec::new();
 
         let project = direct_project();
-        emit_value_on_edge(&project, "src1", outgoing_refs[0], "out", json!(42), color, &frames, &mut pulses, &mut emissions);
-        emit_value_on_edge(&project, "src2", outgoing_refs[0], "out", json!(42), color, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&project, "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), color, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&project, "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), color, &frames, &mut pulses, &mut emissions);
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
         let pending: Vec<_> = consumer_bucket
@@ -463,6 +474,39 @@ mod fan_in_tests {
             .filter(|p| p.status.is_pending())
             .collect();
         assert_eq!(pending.len(), 1, "exactly one pending pulse after dedup");
+    }
+
+    /// The same emission applied twice (a journal row replayed) is
+    /// one pulse, even on a generator target where equal items are
+    /// otherwise two items.
+    #[test]
+    fn a_replayed_emission_is_one_pulse_even_on_a_generator_target() {
+        let project: ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("src", vec!["out"], vec![]),
+                { "id": "consumer", "nodeType": "Test", "label": null, "config": null,
+                  "position": { "x": 0.0, "y": 0.0 },
+                  "inputs": [{ "name": "in", "portType": "Generator[Number]", "required": true }],
+                  "outputs": [], "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] }
+            ],
+            "edges": [{ "id": "e", "source": "src", "sourceHandle": "out", "target": "consumer", "targetHandle": "in" }],
+            "groups": [],
+            "createdAt": "1970-01-01T00:00:00Z",
+            "updatedAt": "1970-01-01T00:00:00Z",
+        }))
+        .expect("stream project");
+        let edge_idx = EdgeIndex::build(&project);
+        let mut pulses = PulseTable::default();
+        let mut emissions = Vec::new();
+        let same = emission();
+        for _ in 0..2 {
+            postprocess_output("src", &bag(json!({"out": 1})), same, Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut emissions).expect("emit");
+        }
+        assert_eq!(pulses["consumer"].len(), 1, "one pulse for one emission, however often applied");
+        let other = emission();
+        postprocess_output("src", &bag(json!({"out": 1})), other, Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut emissions).expect("emit");
+        assert_eq!(pulses["consumer"].len(), 2, "a second emission of an equal item is a second item");
     }
 
     #[test]
@@ -476,21 +520,21 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_closure_on_outgoing(
-            &project, "src1", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src1", "out", emission(), color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_value_on_edge(
-            &project, "src2", outgoing_refs[0], "out", json!(42), color, &frames, &mut pulses, &mut emissions,
+            &project, "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), color, &frames, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
-        let pending: Vec<_> = consumer_bucket
+        let pending: Vec<&Pulse> = consumer_bucket
             .iter()
             .filter(|p| p.status.is_pending())
             .collect();
         assert_eq!(pending.len(), 2, "both pulses pending in the table");
-        let winner = crate::exec::ready::resolve_port_value(consumer_bucket, color, &frames, "in")
+        let winner = crate::exec::ready::resolve_port_value(&pending, "in")
             .expect("a winner");
-        assert_eq!(winner.value, json!(42), "resolve picks data over closure");
+        assert_eq!(*winner.value, json!(42), "resolve picks data over closure");
         assert!(!winner.closed);
     }
 
@@ -505,11 +549,11 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_value_on_edge(
-            &project, "src1", outgoing_refs[0], "out", json!(42), color, &frames, &mut pulses, &mut emissions,
+            &project, "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), color, &frames, &mut pulses, &mut emissions,
         );
         let emissions_before = emissions.len();
         emit_closure_on_outgoing(
-            &project, "src2", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src2", "out", emission(), color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         assert_eq!(
             emissions.len(),
@@ -523,7 +567,7 @@ mod fan_in_tests {
             .filter(|p| p.status.is_pending())
             .collect();
         assert_eq!(pending.len(), 1, "only the data pulse remains pending");
-        assert_eq!(pending[0].value, json!(42));
+        assert_eq!(*pending[0].value, json!(42));
         assert!(!pending[0].closed);
     }
 
@@ -595,6 +639,15 @@ mod fan_in_tests {
         .expect("test project")
     }
 
+    fn bag(output: serde_json::Value) -> OutputBag {
+        output
+            .as_object()
+            .expect("test bag is an object")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
+            .collect()
+    }
+
     fn run_postprocess(
         project: &ProjectDefinition,
         output: serde_json::Value,
@@ -603,15 +656,16 @@ mod fan_in_tests {
     ) -> WeftResult<HashSet<String>> {
         let edge_idx = EdgeIndex::build(project);
         postprocess_output(
-            "src", &output, uuid::Uuid::nil(), &Vec::new(), project, pulses, &edge_idx, emissions,
+            "src", &bag(output), emission(), uuid::Uuid::nil(), &Vec::new(), project, pulses, &edge_idx, emissions,
         )
     }
 
-    /// Cross-firing collision: a pending data pulse with a DIFFERENT
-    /// value already sits at the fan-in key. The second firing must
-    /// fail atomically: no pulse committed, no emission journaled.
+    /// The producer fires again at the same location with a DIFFERENT
+    /// value while its first value is still pending at the consumer:
+    /// the second firing fails atomically, no pulse committed, no
+    /// emission reported. The same value again dedups to one pulse.
     #[test]
-    fn cross_firing_different_value_errors_with_no_partial_state() {
+    fn a_second_value_over_a_pending_one_errors_with_no_partial_state() {
         let project = project_with_edges(&["out1"]);
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
@@ -622,52 +676,13 @@ mod fan_in_tests {
 
         let err = run_postprocess(&project, json!({"out1": "B"}), &mut pulses, &mut emissions)
             .expect_err("conflicting value must error");
-        assert!(
-            err.to_string().contains("another upstream producer"),
-            "names the cross-firing case: {err}"
-        );
+        assert!(err.to_string().contains("still pending"), "names the case: {err}");
         assert_eq!(pulses.get("consumer").map(|b| b.len()).unwrap_or(0), pulses_before);
         assert_eq!(emissions.len(), emissions_before, "no partial journal mutations");
-    }
 
-    /// Within-firing collision: two sibling output ports of ONE firing
-    /// wire to the same input with different values. Atomic failure.
-    #[test]
-    fn within_firing_sibling_collision_errors_with_no_partial_state() {
-        let project = project_with_edges(&["out1", "out2"]);
-        let mut pulses = PulseTable::default();
-        let mut emissions = Vec::new();
-        let err = run_postprocess(
-            &project,
-            json!({"out1": "A", "out2": "B"}),
-            &mut pulses,
-            &mut emissions,
-        )
-        .expect_err("sibling collision must error");
-        assert!(
-            err.to_string().contains("two output ports"),
-            "names the within-firing case: {err}"
-        );
-        assert!(pulses.get("consumer").map(|b| b.is_empty()).unwrap_or(true));
-        assert!(emissions.is_empty(), "no partial journal mutations");
-    }
-
-    /// Same value through both siblings is the sanctioned fan-in shape
-    /// (dedup, one pulse).
-    #[test]
-    fn within_firing_same_value_dedups() {
-        let project = project_with_edges(&["out1", "out2"]);
-        let mut pulses = PulseTable::default();
-        let mut emissions = Vec::new();
-        run_postprocess(
-            &project,
-            json!({"out1": "A", "out2": "A"}),
-            &mut pulses,
-            &mut emissions,
-        )
-        .expect("same value is fine");
-        let pending = pulses.get("consumer").map(|b| b.len()).unwrap_or(0);
-        assert_eq!(pending, 1, "deduped to one pulse");
+        run_postprocess(&project, json!({"out1": "A"}), &mut pulses, &mut emissions)
+            .expect("the same value again is fine");
+        assert_eq!(pulses["consumer"].len(), 1, "deduped to one pulse");
     }
 
     /// An undeclared output port fails the firing loudly and commits
@@ -704,10 +719,10 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_closure_on_outgoing(
-            &project, "src1", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src1", "out", emission(), color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_closure_on_outgoing(
-            &project, "src2", "out", color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, "src2", "out", emission(), color, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
@@ -741,6 +756,10 @@ mod fan_in_tests {
                 { "id": "whole", "nodeType": "Test", "label": null, "config": null,
                   "position": { "x": 0.0, "y": 0.0 },
                   "inputs": [{ "name": "in", "portType": ty, "required": true }],
+                  "outputs": [], "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] },
+                { "id": "whole2", "nodeType": "Test", "label": null, "config": null,
+                  "position": { "x": 0.0, "y": 0.0 },
+                  "inputs": [{ "name": "in", "portType": ty, "required": true }],
                   "outputs": [], "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] }
             ],
             "edges": [
@@ -748,7 +767,8 @@ mod fan_in_tests {
                   "path": ["profile", "wpm"] },
                 { "id": "e2", "source": "src", "sourceHandle": "out", "target": "who", "targetHandle": "in",
                   "path": ["profile", "name"] },
-                { "id": "e3", "source": "src", "sourceHandle": "out", "target": "whole", "targetHandle": "in" }
+                { "id": "e3", "source": "src", "sourceHandle": "out", "target": "whole", "targetHandle": "in" },
+                { "id": "e4", "source": "src", "sourceHandle": "out", "target": "whole2", "targetHandle": "in" }
             ],
             "groups": [],
             "createdAt": "1970-01-01T00:00:00Z",
@@ -762,10 +782,10 @@ mod fan_in_tests {
     }
 
     /// Each wire projects on its own: the dereferencing wires deliver
-    /// the key's value, the plain wire the whole record, and an absent
-    /// `?` key closes only its own wire.
+    /// the key's value, the plain wires share ONE allocation of the
+    /// whole record, and an absent `?` key closes only its own wire.
     #[test]
-    fn a_wire_with_a_path_delivers_the_key_and_an_absent_optional_key_closes_it() {
+    fn a_wire_with_a_path_delivers_the_key_and_plain_wires_share_the_value() {
         let project = deref_project();
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
@@ -775,7 +795,7 @@ mod fan_in_tests {
 
         let speed = pending_on(&pulses, "speed");
         assert_eq!(speed.len(), 1);
-        assert_eq!(speed[0].value, json!(42));
+        assert_eq!(*speed[0].value, json!(42));
         assert!(!speed[0].closed);
 
         let who = pending_on(&pulses, "who");
@@ -783,10 +803,35 @@ mod fan_in_tests {
         assert!(who[0].closed, "the absent `name?` closes that wire alone");
 
         let whole = pending_on(&pulses, "whole");
-        assert_eq!(whole.len(), 1);
-        assert_eq!(whole[0].value, value, "the plain wire is untouched");
-        // Every delivery is journaled with what it delivered.
-        assert_eq!(emissions.len(), 3);
+        let whole2 = pending_on(&pulses, "whole2");
+        assert_eq!(*whole[0].value, value, "the plain wire is untouched");
+        assert!(
+            Arc::ptr_eq(&whole[0].value, &whole2[0].value),
+            "two plain wires off one port point at one value"
+        );
+        // Every delivery is reported with what it delivered.
+        assert_eq!(emissions.len(), 4);
+    }
+
+    /// The same emission over the same program yields the same pulse
+    /// ids: the property the journal fold rests on.
+    #[test]
+    fn the_same_emission_yields_the_same_pulse_ids() {
+        let project = deref_project();
+        let edge_idx = EdgeIndex::build(&project);
+        let same = emission();
+        let value = bag(json!({ "out": { "profile": { "wpm": 42 }, "id": "u1" } }));
+        let ids = |pulses: &PulseTable| -> Vec<(String, Uuid)> {
+            let mut v: Vec<(String, Uuid)> = pulses.iter().flat_map(|(n, b)| b.iter().map(move |p| (n.clone(), p.id))).collect();
+            v.sort();
+            v
+        };
+        let mut a = PulseTable::default();
+        postprocess_output("src", &value, same, Uuid::nil(), &Vec::new(), &project, &mut a, &edge_idx, &mut Vec::new()).expect("emit");
+        let mut b = PulseTable::default();
+        postprocess_output("src", &value, same, Uuid::nil(), &Vec::new(), &project, &mut b, &edge_idx, &mut Vec::new()).expect("emit");
+        assert_eq!(ids(&a), ids(&b));
+        assert_eq!(ids(&a).len(), 4);
     }
 
     /// A required key missing is a value that broke its declared type:
@@ -807,4 +852,5 @@ mod fan_in_tests {
         assert!(pulses.values().all(|b| b.is_empty()), "no pulse committed");
         assert!(emissions.is_empty(), "nothing journaled");
     }
+
 }

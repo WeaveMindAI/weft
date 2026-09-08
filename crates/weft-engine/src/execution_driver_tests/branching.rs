@@ -106,6 +106,70 @@
 
     use super::engine_test_rig::catalog;
 
+    /// A group boundary never journals a row: what it did is what the
+    /// fold derives, so a test reads it off the snapshot.
+    fn fold(project: ProjectDefinition, events: &[ExecEvent]) -> weft_core::primitive::ExecutionSnapshot {
+        fold_with_boundaries(project, events).0
+    }
+
+    /// The fold plus every boundary firing it derived, as `(node, skip
+    /// reason)`: what the live bridge paints the boundary from.
+    fn fold_with_boundaries(
+        project: ProjectDefinition,
+        events: &[ExecEvent],
+    ) -> (weft_core::primitive::ExecutionSnapshot, Vec<(String, Option<SkipReason>)>) {
+        let color = events.first().expect("journal has rows").color();
+        let mut fold = weft_journal::Fold::new(color, Arc::new(project));
+        let mut boundaries = Vec::new();
+        for e in events {
+            for b in fold.apply(e).boundaries {
+                if let weft_core::exec::boundary::BoundaryOutcome::Fired { skip_reason, .. } = b.outcome {
+                    boundaries.push((b.node_id, skip_reason));
+                }
+            }
+        }
+        let snap = fold.into_snapshot();
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        (snap, boundaries)
+    }
+
+    /// A run that reached its end folds to the same end: every record
+    /// terminal, nothing left in flight, and the fold applied every
+    /// row. THE check that the journal carries enough to rebuild what
+    /// the live engine held, now that the rows carry no derived state.
+    fn assert_fold_settles(project: ProjectDefinition, events: &[ExecEvent]) {
+        let snap = fold(project, events);
+        let pending: Vec<String> = snap
+            .pulses
+            .iter()
+            .flat_map(|(n, b)| b.iter().filter(|p| p.status.in_flight()).map(move |p| format!("{n}.{}@{:?}", p.target_port, p.frames)))
+            .collect();
+        assert!(pending.is_empty(), "a completed run folds with pulses in flight: {pending:?}");
+        let open: Vec<String> = snap
+            .executions
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|e| !e.status.is_terminal())
+            .map(|e| format!("{}@{:?}", e.node_id, e.frames))
+            .collect();
+        assert!(open.is_empty(), "a completed run folds with open records: {open:?}");
+        assert_eq!(
+            weft_core::exec::check_completion(&snap.pulses, &snap.executions),
+            Some(false),
+            "the fold reaches the live engine's conclusion"
+        );
+    }
+
+    /// The skip reason a boundary fired with, off the fold: `None` is
+    /// a boundary that fired and ran. A boundary that never fired is a
+    /// failed assertion here, never a `None`.
+    fn boundary_skip_reason(boundaries: &[(String, Option<SkipReason>)], node: &str) -> Option<SkipReason> {
+        let mut reasons: Vec<Option<SkipReason>> =
+            boundaries.iter().filter(|(n, _)| n == node).map(|(_, r)| r.clone()).collect();
+        assert_eq!(reasons.len(), 1, "one boundary firing per location, '{node}' has {}", reasons.len());
+        reasons.pop().flatten()
+    }
+
     /// source.value -> guarded.value, source.allowed -> guarded._should_flow,
     /// guarded.value -> behind.value. The shape every test here drives.
     fn guarded_project() -> ProjectDefinition {
@@ -164,7 +228,7 @@
             .iter()
             .filter_map(|e| match e {
                 ExecEvent::NodeSkipped { node_id, reason, .. } if node_id == node => {
-                    Some(reason.clone().expect("every live writer journals a reason"))
+                    Some(reason.clone())
                 }
                 _ => None,
             })
@@ -211,7 +275,7 @@
             "the node behind is a CONSEQUENCE (its input closed), not a decision"
         );
         assert!(
-            matches!(outcome, ExecutionOutcome::Completed { .. }),
+            matches!(outcome, ExecutionOutcome::Completed),
             "a branch not taken is not a failure: {outcome:?}"
         );
     }
@@ -226,7 +290,7 @@
 
         assert_eq!(*ran.lock().unwrap(), vec!["guarded", "behind"]);
         assert!(skip_reason(&events, "guarded").is_none());
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
     }
 
     /// A guard that never spoke is its own reason: nothing decided, so
@@ -277,7 +341,7 @@
             ran.lock().unwrap()
         );
         assert_eq!(skip_reason(&events, "solo"), Some(SkipReason::DidNotFlow));
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
     }
 
     /// A journaled run subgraph (a trigger fire's program) holds the
@@ -299,7 +363,7 @@
             CancellationFlag::new_arc(),
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(
             ran.lock().unwrap().as_slice(),
             &["guarded"],
@@ -403,7 +467,7 @@
             Some(&["my_trigger", "shared", "mine"]),
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(ran.lock().unwrap().as_slice(), &["guarded"], "only the fired program's node runs");
         // The other program: nothing, not even a skip row.
         assert!(!touched(&events, "theirs"), "another program's node must leave no trace: {events:?}");
@@ -536,7 +600,7 @@
             CancellationFlag::new_arc(),
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(ran.lock().unwrap().as_slice(), &["a"]);
         assert!(!touched(&events, "b"), "{events:?}");
     }
@@ -607,7 +671,7 @@
             CancellationFlag::new_arc(),
         )
         .await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(ran.lock().unwrap().as_slice(), &["a"]);
         assert!(!touched(&events, "b"), "no row for the out-of-scope node: {events:?}");
     }
@@ -707,17 +771,49 @@
             "nothing inside the group, and nothing after it, may run: {:?}",
             ran.lock().unwrap()
         );
-        assert_eq!(skip_reason(&events, "outer__in"), Some(SkipReason::DidNotFlow));
+        let (_, boundaries) = fold_with_boundaries(nested_group_project(), &events);
+        assert_eq!(boundary_skip_reason(&boundaries, "outer__in"), Some(SkipReason::DidNotFlow));
         let scope_skipped = Some(SkipReason::ScopeSkipped { scope: "outer".into() });
         assert_eq!(skip_reason(&events, "deep"), scope_skipped, "the node two levels in");
-        assert_eq!(skip_reason(&events, "outer.inner__in"), scope_skipped, "the nested boundary");
-        assert_eq!(skip_reason(&events, "outer.inner__out"), scope_skipped);
+        assert_eq!(boundary_skip_reason(&boundaries, "outer.inner__in"), scope_skipped, "the nested boundary");
+        assert_eq!(boundary_skip_reason(&boundaries, "outer.inner__out"), scope_skipped);
         assert_eq!(
             skip_reason(&events, "after"),
             Some(SkipReason::RequiredInputClosed { port: "value".into() }),
             "outside the scope, the closure cascade carries on"
         );
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+        assert_fold_settles(nested_group_project(), &events);
+    }
+
+    /// The same nesting with the gate open: the value crosses two
+    /// boundaries in and two out, and the journal (which holds no row
+    /// for any of the four) folds back to the settled run the engine
+    /// held, boundaries included.
+    #[tokio::test]
+    async fn a_nested_group_run_folds_back_to_its_settled_state() {
+        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
+        let mut project = nested_group_project();
+        let outer_in = project.nodes.iter_mut().find(|n| n.id == "outer__in").expect("outer__in");
+        outer_in.port_literals.remove(SHOULD_FLOW_PORT);
+        let project_again = project.clone();
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("deep", Box::new(Echo { id: "deep", ran: ran.clone() })),
+            ("after", Box::new(Echo { id: "after", ran: ran.clone() })),
+        ]);
+        let (outcome, events) = drive(project, cat, &["source"]).await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+        assert_eq!(ran.lock().unwrap().as_slice(), &["deep", "after"]);
+        assert!(
+            !events.iter().any(|e| matches!(e, ExecEvent::NodeStarted { node_id, .. } if node_id.ends_with("__in") || node_id.ends_with("__out"))),
+            "a boundary never journals a row: {events:?}"
+        );
+        let snap = fold(project_again.clone(), &events);
+        for boundary in ["outer__in", "outer.inner__in", "outer.inner__out", "outer__out"] {
+            assert_eq!(snap.executions[boundary][0].status, NodeExecutionStatus::Completed, "{boundary}");
+        }
+        assert_fold_settles(project_again, &events);
     }
 
     /// A literal written on a container's interface port (`g.b = "fixed"`)
@@ -781,7 +877,7 @@
         ]);
         let (outcome, _) = drive(project, cat, &["source"]).await;
 
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["fixed".to_string()]);
     }
 
@@ -865,13 +961,12 @@
         ]);
         let (outcome, events) = drive(rooted_group_project(), cat, &["source"]).await;
 
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "the root's value reached deep");
-        assert!(
-            events.iter().any(|e| matches!(e, ExecEvent::ScopeLaunched { group_id, roots, .. }
-                if group_id == "g" && roots == &vec!["seed".to_string()])),
-            "the launch names the root it kicked: {events:?}"
-        );
+        let snap = fold(rooted_group_project(), &events);
+        let kick = snap.kicked.get(&FiringLocation::new("seed", vec![])).expect("the launch kicked the root");
+        assert!(kick.dispatched && kick.scope_skipped.is_none(), "{kick:?}");
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Completed);
     }
 
     /// The same root when the group's `_should_flow` says no: nothing
@@ -888,19 +983,20 @@
         ]);
         let (outcome, events) = drive(rooted_group_project(), cat, &["source"]).await;
 
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert!(ran.lock().unwrap().is_empty(), "{:?}", ran.lock().unwrap());
-        assert_eq!(skip_reason(&events, "g__in"), Some(SkipReason::DidNotFlow));
+        // The boundary itself journals nothing; the fold holds its
+        // skipped record and the skip kicks of every member.
+        let snap = fold(rooted_group_project(), &events);
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Skipped);
+        assert_eq!(
+            snap.kicked.get(&FiringLocation::new("seed", vec![])).map(|k| k.scope_skipped.as_deref()),
+            Some(Some("g")),
+            "a gated scope kicks its members into a skip"
+        );
         let scope_skipped = Some(SkipReason::ScopeSkipped { scope: "g".into() });
         assert_eq!(skip_reason(&events, "seed"), scope_skipped, "the root, which no wire feeds");
         assert_eq!(skip_reason(&events, "deep"), scope_skipped);
-        // The launch row still lands, marked as the skip it was: that
-        // is what a replay folds into the members' skip kicks.
-        assert!(
-            events.iter().any(|e| matches!(e, ExecEvent::ScopeLaunched { group_id, skipped_by, .. }
-                if group_id == "g" && skipped_by.as_deref() == Some("g"))),
-            "a gated scope journals its launch as a skip: {events:?}"
-        );
     }
 
     /// `_should_flow` on a group from outside, when whatever decides it
@@ -944,12 +1040,14 @@
             ("gate", Box::new(Echo { id: "gate", ran: ran.clone() })),
             ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
         ]);
+        let project_again = project.clone();
         let (outcome, events) = drive(project, cat, &["source"]).await;
 
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert!(ran.lock().unwrap().is_empty(), "{:?}", ran.lock().unwrap());
         assert_eq!(skip_reason(&events, "gate"), Some(SkipReason::DidNotFlow));
-        assert_eq!(skip_reason(&events, "g__in"), Some(SkipReason::FlowClosed));
+        let (_, boundaries) = fold_with_boundaries(project_again, &events);
+        assert_eq!(boundary_skip_reason(&boundaries, "g__in"), Some(SkipReason::FlowClosed));
         assert_eq!(skip_reason(&events, "deep"), Some(SkipReason::ScopeSkipped { scope: "g".into() }));
     }
 
@@ -1000,11 +1098,17 @@
             ("reads_a", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
             ("reads_b", Box::new(Echo { id: "reads_b", ran: ran.clone() })),
         ]);
+        let project_again = project.clone();
         let (outcome, events) = drive(project, cat, &["source"]).await;
 
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "reads_a ran on the open port");
-        assert_eq!(skip_reason(&events, "g__in"), None, "the group itself runs");
+        // Boundaries never journal: the group's own firing is read off
+        // the fold, and it ran (a closed input gates a member, never
+        // the group).
+        let (snap, boundaries) = fold_with_boundaries(project_again, &events);
+        assert_eq!(boundary_skip_reason(&boundaries, "g__in"), None, "the group itself runs");
+        assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Completed);
         assert_eq!(
             skip_reason(&events, "reads_b"),
             Some(SkipReason::RequiredInputClosed { port: "value".into() }),
@@ -1056,10 +1160,16 @@
             ("deep", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
             ("reads_a", Box::new(Echo { id: "reads_a", ran: ran.clone() })),
         ]);
+        let project_again = project.clone();
         let (outcome, events) = drive(project, cat, &["source"]).await;
 
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
-        assert_eq!(skip_reason(&events, "g__in"), None, "the boundary is not gated by its inputs");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+        let snap = fold(project_again, &events);
+        assert_eq!(
+            snap.executions["g__in"][0].status,
+            NodeExecutionStatus::Completed,
+            "the boundary is not gated by its inputs"
+        );
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string()], "the root ran and fed deep");
         assert_eq!(
             skip_reason(&events, "reads_a"),
@@ -1068,8 +1178,8 @@
         );
         assert_eq!(skip_reason(&events, "seed"), None);
         assert!(
-            events.iter().any(|e| matches!(e, ExecEvent::ScopeLaunched { group_id, skipped_by: None, .. } if group_id == "g")),
-            "the scope launched for real: {events:?}"
+            snap.kicked.get(&FiringLocation::new("seed", vec![])).is_some_and(|k| k.scope_skipped.is_none()),
+            "the scope launched for real"
         );
     }
 
@@ -1131,10 +1241,12 @@
             ("Seed", Box::new(Source { allowed: json!(true) })),
             ("tally", Box::new(Recorder { seen: seen.clone(), ran: ran.clone() })),
         ]);
+        let project_again = project.clone();
         let (outcome, events) = drive(project, cat, &["lister"]).await;
 
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "{outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["payload".to_string(), "payload".to_string()]);
+        assert_fold_settles(project_again, &events);
         let mut seed_frames: Vec<Vec<u32>> = events
             .iter()
             .filter_map(|e| match e {
@@ -1225,4 +1337,36 @@
             .collect();
         assert_eq!(node_cancels.len(), 1, "the parked node gets one cancel row: {events:?}");
         assert_eq!(node_cancels[0], &cause.to_string(), "per-node cancel rows carry the same cause");
+    }
+
+    /// The cancel walk's closures get the same pass a turn's would: a
+    /// node parked two groups deep is cancelled with its output port
+    /// never written, so the closure the walk puts on that port makes
+    /// both Out boundaries ready, and they fire (records, closures
+    /// forwarded outward) on the worker exactly as the fold fires them
+    /// from the `NodeCancelled` row (`drive` compares the two).
+    #[tokio::test]
+    async fn a_cancelled_body_closes_its_groups_outward() {
+        let mut project = nested_group_project();
+        let outer_in = project.nodes.iter_mut().find(|n| n.id == "outer__in").expect("outer__in");
+        outer_in.port_literals.remove(SHOULD_FLOW_PORT);
+        let project_again = project.clone();
+        let cat = catalog(vec![
+            ("Source", Box::new(Source { allowed: json!(true) })),
+            ("deep", Box::new(SelfStopper { cause: weft_core::exec::CancelCause::User })),
+        ]);
+        let (outcome, events) = drive(project, cat, &["source"]).await;
+        assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }), "{outcome:?}");
+        let snap = fold(project_again, &events);
+        assert_eq!(snap.executions["deep"][0].status, NodeExecutionStatus::Cancelled);
+        for boundary in ["outer.inner__out", "outer__out"] {
+            assert_eq!(
+                snap.executions.get(boundary).map(|r| r[0].status.clone()),
+                Some(NodeExecutionStatus::Completed),
+                "{boundary} fired on the cancelled body's closure"
+            );
+        }
+        let after: Vec<_> = snap.pulses["after"].iter().collect();
+        assert_eq!(after.len(), 1, "the closure reached past both groups: {after:?}");
+        assert!(after[0].closed);
     }

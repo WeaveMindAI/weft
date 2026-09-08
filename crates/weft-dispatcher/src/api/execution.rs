@@ -4,6 +4,10 @@
 //! and VS Code extension hit over HTTP: logs, replay,
 //! list_executions, get.
 
+use std::sync::Arc;
+
+use weft_core::ProjectDefinition;
+
 use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,7 +139,12 @@ pub async fn cancel_color(
         %cause,
         "cancel_color start"
     );
-    let write = state.journal.cancel_execution(color, cause).await?;
+    // The per-node cancels come off the fold, which needs the run's
+    // program; a color with none (never started, a node self-test)
+    // has no nodes to cancel, and a program that cannot be found is no
+    // reason to leave the run running: the terminal lands anyway.
+    let program = program_for_cancel(state, color).await?;
+    let write = state.journal.cancel_execution(color, program.as_deref(), cause).await?;
     state
         .listeners
         .unregister_many(&state.pg_pool, &write.removed)
@@ -170,46 +179,88 @@ pub async fn cancel_color(
 pub fn cancel_terminal_events(
     color: Color,
     events: &[weft_journal::ExecEvent],
+    program: Option<&ProjectDefinition>,
     cause: &CancelCause,
     now: u64,
-) -> Vec<(weft_journal::ExecEvent, String)> {
+) -> anyhow::Result<Vec<(weft_journal::ExecEvent, String)>> {
     use weft_journal::ExecEvent;
     let reason = cause.to_string();
-    let snapshot = weft_journal::fold_to_snapshot(color, events);
-    // `snapshot.corruptions` is intentionally not consumed here. The
-    // cancel writers only need the executions map to know which
-    // nodes are still non-terminal. The inspector's `/replay` path
-    // is the user-visible surface for corruptions; `report_corruption`
-    // already logged each row at `error!` level for ops.
     let mut writes = Vec::new();
-    for (node_id, execs) in &snapshot.executions {
-        for e in execs {
-            if e.status.is_terminal() {
-                continue;
+    match program {
+        Some(program) => {
+            // The executions map says which nodes are still non-terminal.
+            // A row the fold could not apply was logged at `error!`
+            // level and is the inspector's `/replay` to show; the
+            // records that did fold are the ones to flip.
+            let snapshot = weft_journal::fold_to_snapshot(
+                color,
+                Arc::new(program.clone()),
+                events,
+            );
+            for (node_id, execs) in &snapshot.executions {
+                for e in execs {
+                    if e.status.is_terminal() {
+                        continue;
+                    }
+                    let frames_key: String =
+                        e.frames.iter().map(|f| f.index.to_string()).collect::<Vec<_>>().join(".");
+                    writes.push((
+                        ExecEvent::NodeCancelled {
+                            color,
+                            node_id: node_id.clone(),
+                            frames: e.frames.clone(),
+                            reason: reason.clone(),
+                            at_unix: now,
+                        },
+                        format!("cancel:{color}:{node_id}:{frames_key}"),
+                    ));
+                }
             }
-            let frames_key: String =
-                e.frames.iter().map(|f| f.index.to_string()).collect::<Vec<_>>().join(".");
-            writes.push((
-                ExecEvent::NodeCancelled {
-                    color,
-                    node_id: node_id.clone(),
-                    frames: e.frames.clone(),
-                    reason: reason.clone(),
-                    // Dispatcher-side catch-up cancel only flips records
-                    // terminal; the closure cascade is the worker/cleanup's
-                    // job, so no per-node closures ride here.
-                    closure_emissions: Vec::new(),
-                    at_unix: now,
-                },
-                format!("cancel:{color}:{node_id}:{frames_key}"),
-            ));
+        }
+        // No program: a color that never ran a node body (a node
+        // self-test) has nothing per node to flip. A color whose
+        // program is gone (its project was removed) or cannot be read
+        // still ends, on the terminal alone: the stop must land, and
+        // the run's status is read off the terminal. Its node records
+        // stay as they were (the execution view paints them from a
+        // fold this run no longer has), which is what a run without a
+        // program looks like everywhere else.
+        None => {
+            if events.iter().any(|e| matches!(e, ExecEvent::NodeStarted { .. })) {
+                tracing::warn!(
+                    target: "weft_dispatcher::cancel",
+                    %color,
+                    "cancelling without the run's program: the terminal is written, the \
+                     per-node cancels cannot be derived"
+                );
+            }
         }
     }
     writes.push((
         ExecEvent::ExecutionCancelled { color, reason, cause: Some(cause.clone()), at_unix: now },
         format!("execution_cancelled:{color}"),
     ));
-    writes
+    Ok(writes)
+}
+
+/// The program a cancel folds with to derive its per-node cancels, or
+/// `None` when the color has none to fold with: no program at all, a
+/// removed project, or a program that cannot be read (logged; the
+/// stop still lands on the terminal). `Err` only for the database.
+pub async fn program_for_cancel(
+    state: &crate::state::DispatcherState,
+    color: Color,
+) -> anyhow::Result<Option<Arc<ProjectDefinition>>> {
+    let lookup = crate::projection::execution_program(state, color).await?;
+    if let crate::projection::ProgramLookup::Unreadable(reason) = &lookup {
+        tracing::warn!(
+            target: "weft_dispatcher::cancel",
+            %color, %reason,
+            "cancelling a run whose program cannot be read: the terminal is written, the \
+             per-node cancels cannot be derived"
+        );
+    }
+    Ok(lookup.program())
 }
 
 /// The terminal outcome recorded for a color, if any. The journal is
@@ -400,7 +451,7 @@ pub async fn list_logs(
 /// `ExecutionCancelled`) are NOT synthesized from the execution
 /// summary. They are already in the journal log when the execution
 /// settled (the summary's status is itself derived from the presence
-/// of that journal row), and `to_dispatcher_events` projects them
+/// of that journal row), and `ExecutionProjector` projects them
 /// faithfully (carrying the real outputs / error / reason). Synthesizing
 /// a duplicate from the summary would emit a lossy second terminal
 /// (empty payloads) that overrides the real one on the receiving
@@ -418,14 +469,13 @@ pub async fn replay(
     // replay's event attribution.
     let project_id =
         authorize_execution(&*state.journal, &caller.0, color).await.map_err(|(s, _)| s)?.project_id;
-    // Use the full ExecEvent log so bus events ride along with node
-    // lifecycle events. The same `to_dispatcher_events` mapper the
-    // live `journal_bridge` uses runs over the log; replay and live
-    // share the projection so they can't drift.
+    // The full ExecEvent log, folded over the run's program through
+    // the SAME projection the live `journal_bridge` runs, so replay and
+    // live cannot drift; bus and caller events ride along.
     // Lossy read: the inspector renders what exists, and every row
     // that no longer decodes lands below as its own JournalCorruption
     // entry, naming `weft clean`, instead of taking the response down.
-    let (raw_events, undecodable) =
+    let (raw_events, mut undecodable) =
         state.journal.events_log_lossy(color).await.map_err(|e| {
             tracing::error!(
                 target: "weft_dispatcher::api",
@@ -434,27 +484,34 @@ pub async fn replay(
             );
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    // Fold once for corruption detection. The fold is otherwise
-    // unused here (the replay sends raw ExecEvent projections, not
-    // snapshot state), but it's cheap relative to the network round-
-    // trip and gives the inspector a one-shot list of any rows that
-    // could not be applied. The same fold runs in the engine resume
-    // path and the cancel handler; this is the inspector's window.
-    let snapshot = weft_journal::fold_to_snapshot(color, raw_events.iter().map(|record| &record.event));
-    let mut out: Vec<crate::events::LiveEvent> = raw_events
-        .into_iter()
-        .flat_map(|e| {
-            crate::journal_bridge::project_recorded_event(e, project_id.clone())
-        })
-        .collect();
-    for c in snapshot.corruptions {
-        out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
-            color,
-            project_id: project_id.clone(),
-            site: c.site,
-            reason: c.reason,
-        }));
+    // Only the database itself fails the read; a program that cannot
+    // be found paints the run as unreadable, the way the live bridge
+    // does for the same journal, and names `weft clean` below.
+    let program = match crate::projection::execution_program(&state, color).await.map_err(|e| {
+        tracing::error!(
+            target: "weft_dispatcher::api",
+            %color, error = %e,
+            "replay: looking up the run's program failed"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
+        crate::projection::ProgramLookup::Unreadable(reason) => {
+            undecodable.push(reason);
+            crate::projection::ProgramLookup::Unreadable(String::new())
+        }
+        found => found,
+    };
+    let mut projector = crate::projection::ExecutionProjector::new(color, program, project_id.clone());
+    let mut out: Vec<crate::events::LiveEvent> = Vec::new();
+    for record in raw_events {
+        let projected = projector.project(&record.event);
+        out.extend(
+            crate::events::IdentifiedEvent { event_id: record.event_id, event: () }
+                .project(|()| projected),
+        );
     }
+    // A row the fold could not apply is painted as its corruption, at
+    // the row, by the projector; the rows that never decoded follow.
     for reason in undecodable {
         out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
             color,
@@ -572,4 +629,47 @@ pub async fn delete_execution(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    use super::*;
+    use weft_journal::ExecEvent;
+
+    fn program() -> ProjectDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [{
+                "id": "wait", "nodeType": "Wait", "label": null, "config": null,
+                "position": { "x": 0.0, "y": 0.0 }, "inputs": [], "outputs": [],
+                "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+            }],
+            "edges": []
+        }))
+        .expect("program")
+    }
+
+    fn open_firing(color: Color) -> Vec<ExecEvent> {
+        vec![
+            ExecEvent::NodeKicked { color, node_id: "wait".into(), firing: true, payload: None, port_snapshot: None, at_unix: 0 },
+            ExecEvent::NodeStarted { color, node_id: "wait".into(), frames: vec![], at_unix: 1 },
+        ]
+    }
+
+    /// With the program, every open firing gets its `NodeCancelled`
+    /// before the terminal; without one (a removed or unreadable
+    /// program, a node self-test) the terminal still lands, alone.
+    #[test]
+    fn cancel_writes_per_node_rows_with_the_program_and_the_terminal_without() {
+        let color = Color::new_v4();
+        let program = program();
+        let with = cancel_terminal_events(color, &open_firing(color), Some(&program), &CancelCause::User, 9).unwrap();
+        let kinds: Vec<&str> = with.iter().map(|(e, _)| e.kind_str()).collect();
+        assert_eq!(kinds, vec!["node_cancelled", "execution_cancelled"]);
+        assert_eq!(with[0].1, format!("cancel:{color}:wait:"));
+        let without = cancel_terminal_events(color, &open_firing(color), None, &CancelCause::User, 9).unwrap();
+        let kinds: Vec<&str> = without.iter().map(|(e, _)| e.kind_str()).collect();
+        assert_eq!(kinds, vec!["execution_cancelled"]);
+        assert!(matches!(&without[0].0, ExecEvent::ExecutionCancelled { cause: Some(CancelCause::User), .. }));
+    }
 }

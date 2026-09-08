@@ -7,6 +7,7 @@
 //!     compared against each listener pod's in-process registry, to
 //!     surface drift between the dispatcher's view and the listener's.
 
+use anyhow::Context;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -299,6 +300,8 @@ pub async fn listener_inspect(
         // mismatches between the placement table and the pod's
         // registry. A silenced DB error or silent JSON decode failure
         // here would defeat that. Propagate / report the failure shape.
+        // Postgres counts in a signed integer; the wire promises the
+        // CLI a count, never a sign.
         let placed_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM signal WHERE listener_pod = $1",
         )
@@ -306,6 +309,9 @@ pub async fn listener_inspect(
         .fetch_one(&state.pg_pool)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("placed_count: {e}")))?;
+        let placed_count = u64::try_from(placed_count).map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("placed_count: negative count {placed_count}"))
+        })?;
         let listener_registry: Value = match http
             .get(format!("{}/signals", admin_url.trim_end_matches('/')))
             .send()
@@ -816,7 +822,13 @@ pub(crate) async fn dispatch_listener_outcome(
                             Some(&tenant_str),
                         )
                         .await?;
-                        state.journal.consume_suspension(&token_owned).await?;
+                        // The row is gone now, so the pod that held the
+                        // signal only learns of it from the row we just
+                        // deleted (its holder rides on the returned
+                        // registration).
+                        if let Some(consumed) = state.journal.consume_suspension(&token_owned).await? {
+                            state.listeners.unregister_many(&state.pg_pool, &[consumed]).await;
+                        }
                         Ok(StatusCode::OK)
                     }
                     ProcessTarget::Entry => {
@@ -1364,38 +1376,50 @@ impl TokenScope {
         &self,
         state: &DispatcherState,
     ) -> anyhow::Result<Vec<crate::journal::SignalRegistration>> {
-        // One decoder for a signal row, shared with the journal
-        // (`row_to_signal`): the SELECT differs (a join and the
-        // consumer filters), the decoding must not.
-        let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(
-            "SELECT s.token, s.tenant_id, s.project_id, s.color, s.node_id, s.is_resume, \
-                    s.spec_json, s.access_id, s.consumer_kind, s.tags, s.port_snapshot, \
-                    s.consumer_payload, \
-                    s.surface_kind, s.mount_path, s.auth_kind, s.auth_config, \
-                    s.kind_state, s.kind_state_seq \
-             FROM signal s \
-             LEFT JOIN project p ON p.id::text = s.project_id \
-             WHERE COALESCE(p.fires_visible_to_consumers, FALSE) = TRUE \
-               AND s.tenant_id = $1 \
-               AND ($2::uuid[] = '{}'::uuid[] OR s.project_id::uuid = ANY($2)) \
-               AND ($3::text[] = '{}'::text[] OR s.tags && $3) \
-               AND ( \
-                 s.is_resume = FALSE \
-                 OR jsonb_array_length(s.parked_fires) = 0 \
-               ) \
-             ORDER BY s.is_resume ASC, s.created_at ASC",
+        signals_visible_to(
+            &state.pg_pool,
+            &self.row.tenant_id,
+            &self.row.allowed_projects,
+            &self.row.allowed_tags,
         )
-        .bind(&self.row.tenant_id)
-        .bind(&self.row.allowed_projects)
-        .bind(&self.row.allowed_tags)
-        .fetch_all(&state.pg_pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            out.push(crate::journal::postgres::row_to_signal(r)?);
-        }
-        Ok(out)
+        .await
     }
+}
+
+/// Every signal a consumer token scoped to `tenant`, `projects` (empty:
+/// all of the tenant's) and `tags` (empty: any) may see: rows of projects
+/// showing their fires to consumers, resume rows only while unanswered.
+/// Entry rows first, then by age.
+pub async fn signals_visible_to(
+    pool: &sqlx::PgPool,
+    tenant: &str,
+    projects: &[uuid::Uuid],
+    tags: &[String],
+) -> anyhow::Result<Vec<crate::journal::SignalRegistration>> {
+    // One decoder for a signal row, shared with the journal
+    // (`row_to_signal`): the SELECT differs (a join and the consumer
+    // filters), the columns and the decoding must not.
+    let rows = sqlx::query_as::<_, crate::journal::postgres::SignalRow>(concat!(
+        "SELECT ", crate::journal::postgres::signal_columns!("s."), " \
+         FROM signal s \
+         LEFT JOIN project p ON p.id::text = s.project_id \
+         WHERE COALESCE(p.fires_visible_to_consumers, FALSE) = TRUE \
+           AND s.tenant_id = $1 \
+           AND ($2::uuid[] = '{}'::uuid[] OR s.project_id::uuid = ANY($2)) \
+           AND ($3::text[] = '{}'::text[] OR s.tags && $3) \
+           AND ( \
+             s.is_resume = FALSE \
+             OR jsonb_array_length(s.parked_fires) = 0 \
+           ) \
+         ORDER BY s.is_resume ASC, s.created_at ASC"
+    ))
+    .bind(tenant)
+    .bind(projects)
+    .bind(tags)
+    .fetch_all(pool)
+    .await
+    .context("signals_visible_to (the consumer listing): read a signal row")?;
+    rows.into_iter().map(crate::journal::postgres::row_to_signal).collect()
 }
 
 // ---------- PublicEntry catch-all + inspector display/action -----------
@@ -2030,16 +2054,20 @@ async fn spawn_worker_pod(
 /// row, which is exactly the state the orphan-task sweep reconciles, so the
 /// failure is loud but leaves only reclaimable state.
 async fn teardown_unclaimed_live_execution(state: &DispatcherState, color: uuid::Uuid) {
-    if let Err(e) = state
-        .journal
-        .cancel_never_claimed_execution(
-            color,
-            &weft_core::exec::CancelCause::Runtime {
-                detail: "live-connection setup failed; no worker run was created".into(),
-            },
-        )
-        .await
-    {
+    let teardown = async {
+        let program = crate::api::execution::program_for_cancel(state, color).await?;
+        state
+            .journal
+            .cancel_never_claimed_execution(
+                color,
+                program.as_deref(),
+                &weft_core::exec::CancelCause::Runtime {
+                    detail: "live-connection setup failed; no worker run was created".into(),
+                },
+            )
+            .await
+    };
+    if let Err(e) = teardown.await {
         tracing::warn!(
             target: "weft_dispatcher::signal",
             color = %color, error = %e,
@@ -2309,6 +2337,7 @@ mod public_url_tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            listener_pod: None,
         }
     }
 
@@ -2478,6 +2507,7 @@ mod can_cancel_tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            listener_pod: None,
         }
     }
 
@@ -2572,6 +2602,7 @@ mod signal_file_scope_tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            listener_pod: None,
         }
     }
 

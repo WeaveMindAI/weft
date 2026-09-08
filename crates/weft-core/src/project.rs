@@ -501,6 +501,15 @@ pub struct InputDefinition {
     pub requires_values: Option<Vec<String>>,
 }
 
+impl PortDefinition {
+    /// Whether this port carries a stream (`Generator[T]`). THE one
+    /// reading of a port's type for that question; the node-level
+    /// readers in `exec::ready` are built on it.
+    pub fn is_generator(&self) -> bool {
+        self.port_type.as_generator().is_some()
+    }
+}
+
 impl InputDefinition {
     /// An input for a pure WIRE port (a boundary passthrough side, a
     /// source-declared custom port): drivers from the type, no editor

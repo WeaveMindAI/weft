@@ -27,7 +27,8 @@ use uuid::Uuid;
 use weft_core::ProjectDefinition;
 use weft_dispatcher::api::project::{due_parked_tokens, release_stale_drain_claims};
 use weft_dispatcher::api::signal::{
-    append_parked_fire, restamp_parked_fire, ParkAppend, ParkedFire, ParkRefusal,
+    append_parked_fire, restamp_parked_fire, signals_visible_to, ParkAppend, ParkedFire,
+    ParkRefusal,
 };
 use weft_dispatcher::journal::postgres::PostgresJournal;
 use weft_dispatcher::journal::{Journal, SignalPlacement, SignalRegistration};
@@ -125,6 +126,7 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         kind_state_seq: 0,
         access_id: None,
         port_snapshot: None,
+        listener_pod: None,
     }
 }
 
@@ -931,6 +933,60 @@ async fn seed_parked_signal(journal: &PostgresJournal, token: &str, project: Uui
         )
         .await
         .expect("seed signal row");
+}
+
+/// Consuming a resume token deletes its row and hands the row back
+/// naming the pod that held it, so the in-RAM unregister that follows
+/// the DELETE knows where to go. An entry row is not consumed.
+#[sqlx::test]
+async fn consume_suspension_returns_the_deleted_row_with_its_holder(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    seed_listener_pod(&pool, "listener-park", "disp-1").await;
+    seed_parked_signal(&journal, "tok-entry", project).await;
+    let mut resume = entry_signal("tok-resume", project);
+    resume.is_resume = true;
+    journal
+        .signal_insert(
+            &resume,
+            &SignalPlacement { listener_pod: "listener-park".to_string(), generation: 1 },
+        )
+        .await
+        .expect("seed resume signal");
+
+    let consumed = journal.consume_suspension("tok-resume").await.unwrap().expect("the resume row");
+    assert_eq!(consumed.token, "tok-resume");
+    assert_eq!(consumed.listener_pod.as_deref(), Some("listener-park"));
+    assert!(journal.signal_get("tok-resume").await.unwrap().is_none(), "single use");
+    assert!(journal.consume_suspension("tok-resume").await.unwrap().is_none());
+
+    assert!(journal.consume_suspension("tok-entry").await.unwrap().is_none(), "entry rows stay");
+    let entry = journal.signal_get("tok-entry").await.unwrap().expect("entry row kept");
+    assert_eq!(entry.listener_pod.as_deref(), Some("listener-park"), "a read names the holder");
+}
+
+/// The consumer listing decodes the same row shape as every journal
+/// read, so a column added to the row reaches this query too: one
+/// visible entry signal lists, naming its holder.
+#[sqlx::test]
+async fn the_consumer_listing_reads_the_whole_signal_row(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    sqlx::query("UPDATE project SET fires_visible_to_consumers = TRUE WHERE id = $1")
+        .bind(project)
+        .execute(&pool)
+        .await
+        .expect("show fires to consumers");
+    seed_listener_pod(&pool, "listener-park", "disp-1").await;
+    seed_parked_signal(&journal, "tok-entry", project).await;
+
+    let listed = signals_visible_to(&pool, TENANT, &[], &[]).await.expect("listing decodes");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0].token, "tok-entry");
+    assert_eq!(listed[0].listener_pod.as_deref(), Some("listener-park"));
+    assert!(signals_visible_to(&pool, "someone-else", &[], &[]).await.unwrap().is_empty());
 }
 
 /// Read one token's queue back as parsed JSON.

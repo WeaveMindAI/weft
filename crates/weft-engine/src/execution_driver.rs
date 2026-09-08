@@ -35,15 +35,25 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use weft_core::exec::boundary::{
+    is_passthrough, kick_scope, settle_table, tear_down_gated_scope, BoundaryOutcome,
+};
+use weft_core::exec::emission::terminal_sweep_emission;
+use weft_core::exec::loop_runtime::{
+    self as loops, classify_loop_out, close_loop_outward, instantiate, LoopAdvance, LoopRuntime,
+    LoopStreamItem,
+};
+use weft_core::exec::ready::{kicked_group, owned_bag};
 use weft_core::exec::{
-    check_completion, find_ready_nodes, postprocess::{close_unmentioned_downstream, postprocess_output},
+    check_completion, find_ready_nodes, latest_firing, latest_firing_mut, next_firing_ordinal,
+    postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag},
     NodeExecution, NodeExecutionStatus, NodeExecutionTable,
 };
 use weft_core::generator::{StreamEnd, DEFAULT_MAX_BUFFERED_ITEMS};
 use weft_core::liveness::FiringLocation;
 use weft_core::node::NodeOutput;
 use weft_core::primitive::ExecutionSnapshot;
-use weft_core::project::{infra_ids, scope_body_roots, scope_members, trigger_ids, EdgeIndex};
+use weft_core::project::EdgeIndex;
 use weft_core::pulse::{PulseStatus, PulseTable};
 use weft_core::cancellation::CancellationFlag;
 use weft_core::{Color, ExecutionContext, NodeCatalog, ProjectDefinition};
@@ -52,10 +62,12 @@ use weft_journal::JournalClient;
 
 use crate::context::{
     ship_node_completed, ship_node_failed, ship_node_lifecycle, ship_node_skipped,
-    ship_node_suspended, EngineClients, NodeTaskOutcome, RunnerHandle, TaskMsg,
+    ship_node_suspended, ship_port_closed, ship_port_emissions, EngineClients, NodeTaskOutcome,
+    RunnerHandle, TaskMsg,
 };
 use crate::now_unix;
 use crate::stream_runtime::{AbsorbKind, StreamRuntime};
+use crate::wait_tracker::DeliveryGate;
 
 
 /// How long shutdown waits for the bus-journal pump to drain every
@@ -82,7 +94,9 @@ const RESUME_POLL_INTERVAL_MS: u64 = 250;
 /// Outcome the loop reports back to the binary wrapper.
 #[derive(Debug, Clone)]
 pub enum ExecutionOutcome {
-    Completed { outputs: Value },
+    /// Every firing terminal, nothing in flight, no failure. The run's
+    /// outputs are its nodes' emissions in the journal.
+    Completed,
     Failed { error: String },
     /// The execution was cancelled (the cancellation flag tripped).
     /// A distinct variant rather than `Failed { error: "cancelled" }`:
@@ -120,7 +134,194 @@ pub enum ExecutionOutcome {
 /// magic iteration cap; the absent-new-rows invariant is sharper.
 /// `pod_name` stamps every journal write so the fencing trigger can
 /// reject writes from a Pod whose row is no longer alive.
+///
+/// An error out of the drive (the journal will not read or fold, an
+/// engine invariant broke, a journal write poisoned the drive) is
+/// journaled as the run's `ExecutionFailed` terminal before it is
+/// handed back: the execute task fails with it and nothing respawns
+/// the color (the task store does not retry, and the reaper only
+/// sweeps the runs of a dead pod), so without the terminal the run
+/// would read as running forever. The birth row exists at every such
+/// exit: the dispatcher commits it in the same transaction as the
+/// execute task this worker claimed.
 pub async fn run_one_execution(
+    project: Arc<ProjectDefinition>,
+    catalog: Arc<dyn NodeCatalog>,
+    color: Color,
+    clients: EngineClients,
+    pod_name: String,
+    tenant_id: String,
+    namespace: String,
+    cancellation: Arc<CancellationFlag>,
+    caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+) -> anyhow::Result<ExecutionOutcome> {
+    run_one_execution_observed(
+        project, catalog, color, clients, pod_name, tenant_id, namespace, cancellation, caller,
+    )
+    .await
+    .map(|drove| drove.outcome)
+}
+
+/// What a drive ended with: the outcome, plus the tables the worker
+/// held at the end. The tables are what a refold of the journal has
+/// to rebuild, so the engine's own tests fold the rows the run wrote
+/// and compare; production reads the outcome alone (hence the tables
+/// are unread outside test builds).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct Drove {
+    pub(crate) outcome: ExecutionOutcome,
+    pub(crate) pulses: PulseTable,
+    pub(crate) executions: NodeExecutionTable,
+    pub(crate) loop_runtime: LoopRuntime,
+    pub(crate) kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+}
+
+/// `run_one_execution`, keeping the worker's tables.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_one_execution_observed(
+    project: Arc<ProjectDefinition>,
+    catalog: Arc<dyn NodeCatalog>,
+    color: Color,
+    clients: EngineClients,
+    pod_name: String,
+    tenant_id: String,
+    namespace: String,
+    cancellation: Arc<CancellationFlag>,
+    caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+) -> anyhow::Result<Drove> {
+    let journal = clients.journal.clone();
+    let clock = clients.clock.clone();
+    // The execution owns its shared wait tracker; the bus coordinator,
+    // the stream runtime and every firing's handle are its clients.
+    //
+    // Per-execution bus coordinator: shared with every RunnerHandle so
+    // `create_bus` can register its bus, and read by the loop's idle-
+    // wait stuck-check (loop stuck + any bus live -> close every bus;
+    // every cursor wakes with None, every wait wakes with Closed).
+    //
+    // Spawn the one-task bus-journal pump alongside: every bus append
+    // pings the coordinator's `journal_pump_notify`; the pump walks
+    // every live bus, drains its unjournaled tail, and ships the
+    // entries to the journal so the inspector can replay the
+    // conversation. The pump holds a `Weak<BusCoordinator>` plus an
+    // owned `Arc<Notify>`. At shutdown the coordinator (1) closes
+    // every bus, (2) waits notify-driven for the pump to drain, (3)
+    // releases its `Arc<BusInner>` pins, (4) sets the explicit
+    // `pump_should_exit` flag and wakes the pump. The pump's next
+    // iteration reads the flag, runs one final (empty) drain pass,
+    // and exits. The `Weak<BusCoordinator>::upgrade()` failure path
+    // is a backstop for the case where the coordinator is dropped
+    // without shutdown (panic unwind); the explicit flag is the
+    // primary exit signal.
+    //
+    // The pump takes the UNwrapped journal client: bus-row failures
+    // degrade per-bus without poisoning the drive (`drive_color` wraps
+    // its own copy). Both live here, around the drive, so the shutdown
+    // below runs whether the drive returned an outcome or an error: a
+    // run that bailed out must not leave its buses open or its pump
+    // running. (A shutdown that panics on its deadline leaves the
+    // pump to the coordinator's `Drop` backstop, which is why the
+    // terminal is written first.)
+    let waits = crate::wait_tracker::WaitTracker::new();
+    let bus_coordinator = crate::context::BusCoordinator::new(waits.clone());
+    let bus_journal_task = tokio::spawn(crate::context::run_bus_journal_task(
+        Arc::downgrade(&bus_coordinator),
+        color,
+        journal.clone(),
+        pod_name.clone(),
+    ));
+    // A panic inside the drive (an engine invariant checked with a
+    // panic, a bug) is an error out of the drive like any other: caught
+    // here so the run still gets its Failed terminal below, instead of
+    // unwinding past it and reading as running forever.
+    let drove = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(drive_color(
+        project,
+        catalog,
+        color,
+        clients,
+        pod_name.clone(),
+        tenant_id,
+        namespace,
+        cancellation,
+        caller,
+        waits,
+        bus_coordinator.clone(),
+    )))
+    .await
+    {
+        Ok(drove) => drove,
+        Err(panic) => Err(anyhow::anyhow!(
+            "the drive of color {color} panicked: {}",
+            panic_message(panic.as_ref())
+        )),
+    };
+    // The run's terminal is written BEFORE the pump shuts down, on
+    // every path: `drive_color` wrote it on the way out, and an error
+    // gets its Failed terminal here. The shutdown can only end in a
+    // drained pump or a panic (a deadline miss on a wedged journal),
+    // and a panic must not stand between the run and its end row.
+    let result = match drove {
+        Ok(drove) => Ok(drove),
+        // The run reached its outcome and the journal would not take
+        // the terminal: writing `Failed` in its place would misname a
+        // run that completed, so the error goes back as it is.
+        Err(e) if e.is::<TerminalUnwritten>() => Err(e),
+        Err(e) => Err(fail_before_terminal(journal.as_ref(), clock.as_ref(), color, &pod_name, e).await),
+    };
+    // Shut down the bus-journal pump. Append `Closed` to every live
+    // bus, wait (notify-driven) for the pump to drain, drop the
+    // coordinator's pinned `Arc<BusInner>` refs, then await the pump's
+    // JoinHandle. A pump abort means bus events written during the
+    // drive never reached the journal: replay is degraded for this
+    // execution. Surface it loudly via tracing.
+    bus_coordinator
+        .shutdown(std::time::Duration::from_secs(BUS_PUMP_SHUTDOWN_DEADLINE_SECS))
+        .await;
+    drop(bus_coordinator);
+    if let Err(e) = bus_journal_task.await {
+        tracing::error!(
+            target: "weft_engine::execution_driver",
+            color = %color,
+            error = %e,
+            "bus journal task ended abnormally; bus replay for this execution is degraded"
+        );
+    }
+    result
+}
+
+/// The text of a caught panic: what `panic!` was given, or a marker
+/// for a payload that is not text.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "a panic with a non-text payload".to_string()
+    }
+}
+
+/// The run's outcome is known but the journal would not take its
+/// terminal (`journal_terminal` gave up), so the run has no end row.
+#[derive(Debug)]
+struct TerminalUnwritten {
+    outcome: ExecutionOutcome,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for TerminalUnwritten {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the run ended ({:?}) but its terminal could not be journaled: {:#}", self.outcome, self.error)
+    }
+}
+
+impl std::error::Error for TerminalUnwritten {}
+
+/// `run_one_execution` without its failure terminal and its bus pump:
+/// every `?` in here ends the run, and the wrapper journals that end
+/// and closes the buses.
+#[allow(clippy::too_many_arguments)]
+async fn drive_color(
     project: Arc<ProjectDefinition>,
     catalog: Arc<dyn NodeCatalog>,
     color: Color,
@@ -138,16 +339,19 @@ pub async fn run_one_execution(
     // into the loop's keep-warm decision (an attached caller under a
     // `keep_alive` reconcile holds the worker warm like a live bus does).
     caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
-) -> anyhow::Result<ExecutionOutcome> {
-    let project = &*project;
+    waits: Arc<crate::wait_tracker::WaitTracker>,
+    bus_coordinator: Arc<crate::context::BusCoordinator>,
+) -> anyhow::Result<Drove> {
+    let project_arc = project;
+    let project = &*project_arc;
     let edge_idx = EdgeIndex::build(project);
     let mut pulses: PulseTable = Default::default();
     let mut executions: NodeExecutionTable = Default::default();
     // Kicked nodes (the execution's entry points: the firing trigger,
     // manual-run roots, infra-setup roots, at frames `[]`; and every
     // scope body's own roots, at the scope's frames). Folded from
-    // `ExecEvent::NodeKicked`, `ScopeLaunched` and
-    // `LoopIterationLaunched::roots`. The scheduler dispatches each
+    // `ExecEvent::NodeKicked`, a group's In boundary firing and
+    // `LoopIterationLaunched`. The scheduler dispatches each
     // not-yet-dispatched kick once at its own frames; the payload for
     // the firing trigger threads through to the `ctx.wake` bag.
     let mut kicked: HashMap<FiringLocation, weft_core::primitive::KickedNode> = HashMap::new();
@@ -166,9 +370,6 @@ pub async fn run_one_execution(
     // The drive's journal client is wrapped so a failed lifecycle
     // write poisons the drive (the loop checks the flag every
     // iteration and exits the worker; see `PoisonOnWriteFailure`).
-    // The bus pump below keeps the UNwrapped client: bus-row failures
-    // degrade per-bus without killing the worker.
-    let pump_journal = clients.journal.clone();
     let (wrapped_journal, journal_poisoned) =
         crate::context::PoisonOnWriteFailure::wrap(clients.journal.clone());
     let clients = EngineClients { journal: wrapped_journal, ..clients };
@@ -183,7 +384,13 @@ pub async fn run_one_execution(
             tokio::select! {
                 _ = clients.clock.sleep(std::time::Duration::from_millis(200)) => {}
                 _ = cancellation.cancelled() => {
-                    return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) });
+                    return Ok(Drove {
+                        outcome: ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) },
+                        pulses,
+                        executions,
+                        loop_runtime: LoopRuntime::new(),
+                        kicked,
+                    });
                 }
             }
             let evs = fetch_events(journal.as_ref(), color).await?;
@@ -219,7 +426,13 @@ pub async fn run_one_execution(
             color = %color,
             "journal already holds a terminal for this color; not driving it"
         );
-        return Ok(ExecutionOutcome::AlreadySettled);
+        return Ok(Drove {
+            outcome: ExecutionOutcome::AlreadySettled,
+            pulses,
+            executions,
+            loop_runtime: LoopRuntime::new(),
+            kicked,
+        });
     }
     // Phase derives from the ExecutionStarted event we now have. No
     // unwrap_or fallback: if events is non-empty but contains no
@@ -239,13 +452,26 @@ pub async fn run_one_execution(
     // The subgraph the run set out to execute (a trigger fire, or a
     // manual run aimed at targets); resumes rebuild the same boundary
     // from the same row.
-    let run_subgraph: Option<std::collections::HashSet<String>> =
-        run_subgraph.map(|v| v.into_iter().collect());
-    let snap = weft_journal::fold_to_snapshot(color, &events);
-    let mut loop_runtime = rehydrate_loop_runtime(project, &snap.loop_instances)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let doomed =
-        apply_snapshot(project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences);
+    // The set of nodes this execution may dispatch. In TriggerSetup
+    // only the run subgraph of the triggers (features.is_trigger) runs;
+    // in InfraSetup only that of the infra nodes (requires_infra). The
+    // dispatcher kicked the roots of the same subgraph, so the two
+    // never disagree. A node outside the set never dispatches: what
+    // lands on it settles with no row (`settle_out_of_run`), otherwise
+    // downstream nodes would block forever on inputs the setup phase
+    // never produces. Phase::Fire is bounded when the dispatcher
+    // journaled a subgraph (every trigger fire and targeted manual run
+    // carries its allowed nodes); an untargeted manual run carries
+    // none and dispatches every pulse. Derived once here: the drive
+    // and the cancel walk settle under the same set.
+    let dispatchable: Option<std::collections::HashSet<String>> =
+        phase.dispatchable_nodes(&project_arc, &edge_idx, run_subgraph.as_deref());
+    let snap = fold_journal(color, &project_arc, &events)?;
+    let mut loop_runtime = LoopRuntime::new();
+    let doomed = apply_snapshot(
+        project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
+        &mut loop_runtime,
+    );
     fail_unresumable_stream_consumers(
         doomed, color, project, &edge_idx, &mut pulses, &mut executions,
         journal.as_ref(), &pod_name,
@@ -253,35 +479,6 @@ pub async fn run_one_execution(
     .await;
 
     let exec_id = uuid::Uuid::new_v4().to_string();
-    // Per-execution bus coordinator: shared with every RunnerHandle so
-    // `create_bus` can register its bus, and read by the loop's idle-
-    // wait stuck-check (loop stuck + any bus live -> close every bus;
-    // every cursor wakes with None, every wait wakes with Closed).
-    //
-    // Spawn the one-task bus-journal pump alongside: every bus append
-    // pings the coordinator's `journal_pump_notify`; the pump walks
-    // every live bus, drains its unjournaled tail, and ships the
-    // entries to the journal so the inspector can replay the
-    // conversation. The pump holds a `Weak<BusCoordinator>` plus an
-    // owned `Arc<Notify>`. At shutdown the coordinator (1) closes
-    // every bus, (2) waits notify-driven for the pump to drain, (3)
-    // releases its `Arc<BusInner>` pins, (4) sets the explicit
-    // `pump_should_exit` flag and wakes the pump. The pump's next
-    // iteration reads the flag, runs one final (empty) drain pass,
-    // and exits. The `Weak<BusCoordinator>::upgrade()` failure path
-    // is a backstop for the case where the coordinator is dropped
-    // without shutdown (panic unwind); the explicit flag is the
-    // primary exit signal.
-    // The execution owns its shared wait tracker; the bus coordinator,
-    // the stream runtime and every firing's handle are its clients.
-    let waits = crate::wait_tracker::WaitTracker::new();
-    let bus_coordinator = crate::context::BusCoordinator::new(waits.clone());
-    let bus_journal_task = tokio::spawn(crate::context::run_bus_journal_task(
-        Arc::downgrade(&bus_coordinator),
-        color,
-        pump_journal,
-        pod_name.to_string(),
-    ));
     // Drive in a re-fetch loop. drive() folds the journal once at
     // boot and works off that snapshot; SuspensionResolved rows that
     // arrive while drive() is running are invisible to it. When
@@ -311,7 +508,7 @@ pub async fn run_one_execution(
     let mut outcome;
     loop {
         outcome = drive(
-            project,
+            &project_arc,
             &edge_idx,
             catalog.as_ref(),
             &exec_id,
@@ -331,7 +528,7 @@ pub async fn run_one_execution(
             std::mem::take(&mut awaited_sequences),
             &mut loop_runtime,
             phase,
-            run_subgraph.as_ref(),
+            dispatchable.as_ref(),
             event_count_before,
         )
         .await?;
@@ -421,11 +618,10 @@ pub async fn run_one_execution(
             break;
         }
         event_count_before = fresh.len();
-        let snap = weft_journal::fold_to_snapshot(color, &fresh);
-        loop_runtime = rehydrate_loop_runtime(project, &snap.loop_instances)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let snap = fold_journal(color, &project_arc, &fresh)?;
         let doomed = apply_snapshot(
             project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited_sequences,
+            &mut loop_runtime,
         );
         fail_unresumable_stream_consumers(
             doomed, color, project, &edge_idx, &mut pulses, &mut executions,
@@ -440,156 +636,148 @@ pub async fn run_one_execution(
     }
 
     // Journal the terminal event based on what the worker actually
-    // did. The pump shutdown happens AFTER so a pump abort surfaces
-    // via tracing without corrupting the terminal payload (the round-1
+    // did. The pump shutdown (in `run_one_execution`, on every exit of
+    // this function) happens AFTER, so a pump abort surfaces via
+    // tracing without corrupting the terminal payload (the round-1
     // override of outcome made cancellation+pump_abort write a
     // Failed{"pump aborted"} terminal after NodeCancelled events, a
     // self-contradictory journal). The caller (run_pod) discards the
     // outcome variant via `.map(|_| ())`, so there is no return-value
     // path that needs the override either.
-    match &outcome {
-        // Cancellation: walk the in-memory snapshot and journal a
-        // NodeCancelled per non-terminal node so the UI's per-node
-        // tally flips to cancelled (not stuck-running). Only the
-        // worker knows which nodes are non-terminal AT the moment
-        // we exit, so this can't live in the dispatcher's cancel
-        // path.
+    let terminal = match &outcome {
+        // Cancellation: a drive that observed the flag already ran the
+        // cancel walk inside `cancel_cleanup`; the refetch loop's
+        // hold-expiry kill (a parked run, no drive running) has not,
+        // so the walk runs here over whatever is still open. The
+        // outcome carries WHY (read off the flag when the driver gave
+        // up); every row written here names that cause, so the run
+        // reads the same whichever side (this worker or the
+        // dispatcher) wrote its terminal first.
         ExecutionOutcome::Cancelled { cause } => {
-            // The outcome carries WHY (read off the flag when the driver
-            // gave up); every row written here names that cause, so the
-            // run reads the same whichever side (this worker or the
-            // dispatcher) wrote its terminal first.
-            journal_node_cancellations(journal.as_ref(), color, &pod_name, cause).await;
-            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
+            cancel_open_firings(
+                &mut executions, &mut pulses, &mut kicked, &mut loop_runtime, color, &project_arc,
+                &edge_idx, journal.as_ref(), &pod_name, &cause.to_string(), phase,
+                dispatchable.as_ref(),
+            )
+            .await;
+            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await
         }
-        ExecutionOutcome::Completed { .. } | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck { .. } => {
-            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await;
+        ExecutionOutcome::Completed | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck { .. } => {
             // No worker-side storage cleanup here: the dispatcher's durable
             // terminate sweep owns the run's un-kept exec files. It reaps
             // crashed uploads and grants completed files a short post-run
             // linger (so the user can still download a run's output), then
             // the broker's expiry sweep deletes them. A worker-side eager
             // delete would defeat that linger.
+            journal_terminal(journal.as_ref(), clients.clock.as_ref(), color, &pod_name, &outcome).await
         }
-        ExecutionOutcome::AlreadySettled => {
-            // Returned before the drive loop; unreachable here, and there
-            // is nothing to journal for it anyway.
-        }
-        ExecutionOutcome::Stalled => {
-            // Worker exits cleanly without writing a terminal event.
-            // Resume happens on the next fire: dispatcher writes a
-            // SuspensionResolved row + enqueues a fresh `resume`
-            // task (the prior task is `complete` so dedup lets a
-            // new one through), and a worker spawns to fold the
-            // updated journal. Nothing extra to journal here.
-        }
-    }
-
-    // Shut down the bus-journal pump AFTER the terminal write. Append
-    // `Closed` to every live bus, wait (notify-driven) for the pump to
-    // drain, drop the coordinator's pinned `Arc<BusInner>` refs, then
-    // await the pump's JoinHandle. A pump abort means bus events
-    // written during the drive never reached the journal: replay is
-    // degraded for this execution. Surface it loudly via tracing.
-    bus_coordinator
-        .shutdown(std::time::Duration::from_secs(BUS_PUMP_SHUTDOWN_DEADLINE_SECS))
-        .await;
-    drop(bus_coordinator);
-    if let Err(e) = bus_journal_task.await {
-        tracing::error!(
-            target: "weft_engine::execution_driver",
-            color = %color,
-            error = %e,
-            "bus journal task ended abnormally; bus replay for this execution is degraded"
-        );
-    }
-    Ok(outcome)
+        // Returned before the drive loop; unreachable here, and there
+        // is nothing to journal for it anyway.
+        ExecutionOutcome::AlreadySettled => Ok(()),
+        // Worker exits cleanly without writing a terminal event.
+        // Resume happens on the next fire: dispatcher writes a
+        // SuspensionResolved row + enqueues a fresh `resume`
+        // task (the prior task is `complete` so dedup lets a
+        // new one through), and a worker spawns to fold the
+        // updated journal. Nothing extra to journal here.
+        ExecutionOutcome::Stalled => Ok(()),
+    };
+    terminal.map_err(|error| TerminalUnwritten { outcome: outcome.clone(), error })?;
+    Ok(Drove { outcome, pulses, executions, loop_runtime, kicked })
 }
 
-/// Rebuild the `LoopRuntime` from a journal-fold snapshot. The full
-/// `LoopConfig` (over / carry / trim_on_mismatch) rides on the
-/// snapshot itself, so the project definition is only consulted to
-/// recover the LoopOut node's declared gather port names (needed to
-/// assemble outward emits for ports no iteration touched). A missing
-/// LoopOut on resume is corruption: the project drifted between
-/// suspend and resume, OR the worker is folding a journal that
-/// doesn't match its project_definition fetch. Either way, silent
-/// recovery would mask the bug; bail loud.
-fn rehydrate_loop_runtime(
-    project: &ProjectDefinition,
-    snapshot: &HashMap<
-        weft_core::primitive::LoopInstanceKey,
-        weft_core::primitive::LoopInstanceSnapshot,
-    >,
-) -> Result<crate::loop_runtime::LoopRuntime, String> {
-    let mut rt = crate::loop_runtime::LoopRuntime::new();
-    for (key, snap) in snapshot {
-        let gather_ports = loop_gather_ports(project, &key.group_id, &snap.carry)
-            .ok_or_else(|| {
-                format!(
-                    "rehydrate: snapshot has loop instance {} at parent_frames={:?} \
-                     but the project has no LoopOut node '{}'; the snapshot was \
-                     written against a different project shape",
-                    key.group_id,
-                    key.parent_frames,
-                    weft_core::project::boundary_out_id(&key.group_id),
-                )
-            })?;
-        // The item source is re-derived from the LIVE project shape
-        // (the LoopIn's declared port types), same posture as
-        // `gather_ports` above: the snapshot carries the config, the
-        // project carries the types. Buffered stream items are NOT in
-        // the snapshot; their pulses refolded Pending and the routing
-        // pass re-ingests them.
-        let loop_in_id = weft_core::project::boundary_in_id(&key.group_id);
-        let loop_in = project.nodes.iter().find(|n| n.id == loop_in_id).ok_or_else(|| {
-            format!(
-                "rehydrate: snapshot has loop instance {} but the project has no LoopIn \
-                 node '{loop_in_id}'; the snapshot was written against a different \
-                 project shape",
-                key.group_id,
-            )
-        })?;
-        let config = crate::loop_runtime::LoopConfig {
-            parallel: snap.parallel,
-            over: snap.over.clone(),
-            carry: snap.carry.clone(),
-            max_iters: snap.max_iters,
-            trim_on_mismatch: snap.trim_on_mismatch,
-        };
-        let source = loop_source_kind(&config, loop_in, snap.stream_end.clone())
-            .map_err(|e| format!("rehydrate loop '{}': {e}", key.group_id))?;
-        let inst = crate::loop_runtime::LoopInstance::from_snapshot(
-            key.clone(),
-            snap,
-            source,
-            gather_ports,
-        );
-        rt.insert(inst);
+/// Fold the journal over the program, refusing to resume over a row
+/// the fold could not apply: a state rebuilt from a partial log is a
+/// state that never existed (skips un-happen, closures never cascade),
+/// so the execution fails loudly here and `weft clean` removes it,
+/// instead of resuming wrong.
+fn fold_journal(
+    color: Color,
+    project: &Arc<ProjectDefinition>,
+    events: &[weft_journal::ExecEvent],
+) -> anyhow::Result<ExecutionSnapshot> {
+    let snap = weft_journal::fold_to_snapshot(color, project.clone(), events);
+    if snap.corruptions.is_empty() {
+        return Ok(snap);
     }
-    Ok(rt)
+    let reasons: Vec<String> = snap
+        .corruptions
+        .iter()
+        .map(|c| format!("{:?}: {}", c.site, c.reason))
+        .collect();
+    anyhow::bail!(
+        "the journal of color {color} cannot be folded over its program ({} row(s) rejected: \
+         {}); the execution cannot resume. `weft clean {color}` removes it.",
+        reasons.len(),
+        reasons.join("; "),
+    )
 }
 
-/// The declared gather port names for a loop: the matching LoopOut
-/// node's outward outputs minus the carry-named ones. Captured at
-/// instantiation (and on rehydrate) so the outward emit assembles a
-/// list for EVERY declared gather port, even ones no iteration writes
-/// to (which would otherwise produce no pulse and deadlock downstream
-/// consumers). `None` when the project has no `{group_id}__out` node,
-/// which every caller treats as corruption.
-fn loop_gather_ports(
-    project: &ProjectDefinition,
-    group_id: &str,
-    carry: &[String],
-) -> Option<Vec<String>> {
-    let loop_out_id = weft_core::project::boundary_out_id(group_id);
-    project.nodes.iter().find(|n| n.id == loop_out_id).map(|n| {
-        n.outputs
-            .iter()
-            .filter(|p| !carry.contains(&p.name))
-            .map(|p| p.name.clone())
-            .collect()
-    })
+/// A spawned node task ended: forget its firing, so the location is
+/// free to fire again. Returns whether a location was freed: the
+/// caller treats that as a turn with work (the scan that ran before
+/// the reap held the location, and nothing else wakes the loop to
+/// rescan it). A `JoinError` means a panic: the panicked task
+/// never sent its terminal, so the panic is turned into a Failed
+/// terminal for the right firing (looked up via the task id);
+/// otherwise its exec record stays Running, the crashed-Running refold
+/// path re-dispatches it on every respawn, and the node panics in an
+/// infinite re-run loop. A successful task already reported through
+/// the task channel; only its id is dropped.
+fn note_task_joined(
+    joined: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+    task_firings: &mut HashMap<tokio::task::Id, FiringLocation>,
+    task_tx: &mpsc::UnboundedSender<TaskMsg>,
+    color: Color,
+) -> bool {
+    match joined {
+        Ok((task_id, ())) => task_firings.remove(&task_id).is_some(),
+        Err(join_err) => {
+            let task_id = join_err.id();
+            match task_firings.remove(&task_id) {
+                Some(loc) => {
+                    let err = format!("node task panicked: {join_err}");
+                    tracing::error!(
+                        target: "weft_engine::execution_driver",
+                        color = %color,
+                        node = %loc.node_id,
+                        frames = ?loc.frames,
+                        error = %err,
+                        "in-flight node task panicked; failing the node"
+                    );
+                    // Route the panic through the SAME failure path a
+                    // body-returned error takes: send a synthetic Failed
+                    // terminal and loop. The task channel drains in FIFO
+                    // order, so any pulses the node emitted before
+                    // panicking are applied first, then this Terminal
+                    // fails the node with the correct mentioned set off
+                    // its record (keeping already-emitted ports' values,
+                    // closing only the rest). Handling it inline with an
+                    // empty mentioned set would double-pulse
+                    // already-emitted ports (value + closure on one
+                    // edge).
+                    let _ = task_tx.send(TaskMsg::Terminal {
+                        loc,
+                        color,
+                        outcome: NodeTaskOutcome::Failed(err),
+                    });
+                    true
+                }
+                None => {
+                    // No identity recorded: a panic from a task we don't
+                    // own (should be impossible). Fail loud rather than
+                    // silently drop it.
+                    tracing::error!(
+                        target: "weft_engine::execution_driver",
+                        color = %color,
+                        error = %join_err,
+                        "in-flight task panicked with no recorded firing; engine invariant violated"
+                    );
+                    false
+                }
+            }
+        }
+    }
 }
 
 // A firing's identity `(node_id, frames)` is `weft_core::liveness::
@@ -697,18 +885,19 @@ fn apply_snapshot(
     executions: &mut NodeExecutionTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
+    loop_runtime: &mut LoopRuntime,
 ) -> Vec<FiringLocation> {
     *pulses = snap.pulses;
     *executions = snap.executions;
     *kicked = snap.kicked;
     *awaited_sequences = snap.awaited_sequences;
-    // `snap.corruptions` is intentionally not consumed here. The
-    // engine cannot do anything with a list of unparseable rows it
-    // already skipped during fold. The same fold runs when the
-    // inspector calls `/replay`, and THAT path forwards
-    // each corruption as a `DispatcherEvent::JournalCorruption`
-    // (the user-facing surface). For ops, `report_corruption`
-    // already wrote each row at `error!` level when the fold ran.
+    // The fold drove every loop instance from the loop rows; the
+    // resumed worker takes them over as its own runtime. Buffered
+    // stream items are not in it: their pulses refolded Pending and
+    // the routing pass re-ingests them.
+    *loop_runtime = snap.loop_runtime;
+    // `snap.corruptions` is empty here: `fold_journal` refused the
+    // snapshot otherwise.
 
     // A WaitingForInput exec re-dispatches ONLY if the suspension it
     // is CURRENTLY parked on has been resolved by a fire AND the exec
@@ -741,7 +930,7 @@ fn apply_snapshot(
         .nodes
         .iter()
         .filter(|n| n.group_boundary.is_none())
-        .filter(|n| n.inputs.iter().any(|p| p.port_type.as_generator().is_some()))
+        .filter(|n| !weft_core::exec::ready::generator_inputs(n).is_empty())
         .map(|n| n.id.as_str())
         .collect();
     let mut crashed_running: std::collections::HashSet<FiringLocation> =
@@ -791,9 +980,13 @@ async fn fail_unresumable_stream_consumers(
              the execution to restart the stream from its beginning.",
             loc.node_id
         );
+        // The record came out of the refold with the ports the firing
+        // had already emitted on; those keep their values, as on the
+        // fold's reading of the NodeFailed row.
+        let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
         handle_node_failure(
-            &loc.node_id, &std::collections::HashSet::new(), color, &loc.frames, &err,
-            project, edge_idx, pulses, executions, journal, pod_name,
+            &loc.node_id, &mentioned, color, &loc.frames, &err, project, edge_idx, pulses,
+            executions, journal, pod_name,
         )
         .await;
     }
@@ -816,13 +1009,14 @@ async fn fail_unresumable_stream_consumers(
 /// exec is a live task, not a dead one).
 fn resume_resolved_suspensions_in_place(
     color: Color,
+    project: &Arc<ProjectDefinition>,
     events: &[weft_journal::ExecEvent],
     executions: &NodeExecutionTable,
     pulses: &mut PulseTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     awaited_sequences: &mut HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
-) -> usize {
-    let snap = weft_journal::fold_to_snapshot(color, events);
+) -> anyhow::Result<usize> {
+    let snap = fold_journal(color, project, events)?;
 
     // Which parked nodes have their CURRENT suspension resolved now?
     // Computed against the FRESHLY-FOLDED sequences (the live map is
@@ -832,7 +1026,7 @@ fn resume_resolved_suspensions_in_place(
     let resume_locations = resolved_waiting_locations(executions, &snap.awaited_sequences);
 
     if resume_locations.is_empty() {
-        return 0;
+        return Ok(0);
     }
 
     // Install the resolved await sequences for exactly those nodes so the
@@ -847,7 +1041,7 @@ fn resume_resolved_suspensions_in_place(
     // same mechanic the boot-time path uses.
     redispatch_locations(&resume_locations, pulses, executions, kicked);
 
-    resume_locations.len()
+    Ok(resume_locations.len())
 }
 
 // ---------- Main drive loop ----------
@@ -855,7 +1049,7 @@ fn resume_resolved_suspensions_in_place(
 /// Internal loop body called once per execution by `run_one_execution`.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
-    project: &ProjectDefinition,
+    project_arc: &Arc<ProjectDefinition>,
     edge_idx: &EdgeIndex,
     catalog: &dyn NodeCatalog,
     exec_id: &str,
@@ -875,17 +1069,17 @@ async fn drive(
     executions: &mut NodeExecutionTable,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>>,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     phase: weft_core::context::Phase,
-    // The journaled subgraph (a trigger fire's program): in Phase::Fire,
-    // only these nodes dispatch; a pulse into anything else (another
-    // program's node) is absorbed silently. None = whole graph.
-    run_subgraph: Option<&std::collections::HashSet<String>>,
+    // The nodes this run may dispatch (see `run_one_execution_observed`
+    // where it is derived); None = the whole graph.
+    dispatchable: Option<&std::collections::HashSet<String>>,
     // Number of journal events the caller already folded into the
     // snapshot it handed us. The bus-held resume poll compares against
     // this to detect newly-landed rows without a redundant re-fetch.
     journaled_baseline: usize,
 ) -> anyhow::Result<ExecutionOutcome> {
+    let project: &ProjectDefinition = project_arc;
     let journal = clients.journal.as_ref();
     // ONE ordered channel from node tasks to the loop. A node sends
     // `TaskMsg::Emission` zero or more times while it runs (each
@@ -902,14 +1096,6 @@ async fn drive(
     // This drive's stream bookkeeping (live feeds + pending delivery
     // gates), reporting to the execution's shared wait tracker.
     let mut stream_rt = StreamRuntime::new(waits.clone());
-    // Per-(node, frames) set of OUTPUT PORTS this firing has mentioned
-    // across all its `pulse_downstream` and `close_port` calls. On the
-    // firing's terminal event (Completed / Failed / Skipped / Cancelled),
-    // the loop emits CLOSURE markers on every output port NOT in this
-    // set so downstream consumers learn no value is coming. A firing
-    // that never emitted at all is the empty-set case: every output
-    // port is closed.
-    let mut emitted_ports: HashMap<FiringLocation, std::collections::HashSet<String>> = HashMap::new();
     let mut in_flight: JoinSet<()> = JoinSet::new();
     // Maps each spawned node task's `tokio::task::Id` to the firing it
     // runs, so a task that PANICS (which never sends a NodeTaskResult on
@@ -925,34 +1111,6 @@ async fn drive(
     // the worker tells the dispatcher "I'm just waiting, please
     // kill me" and exits.
     let mut waiting: HashMap<String, FiringLocation> = HashMap::new();
-
-    // The set of nodes this execution may dispatch. In TriggerSetup
-    // only the run subgraph of the triggers (features.is_trigger) runs;
-    // in InfraSetup only that of the infra nodes (requires_infra). The
-    // dispatcher kicked the roots of the same subgraph, so the two
-    // never disagree. A node outside the set skips the moment a pulse lands on
-    // it, otherwise downstream nodes would block forever on inputs the
-    // setup phase never produces (the ready pass owns that decision;
-    // the dispatch loop decides whether the skip is journaled or
-    // silent).
-    //
-    // Phase::Fire is bounded when the dispatcher journaled a subgraph:
-    // every trigger fire and targeted manual run carries its allowed
-    // nodes. Untargeted manual runs carry none and dispatch every pulse.
-    let dispatchable: Option<std::collections::HashSet<String>> =
-        match phase {
-            weft_core::context::Phase::TriggerSetup => {
-                Some(weft_core::project::run_subgraph(project, edge_idx, &trigger_ids(project), &Default::default()))
-            }
-            weft_core::context::Phase::InfraSetup => {
-                Some(weft_core::project::run_subgraph(project, edge_idx, &infra_ids(project), &Default::default()))
-            }
-            weft_core::context::Phase::Fire => run_subgraph.cloned(),
-        };
-    // A pulse landing on a node outside the scope is absorbed silently
-    // in the dispatch loop (`out_of_scope`): a setup phase's scope is
-    // engine plumbing the user never chose, and on a fire the node is
-    // another program's, so neither is this run's business to paint.
 
     // Rehydrate sweep: a resumed stream-driven loop whose durable
     // `stream_end` is already recorded has no close pulse left (it was
@@ -996,13 +1154,13 @@ async fn drive(
         // the last iteration. The journal is now a strict prefix of
         // the live state; driving further would compound the
         // divergence (every later refold rebuilds a different world).
-        // Exit the worker; the respawn refolds from the consistent
-        // prefix and re-runs the lost suffix (same at-least-once
-        // semantics as a crash).
+        // Stop here: the error becomes the run's Failed terminal
+        // (`run_one_execution`), which is the only end this run gets,
+        // since nothing respawns a color whose task failed.
         if journal_poisoned.load(std::sync::atomic::Ordering::Acquire) {
             anyhow::bail!(
-                "a journal write failed mid-drive for color {color}; worker exiting so a \
-                 respawned worker resumes from the journal's consistent prefix"
+                "a journal write failed mid-drive for color {color}; the journal no longer \
+                 holds what the worker did, so the run cannot go on"
             );
         }
 
@@ -1034,7 +1192,6 @@ async fn drive(
                 &mut task_rx,
                 &mut waiting,
                 executions,
-                &mut emitted_ports,
                 color,
                 project,
                 edge_idx,
@@ -1042,36 +1199,14 @@ async fn drive(
                 journal,
                 pod_name,
                 loop_runtime,
+                kicked,
                 &mut stream_rt,
+                &recorded_cancel_cause(cancellation).to_string(),
+                phase,
+                dispatchable,
             )
             .await;
             return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
-        }
-
-        // At Fire, wires INTO a trigger are inert: a trigger's ports
-        // replay its setup-time snapshot, so an upstream node that ran
-        // for the output path must not re-dispatch the trigger with a
-        // live value. Drop those
-        // pulses before groups form; the trigger's one dispatch is its
-        // kick.
-        if matches!(phase, weft_core::context::Phase::Fire) {
-            for trigger_id in project.nodes.iter().filter(|n| n.features.is_trigger) {
-                if let Some(bucket) = pulses.remove(&trigger_id.id) {
-                    // A producer that yield_downstream'ed into the
-                    // trigger's inert input is parked on these pulses;
-                    // its wait must fail loudly, not hang.
-                    let dropped: Vec<uuid::Uuid> = bucket.iter().map(|p| p.id).collect();
-                    stream_rt.on_pulses_absorbed(
-                        &dropped,
-                        AbsorbKind::Skipped {
-                            reason:
-                                "the target is a trigger; wires into a trigger are inert \
-                                 at Fire (its ports replay the setup-time snapshot), so \
-                                 the awaited delivery can never happen",
-                        },
-                    );
-                }
-            }
         }
 
         // Route generator pulses that arrived for CONSUMERS ALREADY IN
@@ -1083,7 +1218,7 @@ async fn drive(
         // exactly like any first pulse does.
         let acted = route_stream_pulses(
             color, project, edge_idx, pulses, executions, journal, pod_name,
-            &mut stream_rt, loop_runtime, &mut emitted_ports, kicked,
+            &mut stream_rt, loop_runtime, kicked,
         )
         .await;
         if acted > 0 {
@@ -1095,7 +1230,77 @@ async fn drive(
             idled_since_progress = false;
         }
 
-        let mut ready = find_ready_nodes(project, pulses, edge_idx, dispatchable.as_ref());
+        // Group boundaries fire here, synchronously and without a
+        // journal row: a boundary is a pure function of its inputs, so
+        // the fold fires it from the same pass and holds the same
+        // record. Every pulse a boundary absorbed settles its delivery
+        // gate exactly as an ordinary dispatch would.
+        // The same pass the fold runs after every row (`settle_table`):
+        // boundaries, then what this run never dispatches settles with
+        // no row (a pulse on a node outside the run's set is absorbed,
+        // a pulse into a trigger at Fire is dropped). A producer that
+        // yield_downstream'ed into any of those is parked on the
+        // pulses; its wait fails loudly instead of hanging.
+        let pass = settle_table(
+            project, edge_idx, phase, dispatchable, color, now_unix(), pulses, executions, kicked,
+        );
+        let boundaries = pass.boundaries;
+        for b in &boundaries {
+            match &b.outcome {
+                BoundaryOutcome::OutOfScope => {
+                    let msg = format!(
+                        "the consumer '{}' is outside the part of the graph this \
+                         execution runs, so the awaited delivery can never happen",
+                        b.node_id
+                    );
+                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Skipped { reason: &msg });
+                }
+                BoundaryOutcome::Fired { skip_reason: Some(reason), .. } => {
+                    let msg = format!(
+                        "the consumer '{}' skipped ({reason}), so the awaited delivery can \
+                         never happen",
+                        b.node_id
+                    );
+                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Skipped { reason: &msg });
+                }
+                // A boundary that failed before forwarding (a port
+                // refused its value) delivered nothing: its producers'
+                // waits fail with the reason, as a skip's do.
+                BoundaryOutcome::Fired { error: Some(err), .. } => {
+                    let msg = format!(
+                        "the consumer '{}' failed before running ({err}), so the awaited \
+                         delivery can never happen",
+                        b.node_id
+                    );
+                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Skipped { reason: &msg });
+                }
+                BoundaryOutcome::Fired { .. } => {
+                    stream_rt.on_pulses_absorbed(&b.absorbed, AbsorbKind::Taken);
+                }
+            }
+        }
+        let boundaries_fired = !boundaries.is_empty();
+        if boundaries_fired {
+            idled_since_progress = false;
+        }
+
+        stream_rt.on_pulses_absorbed(
+            &pass.out_of_run.absorbed,
+            AbsorbKind::Skipped {
+                reason: "the consumer is outside the part of the graph this execution runs, \
+                         so the awaited delivery can never happen",
+            },
+        );
+        stream_rt.on_pulses_absorbed(
+            &pass.out_of_run.dropped,
+            AbsorbKind::Skipped {
+                reason: "the target is a trigger; wires into a trigger are inert at Fire (its \
+                         ports replay the setup-time snapshot), so the awaited delivery can \
+                         never happen",
+            },
+        );
+
+        let mut ready = find_ready_nodes(project, pulses, edge_idx, dispatchable);
         // HOLD pulses that arrive at a node already PARKED on an
         // unresolved suspension. A WaitingForInput record is waiting for
         // its token to RESOLVE (a signal), not for input pulses; a fresh
@@ -1112,8 +1317,30 @@ async fn drive(
         // not spin. A record that is Running (crashed/mid-flight) or
         // WaitingForInput-with-token-RESOLVED is a real resume and stays.
         let resolved_waiters = resolved_waiting_locations(executions, &awaited_sequences);
+        // HOLD pulses that arrive at a node whose body is still RUNNING
+        // in this worker, too. Readiness keys on pending pulses alone,
+        // and the dispatch below continues any non-terminal record, so
+        // without this a producer firing again at the same location (a
+        // bus or stream consumer re-firing) would spawn the consumer's
+        // body a second time on top of the first: double spend, and two
+        // `PortEmitted` rows on one record that a refold rejects. The
+        // pulses stay Pending; when the task ends and the record goes
+        // terminal, the next scan opens a SECOND firing over them (the
+        // next ordinal), which is what the fold rebuilds from the
+        // second `NodeStarted`. A record that is Running with NO task
+        // (a crashed-Running recovery after a refold) is a real resume
+        // and stays. "Still running" is read off the JoinSet, which the
+        // end of every turn reaps without blocking (before the task
+        // channel is drained, so a panicked task's synthetic terminal
+        // lands in the same drain and the location never reads free
+        // while its record is still Running).
+        let in_flight_firings: std::collections::HashSet<&FiringLocation> =
+            task_firings.values().collect();
         ready.retain(|(node_id, group)| {
             let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
+            if in_flight_firings.contains(&loc) {
+                return false;
+            }
             // A WaitingForInput record whose token is NOT resolved is
             // parked-and-unresolved: hold this group. `resolved_waiting_
             // locations` is the single source of "this parked node's
@@ -1172,61 +1399,21 @@ async fn drive(
                 .iter()
                 .any(|(rid, g)| *rid == loc.node_id && g.frames == loc.frames);
             if !already_in_ready {
-                // Synthesize a ReadyGroup at the kick's frames with
-                // input populated from the node's written constants.
-                // Configurable input ports (`Range.to: 10`, etc.) reach
-                // the firing as input values; without this the kick path
-                // saw an empty bag and the node failed with `missing
-                // input on port: <name>` despite the source setting the
-                // value.
-                // A kicked entry node still answers to `_should_flow`:
-                // a `false` literal in its braces (no pulses exist on a
-                // kick, so only the literal branch can fire) turns it
-                // off, same as any other node. A kick from a scope that
-                // was gated off is dispatched straight into its skip.
-                let (input, input_errors, skip) = match project.nodes.iter().find(|n| n.id == loc.node_id) {
-                    Some(def) => {
-                        let (input, input_errors) = weft_core::exec::ready::build_kicked_input(
-                            def,
-                            info.port_snapshot.as_ref(),
-                        );
-                        (
-                        input,
-                        input_errors,
-                        match &info.scope_skipped {
-                            Some(scope) => Some(weft_core::exec::skip::SkipReason::ScopeSkipped {
-                                scope: scope.clone(),
-                            }),
-                            None => weft_core::exec::skip::check_flow_permission(
-                                def,
-                                &[],
-                                &loc.frames,
-                                color,
-                            ),
-                        },
-                        )
-                    }
-                    None => (Value::Object(serde_json::Map::new()), Vec::new(), None),
+                // Synthesize a ReadyGroup at the kick's frames from the
+                // node's written constants (and a firing trigger's port
+                // snapshot): `kicked_group` is the one derivation, shared
+                // with the boundary pass. A kick naming a node the
+                // project does not have is a corrupt compiled shape;
+                // fail the drive loudly instead of parking the kick
+                // forever.
+                let Some(def) = project.nodes.iter().find(|n| n.id == loc.node_id) else {
+                    return Err(anyhow::anyhow!(
+                        "kick: node '{}' is not in the project definition; corrupt compiled \
+                         project shape",
+                        loc.node_id
+                    ));
                 };
-                ready.push((
-                    loc.node_id.clone(),
-                    weft_core::exec::ready::ReadyGroup {
-                        frames: loc.frames.clone(),
-                        color,
-                        input,
-                        closed_ports: Vec::new(),
-                        skip,
-                        pulse_ids: Vec::new(),
-                        // A kicked node whose own ports refuse their
-                        // values fails the same way a pulsed one does.
-                        error: if input_errors.is_empty() {
-                            None
-                        } else {
-                            Some(input_errors.join("; "))
-                        },
-                        out_of_scope: false,
-                    },
-                ));
+                ready.push((loc.node_id.clone(), kicked_group(def, info, &loc.frames, color)));
             }
             info.dispatched = true;
         }
@@ -1244,9 +1431,12 @@ async fn drive(
             idled_since_progress = false;
         }
 
-        // Dispatch every ready group that isn't already Running for
-        // this (node_id, color, frames). Each dispatch either short-
-        // circuits (skip/failure) or spawns a task.
+        let dispatched_this_turn = boundaries_fired || !ready.is_empty();
+
+        // Dispatch every ready group (the holds above already dropped
+        // the parked and the in-flight locations). Each dispatch either
+        // short-circuits (skip/failure) or spawns a task; every path
+        // absorbs the group's pulses, so a non-empty batch is progress.
         for (node_id, mut group) in ready {
             tracing::info!(
                 target: "weft_engine::execution_driver",
@@ -1266,32 +1456,29 @@ async fn drive(
                      project definition; corrupt compiled project shape"
                 ));
             };
+            // Group boundaries (Passthrough) fire in the boundary pass
+            // at the top of the turn, never here: the pass absorbs their
+            // pulses before readiness runs and consumes their kicks. One
+            // reaching this loop means a pulse landed on a boundary
+            // between the pass and readiness, which nothing in between
+            // does; fail loud BEFORE anything is absorbed or journaled
+            // (a boundary never has a row, and the fold refuses one).
+            if is_passthrough(node_def) {
+                return Err(anyhow::anyhow!(
+                    "dispatch: group boundary '{node_id}' reached the node dispatch loop; \
+                     boundaries fire in the boundary pass (engine invariant violated)"
+                ));
+            }
             // Scope is decided inside `find_ready_nodes`: an out-of-scope
-            // node forms a group on ANY pulse and arrives here flagged.
-            // It absorbs SILENTLY, journaling nothing: a setup phase's
-            // scope is engine plumbing the user never chose, so an
-            // activation must not paint the business graph "skipped",
-            // and on a trigger fire the node is another program's (a
-            // shared upstream node emits down every wire it has), not
-            // this run's business to paint. Any delivery gate settles
-            // through the same skip-absorb path a journaled skip uses.
+            // node forms a group on ANY pending pulse. `settle_out_of_run`
+            // absorbed every such pulse right before this scan, so a
+            // group here means the scan and the settle disagree on the
+            // run's node set.
             if group.out_of_scope {
-                if let Some(bucket) = pulses.get_mut(&node_id) {
-                    for p in bucket.iter_mut() {
-                        if group.pulse_ids.contains(&p.id)
-                            && p.status == weft_core::pulse::PulseStatus::Pending
-                        {
-                            p.absorb();
-                        }
-                    }
-                }
-                let msg = format!(
-                    "the consumer '{node_id}' is outside the part of the graph this \
-                     execution runs, so the awaited delivery can never happen"
-                );
-                stream_rt
-                    .on_pulses_absorbed(&group.pulse_ids, AbsorbKind::Skipped { reason: &msg });
-                continue;
+                return Err(anyhow::anyhow!(
+                    "'{node_id}' formed a group outside the run's node set after the \
+                     out-of-run settle (engine invariant violated)"
+                ));
             }
             // Absorb input pulses for this dispatch, EXCEPT pulses on
             // generator-typed input ports of a dispatch that will RUN:
@@ -1299,19 +1486,14 @@ async fn drive(
             // the running consumer through its feed by the routing pass
             // instead of being consumed by the dispatch. A SKIP dispatch
             // absorbs everything (skip is the whole group's consumption).
-            let generator_ports: Vec<String> = node_def
-                .inputs
-                .iter()
-                .filter(|p| p.port_type.as_generator().is_some())
-                .map(|p| p.name.clone())
-                .collect();
+            let generator_ports = weft_core::exec::ready::generator_inputs(node_def);
             let mut deferred: std::collections::HashSet<uuid::Uuid> =
                 std::collections::HashSet::new();
             if group.skip.is_none() && !generator_ports.is_empty() {
                 if let Some(bucket) = pulses.get(&node_id) {
                     for p in bucket.iter() {
                         if group.pulse_ids.contains(&p.id)
-                            && generator_ports.contains(&p.target_port)
+                            && generator_ports.contains(p.target_port.as_str())
                         {
                             deferred.insert(p.id);
                         }
@@ -1341,6 +1523,14 @@ async fn drive(
                      delivery can never happen"
                 );
                 stream_rt.on_pulses_absorbed(&absorbed_now, AbsorbKind::Skipped { reason: &msg });
+            } else if let Some(err) = &group.error {
+                // A pre-dispatch failure (a port refused its value)
+                // never runs the body, so nothing was delivered.
+                let msg = format!(
+                    "the consumer '{node_id}' failed before running ({err}), so the awaited \
+                     delivery can never happen"
+                );
+                stream_rt.on_pulses_absorbed(&absorbed_now, AbsorbKind::Skipped { reason: &msg });
             } else {
                 stream_rt.on_pulses_absorbed(&absorbed_now, AbsorbKind::Taken);
             }
@@ -1353,63 +1543,36 @@ async fn drive(
                 .get(&node_id)
                 .and_then(|v| v.iter().rposition(|e| e.frames == group.frames && !e.status.is_terminal()));
             let is_resume = existing.is_some();
-            // For NodeResumed event reporting: the token + resolved value
-            // of the await this dispatch is actually resuming on. Scope it
-            // to the existing record's CURRENT parked token
-            // (`callback_id`), NOT just "the last resolved await in the
-            // sequence". A crashed-Running recovery has the record Running
-            // with `callback_id = None` (it is not parked on anything), so
-            // this is None and the dispatch ships a crash re-run, not a
-            // fresh delivery. Picking the last resolved await instead would
-            // make a multi-await body whose EARLIER await resolved in a
-            // prior life ship a NodeResumed carrying that stale token/value,
-            // rendering a crash re-run as a fresh signal delivery in the
-            // inspector.
+            // For the NodeResumed row: the token of the await this
+            // dispatch is actually resuming on, the existing record's
+            // CURRENT parked token (`callback_id`). A crashed-Running
+            // recovery has the record Running with `callback_id = None`
+            // (it is not parked on anything), so this is None and the
+            // dispatch ships a crash re-run, not a fresh delivery.
             let parked_token: Option<String> = existing
                 .and_then(|idx| executions.get(&node_id).and_then(|v| v.get(idx)))
                 .and_then(|e| e.callback_id.clone());
-            let resume_token_value: Option<(String, serde_json::Value)> = parked_token
-                .as_ref()
-                .and_then(|token| {
-                    awaited_sequences
-                        .get(&FiringLocation::new(node_id.clone(), group.frames.clone()))
-                        .and_then(|seq| {
-                            seq.iter().rev().find_map(|e| match &e.kind {
-                                weft_core::primitive::AwaitedEntryKind::Await {
-                                    token: t,
-                                    resolved: Some(value),
-                                } if t == token => Some((token.clone(), value.clone())),
-                                _ => None,
-                            })
-                        })
-                });
 
             if is_resume {
                 if let Some(idx) = existing {
                     if let Some(record) = executions.get_mut(&node_id).and_then(|v| v.get_mut(idx)) {
                         record.status = NodeExecutionStatus::Running;
-                        // Keep the original input: the fold always
-                        // recorded it (`NodeStarted.input` is non-null),
-                        // and a resume replays from the journal sequence
-                        // rather than re-deriving inputs.
-                        //
                         // Extend `pulses_absorbed` with this resume
                         // dispatch's newly-absorbed pulses, exactly as the
-                        // fold does on `NodeResumed` (events.rs). The
-                        // dispatch site below ships those same ids via
-                        // `NodeResumed.pulses_absorbed`, so a full refold
-                        // lands them here too. This keeps the live record
-                        // equal to what a refold produces (RAM == refold),
-                        // the invariant the in-place resume path
-                        // (`resume_resolved_suspensions_in_place`) relies
-                        // on when it reads `pulses_absorbed` straight from
-                        // the live record. The matching fold-side flip
-                        // (events.rs `NodeResumed` arm marks these pulses
-                        // Absorbed in the pulse table) is what makes a
-                        // refold-after-stall NOT re-fire this node: without
-                        // it the pulses came back Pending at a terminal
-                        // record and `find_ready_nodes` double-executed the
-                        // node. Both sides must stay in lockstep.
+                        // fold does on `NodeResumed` (it absorbs every
+                        // pulse pending at the location when the row
+                        // lands, which is this same set). This keeps the
+                        // live record equal to what a refold produces (RAM
+                        // == refold), the invariant the in-place resume
+                        // path (`resume_resolved_suspensions_in_place`)
+                        // relies on when it reads `pulses_absorbed`
+                        // straight from the live record. The matching
+                        // fold-side flip (the pulses marked Absorbed in
+                        // the table) is what makes a refold-after-stall
+                        // NOT re-fire this node: without it the pulses
+                        // came back Pending at a terminal record and
+                        // `find_ready_nodes` double-executed the node.
+                        // Both sides must stay in lockstep.
                         for id in &absorbed_now {
                             if !record.pulses_absorbed.contains(id) {
                                 record.pulses_absorbed.push(*id);
@@ -1426,22 +1589,20 @@ async fn drive(
                     }
                 }
             } else {
-                let dispatch_pulse_id = uuid::Uuid::new_v4();
                 let record = NodeExecution {
                     id: uuid::Uuid::new_v4(),
                     node_id: node_id.clone(),
                     status: NodeExecutionStatus::Running,
                     pulses_absorbed: absorbed_now.clone(),
-                    dispatch_pulse: dispatch_pulse_id,
+                    ordinal: next_firing_ordinal(executions, &node_id, group.color, &group.frames),
                     error: group.error.clone(),
                     callback_id: None,
                     started_at: now_unix(),
                     completed_at: None,
-                    input: Some(group.input.clone()),
-                    output: None,
                     cost_usd: 0.0,
                     logs: Vec::new(),
                     port_warnings: Vec::new(),
+                    mentioned_ports: Default::default(),
                     color: group.color,
                     frames: group.frames.clone(),
                 };
@@ -1463,13 +1624,12 @@ async fn drive(
             // the fold must reconstruct.
             ship_node_lifecycle(
                 journal, pod_name, color, &node_id, &group.frames,
-                &group.input, &group.closed_ports, &absorbed_now,
-                resume_token_value.as_ref(), is_resume,
+                parked_token.as_deref(), is_resume,
             ).await;
 
             if let Some(reason) = &group.skip {
                 handle_node_skip(
-                    &node_id, group.color, &group.frames, &group.closed_ports, reason,
+                    &node_id, group.color, &group.frames, reason,
                     project, edge_idx, pulses, executions, kicked, journal, pod_name,
                 )
                 .await;
@@ -1486,80 +1646,6 @@ async fn drive(
                     project, edge_idx, pulses, executions, journal, pod_name,
                 )
                 .await;
-                continue;
-            }
-
-            // Group boundary nodes (Passthrough) are built-in firings
-            // handled inline, like the loop boundaries below: a plain
-            // Group's __in/__out forwards every input port verbatim to
-            // the same-named output at the same frames. There is no
-            // catalog impl and no async body to spawn. Closed inputs
-            // are absent from the input bag, so the unmentioned sweep
-            // closes their same-named outputs and skips cascade
-            // through (and out of) the group.
-            if node_def.node_type == "Passthrough" {
-                // The scope's gate is consumed here, never forwarded:
-                // the In boundary has no `_should_flow` output, and the
-                // children take the scope's decision as a whole.
-                let mut forwarded = group.input.clone();
-                if let Some(obj) = forwarded.as_object_mut() {
-                    obj.remove(weft_core::exec::skip::SHOULD_FLOW_PORT);
-                }
-                let mut emissions = Vec::new();
-                match weft_core::exec::postprocess_output(
-                    &node_id, &forwarded, color, &group.frames,
-                    project, pulses, edge_idx, &mut emissions,
-                ) {
-                    Ok(mentioned) => {
-                        // Passthrough is SYNCHRONOUS: it forwards its
-                        // inputs verbatim and has no async body, so a
-                        // crash between shipping the forwarded values and
-                        // NodeCompleted would re-fire it on resume and
-                        // re-emit with fresh ids (duplicate pulses
-                        // downstream). Carry BOTH the forwarded values AND
-                        // the unmentioned-port closures INSIDE NodeCompleted
-                        // so the whole emission set folds atomically with
-                        // the terminal marker (push_pulse dedup makes a
-                        // replayed row idempotent).
-                        let mut all_emissions = emissions;
-                        all_emissions.extend(build_unmentioned_closures(
-                            &node_id, &mentioned, color, &group.frames,
-                            project, edge_idx, pulses, None,
-                        ));
-                        mark_completed(executions, &node_id, color, &group.frames);
-                        // A boundary forwards synchronously, so it never
-                        // goes through the emission merge above; record
-                        // what it forwarded here, or the live record and
-                        // the folded one disagree on this firing.
-                        if let Some(rec) = executions.get_mut(&node_id).and_then(|v| {
-                            v.iter_mut().rev().find(|e| e.color == color && e.frames == group.frames)
-                        }) {
-                            rec.set_output(&forwarded);
-                        }
-                        ship_node_completed(journal, pod_name, color, &node_id, &group.frames, &forwarded, all_emissions).await;
-                        // The scope has started: everything inside it
-                        // runs now, wired to its edges or not. Its own
-                        // roots are kicked at the scope's frames.
-                        if let Some(gb) = node_def
-                            .group_boundary
-                            .as_ref()
-                            .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
-                        {
-                            launch_scope(
-                                project, edge_idx, journal, pod_name, color, &gb.group_id,
-                                &group.frames, None, kicked,
-                            )
-                            .await;
-                        }
-                    }
-                    Err(e) => {
-                        let mentioned = std::collections::HashSet::new();
-                        handle_node_failure(
-                            &node_id, &mentioned, color, &group.frames, &e.to_string(),
-                            project, edge_idx, pulses, executions, journal, pod_name,
-                        ).await;
-                    }
-                }
                 continue;
             }
 
@@ -1590,8 +1676,8 @@ async fn drive(
                     Ok(()) => {
                         mark_completed(executions, &node_id, color, &group.frames);
                         // Loop boundary: closures are the loop machinery's
-                        // job, not the generic sweep; no closures to carry.
-                        ship_node_completed(journal, pod_name, color, &node_id, &group.frames, &serde_json::Value::Object(serde_json::Map::new()), Vec::new()).await;
+                        // job, not the generic sweep.
+                        ship_node_completed(journal, pod_name, color, &node_id, &group.frames).await;
                     }
                     Err(err) => {
                         handle_loop_boundary_failure(
@@ -1632,38 +1718,38 @@ async fn drive(
             // the port resolves the marker to the feed).
             if !generator_ports.is_empty() {
                 let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
-                let wired: std::collections::HashSet<&str> = edge_idx
-                    .get_incoming(project, &node_id)
-                    .iter()
-                    .map(|e| e.target_handle.as_deref().unwrap_or("default"))
-                    .collect();
+                let wired = weft_core::exec::ready::wired_inputs(project, edge_idx, &node_id);
                 let mut feed_error: Option<String> = None;
-                if let Some(obj) = group.input.as_object_mut() {
-                    for port in &generator_ports {
-                        if !wired.contains(port.as_str()) {
-                            // An unwired optional generator input stays
-                            // absent; a read answers None honestly.
-                            continue;
+                // In declared port order: the feeds are created one per
+                // port, in the order the node declares them.
+                let generator_ports_in_order = node_def
+                    .inputs
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .filter(|p| generator_ports.contains(p));
+                for port in generator_ports_in_order {
+                    if !wired.contains(port) {
+                        // An unwired optional generator input stays
+                        // absent; a read answers None honestly.
+                        continue;
+                    }
+                    match stream_rt.create_feed(&loc, port, task_tx.clone()) {
+                        Ok(marker) => {
+                            // An ENDED generator port (an empty
+                            // stream, or a closure racing dispatch)
+                            // is a live feed, never a closed port;
+                            // `firing_input` (exec/ready.rs) is the
+                            // one owner of that rule and never lists
+                            // a generator port as closed.
+                            debug_assert!(
+                                !group.closed_ports.iter().any(|p| p == port),
+                                "a generator port must never list as closed"
+                            );
+                            group.input.insert(port.to_string(), Arc::new(marker));
                         }
-                        match stream_rt.create_feed(&loc, port, task_tx.clone()) {
-                            Ok(marker) => {
-                                // An ENDED generator port (an empty
-                                // stream, or a closure racing dispatch)
-                                // is a live feed, never a closed port;
-                                // `find_groups_for_node` (exec/ready.rs)
-                                // is the one owner of that rule and
-                                // never lists a generator port as
-                                // closed.
-                                debug_assert!(
-                                    !group.closed_ports.contains(port),
-                                    "a generator port must never list as closed"
-                                );
-                                obj.insert(port.clone(), marker);
-                            }
-                            Err(e) => {
-                                feed_error = Some(e);
-                                break;
-                            }
+                        Err(e) => {
+                            feed_error = Some(e);
+                            break;
                         }
                     }
                 }
@@ -1693,7 +1779,7 @@ async fn drive(
             // is still absent (a closed wire is never defaulted).
             let inputs = match weft_core::context::node_input_bag(
                 node_def,
-                group.input.as_object().cloned().unwrap_or_default(),
+                owned_bag(&group.input),
                 &group.closed_ports,
             ) {
                 Ok(bag) => bag,
@@ -1954,6 +2040,17 @@ async fn drive(
             );
         }
 
+        // Reap every task that ended, without blocking: its firing
+        // location is free to fire again on the next readiness scan
+        // (the hold above reads `task_firings`), and a task that
+        // PANICKED gets its synthetic Failed terminal queued here, so
+        // the drain right below applies it before that location can
+        // read free with a record still Running.
+        let mut freed_a_location = false;
+        while let Some(joined) = in_flight.try_join_next_with_id() {
+            freed_a_location |= note_task_joined(joined, &mut task_firings, &task_tx, color);
+        }
+
         // Drain the task channel in FIFO order: each `Emission`
         // (a still-running node's `pulse_downstream` / `close_port`)
         // postprocesses into downstream pulses and records the mentioned
@@ -1974,13 +2071,33 @@ async fn drive(
             journal,
             pod_name,
             &mut waiting,
-            &mut emitted_ports,
             &mut stream_rt,
             /* is_cancel = */ false,
         )
         .await;
 
         if progress {
+            idled_since_progress = false;
+            continue;
+        }
+
+        // A turn that dispatched anything is progress even with no
+        // task message behind it: a boundary, a loop boundary or a
+        // skip fires synchronously and leaves its pulses and kicks for
+        // the NEXT turn's readiness scan. Ending the run here would
+        // judge a table that still holds that work (a loop body's
+        // roots kicked by the LoopIn this turn are invisible to
+        // `check_completion`, and the run would read Completed).
+        //
+        // A turn that freed a location is the same: this turn's scan
+        // ran BEFORE the reap and held the location, and a task whose
+        // terminal was drained on an earlier turn (it sent, then was
+        // reaped a turn later) wakes nothing else. Without the rescan
+        // the pulses pending at that location wait for an unrelated
+        // event, and the stuck-check below could read the remaining
+        // tasks (parked on what this location would produce) as a
+        // deadlock and close their buses.
+        if dispatched_this_turn || freed_a_location {
             idled_since_progress = false;
             continue;
         }
@@ -2197,8 +2314,8 @@ async fn drive(
                 if fresh.len() > journaled_count {
                     journaled_count = fresh.len();
                     let resumed = resume_resolved_suspensions_in_place(
-                        color, &fresh, executions, pulses, kicked, &mut awaited_sequences,
-                    );
+                        color, project_arc, &fresh, executions, pulses, kicked, &mut awaited_sequences,
+                    )?;
                     if resumed > 0 {
                         tracing::info!(
                             target: "weft_engine::resume",
@@ -2210,70 +2327,14 @@ async fn drive(
                 }
             }
             joined = in_flight.join_next_with_id() => {
-                // A spawned node task ended. A JoinError here means a
-                // panic: cancellation-aborted tasks are drained inside
+                // A spawned node task ended while the loop was idle.
+                // Cancellation-aborted tasks are drained inside
                 // `JoinSet::shutdown().await` (see cancel_cleanup) and
-                // never surface in this idle-wait arm. The panicked task
-                // never sent its NodeTaskResult, so we must turn the
-                // panic into a terminal NodeFailed for the right firing
-                // ourselves (looked up via the task id); otherwise its
-                // exec record stays Running, the crashed-Running refold
-                // path re-dispatches it on every respawn, and the node
-                // panics in an infinite re-run loop. A successful task
-                // already reported via `result_tx`; we just drop its id.
-                match joined {
-                    Some(Ok((task_id, ()))) => {
-                        task_firings.remove(&task_id);
-                    }
-                    Some(Err(join_err)) => {
-                        let task_id = join_err.id();
-                        match task_firings.remove(&task_id) {
-                            Some(loc) => {
-                                let err = format!("node task panicked: {join_err}");
-                                tracing::error!(
-                                    target: "weft_engine::execution_driver",
-                                    color = %color,
-                                    node = %loc.node_id,
-                                    frames = ?loc.frames,
-                                    error = %err,
-                                    "in-flight node task panicked; failing the node"
-                                );
-                                // Route the panic through the SAME failure
-                                // path a body-returned error takes: send a
-                                // synthetic Failed terminal and loop. The
-                                // next iteration drains the task channel in
-                                // FIFO order, so any pulses the node emitted
-                                // before panicking are applied first, then
-                                // this Terminal fails the node with the
-                                // correct `mentioned` set from
-                                // `emitted_ports` (keeping already-emitted
-                                // ports' values, closing only the rest) and
-                                // cleans up its `emitted_ports` entry.
-                                // Handling it inline with an empty mentioned
-                                // set would double-pulse already-emitted
-                                // ports (value + closure on one edge) and
-                                // leak the emitted_ports entry.
-                                let _ = task_tx.send(TaskMsg::Terminal {
-                                    loc,
-                                    color,
-                                    outcome: NodeTaskOutcome::Failed(err),
-                                });
-                            }
-                            None => {
-                                // No identity recorded: a panic from a
-                                // task we don't own (should be impossible).
-                                // Fail loud rather than silently drop it.
-                                tracing::error!(
-                                    target: "weft_engine::execution_driver",
-                                    color = %color,
-                                    error = %join_err,
-                                    "in-flight task panicked with no recorded firing; \
-                                     engine invariant violated"
-                                );
-                            }
-                        }
-                    }
-                    None => {}
+                // never surface in this idle-wait arm.
+                if let Some(joined) = joined {
+                    // The next turn rescans regardless, so the freed
+                    // flag is not needed here.
+                    note_task_joined(joined, &mut task_firings, &task_tx, color);
                 }
             }
             task_msg = task_rx.recv() => {
@@ -2285,7 +2346,7 @@ async fn drive(
                 if let Some(msg) = task_msg {
                     apply_one_task_msg(
                         msg, color, project, edge_idx, pulses, executions, journal, pod_name,
-                        &mut waiting, &mut emitted_ports,
+                        &mut waiting,
                         &mut stream_rt,
                         /* is_cancel = */ false,
                     )
@@ -2307,15 +2368,18 @@ async fn drive(
                     &mut task_rx,
                     &mut waiting,
                     executions,
-                    &mut emitted_ports,
-                    color,
+                        color,
                     project,
                     edge_idx,
                     pulses,
                     journal,
                     pod_name,
                     loop_runtime,
+                    kicked,
                     &mut stream_rt,
+                    &recorded_cancel_cause(cancellation).to_string(),
+                    phase,
+                    dispatchable,
                 )
                 .await;
                 return Ok(ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(cancellation) });
@@ -2332,14 +2396,31 @@ async fn drive(
 /// different signals and the consumer-side `skip` distinguishes them.
 ///
 /// Build (and apply to `pulses`) the CLOSURE pulses on every output port
-/// the firing did NOT mention. RETURNS
-/// the emissions so the caller folds them into its terminal row
-/// (NodeCompleted / NodeFailed / NodeSkipped) so the marker and the
-/// closures it implies are ONE atomic write: a crash between two separate
-/// writes would lose the closures and leave downstream consumers neither
-/// firing nor skipping (refold Stuck). Every terminal-shipping path uses
-/// this; the standalone shipping wrapper below exists only for the
-/// cancel-cleanup walk, which has no terminal row to carry them.
+/// the firing did NOT mention. Nothing is journaled for them: the
+/// firing's terminal row is the fact, and the fold sweeps the same
+/// ports from the program with the same emission id
+/// (`terminal_sweep_emission`, keyed on the firing's ordinal at its
+/// location), so the closures it puts on the wires are these.
+#[allow(clippy::too_many_arguments)]
+/// The ordinal of the firing being ENDED at `(node, color, frames)`,
+/// which keys its termination sweep. Every ending path (a completion,
+/// a failure, a skip, a cancel) follows the dispatch that opened the
+/// record, so no record is an engine invariant broken: a sweep under
+/// a made-up ordinal would collide with another firing's closures,
+/// so the drive panics here naming the location, which
+/// `run_one_execution` catches and journals as the run's Failed
+/// terminal.
+fn ended_firing_ordinal(
+    executions: &NodeExecutionTable,
+    node_id: &str,
+    color: Color,
+    frames: &weft_core::frames::LoopFrames,
+) -> usize {
+    latest_firing(executions, node_id, color, frames)
+        .unwrap_or_else(|| panic!("ending a firing of '{node_id}' at {frames:?} that has no record"))
+        .ordinal
+}
+
 fn build_unmentioned_closures(
     node_id: &str,
     mentioned: &std::collections::HashSet<String>,
@@ -2348,6 +2429,7 @@ fn build_unmentioned_closures(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
+    executions: &NodeExecutionTable,
     // The firing's error on a FAILURE path: rides generator ports'
     // closures as a failed stream end (the consumer's pull gets the
     // error). None on every non-failure termination.
@@ -2363,14 +2445,17 @@ fn build_unmentioned_closures(
     if is_loop_boundary_node(project, node_id) {
         return Vec::new();
     }
+    let emission_id =
+        terminal_sweep_emission(color, node_id, frames, ended_firing_ordinal(executions, node_id, color, frames));
     let mut emissions = Vec::new();
     // Teardown cannot propagate (this is the shared tail of failure /
     // skip / completion paths), so a sweep error (node or port missing
     // from the project: corrupt compiled shape) is logged at error
-    // level here, the single chokepoint. Partial emissions still ship
+    // level here, the single chokepoint. Partial emissions still land
     // so whatever closed before the error reaches downstream.
     if let Err(e) = close_unmentioned_downstream(
-        node_id, mentioned, color, frames, project, pulses, edge_idx, &mut emissions, failure,
+        node_id, mentioned, emission_id, color, frames, project, pulses, edge_idx, &mut emissions,
+        failure,
     ) {
         tracing::error!(
             target: "weft_engine::execution_driver",
@@ -2381,27 +2466,6 @@ fn build_unmentioned_closures(
         );
     }
     emissions
-}
-
-/// Shipping wrapper that journals the closures as standalone
-/// `PulseEmitted` rows. Sole caller is the cancel-cleanup walk, which
-/// suppresses the per-node terminal row (the dispatcher's NodeCancelled
-/// is the status truth), so there is no terminal row to carry them.
-/// Every other path folds the closures into its terminal event instead.
-async fn close_unmentioned_downstream_and_ship(
-    node_id: &str,
-    mentioned: &std::collections::HashSet<String>,
-    color: weft_core::Color,
-    frames: &weft_core::frames::LoopFrames,
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-    journal: &dyn JournalClient,
-    pod_name: &str,
-) {
-    let emissions =
-        build_unmentioned_closures(node_id, mentioned, color, frames, project, edge_idx, pulses, None);
-    crate::context::ship_pulse_emissions(journal, pod_name, emissions).await;
 }
 
 /// Whether `node_id` is a `LoopIn` or `LoopOut` boundary node. Lives
@@ -2418,12 +2482,14 @@ fn is_loop_boundary_node(project: &ProjectDefinition, node_id: &str) -> bool {
 
 /// LoopIn / LoopOut firing handler. The engine treats these two
 /// boundary node types as built-in: no catalog impl, no spawned task.
-/// LoopIn instantiates / lookups the `LoopInstance`, validates zip
-/// lengths, computes the effective iteration count, and emits per-
-/// iteration pulses on its inside outputs at the body's frame stack.
-/// LoopOut records per-iteration writes via `LoopRuntime` and, on
-/// termination, emits assembled gather lists + final carry values on
-/// its outer outputs at the parent frame stack.
+/// LoopIn instantiates / looks up the `LoopInstance` (the pure
+/// derivation in `weft_core::exec::loop_runtime::instantiate`) and
+/// launches the iterations due now. LoopOut records per-iteration
+/// writes via `LoopRuntime` and, on termination, emits assembled
+/// gather lists + final carry values on its outer outputs at the
+/// parent frame stack. Every state change the fold needs is journaled
+/// as a loop row; the values are never on the rows, the fold reads
+/// them off the boundary firings' pulses.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_loop_boundary_firing(
     node_def: &weft_core::project::NodeDefinition,
@@ -2433,30 +2499,14 @@ pub(crate) async fn handle_loop_boundary_firing(
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> Result<(), String> {
-    use crate::loop_runtime::{LoopAdvance, LoopConfig, LoopItemSource};
-    use weft_core::primitive::{LoopInstanceKey, LoopTerminationReason};
+    use weft_core::primitive::LoopTerminationReason;
 
-    let group_id = node_def
-        .group_boundary
-        .as_ref()
-        .ok_or_else(|| format!("{} '{}' missing group_boundary", node_def.node_type, node_def.id))?
-        .group_id
-        .clone();
-    let parent_frames =
-        crate::loop_runtime::boundary_parent_frames(&node_def.node_type, &group.frames);
-    let key = LoopInstanceKey {
-        group_id: group_id.clone(),
-        parent_frames,
-        color: group.color,
-    };
-    let mut input_obj = group.input.as_object().cloned().unwrap_or_default();
-    // The loop's gate is consumed at the boundary, never broadcast into
-    // the body (the LoopIn has no `_should_flow` inside output).
-    input_obj.remove(weft_core::exec::skip::SHOULD_FLOW_PORT);
+    let key = loops::instance_key(node_def, &group.frames, group.color)?;
+    let group_id = key.group_id.clone();
 
     // A boundary firing over an instance that already terminated FAILED
     // must route to the FAILURE path, not the idle-complete path:
@@ -2467,10 +2517,10 @@ pub(crate) async fn handle_loop_boundary_firing(
     // same-worker-life straggler (a sibling iteration's LoopOut still
     // queued after another iteration's failure marked the instance
     // Failed). Both route to `handle_loop_boundary_failure`, whose
-    // already-terminated branch ships NodeFailed with no closures (they
-    // already rode LoopTerminated) and no second LoopTerminated. Only
-    // FAILED is gated: idle replays after OverExhausted / DoneVoted /
-    // MaxItersReached / Cancelled are legitimate and stay Ok.
+    // already-terminated branch ships NodeFailed and no second
+    // LoopTerminated. Only FAILED is gated: idle replays after
+    // OverExhausted / DoneVoted / MaxItersReached / Cancelled are
+    // legitimate and stay Ok.
     if matches!(
         loop_runtime.get(&key).and_then(|inst| inst.terminated),
         Some(LoopTerminationReason::Failed)
@@ -2483,106 +2533,20 @@ pub(crate) async fn handle_loop_boundary_firing(
     }
 
     if node_def.node_type == "LoopIn" {
-        // LoopConfig lives on LoopIn ONLY (the compiler emits the
-        // minimal `{"parentId": ...}` on LoopOut). Parse here so a
-        // LoopOut firing doesn't hard-error on the missing parallel
-        // field; LoopOut reads the config from the runtime instance
-        // it shares with LoopIn.
-        let config = LoopConfig::from_node_config(&node_def.config)
-            .map_err(|e| format!("LoopIn '{}': {}", node_def.id, e))?;
-        let (source, iter_cap) = compute_loop_item_source(&config, node_def, &input_obj)?;
-        let is_stream = matches!(source, LoopItemSource::Stream(_));
-        // A stream's items never live in the outer input bag (they are
-        // routed in pulse by pulse); a first item that happened to ride
-        // this dispatch must not be journaled as a broadcast input.
-        if let LoopItemSource::Stream(st) = &source {
-            input_obj.remove(&st.port);
-        }
-        let gather_ports = loop_gather_ports(project, &group_id, &config.carry)
-            .ok_or_else(|| {
-                format!(
-                    "LoopIn '{}': project has no LoopOut node '{}'; \
-                     corrupt compiled project shape",
-                    node_def.id,
-                    weft_core::project::boundary_out_id(&group_id),
-                )
-            })?;
-        // Initial carry seeds come from the loop's same-named inputs.
-        // A carry port that is wired and carries a real value seeds from
-        // it; an unwired (or null) carry seeds from its declared type's
-        // ZERO VALUE (Number -> 0, String -> "", List -> [], etc), so a
-        // loop can accumulate from a clean default without the author
-        // wiring an explicit seed. The port type lives on the LoopIn's
-        // input def. Seeded BEFORE `ensure` so a failure cannot leave a
-        // RAM instance behind with no LoopInstantiated row.
-        let mut seed_carry: Vec<(String, serde_json::Value)> = Vec::new();
-        for carry_port in &config.carry {
-            let v = match input_obj.get(carry_port) {
-                Some(v) if !v.is_null() => v.clone(),
-                _ => {
-                    let port = node_def
-                        .inputs
-                        .iter()
-                        .find(|p| &p.name == carry_port)
-                        .ok_or_else(|| {
-                            format!(
-                                "loop '{}': carry port '{}' has no input definition on the \
-                                 LoopIn node; corrupt compiled project shape",
-                                group_id, carry_port,
-                            )
-                        })?;
-                    port.port_type.zero_value()
-                }
-            };
-            seed_carry.push((carry_port.clone(), v));
-        }
-        let first_instantiation = loop_runtime.ensure(
-            key.clone(),
-            config.clone(),
-            source,
-            iter_cap,
-            gather_ports.clone(),
-        );
-        if first_instantiation {
-            // Stash the outer input bag and seed initial carry values
-            // BEFORE journaling, so the journal's LoopInstantiated event
-            // carries the bag for resume.
-            if let Some(inst) = loop_runtime.get_mut(&key) {
-                let input_map: HashMap<String, serde_json::Value> =
-                    input_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                inst.outer_input = input_map;
-                for (port, v) in seed_carry {
-                    inst.carry_values.insert(port, v);
-                }
-            }
-            let (outer_input_map, initial_carry_map) = loop_runtime
-                .get(&key)
-                .map(|inst| (inst.outer_input.clone(), inst.carry_values.clone()))
-                .unwrap_or_default();
+        let firing = instantiate(loop_runtime, node_def, project, &group.input, &group.frames, group.color)?;
+        if firing.first_instantiation {
             crate::context::record_from_pod(
                 journal,
                 weft_journal::ExecEvent::LoopInstantiated {
                     color: group.color,
                     group_id: group_id.clone(),
                     parent_frames: group.frames.clone(),
-                    iter_cap,
-                    parallel: config.parallel,
-                    max_iters: config.max_iters,
-                    over: config.over.clone(),
-                    carry: config.carry.clone(),
-                    trim_on_mismatch: config.trim_on_mismatch,
-                    outer_input: outer_input_map,
-                    initial_carry: initial_carry_map,
                     at_unix: now_unix(),
                 },
                 pod_name,
             )
             .await;
         }
-        let inst_carry: Vec<(String, serde_json::Value)> = loop_runtime
-            .get(&key)
-            .map(|inst| inst.carry_values.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default();
         // Decide which iterations to launch now. Launches derive from
         // the instance's (journal-backed) `launched` set, NEVER from
         // `first_instantiation`: on crash-resume the LoopIn re-fires
@@ -2590,30 +2554,30 @@ pub(crate) async fn handle_loop_boundary_firing(
         // may have launched only a subset (or none) of its iterations,
         // and deciding from first_instantiation would silently skip
         // the rest (the loop "completes" without running). The inverse
-        // hazard is covered too: `LoopIterationLaunched` CARRIES the
-        // iteration's body pulses in the same journal row, so an index
-        // in `launched` has its body pulses durably journaled and
-        // re-launching it would duplicate them.
+        // hazard is covered too: an index in `launched` has its
+        // `LoopIterationLaunched` row in the journal, so the fold put
+        // its body pulses on the wires and re-launching it would
+        // duplicate them.
         let (already_launched, inst_terminated) = loop_runtime
             .get(&key)
             .map(|inst| (inst.launched.clone(), inst.terminated.is_some()))
             .unwrap_or((Vec::new(), false));
         let to_launch: Vec<u32> = if inst_terminated {
             Vec::new()
-        } else if is_stream {
+        } else if firing.is_stream {
             // Stream-driven: iterations launch when items arrive (the
             // engine's routing pass feeds `stream_push`), never here.
             Vec::new()
-        } else if config.parallel {
+        } else if firing.config.parallel {
             // Parallel is list-driven by construction here: the
             // compiler rejects `parallel` without `over`, and a stream
             // returned above, so a resolved cap always exists.
-            let cap = iter_cap.ok_or_else(|| {
+            let cap = firing.iter_cap.ok_or_else(|| {
                 "parallel loop without a resolved iteration cap (compiled shape drifted)"
                     .to_string()
             })?;
             (0..cap).filter(|i| !already_launched.contains(i)).collect()
-        } else if already_launched.is_empty() && iter_cap != Some(0) {
+        } else if already_launched.is_empty() && firing.iter_cap != Some(0) {
             vec![0]
         } else {
             // Sequential with a launch already recorded: subsequent
@@ -2621,7 +2585,7 @@ pub(crate) async fn handle_loop_boundary_firing(
             // `LoopAdvance::LaunchNext` path, not LoopIn.
             Vec::new()
         };
-        if iter_cap == Some(0) {
+        if firing.iter_cap == Some(0) {
             // Zero-iteration loop: terminate immediately. The runtime
             // assembles the outward payload (a length-0 list for EVERY
             // declared gather port, initial carry values) and marks
@@ -2632,27 +2596,16 @@ pub(crate) async fn handle_loop_boundary_firing(
             // when iter_cap was capped at max_iters (including the
             // user writing `max_iters: 0`), the binding constraint is
             // MaxItersReached. Otherwise OverExhausted (empty over).
-            let reason = if config.max_iters == iter_cap {
+            let reason = if firing.config.max_iters == firing.iter_cap {
                 LoopTerminationReason::MaxItersReached
             } else {
                 LoopTerminationReason::OverExhausted
             };
-            match loop_runtime.emit_outward(&key, reason) {
+            match loop_runtime.emit_outward(&key, reason)? {
                 LoopAdvance::EmitOutward { reason, gather, carry } => {
                     emit_loop_outward(
-                        project,
-                        edge_idx,
-                        pulses,
-                        journal,
-                        pod_name,
-                        group.color,
-                        &group_id,
-                        &group.frames,
-                        gather,
-                        carry,
-                        reason,
+                        project, edge_idx, pulses, journal, pod_name, &key, gather, carry, reason,
                         loop_runtime,
-                        &key,
                     )
                     .await?;
                 }
@@ -2673,24 +2626,10 @@ pub(crate) async fn handle_loop_boundary_firing(
         } else {
             for index in to_launch {
                 launch_iteration(
-                    project,
-                    edge_idx,
-                    pulses,
-                    journal,
-                    pod_name,
-                    group.color,
-                    &group_id,
-                    &group.frames,
-                    &node_def.id,
-                    index,
-                    &config,
-                    &input_obj,
-                    &inst_carry,
-                    None,
+                    project, edge_idx, pulses, journal, pod_name, &key, index, None, loop_runtime,
                     kicked,
                 )
                 .await?;
-                loop_runtime.record_launched(&key, index);
             }
         }
         Ok(())
@@ -2711,86 +2650,9 @@ pub(crate) async fn handle_loop_boundary_firing(
                     node_def.id, key.parent_frames,
                 )
             })?;
-
-        let mut gather_writes: HashMap<String, weft_core::primitive::LoopWrite> = HashMap::new();
-        let mut carry_writes: HashMap<String, weft_core::primitive::LoopWrite> = HashMap::new();
-        let mut done_vote: Option<bool> = None;
-
-        let closed: std::collections::HashSet<&str> =
-            group.closed_ports.iter().map(|s| s.as_str()).collect();
-        for port in &node_def.inputs {
-            let name = &port.name;
-            if name == "done" {
-                done_vote = if closed.contains(name.as_str()) {
-                    None
-                } else {
-                    // `done` is a Boolean port marked optional. Three
-                    // legitimate inbound shapes, all "no vote":
-                    //   - absent from input_obj    (port not wired)
-                    //   - present as Value::Null   (no-value marker;
-                    //     `check_input` in ready.rs treats Null as Ok
-                    //     for any port AND maps non-matching values on
-                    //     optional ports to Null via NullIt, so Null
-                    //     is the normalized form of "no usable vote")
-                    //   - present as a real bool   (the actual vote)
-                    // A non-null non-bool value here is impossible
-                    // post-type-check; if one slips through, fail loud
-                    // because silently dropping the vote would let a
-                    // wrongly-typed body skip the termination check.
-                    match input_obj.get(name) {
-                        None => None,
-                        Some(v) if v.is_null() => None,
-                        Some(v) => match v.as_bool() {
-                            Some(b) => Some(b),
-                            None => return Err(format!(
-                                "LoopOut '{}' 'done' port received non-boolean non-null value {:?}; \
-                                 type-check should have rejected this upstream",
-                                node_def.id, v,
-                            )),
-                        },
-                    }
-                };
-                continue;
-            }
-            // `LoopWrite::Closed` for closure, `LoopWrite::Value(v)`
-            // for an actual write (including a real JSON null, which
-            // must round-trip through the journal without collapsing
-            // into "closure"). The dispatch invariant says every
-            // non-closed input port has a pulse in `input_obj`; if
-            // it's missing, that's corruption, not "default to null"
-            // (which for carry ports would silently overwrite the
-            // current value to null instead of keeping the previous).
-            let write = if closed.contains(name.as_str()) {
-                weft_core::primitive::LoopWrite::Closed
-            } else {
-                let v = input_obj.get(name).cloned().ok_or_else(|| format!(
-                    "LoopOut '{}' input port '{}' is neither closed nor present in input bag; \
-                     dispatch invariant violated",
-                    node_def.id, name,
-                ))?;
-                weft_core::primitive::LoopWrite::Value(v)
-            };
-            if inst_config.carry.contains(name) {
-                carry_writes.insert(name.clone(), write);
-            } else {
-                gather_writes.insert(name.clone(), write);
-            }
-        }
-
-        // A `done` vote on a PARALLEL loop has no decision tree to
-        // enter (all iterations launched upfront; termination is
-        // all-fired). Validate rejects wiring `done` in parallel mode,
-        // so a vote arriving here means the compiled config drifted;
-        // silently discarding it would let a wrongly-compiled loop
-        // ignore its own termination signal. Checked BEFORE the
-        // journal write so the refused firing leaves no row behind.
-        if inst_config.parallel && done_vote.is_some() {
-            return Err(format!(
-                "LoopOut '{}': `done` vote received on a parallel loop; the compiler's \
-                 validation rejects `done` in parallel mode, so this compiled config drifted",
-                node_def.id,
-            ));
-        }
+        // Read the writes off the firing BEFORE the journal write, so
+        // a refused firing (a drifted config) leaves no row behind.
+        let writes = classify_loop_out(node_def, &inst_config, &group.input, &group.closed_ports)?;
 
         // Journal the firing ONLY when the runtime will record it as
         // new state (instance live, index not already fired). The fold
@@ -2806,9 +2668,6 @@ pub(crate) async fn handle_loop_boundary_firing(
                     group_id: group_id.clone(),
                     parent_frames: key.parent_frames.clone(),
                     index,
-                    gather_writes: gather_writes.clone(),
-                    carry_writes: carry_writes.clone(),
-                    done_vote,
                     at_unix: now_unix(),
                 },
                 pod_name,
@@ -2816,69 +2675,29 @@ pub(crate) async fn handle_loop_boundary_firing(
             .await;
         }
 
-        let advance = loop_runtime
-            .record_loop_out(&key, index, gather_writes, carry_writes, done_vote)?;
+        let advance = loop_runtime.record_loop_out(
+            &key, index, writes.gather_writes, writes.carry_writes, writes.done_vote,
+        )?;
         match advance {
             LoopAdvance::Idle => Ok(()),
             LoopAdvance::LaunchNext { index: next, stream_item: Some(item) } => {
-                let loop_in_id = weft_core::project::boundary_in_id(&group_id);
                 launch_stream_iteration(
-                    project, edge_idx, pulses, journal, pod_name, group.color,
-                    &key, &loop_in_id, next, item, loop_runtime, stream_rt, kicked,
+                    project, edge_idx, pulses, journal, pod_name, &key, next, item, loop_runtime,
+                    stream_rt, kicked,
                 )
                 .await
             }
             LoopAdvance::LaunchNext { index: next, stream_item: None } => {
-                let (inst_carry, loop_in_input): (
-                    Vec<(String, serde_json::Value)>,
-                    serde_json::Map<String, serde_json::Value>,
-                ) = loop_runtime
-                    .get(&key)
-                    .map(|inst| {
-                        let carry = inst.carry_values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        let input: serde_json::Map<String, serde_json::Value> =
-                            inst.outer_input.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                        (carry, input)
-                    })
-                    .unwrap_or_default();
-                let loop_in_id = weft_core::project::boundary_in_id(&group_id);
                 launch_iteration(
-                    project,
-                    edge_idx,
-                    pulses,
-                    journal,
-                    pod_name,
-                    group.color,
-                    &group_id,
-                    &key.parent_frames,
-                    &loop_in_id,
-                    next,
-                    &inst_config,
-                    &loop_in_input,
-                    &inst_carry,
-                    None,
+                    project, edge_idx, pulses, journal, pod_name, &key, next, None, loop_runtime,
                     kicked,
                 )
-                .await?;
-                loop_runtime.record_launched(&key, next);
-                Ok(())
+                .await
             }
             LoopAdvance::EmitOutward { reason, gather, carry } => {
-                let parent_frames = key.parent_frames.clone();
                 emit_loop_outward(
-                    project,
-                    edge_idx,
-                    pulses,
-                    journal,
-                    pod_name,
-                    group.color,
-                    &group_id,
-                    &parent_frames,
-                    gather,
-                    carry,
-                    reason,
+                    project, edge_idx, pulses, journal, pod_name, &key, gather, carry, reason,
                     loop_runtime,
-                    &key,
                 )
                 .await?;
                 // A stream-driven loop that terminated (a done vote,
@@ -2896,115 +2715,13 @@ pub(crate) async fn handle_loop_boundary_firing(
     }
 }
 
-/// Answer the loop's ONE item-source question from its config and the
-/// LoopIn's declared port types: `over` lists (count known), no `over`
-/// (done-driven), or `over` on a single `Generator[T]` port (stream).
-/// The returned cap is the iteration CAP: the zip-trimmed count for
-/// lists, `max_iters` otherwise; `None` means uncapped.
-pub(crate) fn compute_loop_item_source(
-    config: &crate::loop_runtime::LoopConfig,
-    node_def: &weft_core::project::NodeDefinition,
-    input: &serde_json::Map<String, serde_json::Value>,
-) -> Result<(crate::loop_runtime::LoopItemSource, Option<u32>), String> {
-    use crate::loop_runtime::LoopItemSource;
-    let source = loop_source_kind(config, node_def, None)?;
-    let cap = match &source {
-        LoopItemSource::Lists => Some(compute_loop_iter_cap(config, input)?),
-        LoopItemSource::DoneDriven | LoopItemSource::Stream(_) => config.max_iters,
-    };
-    Ok((source, cap))
-}
-
-/// The source VARIANT alone, from the config plus the LoopIn's declared
-/// port types (no input values needed). The rehydrate path uses this
-/// directly: the snapshot already carries the resolved cap.
-/// `stream_end` seeds an already-ended stream source (a rehydrate
-/// whose snapshot recorded the durable `LoopStreamEnded`); a fresh
-/// instantiation passes `None`.
-fn loop_source_kind(
-    config: &crate::loop_runtime::LoopConfig,
-    node_def: &weft_core::project::NodeDefinition,
-    stream_end: Option<StreamEnd>,
-) -> Result<crate::loop_runtime::LoopItemSource, String> {
-    use crate::loop_runtime::{LoopItemSource, LoopStreamState};
-    let stream_port = config.over.iter().find(|p| {
-        node_def
-            .inputs
-            .iter()
-            .any(|i| &&i.name == p && i.port_type.as_generator().is_some())
-    });
-    if let Some(port) = stream_port {
-        // The compiler rejects a stream mixed with other over ports;
-        // reaching here with one means the compiled shape drifted.
-        if config.over.len() != 1 {
-            return Err(format!(
-                "loop 'over' mixes the stream port '{port}' with other ports; a loop \
-                 iterates one stream at a time (compiled shape drifted)"
-            ));
-        }
-        return Ok(LoopItemSource::Stream(LoopStreamState::new(port.clone(), stream_end)));
-    }
-    if config.over.is_empty() {
-        return Ok(LoopItemSource::DoneDriven);
-    }
-    Ok(LoopItemSource::Lists)
-}
-
-pub(crate) fn compute_loop_iter_cap(
-    config: &crate::loop_runtime::LoopConfig,
-    input: &serde_json::Map<String, serde_json::Value>,
-) -> Result<u32, String> {
-    let mut lengths: Vec<usize> = Vec::new();
-    for port in &config.over {
-        match input.get(port).and_then(|v| v.as_array()) {
-            Some(arr) => lengths.push(arr.len()),
-            None => {
-                // An absent `over` port (unwired, or an optional input
-                // whose upstream closed) must NOT silently degrade:
-                // skipping it would either iterate over the remaining
-                // lists with this port missing inside the body, or
-                // (all absent) reclassify a list-driven loop as a
-                // done-driven one (unbounded, or capped only by
-                // max_iters).
-                return Err(format!(
-                    "loop 'over' port '{port}' must be a List; got {}",
-                    input
-                        .get(port)
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "no value (unwired, or upstream closed)".into())
-                ));
-            }
-        }
-    }
-    let count = if lengths.is_empty() {
-        // List-driven only: the caller (`compute_loop_item_source`)
-        // classifies an empty `over` as done-driven and never calls
-        // this. Reaching here with no lists is a caller bug.
-        return Err(
-            "compute_loop_iter_cap on a loop with no 'over' lists; the caller \
-             classifies done-driven loops itself"
-                .into(),
-        );
-    } else if config.trim_on_mismatch {
-        lengths.into_iter().min().unwrap_or(0) as u32
-    } else {
-        let first = lengths[0];
-        for l in &lengths[1..] {
-            if *l != first {
-                return Err(format!(
-                    "loop 'over' length mismatch with trim_on_mismatch=false: {lengths:?}",
-                    lengths = lengths
-                ));
-            }
-        }
-        first as u32
-    };
-    Ok(match config.max_iters {
-        Some(m) => count.min(m),
-        None => count,
-    })
-}
-
+/// Launch one iteration: put the body's pulses on the wires (the pure
+/// derivation in `weft_core::exec::loop_runtime::launch_iteration`),
+/// journal the launch row, and kick the body's roots. The row is the
+/// ONE fact of the launch; on crash-resume `launched.contains(index)`
+/// is true iff the fold put the body pulses on the wires from that
+/// row, so `record_loop_out`'s already-launched guard correctly
+/// returns Idle instead of double-launching.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn launch_iteration(
     project: &ProjectDefinition,
@@ -3012,196 +2729,39 @@ pub(crate) async fn launch_iteration(
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    color: weft_core::Color,
-    group_id: &str,
-    parent_frames: &weft_core::frames::LoopFrames,
-    loop_in_id: &str,
+    key: &weft_core::primitive::LoopInstanceKey,
     index: u32,
-    config: &crate::loop_runtime::LoopConfig,
-    outer_input: &serde_json::Map<String, serde_json::Value>,
-    carry_values: &[(String, serde_json::Value)],
-    // A stream-driven iteration's item: `(over port, item pulse id,
-    // item value)`. The pulse id is journaled INSIDE the launch row
-    // (`stream_pulse`), so the take and the launch are one atomic
-    // write. `None` for list-driven and done-driven launches.
-    stream_item: Option<(String, uuid::Uuid, serde_json::Value)>,
+    stream_item: Option<LoopStreamItem>,
+    loop_runtime: &mut LoopRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> Result<(), String> {
-    use crate::loop_runtime::iteration_frames;
-
-    let body_frames = iteration_frames(parent_frames, index);
-    let mut output = serde_json::Map::new();
-    if let Some((port, _, value)) = &stream_item {
-        output.insert(port.clone(), value.clone());
-    }
-    for (port, value) in outer_input {
-        if config.over.contains(port) {
-            // The iteration count was derived from this same array's
-            // length, so an out-of-range index can only mean iter_cap
-            // vs input-list drift (a corrupt snapshot, or a definition
-            // change across resume). Fail loud like the rest of this
-            // module rather than injecting Null and running the iteration
-            // on fabricated data; the caller routes this into
-            // `handle_loop_boundary_failure`.
-            let arr = value.as_array().ok_or_else(|| {
-                format!("loop '{group_id}': over port '{port}' is not a List at launch")
-            })?;
-            let elem = arr.get(index as usize).cloned().ok_or_else(|| {
-                format!(
-                    "loop '{group_id}': over port '{port}' has no element at index {index} \
-                     (len {}); iter_cap/input drift",
-                    arr.len()
-                )
-            })?;
-            output.insert(port.clone(), elem);
-        } else if !config.carry.contains(port) {
-            // Broadcast input: emit verbatim per iteration.
-            output.insert(port.clone(), value.clone());
-        }
-    }
-    // Carry values: read current carry on the inside-out side per
-    // iteration. Closure carry-write fallback already handled by the
-    // runtime; what reaches here is always a real value.
-    for (port, value) in carry_values {
-        output.insert(port.clone(), value.clone());
-    }
-    // Implicit `self.index`.
-    output.insert("index".to_string(), serde_json::json!(index));
-
-    let mut emissions = Vec::new();
-    let mentioned = weft_core::exec::postprocess_output(
-        loop_in_id,
-        &serde_json::Value::Object(output),
-        color,
-        &body_frames,
-        project,
-        pulses,
-        edge_idx,
-        &mut emissions,
-    )
-    .map_err(|e| e.to_string())?;
-    // Close every inside output port this iteration did NOT emit (an
-    // optional broadcast/over input that arrived closed or unwired is
-    // absent from `output`). Without this, a body node wired to that
-    // port waits forever on a pulse that never comes and the whole loop
-    // hangs (mislabeled Stuck). The generic termination-time sweep skips
-    // loop boundaries, so the per-iteration analogue lives here, scoped
-    // to this iteration's own frame stack so it can't touch the outward
-    // ports. A plain Group already gets this via its Passthrough sweep;
-    // loops must not break the skip cascade.
-    weft_core::exec::close_unmentioned_downstream(
-        loop_in_id,
-        &mentioned,
-        color,
-        &body_frames,
-        project,
-        pulses,
-        edge_idx,
-        &mut emissions,
-        None,
-    )
-    .map_err(|e| e.to_string())?;
-    // The body pulses ride INSIDE the `LoopIterationLaunched` row
-    // (one atomic journal write) instead of separate `PulseEmitted`
-    // rows. Two writes would have a crash window with no safe order:
-    // pulses-first replays the body twice on resume (`launched` lacks
-    // the index, so the LaunchNext path re-ships them), marker-first
-    // hangs it (index in `launched`, no body pulses). With the atomic
-    // row, on crash-resume `launched.contains(index)` is true iff the
-    // body pulses are in the folded table, so `record_loop_out`'s
-    // already-launched guard correctly returns Idle instead of
-    // double-launching.
-    // The body's own roots (members no wire feeds) start with the
-    // iteration, at its frames: everything inside a loop runs once per
-    // iteration, wired to the loop's edges or not. They ride the same
-    // atomic row as the pulses.
-    let roots = scope_body_roots(project, edge_idx, group_id);
+    let stream_pulse = stream_item.as_ref().map(|item| item.pulse.to_string());
+    let launch = loops::launch_iteration(
+        loop_runtime, key, index, stream_item, project, edge_idx, pulses,
+    )?;
     crate::context::record_from_pod(
         journal,
         weft_journal::ExecEvent::LoopIterationLaunched {
-            color,
-            group_id: group_id.to_string(),
-            parent_frames: parent_frames.clone(),
+            color: key.color,
+            group_id: key.group_id.clone(),
+            parent_frames: key.parent_frames.clone(),
             index,
-            body_emissions: emissions.into_iter().map(Into::into).collect(),
-            roots: roots.clone(),
-            stream_pulse: stream_item.as_ref().map(|(_, id, _)| id.to_string()),
+            stream_pulse,
             at_unix: now_unix(),
         },
         pod_name,
     )
     .await;
-    register_scope_kicks(kicked, &roots, &body_frames, None);
+    kick_scope(kicked, &launch.roots, &launch.body_frames, None);
     Ok(())
 }
 
-/// Journal the kick every scope body root gets at `frames` and hand the
-/// kicks to the scheduler: the group launcher, the one-iteration case
-/// of a loop's launch (which rides `LoopIterationLaunched::roots`
-/// instead of this row, so the launch stays one atomic fact). With
-/// `skipped_by`, the scope was gated off: every member (nested scopes
-/// included) is kicked straight into a `ScopeSkipped` skip, so the
-/// journal says of each that its scope did not run.
-#[allow(clippy::too_many_arguments)]
-async fn launch_scope(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    journal: &dyn JournalClient,
-    pod_name: &str,
-    color: Color,
-    group_id: &str,
-    frames: &weft_core::frames::LoopFrames,
-    skipped_by: Option<&str>,
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
-) {
-    let roots: Vec<String> = match skipped_by {
-        None => scope_body_roots(project, edge_idx, group_id),
-        Some(_) => scope_members(project, group_id).into_iter().map(|n| n.id.clone()).collect(),
-    };
-    if roots.is_empty() {
-        return;
-    }
-    crate::context::record_from_pod(
-        journal,
-        weft_journal::ExecEvent::ScopeLaunched {
-            color,
-            group_id: group_id.to_string(),
-            frames: frames.clone(),
-            roots: roots.clone(),
-            skipped_by: skipped_by.map(str::to_string),
-            at_unix: now_unix(),
-        },
-        pod_name,
-    )
-    .await;
-    register_scope_kicks(kicked, &roots, frames, skipped_by);
-}
-
-/// The RAM twin of what the journal row just recorded (the fold builds
-/// the same entries from `ScopeLaunched` / `LoopIterationLaunched`):
-/// one kick per root at `frames`, first launch wins.
-fn register_scope_kicks(
-    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
-    roots: &[String],
-    frames: &weft_core::frames::LoopFrames,
-    skipped_by: Option<&str>,
-) {
-    for root in roots {
-        kicked
-            .entry(FiringLocation::new(root.clone(), frames.clone()))
-            .or_insert_with(|| weft_core::primitive::KickedNode {
-                firing: false,
-                payload: None,
-                port_snapshot: None,
-                dispatched: false,
-                scope_skipped: skipped_by.map(str::to_string),
-            });
-    }
-}
-
-/// Ship a terminated loop's outward payload: postprocess the assembled
-/// gather lists + final carry values onto LoopOut's outer outputs at
-/// the parent frame stack, then journal `LoopTerminated`.
+/// Ship a terminated loop's outward payload: the assembled gather
+/// lists + final carry values onto LoopOut's outer outputs at the
+/// parent frame stack (the pure derivation in
+/// `weft_core::exec::loop_runtime::emit_loop_outward`), then journal
+/// `LoopTerminated`; the fold puts the same pulses on the wires from
+/// that row.
 ///
 /// On postprocess failure nothing partial ships (postprocess
 /// pre-validates before touching state): the outward ports are CLOSED
@@ -3217,134 +2777,51 @@ pub(crate) async fn emit_loop_outward(
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    color: weft_core::Color,
-    group_id: &str,
-    parent_frames: &weft_core::frames::LoopFrames,
-    gather: HashMap<String, Vec<Option<serde_json::Value>>>,
-    carry: HashMap<String, serde_json::Value>,
-    reason: weft_core::primitive::LoopTerminationReason,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
     key: &weft_core::primitive::LoopInstanceKey,
+    gather: HashMap<String, Vec<Option<Arc<serde_json::Value>>>>,
+    carry: HashMap<String, Arc<serde_json::Value>>,
+    reason: weft_core::primitive::LoopTerminationReason,
+    loop_runtime: &mut LoopRuntime,
 ) -> Result<(), String> {
-    let loop_out_id = weft_core::project::boundary_out_id(group_id);
-    let mut output = serde_json::Map::new();
-    for (port, slots) in gather {
-        let arr: Vec<serde_json::Value> = slots
-            .into_iter()
-            .map(|v| v.unwrap_or(serde_json::Value::Null))
-            .collect();
-        output.insert(port, serde_json::Value::Array(arr));
-    }
-    for (port, v) in carry {
-        output.insert(port, v);
-    }
-    let mut emissions = Vec::new();
-    if let Err(e) = weft_core::exec::postprocess_output(
-        &loop_out_id,
-        &serde_json::Value::Object(output),
-        color,
-        parent_frames,
-        project,
-        pulses,
-        edge_idx,
-        &mut emissions,
-    ) {
-        let failed = weft_core::primitive::LoopTerminationReason::Failed;
-        if let Some(inst) = loop_runtime.get_mut(key) {
-            inst.terminated = Some(failed);
+    match loops::emit_loop_outward(key, gather, carry, project, edge_idx, pulses) {
+        Ok(_emissions) => {
+            journal_loop_terminated(journal, pod_name, key, reason).await;
+            Ok(())
         }
-        // Closures carried in the terminal row (atomic), same reason as
-        // the success path above.
-        let closures = build_scope_outward_closures(
-            project, edge_idx, pulses, color, group_id, parent_frames,
-        );
-        crate::context::record_from_pod(
-            journal,
-            weft_journal::ExecEvent::LoopTerminated {
-                color,
-                group_id: group_id.to_string(),
-                parent_frames: parent_frames.clone(),
-                reason: failed,
-                outward_emissions: closures.into_iter().map(Into::into).collect(),
-                at_unix: now_unix(),
-            },
-            pod_name,
-        )
-        .await;
-        return Err(format!("loop '{group_id}' outward emit failed: {e}"));
+        Err(e) => {
+            let failed = weft_core::primitive::LoopTerminationReason::Failed;
+            // The instance was terminated by the advance that got us
+            // here; a failed outward emit re-marks it Failed (the
+            // documented override), in the one place `terminated` is
+            // ever rewritten.
+            if let Some(inst) = loop_runtime.get_mut(key) {
+                inst.terminated = Some(failed);
+            }
+            close_loop_outward(key, project, edge_idx, pulses);
+            journal_loop_terminated(journal, pod_name, key, failed).await;
+            Err(e)
+        }
     }
-    // Carry the outward pulses INSIDE the LoopTerminated row (one atomic
-    // write) instead of shipping them as separate PulseEmitted rows. A
-    // crash between two separate writes would leave the pulses pending
-    // with `terminated: None` on refold, re-firing LoopOut and emitting
-    // the loop's outputs twice downstream.
+}
+
+async fn journal_loop_terminated(
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    key: &weft_core::primitive::LoopInstanceKey,
+    reason: weft_core::primitive::LoopTerminationReason,
+) {
     crate::context::record_from_pod(
         journal,
         weft_journal::ExecEvent::LoopTerminated {
-            color,
-            group_id: group_id.to_string(),
-            parent_frames: parent_frames.clone(),
+            color: key.color,
+            group_id: key.group_id.clone(),
+            parent_frames: key.parent_frames.clone(),
             reason,
-            outward_emissions: emissions.into_iter().map(Into::into).collect(),
             at_unix: now_unix(),
         },
         pod_name,
     )
     .await;
-    Ok(())
-}
-
-/// Build (and apply to `pulses` exactly once) the outward closure pulses
-/// for `group_id`'s LoopOut at `parent_frames` (a loop's abnormal ending
-/// tells its consumers "nothing will arrive" so they cascade-skip instead
-/// of deadlocking), RETURNING them. EVERY caller carries the returned
-/// emissions inside a terminal journal row (`LoopTerminated` /
-/// `NodeFailed` / `NodeSkipped`) so the marker and its closures fold as
-/// one atomic unit (no crash-resume double-emit / lost-closure window);
-/// there is no standalone-ship path. A missing `__out` node (impossible
-/// unless the compiled project shape is corrupt) is logged at error level
-/// rather than returned, since teardown paths cannot propagate.
-/// The closures a scope that never runs owes the outside: one per
-/// outward port of its Out boundary, at the scope's own frames. A
-/// group's and a loop's alike; the outward surface is the Out node's
-/// outputs either way.
-fn build_scope_outward_closures(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-    color: weft_core::Color,
-    group_id: &str,
-    frames: &weft_core::frames::LoopFrames,
-) -> Vec<weft_core::exec::PulseEmission> {
-    let out_id = weft_core::project::boundary_out_id(group_id);
-    let Some(out_node) = project.nodes.iter().find(|n| n.id == out_id) else {
-        tracing::error!(
-            target: "weft_engine::loop_runtime",
-            group_id = %group_id,
-            "scope teardown: project has no '{out_id}' node; outward consumers \
-             will not receive closures (corrupt compiled project shape)"
-        );
-        return Vec::new();
-    };
-    let mut emissions = Vec::new();
-    for port in &out_node.outputs {
-        // Unreachable by construction (we iterate the node's own
-        // declared outputs), but teardown cannot propagate, so log
-        // loud rather than unwrap.
-        if let Err(e) = weft_core::exec::postprocess::emit_port_closure(
-            &out_id, &port.name, color, frames,
-            project, pulses, edge_idx, &mut emissions,
-        ) {
-            tracing::error!(
-                target: "weft_engine::loop_runtime",
-                group_id = %group_id,
-                port = %port.name,
-                error = %e,
-                "scope teardown closure failed"
-            );
-        }
-    }
-    emissions
 }
 
 /// Failure tail for an inline boundary firing (LoopIn / LoopOut). On
@@ -3357,13 +2834,16 @@ fn build_scope_outward_closures(
 /// resumed workers both see a dead loop rather than a live instance
 /// nothing will ever drive again.
 ///
-/// Pre-instantiation failures (config parse, missing carry seed,
-/// iter-count errors) have no instance: closures alone carry the
-/// teardown, and the fold never sees a `LoopTerminated` without its
-/// `LoopInstantiated`. An instance that is ALREADY terminated means
-/// the teardown (closures + terminal row) was journaled by
-/// `emit_loop_outward`'s failure path; doing it again would duplicate
-/// closure pulses downstream.
+/// Which row the fold derives the outward closures from depends on
+/// the three cases: a LIVE instance is terminated FIRST
+/// (`LoopTerminated{Failed}` carries the teardown; a crash between it
+/// and the NodeFailed leaves the instance dead and the closures
+/// delivered, self-consistent), then NodeFailed; a NO-instance failure
+/// (config parse, missing carry seed, iter-count errors) has only the
+/// NodeFailed, and the fold closes the loop's outward surface from
+/// that row when it finds no instance; an ALREADY terminated instance
+/// means the teardown was journaled by `emit_loop_outward`'s failure
+/// path, so the NodeFailed adds nothing.
 #[allow(clippy::too_many_arguments)]
 async fn handle_loop_boundary_failure(
     node_def: &weft_core::project::NodeDefinition,
@@ -3376,98 +2856,58 @@ async fn handle_loop_boundary_failure(
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
 ) {
-    use weft_core::primitive::{LoopInstanceKey, LoopTerminationReason};
+    use weft_core::primitive::LoopTerminationReason;
 
-    // The boundary's outward closures (a failed loop tells its consumers
-    // "nothing will arrive") must survive a crash and ride EXACTLY ONE
-    // terminal journal row, and the instance-dead marker must never land
-    // in a LATER row than the closures. So which row carries them depends
-    // on the three cases handled below: a live instance carries them in
-    // the LoopTerminated row written FIRST (then NodeFailed empty); a
-    // no-instance failure carries them in NodeFailed (the only terminal
-    // row); an already-terminated instance carries none (the prior
-    // LoopTerminated already did). They are never duplicated across rows.
-    let Some(gb) = node_def.group_boundary.as_ref() else {
-        // Unreachable for LoopIn/LoopOut (the compiler always sets the
-        // boundary). Still fail the node loudly with no loop teardown.
-        tracing::error!(
-            target: "weft_engine::loop_runtime",
-            node = %node_def.id,
-            "boundary failure: node has no group_boundary; cannot tear down its loop"
-        );
-        let mentioned = std::collections::HashSet::new();
-        handle_node_failure(
-            &node_def.id, &mentioned, color, frames, err,
-            project, edge_idx, pulses, executions, journal, pod_name,
-        )
-        .await;
-        return;
-    };
-    let group_id = gb.group_id.clone();
-    let parent_frames = crate::loop_runtime::boundary_parent_frames(&node_def.node_type, frames);
-    let key = LoopInstanceKey {
-        group_id: group_id.clone(),
-        parent_frames: parent_frames.clone(),
-        color,
-    };
-    let already_terminated =
-        matches!(loop_runtime.get(&key).map(|inst| inst.terminated.is_some()), Some(true));
-
-    // Each closure set must ride EXACTLY ONE journal row, and the
-    // instance-dead marker (LoopTerminated) must land in the SAME or an
-    // EARLIER row than the closures, never later. So:
-    //   - LIVE instance: write LoopTerminated FIRST (carries the closures
-    //     AND marks the instance dead), then NodeFailed with NO closures.
-    //     A crash between them leaves the instance dead + closures
-    //     delivered; the boundary record is still Running so it re-fires,
-    //     hits the terminated instance, and goes idle. Self-consistent.
-    //     If we wrote NodeFailed-with-closures first and crashed, the
-    //     refold would have closures delivered but the instance LIVE, and
-    //     surviving body work could re-fire LoopOut and emit REAL outward
-    //     values onto ports whose consumers already got closures.
-    //   - NO instance (pre-instantiation failure): there is no
-    //     LoopTerminated to write, so NodeFailed carries the closures.
-    //   - ALREADY terminated: the prior LoopTerminated already carried
-    //     the closures; NodeFailed carries none.
-    let live_instance =
-        matches!(loop_runtime.get(&key).map(|inst| inst.terminated.is_some()), Some(false));
-    let nodefailed_closures = if live_instance {
-        if let Some(inst) = loop_runtime.get_mut(&key) {
-            inst.terminated = Some(LoopTerminationReason::Failed);
+    let key = match loops::instance_key(node_def, frames, color) {
+        Ok(key) => key,
+        Err(e) => {
+            // Unreachable for LoopIn/LoopOut (the compiler always sets
+            // the boundary). Still fail the node loudly with no loop
+            // teardown.
+            tracing::error!(
+                target: "weft_engine::loop_runtime",
+                node = %node_def.id,
+                error = %e,
+                "boundary failure: cannot tear down its loop"
+            );
+            let mentioned = std::collections::HashSet::new();
+            handle_node_failure(
+                &node_def.id, &mentioned, color, frames, err,
+                project, edge_idx, pulses, executions, journal, pod_name,
+            )
+            .await;
+            return;
         }
-        let closures =
-            build_scope_outward_closures(project, edge_idx, pulses, color, &group_id, &parent_frames);
-        crate::context::record_from_pod(
-            journal,
-            weft_journal::ExecEvent::LoopTerminated {
-                color,
-                group_id: group_id.clone(),
-                parent_frames: parent_frames.clone(),
-                reason: LoopTerminationReason::Failed,
-                outward_emissions: closures.into_iter().map(Into::into).collect(),
-                at_unix: now_unix(),
-            },
-            pod_name,
-        )
-        .await;
-        Vec::new()
-    } else if already_terminated {
-        Vec::new()
-    } else {
-        // No instance: NodeFailed is the only terminal row, so it carries
-        // the closures.
-        build_scope_outward_closures(project, edge_idx, pulses, color, &group_id, &parent_frames)
     };
+    match loop_runtime.get(&key).map(|inst| inst.terminated.is_some()) {
+        // LIVE instance: dead marker and closures first, then the
+        // boundary's own failure.
+        Some(false) => {
+            loop_runtime
+                .terminate(&key, LoopTerminationReason::Failed)
+                .expect("the instance was found live just above");
+            close_loop_outward(&key, project, edge_idx, pulses);
+            journal_loop_terminated(journal, pod_name, &key, LoopTerminationReason::Failed).await;
+        }
+        // ALREADY terminated: the prior LoopTerminated closed the
+        // outward surface.
+        Some(true) => {}
+        // NO instance: the outward surface closes now, in RAM; the
+        // fold does the same from the NodeFailed row below.
+        None => {
+            close_loop_outward(&key, project, edge_idx, pulses);
+        }
+    }
 
     // Boundary firings never emit through the task channel, so the
-    // generic mentioned set is empty.
+    // generic mentioned set is empty (and the sweep no-ops for a loop
+    // boundary anyway).
     let mentioned = std::collections::HashSet::new();
-    handle_node_failure_inner(
-        &node_def.id, &mentioned, color, frames, err,
-        project, edge_idx, pulses, executions, journal, pod_name,
-        /* ship_node_terminal = */ true, nodefailed_closures,
+    handle_node_failure(
+        &node_def.id, &mentioned, color, frames, err, project, edge_idx, pulses, executions,
+        journal, pod_name,
     )
     .await;
 }
@@ -3493,83 +2933,65 @@ async fn handle_node_failure(
     journal: &dyn JournalClient,
     pod_name: &str,
 ) {
-    handle_node_failure_inner(
-        node_id, mentioned, color, frames, err, project, edge_idx, pulses, executions,
-        journal, pod_name, /* ship_node_terminal = */ true, Vec::new(),
-    )
-    .await;
-}
-
-/// Cancel-path variant: in-memory `mark_failed` + downstream-closure
-/// journal writes (those carry PulseEmitted rows, not node-status), but
-/// SKIP the `NodeFailed` node-status write. The dispatcher writes
-/// `NodeCancelled` for every non-terminal node found in its
-/// journal-folded snapshot at cancel time; if the worker journaled
-/// `NodeFailed` for the same `(node, frames)` first, the fold's
-/// last-write-wins flips the final state to Failed and the user sees a
-/// misleading shape error on a cancelled run. Skipping the node-status
-/// write here keeps the dispatcher's `NodeCancelled` as the source of
-/// truth for status while preserving downstream-close correctness so no
-/// pulses leak.
-async fn handle_node_failure_cancel_path(
-    node_id: &str,
-    mentioned: &std::collections::HashSet<String>,
-    color: weft_core::Color,
-    frames: &weft_core::frames::LoopFrames,
-    err: &str,
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-    executions: &mut NodeExecutionTable,
-    journal: &dyn JournalClient,
-    pod_name: &str,
-) {
-    handle_node_failure_inner(
-        node_id, mentioned, color, frames, err, project, edge_idx, pulses, executions,
-        journal, pod_name, /* ship_node_terminal = */ false, Vec::new(),
-    )
-    .await;
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_node_failure_inner(
-    node_id: &str,
-    mentioned: &std::collections::HashSet<String>,
-    color: weft_core::Color,
-    frames: &weft_core::frames::LoopFrames,
-    err: &str,
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    pulses: &mut PulseTable,
-    executions: &mut NodeExecutionTable,
-    journal: &dyn JournalClient,
-    pod_name: &str,
-    ship_node_terminal: bool,
-    // Closures the CALLER already built (and applied to `pulses`) for a
-    // terminal row whose ONLY carrier is this NodeFailed: the no-instance
-    // loop-boundary failure (no LoopTerminated row exists). The generic
-    // sweep no-ops for boundary nodes, so these are passed explicitly.
-    // The live-instance case does NOT use this (its closures ride the
-    // LoopTerminated row written first); empty for ordinary nodes.
-    extra_closures: Vec<weft_core::exec::PulseEmission>,
-) {
     mark_failed(executions, node_id, color, frames, err);
-    // Build the closures FIRST (mutates RAM pulses), then ship
-    // them INSIDE the NodeFailed row so the terminal marker and its
-    // closures are one atomic write. A crash between two separate writes
-    // would lose the closures, leaving downstream consumers neither
-    // firing nor skipping (the execution refolds Stuck).
-    let mut closures = build_unmentioned_closures(
-        node_id, mentioned, color, frames, project, edge_idx, pulses, Some(err),
+    // The closures on every unmentioned port go on the wires in RAM;
+    // the NodeFailed row is the fact the fold sweeps the same ports
+    // from.
+    build_unmentioned_closures(
+        node_id, mentioned, color, frames, project, edge_idx, pulses, executions, Some(err),
     );
-    closures.extend(extra_closures);
-    if ship_node_terminal {
-        ship_node_failed(journal, pod_name, color, node_id, frames, err, closures).await;
-    } else {
-        // The caller suppresses the terminal row (cancel re-fold path),
-        // so the closures can't ride it; ship them standalone.
-        crate::context::ship_pulse_emissions(journal, pod_name, closures).await;
+    ship_node_failed(journal, pod_name, color, node_id, frames, err).await;
+}
+
+/// The output ports a firing has put on a wire or closed, off its
+/// record: what its termination sweep leaves alone.
+fn mentioned_ports(
+    executions: &NodeExecutionTable,
+    node_id: &str,
+    color: weft_core::Color,
+    frames: &weft_core::frames::LoopFrames,
+) -> std::collections::HashSet<String> {
+    latest_firing(executions, node_id, color, frames).map(|e| e.mentioned_ports.clone()).unwrap_or_default()
+}
+
+/// An emission the engine refused (over the stream cap, a bad-shape
+/// value, a close on an undeclared port): nothing was committed, and a
+/// producer parked on its delivery gets the error. Live, the firing
+/// fails now. In the cancel drain the firing is about to be ended
+/// Cancelled by the cancel walk, which owns its status and its
+/// closures, so the error is only logged: a NodeFailed there would
+/// show a shape error on a run the user cancelled.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_emission(
+    loc: &FiringLocation,
+    err: String,
+    delivery: Option<&DeliveryGate>,
+    is_cancel: bool,
+    color: weft_core::Color,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    pulses: &mut PulseTable,
+    executions: &mut NodeExecutionTable,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+) {
+    if let Some(gate) = delivery {
+        gate.fail(err.clone());
     }
+    if is_cancel {
+        tracing::warn!(
+            target: "weft_engine::execution_driver",
+            %color, node = %loc.node_id, frames = ?loc.frames, error = %err,
+            "an emission was refused while the run was being cancelled; the firing ends Cancelled"
+        );
+        return;
+    }
+    let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
+    handle_node_failure(
+        &loc.node_id, &mentioned, color, &loc.frames, &err, project, edge_idx, pulses,
+        executions, journal, pod_name,
+    )
+    .await;
 }
 
 /// Skip a firing (a scope/condition decided it shouldn't run):
@@ -3581,7 +3003,6 @@ async fn handle_node_skip(
     node_id: &str,
     color: weft_core::Color,
     frames: &weft_core::frames::LoopFrames,
-    closed_ports: &[String],
     reason: &weft_core::exec::skip::SkipReason,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
@@ -3598,23 +3019,17 @@ async fn handle_node_skip(
     // rode its In boundary's skip row. A cascade here would only
     // manufacture a second firing for nodes the sweep already settled.
     if matches!(reason, weft_core::exec::skip::SkipReason::ScopeSkipped { .. }) {
-        ship_node_skipped(
-            journal, pod_name, color, node_id, frames, closed_ports, reason, Vec::new(),
-        )
-        .await;
+        ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
         return;
     }
-    // A skipped scope (its In boundary said no) needs its own teardown:
-    // the generic sweep below deliberately no-ops for loop boundaries
-    // (per-iteration firings must not auto-close the outward ports),
-    // and a group's inside outputs must not cascade either, since every
-    // member is settled by the sweep instead. The scope's skip surface
-    // is its outward ports at the scope's own frames; the outward
-    // closures ride INSIDE the NodeSkipped row, same atomic discipline
-    // as everywhere else: a crash between a bare NodeSkipped and a
-    // separate closure write would leave the scope dead but its
-    // consumers never closed (refold Stuck). Then every member logs
-    // that its scope did not run.
+    // A skipped scope (its In boundary said no: a LoopIn here, a
+    // group's In boundary fires in the boundary pass) needs its own
+    // teardown: the generic sweep below deliberately no-ops for loop
+    // boundaries (per-iteration firings must not auto-close the
+    // outward ports). The scope's skip surface is its outward ports at
+    // the scope's own frames; the NodeSkipped row is the fact the fold
+    // closes them from. Then every member is kicked into a skip that
+    // says its scope did not run.
     let skipped_scope = project
         .nodes
         .iter()
@@ -3623,26 +3038,22 @@ async fn handle_node_skip(
         .filter(|gb| gb.role == weft_core::project::GroupBoundaryRole::In)
         .map(|gb| gb.group_id.clone());
     if let Some(group_id) = skipped_scope {
-        let closures = build_scope_outward_closures(
-            project, edge_idx, pulses, color, &group_id, frames,
+        let emission_id =
+            terminal_sweep_emission(color, node_id, frames, ended_firing_ordinal(executions, node_id, color, frames));
+        tear_down_gated_scope(
+            project, edge_idx, pulses, kicked, emission_id, color, &group_id, frames, reason,
         );
-        ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, reason, closures).await;
-        launch_scope(
-            project, edge_idx, journal, pod_name, color, &group_id, frames, Some(&group_id), kicked,
-        )
-        .await;
+        ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
         return;
     }
     // A skipped node's body never runs, so it never emitted on ANY
-    // output port → close every port. Same shape as a pre-dispatch
-    // failure: empty mentioned set means "close everything". Build the
-    // closures FIRST, then ship them INSIDE the NodeSkipped row (atomic
-    // marker+closures, same reason as the failure path).
+    // output port: close every port. Same shape as a pre-dispatch
+    // failure: empty mentioned set means "close everything".
     let mentioned = std::collections::HashSet::new();
-    let closures = build_unmentioned_closures(
-        node_id, &mentioned, color, frames, project, edge_idx, pulses, None,
+    build_unmentioned_closures(
+        node_id, &mentioned, color, frames, project, edge_idx, pulses, executions, None,
     );
-    ship_node_skipped(journal, pod_name, color, node_id, frames, closed_ports, reason, closures).await;
+    ship_node_skipped(journal, pod_name, color, node_id, frames, reason).await;
 }
 
 /// Gives a firing's runtime-granted provider accesses back on every exit
@@ -3674,7 +3085,7 @@ impl Drop for AccessCloseGuard {
 
 /// Single cancellation cleanup path. Called from BOTH cancellation
 /// entry points (loop-top check and idle-wait branch) so they have
-/// identical drain semantics. The order is load-bearing:
+/// identical drain semantics. The order matters:
 ///
 /// 1. `in_flight.shutdown().await` drives every spawned task to its
 ///    abort point. A task mid-`record_event` finishes its write; a
@@ -3683,41 +3094,41 @@ impl Drop for AccessCloseGuard {
 ///    path could flip the final state to Completed AFTER we wrote
 ///    NodeCancelled (last-write-wins fold).
 ///
-/// 2. Drain the task channel (one FIFO pass). In-channel `pulse_downstream`
-///    emissions land in `emitted_ports` (and their downstream pulses)
-///    BEFORE we compute the "unmentioned" closure set, so a port the body
-///    just emitted on isn't wrongly closed as unmentioned ("stuff already
-///    sent stays sent"). In-channel terminals (Completed/Failed) land in
-///    `executions` STATE ONLY (no journal write here) so they are SKIPPED
-///    by the closure sweep below; otherwise a firing that completed during
-///    the abort window would get closure-downstreamed AND a NodeCancelled,
-///    when the right answer is "it completed, leave it alone". The shared
-///    channel's FIFO ordering means a node's emissions precede its
-///    terminal in this same pass.
+/// 2. Drain the task channel (one FIFO pass). In-channel
+///    `pulse_downstream` emissions land on their records' mentioned
+///    sets (and their downstream pulses) BEFORE the cancel walk
+///    computes the "unmentioned" closure set, so a port the body just
+///    emitted on isn't wrongly closed as unmentioned ("stuff already
+///    sent stays sent"). In-channel terminals are NOT applied: the
+///    user cancelled, so every firing still open when the cancel was
+///    observed ends Cancelled, including one whose body happened to
+///    return during the abort window (a Completed or Failed there
+///    would show a firing outliving its cancelled run).
 ///
-/// 3. Walk `executions` and close downstream for every non-terminal
-///    firing. This is "two sources of truth" with
-///    `journal_node_cancellations` (which re-folds the journal),
-///    consolidated by ensuring `executions` is fully drained first
-///    so any committed terminal transitions are visible here.
-///    Remaining drift between in-memory and journal can only come
-///    from a journal write that actually failed (broker error logged
-///    upstream), which is a separate dispatcher-side problem.
+/// 3. `cancel_open_firings`: every open firing ends Cancelled, in RAM
+///    and in the journal, its unmentioned ports closed with the
+///    reason, then every live loop instance is cancelled the same
+///    way. The refetch loop's hold-expiry kill runs the same walk.
 #[allow(clippy::too_many_arguments)]
 async fn cancel_cleanup(
     in_flight: &mut tokio::task::JoinSet<()>,
     task_rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
     waiting: &mut HashMap<String, FiringLocation>,
     executions: &mut NodeExecutionTable,
-    emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
     color: Color,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
     stream_rt: &mut StreamRuntime,
+    // The cause in words, what every cancelled record carries as its
+    // error (the same text the `NodeCancelled` rows will carry).
+    reason: &str,
+    phase: weft_core::context::Phase,
+    dispatchable: Option<&std::collections::HashSet<String>>,
 ) {
     // An in-flight node's future is aborted immediately; it needs no window
     // to wrap up first. A paid call's cost is measured by the metering tap
@@ -3726,39 +3137,49 @@ async fn cancel_cleanup(
     // aborted node body never loses money bookkeeping.
     // 1. Drive every spawned task to its abort point.
     in_flight.shutdown().await;
-    // 2. Drain the task channel in one FIFO pass. Emissions: apply with
-    //    `is_cancel=true` so a bad-shape emission queued before the cancel
-    //    doesn't journal `NodeFailed` and race the dispatcher's post-cancel
-    //    `NodeCancelled` write (last-write-wins would flip the node's final
-    //    status to Failed); downstream-closure writes still happen so no
-    //    pulses leak, and `emitted_ports` reflects the real "what was sent"
-    //    set. Terminals: applied to `executions` STATE ONLY (no journal
-    //    write) so a firing that completed during the abort window is
-    //    SKIPPED by the closure sweep below instead of getting both a
-    //    closure-downstream AND a NodeCancelled. The dispatcher's post-loop
-    //    `journal_node_cancellations` owns the journal side via the folded
-    //    snapshot. The returned `late_terminated` list (firings that landed
-    //    Completed/Failed here) is appended in step 3 so their
-    //    unmentioned-port closures get the same walk (else a late-Completed
-    //    firing's closures would be lost and downstream never learn).
-    let late_terminated = drain_task_msgs_for_cancel(
+    // 2. Drain the task channel in one FIFO pass (see the doc above).
+    drain_task_msgs_for_cancel(
         task_rx, color, project, edge_idx, pulses, executions, journal, pod_name,
-        waiting, emitted_ports, stream_rt,
+        waiting, stream_rt,
     )
     .await;
     // Every delivery wait dies with its task (the abort above): fail
     // the gates so no producer future that survives to be polled once
     // more reads a phantom success. The feeds die with the
-    // StreamRuntime; the dispatcher's cancel walk owns journal truth.
+    // StreamRuntime.
     stream_rt.fail_all_gates("the execution was cancelled");
-    // 3. Snapshot the (node, frames) keys to close so we don't borrow
-    //    `executions` and `emitted_ports` simultaneously, then for each
-    //    non-terminal firing close every output port that wasn't already
-    //    emitted or closed (mirrors the Completed/Failed/Skipped shape
-    //    at the same frame stack). Late-terminated firings (from step
-    //    3) are appended so their unmentioned-port closures get the
-    //    same walk.
-    let mut firings: Vec<FiringLocation> = executions
+    // 3. The cancel walk.
+    cancel_open_firings(
+        executions, pulses, kicked, loop_runtime, color, project, edge_idx, journal, pod_name,
+        reason, phase, dispatchable,
+    )
+    .await;
+}
+
+/// The cancel walk: every firing of `color` still open ends Cancelled,
+/// in RAM (as the fold ends it from the row) and in the journal (one
+/// `NodeCancelled` per firing, carrying `reason`), and every output
+/// port it never mentioned closes with the reason as the stream end a
+/// consumer's pull reads. Then every live loop instance is cancelled
+/// and its outward surface closed (`cancel_loop_instances`). Idempotent:
+/// a walk over a table with nothing open writes nothing, so the
+/// terminal path runs it unconditionally.
+#[allow(clippy::too_many_arguments)]
+async fn cancel_open_firings(
+    executions: &mut NodeExecutionTable,
+    pulses: &mut PulseTable,
+    kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
+    loop_runtime: &mut LoopRuntime,
+    color: Color,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    journal: &dyn JournalClient,
+    pod_name: &str,
+    reason: &str,
+    phase: weft_core::context::Phase,
+    dispatchable: Option<&std::collections::HashSet<String>>,
+) {
+    let open: Vec<FiringLocation> = executions
         .iter()
         .flat_map(|(node_id, execs)| {
             execs
@@ -3767,37 +3188,49 @@ async fn cancel_cleanup(
                 .map(move |e| FiringLocation::new(node_id.clone(), e.frames.clone()))
         })
         .collect();
-    firings.extend(late_terminated);
-    for loc in firings {
-        let mentioned = emitted_ports.remove(&loc).unwrap_or_default();
-        close_unmentioned_downstream_and_ship(
-            &loc.node_id, &mentioned, color, &loc.frames, project, edge_idx, pulses, journal,
-            pod_name,
-        )
-        .await;
+    for loc in open {
+        let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
+        mark_cancelled(executions, &loc.node_id, color, &loc.frames, reason);
+        build_unmentioned_closures(
+            &loc.node_id, &mentioned, color, &loc.frames, project, edge_idx, pulses, executions,
+            Some(reason),
+        );
+        let event = weft_journal::ExecEvent::NodeCancelled {
+            color,
+            node_id: loc.node_id.clone(),
+            frames: loc.frames.clone(),
+            reason: reason.to_string(),
+            at_unix: now_unix(),
+        };
+        if let Err(err) = journal.record_event(&event, Some(pod_name)).await {
+            tracing::warn!(
+                target: "weft_engine",
+                error = %err,
+                node = %loc.node_id,
+                "failed to journal NodeCancelled"
+            );
+        }
     }
-
-    // 5. Mark every live `LoopInstance` for this color as cancelled and
-    //    emit closures on the LoopOut's outward output ports at the
-    //    instance's parent_frames. No partial outward emit (a real
-    //    outward emit would be a lie about how many iterations
-    //    completed). The closures propagate through the rest of the
-    //    graph as the standard "no value will arrive on this port"
-    //    marker. Inner-loop instances inside the cancelled scope are
-    //    covered too: each instance lives at its own parent_frames, so
-    //    the per-instance close emits at the right level.
-    cancel_loop_instances(
-        loop_runtime, color, project, edge_idx, pulses, journal, pod_name,
-    )
-    .await;
+    // No partial outward emit for a cancelled loop (a real outward
+    // emit would be a lie about how many iterations completed): its
+    // LoopOut's outward ports close, at the instance's own
+    // parent_frames, so inner instances inside the cancelled scope
+    // close at the right level too.
+    cancel_loop_instances(loop_runtime, color, project, edge_idx, pulses, journal, pod_name).await;
+    // The closures just put on the wires get the pass any turn's would
+    // (the fold runs it after every row it closes from): a boundary
+    // they made ready fires, and what the run never dispatches settles.
+    // No waiter is parked on any of it: the gates all failed above, or
+    // never existed on the refetch-kill path.
+    settle_table(project, edge_idx, phase, dispatchable, color, now_unix(), pulses, executions, kicked);
 }
 
 /// On cancellation, walk every non-terminated `LoopInstance` for this
 /// color, mark it cancelled, and emit closures on every outward output
 /// port of its LoopOut at `parent_frames`. Idempotent: an instance
-/// already marked terminated is skipped.
+/// already terminated is skipped and gets no second row.
 pub(crate) async fn cancel_loop_instances(
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     color: Color,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
@@ -3806,40 +3239,15 @@ pub(crate) async fn cancel_loop_instances(
     pod_name: &str,
 ) {
     use weft_core::primitive::LoopTerminationReason;
-    let mut to_close: Vec<(String, weft_core::frames::LoopFrames)> = Vec::new();
-    loop_runtime.cancel_inside(&Vec::new(), color);
-    for (key, inst) in loop_runtime.iter() {
-        if key.color != color {
-            continue;
-        }
-        if !matches!(inst.terminated, Some(LoopTerminationReason::Cancelled)) {
-            continue;
-        }
-        to_close.push((key.group_id.clone(), key.parent_frames.clone()));
-    }
-    for (group_id, parent_frames) in to_close {
-        // Closures carried in the terminal row (atomic). Journaling the
-        // cancellation is what makes it durable across resume: a refold
-        // without it rebuilds the instance as live (terminated=None) and
-        // the engine drives it again. Folding the closures into the same
-        // row means a crash can't leave the closures pending with the
-        // instance still live (which would re-emit them).
-        let closures = build_scope_outward_closures(
-            project, edge_idx, pulses, color, &group_id, &parent_frames,
-        );
-        crate::context::record_from_pod(
-            journal,
-            weft_journal::ExecEvent::LoopTerminated {
-                color,
-                group_id: group_id.clone(),
-                parent_frames: parent_frames.clone(),
-                reason: LoopTerminationReason::Cancelled,
-                outward_emissions: closures.into_iter().map(Into::into).collect(),
-                at_unix: now_unix(),
-            },
-            pod_name,
-        )
-        .await;
+    // Only what this call cancelled: an instance cancelled by an earlier
+    // walk already has its row, and a second one would be noise.
+    for key in loop_runtime.cancel_inside(&Vec::new(), color) {
+        // Journaling the cancellation is what makes it durable across
+        // resume: a refold without it rebuilds the instance as live
+        // (terminated=None) and the engine drives it again. The fold
+        // closes the outward surface from the row, as this does in RAM.
+        close_loop_outward(&key, project, edge_idx, pulses);
+        journal_loop_terminated(journal, pod_name, &key, LoopTerminationReason::Cancelled).await;
     }
 }
 
@@ -3857,11 +3265,11 @@ fn stream_end_of_closure(p: &weft_core::pulse::Pulse) -> StreamEnd {
 /// mutation phase never fights the scan's borrows.
 enum RouteAction {
     /// An item for a running consumer's feed.
-    FeedItem { loc: FiringLocation, port: String, pulse: uuid::Uuid, value: Value },
+    FeedItem { loc: FiringLocation, port: String, pulse: uuid::Uuid, value: Arc<Value> },
     /// The stream's end for a running consumer's feed.
     FeedClose { loc: FiringLocation, port: String, pulse: uuid::Uuid, end: StreamEnd },
     /// An item for a live stream-driven loop.
-    LoopItem { key: weft_core::primitive::LoopInstanceKey, loop_in: String, pulse: uuid::Uuid, value: Value },
+    LoopItem { key: weft_core::primitive::LoopInstanceKey, loop_in: String, pulse: uuid::Uuid, value: Arc<Value> },
     /// The stream's end for a live stream-driven loop.
     LoopClose { key: weft_core::primitive::LoopInstanceKey, loop_in: String, pulse: uuid::Uuid, end: StreamEnd },
     /// The consumer is gone (terminal record / terminated loop): the
@@ -3887,21 +3295,13 @@ async fn route_stream_pulses(
     journal: &dyn JournalClient,
     pod_name: &str,
     stream_rt: &mut StreamRuntime,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
-    emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
+    loop_runtime: &mut LoopRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> usize {
-    use crate::loop_runtime::{LoopAdvance, LoopStreamItem};
-
     // Scan phase: decide an action per routable pulse.
     let mut actions: Vec<RouteAction> = Vec::new();
     for node in &project.nodes {
-        let generator_ports: Vec<&str> = node
-            .inputs
-            .iter()
-            .filter(|p| p.port_type.as_generator().is_some())
-            .map(|p| p.name.as_str())
-            .collect();
+        let generator_ports = weft_core::exec::ready::generator_inputs(node);
         if generator_ports.is_empty() {
             continue;
         }
@@ -3953,14 +3353,7 @@ async fn route_stream_pulses(
                 // truth. Terminal -> drop; live feed -> route; neither
                 // -> the pulse is what dispatches the consumer, leave
                 // it Pending.
-                let terminal = executions
-                    .get(&node.id)
-                    .and_then(|v| {
-                        v.iter().rev().find(|e| e.color == color && e.frames == p.frames)
-                    })
-                    .map(|e| e.status.is_terminal())
-                    .unwrap_or(false);
-                if terminal {
+                if firing_already_terminal(executions, &node.id, color, &p.frames) {
                     actions.push(RouteAction::Drop { loc, pulse: p.id, closed: p.closed });
                 } else if stream_rt.feed_for(&loc, &p.target_port).is_some() {
                     if p.closed {
@@ -4034,7 +3427,7 @@ async fn route_stream_pulses(
                             &loc, color, pulses, journal, pod_name, stream_rt,
                         )
                         .await;
-                        let mentioned = emitted_ports.remove(&loc).unwrap_or_default();
+                        let mentioned = mentioned_ports(executions, &loc.node_id, color, &loc.frames);
                         handle_node_failure(
                             &loc.node_id, &mentioned, color, &loc.frames, &err,
                             project, edge_idx, pulses, executions, journal, pod_name,
@@ -4102,8 +3495,8 @@ async fn route_stream_pulses(
                         // same routing every other boundary failure
                         // takes; it must not kill the whole drive.
                         if let Err(e) = launch_stream_iteration(
-                            project, edge_idx, pulses, journal, pod_name, color,
-                            &key, &loop_in, index, item, loop_runtime, stream_rt, kicked,
+                            project, edge_idx, pulses, journal, pod_name,
+                            &key, index, item, loop_runtime, stream_rt, kicked,
                         )
                         .await
                         {
@@ -4354,55 +3747,24 @@ async fn launch_stream_iteration(
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    color: Color,
     key: &weft_core::primitive::LoopInstanceKey,
-    loop_in_id: &str,
     index: u32,
-    item: crate::loop_runtime::LoopStreamItem,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    item: LoopStreamItem,
+    loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
     kicked: &mut HashMap<FiringLocation, weft_core::primitive::KickedNode>,
 ) -> Result<(), String> {
-    let (config, port, inst_carry, outer_input) = {
-        let inst = loop_runtime.get(key).ok_or_else(|| {
-            format!("stream launch for loop '{}' with no LoopInstance", key.group_id)
-        })?;
-        let crate::loop_runtime::LoopItemSource::Stream(st) = &inst.source else {
-            return Err(format!(
-                "stream launch for loop '{}' whose over is not a stream",
-                key.group_id
-            ));
-        };
-        let carry: Vec<(String, Value)> =
-            inst.carry_values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let input: serde_json::Map<String, Value> =
-            inst.outer_input.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        (inst.config.clone(), st.port.clone(), carry, input)
-    };
+    let pulse = item.pulse;
     launch_iteration(
-        project,
-        edge_idx,
-        pulses,
-        journal,
-        pod_name,
-        color,
-        &key.group_id,
-        &key.parent_frames,
-        loop_in_id,
-        index,
-        &config,
-        &outer_input,
-        &inst_carry,
-        Some((port, item.pulse, item.value)),
-        kicked,
+        project, edge_idx, pulses, journal, pod_name, key, index, Some(item), loop_runtime, kicked,
     )
     .await?;
-    loop_runtime.record_launched(key, index);
     // The launch row (with `stream_pulse`) is the take's durability;
     // the RAM removal + gate resolution mirror it here. No separate
     // PulsesConsumed row: the fold reads it off the launch row.
-    drop_consumed_pulses(pulses, loop_in_id, &[item.pulse]);
-    stream_rt.on_pulses_absorbed(&[item.pulse], AbsorbKind::Taken);
+    let loop_in_id = weft_core::project::boundary_in_id(&key.group_id);
+    drop_consumed_pulses(pulses, &loop_in_id, &[pulse]);
+    stream_rt.on_pulses_absorbed(&[pulse], AbsorbKind::Taken);
     Ok(())
 }
 
@@ -4421,7 +3783,7 @@ async fn apply_loop_stream_close(
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
     end: StreamEnd,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
     let advance = loop_runtime.stream_close(key, end);
@@ -4453,7 +3815,7 @@ async fn settle_rehydrated_stream_ends(
     journal: &dyn JournalClient,
     pod_name: &str,
     color: Color,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
     for (key, port, end) in loop_runtime.stream_instances_with_recorded_end() {
@@ -4487,7 +3849,7 @@ async fn settle_rehydrated_stream_ends(
 /// sweep) into the loop's outward emit / loud failure paths.
 #[allow(clippy::too_many_arguments)]
 async fn apply_loop_stream_advance(
-    advance: Result<crate::loop_runtime::LoopAdvance, String>,
+    advance: Result<LoopAdvance, String>,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
@@ -4497,15 +3859,14 @@ async fn apply_loop_stream_advance(
     color: Color,
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
-    use crate::loop_runtime::LoopAdvance;
     match advance {
         Ok(LoopAdvance::EmitOutward { reason, gather, carry }) => {
             if let Err(e) = emit_loop_outward(
-                project, edge_idx, pulses, journal, pod_name, color, &key.group_id,
-                &key.parent_frames, gather, carry, reason, loop_runtime, key,
+                project, edge_idx, pulses, journal, pod_name, key, gather, carry, reason,
+                loop_runtime,
             )
             .await
             {
@@ -4547,7 +3908,7 @@ async fn fail_loop_from_stream(
     key: &weft_core::primitive::LoopInstanceKey,
     loop_in_id: &str,
     err: &str,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
     let Some(node_def) = project.nodes.iter().find(|n| n.id == loop_in_id) else {
@@ -4579,7 +3940,7 @@ async fn drop_loop_stream_leftovers(
     pulses: &mut PulseTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    loop_runtime: &mut crate::loop_runtime::LoopRuntime,
+    loop_runtime: &mut LoopRuntime,
     stream_rt: &mut StreamRuntime,
 ) {
     let leftover = match loop_runtime.drain_stream_leftovers(key) {
@@ -4629,16 +3990,10 @@ fn check_generator_buffer_cap(
     let outgoing = edge_idx.get_outgoing(project, node_id);
     for port in output.outputs.keys() {
         for edge in outgoing.iter().filter(|e| e.source_handle.as_deref() == Some(port.as_str())) {
-            let handle = edge.target_handle.as_deref().unwrap_or("default");
-            let target_is_generator = project
-                .nodes
-                .iter()
-                .find(|n| n.id == edge.target)
-                .and_then(|n| n.inputs.iter().find(|p| p.name == handle))
-                .is_some_and(|p| p.port_type.as_generator().is_some());
-            if !target_is_generator {
+            if !weft_core::exec::ready::edge_targets_generator(project, edge) {
                 continue;
             }
+            let handle = edge.target_handle.as_deref().unwrap_or("default");
             let cap = stream_caps.get(port.as_str()).copied().unwrap_or(DEFAULT_MAX_BUFFERED_ITEMS);
             let buffered = pulses
                 .get(&edge.target)
@@ -4682,7 +4037,6 @@ async fn apply_one_emission(
     executions: &mut NodeExecutionTable,
     journal: &dyn JournalClient,
     pod_name: &str,
-    emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
 ) {
@@ -4701,10 +4055,12 @@ async fn apply_one_emission(
         return;
     }
     let mut emissions = Vec::new();
+    // Every act that puts pulses on wires is one emission: the pulse
+    // ids derive from this id and the journal rows carry it, so the
+    // fold puts the same pulses on the same wires.
+    let emission_id = uuid::Uuid::new_v4();
     let just_mentioned: std::collections::HashSet<String> = match msg.kind {
         crate::context::EmitKind::Values(output) => {
-            let output_value = output_to_value(&output);
-
             // Generator buffer bound: an emission that would push a
             // generator edge past its un-taken cap fails the producer
             // loudly BEFORE any pulse is committed.
@@ -4712,40 +4068,31 @@ async fn apply_one_emission(
                 project, edge_idx, &msg.loc.node_id, &output, &msg.stream_caps, color,
                 &msg.loc.frames, pulses,
             ) {
-                if let Some(gate) = &delivery {
-                    gate.fail(err.clone());
-                }
-                let prior_mentioned = emitted_ports
-                    .remove(&msg.loc)
-                    .unwrap_or_default();
-                if is_cancel {
-                    handle_node_failure_cancel_path(
-                        &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err,
-                        project, edge_idx, pulses, executions, journal, pod_name,
-                    )
-                    .await;
-                } else {
-                    handle_node_failure(
-                        &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err,
-                        project, edge_idx, pulses, executions, journal, pod_name,
-                    )
-                    .await;
-                }
+                refuse_emission(
+                    &msg.loc, err, delivery.as_deref(), is_cancel, color, project, edge_idx,
+                    pulses, executions, journal, pod_name,
+                )
+                .await;
                 return;
             }
 
-            // Run postprocess FIRST. It pre-validates the output_obj
-            // (e.g. an Expand port must carry an array) before touching
-            // `pulses` or `mutations`, so a bad-shape emission produces
-            // zero live pulses and zero journal mutations: the firing
-            // fails atomically with no partial state. Persisting the
-            // execution record's `output` only AFTER success keeps the
-            // record honest too: a failed firing doesn't carry an
-            // "output" that the inspector would render alongside an
-            // error.
+            // The node's owned values become the shared values every
+            // wire, the journal row, and the fold point at: one
+            // allocation per port from here on.
+            let bag: OutputBag = output
+                .outputs
+                .into_iter()
+                .map(|(port, value)| (port, Arc::new(value)))
+                .collect();
+            // Run postprocess FIRST. It pre-validates the bag (e.g. a
+            // wire's key path must read) before touching `pulses`, so a
+            // bad-shape emission produces zero live pulses and zero
+            // journal rows: the firing fails atomically with no partial
+            // state.
             match postprocess_output(
                 &msg.loc.node_id,
-                &output_value,
+                &bag,
+                emission_id,
                 color,
                 &msg.loc.frames,
                 project,
@@ -4754,31 +4101,11 @@ async fn apply_one_emission(
                 &mut emissions,
             ) {
                 Ok(set) => {
-                    // Record what this firing emitted onto its own
-                    // execution record, so the inspector card shows
-                    // the produced values. A firing that emits more
-                    // than once merges ports across emits (later port
-                    // value wins). Closures (the `Close` branch below)
-                    // don't go into the execution record because they
-                    // carry no user-facing value.
-                    if let Some(rec) = executions.get_mut(&msg.loc.node_id).and_then(|v| {
-                        v.iter_mut()
-                            .rev()
-                            .find(|e| e.color == color && e.frames == msg.loc.frames)
-                    }) {
-                        let merged = match rec.output.take() {
-                            Some(Value::Object(mut prev)) => {
-                                if let Value::Object(now) = &output_value {
-                                    for (k, v) in now {
-                                        prev.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                Value::Object(prev)
-                            }
-                            _ => output_value.clone(),
-                        };
-                        rec.set_output(&merged);
-                    }
+                    ship_port_emissions(
+                        journal, pod_name, color, emission_id, &msg.loc.node_id, &msg.loc.frames,
+                        &bag,
+                    )
+                    .await;
                     set
                 }
                 Err(err) => {
@@ -4792,64 +4119,23 @@ async fn apply_one_emission(
                     // A delivery-waiting producer parked on this
                     // emission gets the same error back instead of
                     // hanging on pulses that were never created.
-                    if let Some(gate) = &delivery {
-                        gate.fail(err.to_string());
-                    }
-                    //
-                    // Cancel-path variant: skip the `NodeFailed`
-                    // node-status journal write so it can't race the
-                    // dispatcher's post-cancel `NodeCancelled` write
-                    // (the dispatcher writes NodeCancelled for every
-                    // non-terminal node it sees in the folded journal;
-                    // a NodeFailed lands first, flipping the final
-                    // status to Failed). Downstream-closure writes
-                    // still happen so the in-memory pulse table stays
-                    // consistent with no leaks.
-                    let prior_mentioned = emitted_ports
-                        .remove(&msg.loc)
-                        .unwrap_or_default();
-                    if is_cancel {
-                        handle_node_failure_cancel_path(
-                            &msg.loc.node_id,
-                            &prior_mentioned,
-                            color,
-                            &msg.loc.frames,
-                            &err.to_string(),
-                            project,
-                            edge_idx,
-                            pulses,
-                            executions,
-                            journal,
-                            pod_name,
-                        )
-                        .await;
-                    } else {
-                        handle_node_failure(
-                            &msg.loc.node_id,
-                            &prior_mentioned,
-                            color,
-                            &msg.loc.frames,
-                            &err.to_string(),
-                            project,
-                            edge_idx,
-                            pulses,
-                            executions,
-                            journal,
-                            pod_name,
-                        )
-                        .await;
-                    }
+                    refuse_emission(
+                        &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, color, project,
+                        edge_idx, pulses, executions, journal, pod_name,
+                    )
+                    .await;
                     return;
                 }
             }
         }
-        crate::context::EmitKind::Close(port_name) => {
+        crate::context::EmitKind::Close { port: port_name, refused } => {
             // Same failure routing as the Values arm above: a
             // `close_port` on an undeclared port is a wiring bug and
             // fails the firing loud (nothing was committed).
             if let Err(err) = weft_core::exec::postprocess::emit_port_closure(
                 &msg.loc.node_id,
                 &port_name,
+                emission_id,
                 color,
                 &msg.loc.frames,
                 project,
@@ -4857,38 +4143,39 @@ async fn apply_one_emission(
                 edge_idx,
                 &mut emissions,
             ) {
-                let prior_mentioned = emitted_ports
-                    .remove(&msg.loc)
-                    .unwrap_or_default();
-                if is_cancel {
-                    handle_node_failure_cancel_path(
-                        &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err.to_string(),
-                        project, edge_idx, pulses, executions, journal, pod_name,
-                    )
-                    .await;
-                } else {
-                    handle_node_failure(
-                        &msg.loc.node_id, &prior_mentioned, color, &msg.loc.frames, &err.to_string(),
-                        project, edge_idx, pulses, executions, journal, pod_name,
-                    )
-                    .await;
-                }
+                refuse_emission(
+                    &msg.loc, err.to_string(), delivery.as_deref(), is_cancel, color, project,
+                    edge_idx, pulses, executions, journal, pod_name,
+                )
+                .await;
                 return;
             }
+            // A refused value is the record's warning too, live as on
+            // the fold: the node did NOT fail, one port's value was
+            // dropped.
+            if let Some(warning) = &refused {
+                if let Some(rec) =
+                    latest_firing_mut(executions, &msg.loc.node_id, color, &msg.loc.frames)
+                {
+                    rec.port_warnings.push(warning.clone());
+                }
+            }
+            ship_port_closed(
+                journal, pod_name, color, emission_id, &msg.loc.node_id, &msg.loc.frames,
+                &port_name, refused.as_ref(),
+            )
+            .await;
             std::iter::once(port_name).collect()
         }
     };
 
-    // Union into the firing's running mentioned-set so termination
-    // knows which ports were already touched (whether by value or by
-    // closure). Multiple emissions from one firing share the firing's
-    // (node, frames), so they union into one entry here.
-    let entry = emitted_ports
-        .entry(msg.loc.clone())
-        .or_default();
-    for name in just_mentioned {
-        entry.insert(name);
-    }
+    // Union into the firing's mentioned set (on its record, as the
+    // fold keeps it) so termination knows which ports were already
+    // touched, whether by value or by closure.
+    latest_firing_mut(executions, &msg.loc.node_id, color, &msg.loc.frames)
+        .expect("an emission comes from a firing with a record (checked non-terminal above)")
+        .mentioned_ports
+        .extend(just_mentioned);
 
     // A delivery-waiting emission: arm its gate with exactly the
     // pulses this apply created. They resolve at the absorb sites; an
@@ -4899,8 +4186,6 @@ async fn apply_one_emission(
         let ids: Vec<uuid::Uuid> = emissions.iter().map(|e| e.pulse.id).collect();
         stream_rt.register_gate(gate, &ids);
     }
-
-    crate::context::ship_pulse_emissions(journal, pod_name, emissions).await;
     // A pulse toward a node outside the scope stays in the table: the
     // readiness pass dispatches that node as a skip (reason: outside
     // this run), which absorbs the pulse and settles any delivery gate
@@ -4926,7 +4211,6 @@ async fn apply_task_msgs(
     journal: &dyn JournalClient,
     pod_name: &str,
     waiting: &mut HashMap<String, FiringLocation>,
-    emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
 ) -> bool {
@@ -4935,7 +4219,7 @@ async fn apply_task_msgs(
         any = true;
         apply_one_task_msg(
             msg, color, project, edge_idx, pulses, executions, journal, pod_name,
-            waiting, emitted_ports, stream_rt, is_cancel,
+            waiting, stream_rt, is_cancel,
         )
         .await;
     }
@@ -4956,7 +4240,6 @@ async fn apply_one_task_msg(
     journal: &dyn JournalClient,
     pod_name: &str,
     waiting: &mut HashMap<String, FiringLocation>,
-    emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
     is_cancel: bool,
 ) {
@@ -4964,7 +4247,7 @@ async fn apply_one_task_msg(
         TaskMsg::Emission(emit) => {
             apply_one_emission(
                 emit, color, project, edge_idx, pulses, executions, journal, pod_name,
-                emitted_ports, stream_rt, is_cancel,
+                stream_rt, is_cancel,
             )
             .await;
         }
@@ -4983,7 +4266,6 @@ async fn apply_one_task_msg(
                 // over the Failed record would flip the fold's
                 // last-write-wins and hide the failure entirely.
                 if firing_already_terminal(executions, &loc.node_id, tcolor, &loc.frames) {
-                    emitted_ports.remove(&loc);
                     return;
                 }
                 // Emissions already happened via `pulse_downstream` and
@@ -4996,25 +4278,15 @@ async fn apply_one_task_msg(
                 // emits A then B has both A and B as real values
                 // downstream.
                 mark_completed(executions, &loc.node_id, tcolor, &loc.frames);
-                let output = executions
-                    .get(&loc.node_id)
-                    .and_then(|v| {
-                        v.iter().rev().find(|e| e.color == tcolor && e.frames == loc.frames)
-                    })
-                    .and_then(|e| e.output.clone())
-                    .unwrap_or(serde_json::Value::Null);
-                let mentioned = emitted_ports.remove(&loc).unwrap_or_default();
-                // Build the unmentioned-port closures FIRST, then carry
-                // them INSIDE the NodeCompleted row (atomic marker+
-                // closures, same reason as the failure/skip paths).
-                let closures = build_unmentioned_closures(
+                let mentioned = mentioned_ports(executions, &loc.node_id, tcolor, &loc.frames);
+                // The unmentioned-port closures go on the wires in RAM;
+                // the NodeCompleted row is the fact the fold sweeps the
+                // same ports from.
+                build_unmentioned_closures(
                     &loc.node_id, &mentioned, tcolor, &loc.frames,
-                    project, edge_idx, pulses, None,
+                    project, edge_idx, pulses, executions, None,
                 );
-                ship_node_completed(
-                    journal, pod_name, tcolor, &loc.node_id, &loc.frames, &output, closures,
-                )
-                .await;
+                ship_node_completed(journal, pod_name, tcolor, &loc.node_id, &loc.frames).await;
             }
             NodeTaskOutcome::Failed(err) => {
                 retire_consumer_streams(&loc, tcolor, pulses, journal, pod_name, stream_rt)
@@ -5023,10 +4295,9 @@ async fn apply_one_task_msg(
                 // engine's mid-flight failure already terminated the
                 // record and swept its ports.
                 if firing_already_terminal(executions, &loc.node_id, tcolor, &loc.frames) {
-                    emitted_ports.remove(&loc);
                     return;
                 }
-                let mentioned = emitted_ports.remove(&loc).unwrap_or_default();
+                let mentioned = mentioned_ports(executions, &loc.node_id, tcolor, &loc.frames);
                 handle_node_failure(
                     &loc.node_id, &mentioned, tcolor, &loc.frames, &err,
                     project, edge_idx, pulses, executions, journal, pod_name,
@@ -5044,25 +4315,12 @@ async fn apply_one_task_msg(
 }
 
 /// Drain queued task results into in-memory state ONLY (no journal
-/// writes, no downstream closure emission). Used by `cancel_cleanup`
-/// where the dispatcher may have already written `NodeCancelled` for
-/// the same (node, frames); a subsequent `NodeCompleted` / `NodeFailed`
-/// / `NodeSkipped` journal write would last-write-wins flip the
-/// state. The in-memory updates are consumed locally by the
-/// close-walk's `is_terminal()` filter and discarded when `drive_loop`
-/// returns; the journal source-of-truth for cancelled firings is
-/// owned by the post-loop `journal_node_cancellations` walk.
-///
-/// Waiting outcomes are preserved in the `waiting` map and the
-/// executions table because a still-Suspended firing remains
-/// non-terminal and the close-walk will close its downstream.
-/// Returns the set of (node, frames) keys that landed Completed or
-/// Failed while draining, so the caller can run the same
-/// `close_unmentioned_downstream` pass over them that the live path
-/// runs on a normal Completed/Failed transition. Without that pass,
-/// downstream nodes never learn no value is coming on the unmentioned
-/// output ports of a late-completed firing, and the replay-from-
-/// snapshot view diverges from what the live worker actually saw.
+/// writes, no downstream closure emission). Used by `cancel_cleanup`:
+/// a firing whose body returned during the abort window still ends
+/// Cancelled (the cancel walk owns its status and its closures), so
+/// its terminal is dropped here rather than applied. A Waiting
+/// outcome is applied: a firing that just parked is still open, and
+/// the walk cancels it like any other.
 #[allow(clippy::too_many_arguments)]
 async fn drain_task_msgs_for_cancel(
     rx: &mut mpsc::UnboundedReceiver<TaskMsg>,
@@ -5074,10 +4332,8 @@ async fn drain_task_msgs_for_cancel(
     journal: &dyn JournalClient,
     pod_name: &str,
     waiting: &mut HashMap<String, FiringLocation>,
-    emitted_ports: &mut HashMap<FiringLocation, std::collections::HashSet<String>>,
     stream_rt: &mut StreamRuntime,
-) -> Vec<FiringLocation> {
-    let mut late_terminated: Vec<FiringLocation> = Vec::new();
+) {
     while let Ok(msg) = rx.try_recv() {
         match msg {
             // Emissions: apply with downstream closures (is_cancel=true),
@@ -5086,7 +4342,7 @@ async fn drain_task_msgs_for_cancel(
             TaskMsg::Emission(emit) => {
                 apply_one_emission(
                     emit, color, project, edge_idx, pulses, executions, journal, pod_name,
-                    emitted_ports, stream_rt, /* is_cancel = */ true,
+                    stream_rt, /* is_cancel = */ true,
                 )
                 .await;
             }
@@ -5099,16 +4355,13 @@ async fn drain_task_msgs_for_cancel(
                 )
                 .await;
             }
-            // Terminals: STATE ONLY, no journal write (the post-loop
-            // cancellation walk owns the journal side).
             TaskMsg::Terminal { loc, color: tcolor, outcome } => match outcome {
-                NodeTaskOutcome::Completed => {
-                    mark_completed(executions, &loc.node_id, tcolor, &loc.frames);
-                    late_terminated.push(loc);
-                }
-                NodeTaskOutcome::Failed(err) => {
-                    mark_failed(executions, &loc.node_id, tcolor, &loc.frames, &err);
-                    late_terminated.push(loc);
+                NodeTaskOutcome::Completed | NodeTaskOutcome::Failed(_) => {
+                    tracing::debug!(
+                        target: "weft_engine::execution_driver",
+                        color = %tcolor, node = %loc.node_id, frames = ?loc.frames,
+                        "a firing ended during the cancel window; it ends Cancelled with the run"
+                    );
                 }
                 NodeTaskOutcome::Waiting(token) => {
                     mark_waiting(executions, &loc.node_id, tcolor, &loc.frames, &token);
@@ -5117,7 +4370,6 @@ async fn drain_task_msgs_for_cancel(
             },
         }
     }
-    late_terminated
 }
 
 /// Whether the latest record at `(node, color, frames)` is already
@@ -5131,25 +4383,19 @@ fn firing_already_terminal(
     color: Color,
     frames: &weft_core::frames::LoopFrames,
 ) -> bool {
-    executions
-        .get(node_id)
-        .and_then(|v| v.iter().rev().find(|e| e.color == color && &e.frames == frames))
-        .map(|e| e.status.is_terminal())
-        .unwrap_or(false)
+    latest_firing(executions, node_id, color, frames).is_some_and(|e| e.status.is_terminal())
 }
 
 fn mark_waiting(
     executions: &mut NodeExecutionTable,
     node_id: &str,
     color: Color,
-    frames: &[weft_core::frames::LoopIteration],
+    frames: &weft_core::frames::LoopFrames,
     token: &str,
 ) {
-    if let Some(execs) = executions.get_mut(node_id) {
-        if let Some(e) = execs.iter_mut().rev().find(|e| e.color == color && e.frames == frames) {
-            e.status = NodeExecutionStatus::WaitingForInput;
-            e.callback_id = Some(token.to_string());
-        }
+    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+        e.status = NodeExecutionStatus::WaitingForInput;
+        e.callback_id = Some(token.to_string());
     }
 }
 
@@ -5171,9 +4417,7 @@ async fn terminate(
 
     let completion = check_completion(pulses, executions);
     match completion {
-        Some(false) => Ok(ExecutionOutcome::Completed {
-            outputs: final_outputs(executions),
-        }),
+        Some(false) => Ok(ExecutionOutcome::Completed),
         Some(true) => Ok(ExecutionOutcome::Failed {
             error: first_failure(executions).unwrap_or_else(|| "execution failed".into()),
         }),
@@ -5204,18 +4448,6 @@ fn waiting_count(executions: &NodeExecutionTable) -> usize {
 
 // ---------- Mutation helpers ----------
 
-fn final_outputs(executions: &NodeExecutionTable) -> Value {
-    let mut obj = serde_json::Map::new();
-    for (node_id, execs) in executions {
-        if let Some(last) = execs.iter().rev().find(|e| e.status == NodeExecutionStatus::Completed) {
-            if let Some(output) = &last.output {
-                obj.insert(node_id.clone(), output.clone());
-            }
-        }
-    }
-    Value::Object(obj)
-}
-
 /// The earliest failure in the table (by completion time, node id as
 /// tie-break). The table is a HashMap, so a plain "first hit wins"
 /// scan would report a different failure run-to-run; the earliest one
@@ -5235,21 +4467,15 @@ fn first_failure(executions: &NodeExecutionTable) -> Option<String> {
         })
 }
 
-fn output_to_value(output: &NodeOutput) -> Value {
-    Value::Object(output.outputs.clone().into_iter().collect())
-}
-
 fn mark_completed(
     executions: &mut NodeExecutionTable,
     node_id: &str,
     color: Color,
-    frames: &[weft_core::frames::LoopIteration],
+    frames: &weft_core::frames::LoopFrames,
 ) {
-    if let Some(execs) = executions.get_mut(node_id) {
-        if let Some(e) = execs.iter_mut().rev().find(|e| e.color == color && e.frames == frames) {
-            e.status = NodeExecutionStatus::Completed;
-            e.completed_at = Some(now_unix());
-        }
+    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+        e.status = NodeExecutionStatus::Completed;
+        e.completed_at = Some(now_unix());
     }
 }
 
@@ -5257,15 +4483,13 @@ fn mark_failed(
     executions: &mut NodeExecutionTable,
     node_id: &str,
     color: Color,
-    frames: &[weft_core::frames::LoopIteration],
+    frames: &weft_core::frames::LoopFrames,
     err: &str,
 ) {
-    if let Some(execs) = executions.get_mut(node_id) {
-        if let Some(e) = execs.iter_mut().rev().find(|e| e.color == color && e.frames == frames) {
-            e.status = NodeExecutionStatus::Failed;
-            e.completed_at = Some(now_unix());
-            e.error = Some(err.to_string());
-        }
+    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+        e.status = NodeExecutionStatus::Failed;
+        e.completed_at = Some(now_unix());
+        e.error = Some(err.to_string());
     }
 }
 
@@ -5273,13 +4497,28 @@ fn mark_skipped(
     executions: &mut NodeExecutionTable,
     node_id: &str,
     color: Color,
-    frames: &[weft_core::frames::LoopIteration],
+    frames: &weft_core::frames::LoopFrames,
 ) {
-    if let Some(execs) = executions.get_mut(node_id) {
-        if let Some(e) = execs.iter_mut().rev().find(|e| e.color == color && e.frames == frames) {
-            e.status = NodeExecutionStatus::Skipped;
-            e.completed_at = Some(now_unix());
-        }
+    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+        e.status = NodeExecutionStatus::Skipped;
+        e.completed_at = Some(now_unix());
+    }
+}
+
+/// The cancel walk's end of an open firing: what the fold does with
+/// the firing's `NodeCancelled` row.
+fn mark_cancelled(
+    executions: &mut NodeExecutionTable,
+    node_id: &str,
+    color: Color,
+    frames: &weft_core::frames::LoopFrames,
+    reason: &str,
+) {
+    if let Some(e) = latest_firing_mut(executions, node_id, color, frames) {
+        e.status = NodeExecutionStatus::Cancelled;
+        e.completed_at = Some(now_unix());
+        e.error = Some(reason.to_string());
+        e.callback_id = None;
     }
 }
 
@@ -5341,113 +4580,55 @@ fn recorded_cancel_cause(cancellation: &CancellationFlag) -> weft_core::exec::Ca
         .expect("a tripped flag carries its cause: cancel_because is the only door")
 }
 
-/// Walk the journal, find every (node, frames) that's currently
-/// non-terminal, and journal a NodeCancelled for each so the UI
-/// flips them out of "running". Called when the loop driver exits
-/// with `ExecutionOutcome::Cancelled`.
-///
-/// Important: the source of truth is the freshly-folded journal,
-/// NOT the worker's in-memory `executions` table. The dispatcher's
-/// cancel path may have already written some NodeCancelled events
-/// (those records will be terminal in the fold and skipped). The
-/// worker may have spawned more nodes between when the dispatcher
-/// folded and when the worker observed the cancellation flag;
-/// those records are still non-terminal, and only the worker can
-/// catch them. Per-node idempotency falls out of "if it's already
-/// terminal in the journal, skip it."
-async fn journal_node_cancellations(
+/// The worker cannot go on (see `run_one_execution`): journal the
+/// failure as the run's terminal so the run reads Failed with the
+/// reason instead of running forever, then hand the error back for
+/// the task to fail with. `journal_terminal` is idempotent, so a
+/// terminal already there wins; a journal that will not take the
+/// row leaves the run with no terminal, and the error says so.
+async fn fail_before_terminal(
     journal: &dyn JournalClient,
+    clock: &dyn weft_platform_traits::Clock,
     color: Color,
     pod_name: &str,
-    cause: &weft_core::exec::CancelCause,
-) {
-    let events = match fetch_events(journal, color).await {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!(
-                target: "weft_engine",
-                error = %err,
-                "journal_node_cancellations: failed to fetch events for catch-up fold"
-            );
-            return;
-        }
-    };
-    let snapshot = weft_journal::fold_to_snapshot(color, &events);
-    let now = now_unix();
-    let reason = cause.to_string();
-    for (node_id, execs) in snapshot.executions.iter() {
-        for e in execs {
-            if e.status.is_terminal() {
-                continue;
-            }
-            let event = weft_journal::ExecEvent::NodeCancelled {
-                color,
-                node_id: node_id.clone(),
-                frames: e.frames.clone(),
-                reason: reason.clone(),
-                // This catch-up cancel only flips records terminal; the
-                // downstream closure cascade is handled by the cancel
-                // cleanup (cancel_loop_instances + the normal teardown),
-                // so there are no per-node closures to carry here.
-                closure_emissions: Vec::new(),
-                at_unix: now,
-            };
-            if let Err(err) = journal.record_event(&event, Some(pod_name)).await {
-                tracing::warn!(
-                    target: "weft_engine",
-                    error = %err,
-                    node = %node_id,
-                    "failed to journal NodeCancelled"
-                );
-            }
-        }
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let outcome = ExecutionOutcome::Failed { error: format!("{error:#}") };
+    match journal_terminal(journal, clock, color, pod_name, &outcome).await {
+        Ok(()) => error,
+        Err(write) => error.context(format!("and the run has no terminal: {write:#}")),
     }
 }
 
 /// Journal the terminal event for this execution's color. Pure
 /// translation from `ExecutionOutcome` to the matching `ExecEvent`
 /// variant: `Completed`/`Failed`/`Stuck` map; `Stalled` is a
-/// caller-side no-op so this function isn't called for it.
+/// caller-side no-op so this function isn't called for it. `Err`
+/// when the journal would not take the row: the run then has no
+/// terminal, and the caller fails the task naming that, since a
+/// terminal is what the bridge and every status read key off.
 async fn journal_terminal(
     journal: &dyn JournalClient,
     clock: &dyn weft_platform_traits::Clock,
     color: Color,
     pod_name: &str,
     outcome: &ExecutionOutcome,
-) {
+) -> anyhow::Result<()> {
     // Idempotent: if a terminal event already exists for this color
     // (e.g. the dispatcher's cancel path wrote ExecutionCancelled
     // before the worker's loop driver observed cancellation), skip
     // the write. Avoids the bridge double-publishing. There is NO
     // DB uniqueness guard on terminal events (the write uses
     // record_event, not record_event_dedup), so this check is the
-    // only dedup. On a transient read error, skip the write rather
-    // than risk a double-publish: a missed terminal is re-folded by
-    // the bridge from the journal, a duplicate confuses SSE
-    // consumers.
-    match journal.has_terminal_event(color).await {
-        Ok(true) => return,
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(
-                target: "weft_engine::execution_driver",
-                color = %color,
-                error = %e,
-                "has_terminal_event failed; skipping terminal write to avoid double-publish"
-            );
-            return;
-        }
-    }
+    // only dedup, and it is never skipped over a failed read: a
+    // blind write could stack a duplicate terminal, which confuses
+    // SSE consumers.
     let at_unix = now_unix();
     let event = match outcome {
         // Returned before anything ran; there is no terminal of ours to
         // write, the journal already holds one.
-        ExecutionOutcome::AlreadySettled => return,
-        ExecutionOutcome::Completed { outputs } => weft_journal::ExecEvent::ExecutionCompleted {
-            color,
-            outputs: outputs.clone(),
-            at_unix,
-        },
+        ExecutionOutcome::AlreadySettled => return Ok(()),
+        ExecutionOutcome::Completed => weft_journal::ExecEvent::ExecutionCompleted { color, at_unix },
         // A cancel maps to the proper ExecutionCancelled terminal so the
         // UI renders the cancel affordance instead of a generic failure.
         ExecutionOutcome::Cancelled { cause } => weft_journal::ExecEvent::ExecutionCancelled {
@@ -5468,39 +4649,38 @@ async fn journal_terminal(
         },
         ExecutionOutcome::Stalled => {
             debug_assert!(false, "journal_terminal must not be called for Stalled");
-            return;
+            return Ok(());
         }
     };
     // Terminal events MUST land in the journal: the SSE bridge keys
     // off them, and a missing terminal leaves the UI showing a hung
-    // execution forever with no operator recourse. Retry with bounded
-    // backoff on transient errors; on persistent failure, panic so
-    // k8s restarts the pod (the new pod will run the worker again
-    // and re-emit the terminal once the journal is back up).
+    // execution forever with no operator recourse. The read and the
+    // write share one bounded backoff, so a blip on either side gets
+    // the same attempts; past that the terminal is given up as an
+    // error (the task executor catches a panic and fails the task
+    // just the same, and nothing restarts the pod for it).
     let mut delay_ms = 100u64;
     let mut attempt = 0u32;
     const MAX_ATTEMPTS: u32 = 5;
     loop {
-        match journal.record_event(&event, Some(pod_name)).await {
-            Ok(()) => return,
-            Err(e) => {
-                attempt += 1;
-                if attempt >= MAX_ATTEMPTS {
-                    panic!(
-                        "failed to journal terminal event after {MAX_ATTEMPTS} attempts: {e}; \
-                         panicking so the pod restarts and the next run can re-emit"
-                    );
-                }
-                tracing::warn!(
-                    target: "weft_engine",
-                    error = %e,
-                    attempt,
-                    "retrying terminal-event journal write"
-                );
-                clock.sleep(std::time::Duration::from_millis(delay_ms)).await;
-                delay_ms = (delay_ms * 2).min(5000);
-            }
+        let written = match journal.has_terminal_event(color).await {
+            Ok(true) => Ok(()),
+            Ok(false) => journal.record_event(&event, Some(pod_name)).await,
+            Err(e) => Err(anyhow::anyhow!("cannot tell whether the color already holds a terminal: {e}")),
+        };
+        let Err(e) = written else { return Ok(()) };
+        attempt += 1;
+        if attempt >= MAX_ATTEMPTS {
+            anyhow::bail!("failed to journal the terminal of color {color} after {MAX_ATTEMPTS} attempts: {e}");
         }
+        tracing::warn!(
+            target: "weft_engine",
+            error = %e,
+            attempt,
+            "retrying terminal-event journal write"
+        );
+        clock.sleep(std::time::Duration::from_millis(delay_ms)).await;
+        delay_ms = (delay_ms * 2).min(5000);
     }
 }
 

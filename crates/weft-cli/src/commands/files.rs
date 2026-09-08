@@ -69,8 +69,7 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
         .into_iter()
         .filter(|f| prefix.as_deref().map(|p| scope_key(&f.key).starts_with(p)).unwrap_or(true))
         .collect();
-    if ctx.json() {
-        println!("{}", serde_json::to_string(&files)?);
+    if ctx.json_out(&files)? {
         return Ok(());
     }
     if files.is_empty() {
@@ -513,8 +512,7 @@ pub async fn usage(ctx: Ctx) -> anyhow::Result<()> {
     let resp = client
         .get_json(&format!("/storage/usage{}", project_query(&ctx)))
         .await?;
-    if ctx.json() {
-        println!("{resp}");
+    if ctx.json_out(&resp)? {
         return Ok(());
     }
     let stored = resp.get("storedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
