@@ -30,10 +30,8 @@
 
 use std::collections::HashSet;
 
-use crate::frames::LoopFrames;
 use crate::project::NodeDefinition;
 use crate::pulse::Pulse;
-use crate::Color;
 
 /// Why a firing did not run. Carried on the Skipped lifecycle event so
 /// the inspector can tell a DECISION (the author's `_should_flow` said
@@ -98,15 +96,10 @@ pub const SHOULD_FLOW_PORT: &str = "_should_flow";
 /// including entry nodes with no incoming edges (which the closure
 /// rules never see: with nothing wired there is nothing to close, but
 /// a `_should_flow: false` literal still turns the node off).
-pub fn check_flow_permission(
-    node: &NodeDefinition,
-    node_pulses: &[Pulse],
-    frames: &LoopFrames,
-    color: Color,
-) -> Option<SkipReason> {
-    match super::ready::resolve_port_value(node_pulses, color, frames, SHOULD_FLOW_PORT) {
+pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> Option<SkipReason> {
+    match super::ready::resolve_port_value(group_pulses, SHOULD_FLOW_PORT) {
         Some(pulse) if pulse.closed => Some(SkipReason::FlowClosed),
-        Some(pulse) if pulse.value == serde_json::Value::Bool(false) => {
+        Some(pulse) if *pulse.value == serde_json::Value::Bool(false) => {
             Some(SkipReason::DidNotFlow)
         }
         // A value arrived and it is not `false`: this node flows.
@@ -125,16 +118,14 @@ pub fn check_flow_permission(
 #[allow(clippy::too_many_arguments)]
 pub fn check_should_skip(
     node: &NodeDefinition,
-    node_pulses: &[Pulse],
-    frames: &LoopFrames,
-    color: Color,
+    group_pulses: &[&Pulse],
     required: &HashSet<&str>,
     wired: &HashSet<&str>,
     literal_filled: &HashSet<&str>,
 ) -> Option<SkipReason> {
     // Rule 0: `_should_flow` said no. The port is optional, so neither
     // of its skip reasons reaches rule 1.
-    if let Some(reason) = check_flow_permission(node, node_pulses, frames, color) {
+    if let Some(reason) = check_flow_permission(node, group_pulses) {
         return Some(reason);
     }
 
@@ -144,10 +135,10 @@ pub fn check_should_skip(
     // Generator ports are exempt: their closure is the empty stream,
     // not "nothing is coming" (module doc).
     for port_name in required {
-        if !wired.contains(port_name) || is_generator_port(node, port_name) {
+        if !wired.contains(port_name) || super::ready::is_generator_input(node, port_name) {
             continue;
         }
-        if port_arrived_closed(node_pulses, frames, color, port_name) {
+        if port_arrived_closed(group_pulses, port_name) {
             return Some(SkipReason::RequiredInputClosed { port: (*port_name).to_string() });
         }
     }
@@ -203,10 +194,10 @@ pub fn check_should_skip(
             // A wired generator port in a formed group has an arrival
             // by construction, and even a closure-arrival is a live
             // value (the empty stream): never dead.
-            if port.port_type.as_generator().is_some() {
+            if port.is_generator() {
                 return false;
             }
-            port_arrived_closed(node_pulses, frames, color, &port.name)
+            port_arrived_closed(group_pulses, &port.name)
         });
         if all_dead {
             return Some(SkipReason::EveryInputClosed);
@@ -227,10 +218,10 @@ pub fn check_should_skip(
             }
             // A generator port's closure is the empty stream, a live
             // value; it keeps its oneOf group satisfied.
-            if is_generator_port(node, port_name) {
+            if super::ready::is_generator_input(node, port_name) {
                 return false;
             }
-            port_arrived_closed(node_pulses, frames, color, port_name)
+            port_arrived_closed(group_pulses, port_name)
         });
         if all_closed {
             return Some(SkipReason::OneOfGroupClosed { ports: group.clone() });
@@ -240,19 +231,8 @@ pub fn check_should_skip(
     None
 }
 
-fn is_generator_port(node: &NodeDefinition, port_name: &str) -> bool {
-    node.inputs
-        .iter()
-        .any(|p| p.name == port_name && p.port_type.as_generator().is_some())
-}
-
-fn port_arrived_closed(
-    node_pulses: &[Pulse],
-    frames: &LoopFrames,
-    color: Color,
-    port_name: &str,
-) -> bool {
-    super::ready::resolve_port_value(node_pulses, color, frames, port_name)
+fn port_arrived_closed(group_pulses: &[&Pulse], port_name: &str) -> bool {
+    super::ready::resolve_port_value(group_pulses, port_name)
         .map(|p| p.closed)
         .unwrap_or(false)
 }
@@ -334,9 +314,7 @@ mod tests {
         let required: HashSet<&str> = ["a"].into_iter().collect();
         let wired: HashSet<&str> = ["a", SHOULD_FLOW_PORT].into_iter().collect();
         assert_eq!(
-            check_should_skip(
-                &node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &HashSet::new()
-            ),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &HashSet::new()),
             Some(SkipReason::DidNotFlow),
         );
     }
@@ -350,9 +328,7 @@ mod tests {
         let required: HashSet<&str> = ["a"].into_iter().collect();
         let wired: HashSet<&str> = ["a", SHOULD_FLOW_PORT].into_iter().collect();
         assert_eq!(
-            check_should_skip(
-                &node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &HashSet::new()
-            ),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &HashSet::new()),
             Some(SkipReason::FlowClosed),
         );
     }
@@ -368,10 +344,7 @@ mod tests {
             let required: HashSet<&str> = ["a"].into_iter().collect();
             let wired: HashSet<&str> = ["a", SHOULD_FLOW_PORT].into_iter().collect();
             assert_eq!(
-                check_should_skip(
-                    &node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired,
-                    &HashSet::new()
-                ),
+                check_should_skip(&node, &view(&pulses), &required, &wired, &HashSet::new()),
                 None,
                 "a guard carrying {value} is not a refusal",
             );
@@ -388,9 +361,7 @@ mod tests {
         let required: HashSet<&str> = ["a"].into_iter().collect();
         let wired: HashSet<&str> = ["a"].into_iter().collect();
         assert_eq!(
-            check_should_skip(
-                &node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &HashSet::new()
-            ),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &HashSet::new()),
             Some(SkipReason::DidNotFlow),
         );
     }
@@ -414,20 +385,22 @@ mod tests {
         ];
         let wired: HashSet<&str> = ["a", "b", SHOULD_FLOW_PORT].into_iter().collect();
         assert_eq!(
-            check_should_skip(
-                &node, &pulses, &Vec::new(), uuid::Uuid::nil(), &HashSet::new(), &wired,
-                &HashSet::new()
-            ),
+            check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
             Some(SkipReason::EveryInputClosed),
         );
     }
 
     fn data_pulse(port: &str, value: serde_json::Value) -> Pulse {
-        Pulse::new(uuid::Uuid::nil(), Vec::new(), "n", port, value)
+        Pulse::new(uuid::Uuid::new_v4(), uuid::Uuid::nil(), Vec::new(), "n", port, std::sync::Arc::new(value))
     }
 
     fn closure_pulse(port: &str) -> Pulse {
-        Pulse::closure(uuid::Uuid::nil(), Vec::new(), "n", port)
+        Pulse::closure(uuid::Uuid::new_v4(), uuid::Uuid::nil(), Vec::new(), "n", port)
+    }
+
+    /// The pulses as a firing sees them.
+    fn view(pulses: &[Pulse]) -> Vec<&Pulse> {
+        pulses.iter().collect()
     }
 
     fn node_generator_required() -> crate::project::NodeDefinition {
@@ -459,7 +432,7 @@ mod tests {
         let wired: HashSet<&str> = ["rows"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
             "an empty stream must RUN its consumer, not skip it"
         );
     }
@@ -472,7 +445,7 @@ mod tests {
         let wired: HashSet<&str> = ["a"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
             "user-emitted null is data; required port + null must NOT skip"
         );
     }
@@ -485,7 +458,7 @@ mod tests {
         let wired: HashSet<&str> = ["a"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_some(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_some(),
             "closure on a required port must skip"
         );
     }
@@ -498,7 +471,7 @@ mod tests {
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_some(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_some(),
             "all-optional + all-closed must skip"
         );
     }
@@ -519,12 +492,12 @@ mod tests {
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&boundary, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&boundary, &view(&pulses), &required, &wired, &literal_filled).is_none(),
             "an In boundary starts its scope whatever its inputs did"
         );
         let plain = node_all_optional();
         assert!(
-            check_should_skip(&plain, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_some(),
+            check_should_skip(&plain, &view(&pulses), &required, &wired, &literal_filled).is_some(),
             "the same closures skip a plain node"
         );
     }
@@ -537,7 +510,7 @@ mod tests {
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
             "all-optional + one value + one closed must NOT skip"
         );
     }
@@ -553,7 +526,7 @@ mod tests {
         let wired: HashSet<&str> = ["a"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_some(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_some(),
             "closed wire + unwired unconfigured port must skip"
         );
     }
@@ -568,7 +541,7 @@ mod tests {
         let wired: HashSet<&str> = ["a"].into_iter().collect();
         let literal_filled: HashSet<&str> = ["b"].into_iter().collect();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
             "a config-filled port keeps the node alive"
         );
     }
@@ -581,7 +554,7 @@ mod tests {
         let wired: HashSet<&str> = ["a", "b"].into_iter().collect();
         let literal_filled = HashSet::new();
         assert!(
-            check_should_skip(&node, &pulses, &Vec::new(), uuid::Uuid::nil(), &required, &wired, &literal_filled).is_none(),
+            check_should_skip(&node, &view(&pulses), &required, &wired, &literal_filled).is_none(),
             "user-emitted null is data; one null + one closed must NOT skip"
         );
     }

@@ -46,8 +46,7 @@ pub async fn list(
     let client = ctx.client();
     let (arr, total) =
         executions_page(&client, limit, 0, project.as_deref(), phase.map(|p| p.as_str())).await?;
-    if ctx.json() {
-        println!("{}", serde_json::json!({ "executions": arr, "total": total }));
+    if ctx.json_out(&serde_json::json!({ "executions": arr, "total": total }))? {
         return Ok(());
     }
     if arr.is_empty() {
@@ -217,8 +216,7 @@ pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Re
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {resp}"))?;
     let kept: Vec<&serde_json::Value> = arr.iter().filter(|row| filter.keeps(row)).collect();
-    if ctx.json() {
-        println!("{}", serde_json::Value::Array(kept.into_iter().cloned().collect()));
+    if ctx.json_out(&kept)? {
         return Ok(());
     }
     if kept.is_empty() {

@@ -627,7 +627,7 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
                 Ok(ExecutionOutcome::AlreadySettled) => Some(
                     "execution already ended before this worker claimed it".to_string(),
                 ),
-                Ok(ExecutionOutcome::Completed { .. }) | Ok(ExecutionOutcome::Stalled) => None,
+                Ok(ExecutionOutcome::Completed) | Ok(ExecutionOutcome::Stalled) => None,
             };
             if let Some(why) = why {
                 conn.surface_error(&why).await;

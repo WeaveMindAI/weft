@@ -1,7 +1,8 @@
     use super::*;
     use async_trait::async_trait;
-    use crate::loop_runtime::LoopRuntime;
     use std::sync::Mutex as StdMutex;
+    use weft_core::exec::loop_runtime::{compute_loop_iter_cap, LoopConfig, LoopItemSource};
+    use weft_core::exec::ready::InputBag;
     use weft_core::frames::LoopIteration;
     use weft_core::exec::ready::ReadyGroup;
     use weft_core::primitive::LoopInstanceKey;
@@ -56,6 +57,51 @@
 
     fn primitive(p: WeftPrimitive) -> WeftType {
         WeftType::primitive(p)
+    }
+
+    /// A firing's bag from a JSON object, the shape readiness would
+    /// hand the boundary.
+    fn bag(v: serde_json::Value) -> InputBag {
+        v.as_object()
+            .expect("bag fixture is an object")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
+            .collect()
+    }
+
+    /// The journal rows a producer feeding the LoopIn writes, then the
+    /// LoopIn's own start: what a real run holds before the loop rows,
+    /// and what the fold rebuilds the instance from.
+    fn rows_before_loop_in(lp: &LoopProject, bag_json: &serde_json::Value) -> Vec<ExecEvent> {
+        let color = uuid::Uuid::nil();
+        let mut rows = vec![ExecEvent::NodeStarted {
+            color, node_id: "producer".into(), frames: vec![], at_unix: 0,
+        }];
+        for (port, value) in bag_json.as_object().expect("bag fixture is an object") {
+            rows.push(ExecEvent::PortEmitted {
+                color,
+                emission_id: uuid::Uuid::new_v4(),
+                node_id: "producer".into(),
+                frames: vec![],
+                port: port.clone(),
+                value: Arc::new(value.clone()),
+                at_unix: 0,
+            });
+        }
+        rows.push(ExecEvent::NodeCompleted { color, node_id: "producer".into(), frames: vec![], at_unix: 0 });
+        rows.push(ExecEvent::NodeStarted { color, node_id: lp.loop_in_id.clone(), frames: vec![], at_unix: 0 });
+        rows
+    }
+
+    /// Rebuild the loop runtime the way a resumed worker does: fold
+    /// the producer's rows, the LoopIn's start, and the captured loop
+    /// rows over the program.
+    fn rehydrate(lp: &LoopProject, bag_json: &serde_json::Value, loop_rows: &[ExecEvent]) -> LoopRuntime {
+        let mut events = rows_before_loop_in(lp, bag_json);
+        events.extend(loop_rows.iter().cloned());
+        let snap = weft_journal::fold_to_snapshot(uuid::Uuid::nil(), Arc::new(lp.project.clone()), &events);
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        snap.loop_runtime
     }
 
     fn list_of(inner: WeftType) -> WeftType {
@@ -307,9 +353,10 @@
             },
         ];
 
+        let (producer, edges) = producer_feeding(&loop_in, edges);
         let project_json = serde_json::json!({
             "id": "00000000-0000-0000-0000-000000000000",
-            "nodes": serde_json::to_value(vec![&loop_in, &loop_out, &body, &consumer]).unwrap(),
+            "nodes": serde_json::to_value(vec![&producer, &loop_in, &loop_out, &body, &consumer]).unwrap(),
             "edges": serde_json::to_value(&edges).unwrap(),
             "groups": [],
             "createdAt": parse_dt(),
@@ -340,7 +387,7 @@
         let group = ReadyGroup {
             frames: Vec::new(),
             color: uuid::Uuid::nil(),
-            input: outer_input,
+            input: bag(outer_input),
             closed_ports: Vec::new(),
             skip: None,
             pulse_ids: Vec::new(),
@@ -361,6 +408,11 @@
     }
 
     /// Helper: fire LoopOut for iteration `i` with the given writes.
+    /// Journals what the real driver journals around the handler: the
+    /// body's writes as the body's emissions, then the LoopOut's own
+    /// start and completion, so the captured rows fold the way a real
+    /// run's do (the fold reads the LoopOut's writes off its firing's
+    /// absorbed pulses).
     async fn fire_loop_out(
         lp: &LoopProject,
         iter: u32,
@@ -370,12 +422,58 @@
         pulses: &mut PulseTable,
         journal: &CapturingJournal,
     ) {
+        let color = uuid::Uuid::nil();
+        let frames = vec![LoopIteration { index: iter }];
         let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
         let loop_out = lp.project.nodes.iter().find(|n| n.id == lp.loop_out_id).unwrap();
+        // The body firings that produced these writes: `writes` is
+        // keyed by LoopOut input port, so each write is journaled as
+        // the emission of the body port wired into it, then each body
+        // node's completion (which closes the ports it did not write,
+        // the `closed_ports` the LoopOut sees).
+        let mut by_source: std::collections::BTreeMap<String, Vec<(String, serde_json::Value)>> =
+            Default::default();
+        for (port, value) in writes.as_object().expect("writes fixture is an object") {
+            // Every write reaches the LoopOut down a wire, as in a real
+            // run: a fixture writing an unwired port is a fixture bug.
+            let edge = lp
+                .project
+                .edges
+                .iter()
+                .find(|e| e.target == lp.loop_out_id && e.target_handle.as_deref() == Some(port))
+                .unwrap_or_else(|| panic!("the rig project wires no body port into LoopOut '{port}'"));
+            by_source
+                .entry(edge.source.clone())
+                .or_default()
+                .push((edge.source_handle.clone().expect("edge names its source port"), value.clone()));
+        }
+        for (source, emitted) in by_source {
+            journal.record_event(&ExecEvent::NodeStarted { color, node_id: source.clone(), frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
+            let emission = uuid::Uuid::new_v4();
+            for (port, value) in emitted {
+                journal
+                    .record_event(
+                        &ExecEvent::PortEmitted {
+                            color,
+                            emission_id: emission,
+                            node_id: source.clone(),
+                            frames: frames.clone(),
+                            port,
+                            value: Arc::new(value),
+                            at_unix: 0,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            journal.record_event(&ExecEvent::NodeCompleted { color, node_id: source, frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
+        }
+        journal.record_event(&ExecEvent::NodeStarted { color, node_id: lp.loop_out_id.clone(), frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
         let group = ReadyGroup {
-            frames: vec![LoopIteration { index: iter }],
-            color: uuid::Uuid::nil(),
-            input: writes,
+            frames,
+            color,
+            input: bag(writes),
             closed_ports,
             skip: None,
             pulse_ids: Vec::new(),
@@ -390,6 +488,10 @@
         )
         .await
         .expect("LoopOut firing");
+        journal
+            .record_event(&ExecEvent::NodeCompleted { color, node_id: lp.loop_out_id.clone(), frames: vec![LoopIteration { index: iter }], at_unix: 0 }, None)
+            .await
+            .unwrap();
     }
 
     /// Layer-3 rig 1: parallel-map LoopIn fires per-iteration body pulses
@@ -477,7 +579,7 @@
         let data: Vec<_> = consumer.iter().filter(|p| p.target_port == "data" && !p.closed).collect();
         assert_eq!(data.len(), 1, "one outward pulse on consumer.data");
         assert!(data[0].frames.is_empty(), "outward emit at parent_frames=[]");
-        assert_eq!(data[0].value, serde_json::json!(["A", "B", "C"]),
+        assert_eq!(*data[0].value, serde_json::json!(["A", "B", "C"]),
             "assembled in iteration-index order: {:?}", data[0].value);
         let events = journal.events.lock().unwrap();
         let terminated: Vec<_> = events.iter().filter(|e| matches!(e, ExecEvent::LoopTerminated { .. })).collect();
@@ -514,8 +616,7 @@
             })
             .cloned()
             .collect();
-        let snap = weft_journal::fold_to_snapshot(uuid::Uuid::nil(), &events);
-        let mut rt2 = rehydrate_loop_runtime(&lp.project, &snap.loop_instances).expect("rehydrate");
+        let mut rt2 = rehydrate(&lp, &bag, &events);
         let mut pulses2 = PulseTable::default();
         let journal2 = CapturingJournal::default();
         fire_loop_in(&lp, bag, &mut rt2, &mut pulses2, &journal2).await;
@@ -551,8 +652,7 @@
             "zero-iter loop emits one outward pulse"
         );
         let events: Vec<ExecEvent> = journal.events.lock().unwrap().clone();
-        let snap = weft_journal::fold_to_snapshot(uuid::Uuid::nil(), &events);
-        let mut rt2 = rehydrate_loop_runtime(&lp.project, &snap.loop_instances).expect("rehydrate");
+        let mut rt2 = rehydrate(&lp, &bag, &events);
         let mut pulses2 = PulseTable::default();
         let journal2 = CapturingJournal::default();
         fire_loop_in(&lp, bag, &mut rt2, &mut pulses2, &journal2).await;
@@ -622,7 +722,7 @@
         fire_loop_out(&lp, 2, serde_json::json!({"results": "C"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
         let consumer = pulses.get(&lp.consumer_id).expect("consumer bucket");
         let data: Vec<_> = consumer.iter().filter(|p| p.target_port == "data" && !p.closed).collect();
-        assert_eq!(data[0].value, serde_json::json!(["A", null, "C"]),
+        assert_eq!(*data[0].value, serde_json::json!(["A", null, "C"]),
             "closed iteration becomes null at its index: {:?}", data[0].value);
     }
 
@@ -786,7 +886,7 @@
         fire_loop_out(&lp, 1, serde_json::json!({"results": "B"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
         let consumer = pulses.get(&lp.consumer_id).expect("consumer bucket");
         let data: Vec<_> = consumer.iter().filter(|p| p.target_port == "data" && !p.closed).collect();
-        assert_eq!(data[0].value, serde_json::json!(["A", "B", "C"]),
+        assert_eq!(*data[0].value, serde_json::json!(["A", "B", "C"]),
             "BTreeMap-driven assembly preserves input order: {:?}", data[0].value);
     }
 
@@ -794,7 +894,6 @@
     /// `over` ports of different lengths.
     #[test]
     fn compute_iter_cap_trims_to_shortest_with_trim_on() {
-        use crate::loop_runtime::LoopConfig;
         let cfg = LoopConfig {
             parallel: true,
             over: vec!["a".into(), "b".into()],
@@ -802,9 +901,7 @@
             max_iters: None,
             trim_on_mismatch: true,
         };
-        let input: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"a": [1, 2, 3, 4, 5], "b": [10, 20, 30]})
-        ).unwrap();
+        let input = bag(serde_json::json!({"a": [1, 2, 3, 4, 5], "b": [10, 20, 30]}));
         let count = compute_loop_iter_cap(&cfg, &input).expect("ok");
         assert_eq!(count, 3, "trims to shortest: {count}");
     }
@@ -813,7 +910,6 @@
     /// with trim_on_mismatch=false (a loud Err, no silent trim).
     #[test]
     fn compute_iter_cap_rejects_mismatch_with_trim_off() {
-        use crate::loop_runtime::LoopConfig;
         let cfg = LoopConfig {
             parallel: true,
             over: vec!["a".into(), "b".into()],
@@ -821,9 +917,7 @@
             max_iters: None,
             trim_on_mismatch: false,
         };
-        let input: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"a": [1, 2, 3], "b": [10, 20]})
-        ).unwrap();
+        let input = bag(serde_json::json!({"a": [1, 2, 3], "b": [10, 20]}));
         let err = compute_loop_iter_cap(&cfg, &input).expect_err("must err on mismatch");
         assert!(err.contains("mismatch"), "loud mismatch error: {err}");
     }
@@ -831,7 +925,6 @@
     /// Layer-3 rig 11: max_iters cap applies in compute_iter_cap.
     #[test]
     fn compute_iter_cap_caps_at_max_iters() {
-        use crate::loop_runtime::LoopConfig;
         let cfg = LoopConfig {
             parallel: true,
             over: vec!["a".into()],
@@ -839,9 +932,7 @@
             max_iters: Some(2),
             trim_on_mismatch: true,
         };
-        let input: serde_json::Map<String, serde_json::Value> = serde_json::from_value(
-            serde_json::json!({"a": [1, 2, 3, 4, 5]})
-        ).unwrap();
+        let input = bag(serde_json::json!({"a": [1, 2, 3, 4, 5]}));
         let count = compute_loop_iter_cap(&cfg, &input).expect("ok");
         assert_eq!(count, 2, "max_iters caps: {count}");
     }
@@ -855,7 +946,7 @@
         // `index` output reaches downstream nodes wired to it. The body
         // node's `in` port is wired to `items`, not `index`, so `index`
         // pulses won't reach `body.in`. Instead, scan all pulses for a
-        // PulseEmitted on source_port=index. But this fires through
+        // a pulse from source_port=index. But this fires through
         // postprocess; pulses with no consumer edge are silently dropped.
         // Easier path: check the journal's LoopIterationLaunched events
         // line up with the iteration count.
@@ -916,12 +1007,12 @@
             parent_frames: vec![LoopIteration { index: 1 }],
             color: uuid::Uuid::nil(),
         };
-        rt.ensure(key_inner_iter0.clone(), crate::loop_runtime::LoopConfig {
+        rt.ensure(key_inner_iter0.clone(), LoopConfig {
             parallel: false, over: vec![], carry: vec![], max_iters: Some(1), trim_on_mismatch: true,
-        }, crate::loop_runtime::LoopItemSource::DoneDriven, Some(1), vec![]);
-        rt.ensure(key_inner_iter1.clone(), crate::loop_runtime::LoopConfig {
+        }, LoopItemSource::DoneDriven, Some(1), vec![]);
+        rt.ensure(key_inner_iter1.clone(), LoopConfig {
             parallel: false, over: vec![], carry: vec![], max_iters: Some(1), trim_on_mismatch: true,
-        }, crate::loop_runtime::LoopItemSource::DoneDriven, Some(1), vec![]);
+        }, LoopItemSource::DoneDriven, Some(1), vec![]);
         assert!(rt.get(&key_outer).is_some(), "outer instance lives");
         assert!(rt.get(&key_inner_iter0).is_some(), "inner instance at outer iter 0 lives");
         assert!(rt.get(&key_inner_iter1).is_some(), "inner instance at outer iter 1 lives");
@@ -938,6 +1029,62 @@
     /// LoopOut has a `results` gather output (List[String | Null]) AND
     /// an `acc` carry output (String). Body wires `self.items` to a
     /// concat node and writes both `self.results` and `self.acc`.
+    /// The producer that feeds a loop's outer inputs (one output per
+    /// LoopIn input, wired across), so a journal of the loop's rows
+    /// folds the way a real run's does: the LoopIn's bag is its
+    /// absorbed pulses. Returns the node and `edges` with the wires
+    /// added.
+    fn producer_feeding(loop_in: &NodeDefinition, mut edges: Vec<Edge>) -> (NodeDefinition, Vec<Edge>) {
+        let producer = NodeDefinition {
+            id: "producer".into(),
+            node_type: "Producer".into(),
+            label: None,
+            config: serde_json::Value::Object(Default::default()),
+            position: Position { x: 0.0, y: 0.0 },
+            scope: vec![],
+            group_boundary: None,
+            inputs: inputs_of(vec![]),
+            outputs: loop_in
+                .inputs
+                .iter()
+                .map(|i| PortDefinition {
+                    name: i.name.clone(),
+                    port_type: i.port_type.clone(),
+                    required: false,
+                    description: None,
+                    synthesized_from_carry: false,
+                    declared_type: None,
+                })
+                .collect(),
+            features: Default::default(),
+            requires_infra: false,
+            images: vec![],
+            published_service: None,
+            span: None,
+            header_span: None,
+            config_spans: Default::default(),
+            optional_ports: Default::default(),
+            port_literals: Default::default(),
+            port_literal_spans: Default::default(),
+            file_refs: Default::default(),
+            include_path: None,
+            source_file: None,
+        };
+        for port in &producer.outputs {
+            edges.push(Edge {
+                id: format!("producer-{}", port.name),
+                source: "producer".into(),
+                source_handle: Some(port.name.clone()),
+                target: loop_in.id.clone(),
+                target_handle: Some(port.name.clone()),
+                path: Vec::new(),
+                span: None,
+                source_file: None,
+            });
+        }
+        (producer, edges)
+    }
+
     fn build_sequential_fold_project() -> LoopProject {
         let group_id = "fold".to_string();
         let loop_in_id = weft_core::project::boundary_in_id(&group_id);
@@ -1005,6 +1152,11 @@
             ]),
             outputs: vec![
                 PortDefinition { name: "out".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
+                // The carry write leaves on its own port, so a test can
+                // hand the gather and the carry different values and
+                // tell the two wires apart on the way back.
+                PortDefinition { name: "acc".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
+                PortDefinition { name: "done".into(), port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
             features: Default::default(), requires_infra: false, images: vec![],
             published_service: None,
@@ -1034,14 +1186,17 @@
             Edge { id: "e2".into(), source: loop_in_id.clone(),  source_handle: Some("acc".into()),   target: body_id.clone(),     target_handle: Some("left".into()),  path: Vec::new(), span: None, source_file: None },
             // body writes back to LoopOut on both results and acc.
             Edge { id: "e3".into(), source: body_id.clone(),     source_handle: Some("out".into()),   target: loop_out_id.clone(), target_handle: Some("results".into()), path: Vec::new(), span: None, source_file: None },
-            Edge { id: "e4".into(), source: body_id.clone(),     source_handle: Some("out".into()),   target: loop_out_id.clone(), target_handle: Some("acc".into()),     path: Vec::new(), span: None, source_file: None },
+            Edge { id: "e4".into(), source: body_id.clone(),     source_handle: Some("acc".into()),   target: loop_out_id.clone(), target_handle: Some("acc".into()),     path: Vec::new(), span: None, source_file: None },
+            // and its done vote.
+            Edge { id: "e7".into(), source: body_id.clone(),     source_handle: Some("done".into()),  target: loop_out_id.clone(), target_handle: Some("done".into()),    path: Vec::new(), span: None, source_file: None },
             // outward to consumer.
             Edge { id: "e5".into(), source: loop_out_id.clone(), source_handle: Some("results".into()), target: consumer_id.clone(), target_handle: Some("data".into()),  path: Vec::new(), span: None, source_file: None },
             Edge { id: "e6".into(), source: loop_out_id.clone(), source_handle: Some("acc".into()),     target: consumer_id.clone(), target_handle: Some("final".into()), path: Vec::new(), span: None, source_file: None },
         ];
+        let (producer, edges) = producer_feeding(&loop_in, edges);
         let project_json = serde_json::json!({
             "id": "00000000-0000-0000-0000-000000000000",
-            "nodes": serde_json::to_value(vec![&loop_in, &loop_out, &body, &consumer]).unwrap(),
+            "nodes": serde_json::to_value(vec![&producer, &loop_in, &loop_out, &body, &consumer]).unwrap(),
             "edges": serde_json::to_value(&edges).unwrap(),
             "groups": [], "createdAt": parse_dt(), "updatedAt": parse_dt(),
         });
@@ -1074,7 +1229,7 @@
             pulses.get(body_id)
                 .map(|b| b.iter()
                     .filter(|p| p.frames.len() == 1 && p.frames[0].index == idx && !p.closed)
-                    .map(|p| (p.target_port.clone(), p.value.clone()))
+                    .map(|p| (p.target_port.clone(), (*p.value).clone()))
                     .collect())
                 .unwrap_or_default()
         }
@@ -1113,10 +1268,10 @@
         let data: Vec<_> = consumer.iter().filter(|p| p.target_port == "data" && !p.closed).collect();
         let final_carry: Vec<_> = consumer.iter().filter(|p| p.target_port == "final" && !p.closed).collect();
         assert_eq!(data.len(), 1, "one outward pulse on consumer.data: {} pulses found", data.len());
-        assert_eq!(data[0].value, serde_json::json!(["a", "ab", "abc"]),
+        assert_eq!(*data[0].value, serde_json::json!(["a", "ab", "abc"]),
             "gather list assembled in iteration order: {:?}", data[0].value);
         assert_eq!(final_carry.len(), 1, "one outward pulse on consumer.final");
-        assert_eq!(final_carry[0].value, serde_json::json!("abc"),
+        assert_eq!(*final_carry[0].value, serde_json::json!("abc"),
             "final carry value is the last successful write: {:?}", final_carry[0].value);
 
         // The instance is gone in the runtime perspective: terminated.
@@ -1151,7 +1306,7 @@
             pulses.get(&lp.body_id)
                 .map(|b| b.iter()
                     .filter(|p| p.frames.len() == 1 && p.frames[0].index == idx && !p.closed)
-                    .map(|p| (p.target_port.clone(), p.value.clone()))
+                    .map(|p| (p.target_port.clone(), (*p.value).clone()))
                     .collect())
                 .unwrap_or_default()
         };
@@ -1168,10 +1323,49 @@
             group_id: lp.group_id.clone(), parent_frames: Vec::new(), color: uuid::Uuid::nil(),
         };
         assert_eq!(
-            rt.get(&key).expect("instance").carry_values.get("acc"),
+            rt.get(&key).expect("instance").carry_values.get("acc").map(|v| &**v),
             Some(&serde_json::json!("")),
             "seeded carry value is the type zero, not null or missing"
         );
+    }
+
+    /// The worker dies mid-loop, two iterations gathered and the third
+    /// launched: the fold rebuilds the writes and the carry off the
+    /// LoopOut firings' pulses, and the re-fired LoopIn launches nothing
+    /// twice.
+    #[tokio::test]
+    async fn a_loop_resumed_mid_gather_rebuilds_its_writes_and_relaunches_nothing() {
+        let lp = build_sequential_fold_project();
+        let mut rt = LoopRuntime::new();
+        let mut pulses = PulseTable::default();
+        let journal = CapturingJournal::default();
+        let bag = serde_json::json!({"items": ["a", "b", "c"], "acc": ""});
+        fire_loop_in(&lp, bag.clone(), &mut rt, &mut pulses, &journal).await;
+        // The gather and the carry get DIFFERENT values, so the rebuilt
+        // instance proves each wire was read, not a coincidence.
+        fire_loop_out(&lp, 0, serde_json::json!({"results": "a", "acc": "A"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
+        fire_loop_out(&lp, 1, serde_json::json!({"results": "ab", "acc": "AB"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
+        let events: Vec<ExecEvent> = journal.events.lock().unwrap().clone();
+        // The worker died here: two iterations gathered, the third
+        // launched and not yet fired.
+        let key = LoopInstanceKey { group_id: lp.group_id.clone(), parent_frames: Vec::new(), color: uuid::Uuid::nil() };
+        let rt2 = rehydrate(&lp, &bag, &events);
+        let inst = rt2.get(&key).expect("the instance is rebuilt");
+        assert_eq!(inst.out_fired, vec![0, 1]);
+        assert_eq!(inst.launched, vec![0, 1, 2]);
+        assert_eq!(*inst.carry_values["acc"], serde_json::json!("AB"), "the carry is the last write");
+        assert_eq!(inst.gather_lists["results"].len(), 2, "both gathered writes are back");
+        assert_eq!(inst.gather_lists["results"][&0], weft_core::exec::loop_runtime::LoopWrite::Value(Arc::new(serde_json::json!("a"))));
+        assert_eq!(inst.gather_lists["results"][&1], weft_core::exec::loop_runtime::LoopWrite::Value(Arc::new(serde_json::json!("ab"))));
+        assert!(inst.terminated.is_none());
+        // The re-fired LoopIn finds every iteration launched and
+        // launches nothing more.
+        let mut rt2 = rt2;
+        let mut pulses2 = PulseTable::default();
+        let journal2 = CapturingJournal::default();
+        fire_loop_in(&lp, bag, &mut rt2, &mut pulses2, &journal2).await;
+        assert!(pulses2.get(&lp.body_id).map(|b| b.is_empty()).unwrap_or(true), "nothing relaunched: {pulses2:?}");
+        assert_eq!(rt2.get(&key).unwrap().launched, vec![0, 1, 2]);
     }
 
     /// Done-driven loop with carry: body writes self.done = true at iter 2.
@@ -1198,7 +1392,7 @@
         let consumer = pulses.get(&lp.consumer_id).expect("consumer bucket");
         let data: Vec<_> = consumer.iter().filter(|p| p.target_port == "data" && !p.closed).collect();
         assert_eq!(data.len(), 1);
-        assert_eq!(data[0].value, serde_json::json!(["a", "ab", "abc"]),
+        assert_eq!(*data[0].value, serde_json::json!(["a", "ab", "abc"]),
             "gather list capped at iter 2's done vote: {:?}", data[0].value);
 
         let key = LoopInstanceKey {

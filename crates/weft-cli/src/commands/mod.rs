@@ -97,6 +97,18 @@ impl Ctx {
         self.json
     }
 
+    /// Under `--json`, print `value` as the command's one JSON line on
+    /// stdout and answer true, so the caller returns right after and
+    /// nothing human follows it. Without the flag, print nothing and
+    /// answer false.
+    pub fn json_out(&self, value: &impl serde::Serialize) -> anyhow::Result<bool> {
+        if !self.json {
+            return Ok(false);
+        }
+        println!("{}", serde_json::to_string(value)?);
+        Ok(true)
+    }
+
     pub fn dispatcher_url(&self) -> &str {
         &self.dispatcher_url
     }

@@ -167,9 +167,11 @@ pub use node_test::{
     fixture_spec, fixture_spec_like, with_cleanup, EndpointCall, FakeRig, LiveRig, NodeTest,
     NodeTestInfo, RunOutcome, SentRequest, TestTier,
 };
+#[cfg(feature = "runtime")]
+pub use primitive::ExecutionSnapshot;
 pub use primitive::{
-    AwaitedEntry, AwaitedEntryKind, ExecutionSnapshot, KickedNode, SignalAuth,
-    SignalRouting, SignalSpec, SignalSurface, SuspensionInfo,
+    AwaitedEntry, AwaitedEntryKind, KickedNode, SignalAuth, SignalRouting, SignalSpec,
+    SignalSurface, SuspensionInfo,
 };
 pub use project::{
     has_infra, Edge, EdgeIndex, GroupBoundary, GroupBoundaryRole, GroupDefinition, GroupKind,

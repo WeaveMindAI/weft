@@ -6,6 +6,7 @@
 //! Applies no schema of its own: the boot's `app::apply_core_schema`
 //! runs every group (this crate's [`GROUP`] included) in one pass.
 
+use anyhow::Context;
 use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -145,6 +146,7 @@ fn summary_from_payloads(
 async fn cancel_terminals_in(
     tx: &mut sqlx::PgConnection,
     color: Color,
+    program: Option<&weft_core::ProjectDefinition>,
     cause: &weft_core::exec::CancelCause,
 ) -> anyhow::Result<Option<usize>> {
     let events = decode_all(color, payload_rows(&mut *tx, color).await?)?;
@@ -152,7 +154,7 @@ async fn cancel_terminals_in(
         return Ok(None);
     }
     let now = crate::lease::now_unix() as u64;
-    let writes = crate::api::execution::cancel_terminal_events(color, &events, cause, now);
+    let writes = crate::api::execution::cancel_terminal_events(color, &events, program, cause, now)?;
     let node_cancellations = writes.len() - 1;
     for (event, dedup) in writes {
         weft_journal::record_event_in(&mut *tx, &event, None, Some(&dedup))
@@ -673,6 +675,7 @@ impl Journal for PostgresJournal {
     async fn cancel_never_claimed_execution(
         &self,
         color: Color,
+        program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome> {
         use weft_task_store::tasks::SetupFailureOutcome;
@@ -687,7 +690,7 @@ impl Journal for PostgresJournal {
         // No worker will ever run this color: journal the cancel terminals in
         // the SAME transaction as the task delete, so "task deleted" and
         // "cancel journaled" can never disagree.
-        cancel_terminals_in(&mut tx, color, cause).await?;
+        cancel_terminals_in(&mut tx, color, program, cause).await?;
         tx.commit().await?;
         Ok(SetupFailureOutcome::NoWorkerWillRun)
     }
@@ -695,6 +698,7 @@ impl Journal for PostgresJournal {
     async fn cancel_execution(
         &self,
         color: Color,
+        program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<CancelWrite> {
         let mut tx = self.pool.begin().await?;
@@ -706,7 +710,8 @@ impl Journal for PostgresJournal {
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_COLOR_RETURNING)
             .bind(color.to_string())
             .fetch_all(&mut *tx)
-            .await?;
+            .await
+            .context("cancel_execution: strip the color's signals: read a signal row")?;
         let removed: Vec<SignalRegistration> =
             rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
         // 2 + 3. Only a started color has a journal to close and a pod to
@@ -719,7 +724,7 @@ impl Journal for PostgresJournal {
                 .await?;
         let mut write = CancelWrite { removed, ..CancelWrite::default() };
         if let Some((project_id, tenant_id)) = owner {
-            write.node_cancellations = cancel_terminals_in(&mut tx, color, cause).await?;
+            write.node_cancellations = cancel_terminals_in(&mut tx, color, program, cause).await?;
             write.task_enqueued = crate::task_kinds::execute::enqueue_cancel_in(
                 &mut tx,
                 &project_id,
@@ -733,17 +738,16 @@ impl Journal for PostgresJournal {
         Ok(write)
     }
 
-    async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool> {
+    async fn consume_suspension(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
         // Drop the signal row entirely; resume tokens are
         // single-use. Entry triggers (is_resume=false) are NOT
         // touched here; deactivate handles those.
-        let result = sqlx::query(
-            "DELETE FROM signal WHERE token = $1 AND is_resume = TRUE",
-        )
-        .bind(token)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING)
+            .bind(token)
+            .fetch_optional(&self.pool)
+            .await
+            .context("consume_suspension: read a signal row")?;
+        row.map(row_to_signal).transpose()
     }
 
     async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
@@ -1263,7 +1267,8 @@ impl Journal for PostgresJournal {
         let row: Option<SignalRow> = sqlx::query_as(SIGNAL_SELECT_WHERE_TOKEN)
             .bind(token)
             .fetch_optional(&self.pool)
-            .await?;
+            .await
+            .context("signal_get: read a signal row")?;
         row.map(row_to_signal).transpose()
     }
 
@@ -1303,7 +1308,8 @@ impl Journal for PostgresJournal {
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_TOKENS_RETURNING)
             .bind(tokens)
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .context("signal_remove_many: read a signal row")?;
         rows.into_iter().map(row_to_signal).collect()
     }
 
@@ -1314,7 +1320,8 @@ impl Journal for PostgresJournal {
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_WHERE_PROJECT)
             .bind(project_id)
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .context("signal_list_for_project: read a signal row")?;
         rows.into_iter().map(row_to_signal).collect()
     }
 
@@ -1325,7 +1332,8 @@ impl Journal for PostgresJournal {
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_COLOR_RETURNING)
             .bind(color.to_string())
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .context("signal_remove_for_color: read a signal row")?;
         rows.into_iter().map(row_to_signal).collect()
     }
 
@@ -1336,40 +1344,50 @@ impl Journal for PostgresJournal {
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_PROJECT_RETURNING)
             .bind(project_id)
             .fetch_all(&self.pool)
-            .await?;
+            .await
+            .context("signal_remove_for_project: read a signal row")?;
         rows.into_iter().map(row_to_signal).collect()
     }
 }
 
+/// The columns every signal read hands back, in `SignalRow` order,
+/// each behind the table prefix the query names the row by (`""` or
+/// `"s."`). One list so every SELECT and DELETE ... RETURNING that
+/// decodes into `SignalRow` agrees with it: a column added to the row
+/// and missing from one query fails at run time, not compile time.
+macro_rules! signal_columns {
+    ($p:literal) => {
+        concat!(
+            $p, "token, ", $p, "tenant_id, ", $p, "project_id, ", $p, "color, ",
+            $p, "node_id, ", $p, "is_resume, ", $p, "spec_json, ", $p, "access_id, ",
+            $p, "consumer_kind, ", $p, "tags, ", $p, "port_snapshot, ",
+            $p, "consumer_payload, ", $p, "surface_kind, ", $p, "mount_path, ",
+            $p, "auth_kind, ", $p, "auth_config, ", $p, "kind_state, ",
+            $p, "kind_state_seq, ", $p, "listener_pod"
+        )
+    };
+}
+pub(crate) use signal_columns;
+
 const SIGNAL_SELECT_WHERE_TOKEN: &str =
-    "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
-     spec_json, access_id, consumer_kind, tags, port_snapshot, consumer_payload, \
-     surface_kind, mount_path, auth_kind, auth_config, kind_state, kind_state_seq \
-     FROM signal WHERE token = $1";
+    concat!("SELECT ", signal_columns!(""), " FROM signal WHERE token = $1");
 
 const SIGNAL_SELECT_WHERE_PROJECT: &str =
-    "SELECT token, tenant_id, project_id, color, node_id, is_resume, \
-     spec_json, access_id, consumer_kind, tags, port_snapshot, consumer_payload, \
-     surface_kind, mount_path, auth_kind, auth_config, kind_state, kind_state_seq \
-     FROM signal WHERE project_id = $1";
+    concat!("SELECT ", signal_columns!(""), " FROM signal WHERE project_id = $1");
 
 const SIGNAL_DELETE_BY_COLOR_RETURNING: &str =
-    "DELETE FROM signal WHERE color = $1 RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
-     consumer_payload, surface_kind, mount_path, \
-     auth_kind, auth_config, kind_state, kind_state_seq";
+    concat!("DELETE FROM signal WHERE color = $1 RETURNING ", signal_columns!(""));
 
 const SIGNAL_DELETE_BY_PROJECT_RETURNING: &str =
-    "DELETE FROM signal WHERE project_id = $1 RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
-     consumer_payload, surface_kind, mount_path, \
-     auth_kind, auth_config, kind_state, kind_state_seq";
+    concat!("DELETE FROM signal WHERE project_id = $1 RETURNING ", signal_columns!(""));
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
-    "DELETE FROM signal WHERE token = ANY($1) RETURNING token, tenant_id, project_id, color, \
-     node_id, is_resume, spec_json, access_id, consumer_kind, tags, port_snapshot, \
-     consumer_payload, surface_kind, mount_path, \
-     auth_kind, auth_config, kind_state, kind_state_seq";
+    concat!("DELETE FROM signal WHERE token = ANY($1) RETURNING ", signal_columns!(""));
+
+const SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING: &str = concat!(
+    "DELETE FROM signal WHERE token = $1 AND is_resume = TRUE RETURNING ",
+    signal_columns!("")
+);
 
 /// Row shape for signal SELECTs. `FromRow` (not a tuple) because
 /// the row exceeds sqlx's 16-tuple cap.
@@ -1393,6 +1411,7 @@ pub(crate) struct SignalRow {
     pub(crate) auth_config: Option<serde_json::Value>,
     pub(crate) kind_state: serde_json::Value,
     pub(crate) kind_state_seq: i64,
+    pub(crate) listener_pod: Option<String>,
 }
 
 pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
@@ -1452,6 +1471,7 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
         auth_config: row.auth_config,
         kind_state: row.kind_state,
         kind_state_seq: row.kind_state_seq,
+        listener_pod: row.listener_pod,
     })
 }
 

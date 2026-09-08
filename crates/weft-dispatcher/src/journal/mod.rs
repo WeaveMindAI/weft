@@ -122,6 +122,7 @@ pub trait Journal: Send + Sync {
     async fn cancel_never_claimed_execution(
         &self,
         color: Color,
+        program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<weft_task_store::tasks::SetupFailureOutcome>;
 
@@ -139,18 +140,23 @@ pub trait Journal: Send + Sync {
     ///
     /// The listener still holds the stripped signals in RAM: the caller
     /// unregisters them there after the commit (`CancelWrite::removed`).
+    /// `program` is the run's definition (the per-node cancels come off
+    /// the fold); `None` for a color with no program, which has no
+    /// nodes to cancel.
     async fn cancel_execution(
         &self,
         color: Color,
+        program: Option<&weft_core::ProjectDefinition>,
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<CancelWrite>;
 
     /// Drop the signal row for a single-use resume token. Called
     /// when a suspension's fire is consumed (the engine has handed
-    /// the value back to the waiting firing). Returns true if a row
-    /// was deleted. Entry-trigger rows (`is_resume=false`) stay
-    /// untouched; the deactivate path manages those separately.
-    async fn consume_suspension(&self, token: &str) -> anyhow::Result<bool>;
+    /// the value back to the waiting firing). Returns the deleted row
+    /// so the caller can unregister it from the pod that held it.
+    /// Entry-trigger rows (`is_resume=false`) stay untouched; the
+    /// deactivate path manages those separately.
+    async fn consume_suspension(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
 
     /// Persist a signal token (token-scoped enumeration credential).
     /// Record a freshly minted signal token. The api layer generates the token
@@ -411,17 +417,24 @@ pub struct SignalRegistration {
     /// carries prior state forward passes the seq it read; a fresh
     /// token starts at 0.
     pub kind_state_seq: i64,
+    /// The pod holding this signal in RAM when the row was read
+    /// (`signal.listener_pod`); `None` when the holder was reaped and
+    /// the signal waits to be re-placed. Read-side only: `signal_insert`
+    /// stamps the `SignalPlacement` it is handed and never reads this
+    /// field. It rides on the row so an unregister after a DELETE still
+    /// knows which pod to tell: the row is gone by then, so nothing can
+    /// look the holder up again.
+    pub listener_pod: Option<String>,
 }
 
 /// The placement an insert stamps on a new `signal` row: which pod holds
 /// it and under what generation. Passed to `signal_insert` SEPARATELY
 /// from `SignalRegistration` (the signal's identity/config) because it is
-/// WRITE-time-only data: readers resolve the live holder via dedicated
-/// SQL, never off the registration struct, so it does not belong on the
-/// read+write `SignalRegistration`. Writing it WITH the row (rather than
-/// a later UPDATE) closes the window where a committed row had a NULL
-/// holder while a pod already held the signal in RAM (a fire in that
-/// window would double-place).
+/// WRITE-time data chosen under the pod lock at register time; a read
+/// hands the holder back on `SignalRegistration::listener_pod`. Writing
+/// it WITH the row (rather than a later UPDATE) closes the window where
+/// a committed row had a NULL holder while a pod already held the signal
+/// in RAM (a fire in that window would double-place).
 #[derive(Debug, Clone)]
 pub struct SignalPlacement {
     pub listener_pod: String,
@@ -780,7 +793,6 @@ mod log_entry_tests {
                 node_id: "llm".into(),
                 frames: Default::default(),
                 error: "boom".into(),
-                closure_emissions: Vec::new(),
                 at_unix: 2,
             },
             ExecEvent::NodeCancelled {
@@ -788,11 +800,11 @@ mod log_entry_tests {
                 node_id: "llm".into(),
                 frames: Default::default(),
                 reason: "stopped".into(),
-                closure_emissions: Vec::new(),
                 at_unix: 3,
             },
             ExecEvent::PortTypeMismatch {
                 color,
+                emission_id: uuid::Uuid::nil(),
                 node_id: "bridge".into(),
                 frames: Default::default(),
                 port: "jid".into(),
@@ -807,7 +819,7 @@ mod log_entry_tests {
                 cause: None,
                 at_unix: 6,
             },
-            ExecEvent::ExecutionCompleted { color, outputs: serde_json::Value::Null, at_unix: 7 },
+            ExecEvent::ExecutionCompleted { color, at_unix: 7 },
             ExecEvent::ExecutionTagged { color, tags: vec!["t".into()], at_unix: 8 },
         ]
     }
@@ -879,7 +891,6 @@ mod log_entry_tests {
             node_id: "a".into(),
             frames: Default::default(),
             error: "boom".into(),
-            closure_emissions: Vec::new(),
             at_unix: 10,
         };
         // Journal (drain) order: the failure first, then a's second

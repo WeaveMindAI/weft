@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 use crate::frames::LoopFrames;
 use crate::Color;
@@ -16,6 +18,18 @@ use crate::Color;
 /// can replay pulses without the metadata machinery, the metadata can
 /// grow without disturbing the hot path.
 ///
+/// The value is SHARED, never copied: one emission that fans out to
+/// fifty wires is fifty pulses pointing at one `Arc<Value>`. The only
+/// owned copy a value ever gets is the input bag handed to the node
+/// body that consumes it.
+///
+/// A pulse's `id` is DERIVED from the emission that placed it and the
+/// wire it landed on (`exec::emission::pulse_id`), never minted at
+/// random: the journal records the emission once and the fold puts
+/// the same pulse, with the same id, on the same wire, so every row
+/// that names a pulse by id (a stream take, a loop's item launch)
+/// resolves identically live and on replay.
+///
 /// A pulse with `closed: true` is a CLOSURE marker, not data. It tells
 /// the consumer "nothing will ever arrive on this port at this frame
 /// stack". An explicit `Value::Null` with `closed: false` is a
@@ -29,7 +43,7 @@ pub struct Pulse {
     pub target_node: String,
     /// The port on the destination node.
     pub target_port: String,
-    pub value: Value,
+    pub value: Arc<Value>,
     pub status: PulseStatus,
     /// Closure marker. `true` means this pulse is the engine telling
     /// the consumer "nothing will arrive here": the upstream terminated
@@ -80,15 +94,19 @@ impl PulseStatus {
 }
 
 impl Pulse {
+    /// A data pulse. `id` comes from `exec::emission::pulse_id` (the
+    /// emission plus the wire); the value is shared with every other
+    /// wire the same emission reached.
     pub fn new(
+        id: uuid::Uuid,
         color: Color,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
-        value: Value,
+        value: Arc<Value>,
     ) -> Self {
         Self {
-            id: uuid::Uuid::new_v4(),
+            id,
             color,
             frames,
             target_node: target_node.into(),
@@ -106,18 +124,20 @@ impl Pulse {
     /// Required port + closure -> consumer skips. Optional port +
     /// closure -> consumer fires with the port missing.
     pub fn closure(
+        id: uuid::Uuid,
         color: Color,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
     ) -> Self {
-        Self::closure_with_error(color, frames, target_node, target_port, None)
+        Self::closure_with_error(id, color, frames, target_node, target_port, None)
     }
 
     /// Closure carrying WHY the upstream ended, for generator ports:
     /// `Some(error)` marks a failed stream end (the consumer's pull
     /// gets the error), `None` a clean finish.
     pub fn closure_with_error(
+        id: uuid::Uuid,
         color: Color,
         frames: LoopFrames,
         target_node: impl Into<String>,
@@ -125,12 +145,12 @@ impl Pulse {
         close_error: Option<String>,
     ) -> Self {
         Self {
-            id: uuid::Uuid::new_v4(),
+            id,
             color,
             frames,
             target_node: target_node.into(),
             target_port: target_port.into(),
-            value: Value::Null,
+            value: Arc::new(Value::Null),
             status: PulseStatus::Pending,
             closed: true,
             close_error,
@@ -140,48 +160,6 @@ impl Pulse {
     /// Mark this pulse as absorbed. Absorbed pulses are never reused.
     pub fn absorb(&mut self) {
         self.status = PulseStatus::Absorbed;
-    }
-
-    /// Reconstruct a pulse from a journaled `PulseEmitted` event. The
-    /// caller passes the event's full shape; this constructor enforces
-    /// the closure invariants (closed implies value: Null; an error
-    /// only rides a closure) so a broken journal row is caught at the
-    /// reconstruction boundary rather than silently propagated into
-    /// the live pulse table. Returns `Err` instead of panicking so a
-    /// corrupt row in one execution's journal doesn't poison the
-    /// dispatcher's cancel path or any other fold-driven HTTP handler.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_journal_emit(
-        id: uuid::Uuid,
-        color: Color,
-        frames: LoopFrames,
-        target_node: impl Into<String>,
-        target_port: impl Into<String>,
-        value: Value,
-        closed: bool,
-        close_error: Option<String>,
-    ) -> Result<Self, &'static str> {
-        if closed && !value.is_null() {
-            return Err(
-                "closure pulse must have value: Null (journal row violates the closed-implies-null invariant)"
-            );
-        }
-        if !closed && close_error.is_some() {
-            return Err(
-                "a close_error can only ride a closure pulse (journal row violates the invariant)"
-            );
-        }
-        Ok(Self {
-            id,
-            color,
-            frames,
-            target_node: target_node.into(),
-            target_port: target_port.into(),
-            value,
-            status: PulseStatus::Pending,
-            closed,
-            close_error,
-        })
     }
 }
 

@@ -56,8 +56,9 @@ you leave signing on.
 weft token mint --name "my laptop"
 ```
 
-This prints a connect URL **once**. The server stores only a hash and can never
-show it to you again. Paste it into the extension's popup and pending tasks
+This prints the connect URL, then the bare token on a second line for a
+script that wants only that. Both hold the same secret, shown **once**: the
+server stores only a hash and can never show it to you again. Paste it into the extension's popup and pending tasks
 start appearing. Lose it and there is no recovery: mint a second token and
 `weft token revoke` the one you lost.
 

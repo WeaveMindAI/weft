@@ -113,7 +113,7 @@ export type DispatcherEvent = { event_id: string } & (
   | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; done_vote?: boolean | null; at_unix: number }
   | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; reason: LoopTerminationReason; at_unix: number }
   // Graph-level participation: a node is wired to a bus. Derived
-  // dispatcher-side from PulseEmitted events carrying a bus marker,
+  // dispatcher-side from emitted pulses carrying a bus marker,
   // so source AND target nodes get one BusParticipant edge each.
   // `ephemeral` is sniffed from the marker JSON, so the webview learns
   // mode the same time it learns about the bus and renders the panel

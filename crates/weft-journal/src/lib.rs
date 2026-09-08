@@ -7,11 +7,13 @@
 //! write live here.
 
 pub mod events;
+pub mod fold;
 pub mod tags;
 pub mod traits;
 pub mod write;
 
-pub use events::{fold_to_snapshot, ExecEvent};
+pub use events::ExecEvent;
+pub use fold::{fold_to_snapshot, FiringView, Fold, FoldEffects};
 
 /// Decode one journal row, or the loud message every reader shares:
 /// the color, the reason, and the recovery (`weft clean`). THE single

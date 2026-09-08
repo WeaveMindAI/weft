@@ -32,6 +32,7 @@ pub mod listener;
 pub mod pg_wake;
 pub mod placement;
 pub mod project_namespace;
+pub mod projection;
 pub mod project_store;
 pub mod reaper;
 pub mod registry;

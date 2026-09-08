@@ -2,7 +2,7 @@
 //! time a node fires; multiple fires (parallel loop iterations) produce
 //! multiple entries keyed by node id.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -43,14 +43,17 @@ impl NodeExecutionStatus {
 }
 
 /// Record of one node-firing execution. Pulses stay pure data
-/// carriers; every bit of execution metadata (status, input,
-/// output, cost, logs, timing) lives here.
+/// carriers; every bit of execution metadata (status, cost, logs,
+/// timing) lives here. What the firing RECEIVED is the pulses it
+/// absorbed, and what it HANDED OUT is the pulses it emitted: neither
+/// is copied onto the record (the journal fold derives both for the
+/// screen from the pulse table and the emission rows).
 ///
 /// Suspend-then-resume keeps the same record. The `status`
 /// transitions through Running ↔ WaitingForInput on the same
-/// record without churning new entries. So the table has exactly
-/// one row per (node, frames) regardless of how many times
-/// the engine had to dispatch it.
+/// record without churning new entries. A location gets a SECOND
+/// record only when the first went terminal and the node fired again
+/// there (a streaming or bus consumer); `ordinal` tells them apart.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeExecution {
     pub id: uuid::Uuid,
@@ -58,16 +61,18 @@ pub struct NodeExecution {
     pub status: NodeExecutionStatus,
     /// Input pulses consumed by this dispatch.
     pub pulses_absorbed: Vec<uuid::Uuid>,
-    /// Pulse this execution is producing on its output ports (used for
-    /// callback routing when the node is suspended).
-    pub dispatch_pulse: uuid::Uuid,
+    /// This firing's rank among the records at its `(node, color,
+    /// frames)`: 0 for the first, 1 for a second firing after the
+    /// first went terminal. Stamped at creation (`next_firing_ordinal`)
+    /// on the live side and in the fold alike; the firing's derived
+    /// emissions (its termination sweep, a boundary's forwarding) key
+    /// on it, so two firings at one location never share a pulse id.
+    pub ordinal: usize,
     pub error: Option<String>,
     /// Suspension token (set while `status == WaitingForInput`).
     pub callback_id: Option<String>,
     pub started_at: u64,
     pub completed_at: Option<u64>,
-    pub input: Option<Value>,
-    pub output: Option<Value>,
     pub cost_usd: f64,
     pub logs: Vec<Value>,
     /// Non-terminal per-port warnings raised during this dispatch. The
@@ -78,6 +83,12 @@ pub struct NodeExecution {
     /// (`status` stays Completed); the warning is the visible record
     /// that one port's value was dropped.
     pub port_warnings: Vec<PortWarning>,
+    /// The output ports this firing has put on a wire or closed (an
+    /// emission, a close, a refusal): what its termination sweep
+    /// leaves alone, closing every other output port. Kept on the
+    /// record so the worker and the fold read one thing.
+    #[serde(default)]
+    pub mentioned_ports: HashSet<String>,
     pub color: Color,
     pub frames: LoopFrames,
 }
@@ -92,24 +103,6 @@ pub struct PortWarning {
     pub expected: String,
     /// The inferred type of the value the node actually tried to emit.
     pub actual: String,
-}
-
-impl NodeExecution {
-    /// Record what this firing handed out. A bag with nothing in it
-    /// (a sink like `Debug`, a loop boundary, a firing that closed every
-    /// port) leaves `output` at `None`: the live run never writes a
-    /// record for an empty emission, and the fold has to land on the
-    /// same shape, so "nothing" is spelled one way. This is the ONLY
-    /// setter; the engine's live path and the journal fold both go
-    /// through it.
-    pub fn set_output(&mut self, bag: &Value) {
-        let empty = match bag {
-            Value::Null => true,
-            Value::Object(map) => map.is_empty(),
-            _ => false,
-        };
-        self.output = if empty { None } else { Some(bag.clone()) };
-    }
 }
 
 /// One entry per node, growing as each dispatch records its lifecycle.
@@ -153,57 +146,40 @@ pub fn summarize_status(executions: &[NodeExecution]) -> String {
     format!("{base} ({total} executions: {})", parts.join(", "))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+/// The ordinal the NEXT record opened at `(node, color, frames)` gets:
+/// the count of records already there. Every site that opens a record
+/// (the scheduler, the boundary pass, the journal fold) stamps it on
+/// `NodeExecution::ordinal` at creation; nothing re-derives it later.
+pub fn next_firing_ordinal(
+    executions: &NodeExecutionTable,
+    node_id: &str,
+    color: Color,
+    frames: &LoopFrames,
+) -> usize {
+    executions
+        .get(node_id)
+        .map(|v| v.iter().filter(|e| e.color == color && &e.frames == frames).count())
+        .unwrap_or(0)
+}
 
-    fn record() -> NodeExecution {
-        NodeExecution {
-            id: uuid::Uuid::nil(),
-            node_id: "n".into(),
-            status: NodeExecutionStatus::Running,
-            pulses_absorbed: vec![],
-            dispatch_pulse: uuid::Uuid::nil(),
-            error: None,
-            callback_id: None,
-            started_at: 0,
-            completed_at: None,
-            input: None,
-            output: None,
-            cost_usd: 0.0,
-            logs: vec![],
-            port_warnings: vec![],
-            color: uuid::Uuid::nil(),
-            frames: vec![],
-        }
-    }
+/// The latest record at `(node, color, frames)`: the firing every
+/// row and every sweep about that location is about.
+pub fn latest_firing<'a>(
+    executions: &'a NodeExecutionTable,
+    node_id: &str,
+    color: Color,
+    frames: &LoopFrames,
+) -> Option<&'a NodeExecution> {
+    executions.get(node_id)?.iter().rev().find(|e| e.color == color && &e.frames == frames)
+}
 
-    #[test]
-    fn an_empty_bag_is_no_output_whichever_way_it_is_spelled() {
-        // Null (a sink that emits nothing) and `{}` (a boundary that
-        // forwarded nothing) both mean "handed out nothing".
-        let mut rec = record();
-        rec.set_output(&Value::Null);
-        assert_eq!(rec.output, None);
-        rec.set_output(&json!({}));
-        assert_eq!(rec.output, None);
-    }
-
-    #[test]
-    fn a_bag_with_values_is_kept_whole() {
-        let mut rec = record();
-        rec.set_output(&json!({"answer": "yes", "score": 3}));
-        assert_eq!(rec.output, Some(json!({"answer": "yes", "score": 3})));
-    }
-
-    #[test]
-    fn an_empty_bag_clears_an_earlier_value() {
-        // The setter is the one door, so a later empty write lands on
-        // the same shape a never-written record has.
-        let mut rec = record();
-        rec.set_output(&json!({"a": 1}));
-        rec.set_output(&Value::Null);
-        assert_eq!(rec.output, None);
-    }
+/// `latest_firing`, mutably: the record a lifecycle row about the
+/// location updates.
+pub fn latest_firing_mut<'a>(
+    executions: &'a mut NodeExecutionTable,
+    node_id: &str,
+    color: Color,
+    frames: &LoopFrames,
+) -> Option<&'a mut NodeExecution> {
+    executions.get_mut(node_id)?.iter_mut().rev().find(|e| e.color == color && &e.frames == frames)
 }

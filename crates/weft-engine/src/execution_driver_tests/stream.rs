@@ -193,7 +193,7 @@
             ]);
             let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(
-                matches!(outcome, ExecutionOutcome::Completed { .. }),
+                matches!(outcome, ExecutionOutcome::Completed),
                 "stream run completes, got {outcome:?}"
             );
             let entries = log.lock().unwrap().clone();
@@ -233,7 +233,7 @@
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
             let (outcome, _) = drive(stream_project(), cat, &["producer"]).await;
-            assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+            assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             // Lock-step is pinned as "pulling i" BEFORE "sent i":
             // `yield i` may only return once pull i is underway, and
@@ -279,7 +279,7 @@
                 ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
             ]);
             let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
-            assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+            assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
             assert!(
                 !node_skipped(&events, "consumer"),
                 "an empty stream must RUN its consumer, not skip it"
@@ -365,7 +365,7 @@
             ]);
             let (outcome, events) = drive(stream_project(), cat, &["producer"]).await;
             assert!(
-                matches!(outcome, ExecutionOutcome::Completed { .. }),
+                matches!(outcome, ExecutionOutcome::Completed),
                 "a take-1-of-5 consumer is a legal pattern for plain yields, got {outcome:?}"
             );
             let entries = log.lock().unwrap().clone();
@@ -527,7 +527,7 @@
                 ("Joint", Box::new(Joint { log: log.clone(), fail: false })),
             ]);
             let (outcome, events) = drive(join_project(), cat, &["first", "second"]).await;
-            assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+            assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             let before = log_index(&entries, "first before").expect("first ran");
             let second = log_index(&entries, "second emitted").expect("second ran");
@@ -1005,7 +1005,7 @@
             ("Sink", Box::new(Sink { log: log.clone() })),
         ]);
         let (outcome, events) = drive(stream_loop_project(parallel), cat, &["producer"]).await;
-        assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
         let entries = log.lock().unwrap().clone();
         let sink = entries.iter().find(|e| e.starts_with("sink")).expect("sink ran");
         assert_eq!(
@@ -1150,7 +1150,7 @@
             let mut project = stream_project();
             project.edges.clear();
             let (outcome, _) = drive(project, cat, &["producer"]).await;
-            assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+            assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             for i in 0..3 {
                 assert!(entries.contains(&format!("sent {i}")), "{entries:?}");
@@ -1322,7 +1322,7 @@
                 ("TwoTaker", Box::new(TwoTaker { log: log.clone() })),
             ]);
             let (outcome, events) = drive(two_stream_project(), cat, &["pa", "pb"]).await;
-            assert!(matches!(outcome, ExecutionOutcome::Completed { .. }), "got {outcome:?}");
+            assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
             let entries = log.lock().unwrap().clone();
             assert!(
                 entries.contains(&"a [0, 1, 2] b [0, 1]".to_string()),
@@ -1367,7 +1367,7 @@
             ]);
             let (outcome, _) = drive(stream_project(), cat, &["producer"]).await;
             assert!(
-                matches!(outcome, ExecutionOutcome::Completed { .. }),
+                matches!(outcome, ExecutionOutcome::Completed),
                 "a live producer must never be torn down by the stuck-check, got {outcome:?}"
             );
             let entries = log.lock().unwrap().clone();

@@ -14,8 +14,8 @@ started it is gone.
 | Group | Events |
 |---|---|
 | Lifecycle | execution started, node kicked, node started, completed, failed, skipped, suspended, resumed, cancelled |
-| Data flow | pulse emitted, pulses consumed, run output, port type mismatch |
-| Loops | loop instantiated, iteration launched, boundary fired, stream ended, terminated |
+| Data flow | port emitted, port closed, port type mismatch, pulses consumed, run output |
+| Loops | loop instantiated, iteration launched, loop out fired, stream ended, terminated |
 | Suspensions | suspension registered, suspension resolved |
 | Money and logs | cost reported, log line |
 | Terminals | execution completed, failed, cancelled |
@@ -25,15 +25,28 @@ started it is gone.
 Each row carries the execution's color, so reading an execution is one indexed
 query ordered by row id.
 
+A value a node emits is written once, on the port emitted row, however many
+wires it fans out on. Which wires carried it, which ports a firing closed,
+what a group boundary forwarded, and what each loop iteration received are
+never written: they are worked out again from the program when the journal
+is read. Group boundaries have no rows at all. So the journal is the list of
+facts the engine learned from outside (a trigger payload, a node's emission,
+a person's answer, a log line, a cost, a stream take, a cancellation), and
+reading it means replaying those facts over the program.
+
 ## How it is used
 
 **During a normal run, nothing reads it.** The worker holds the whole execution
 in memory and writes rows as it goes. Each write is a checkpoint.
 
-It matters at exactly one moment: when a worker has to rebuild an execution it
-did not run, on a resume or after the previous worker died. Then it **folds**
-the rows in order, reconstructing the pulse table, which nodes completed, which
-are suspended, and where each loop got to, and carries on.
+It matters at two moments. When a worker has to rebuild an execution it did
+not run, on a resume or after the previous worker died, it fetches the program
+the execution was started against and **folds** the rows over it in order,
+reconstructing the pulse table, which nodes completed, which are suspended,
+and where each loop got to, and carries on. And whenever something wants to
+show a run (the editor's execution view, `weft events`), the dispatcher folds
+the same way and hands out what the fold derived: the values each firing
+received and emitted, the group boundaries that ran or were skipped.
 
 ## Reading it yourself
 
@@ -115,13 +128,13 @@ The failed write is logged in `weft daemon logs`. A replacement worker can only
 recover what was saved, so work done after the last saved result may repeat.
 
 An unreadable saved event prevents the worker from loading the execution.
-Some events can be decoded but contain invalid details, such as a malformed
-pulse identifier. Those details are currently skipped during reconstruction
-and reported in the execution view. The worker does not yet distinguish
-damage to old, finished work from damage to values needed to resume.
+Some events decode but cannot be applied to the program: a row naming a node
+the program does not have, a loop row with no instance behind it, a malformed
+pulse identifier. The execution view reports each one, and a worker refuses to
+resume over any of them, because a state rebuilt from a partial journal is a
+state that never existed. A journal written by an older version of weft does
+not decode at all and is refused the same way.
 
-Treating missing and damaged entries consistently, and refusing unsafe
-resumes, is design work tracked in `TODO.md`; it is not implemented.
 Inspect failures with `weft logs <color>` and `weft events <color>` before
 starting a new run. A new run has its own history and can repeat external
 actions. `weft clean <color>` removes the old history when no longer needed.

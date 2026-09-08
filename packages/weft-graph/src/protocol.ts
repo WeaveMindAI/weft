@@ -1275,7 +1275,7 @@ export type CallerInspectorEvent =
 /// Per-bus metadata derived dispatcher-side from the bus marker JSON
 /// (`{"__weft_bus__": {"id":..., "mode":"journaled"|"ephemeral"}}`).
 /// The dispatcher attaches `ephemeral` to every `BusParticipant` edge
-/// it derives from a `PulseEmitted`, so the webview learns mode the
+/// it derives from an emitted pulse, so the webview learns mode the
 /// same time it learns about the bus. Stored keyed by `busId`.
 export interface BusMeta {
   ephemeral: boolean;
@@ -1287,18 +1287,15 @@ export interface BusMeta {
 /// adding a fold branch that can fail requires adding a variant
 /// both here and on the Rust side.
 export type CorruptionSite =
-  | 'PulseEmitted'
-  | 'NodeStarted'
-  | 'NodeResumed'
+  | 'PortEmitted'
+  | 'PortClosed'
+  | 'PulsesConsumed'
+  | 'NodeLifecycle'
+  | 'LoopInstantiated'
+  | 'LoopStreamEnded'
   | 'LoopIterationLaunched'
   | 'LoopOutFired'
   | 'LoopTerminated'
-  | 'NodeCompleted'
-  | 'NodeFailed'
-  | 'NodeSkipped'
-  | 'NodeCancelled'
-  | 'PulsesConsumed'
-  | 'LoopStreamEnded'
   | 'UndecodableRow';
 
 /// One item rendered in a node's body panel. Two distinct feeds
@@ -1770,7 +1767,7 @@ export type HostMessage =
   /// iterations together.
   | { kind: 'loopEvent'; event: LoopInspectorEvent }
   /// "Node N participates in bus B." Derived dispatcher-side from
-  /// PulseEmitted events whose value carries a bus marker. The
+  /// emitted pulses whose value carries a bus marker. The
   /// webview unions these into a per-bus participant set; the
   /// inspector for each participant node renders the bus's IRC log.
   | { kind: 'busParticipant'; busId: string; nodeId: string; meta: BusMeta }

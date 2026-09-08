@@ -25,7 +25,11 @@ A weft program is read as a graph, and a level (the file, or the inside
 of a group or loop) is what the reader scans in one look. The readable
 size is about six items, nodes or groups; past fifteen the compiler warns
 (`level-too-large`), because by then the level has stopped being something
-a person can scan. Groups are the tool for staying readable: when a level
+a person can scan. At the file's top level the count is per branch: the
+items one wire walk reaches, plus the infra nodes it touches. Two
+pipelines that never touch, or that only share a database, each answer
+for their own width (the database as its own node: a group holding one
+is an item like any other, and joins what it is wired to). Groups are the tool for staying readable: when a level
 grows past six, the nodes cooperating on one job become a group of their
 own. And because groups nest, depth absorbs size: growing work goes down
 into a nested group, never wide across a level. A group whose inside holds

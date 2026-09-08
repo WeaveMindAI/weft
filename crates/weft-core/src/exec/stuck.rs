@@ -164,7 +164,7 @@ mod tests {
     }
 
     fn pulse(color: Color, frames: LoopFrames, node: &str, port: &str) -> Pulse {
-        Pulse::new(color, frames, node, port, json!("x"))
+        Pulse::new(uuid::Uuid::new_v4(), color, frames, node, port, std::sync::Arc::new(json!("x")))
     }
 
     #[test]

@@ -22,10 +22,15 @@ struct Cli {
     #[arg(long, env = "WEFT_DISPATCHER_URL", global = true)]
     dispatcher: Option<String>,
 
-    /// Emit JSON progress events to stdout (one object per line)
-    /// instead of human-readable output. Used by the VS Code
-    /// extension to drive its action bar from CLI output. Each
-    /// line is a {"phase": ..., "detail": ...} object.
+    /// Machine-readable output instead of human text. The long
+    /// commands (build, run, activate, deactivate, resync, infra, rm,
+    /// the cancels) stream progress as one {"phase", "detail"} object
+    /// per line, which is how the VS Code extension drives its action
+    /// bar; the readers (status, ps, executions, events, logs, files,
+    /// listener inspect, token, stop, connect) print what the
+    /// dispatcher answered; test-node prints its reports as one JSON
+    /// array. The rest (new, follow, daemon, catalog, clean, update)
+    /// ignore it; describe-nodes, parse and validate are JSON already.
     #[arg(long, global = true)]
     json: bool,
 }
@@ -396,10 +401,10 @@ enum Cmd {
         #[arg(long)]
         full: bool,
     },
-    /// Inspect every active listener: per-tenant, prints the
-    /// journal's signal count alongside the listener's local
-    /// registry. Drift between the two means cleanup went wrong.
-    /// Operator command for diagnosing stuck listeners.
+    /// Inspect every live listener pod: how many signals the
+    /// dispatcher placed on it alongside what the pod holds in RAM.
+    /// Drift between the two means cleanup went wrong. Operator
+    /// command for diagnosing stuck listeners.
     Listener {
         #[command(subcommand)]
         action: ListenerAction,
@@ -628,9 +633,9 @@ enum InfraAction {
 
 #[derive(Debug, Subcommand)]
 enum ListenerAction {
-    /// Pretty-print every active listener: tenant, journal signal
-    /// count, listener registry. Drift highlights where cleanup
-    /// went wrong.
+    /// Print every live listener pod: placed signal count and the
+    /// pod's registry. Drift highlights where cleanup went wrong.
+    /// `--json` prints the rows as the dispatcher returns them.
     Inspect,
 }
 

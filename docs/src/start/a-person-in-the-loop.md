@@ -72,8 +72,8 @@ Load the unpacked build, then connect it to your runtime with a token:
 weft token mint --name "my laptop"
 ```
 
-That prints a connect URL exactly once, because the server stores only a hash
-of it. Paste it into the extension and pending tasks start arriving.
+That prints a connect URL (and the bare token on a second line) exactly once,
+because the server stores only a hash of it. Paste it into the extension and pending tasks start arriving.
 
 A token can also be narrowed to one project or one kind of task, which is how
 you hand a reviewer something that only ever shows them their own queue. That,

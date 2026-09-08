@@ -597,7 +597,6 @@ async fn close_color(state: &DispatcherState, pod_name: &str, color: Option<&str
             .record_event_dedup(
                 &weft_journal::ExecEvent::ExecutionCompleted {
                     color,
-                    outputs: serde_json::json!({ "nodeTest": true }),
                     at_unix: crate::lease::now_unix() as u64,
                 },
                 &format!("node_test_color_close:{color}"),

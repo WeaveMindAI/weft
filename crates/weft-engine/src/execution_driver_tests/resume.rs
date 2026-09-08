@@ -1,4 +1,5 @@
     use super::*;
+    use crate::execution_driver::engine_test_rig::{catalog, drive_journal};
     use serde_json::json;
     use weft_core::signal::{to_spec, Form, FormSchema};
     use weft_journal::ExecEvent;
@@ -48,30 +49,20 @@
     /// re-suspend, two fresh journal rows, refetch sees new rows,
     /// repeat until the wall-clock deadline).
     fn two_await_events() -> (String, Vec<ExecEvent>) {
-        let pid = uuid::Uuid::new_v4().to_string();
+        let emission = uuid::Uuid::new_v4();
+        let pid = weft_core::exec::emission::pulse_id(emission, "out", "n", "in", false).to_string();
         let events = vec![
-            ExecEvent::PulseEmitted {
+            started("src"),
+            ExecEvent::PortEmitted {
                 color: color(),
-                pulse_id: pid.clone(),
-                source_node: "src".into(),
-                source_port: "out".into(),
-                target_node: "n".into(),
-                target_port: "in".into(),
+                emission_id: emission,
+                node_id: "src".into(),
                 frames: vec![],
-                value: json!("x"),
-                closed: false,
-                close_error: None,
+                port: "out".into(),
+                value: Arc::new(json!("x")),
                 at_unix: 0,
             },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "n".into(),
-                frames: vec![],
-                input: json!({"in": "x"}),
-                pulses_absorbed: vec![pid.clone()],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
+            started("n"),
             registered("t0", 0),
             suspended("t0"),
             ExecEvent::SuspensionResolved {
@@ -85,8 +76,6 @@
                 node_id: "n".into(),
                 frames: vec![],
                 token: Some("t0".into()),
-                value: Some(json!("v0")),
-                pulses_absorbed: vec![],
                 at_unix: 0,
             },
             registered("t1", 1),
@@ -95,22 +84,51 @@
         (pid, events)
     }
 
+    fn started(node: &str) -> ExecEvent {
+        ExecEvent::NodeStarted { color: color(), node_id: node.into(), frames: vec![], at_unix: 0 }
+    }
+
+    /// `src.out` feeds `n.in`; neither consumes a stream, so no
+    /// crashed firing is unresumable.
+    fn await_project() -> Arc<ProjectDefinition> {
+        Arc::new(
+            serde_json::from_value(json!({
+                "id": uuid::Uuid::nil(),
+                "nodes": [
+                    {
+                        "id": "src", "nodeType": "Src", "label": null, "config": null,
+                        "position": { "x": 0.0, "y": 0.0 }, "inputs": [],
+                        "outputs": [{ "name": "out", "portType": "String", "required": false }],
+                        "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                    },
+                    {
+                        "id": "n", "nodeType": "Awaiter", "label": null, "config": null,
+                        "position": { "x": 1.0, "y": 0.0 },
+                        "inputs": [{ "name": "in", "portType": "String", "required": true }],
+                        "outputs": [],
+                        "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                    }
+                ],
+                "edges": [
+                    { "id": "e", "source": "src", "target": "n", "sourceHandle": "out", "targetHandle": "in" }
+                ]
+            }))
+            .expect("await project json"),
+        )
+    }
+
     fn apply(events: &[ExecEvent]) -> (PulseTable, NodeExecutionTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>) {
-        let snap = weft_journal::fold_to_snapshot(color(), events);
+        let project = await_project();
+        let snap = weft_journal::fold_to_snapshot(color(), project.clone(), events);
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
         let mut awaited = HashMap::new();
-        // No node in these fixtures consumes a stream, so no crashed
-        // firing is unresumable.
-        let project: weft_core::project::ProjectDefinition = serde_json::from_value(json!({
-            "id": uuid::Uuid::nil(),
-            "nodes": [],
-            "edges": []
-        }))
-        .expect("empty project json");
-        let doomed =
-            apply_snapshot(&project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited);
+        let mut loops = LoopRuntime::new();
+        let doomed = apply_snapshot(
+            &project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited, &mut loops,
+        );
         assert!(doomed.is_empty(), "no stream consumers in these fixtures");
         (pulses, executions, kicked)
     }
@@ -126,8 +144,8 @@
     /// Project with a real stream edge plus a LoopIn boundary that
     /// also declares a generator input, for the doomed-consumer
     /// routing tests below.
-    fn stream_project() -> weft_core::project::ProjectDefinition {
-        serde_json::from_value(json!({
+    fn stream_project() -> Arc<ProjectDefinition> {
+        Arc::new(serde_json::from_value(json!({
             "id": uuid::Uuid::nil(),
             "nodes": [
                 {
@@ -161,34 +179,69 @@
             ],
             "groups": []
         }))
-        .expect("stream project")
+        .expect("stream project"))
     }
 
     fn crashed_running(node: &str) -> Vec<ExecEvent> {
-        vec![ExecEvent::NodeStarted {
-            color: color(),
-            node_id: node.into(),
-            frames: vec![],
-            input: json!({}),
-            pulses_absorbed: vec![],
-            closed_ports: vec![],
-            at_unix: 0,
-        }]
+        vec![started(node)]
+    }
+
+    fn apply_stream(events: &[ExecEvent]) -> Vec<FiringLocation> {
+        let project = stream_project();
+        let snap = weft_journal::fold_to_snapshot(color(), project.clone(), events);
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        let mut pulses = PulseTable::default();
+        let mut executions = NodeExecutionTable::default();
+        apply_snapshot(
+            &project, snap, &mut pulses, &mut executions,
+            &mut HashMap::new(), &mut HashMap::new(), &mut LoopRuntime::new(),
+        )
     }
 
     /// A crashed-Running STREAM CONSUMER is doomed (its already-pulled
     /// items were removed durably, so a re-run would silently compute
     /// over a truncated stream), and lands in the doomed set instead
     /// of being re-dispatched.
+    /// A journal the fold rejects does not resume: the run fails, and
+    /// the failure is journaled as its terminal (naming the rejected
+    /// row and `weft clean`) so the run reads Failed instead of
+    /// running forever with no end row.
+    #[tokio::test]
+    async fn a_journal_that_will_not_fold_fails_the_run_with_a_terminal() {
+        let rows = vec![
+            ExecEvent::ExecutionStarted {
+                color: color(),
+                project_id: uuid::Uuid::nil().to_string(),
+                entry_node: "src".into(),
+                phase: weft_core::context::Phase::Fire,
+                definition_hash: Some("test-hash".into()),
+                node_test: false,
+                subgraph: None,
+                at_unix: 0,
+            },
+            // A resume of a firing the journal never opened.
+            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 0 },
+        ];
+        let (outcome, events) = drive_journal(
+            (*await_project()).clone(),
+            catalog(vec![]),
+            color(),
+            rows,
+            CancellationFlag::new_arc(),
+        )
+        .await;
+        let err = format!("{:#}", outcome.expect_err("a rejected row refuses the resume"));
+        assert!(err.contains("cannot be folded"), "{err}");
+        let Some(ExecEvent::ExecutionFailed { error, .. }) = events.last() else {
+            panic!("the failure is the run's terminal, got {:?}", events.last());
+        };
+        assert!(error.contains("node_resumed node=n") && error.contains("weft clean"), "{error}");
+        assert_eq!(events.iter().filter(|e| e.is_execution_terminal()).count(), 1);
+    }
+
     #[test]
     fn crashed_stream_consumer_is_doomed_not_redispatched() {
-        let snap = weft_journal::fold_to_snapshot(color(), &crashed_running("consumer"));
-        let mut pulses = PulseTable::default();
-        let mut executions = NodeExecutionTable::default();
-        let doomed = apply_snapshot(
-            &stream_project(), snap, &mut pulses, &mut executions,
-            &mut HashMap::new(), &mut HashMap::new(),
-        );
+        let doomed = apply_stream(&crashed_running("consumer"));
         assert_eq!(
             doomed,
             vec![FiringLocation::new("consumer", vec![])],
@@ -200,13 +253,7 @@
     /// normal re-dispatch route, never the doomed one.
     #[test]
     fn crashed_plain_node_is_not_doomed() {
-        let snap = weft_journal::fold_to_snapshot(color(), &crashed_running("producer"));
-        let mut pulses = PulseTable::default();
-        let mut executions = NodeExecutionTable::default();
-        let doomed = apply_snapshot(
-            &stream_project(), snap, &mut pulses, &mut executions,
-            &mut HashMap::new(), &mut HashMap::new(),
-        );
+        let doomed = apply_stream(&crashed_running("producer"));
         assert!(doomed.is_empty(), "a plain crashed node re-dispatches, got {doomed:?}");
     }
 
@@ -216,13 +263,7 @@
     /// recoverable loop.
     #[test]
     fn crashed_loop_boundary_is_not_doomed() {
-        let snap = weft_journal::fold_to_snapshot(color(), &crashed_running("work__in"));
-        let mut pulses = PulseTable::default();
-        let mut executions = NodeExecutionTable::default();
-        let doomed = apply_snapshot(
-            &stream_project(), snap, &mut pulses, &mut executions,
-            &mut HashMap::new(), &mut HashMap::new(),
-        );
+        let doomed = apply_stream(&crashed_running("work__in"));
         assert!(doomed.is_empty(), "a LoopIn resumes normally, got {doomed:?}");
     }
 
@@ -264,15 +305,7 @@
                 port_snapshot: None,
                 at_unix: 0,
             },
-            ExecEvent::NodeStarted {
-                color: color(),
-                node_id: "n".into(),
-                frames: vec![],
-                input: json!({}),
-                pulses_absorbed: vec![],
-                closed_ports: vec![],
-                at_unix: 0,
-            },
+            started("n"),
         ]
     }
 
@@ -295,8 +328,6 @@
             color: color(),
             node_id: "n".into(),
             frames: vec![],
-            output: json!({}),
-            closure_emissions: vec![],
             at_unix: 0,
         });
         let (_, _, kicked) = apply(&events);

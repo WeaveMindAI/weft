@@ -48,6 +48,32 @@ impl Phase {
         }
     }
 
+    /// The set of nodes an execution in this phase may dispatch, or
+    /// `None` for the whole graph. In `TriggerSetup` only the run
+    /// subgraph of the triggers runs; in `InfraSetup` only that of the
+    /// infra nodes; at `Fire` the subgraph the dispatcher journaled on
+    /// `ExecutionStarted` (a trigger fire's program, a targeted manual
+    /// run's selection), or everything for an untargeted run. A pulse
+    /// into any node outside the set is absorbed silently. The ONE
+    /// derivation, read by the live scheduler and the journal fold.
+    pub fn dispatchable_nodes(
+        self,
+        project: &crate::project::ProjectDefinition,
+        edge_idx: &crate::project::EdgeIndex,
+        subgraph: Option<&[String]>,
+    ) -> Option<std::collections::HashSet<String>> {
+        use crate::project::{infra_ids, run_subgraph, trigger_ids};
+        match self {
+            Self::TriggerSetup => {
+                Some(run_subgraph(project, edge_idx, &trigger_ids(project), &Default::default()))
+            }
+            Self::InfraSetup => {
+                Some(run_subgraph(project, edge_idx, &infra_ids(project), &Default::default()))
+            }
+            Self::Fire => subgraph.map(|s| s.iter().cloned().collect()),
+        }
+    }
+
     /// The inverse of `as_str`: a stored or typed tag back to the
     /// phase, `None` for anything else. Every reader of a phase
     /// written as text (the DB column, a CLI flag) comes through here,

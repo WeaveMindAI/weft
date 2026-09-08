@@ -1253,7 +1253,7 @@ fn manifest_input_bag(
                     Box::new(|_| {}),
                 );
                 for item in items {
-                    feed.push(uuid::Uuid::new_v4(), item)?;
+                    feed.push(uuid::Uuid::new_v4(), std::sync::Arc::new(item))?;
                 }
                 feed.close(crate::generator::StreamEnd::Finished);
                 let id = crate::generator::register_feed(&feed);
