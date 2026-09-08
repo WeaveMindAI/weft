@@ -123,6 +123,46 @@ A few things we look for in review:
   to a provider, a `live` one on the cheapest path that still exercises the real
   thing.
 
+## Working on Tangle
+
+Tangle is the AI builder that lives inside a weft project: the persona, the
+skills, the specialists and the commands that an assistant loads when a user
+opens their project. It is all prose, in [`tangle/`](tangle/), one folder per
+assistant, and it is open to contribution. If you use weft with an AI and you
+have watched it get something wrong, you are the right person to fix the
+words that let it.
+
+Three kinds of change are all welcome:
+
+- **Making Tangle better everywhere.** A rule it needs, a trap it keeps
+  falling into, a step of the loop that is vague. Carry these to every folder,
+  because a fix to how Tangle thinks is a fix for everyone.
+- **Adding a skill.** The skills are the knowledge Tangle loads when the work
+  calls for it. If something about weft is hard to get right and no skill
+  covers it, that is a skill worth writing.
+- **Tuning one assistant.** Assistants answer to different wording, and one
+  may need a rule stated twice, or earlier, or in different words, to hold to
+  it. That change belongs in that assistant's folder and nowhere else.
+
+**The folders are copies on purpose, and they are meant to drift.** There is
+no shared source and nothing checking they agree. The line we hold is that
+what Tangle *is* has to be true in every folder, while how it is *said* is
+free to differ. Tangle everywhere shapes the graph before it builds, reads a
+node's real interface instead of writing one from memory, keeps a level of the
+graph small enough to read, fails loudly rather than papering over, and
+reports in plain words. Change one of those and it goes in all eleven folders.
+Change phrasing, ordering, an example, or which of an assistant's own features
+gets used, and it stays in one.
+
+If you are adding a whole new assistant, the mechanics are one row in
+`ASSISTANTS` in
+[`crates/weft-cli/src/commands/new.rs`](crates/weft-cli/src/commands/new.rs)
+plus the folder, and a test checks that the row's files actually exist. Read
+that assistant's own documentation first: the folders differ because the hosts
+do, and the interesting part is finding what it gives you that the others do
+not. For how the current ten each solve it, go and read
+[`tangle/README.md`](tangle/README.md).
+
 ## Adding a provider
 
 A provider is a service whose prices weft knows. For that you need to code a

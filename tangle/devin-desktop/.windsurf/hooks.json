@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "post_write_code": [
+      {
+        "command": "python3 .windsurf/hooks/validate_weft.py",
+        "powershell": "python3 .windsurf\\hooks\\validate_weft.py",
+        "show_output": false
+      }
+    ]
+  }
+}

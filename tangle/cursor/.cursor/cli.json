@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(weft validate)",
+      "Shell(weft parse)",
+      "Shell(weft build)",
+      "Shell(weft build-base)",
+      "Shell(weft run)",
+      "Shell(weft describe-nodes)",
+      "Shell(weft executions)",
+      "Shell(weft events)",
+      "Shell(weft logs)",
+      "Shell(weft status)",
+      "Shell(weft ps)",
+      "Shell(weft follow)",
+      "Shell(weft daemon)",
+      "Shell(weft catalog)",
+      "Shell(weft activate)",
+      "Shell(weft cancel-activate)",
+      "Shell(weft cancel-build)",
+      "Shell(weft cancel-running)",
+      "Shell(weft stop)",
+      "Shell(weft node-test-hash)",
+      "Shell(weft token)",
+      "Shell(weft listener)"
+    ],
+    "deny": [
+      "Shell(weft test-node)",
+      "Shell(weft connect)",
+      "Shell(weft deactivate)",
+      "Shell(weft resync)",
+      "Shell(weft rm)",
+      "Shell(weft clean)",
+      "Shell(weft infra)",
+      "Shell(weft files)"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "postToolUse": [
+      {
+        "type": "command",
+        "matcher": "create|edit|str_replace_editor|apply_patch",
+        "bash": "python3 \"$(git rev-parse --show-toplevel)/.github/hooks/validate_weft.py\"",
+        "timeoutSec": 120
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^(apply_patch|Edit|Write)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/validate_weft.py\"",
+            "timeout": 120,
+            "statusMessage": "weft validate"
+          }
+        ]
+      }
+    ]
+  }
+}

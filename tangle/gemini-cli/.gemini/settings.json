@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "AfterTool": [
+      {
+        "matcher": "^(write_file|replace)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.gemini/hooks/validate_weft.py\"",
+            "name": "weft_validate",
+            "timeout": 120000,
+            "description": "The compiler answers every edit to a .weft file or a node."
+          }
+        ]
+      }
+    ]
+  },
+  "general": {
+    "defaultApprovalMode": "auto_edit"
+  }
+}

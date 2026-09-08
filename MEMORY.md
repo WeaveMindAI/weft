@@ -22,3 +22,7 @@ Real workflows (LLM pipelines, infra builds, human-in-the-loop, executions) can 
 
 ## Never run setup.sh or the e2e yourself
 `./setup.sh` (any flag) and the e2e (`cargo test -p weft-e2e --features e2e`, `scripts/run-e2e.sh`) redeploy the daemon and rebuild the extension while the [user] works in parallel, and they take a long time. Unit tests, `scripts/run-db-tests.sh`, clippy, `svelte-check` and `pnpm run compile` are yours to run. When the code is done and green on those, stop and ask the [user] to install and run the e2e, naming exactly which test files and why.
+
+## Tangle folders are copies on purpose
+`tangle/<assistant>/` holds one independent copy of the Tangle persona, skills, specialists and commands per assistant (eleven folders: the ten named ones plus `fallback/`). They start identical and are MEANT to drift as each is tuned for its host: no shared source, no SYNC markers, no CI check, and deduplicating them is wrong. The line: what Tangle IS must hold in every folder (shape the graph first, read a node's real interface, keep a level small, fail loudly, report plainly); how it is SAID may differ per assistant. `fallback/` installs its root `AGENTS.md` ONLY when no named assistant matched, because Cursor, Cline and Gemini read a root `AGENTS.md` on top of their own persona file rather than instead of it.
+[Update Notice Warning] If we touch `crates/weft-cli/src/commands/new.rs` (the `ASSISTANTS` table), revisit this entry.
