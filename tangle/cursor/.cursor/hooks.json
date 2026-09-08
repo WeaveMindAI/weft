@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "hooks": {
+    "postToolUse": [
+      { "command": "python3 ./.cursor/hooks/validate_weft.py", "timeout": 120 }
+    ]
+  }
+}
