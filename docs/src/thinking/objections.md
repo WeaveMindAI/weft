@@ -1,130 +1,33 @@
-# Things people say to me
+# Objections we sometimes get and what we think about them
 
-Collected as I hear them, with what I actually think.
+## "Why a new language? Just make it a library"
 
-## "This is just Python with extra steps"
+For the actual work, weft is a rust framework. You write a step's logic in Rust with the APIs weft gives you, and I'm not going to invent a new syntax for parsing a response or adding up a number. The language has one job: saying how the pieces fit together. And for that job the syntax is the whole point.
 
-No. Three things below cannot be done in Python at all, and "awkward in" is not
-what I mean.
+Here's the thing I actually care about: in a normal codebase the architecture isn't written down anywhere, it's something you reconstruct by reading the implementations and working upwards. That's fine while everything fits in context. It stops being fine the moment it doesn't, and that's exactly what happens to a coding assistant: it goes down into one detail, does a good job on the piece in front of it, and doesn't know the shape it was supposed to plug into. So it writes a second version of something that already exists, or a path around the infrastructure it should have used. And by default, if you don't guide it, it writes with no structure at the top at all, because nothing in the language asks for one. It works right up until it doesn't.
 
-**A Python program waiting three days for an approval is a process that exists
-for three days.** You can hide that behind a queue and a state machine, which
-is what everyone does, but then the thing that waited is your infrastructure,
-and the thing that resumed is a different invocation rebuilding its own context
-by hand. In weft the process exits and the execution is rows in a table. That
-is not an optimisation of the Python version, it is a different object.
+In weft the structure is the source. Scoping a part of the program nests it, so you get the nesting for free, and a group declares its inputs and outputs before you open it. You read from the top down: collapse everything, see the whole shape, open the one part you're working on. The compiler checks those boundaries, so a wire can't quietly reach into another group's insides, it has to show up in the interface where someone can see it. That's what you hand an assistant: the outer structure from the contracts, then one group, one level deeper, with edges around the job. See [Groups](../language/groups.md) and [The commandments of plumbing](plumbing.md).
 
-**Nothing can check your orchestration, because there is no orchestration to
-check.** There is control flow, spread across a dozen files and two frameworks,
-and no artifact any tool could read. In weft the wires are the source, so a
-type mismatch, an unwired input, or a cycle is refused before anything runs.
+## "Won't better models make this unnecessary?"
 
-**Adding a service means writing the auth.** The author of the S3 node wrote a
-JSON block declaring SigV4 and got AWS request signing. Not a helper that made
-it easier: they wrote no auth code, and neither will you.
+A model getting better at untangling a codebase isn't a reason to keep handing it a tangled one. Even if tomorrow's model held your whole project in its head and never missed a connection, you'd still be paying it to read all of it. If a tenth of the context gives it everything the job needs, why buy the other nine tenths? Being smarter doesn't make those tokens free or faster to produce.
 
-What you *can* do in Python is build all of that yourself, which is exactly
-what everyone is doing and where the several hundred lines of plumbing came
-from. The question was never whether Python is capable. It is whether you want
-to be the person maintaining the durable executor you wrote by accident.
+And you don't have to hand the project to one assistant at all. Agree the contracts, let one arrange the groups, have others work inside them at the same time, and a group can divide again. Weft natively enables high level of parallelization.
+
+## "Visual programming always turns into spaghetti"
+
+It absolutely can. Two hundred boxes on a canvas don't become understandable because you can zoom out far enough to see them all.
+
+The difference is that the nesting isn't an editor feature, it's in the language. A group is a real boundary with declared inputs and outputs, so folding it away actually removes something from what you have to think about. You still have to pick useful boundaries, and no editor rescues a design where everything needs to know about everything else, but the compiler warns you when a level of the graph is getting crowded and Tangle is told to group things before it gets there. The graph also has a text form: the `.weft` file you review in git *is* the source, and the editor edits that file, not a separate model of it.
 
 ## "The compiler checks the wiring, not whether the program is right"
 
-True today, and it is the interesting half of what comes next rather than a
-limit.
+Correct. A perfectly well typed program can send a beautifully formatted wrong answer to the wrong person. What the checks catch today is incompatible port types, missing required inputs and cycles in the wiring. That's feedback about how the pieces got connected, which is exactly the kind of mistake an assistant makes and can fix without you. It says nothing about whether a step does the right work. Your judgement and the step's own tests still have jobs.
 
-What a compiler can check scales with what is legible to it. Because the
-orchestration is data, it can be asked to prove properties about the program
-itself: flags that turn a policy into a property of compilation.
+Where I want to take it is proving things about how the program behaves, at compilation time. The idea is to let a node carry labels about what it is and what it does: a node that takes an action in the world says so, and how big that action is; a node that's an autonomous agent says so; a node that verifies something says what strength of verification it gives you. Then the compiler checks claims across the whole graph. Every path from an autonomous step to a high-stakes action goes through a verification of at least this strength, or a critical action has three separate human approvals in front of it. If the program doesn't hold up, it doesn't build. You could even have metadata that store the recorded probability of a model to hallucinate and be able to tell you after chaining multiple AI the probability of a step containing an hallucination. You could then add recovery steps to reduce the probability of hallucination (like having a double verification with a web search)
 
-None of it is shipped, and all of it is reachable. What each flag would buy,
-with a worked example, is in
-[our approach to AI safety](safety.md#what-becomes-provable).
+It doesn't exist yet but it's high in the roadmap. For the whole argument about why any of this matters, read [How I think about AI safety](safety.md).
 
-## "Nobody adopts new languages"
+---
 
-New languages die because somebody has to learn them, and that cost is gone
-here. Nobody learns weft. A model writes it and you read the graph, the way
-nobody learns SQL's grammar to look at a query and see what it selects.
-
-## "Visual programming always fails"
-
-This one has a graveyard behind it. It fails for three reasons.
-
-**It becomes unreadable past about fifty boxes.** Groups collapse recursively,
-and a group is a typed contract you can reason about without opening it, so a
-two-hundred-node program is five boxes at the top level. It costs nothing at
-run time either, because groups are compiled away before anything executes.
-
-**You cannot diff or merge it.** The source is text: the `.weft` file lives in
-git and merges like any file. The picture is a view, and a GUI gesture goes
-through the compiler, which rewrites the source and hands it back, so your
-comments and formatting survive.
-
-**The boxes eventually cannot express what you need.** The boxes are typed
-nodes whose insides are Rust. When the graph cannot express something you write
-a node, in minutes, and it is vocabulary forever.
-
-## "You will never keep up with the integrations"
-
-I am not trying to.
-
-The design goal is that adding a service is a JSON file and adding a node is a
-folder with two files. While that holds, whoever needs an integration builds it
-in an afternoon and it is vocabulary for everyone afterwards. When it stops
-holding, that is a bug in the language and gets fixed as one.
-
-## "Rust is a barrier"
-
-Nobody writing weft writes the Rust by hand.
-
-The premise of the whole project is that models write the code. A node body is
-usually under a hundred lines because everything hard sits behind the ctx, and
-a small self-contained typed unit with its own test rig is the single thing
-models are best at producing. Nodes are the easiest part of weft to generate,
-not the hardest. And you only reach for one at all when what you need is not
-already vocabulary.
-
-The version of this objection that lands is about *reading* Rust when something
-goes wrong, which is fair, and is why node bodies are kept small enough to read
-in one sitting.
-
-## "Kubernetes on my laptop is absurd"
-
-It sounds absurd right up until you want a Postgres.
-
-Weft can provision a database, a headless browser, or a model server as a node
-you drop on the graph, and something has to manage containers, networks,
-storage, health and lifecycle for that.
-
-Using the real one means the manifests that work on your laptop work in
-production, so there is no separate production setup quietly drifting from your
-development one. You write no YAML and you will not think about the cluster
-again after installing it.
-
-## "It is a graph, so it cannot do X"
-
-Two of the three things people mean by this are deliberate.
-
-**Cycles are refused.** You iterate with a `Loop` and exchange feedback over a
-bus. Refusing cycles is why the compiler can prove things about the rest.
-
-**Two nodes talking while both run** is not expressible with pulses alone,
-which is why buses exist. A parallel loop can launch fifty agents, gather their
-channels, and have a coordinator talking to all fifty while they keep
-working.
-
-**A synchronous call and return between nodes** is the real one. Weft is
-structurally a process network rather than a call graph, and node-to-node
-function callbacks are designed, with one architectural question still open
-about how they ride the replay machinery: see
-[the roadmap](../appendix/roadmap.md#language). Until they land, agent loops
-work but are less elegant than they will be.
-
-## "The docs claim things the code does not do"
-
-If you find one, report it and I will fix it.
-
-Every claim in this book is grounded: read in the source, run, or written by
-the person who built the thing. Where something is a direction rather than
-shipped, the page says so.
+If something here looks wrong, or if you have other arguments, come tell me on [Discord](https://discord.com/invite/FGwNu6mDkU) this could help shape weft toward something even more useful.

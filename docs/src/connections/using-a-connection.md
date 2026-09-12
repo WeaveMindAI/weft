@@ -1,326 +1,282 @@
-# Using a connection
+# Using a connection in a node
 
-## Opening one
+Read an `Access` input, open it, and use the connection's client.
+Authentication is configured for you. Add `use weft::{Access, NodeErrExt};`
+at module scope, then put this fragment in the node's `run` method:
 
 ```rust
 let account: Access = ctx.inputs.get("account")?;
-let conn = ctx.open(&account).await?;   // one resolve, one lease, this firing
-
-conn.client()          // &ClientWithMiddleware: signed in, measured if a meter exists
-conn.credential()?     // &str: ONLY when the sign-in is one string
-conn.value("imap_host")?    // one stored value by name, loud when absent
-conn.opt_value("alias")     // Option<&str>, for genuinely optional values
-conn.identity()             // the display identity, if recorded
+let conn = ctx.open(&account).await?;
+let response = conn.client()
+    .get(url)
+    .send()
+    .await
+    .node_err("calling the service")?;
 ```
 
-For the common case there is sugar:
+`url` is the service API address your node calls.
+For selecting an account in the editor, follow
+[Connect an account](connect-an-account.md).
+
+## Keep credentials out of the graph
+
+Config and port values are recorded in the journal and shown in the
+inspector. A password placed there becomes part of that record.
+
+Use an access node to collect credentials instead. It stores them in the
+access store and gives the graph a connection reference. For a new service,
+follow [Declaring a service](writing-a-service.md).
+
+The opened connection lets your implementation read values when it needs
+them. Keep secrets out of outputs, logs, and error messages.
+
+| Method | Returns |
+|---|---|
+| `client()` | The authenticated HTTP client |
+| `value("imap_host")?` | A stored value, or an error naming the missing field |
+| `opt_value("alias")` | An optional stored value |
+| `identity()` | The recorded display identity, if present |
+| `credential()?` | A single credential string, when the authentication recipe has one |
+
+`credential()` works when authentication consists of one step using one
+stored value, such as a bearer token. Basic authentication with a username
+and password has no single credential string, so this call fails.
+
+Use the raw credential only when an SDK requires it. If the SDK accepts an
+HTTP client too, give it the connection's client so its calls retain the
+authentication and measurement behavior.
+
+## Make calls through the connection
+
+The connection's client authenticates requests and applies any registered
+meter that recognizes them. A separately constructed client bypasses that
+work. Call the service's normal API address; the connection handles routing
+for a runtime-supplied credential.
+
+If you only need the client, use:
 
 ```rust
-let gh = ctx.client(&access).await?;
-gh.post(format!("https://api.github.com/repos/{repo}/issues"))
-  .json(&body)
-  .send().await.node_err("creating the issue")?;
+let client = ctx.client(&account).await?;
 ```
 
-Those four lines are the integration, and they are byte-identical across a
-pasted token, an OAuth grant, a minted installation token, and the runtime's
-own credential.
+A refusal such as "connect your own" needs to reach the user. Silently
+retrying through another client does not fix the missing connection.
 
-When the body finishes, any way at all, the runtime releases the lease.
+### Realtime connections
 
-## Secrets never go through config
-
-**Never add a config field asking the user to paste an API key, a token, or a
-password.**
-
-Node config and port values travel the execution journal and render in the
-inspector in plaintext. A connection's values are sealed in the store and only
-exist in the worker's memory while your node runs.
-
-If your service needs a pasted key, declare it as an access node with a paste
-acquisition, and the value is sealed in the store instead of the journal. See
-[Declaring a service](writing-a-service.md).
-
-## When `credential()` exists
-
-You never declare it. It is there exactly when the resolved auth is **one**
-step interpolating **one** stored value: a bearer key, a bot token.
-
-A Basic pair, a signing step, or two steps have no single string that means
-anything, and the call fails loudly naming the service.
-
-It is there for libraries that insist on a raw string. Do not stash it
-anywhere: not an output port, not a log, not an error, not a struct that
-outlives the call.
+Use `socket` for a provider's WebSocket API. In this fragment, `url`
+and `payload` follow that provider's protocol:
 
 ```rust
-// A library that insists on a string: hand it both.
-let generator = GeneratorInfo::openrouter(model)
-    .with_api_key(conn.credential()?)
-    .with_http_client(conn.client().clone());
-```
-
-## The rules that matter
-
-**Never construct your own HTTP client for a connection's calls.** Always take
-it from the opened connection. A hand-rolled client is invisible to the cost
-trail, and a runtime-supplied credential only works through the connection
-client's routing.
-
-**Address the service's real API.** The client does whatever routing a
-runtime-supplied credential needs, so your code never rewrites a URL.
-
-**Do not paper over a refusal.** When the runtime declines to supply its own
-credential, that is a loud error naming the fix ("connect your own"), and
-passing it on is the correct behavior.
-
-Redirects behave like any ordinary HTTP client's: followed, with authorization
-and cookie headers dropped across a host change.
-
-When you send media on a measured call, declare what you know about it
-(duration, dimensions). It sharpens the pre-flight estimate and never changes
-what is billed.
-
-## Sockets
-
-If the service has a realtime API, the same connection opens it:
-
-```rust
-let mut session = conn.socket("wss://api.example.com/v1/realtime?model=m").await?;
-session.send(SocketMessage::Text(payload)).await?;
-while let Some(frame) = session.recv().await? { /* ... */ }
+let mut session = conn.socket(&url).await?;
+session.send(weft::access::socket::SocketMessage::Text(payload)).await?;
+while let Some(frame) = session.recv().await? {
+    // Handle the provider's response.
+}
 session.close().await?;
 ```
 
-Same rules as the client. The runtime signs the handshake (the credential rides
-the handshake only, never a frame), routes the session, and measures it when
-the service's meter prices sessions. Never hand-roll a socket client for a
-provider.
+The connection signs the handshake and handles routing. A registered
+session meter can measure the exchange. Your node still implements the
+provider's message protocol. Use a trusted provider URL; direct sockets
+attach authentication even outside the meter's declared API base,
+including when using a runtime-owned credential.
+For that distinction, read [Runtime-owned credentials](meters.md#runtime-owned-credentials).
 
-## The lease window
+### Longer calls
 
-Every connection call assumes your provider work fits the default window of 15
-minutes, which is how long a runtime-supplied credential stays usable if your
-node crashes without finishing. On the user's own connected account it changes
-nothing.
+For a runtime-supplied credential, the default lease window is 15 minutes.
+The runtime releases the lease when the node finishes; the window bounds
+its lifetime if the worker crashes before cleanup.
 
-If your node wraps something that takes longer, say so:
+Declare a longer window when the provider's work needs one:
 
 ```rust
-let conn = ctx.open_within(&access, Duration::from_secs(3600)).await?;
+let conn = ctx.open_within(
+    &account,
+    std::time::Duration::from_secs(3600),
+).await?;
 ```
 
-## Declaring what your node needs
+This window does not change the lifetime of the user's own credentials.
 
-Say it on the access **input**, and the checks then run where the answer
-lives:
-live in the editor when a connection is picked, at connect time, and at
-run-time resolution.
+## Declare the requirements on the input
+
+For example, a node reading mail might require the connection's incoming
+server settings:
 
 ```json
-{ "name": "account", "type": "Access", "required": true,
-  "requiresScopes": ["chat:write"],
-  "requiresValues": ["imap_host", "imap_port"] }
+{
+  "name": "account",
+  "type": "Access",
+  "required": true,
+  "requiresValues": ["imap_host", "imap_port"]
+}
 ```
 
-There is deliberately no compile-time check, because source holds only a
-connection id.
+`requiresValues` checks that the named values exist. A missing value
+refuses resolution and tells the user what to add.
 
-### `requiresScopes`
+Use `requiresScopes` for permissions needed by the node's own calls:
 
-Declare **only** what your node's own runtime calls need on every path.
+```json
+{
+  "name": "account",
+  "type": "Access",
+  "required": true,
+  "requiresScopes": ["chat:write"]
+}
+```
 
-A permission that only one picker source needs (a browse-everything scope
-backing a list) belongs on that source's own `requires`, never here. Putting it
-here locks out every connection that would have used the picker or a pasted
-link.
+A verified permission shortfall refuses the connection. Claimed or unknown
+permissions are allowed through because weft cannot establish that they
+are missing; the provider can still refuse the request.
 
-A **verified** shortfall is a hard error. A claimed or unknown one is let
-through, because nobody actually knows, and a pasted key on a service that
-reports nothing must not be refused.
+A permission needed only to browse a resource list belongs on that picker
+source's `requires` field. Putting it on the input would also block
+people who can supply the resource through another source.
 
-A required permission may be an **own-account-only** capability, which the
-service's catalogue marks as such: the node's work creates or reads durable
-things **inside** the connected account (a minted voice, a configured agent),
-so a shared runtime credential can never serve it, because the result would
-land in the runtime's account. Declare it through the same `requiresScopes`.
-Resolution refuses the shared credential with that capability's setup guide,
-and the editor marks the node the moment a shared connection is picked.
+A service can declare capabilities that require the user's own account.
+Nodes request those through `requiresScopes` too. For declaring them,
+read [Own-account-only capabilities](writing-a-service.md#own-account-only-capabilities).
 
-### `requiresValues`
+These checks happen against the connection record. The compiler has a
+reference to that record, not its current credentials and permissions.
 
-For services whose optional fields decide what a connection can **do**. A
-mailbox holding the incoming half, the outgoing half, or both.
+## Allow an absent connection where the API supports it
 
-Unlike a permission set, the answer here is never unknown: a value is stored or
-it is not. So a shortfall **always** refuses, naming the value to add.
-
-## Working without a connection at all
-
-Some providers serve a link-shared resource with no sign-in: Google's
-spreadsheet CSV export, GitHub's normal API.
-
-**If a provider offers that, support it.** It costs the author little and it
-turns "connect your Google account" into "paste the link" for the many people
-whose file is already shared.
-
-Say the two limits when you say it works: only for a resource you already have
-the link to, and only where the provider really does serve anonymously.
-
-Best case, one address serves both worlds and the body has no branch at all,
-which is what GitHub's API does. Verify that before assuming it: Google's CSV
-export is anonymous-**only**, ignores a bearer token, and answers 404 for a
-private sheet, while its Sheets API is signed-in-only. So
-`catalog/google/sheets_read` branches on whether an account is connected, and
-both branches share the parsing so they answer identically.
-
-An access input declared `"required": false` **is** the declaration, and no new
-metadata is needed. `ctx.client` accepts the absent connection and answers a
-plain client:
+If the provider serves the resource without authentication, an optional
+access input lets users reach it without connecting an account.
+Declare `"required": false`, then read it as optional:
 
 ```rust
 let account: Option<Access> = ctx.inputs.opt("account")?;
 let client = ctx.client(account.as_ref()).await?;
 ```
 
-On a `required: true` input an absent value is an ordinary missing-input error,
-never a quiet bare request.
+With no account, this returns a plain client. Verify which API address
+supports anonymous access: a provider may use a different route for public
+resources, or refuse private resources on that route even with credentials.
 
-## Picking a resource
+## Pick a resource inside the account
 
-A connection says **which account**. Almost every real node then needs **which
-thing in it**: a spreadsheet, a channel, a repo.
+A connection selects an account. A `remote_select` field selects a thing
+inside it, such as a spreadsheet or channel.
 
-One field, and a list of sources you declare best-first. The editor uses the
-best one the picked connection actually supports and quietly drops the rest.
+Declare the ways users can supply that resource. The editor can combine
+supported sources, such as a list, a provider chooser, and a pasted link:
 
-| Kind | Where options come from | Needs |
-|---|---|---|
-| `granted` | recorded on the connection during sign-in | nothing, no call |
-| `list` | call the service and enumerate | its `requires` permissions |
-| `picker` | the provider's own chooser, declared entirely by you. Choosing **grants** the picked resource. | a connection |
-| `from_url` | paste a link; the pattern's first capture group is the id | nothing at all |
+| Source | How it fills the field |
+|---|---|
+| `granted` | Resources recorded during sign-in |
+| `list` | A provider API request, with its own required permissions |
+| `picker` | The provider's browser chooser |
+| `from_url` | The first capture group in a pasted URL |
 
-`from_url` needing nothing is what leaves the field standing with **no**
-connection: the works-without-signing-in path.
+This field accepts a spreadsheet link without making an API request:
 
-```jsonc
-{ "name": "spreadsheet", "type": "String", "required": true,
-  "widget": { "kind": "remote_select", "access": "account", "sources": [
-    { "kind": "list",
-      "requires": ["https://www.googleapis.com/auth/drive.readonly"],
-      "get": "https://www.googleapis.com/drive/v3/files?...",
-      "items": "files", "label": "name", "value": "id",
-      "page": { "cursor_param": "pageToken", "cursor_path": "nextPageToken" } },
-    { "kind": "picker",
-      "script": "https://apis.google.com/js/api.js",
-      "code": "await new Promise((r) => gapi.load('picker', r)); ...",
-      "grants": ["https://www.googleapis.com/auth/drive.file"],
-      "mime_types": ["application/vnd.google-apps.spreadsheet"] },
-    { "kind": "from_url", "pattern": "/spreadsheets/d/([a-zA-Z0-9_-]+)" } ] } }
+```json
+{
+  "name": "spreadsheet",
+  "type": "String",
+  "required": true,
+  "widget": {
+    "kind": "remote_select",
+    "access": "account",
+    "sources": [{
+      "kind": "from_url",
+      "pattern": "/spreadsheets/d/([a-zA-Z0-9_-]+)"
+    }]
+  }
+}
 ```
 
-The stored value is the bare id, which is what your node reads and what the
-field's `String` type holds. The human label the editor shows is a display
-cache, never source. Pasting a raw id fills the field just as well.
-A value arriving on the wire at run time skips the picker entirely, since there
-is nobody there to pick.
+The node also needs an `account` access input. Make that input optional
+if the node supports using the resource without signing in.
 
-### Writing a picker
+The editor stores the selection as `{"id": "...", "label": "..."}` in
+the source. The runtime unwraps it, so your node receives the ID as a
+`String`. Set the widget's `free_text` to `true` if users should also
+be able to type values the sources did not list.
 
-A `picker` is yours end to end, and it is the one place a node carries
-**browser JavaScript**, the same way an `ExecPython` node carries Python. Your
-`mod.rs` stays pure Rust and never sees any of it.
+A value wired into the input bypasses the picker.
 
-| Field | What it is |
+### Add a provider's browser chooser
+
+A `picker` source carries browser JavaScript in its metadata.
+Its `script` URL loads the provider's chooser library, then `code`
+runs inside an async function on a page served by weft.
+
+| Source field | Purpose |
 |---|---|
-| `script` | the https address of the provider's own chooser library, the one their embed docs tell every web developer to load |
-| `code` | plain browser JavaScript, usually adapted straight from the provider's sample. It runs on a small page weft serves, opened in the user's real browser, after `script` loaded, inside an async function, so top-level `await` works. |
-| `grants` | the permissions that choosing through this chooser grants on the picked resource, recorded when the pick lands |
-| `mime_types` | narrows the chooser, threaded to your glue |
+| `script` | HTTPS URL of the chooser library |
+| `code` | JavaScript that opens it and handles the result |
+| `grants` | Permissions the choice grants on the selected resource |
+| `mime_types` | Resource types passed to the chooser code |
 
-Your code talks to weft through one object, `weft`, already in scope:
+The code receives a `weft` object:
 
-| | |
+| Property or method | Purpose |
 |---|---|
-| `weft.token` | the connection's access token: the string you hand the chooser where its docs say "your OAuth token" |
-| `weft.clientId` | the **public** client id of the app behind the connection, or `null` when no app made it. Some choosers require an app identifier. |
-| `weft.mimeTypes` | your declared types, for choosers that filter |
-| `weft.done({id, label})` | the user picked this: the field fills with it |
-| `weft.cancel()` | the user closed it without picking: the field closes quietly |
-| `weft.fail(message)` | the chooser could not work: the message shows on the field in red |
+| `weft.token` | Connection token to pass to the chooser |
+| `weft.clientId` | Public app client ID, or `null` |
+| `weft.mimeTypes` | The declared resource types |
+| `weft.done({id, label})` | Return the selection |
+| `weft.cancel()` | Report cancellation; the user can then close the tab |
+| `weft.fail(message)` | Show an error on the field |
 
-Call exactly one of the three enders. The first call wins, and a thrown
-exception or rejected await becomes `weft.fail` automatically, so a provider
-error surfaces on the field instead of hanging it.
+Finish with one of `done`, `cancel`, or `fail`. The first call wins.
+An exception from the supplied code or a rejected `await` reports a failure
+too. Catch errors inside later provider callbacks and pass them to
+`weft.fail(message)`.
 
-So the recipe for any new provider is: open their "picker embed" docs, take
-their sample, replace their token slot with `weft.token`, and route their
-picked and cancelled callbacks into `weft.done` and `weft.cancel`. The page
-opens in the user's real browser, so a chooser that leans on the provider's own
-session finds it already there.
+Start from the provider's current embed example and connect its callbacks
+to these methods. For a complete metadata example, read
+[Google Sheets Read](https://github.com/WeavemindAI/weft/blob/mvp/catalog/google/sheets_read/metadata.json).
 
-A picked resource is as person-scoped as the connection itself, so both are
-re-chosen when a project changes hands, and an unresolvable one is a loud node
-error.
+## Publish a connection to a service your node runs
 
-## Handing out a connection to something your node runs
+An infrastructure node can publish credentials for its own database or
+bridge. Downstream nodes receive an ordinary `Access` value.
 
-If your node **runs** a service itself, a database it provisions say, it can
-hand out a connection to that service, and downstream nodes then reach it
-exactly like one a person connected.
+Declare the service and output in metadata:
 
 ```json
 "publishes": "postgres",
 "outputs": [{ "name": "access", "type": "Access" }]
 ```
 
+Then publish the service's declared fields from `run`:
+
 ```rust
-let values = BTreeMap::from([
-    ("host".into(), host), ("database".into(), db),
-    ("user".into(), user), ("password".into(), password),
-]);
 let access = ctx.publish_access(values).await?;
-ctx.pulse_downstream(NodeOutput::new().set("access", access)).await
+ctx.pulse_downstream(weft::NodeOutput::new().set("access", access)).await
 ```
 
-The call names no service: your metadata already did, and saying it twice is a
-way for the two to disagree. The values are the service's own declared fields,
-the same ones a person would have filled in, and anything else is refused right
-there.
+Here `values` is a `BTreeMap<String, String>` containing the service's
+connection fields. Missing required fields and undeclared names are
+rejected.
 
-The service's recipe stays where it always lives, on that service's access
-node. The compiler looks it up and attaches it at build time, which is why the
-name has to be declared rather than passed at run time: a built project carries
-only the node types its graph uses, so the access node is usually not in there,
-while the compiler sees the whole catalog. A name nothing declares fails the
-build.
+The compiler finds the service recipe in the catalog and attaches it to
+the built project. A `publishes` name with no matching service fails
+the build.
 
-The connection belongs to your node. Publishing again updates it, and
-terminating the node's infrastructure deletes it, so it lives exactly as long
-as the thing it opens. It is always the user's
-own credential; nothing a node publishes can resolve to the runtime's.
+Publishing again updates the node's existing connection. Infrastructure
+termination removes it as part of cleanup. A published connection uses the
+node's supplied values; it does not grant access to a runtime credential.
 
-### Ask for a once-only secret once
+### Preserve a secret before retiring it
 
-A well-built service mints its password on first boot and refuses to say it
-twice, so on later runs read it back from your own connection rather than
-asking the service again:
+The [Postgres database node](https://github.com/WeavemindAI/weft/blob/mvp/catalog/postgres/database/mod.rs)
+gets its password from the service on first use, publishes it, then tells
+the service to stop exposing it. Later runs use `ctx.published_access()`
+to retrieve the connection and confirm that its password still matches
+the database. A replaced disk may have generated a new one.
 
-```rust
-let password = match ctx.published_access().await? {
-    Some(mine) => ctx.open(&mine).await?.value("password")?.to_string(),
-    None => ask_the_container(&ctx).await?,
-};
-```
+Those operations are safe to repeat. If the worker dies after publishing
+but before retiring the password, the next run finishes that job.
 
-The two arms run on different runs, and a replay walks back through the steps
-it recorded, so the arms have to record the same ones. Give them the same sequence of
-`ctx.run` and `ctx.await_signal` calls, or none at all, and do not assume a body
-with no suspension point is exempt. Both rules and why they bite here:
-[the replay rule](../nodes/durable-execution.md#the-replay-rule).
-
-`catalog/postgres/database` is the worked example. It retires the password only
-once a connection holds it, and asks again on every run rather than only the
-one that read it, so a run that dies in between cannot leave a service nothing
-can sign in to.
+This example does not use `ctx.run` to record either branch.
+A lookup such as `published_access()` reads mutable state and can answer
+differently after a restart. If you add recorded steps around such a
+decision, follow [Keep the replayed path stable](../nodes/durable-execution.md#keep-the-replayed-path-stable).

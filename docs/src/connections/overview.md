@@ -1,242 +1,109 @@
 # How connections work
 
-Adding a service to weft is a JSON file.
+Credentials live in weft's own store, never in your program. An access step
+holds a reference to one. Any step that needs to call that service takes that
+reference as an input.
 
-## The one idea
+If you just want to connect something, read [Connect an
+account](connect-an-account.md). This page is about what happens behind that.
 
-A **connection** is an account somebody hooked up to an outside service. It
-lives in the access store and it holds everything secret, while a project's
-source holds a bare id and nothing else, which is why a credential can never
-end up in git history.
+## Four things that sound alike
 
-Every kind of credential is the same concept: an OAuth sign-in, a pasted API
-key, a GitHub App's private key, a mail server's host and user and password.
-One store, one connect flow (the node's Connect panel in the editor, or
-`weft connect` in a terminal), one way for a node to use it.
+| Thing | What it is | Where it lives |
+|---|---|---|
+| Service recipe | How to get a credential, sign a request, check permissions and receive events. The glossary calls this the recipe, and so does the rest of the book | The access step's metadata |
+| Registered app | An OAuth application the operator configured, with its secret and the redirect URLs it is allowed to use | The runtime's apps file |
+| Connection | One connected account: its values, permissions and identity | The access store |
+| `Access` value | The reference your program passes around | On the wire |
 
-## The four objects
+For OAuth, the app and the account are different things: the app is the
+software asking for permission, and the connection is the account that granted
+it. A pasted API key needs no app and still becomes a connection, and so does
+a hostname, username and password for a mail server.
 
-Three of them sit somewhere and are easy to mix up, so here they are side by
-side. The fourth is the one that moves, and it comes after.
-
-```
- RECIPE                     REGISTERED APP              CONNECTION
- in the access node's       in the operator's           a row in the access store
- metadata.json              apps file
-
- written by the node        written by whoever runs     created when a user
- author. Any user.          this weft. Trusted.         connects, or when a node
- Untrusted input.           Holds real secrets.         publishes one for a
-                                                        service it runs itself.
-───────────────────────    ────────────────────────    ─────────────────────────
- describes the SERVICE,     one OAuth app this weft     one account, hooked up:
- true for everybody:        signs users in with:        · who it is
- · how a credential is      · a label                   · through which app
-   acquired                 · client id + secret        · which permissions, and
- · how a request is signed  · the fixed permission        whether they are verified
- · the permission           set it asks for             · the stored values
-   catalogue                · pinned sign-in            · snapshots of the recipe
- · how it is verified         addresses                   and app it was made with
- · how events arrive        · event-receiving secrets
- · which doors exist
-```
-
-And the fourth: the **`Access` value**, which is what actually flows through a
-graph.
+Here is what actually moves between steps. It is small, and there is nothing
+secret in it:
 
 ```json
-{ "__weft_access__": { "accessId": "…uuid…", "service": "slack",
-                       "identity": "Acme Corp" } }
+{
+  "__weft_access__": {
+    "accessId": "connection-id",
+    "service": "slack",
+    "identity": "Acme Corp",
+    "requiresPermissions": ["chat:write"],
+    "requiresValues": []
+  }
+}
 ```
 
-An access node emits it, action nodes consume it. It is not a secret:
-resolving it requires being authenticated as the tenant that owns the row, and
-a missing row and another tenant's row give the same "not found", so existence
-never leaks.
+The two `requires` lists are stamped on per consuming step, from what that
+step said it needed, and a connection that falls short of them is refused when
+it resolves. For where the tenant wall stops and what you still have to keep
+private yourself, go and read the [security
+policy](https://github.com/WeavemindAI/weft/blob/mvp/SECURITY.md).
 
-## How they link
+## Shared credentials, or your own
 
-**By the service name string, and nothing else.**
+A service can offer shared, own, or both. The picker shows whichever of them
+your installation actually has.
 
-A recipe saying `"service": "slack"` reaches the apps filed under `"slack"`.
-The recipe travels with every connect request and the server looks the apps up
-itself. A connection snapshots both at creation, so using it later needs no
-catalog and no file lookup.
+**Shared** uses an app or credential the operator configured. For OAuth, their
+configuration fixes which permissions get asked for and pins the redirect URLs
+the provider sends people back to. Nothing a recipe says can widen
+either.
 
-Because the recipe is user-authored and the apps file is operator-owned, the
-recipe may use a registered app and can never extract from it. Five rules
-follow:
+**Own** means you bring or create the credentials. Depending on the service,
+that is a guided walk through creating an app, a button that creates one for
+you, or a form asking for the values.
 
-- **Pinned addresses.** Each registered app writes its own sign-in and token
-  addresses beside its secret. A shared connect whose recipe names any other
-  address is refused, so the app's credentials only ever go where the operator
-  wrote.
-- **Fixed permissions.** A shared connect's permission set is replaced by the
-  chosen app's declared set, from the trusted file. Nothing a client sends
-  widens it.
-- **Secrets stay compartmentalized.** An app's client secret is snapshotted
-  into its own field on the connection row. What a worker is handed comes from
-  a different field, and nothing ever copies between the two, so the secret has
-  no path to a node.
-- **Event material joins own-door connections only.** An app's event-serving
-  values (a socket token, a signing secret) merge into event resolution only
-  when the app is the user's own. A registered app's material serves
-  connecting, never event serving.
-- **The server resolves the app.** A connect request names a door and, for the
-  shared door, an app label. It never carries an app. The client is not the
-  security boundary.
+For configuring what is on offer, read [the apps file](the-apps-file.md). For
+declaring a service's options, read [declaring a
+service](writing-a-service.md).
 
-## Life of a connection
+## What weft can check about a credential
 
-```
-        the user clicks the access node's field
-                        │
-                        ▼
-          doors probe: what can this weft offer?
-          one option per registered app, plus
-          "your own" when offered
-                        │
-        ┌───────────────┴───────────────┐
-        ▼                               ▼
-   SHARED door                     OWN door: one page with up to
-   one click. The app is           three parts, whichever exist:
-   resolved by label from          · mint   ("create it for me")
-   the trusted file, and           · guide  (generated from the ticks)
-   permissions are its             · fields (paste; always there)
-   declared set.
-        │                               │
-        └───────────────┬───────────────┘
-                        ▼
-          the acquisition runs: consent, paste, a JWT mint,
-          a server-to-server exchange. It runs on the broker,
-          whose egress denies every private range.
-                        │
-                        ▼
-          the verification ladder, and an identity capture
-                        │
-                        ▼
-          one row: values, permissions and whether they are
-          verified, owner, door, label, identity, snapshots
-```
+Providers differ. A few state exactly what they granted, or let weft ask the
+credential to describe itself, and those two answers are the only ones weft
+treats as authoritative. Others confirm only that the credential is alive, or
+say nothing at all until a real call comes back refused.
 
-After that the connection appears in the picker for every project of that
-tenant, and picking it stores only its id on the node.
+weft records which of those answers it got. A permission it knows is missing
+blocks a step that needs it. A permission set that is only claimed, or
+unknown, is not enough to block on, so the call goes through and the provider
+may refuse it.
 
-## Doors
+Stored values are simpler. If a step needs `imap_host` and the connection does
+not have one, the step never starts.
 
-At most two kinds, and a door that is not offered is **hidden**, never greyed
-out.
+A service also says what its check costs to run, and only a `free` one runs on
+its own. Anything paid, or ambiguous because it might bill depending on the
+account, is skipped. So a bad credential sometimes shows up for the first time
+when a step tries to use it.
 
-**`shared`**: a credential this weft holds. A registered app for a
-consent-based service, or the runtime's own key for a key-based service, whose
-calls spend its credit and say so.
+## When a step makes a call
 
-**`own`**: the user brings or creates their own.
+The step opens its `Access` with `ctx.open`. The access store checks what that
+step declared it needs, and refreshes the credential if it has expired. What
+comes back is a client with the authentication already set up.
 
-A service whose auth includes a cryptographic signing step can never offer
-`shared`, and declaring both is a parse error. The shared lane substitutes the
-secret into the request, and a signed request carries a hash computed **from**
-the secret instead, so there is nothing to substitute.
+If a meter recognises the request, weft records what it cost. That is weft's
+own record, not the provider's bill. For the rules, read [measuring what a
+call costs](meters.md).
 
-## The verification ladder
+For using the connection from inside a step without leaking secrets into
+outputs and logs, read [using a connection](using-a-connection.md).
 
-What connect-time checking can learn about a fresh credential, best rung
-first.
+## Where the secrets are
 
-| Rung | What the provider tells us | Permissions recorded as |
-|---|---|---|
-| `reports_permissions` | what it granted, explicitly | **verified** |
-| `self_introspect` | the credential describes itself | **verified** |
-| `reports_validity` | only "alive", never "what" | claimed |
-| `probe` | a real call's refusal, read back | claimed |
-| `silent` | nothing knowable | claimed |
+Secret values are encrypted at rest with AES-256-GCM, keyed by
+`CREDENTIAL_ENCRYPTION_KEY`. Public metadata such as service names stays
+readable so weft can query it.
 
-A check's cost is `free`, `ambiguous`, or `paid`, and anything but `free` is
-**never auto-run**: the first real call surfaces the truth instead.
+If you have not set that key, weft falls back to a development key built into
+its own source, and warns you the first time it seals or opens anything. That
+key is public, so anyone holding a copy of your database can read every
+credential in it. Set a real one before you store a credential you care about,
+and keep it: lose it and every connection you had is unreadable. For setup and
+recovery, read [encryption](the-apps-file.md#encryption).
 
-Later, a permission shortfall hard-fails only on a **verified** set. A claimed
-set passes with a warning, because refusing would block every pasted key on
-every service that reports nothing.
-
-## Coexistence
-
-`grants` on the recipe records how the provider behaves. You do not get to
-choose it.
-
-`coexisting` is the Google class: one token per consent, and grants are per
-project.
-
-`exclusive` is the Slack-bot and GitHub-App class: **one** grant per app and
-account, and there is no way to have two. Re-consent rotates it in place, reuse inherits it, a
-permission upgrade unions onto it, and every referencing project follows.
-
-## Life of a call
-
-```
- node body                    runtime                        store / broker
-──────────────────────────────────────────────────────────────────────────────
- ctx.open(&access) ────────▶ resolve request ─────────────▶ the tenant wall
-                             (id, service, what it needs)  refreshes an expired
-                                                            token once, however
-                                                            many callers ask
-                             ◀───────────────────────────── values + auth steps
-                                                            + owner
-                             build ONE client:
-                               timeouts, redirect and
-                               address limits
-                             + auth           (always)
-                             + metering       (only if the service has
-                                               a meter)
-                             + routing        (only if the credential
-                                               says to)
- conn.client() ◀──────────── the signed-in client
- …the node makes calls…
- body finishes, any way ──▶ release the lease
-```
-
-What the worker receives is everything the connection stores **except** the
-store's own keep-alive material, meaning the refresh token. An app secret is
-not a stored value and cannot travel at all.
-
-Refresh is lazy, at resolution, single-flight through the row lock. A revoked
-credential is a loud "needs reconnecting" error naming the fix, never a silent
-retry.
-
-## Encryption at rest
-
-Every stored secret is sealed with AES-256-GCM under
-`CREDENTIAL_ENCRYPTION_KEY`: a grant's values, an app snapshot, a pending
-consent's verifier, a subscription's echo token.
-
-A database dump alone carries no usable credential. Only non-secret row data
-stays plain (service names, permission sets, value **names**, the public
-client id) so queries can work on it.
-
-Unset, a built-in development key is used with a logged warning. Set a real one
-(`openssl rand -base64 32`) before storing credentials you care about, and see
-[the apps file](the-apps-file.md#encryption) for what changing it later costs
-you.
-
-## Measured and billed are separate switches
-
-Measured and billed sound like one switch, and they answer different questions.
-
-A registered **meter** for the service means its calls are measured, whoever
-pays.
-
-The **owner** on the connection row decides whose money: the user's own
-credential is measured and not billed; the runtime's is measured and billed.
-
-A node declares neither, and node code cannot tell which combination it is
-running in. The same node runs correctly in every combination.
-
-## Where things run
-
-| Component | Its job |
-|---|---|
-| **Editor** | renders the picker and the doors, sends pasted values straight to the store, runs the live requirement check when a connection is picked. Never holds an app, never decides permissions. |
-| **Dispatcher** | the authenticated front door. Forwards connect verbs, serves the OAuth callback and the picker page, answers pure-database reads. |
-| **Broker** | every verb whose work makes an **outbound** call to a URL the tenant influences: test calls, token exchanges, lookups, app mints, event subscribes. Its egress denies every private range, so a crafted URL aimed at an internal address dies at the network layer. |
-| **Access store** | the rows, the tenant wall, the lazy refresh, the permission and value backstops. |
-| **Worker** | opens connections per firing, builds the one signed-in client, runs node code. |
-| **Listener** | holds event sources, resolving the connection freshly through the broker on every reconnect, so credentials are never frozen into a loop. |
+For the event path, read [events from a service](events.md).

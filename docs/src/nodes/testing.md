@@ -1,287 +1,213 @@
 # Testing a node
 
-Every node can carry its own tests, in Rust, next to its code. They run
-without building a project and without a valid graph, and all but the last
-tier below need no credentials and no network.
+You can test a node's Rust body without building a graph or starting the
+weft runtime. Give it inputs, run it with a test context and check what it
+emits. The tests live beside the implementation, so the person changing the
+node can check that job on its own.
 
-End-to-end tests cover runtime mechanisms, one per mechanism, riding some real
-node as a vehicle. Node-level correctness goes here.
+## Test the word counter
 
-## The three tiers
-
-**`basic`** is for pure logic: no ctx, no I/O, just a function and some
-assertions.
-
-**`fake`** runs the node's full `run` (or `setup_trigger`) body against a fake
-ctx: canned provider responses, in-memory storage, canned signal payloads. No
-credentials, no network, no cost.
-
-**`live`** runs the node's body through the production access path: real
-connection resolution, real provider calls, metered and billed like any run.
-It needs a grant for the declared service and it can spend money, so runners
-require an explicit opt-in and confirm before the first run.
-
-## Where they live
-
-In a `tests.rs` inside the node's folder, never in `mod.rs`. `mod.rs` carries
-only the bridge, gated behind the `node-tests` feature, which is what keeps
-tests out of every project binary.
+For the `WordCount` from [Your first node](your-first-node.md), add this
+declaration to `nodes/word_count/mod.rs`, outside the trait implementation:
 
 ```rust
-// mod.rs
 #[cfg(feature = "node-tests")]
 mod tests;
+```
 
-#[async_trait]
-impl Node for MyNode {
-    #[cfg(feature = "node-tests")]
-    fn tests(&self) -> Vec<weft::NodeTest> {
-        tests::tests()
-    }
+Inside `impl Node for WordCountNode`, add:
 
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> { ... }
+```rust
+#[cfg(feature = "node-tests")]
+fn tests(&self) -> Vec<weft::NodeTest> {
+    tests::tests()
 }
 ```
 
+Keep the existing `run` method. The feature guard includes these tests in
+the test build and leaves them out of the program's normal build.
+
+Create `nodes/word_count/tests.rs`:
+
 ```rust
-// tests.rs
 use serde_json::json;
-use weft::{FakeRig, LiveRig, NodeTest, WeftResult};
-use super::MyNode;
+use weft::{FakeRig, NodeTest, WeftResult};
+use super::WordCountNode;
 
 pub fn tests() -> Vec<NodeTest> {
-    vec![
-        NodeTest::basic("parses_the_answer", || {
-            assert_eq!(super::parse("x=1")?, 1);
-            Ok(())
-        }),
-        NodeTest::fake("posts_and_emits", posts_and_emits),
-        NodeTest::live("one_real_call", "myservice", one_real_call),
-    ]
+    vec![NodeTest::fake("counts_whitespace_separated_words", counts_words)]
 }
 
-async fn posts_and_emits(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/api/send", json!({ "ok": true, "id": "m1" }));
-
-    let outcome = rig
-        .run(&MyNode, json!({ "account": rig.access("myservice"), "text": "hi" }))
-        .await
-        .ok()?;
-
-    assert_eq!(outcome.outputs["id"], json!("m1"));
-    rig.assert_sent("POST", "/api/send");
-    Ok(())
-}
-
-async fn one_real_call(rig: LiveRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(&MyNode, json!({ "account": rig.access("myservice"), "text": "hi" }))
-        .await
-        .ok()?;
-
-    assert!(outcome.output("id")?.is_string());
+async fn counts_words(rig: FakeRig) -> WeftResult<()> {
+    for (text, expected) in [
+        ("hello from weft", 3),
+        ("  \n\t", 0),
+        ("one,two  three", 2),
+    ] {
+        let outcome = rig
+            .run(&WordCountNode, json!({ "text": text }))
+            .await
+            .ok()?;
+        assert_eq!(outcome.outputs["count"], json!(expected), "input: {text:?}");
+    }
     Ok(())
 }
 ```
 
-Test names are snake_case sentences:
-`posts_to_a_channel_and_emits_the_permalink`,
-`a_failed_permalink_read_never_fails_the_post`.
+The cases pin down what “word” means: blank text has no words, repeated
+whitespace does not add words, and a comma does not split one.
 
-Fake and live are **separate declarations** by design. A fake test asserts
-exact payloads against canned responses; a live test asserts loosely against
-real provider output. One shared function would force mushy assertions on
-both.
-
-Assertions may panic. A panic fails that one test with its message, never the
-whole run.
-
-## The fake rig
-
-| Call | What it does |
-|---|---|
-| `rig.respond(method, path, json)` | a canned 200. Matching tries `path?query` first, then the bare path. |
-| `rig.respond_status(...)` | a refusal status |
-| `rig.respond_raw(...)` | XML, CSV, binary bodies |
-| `rig.access(service)` | a connection marker to place on the node's access input |
-| `rig.connection_value(service, name, value)` | a stored value the opened connection answers |
-| `rig.connection_permissions(service, granted)` | the scopes the grant came back with |
-| `rig.signal(payload)` | queue a payload for the node's next `await_signal` |
-| `rig.wake(payload)` | the wake payload for the next run: how a trigger fire is emulated |
-| `rig.run(node, inputs)` | run the body. `inputs` is a JSON object; declared defaults fill anything absent. |
-| `rig.run_setup_trigger(node, inputs)` | the trigger registration body |
-| `rig.requests()` / `rig.assert_sent(method, path)` | the request log |
-| `rig.registered_signals()` / `rig.logs()` | what registration and `ctx.log` recorded |
-| `rig.execution_tags()` / `rig.stops()` | what `ctx.tag_execution` and `ctx.stop_tagged` asked for (nothing is stopped: a fake run has no siblings) |
-| `rig.store_file(filename, mime, bytes)` | seed a stored file, get its value for a file input |
-| `rig.output_type(port, type)` | declare a port's resolved type, for ports whose type the compiler normally works out from the `.weft` source |
-| `rig.bus(&outcome.outputs["port"])` | the live bus behind an emitted marker |
-| `rig.run_provision_infra(node, inputs)` | run an infra node's provision body and get the spec |
-
-A `Generator[T]` input takes its value as a plain JSON **array**. The rig
-pre-loads a live, already-finished feed with those items, so the body's pull
-loop runs unmodified.
-
-Storage is an in-memory map. `ctx.run` memo steps run fresh, because there is
-no journal.
-
-Two properties to rely on:
-
-**A fake run can never reach the real network.** `ctx.http()` and a
-connection-less `ctx.client(None)` answer from the same canned routes as
-rig-opened connections, so an undeclared plain call fails loudly rather than
-quietly hitting the internet from your test suite.
-
-**Anything the fake does not support yet fails loudly naming the gap**, never
-as a silent no-op.
-
-The rig also enforces the production emission contract: undeclared output
-ports and double emissions fail exactly as they would in a real run.
-
-## The live rig
-
-`rig.access(service)` hands back the resolved grant's marker for that service.
-`rig.run` mirrors the fake rig, but every capability behind the ctx is the
-production one. Each run mints a throwaway execution identity, so its cost
-records belong to that run alone and are reported with the result.
-
-- `rig.connect()` opens the grant as a real connection for the **test's own**
-  setup and teardown: create a resource before running the node, delete what
-  the node created after.
-- `rig.bus(opts)` is a real bus as a writer plus a marker, for driving a
-  node's bus input.
-
-### Live tests spend real money
-
-So drive the cost of each one as low as the provider allows.
-
-Pick the **cheapest** model or tier that still exercises the node's real path,
-and query the provider's price catalog rather than assuming. Use the smallest
-inputs: one image, the shortest clip, a one-line prompt, the fastest quality
-setting. Mint any needed input material on the cheapest route too.
-
-The live tier must still **cover** the node. Every node whose body
-talks to a provider gets at least one live test, and the set across a package
-should touch the node's main use cases rather than one configuration's happy
-path.
-
-### Clean up after yourself
-
-Live tests prefer self-provisioned targets: act on a resource named
-`weft-node-tests` in the connected account, creating and cleaning up whatever
-the API allows. Everything a test creates is deleted before it returns, so
-repeated runs never pile artifacts onto someone's account.
-
-Deliberate exceptions only where the artifact **is** the proof: a sent email, a
-chat message.
-
-Where cleanup is impossible, `rig.fixture("NAME")` reads a value you supply:
-see [giving the live tier what it needs](#giving-the-live-tier-what-it-needs).
-
-### Fixtures are declared
-
-You declare every fixture your live test reads, on the test itself.
-
-```rust
-NodeTest::live("one_real_send", "telegram", live_send).with_fixture(fixture_spec(
-    "TELEGRAM_CHAT_ID",
-    "Chat id",
-    "The chat the test sends into.",
-)),
-```
-
-A fixture is described with the same shape node inputs use, so a runner renders
-it with the machinery it already has, widgets included.
-
-- `fixture_spec(name, label, description)` for a plain text parameter.
-- `fixture_spec_like(manifest, input_name, fixture_name)` clones one of the
-  node's own inputs and renames it, so the fixture inherits that input's
-  widget. The Sheets tests declare `GOOGLE_SHEET_ID` off the node's
-  `spreadsheet` input and inherit its picker.
-
-The CLI checks them **before** a live run starts, failing up front with every
-missing variable at once, before any grant or pod.
-
-## Giving the live tier what it needs
-
-A live test talks to a real account, so weft has to resolve a connection for
-the service it declares before it can run one. Three ways to give it one, and
-the easiest depends on the service.
-
-**Connect the account in the editor**, on any project of yours, and
-`weft test-node --tier live` picks that connection up by itself. This is the
-normal path, and the only one for a service you sign in to rather than paste a
-key for, such as Slack or Google. If you have several and want a specific one,
-`--connection <service>=<grant-id>`.
-
-**Paste a throwaway key** with `--key <service>`, which prompts for each of
-that service's fields on stdin and deletes the connection it made when the run
-finishes. Right for a key you do not want stored.
-
-**Put the key in the environment** as `WEFT_NODE_TEST_<SERVICE>_<FIELD>`, for
-example `WEFT_NODE_TEST_EXA_KEY`. Same throwaway connection as `--key`, without
-the prompt, which is what a scripted run wants.
-
-If none of the three is there, the run stops before touching anything and names
-all three.
-
-**Fixtures come from the environment too.** A test that needs a target it
-cannot create for itself reads `WEFT_NODE_TEST_<NAME>`, so a declared
-`SLACK_CHANNEL_ID` fixture reads `WEFT_NODE_TEST_SLACK_CHANNEL_ID`. Every
-missing one is reported before the run starts rather than as you hit it.
-
-These are ordinary environment variables, and the CLI reads the nearest `.env`
-walking up from wherever you ran it, so your project's own `.env` is where they
-normally live. Gitignore it.
-
-## Running them
+From the project root, run:
 
 ```bash
-weft test-node                                  # every package's basic + fake tests
-weft test-node slack                            # one package
-weft test-node SlackSendMessage                 # one node
-weft test-node SlackSendMessage --test posts_to_a_channel
-weft test-node web --tier live                  # the live tier (confirms first)
-weft test-node web --tier fake --tier live      # several tiers
-weft test-node web --tier live --key exa        # a throwaway key, deleted after
-weft test-node web --tier live --connection <grant-id>
+weft test-node WordCount --test counts_whitespace_separated_words
 ```
 
-`--tier` is repeatable. Without it, basic and fake run. **Live never runs
-implicitly.**
+This compiles the test on your machine, so you need a Rust toolchain.
+It does not need the daemon. After changing the node, run all its tests
+with `weft test-node WordCount`.
 
-`--parallel` runs tests concurrently: bare for everything at once, `--parallel N`
-to cap in-flight tests. The report keeps declaration order either way.
+## Choose what the test exercises
 
-Basic and fake runs compile the package's test crate on the host and run it
-directly: no cluster, no daemon, no project build. Live runs go through the
-runtime, each test in a short-lived pod with a worker's identity, so connection
-resolution and metering are exactly the production path.
+| Tier | Use it for | What runs |
+|---|---|---|
+| `basic` | A parser or other helper with no context | A Rust function and its assertions |
+| `fake` | The node body, including the requests it builds | The body with canned responses and in-memory services |
+| `live` | Checking the integration against a real provider | The body through the runtime's connection path |
 
-That covers writing and running your own nodes. Sweeping the **whole shipped
-catalog**, which is what you do after changing something in weft that every
-node sits on, is a different job with its own runner:
-[CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md#tests).
+A basic test looks like
+`NodeTest::basic("parses_the_answer", || { /* assertions */ Ok(()) })`.
+Fake tests receive a `FakeRig`, as the word counter does. A live test
+declares the service it needs:
+`NodeTest::live("sends_a_message", "telegram", sends_a_message)`.
+Its function receives a `LiveRig`.
 
-## Tests are never interactive
+An assertion panic fails that test and appears in the report.
+Use assertions that catch the mistake you care about. A fake provider
+response can prove your parser handled that response; a live call checks
+whether the provider still speaks the protocol you expect.
 
-A test body must not read stdin or wait on a human. Every input comes from its
-own inputs, from self-provisioning, or from a declared fixture, and a missing
-one fails loudly naming what to set.
+## Fake provider calls and events
 
-Once any grant field for a service comes from the environment, the whole grant
-is environment driven, so a sweep never stops on a prompt. The only prompt left
-is the one-time live-spend confirmation, and its "don't ask again" answer
-silences it for good.
+Before running a node that calls a service, register a response with the rig:
 
-## What not to write
+```rust
+rig.respond("POST", "/api/send", json!({ "ok": true, "id": "m1" }));
+```
 
-- **No per-node end-to-end tests.** If a test needs the dispatcher, the
-  journal, or a real graph, it is testing a mechanism. Write or extend the one
-  end-to-end test for that mechanism instead.
-- **No tests in `mod.rs`.** A node folder's unit tests belong in `tests.rs` as
-  basic entries. Package-level shared helper files, which are not nodes, keep
-  ordinary `#[cfg(test)]` blocks.
-- **No live tests on trigger or infra nodes.** There is nothing to test live
-  without the provider pushing real events at real infrastructure, so the
-  runner refuses them and `fake` is the top tier for those.
+Give the node `rig.access("myservice")` on its connection input. Calls
+through the context's HTTP clients are answered by the fake routes;
+unmatched requests fail. You can inspect the request with
+`rig.requests()` or assert that it happened with
+`rig.assert_sent("POST", "/api/send")`.
+
+The fake clients do not reach the real network. Arbitrary Rust that creates
+its own client is outside that interception, which is another reason to
+use the framework's clients in your node.
+
+| If the test needs… | Use |
+|---|---|
+| An HTTP error response | `rig.respond_status(method, path, status, body)` |
+| A non-JSON body | `rig.respond_raw(method, path, status, content_type, bytes)` |
+| Stored connection values | `rig.connection_value(service, name, value)` |
+| Known granted scopes | `rig.connection_permissions(service, granted)` |
+| A durable wait's next payload | `rig.signal(payload)` |
+| An event delivered to a trigger's body | `rig.wake(payload)` |
+| The trigger registration method | `rig.run_setup_trigger(node, inputs)` |
+| An infrastructure declaration | `rig.run_provision_infra(node, inputs)` |
+| A file input | `rig.store_file(filename, mime, bytes)` |
+| A type normally resolved from the graph | `rig.output_type(port, type)` |
+
+Response matching tries the path with its query string first, then the
+bare path. The rig does not simulate redirects: register the final response
+directly. Declaring a 3xx response panics.
+
+A `Generator[T]` input takes a JSON array; the rig presents its
+items as an already-finished stream.
+
+You can inspect registrations with `rig.registered_signals()`, log entries
+with `rig.logs()`, and steering requests with `rig.execution_tags()` and
+`rig.stops()`. A fake stop records the request; it has no other executions
+to stop.
+
+Storage lives in memory. `ctx.run` executes its closure fresh because this
+rig has no durable journal. To test recovery or interactions between nodes,
+use a runtime test for that mechanism. For the distinction and repository
+test commands, read
+[Contributing](https://github.com/WeavemindAI/weft/blob/mvp/CONTRIBUTING.md#tests).
+
+## Run a live test deliberately
+
+Live tests use a real account and can create resources or incur provider
+charges. Use a test account and small inputs, and clean up the resources
+your test creates. If a message or email is the intended result, choose a
+recipient who expects it.
+
+A live test uses `rig.access(service)` and `rig.run` like the fake test.
+Use `rig.connect()` when the test itself needs a connection for setup or
+cleanup. Assertions should check the behavior you need without depending
+on an exact response that the provider is free to vary.
+
+To supply the account:
+
+- Connect it in the editor. The runner can use that stored connection.
+  If there are several, select one with
+  `--connection service=grant-id`. A bare grant ID also works when the
+  selected tests need exactly one service.
+- For a key-based service, pass `--key service` to enter a temporary key.
+  The runner deletes the temporary connection afterwards. If cleanup fails,
+  it prints the command to remove it.
+- For an unattended run, set the credential fields as
+  `WEFT_NODE_TEST_<SERVICE>_<FIELD>`, such as `WEFT_NODE_TEST_EXA_KEY`.
+  This also uses a temporary connection.
+
+The CLI loads the nearest `.env` while walking up from the working
+directory. Keep files containing credentials out of Git.
+
+### Giving the live tier what it needs
+
+A live test may need something it cannot create, such as a destination chat.
+Declare that fixture on the test:
+
+```rust
+NodeTest::live("one_real_send", "telegram", live_send)
+    .with_fixture(weft::fixture_spec(
+        "TELEGRAM_CHAT_ID",
+        "Chat id",
+        "The chat the test sends into.",
+    ))
+```
+
+Read it inside the test with `rig.fixture("TELEGRAM_CHAT_ID")?`.
+Supply it as `WEFT_NODE_TEST_TELEGRAM_CHAT_ID`. The CLI checks required
+fixtures before launching the live tests and reports missing values
+together.
+
+If the fixture should use the same picker as a node input,
+`fixture_spec_like(manifest, input_name, fixture_name)` copies that input's
+declaration.
+
+## Select the tests to run
+
+```bash
+weft test-node WordCount
+weft test-node slack
+weft test-node SlackSendMessage --test posts_to_a_channel_and_emits_the_permalink
+weft test-node web --tier live
+weft test-node web --tier fake --tier live
+```
+
+Without `--tier`, the runner selects basic and fake. Supplying `--tier`
+replaces that default, so `--tier live` runs only live tests. Repeat the
+option when you want several tiers.
+
+Live runs ask for confirmation unless you have saved the preference to
+skip it or pass `--yes` for that invocation. Test bodies should get their
+inputs from fixtures or setup code; they should not prompt the person
+running them.
+
+Use `--parallel N` to limit concurrent tests to `N`. Bare `--parallel`
+removes the concurrency limit. Local packages still run one at a time;
+tests within the package can run together. Reports keep declaration order.
+If you omit the target entirely, the command selects all test-declaring
+packages in the project's catalog.

@@ -1,0 +1,20 @@
+---
+name: flow-3-implement
+description: "Fully implement the agreed plan in one long autonomous session"
+---
+
+The design is settled, the plan is written, and I'm going away. Implement it completely, without me, in this session. Switch to [code mode].
+
+Implement as if a paranoid reviewer will tear it apart line by line afterward, because one will. Every hole you leave now becomes a round of the slow, expensive review loop later, so the work is not "make it pass", it's "leave no hole". As you write each piece, hunt the ways it could be wrong before moving on: the unhandled edge, the silent failure path, the concept you just forked instead of extending, the shape that's secretly a patch, the contract you half-changed on one side of a boundary, the dead branch you left behind, the place data flows two directions. The project rules ([decision framework], no fallbacks, fail loud, DRY, testing pyramid, language-vs-node separation, the migration rules in MEMORY.md) are how you decide each line as you write it, not a post-hoc checklist. If something you're about to write feels even slightly off, that feeling is the signal: reshape it now, while the context is loaded. "It's fine, the reviewer will catch it" is banned.
+
+One failure mode to watch for the whole time: you'll plug the new thing into an existing piece of architecture, something already built, adjacent to what you're building. The natural move is to reuse it and connect cleanly. But often that existing piece has a latent flaw nobody ever surfaced, and by plugging into it correctly you inherit the flaw, so your new code is wrong because the thing under it was wrong, and that only blows up rounds later. The tell is that connecting feels subtly off, awkward, like bending your code around a shape that doesn't quite make sense. That feeling is usually not "my code is wrong"; it is "the existing architecture I'm reusing is wrong and no one caught it". When you feel it, do NOT just dependency yourself onto the bad shape and move on. Investigate the existing piece, and if it really is flawed, reshape that upstream architecture so the thing you're building connects the right way. Fixing the foundation is part of this implementation, not scope creep.
+
+How to handle the reshape decision: apply [the fork rule] from the project rules in .codex/config.toml exactly, don't re-derive it. No real fork, or a fork the rules plus how I think obviously resolve: choose and keep implementing, stopping on an obvious call is the bad outcome. Genuine fork, or every option is bad: surface it with the evidence and the branches and wait.
+
+Draft a todo list from the plan and keep exactly one item in progress at a time, refreshing the plan as discoveries change the picture. Build the final shape, never an intermediate one. Write tests at the right layer as you build, per the pyramid, not all at the end. Match the surrounding code's conventions, naming, and comment density so it reads like it was always there.
+
+It does not matter how non-trivial or time-consuming the proper thing is. Never take a shortcut, never stop early because something turned out big. "This step is large or tedious" is never a reason to stop, and neither is "I think it's fine, I'll let the reviewer check". The only reasons to stop before it's done are the two genuine blockers from [the fork rule]: a fork the plan didn't anticipate, or something that breaks the plan's core assumption (surface it with evidence, don't silently route around it). The job is the plan fully done and verified: it compiles, the tests pass.
+
+You never commit and never stage. The whole point of this flow is that I review the uncommitted diff when you are done; a commit takes that away from me. Leave every change in the working tree, unstaged, however many logical pieces it has. If a plan says "one commit per item", that is a note for me, not an instruction for you.
+
+When you're done, report below the `---` line: what you built, what you tested, and anything you noticed along the way that I should know before I start manually testing.

@@ -1,148 +1,139 @@
 # Talking to a live caller
 
-[Suspension](durable-execution.md) is a **disconnected** wait: the worker
-parks and dies.
+If a program starts from an HTTP request or a WebSocket connection, its
+nodes can answer the caller through `ctx`. They share the connection
+attached to that execution.
 
-When someone hits an `ApiEndpoint` (HTTP) or `LiveSocket` (WebSocket) trigger,
-the dispatcher routes that held connection to one worker, which stays alive on
-the open socket for the life of the request. Any node downstream of the trigger
-can talk back over it.
+The connection belongs to a worker. If that worker dies, the socket is
+lost. To let the work outlive its caller, enable `canSuspend` on the trigger
+and give the caller another way to retrieve the result. For saving progress
+across restarts, read [Surviving a restart](durable-execution.md).
 
-A live caller is not durable: the connection is pinned to that worker and dies
-with it. Work that has to survive a restart goes through
-[suspension](durable-execution.md) instead.
+## Answer an HTTP request
 
-## Getting the handle
-
-```rust
-let http = ctx.http_caller().await?;   // fails loud if this run has no HTTP caller
-let ws = ctx.ws_caller().await?;
-```
-
-Those are the one-call forms for a node that only makes sense on one protocol.
-Each folds the whole chain (a caller is present, it is the right protocol, the
-connection barrier passed) and fails loudly naming the trigger to wire it
-under.
-
-For a node that branches:
+Inside a node's `run` method:
 
 ```rust
-ctx.caller()             // Option<CallerHandle>, an enum over the two protocols
-ctx.is_api_call()
-ctx.is_websocket()
-ctx.caller_data_type()   // the declared shape: Json, Text, Bytes
+use weft::caller::OutboundChunk;
+
+let http = ctx.http_caller().await?;
+http.respond(OutboundChunk::Json(
+    serde_json::json!({ "message": "Hello from weft" }),
+)).await?;
 ```
 
-`is_api_call` and `is_websocket` are separate questions because there are three
-answers, not two: HTTP, WebSocket, or nobody on the line at all.
+Wire this node downstream of an `ApiEndpoint` trigger.
+`http_caller()` checks the protocol and waits for the caller to attach;
+it returns an error if the execution has no suitable caller.
 
-`CallerHandle` is protocol-typed, so the type is honest about what each side
-can do. An HTTP caller has no `send`; a WebSocket caller has no `respond`.
+| Method | Use it to |
+|---|---|
+| `request_parts()?` | Read the incoming request |
+| `write(chunk).await?` | Stream part of the response |
+| `respond(body).await?` | Send the final body and finish the response |
+| `close().await?` | Finish without another body |
 
-## HTTP
+`respond` and `close` end the response. A second attempt to end it
+returns an error, including one from another node sharing that caller.
 
-```rust
-http.request_parts()?           // the inbound request
-http.write(chunk).await?        // stream a chunk
-http.respond(body).await?       // send the final body
-http.close().await?
-```
+For a complete node, read the
+[HTTP responder fixture](https://github.com/WeavemindAI/weft/tree/mvp/crates/weft-e2e/fixtures/web_trigger/nodes/http_responder).
 
-`respond` and `close` are terminal. The first one wins and a second errors
-loudly.
+## Read and reply over WebSocket
 
-## WebSocket
-
-```rust
-ws.send(chunk).await?
-ws.recv_next().await?       // Some(msg), or None when the stream ends
-ws.receive().await?         // the typed-error form of the same read
-ws.request(chunk).await?    // send, then await one reply
-ws.close().await?
-```
-
-Both protocols share `is_connected()` and one `ensure_connected().await?`
-barrier, which waits for the caller's socket to actually attach before you
-talk into it.
-
-A read is **unbounded**. A node may wait minutes or hours for the caller's
-next message; only a disconnect or the trigger's session cap ends the wait.
-
-### The loop
+Wire a node downstream of `LiveSocket` and get its connection with
+`ctx.ws_caller().await?`. This body fragment echoes JSON and text messages;
+for binary messages it returns their byte count:
 
 ```rust
 use weft::caller::{InboundMessage, OutboundChunk};
+use serde_json::{json, Value};
 
-async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    let ws = ctx.ws_caller().await?;
+let ws = ctx.ws_caller().await?;
 
-    while let Some(msg) = ws.recv_next().await? {
-        let v = match msg {
-            InboundMessage::Json(v) => v,
-            InboundMessage::Text(s) => Value::String(s),
-            InboundMessage::Bytes(b) => json!({ "bytes": b.len() }),
-        };
-        ws.send(OutboundChunk::Json(json!({ "echo": v }))).await?;
-    }
-
-    let _ = ws.close().await;
-    ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
+while let Some(message) = ws.recv_next().await? {
+    let value = match message {
+        InboundMessage::Json(value) => value,
+        InboundMessage::Text(text) => Value::String(text),
+        InboundMessage::Bytes(bytes) => json!({ "bytes": bytes.len() }),
+    };
+    ws.send(OutboundChunk::Json(json!({ "echo": value }))).await?;
 }
 ```
 
-`recv_next` yields `Some(msg)` per message and `Ok(None)` when the stream ends
-for good: the caller disconnected, the session timed out, or it expired. A
-consumer that fell behind comes back as an `Err` instead, because that gap is
-resumable and must not be read as the end, so the language does the
-end-of-stream classification for you and a real failure propagates through
-`?`. When you need to distinguish the exact outcome, `receive()` returns the
-typed error so you can match every case.
+`recv_next` waits for a message without a per-read deadline. It returns
+`None` when the stream ends, including disconnection or the configured
+session limit. Unexpected failures return an error and propagate through
+`?`. Cancellation can also stop the node while it waits.
 
-## Two readers, no race
+A custom trigger can set `LiveConnectionConfig::max_session_secs` to cap
+the session's total duration. Zero disables that cap. The catalog triggers'
+shared input reader leaves it at zero; it is not a source field you can
+set on those nodes.
 
-Inbound on a WebSocket is **broadcast** and forward-only, the same model as a
-bus. `ws.receive()` reads messages arriving after you got the handle, with the
-position pinned at the moment you obtain it, so a reader that attaches after a
-message was sent still sees it.
+| Method | Use it to |
+|---|---|
+| `send(chunk).await?` | Send a message |
+| `recv_next().await?` | Read a message or finish a loop when the stream ends |
+| `receive().await` | Read while handling specific `CallerError` variants yourself |
+| `request(chunk).await` | Send, then read the next inbound message |
+| `close().await?` | Close the connection |
 
-Every reader has its own position, so a responder and an observer can both run
-off one socket.
+`request` does not match replies to requests. It returns the next
+message at this reader's position, which might be an unrelated event.
+If the protocol uses request IDs, your node needs to match them.
 
-### Reading history
+## More than one reader
 
-Mint a positioned cursor, the same concept as a bus:
+WebSocket messages are broadcast. Separate handles obtained from `ctx`
+have independent read positions, so a responder and an observer can both
+read the same messages.
 
-```rust
-ws.cursor_from_start()        // everything still retained in RAM
-ws.cursor_at(offset)
-ws.cursor_including_last()    // forward, plus the single most recent message
-ws.now_offset()
-ws.retained_floor()
-```
+The handle's starting position is fixed at connection attachment.
+Messages that arrive before your node begins reading are still available
+if the in-memory window retains them. Cloning an existing handle shares
+its read position; create a new cursor when you want an independent reader.
 
-Offsets are absolute over the connection's whole life, so a saved offset keeps
-naming the same message as the retention window moves.
+| Method | Starting position |
+|---|---|
+| `ws.cursor()` | After the messages already received |
+| `ws.cursor_from_start()` | Earliest message still in memory |
+| `ws.cursor_at(offset)` | Specified absolute offset |
+| `ws.cursor_including_last()` | Most recent message, then future messages |
 
-A cursor reads the in-RAM window only. When its offset has been trimmed out,
-the read returns `FellBehind { oldest_resident }` and the cursor is moved
-there, so the next read resumes at the earliest message still retained.
+`now_offset()` gives the next offset after the latest message;
+`retained_floor()` gives the earliest one still in memory.
+
+If your reader falls behind that window, the read returns
+`CallerError::FellBehind { oldest_resident }` and advances its position
+to that oldest retained message. Use `receive()` if you want to handle
+that error and continue. The next read can resume there, but the missing
+messages are no longer available to the cursor. Cursors do not fetch
+older messages from the journal.
 
 ## Lifetime: tied to the caller, or surviving it
 
-One field on the trigger, `canSuspend`, is the whole lifetime axis.
+The trigger's `canSuspend` field decides whether the execution may
+outlive its connection.
 
-**Off (the default).** The run is tied to the caller, so a disconnect cancels
-it and a node that hits a durable `await_signal` holds the worker briefly and
-then the run is killed. This is what a request-response API wants.
+With the default `false`, disconnection cancels the execution. If all
+remaining work becomes suspended while the caller is still connected,
+the runtime keeps the connection open for `defaultHoldSecs`, currently
+60 seconds by default. If no signal lets it continue before that hold
+expires, it cancels the execution. One branch reaching a wait does not
+cancel other branches that are still working.
 
-**On.** The run may suspend and resume later without the caller, becoming a
-background job. A disconnect does not kill it, and further sends go into the
-void.
+With `canSuspend: true`, disconnection allows the work to continue.
+A durable wait can suspend the execution and resume it later without a
+caller. Further sends after disconnection deliver nothing, so arrange
+another way to collect the result.
 
-## Worked examples
+## Nodes that support either protocol
 
-Two live in the end-to-end test fixtures, so they run on every pass of the
-suite:
+Use `ctx.caller()` to get an optional `CallerHandle`, whose variants
+are HTTP and WebSocket. You can also ask `ctx.is_api_call()`,
+`ctx.is_websocket()`, or `ctx.caller_data_type()`.
 
-- `crates/weft-e2e/fixtures/web_trigger/nodes/http_responder`
-- `crates/weft-e2e/fixtures/live_chat/nodes/ws_echo`
+The handle exposes `is_connected()` and `ensure_connected().await?`.
+If your node supports only one protocol, prefer `http_caller()` or
+`ws_caller()`; those methods perform the connection check for you.

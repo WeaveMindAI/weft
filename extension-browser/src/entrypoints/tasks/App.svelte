@@ -428,7 +428,7 @@
 
 <svelte:window on:keydown={onKeyDown} />
 <svelte:head>
-  <title>{currentTask?.title || 'WeaveMind Task'}</title>
+  <title>{currentTask?.title || 'Weft Task'}</title>
 </svelte:head>
 
 <div class="page">
@@ -487,7 +487,7 @@
           <div class="card-header"><div class="dot error"></div><span class="card-title">Not connected</span></div>
           <div class="card-body center">
             <p class="big-msg">No tokens configured</p>
-            <p class="hint">Add a token in the extension popup to connect this page to your WeaveMind projects.</p>
+            <p class="hint">Add a token in the extension popup to connect this page to your weft projects.</p>
             <button class="btn btn-secondary" style="margin-top: 16px" onclick={refresh}>Refresh</button>
           </div>
         </div>

@@ -1,294 +1,167 @@
 # How a weft program runs
 
-Most people arrive already holding a model, and it is nearly right, which is
-the hard case.
+weft calls the steps of a program **nodes**. A node can send its answer before
+it has finished, or sit waiting for a week while the rest of the program
+carries on. So if you want to predict what a program will do, do not read it
+top to bottom. Look at what arrives at each step's inputs.
 
-The model is: it is a DAG. Nodes are tasks, edges are dependencies, something
-walks the graph in topological order and runs each task when its dependencies
-are done. Airflow, Prefect, a build system.
+## Values arrive one at a time
 
-That model gets you a long way and then breaks in three places. It cannot
-express a node that produces nothing. It cannot express the same node running
-twice at once on different data. And it cannot express a task that pauses for a
-week.
+When a step emits, the value travels along every arrow leaving that output.
+Each delivery is a **pulse**, aimed at one input, and carrying a tag saying
+which run it belongs to. One output wired to three inputs is three deliveries.
 
-All three come from the same difference: in weft, nothing walks the graph.
-Values move, and nodes react to them arriving.
+A step waits until every input with an arrow into it has either a value or a
+closure. Optional inputs count too: an arrow is an arrow. Inputs can also be
+satisfied by a value written into the step or by a default, so not everything
+needs an arrow.
 
-## Pulses
+Once every wired input has settled, weft decides whether the step runs or is
+skipped. A step with nothing wired into it has nothing to wait for, so weft
+just starts it when the run begins.
 
-When a node finishes its work it **emits** values on its output ports. Each
-emission becomes a **pulse**: a small object carrying a value, addressed to
-exactly one input port on exactly one node.
+## How a branch stops the steps after it
 
-```mermaid
-flowchart LR
-    A["classify<br/><i>LlmInference</i>"] -- "pulse: {response: &quot;critical&quot;}" --> B["reply<br/><i>SlackSendMessage</i>"]
-```
+A **closure** means: nothing is ever coming out of here, for this run. It is
+how a step says no rather than saying nothing. Everything downstream can then
+stop waiting for it.
 
-A pulse carries more than its value:
+It is not the same as `null`. `null` is a value, and a port whose type allows
+`null` will take it like any other.
 
-| Field | What it is |
-|---|---|
-| `value` | the JSON value being delivered |
-| `target_node` / `target_port` | where it is going |
-| `color` | which execution it belongs to |
-| `frames` | which loop iteration it belongs to |
-| `closed` | whether it carries a value at all |
+For an ordinary step:
 
-A pulse sits at its destination port and waits. **A node fires when every one
-of its required input ports is holding a pulse**, and all of those pulses
-agree on their color and their frames. Then it fires, consuming them.
+- A closed required input skips the step.
+- A closed optional input lets the other inputs decide.
+- If every input closed, the step skips, and so does one whose `@require_one_of` inputs all closed.
+- `_should_flow` set to false, or closed, skips the step.
 
-A node with no inputs has nothing to wait for, so it fires immediately. That is
-where an execution starts.
-
-## What a firing is
-
-One firing is one call to the node's `run` body, with those pulses as its
-inputs. It produces zero or more emissions and then returns.
-
-A firing is not a process. It is an execution id and an iteration number, so
-the same node can be firing four times at once inside a parallel loop, told
-apart by those numbers. That is the second place the DAG model breaks, and it
-is why weft talks about firings rather than about running a task.
-
-## The closed pulse
-
-A node does not have to emit on every output port. When it emits on some ports
-and not others, the ports it left out get **closed**: a pulse is sent down
-each of those wires carrying no value, meaning "nothing will ever arrive here,
-at this color, at these frames. Stop waiting."
-
-What the receiving node does with it depends on one thing:
-
-- If the closed pulse lands on a **required** input, the node cannot run. It is
-  **skipped**, and it closes all of its own outputs in turn.
-- If it lands on an **optional** input (declared with a trailing `?`), the node
-  fires anyway, with that input simply absent.
-- If it lands on `_should_flow`, the node is skipped whatever else arrived:
-  that port is the one that decides whether the node runs at all, and a
-  closure on it means nothing ever said yes.
-
-So a skip cascades forward, closing everything downstream, until it reaches a
-node that opted into handling absence.
+A skipped step closes its own outputs, which can skip the next step, and the
+next, until the closures reach something that can carry on with what it has.
 
 ```mermaid
 flowchart LR
-    G["triage"] -- "closed" --> S1["send_alert<br/>(skipped)"]
-    S1 -- "closed" --> S2["log_alert<br/>(skipped)"]
-    S2 -- "closed" --> S3["notify<br/>(skipped)"]
-    style S1 stroke-dasharray: 4 4
-    style S2 stroke-dasharray: 4 4
-    style S3 stroke-dasharray: 4 4
+    choice[Switch] -->|true| send[Send]
+    choice -. closed .-> review[Review skipped]
+    review -. closed .-> archive[Archive skipped]
 ```
 
-## Branching is just that
+Streams close differently. A closure on a stream is the stream's end rather
+than a skip, so a reader whose stream carried nothing still runs and sees that
+nothing came.
 
-There is no `if`, no `try`/`catch`, and no conditional edge anywhere in the
-language. A branch is a node that did not run, and everything behind it
-closing in turn.
+A failed step also closes whatever it had not already sent. An output it
+already sent does not get taken back.
 
-Every node has a `_should_flow` input deciding whether it runs at all. Leave it
-alone and the node runs. Wire it, and a `false` (or a closure, meaning whatever
-decides never spoke) skips that node, which closes its outputs, which skips
-everything behind it.
+## Choosing a branch, and joining back up
 
-```weft
-reply = SlackSendMessage {
-  _should_flow: review.escalate_approved
-  text: classify.response
-}
-```
+Every step has `_should_flow`, and it defaults to true. Wire a true or false
+value into it to decide whether that step runs.
 
-Both branches of a conditional exist in the graph; the one that was not taken
-goes dark. Two nodes turn that into a shape you can read:
+`Switch` gives you one output port per case. It tries the cases in the order
+you wrote them, and the first one that matches emits `true` while every other
+one closes. Wire a case's port into a step's `_should_flow` and that step runs
+on that case only. If nothing matches and you gave it no `otherwise`, they all
+close.
 
-- `Switch` tests a value against its cases and emits `true` on the one port
-  the winning case names, closing the rest. Each case's kind is its test
-  (`equals`, `in`, `between`, `otherwise`, and the rest). Wire a case's port
-  into the `_should_flow` of whatever that branch runs.
-- `FirstInOrder` takes the branches back to one wire: it emits the first of its
-  inputs that carried a value, in the order they are written, so the answer a
-  person approved can sit above the automatic one and never be overtaken.
+To bring two alternative answers back into one arrow, use `FirstInOrder`. It
+waits for its wired inputs to settle and then takes the first one that
+actually supplied a value, **in written order**. Written order is the
+priority, so moving those lines around changes which answer wins. Which one
+arrived first makes no difference.
 
-A `Group` or a `Loop` takes `_should_flow` too, so one line turns off a whole
-subgraph: it closes the group's outputs, which closes everything inside it,
-however deeply nested.
+Say a sensitive question goes to a person for approval and everything else
+goes straight ahead. Only one of those two can supply an approval, and
+`FirstInOrder` takes whichever it was.
 
-The same rule explains the rest:
+## One step, several runs at once
 
-- A node that fails closes its outputs, so a failure propagates exactly like an
-  absent value, and a downstream node with an optional input is the recovery
-  path.
+A **firing** is one go at one step. Three things say which firing you are
+looking at: the run, the step, and the loop iterations it sits inside. Inside
+a parallel loop the same step can have several firings alive at the same time.
 
-- A trigger that did not fire closes its outputs, so the branches belonging to
-  other triggers go dark and the branch belonging to the one that fired runs.
-- A loop iteration that failed to write its gather port leaves `null` at that
-  index, which is why a gather output is typed `List[T | Null]` and the
-  compiler makes you say so.
-- A node whose every input is optional would run even when everything upstream
-  is dead, which is a bug you almost never want, so the compiler warns and
-  suggests `@require_one_of`.
+Those iteration numbers are called **frames**. Work at the top level has none,
+and work inside two nested loops carries one frame for each. weft only ever
+combines inputs whose run and frames match, which is what stops iteration
+three eating iteration four's answer.
 
-## Groups and loops are compile-time only
+An ordinary output emits at most once per firing, though it can emit on one
+output now and another later. Whatever it never mentions is closed when it
+finishes. Generators and buses have their own rules, in [Live
+channels](live-channels.md).
 
-Neither exists at run time. The compiler flattens a group into two boundary
-nodes and a loop into a pair of them, and their children become ordinary nodes.
+Groups and loops do not exist at run time. The compiler turns each group into
+a pair of boundary steps and each loop into a `LoopIn` and `LoopOut`, and
+hands weft one flat graph with the scope information attached. So folding a
+group in the editor costs nothing at run time, and neither does nesting groups
+inside groups. For the boundary rules, read [Groups](groups.md) and
+[Loops](loops.md).
 
-So what the executor ever sees is one flat graph of nodes and pulses. Nesting,
-folding and iteration were all resolved by the compiler before it started.
+## What happens when you hit run
 
-## Frames
+A **manual run** starts every step at the top level that has nothing wired
+into it, plus every trigger in the project, wired or not. Triggers get no
+event on a run like that, so they close their outputs. Only the paths that do
+not need an event go anywhere.
 
-A `frames` value is a stack of loop iteration indices. Top level is the empty
-stack. Inside a loop's third iteration it is `[2]`. Inside the fifth iteration
-of a loop nested in that one it is `[2, 4]`.
-
-Two pulses only meet at a node if their frames match, so iteration 2's data can
-never combine with iteration 4's. Nothing copies the graph per iteration: there
-is one graph, and pulses that know which iteration they belong to.
-
-## What actually runs
-
-A weft program has no `main`, and nothing declares an entry point. Every
-node the run reaches runs. What differs between the kinds of run is where
-the first pulses are put.
-
-**A manual run** kicks every root: a node at the top level that no wire
-feeds. From there pulses go wherever the wiring takes them, and a node runs
-the moment its inputs are settled. A branch nobody reaches stays blank.
-
-You can start narrower:
+To run part of a project:
 
 ```bash
 weft run --target daily_report --target alert
 ```
 
-which runs those two nodes and what they need, and nothing else: the run
-is held to the targets' upstream, so a root they share with another branch
-(a database the whole file reads) never drags that branch in, and nothing
-past a target runs either. Several targets run the union of what each
-needs, independent branches side by side. Any node can be a target. A
-target inside a group brings the whole group, and whatever feeds the
-group's inputs runs first, the same as when the group starts in a full
-run. In the graph, right-click a node and choose **Set as target**; the
-Run button then says how many targets it is aimed at.
+weft takes those steps and everything feeding into them, stopping the walk
+when it reaches a trigger. Whole groups and loops come along if a target is
+inside one. A step that several branches share does not drag those other
+branches in.
 
-An aimed run answers to what it would execute, reading "what it would
-execute" as the joined upstream walk from every target at once:
+A **trigger firing** picks the work downstream of that trigger, plus whatever
+that work needs upstream, again stopping at other triggers. Only the trigger
+that actually fired gets the event; any others close. Two triggers can share
+the steps in the middle without becoming one run.
 
-- **If no trigger sits anywhere in that walk**, the run is an ordinary
-  one-shot, so the Run button appears next to Activate / Deactivate even in a
-  project full of triggers. This is how a maintenance branch works: a chain
-  the triggers cannot reach, fired by hand whenever you need it, for example
-  the enrollment door in the
-  [telegram example](https://github.com/WeaveMindAI/weft/tree/main/examples/telegram-image-bot).
-- **Only the infra inside that walk gates it.** A run cannot start while
-  an infra node it would touch is not running, the same rule as a plain run;
-  but infra elsewhere in the project has no say, since this run never touches
-  it. The Run button greys out accordingly, and `weft run --target ...`
-  refuses with the same message until you `weft infra start`.
+## How a run ends
 
-**A trigger fire** runs one program: the trigger that fired, everything
-downstream of it, and everything upstream of that, stopping at other
-triggers on the way up. At fire time a trigger's outputs are the event, not
-a function of its inputs, which were read once at activation, so a node that
-only feeds a trigger has nothing to contribute. Every other trigger in that
-set is kicked with no payload, which closes its outputs, and
-[the skip cascade](#the-closed-pulse) prunes the branches that belong to it.
+A run is finished when there is no work left and nothing still in flight. It
+does not need an end step. A run can also end two other ways:
 
-A node the fired trigger cannot reach belongs to another program in the same
-file, and a value that spills into it from a shared node (one database feeding
-two programs) is dropped with no row. One file can hold several programs, one
-per trigger, and a middle section both of them need is picked up by whichever
-one fired without you saying so. What that buys you when laying a project out:
-[one file, several programs](../start/reading-the-graph.md#one-file-several-programs).
+| State | What it means |
+|---|---|
+| Failed | A step failed, or weft could not get any further |
+| Cancelled | A person, or another run, stopped it |
 
-A group or a loop is reached as a whole. When a scope's boundary settles, the
-launcher kicks every root inside it at the scope's frames, and a run aimed at
-a node inside a group brings the whole group.
+A run can also pause without ending. Suspended means a step is parked waiting
+for an answer from outside, and the run carries on when that answer comes.
 
-## When it ends
+If work is left that can never proceed, weft reports the run as stuck and
+names the steps and inputs involved. A run parked on a person's answer is
+suspended, not stuck.
 
-An execution is finished when no pulse is in flight and no node is waiting for
-one. There is no terminal node and nothing declares completion.
+## What survives a restart
 
-Two ends that are not completion:
+As a run goes, the worker writes down each thing that happened, in a log
+called the journal. Those records are what the graph shows you. They are also
+what a replacement worker reads to rebuild a run that was interrupted. A step
+whose completion was safely written down does not run again.
 
-- **Suspended.** Every live firing is parked on a wait for an external event. The
-  worker exits. The execution is alive and costs nothing.
-- **Stuck.** The engine can prove no remaining node can ever proceed, because
-  every one of them is waiting on one of the others. That is a graph-shape bug
-  and it fails loudly rather than hanging: the failure names each node left
-  holding a value and the wired inputs it never received.
+A step whose completion was not written down runs again from the top.
+`ctx.run` gives back a saved result rather than redoing the work, but an
+external action can still happen twice if the worker died before the result
+was recorded. Read [Surviving a restart](../nodes/durable-execution.md) before
+you put side effects around a wait.
 
-And one end that is a decision: **cancelled**. A person pressed Stop, or
-another run of the same project stopped this one. A run can tag itself, and
-any sibling carrying that tag can be stopped, even one parked on a person or
-a timer. The journal records who did it. For how a node asks for that, go
-and read [Stopping other runs](../nodes/steering-executions.md).
+## What the build catches for you
 
-## The journal, and why waiting is free
+The compiler checks that every arrow's types fit, that every required input is
+covered, that no wire crosses a scope boundary it should not, that there are
+no cycles, and that the loop and channel restrictions hold. It also runs
+whatever validation rules a step declares for itself.
 
-Everything above happens in a worker process, in RAM: pulses are values in
-memory and the drive loop is an ordinary loop.
+Some things are checked when you build and some only when you run, so a build
+can succeed and a value can still be rejected later, when a step emits
+something its declared output type does not allow.
 
-Alongside it, the worker writes an append-only **journal**, one row per event,
-as it goes. Nothing reads that journal back during a normal run. It is read
-only when a worker has to rebuild an execution it did not run: it folds the
-rows in order, reconstructs the pulse table and which nodes completed or
-suspended, and carries on from there.
-
-That buys:
-
-- **A human pause costs a database row.** `HumanQuery` parks a firing, and when
-  the last live firing parks, the worker exits. Ten thousand executions waiting
-  on ten thousand people are ten thousand rows and no processes.
-- **Crashes are survivable.** A worker that dies mid-execution is replaced, and
-  the replacement folds the journal and continues, without re-running the nodes
-  that had already completed.
-- **A failure is readable.** A run from last Tuesday is still legible node by
-  node, with the actual values on the actual wires.
-
-Weft's execution guarantee is at-least-once. A crash can lose the write that
-recorded a node's completion, so a node that had already finished when its
-worker died **is re-run** by the replacement. When a node's work must not
-happen twice, `ctx.run` makes it happen once and replays the recorded result
-afterwards. See [Surviving a restart](../nodes/durable-execution.md).
-
-## The compiler's half
-
-None of the above is checked at run time. Before an execution exists, the compiler has already read the whole
-graph and refused it if:
-
-- any connection's types do not match,
-- any required input is unwired,
-- there is a cycle in the wire graph,
-- a type variable was never pinned to anything concrete,
-- a node's own config validation failed,
-- a loop's configuration is internally contradictory,
-- a trigger sits somewhere a trigger cannot sit.
-
-The full list is in [What the compiler refuses](diagnostics.md).
-
-What is left after a successful compile is external: a service is down, an API
-errors, a person never answers.
-
-## The shape of the whole thing
-
-```mermaid
-flowchart TD
-    S[".weft source"] --> P["parse<br/><i>lossless syntax tree</i>"]
-    P --> F["flatten<br/><i>groups and loops become<br/>boundary nodes</i>"]
-    F --> E["enrich<br/><i>attach each node's declared<br/>ports from its metadata</i>"]
-    E --> V["validate<br/><i>types, completeness,<br/>graph shape</i>"]
-    V --> C["codegen<br/><i>emit a Rust crate</i>"]
-    C --> B["cargo build<br/><i>a native binary</i>"]
-    B --> R["run<br/><i>pulses, journal,<br/>suspend, resume</i>"]
-```
-
-Read the next chapters in whatever order you need. [Syntax](syntax.md) is the
-surface, [Types](types.md) is what the checker checks, and
-[Groups](groups.md) and [Loops](loops.md) are the two structures that make
-large programs stay readable.
+It cannot check whether a step does useful work. A model can return a
+perfectly typed answer that is wrong. For the exact rejections, read [What the
+compiler refuses](diagnostics.md). To start writing weft yourself, carry on to
+[Syntax](syntax.md).

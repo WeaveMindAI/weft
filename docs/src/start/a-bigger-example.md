@@ -1,146 +1,105 @@
 # A bigger example
 
-Everything in the book so far has been one idea at a time. This is a whole
-program: a Telegram bot that draws pictures, and charges a credit for each one.
+The [Telegram image bot](https://github.com/WeaveMindAI/weft/tree/mvp/examples/telegram-image-bot)
+turns a chat message into a picture. Before it calls the model it takes one
+credit off the sender's balance, kept in the program's own database. No
+account or no credits, and they get a polite refusal instead.
+
+It is worth opening because it is the first program here with real parts: an
+outside service, a database of its own, a model call, and a form for you to
+fill in. Open `examples/telegram-image-bot` from your weft checkout as a
+project in VS Code, and keep the whole folder, because the program reads its
+SQL, its Python and its prompts from the files sitting next to `main.weft`.
+
+## Get it running
+
+It needs three accounts: Telegram, fal and OpenRouter. Click **Connect** on
+each access step in the graph, or run `weft connect` in the project folder and
+work through the prompts. Either way the credential goes into weft's own
+store, and the program only ever holds a reference to it.
+
+Model calls and image generation spend real money on those accounts. The bot's
+own credits are a separate thing: they are just rows in its database.
+
+Then bring up the database, which the program declares for itself:
+
+```bash
+weft infra start
+```
+
+Now give yourself an account. Right-click the `enroll` step, choose **Set as
+target**, and run. That runs the enrollment path on its own, which creates the
+table and then waits on the **Add a user** form. Fill it in from the browser
+extension with your numeric Telegram user id and a starting balance, leaving
+the balance empty for five. Wait for that run to finish.
+
+Turn the bot on with `weft activate`, then send it a picture request in
+Telegram. Open the run in the graph and watch the credit check, the prompt
+being written, and the reply going back.
+
+## Read it with the groups shut
+
+There are two groups. `credit` decides whether this person may proceed, and
+`brief` turns their message into a prompt for the image model. One line
+between them decides everything:
 
 ```weft
-telegram = TelegramAccess
-db = PostgresAccess
-fal = FalAccess
-
-ask = TelegramReceiveMessage { account: telegram.access }
-
-credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal?: String) {
-  # Take one credit off this telegram account, or say why we cannot.
-  # The query reads the sender's id as `$telegram_id`.
-  debit = PostgresExecuteQuery(telegram_id: String) {
-    query: @file("sql/spend_credit.sql")
-    account: self.db
-    telegram_id: self.telegramUser
-  }
-
-  # `refusal` says nothing when the credit was taken
-  read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal?: String) {
-    code: @file("scripts/outcome.py")
-    rows: debit.rows
-  }
-
-  self.paid = read.paid
-  self.refusal = read.refusal
-}
-credit.db = db.access
-credit.telegramUser = ask.user
-
-sorry = TelegramSendMessage {
-  account: telegram.access
-  chatId: ask.chatId
-  text: credit.refusal
-}
-
-brief = Group(request: String) -> (prompt: String) {
-  # Turn what they typed into an image prompt
-  write = LlmInference -> (response: String) {
-    prompt: self.request
-    provider: OpenRouterProvider { model: "anthropic/claude-sonnet-4.5" }.provider
-    params: LlmParams { systemPrompt: @file("prompts/image_brief.md") }.params
-  }
-  self.prompt = write.response
-}
-brief.request = ask.text
 brief._should_flow = credit.paid
-
-picture = FalGenerateImage {
-  model: "fal-ai/flux/dev"
-  imageSize: "square_hd"
-  account: fal.access
-  prompt: brief.prompt
-}
-
-reply = TelegramSendMedia {
-  kind: "photo"
-  account: telegram.access
-  chatId: ask.chatId
-  file: picture.image
-  caption: brief.prompt
-}
 ```
 
-Somebody messages the bot. One credit comes off their balance if they have
-one, a model turns their message into an image brief, fal draws it, and the
-picture goes back to the chat. No credits, or no account at all, and they get
-told so instead.
+If `paid` is false, the whole `brief` group is skipped and no image is ever
+requested. The refusal goes to `sorry`, which sends it to Telegram. If the
+credit was taken, `credit.refusal` closes, so `sorry` has nothing to send and
+skips itself. Exactly one of the two branches speaks.
 
-Three files sit beside it, none of them weft:
+The picture travels as a reference to a stored file, not as bytes on the wire.
+The Telegram step reads the file when it sends the message.
 
-| File | What it holds |
-|---|---|
-| `sql/spend_credit.sql` | one statement that takes a credit and reports what happened |
-| `scripts/outcome.py` | turns the query's row into `paid` and, when it failed, a sentence |
-| `prompts/image_brief.md` | the system prompt that turns a message into an image brief |
+## Open the credit group
 
-`@file` pulls each one in as that field's value, so the SQL lives in a real
-`.sql` file your editor can highlight while still being the node's config.
-The query's parameter is a port the node declares for itself,
-`PostgresExecuteQuery(telegram_id: String)`, and the SQL reads it as
-`$telegram_id`. For what
-else `@file` can do, and its read-only sibling, go and read
-[Files and reuse](../language/files-and-reuse.md).
+It takes a database connection and a Telegram user id, and its children read
+those as `self.db` and `self.telegramUser`.
 
-## The credit group
+`sql/spend_credit.sql` takes one credit off, but only if the balance is above
+zero, and reports why it did not when it did not. Then `scripts/outcome.py`
+turns that row into the group's two outputs:
 
-```weft
-credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal?: String)
+```python
+row = rows[0]
+if row.get("refusal"):
+    return {"paid": False, "refusal": row["refusal"]}
+return {"paid": True}
 ```
 
-A group is a node with a graph inside it. Its children can only reach each
-other and `self`, which is why the database connection comes in as a port:
-`db` is out in the file where the children cannot see it, so the group asks for
-it. In return you can fold the whole thing shut and read the program without
-it. For what else the boundary buys you, go and read
-[Groups](../language/groups.md).
+Notice that the success case never mentions `refusal`. That omission is what
+closes the output, and the closed output is what keeps the apology quiet. It
+is worth reading [the closed pulse](../language/mental-model.md#how-a-branch-stops-the-steps-after-it)
+if that feels like sleight of hand, because it is the rule the whole language
+branches on.
 
-## Two endings from one query
+## Two front doors, one program
 
-The whole check is one statement, so the read and the debit cannot drift apart
-between two queries:
+`ask` receives Telegram messages. `join` shows the enrollment form. They start
+different runs and share the same database, and neither can trigger the other.
+That is why adding a user never draws a picture, and why a Telegram message
+never opens the enrollment form.
 
-```sql
-with account as (
-  select id from users where telegram_id = $1
-),
-spent as (
-  update users set credits = credits - 1
-  where telegram_id = $1 and credits > 0
-  returning id
-)
-select
-  (select id from spent) as user_id,
-  case
-    when not exists (select 1 from account) then 'this Telegram account is not linked to an account'
-    when not exists (select 1 from spent) then 'you have no credits left'
-  end as refusal
-```
+It is also why the table gets created inside the enrollment path rather than
+somewhere separate: the first enrollment builds it, so the door looks after
+itself.
 
-The two endings are driven by one value. When the credit goes through,
-`outcome.py` returns no `refusal` key at all, so that port closes. `sorry`
-needs that text to run, so it is skipped and nobody gets an apology. The other
-way round, `paid` is false, the `brief` group is told not to flow, and
-everything inside and behind it (the model, fal, the reply) is skipped
-instead.
+## What it does not do
 
-For the whole rule, go and read
-[How a weft program runs](../language/mental-model.md#the-closed-pulse).
+The credit comes off before the picture is made. If generation or delivery
+fails, nobody gives it back, and nothing stops the same request being charged
+twice. That is fine for an example and not fine for anything real, so if you
+grow this into something that bills people, those are the two things you have
+to design on purpose.
 
-## Why nothing marks the endings
+This is a good program to start changing. Ask Tangle for a different image
+prompt, or a human approval before the model runs, or another way to top up
+credits. Change one thing, run it, look at what came out.
 
-The picture and the apology are the two things this program is for, and
-neither says so: a fire of `ask` runs everything it reaches, and each ending
-runs or skips on its own `_should_flow`. For how a run picks its nodes, go and
-read [How a weft program runs](../language/mental-model.md#what-actually-runs).
-
-## Where to go next
-
-For the syntax used here, wires written inside a node's braces and port
-signatures given inline, go and read [Syntax](../language/syntax.md).
-
-Next: [when something goes wrong](troubleshooting.md).
+For more of the language, carry on to
+[how a program runs](../language/mental-model.md). If a run did not do what
+you expected, [when something goes wrong](troubleshooting.md).

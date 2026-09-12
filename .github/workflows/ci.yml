@@ -31,6 +31,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  public-proxy:
+    name: public proxy routes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 deploy/tests/test_public_proxy.py
+
   rust:
     name: cargo test + clippy
     runs-on: ubuntu-latest

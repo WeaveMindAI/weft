@@ -1,12 +1,11 @@
 # The browser extension
 
-The extension is how a running program asks a person a question and waits for
-the answer.
+This is how a running program asks somebody a question and waits for the
+answer.
 
-When an execution reaches a `HumanQuery` node it suspends, and the task appears
-in the extension of everyone whose token is allowed to see it. Someone answers,
-and the execution resumes exactly where it stopped, whether that took a minute
-or a week.
+When a run reaches a `HumanQuery` step it parks, and the task turns up for
+everyone whose token can see it. Somebody answers and the run carries on from
+where it stopped, whether that was a minute ago or last week.
 
 ![A pending approval task in the extension](../img/extension-popup.png)
 
@@ -19,36 +18,20 @@ brief: The extension popup open in a browser toolbar, showing one pending task:
        task below it so the list nature is visible. Clean, no dev tools open.
 --------------------------------------------------------------------------- -->
 
-## Build it
+## Install it
 
-If you want the extension, ask for it, because the default install skips it:
-rebuilding it bumps versions and signs for Firefox, which is slower than a
-normal build and rarely what you are after.
+The extension is in the [Firefox
+store](https://addons.mozilla.org/en-US/firefox/addon/weft-tasks/) and the
+[Chrome Web
+Store](https://chromewebstore.google.com/detail/weavemind/mddobmalhoelphnmhbenmbmeibfpoppm);
+the [latest
+release](https://github.com/WeaveMindAI/weft/releases/tag/mvp-latest) also
+carries a zip for every browser (Chrome, Firefox, Edge, Opera, Safari) if your
+browser has no store listing or you prefer installing by hand.
 
-```bash
-./setup.sh --browser --no-sign
-```
-
-That writes an unpacked build per browser under `extension-browser/build/`
-(for Chrome, `build/chrome-mv3`) plus a zip per browser. You need Node 20 or
-newer and pnpm; the script checks and tells you if either is missing.
-
-Drop the `--no-sign` only if you want a Firefox install that survives closing
-the browser. Signing needs `web-ext` on your `PATH` and Mozilla AMO keys in
-`.env.extension`, and the script stops before building anything if either is
-missing, printing where to get them.
-
-## Load it
-
-**If you are on Chrome, Edge, Opera, or another Chromium browser**: open
-`chrome://extensions`, turn on Developer mode, click "Load unpacked", and pick
-that browser's folder under `extension-browser/build/`.
-
-**If you are on Firefox**: a temporary install loads the zip from
-`about:debugging#/runtime/this-firefox` under "Load Temporary Add-on", and it
-goes away when you close the browser. For one that sticks, install the signed
-`.xpi` that `./setup.sh --browser` drops into `extension-browser/build/` when
-you leave signing on.
+Building it yourself is a contributor thing, and
+[CONTRIBUTING](https://github.com/WeaveMindAI/weft/blob/main/CONTRIBUTING.md)
+covers it.
 
 ## Connect it
 
@@ -56,10 +39,9 @@ you leave signing on.
 weft token mint --name "my laptop"
 ```
 
-This prints a connect URL **once**. The server stores only a hash and can never
-show it to you again. Paste it into the extension's popup and pending tasks
-start appearing. Lose it and there is no recovery: mint a second token and
-`weft token revoke` the one you lost.
+That prints a connect URL **once**, because weft only keeps a hash of it.
+Paste it into the extension and the tasks start turning up. Lose it and there
+is nothing to recover: mint another and `weft token revoke` the old one.
 
 ### Scoping a token
 
@@ -68,9 +50,9 @@ weft token mint --name "reviewer" --projects <id> --tags approvals
 ```
 
 A token with no scope flags sees **every** task in your tenant, in every
-project, until you revoke it. So if you are handing one to somebody else,
-narrow it: `--projects` restricts it to specific projects and `--tags` to
-specific task tags, and both flags repeat.
+project, until you revoke it. So narrow it before handing it to anyone else.
+`--projects` limits it to certain projects and `--tags` to certain task tags,
+and both repeat.
 
 ```bash
 weft token ls
@@ -79,31 +61,31 @@ weft token revoke <id>
 
 ### The doors a token opens
 
-If you are writing your own consumer instead of using the extension, the
-token opens three doors on the dispatcher, the token as bearer on the first
-and the last:
+If you are writing your own consumer instead of using the extension, the token
+opens three doors on the dispatcher, the token as bearer on the first and the
+last:
 
 | Door | Set it when |
 |---|---|
 | `GET /signal-token/signals` | you want the tasks this token may see: one entry per parked question or registered trigger, form fields included |
 | `POST /signal/{signal token}` | you are answering one; the per-task token in the listing is the credential, no bearer |
-| `GET /signal-token/signals/{signal token}/files/{field}` | a field carries a stored file and you want to show it. A file arrives in the listing as its facts only (`mimeType`, `sizeBytes`, `filename`, no link); this door answers a fresh link that lives an hour, so ask each time you render. A file that expired answers a 404 saying so; show that in the image's place rather than a broken picture |
+| `GET /signal-token/signals/{signal token}/files/{field}` | a field carries a stored file and you want to show it. A file arrives in the listing as its facts only (`mimeType`, `sizeBytes`, `filename`, no link); this door answers a fresh link that lives an hour, so ask each time you render. A file that expired answers a **410** saying so; show that in the image's place rather than a broken picture |
 
-The files door is scoped like the listing: a task the token lists, a field
-the form declares, a file that belongs to that task's project or run.
-Anything else is a 404, and the storage key never travels.
+The files door is scoped like the listing: a task the token lists, a field the
+form declares, a file that belongs to that task's project or run. Anything
+else is a 404, and the storage key never travels.
 
 ## Try it end to end
 
-Add a `HumanQuery` node to any program and run it with the graph open.
+Add a `HumanQuery` step to any program and run it with the graph open.
 
-The execution parks on the node, the task pops up in the extension, and your
-answer wakes the program. The graph shows the node in its waiting state the
-whole time, so you can watch the handoff from both sides.
+The run parks on that step, the task appears in the extension, and your answer
+wakes it up. The step sits in its waiting colour the whole time, so you can
+watch both sides of the handover at once.
 
-Then do it again, but close your laptop first and answer tomorrow. Same result,
-because the execution is rows in a table rather than a process holding a
-socket.
+Then do it again, but shut your laptop first and answer tomorrow. Same result,
+because a parked run is rows in a table rather than a process holding a socket
+open.
 
 ## Working on it
 

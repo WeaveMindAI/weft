@@ -47,9 +47,9 @@ it intersects the state a resume depends on, where it refuses rather than
 resume on state it had to guess at.
 
 Defining that resume frontier precisely is the hard part. See
-[The journal](../running/the-journal.md#holes).
+[The journal](../running/the-journal.md#when-records-go-missing).
 
-**Stream journaling volume.** Every stream item writes two journal rows, which
+**Stream journaling volume.** Two journal rows per stream item
 carries real workloads today and does not carry a stream of ten million items.
 Buses already solve this with windowing, and streams take the same route.
 

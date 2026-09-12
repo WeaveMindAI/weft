@@ -1,269 +1,251 @@
 # Types
 
-Every port has a type. Every connection is checked against both ends before
-anything runs. This page is the complete list.
+An arrow has to carry something its destination can accept. A `String` output
+will not go into a `Number` input, and the compiler says `type-mismatch` and
+names both sides. Convert the value, or change the step that produced it.
 
-## Primitives
+Types describe single values and whole structures, so a list of messages or a
+customer record has a type too. They cannot tell you whether a model's answer
+was any good.
 
-| Type | Holds |
+## The everyday types
+
+| Type | What it holds |
 |---|---|
-| `String` | text |
-| `Number` | any number, integer or not |
-| `Boolean` | true or false |
-| `Null` | the absence of a value, as a value |
-| `Image` | a stored image file |
-| `Video` | a stored video file |
-| `Audio` | a stored audio file |
-| `Blob` | any other stored file: a pdf, a zip, a csv |
-| `Empty` | the type of a value that cannot exist. An empty list literal is a `List[Empty]`, and it wires into a list of anything. |
+| `String` | `"hello"` |
+| `Number` | `42` or `3.5` |
+| `Boolean` | `true` or `false` |
+| `Null` | The JSON value `null` |
+| `Image`, `Video`, `Audio` | A reference to a stored file of that kind |
+| `Blob` | A reference to any other stored file, a PDF or a zip |
 
-The four file types are one idea with four names. What travels a wire is a
-small reference to a stored file rather than the bytes, so a conversation
-carrying twenty images stays cheap to journal. The type is what tells the
-runtime which slots hold files, which is what makes
-[media conversion at a provider boundary](../nodes/custom-types.md#media-inside-a-custom-type)
-possible without per-node code.
+A file reference travels through the graph while the bytes stay in storage, so
+you can carry an image inside a message record without copying it into every
+journal row. For handling files, read [Files at run
+time](../running/files.md).
 
-You never write `Empty` yourself. It turns up when the compiler has nothing to
-go on, as in `List[Empty]` for `[]`, and it makes unions simplify:
-`Number | Empty` is `Number`.
+`Media` is short for `Image | Video | Audio`, and `File` is short for those
+three plus `Blob`.
 
-## Union aliases
+## Lists, dictionaries and unions
 
-`Media` is `Image | Video | Audio`, and `File` is `Media | Blob`. Both are just
-names for those unions.
-
-## Containers
-
-```
+```text
 List[Number]
 List[List[String]]
-Dict[String, String]
-```
-
-## Unions
-
-```
+Dict[String, Number]
 String | Number
 Number | Null
 ```
 
-## `JsonDict`
+`Dict[String, Number]` has string keys and number values. A union like `String
+| Number` accepts either. That union cannot then feed a `Number` input,
+because it might turn out to be a string.
 
-An opaque `Dict[String, *]` whose value types are unchecked. It is compatible
-with any `Dict[String, V]` in both directions.
+An empty list `[]` gets the type `List[Empty]`, because there is no item to
+learn from. `Empty` means no value is possible, so an empty list goes into a
+`List[String]` or a `List[Number]` without complaint. Inside a union, `Number
+| Empty` collapses to `Number`.
 
-Reach for it if you are holding a raw API response whose shape you do not know,
-or do not want to declare. It says "I am not claiming to know what is in
-here".
+## When the field names matter: records
 
-## Records
+Use a record when the field names matter:
 
-A dict with known field names and per-field types.
-
+```text
+{ name: String, age: Number, nickname?: String }
 ```
-{ role: String, name?: String }
-```
 
-A `?` on a field marks it optional: the key may be absent, and a present
-`null` counts as absent.
+`name` and `age` have to be there. `nickname` does not, and a `null` counts as
+not there for an optional field. An extra field the record does not declare
+fails validation, so the declaration has to list every field your values
+really carry.
 
-Validation is strict. A value carrying a key the record does not declare is
-**refused**. A record is a contract, so declare every field the real values
-carry.
-
-## Reading a key off a wire
-
-If a node gives you a record and the next node wants one field of it, write
-the field on the wire:
+Here is a step producing a record and another reading one field out of it:
 
 ```weft
-reader = ExecPython() -> (profile: { stats: { wpm: Number, name?: String } }) { ... }
-speed  = ExecPython(wpm: Number) -> (out: Number) {
-  wpm: reader.profile.stats.wpm
+person = ExecPython -> (profile: { name: String, age: Number }) {
+  code: "return {'profile': {'name': 'Mina', 'age': 34}}"
 }
+show = Debug { data: person.profile.name }
 ```
 
-The compiler walks the keys against the record type: each one has to be a
-field of the record at that level, and the wire's type is the last field's
-type, so `wpm: Number` above type-checks like any other wire. A type with no
-fields to walk, a `JsonDict` or a scalar, is refused with `deref-path` and the
-fix in the message: declare the shape on the source port, or `Cast` first.
+### Reading a key off a wire
 
-At run time the value is read right before it lands, once per wire. Five wires
-off one port are five separate reads, and none of them changes what the
-others get. A `?` key that turns out absent (or `null`) closes that wire
-alone, and the port on the other end decides what a closure means to it:
-a required port skips the node, an optional one fires with the value missing.
-A required key that is absent is a value that broke its declared type, and
-that fails the firing rather than turning into a `null`.
-
-In the graph, such a wire is drawn dotted with the path written at its end.
-Right-click any wire whose value is a record to pick a key.
-
-## Named custom types
-
-A type gets a name in one of two places. Any node's `metadata.json` can
-declare named types, and once declared anywhere in the project the name is
-usable in every port type and every inline signature.
-
-```json
-"types": {
-  "ChatHistory": "List[ChatMessage]",
-  "ChatMessage": "{ role: String, content: String | List[Part], name?: String }"
-}
-```
-
-Or the `.weft` source declares one itself, at the top of a scope:
+If you want one field out of a record, add its name to the source port:
 
 ```weft
-type Profile = {
-  wpm: Number,          # words per minute
-  read_delay: Number
-}
-type Names = List[String]
-
-typing = ExecPython(p: Profile, who: Names) -> (delay: Number) { ... }
+speed.wpm = reader.profile.stats.wpm
 ```
 
-The right-hand side is any type the language has, over as many lines as it
-needs, and it may name other declared types. Where you write it decides who
-sees it: a declaration at file level is visible to every header in the file,
-one directly inside a group or loop body is visible in that body and every
-body nested in it, and nowhere else. The group's own signature sits outside
-its braces, so a type declared inside cannot name the group's ports. Order
-within a scope does not matter. A node's braces hold its values, so a `type`
-line inside them is refused, and a name that is already visible (from an
-outer scope, from a metadata `types` block, or a builtin like `Media`)
-cannot be declared again: nothing shadows. An included file sees the
-catalog's types and its own declarations, never the including file's, so a
-component compiles the same on its own as spliced in.
+The compiler follows `stats`, then `wpm`, through the declared record type,
+and the arrow ends up with `wpm`'s type. A plain value has no declared fields
+to follow, so you get `deref-path` asking you to declare the shape or `Cast`
+it first. The same goes for a `JsonDict`, further down this page: it holds an
+object without saying what is in it.
 
-Named types are **nominal**: the name is the contract, not the shape.
+In the graph, a path like this draws as a dotted arrow with the field names at
+its end. If you would rather not type it, right-click any arrow carrying a
+record and pick a field.
 
-- A `ChatHistory` value wires freely into `JsonDict`, or into its own
-  structural shape.
-- Nothing unnamed wires into a `ChatHistory` input. A dict that happens to have
-  the right shape is not one.
+If an optional field is missing or `null`, only that arrow closes, and
+whatever was waiting on it does what any step does with a closed input. For
+those rules, go and read [How a weft program runs](mental-model.md). A missing
+required field is bad data and fails the firing.
 
-The door between the two worlds is the `Cast` node, below.
+## Optional or nullable: which one you want
 
-Declaring the same name twice is fine when the bodies are structurally
-identical, so two packages can ship the same shared type without depending on
-each other. Two different bodies under one name is a loud error, which turns
-drift between two copies into a build failure.
+A field that can be absent and a field that can hold `null` are two different
+declarations:
 
-## Type variables
+```text
+count?: Number
+count: Number | Null
+```
 
-A bare capitalized name like `T` is a generic that unifies across a node's
-ports, so a node with input `T` and output `T` carries whatever concrete type
-flows in. Every type variable has to be pinned to something concrete somewhere
-in the graph, and one that is not is rejected as `unresolved-typevar`.
+The first says the value can be absent. The second says something has to
+arrive, and it is allowed to be `null`. A closed required input skips the
+step; a `null` on a nullable input reaches the code.
 
-## `MustOverride`
+Put the `?` after the name, including on record fields; `count: Number?` is an
+error. Outputs never take `?`. A step is always allowed to finish without
+emitting on an output, and weft closes that output for it.
 
-A node whose metadata cannot know a port's type declares it `MustOverride`,
-and the `.weft` author has to pin it with an inline port signature. A
-`MustOverride` port that is wired and still unpinned at compile time is an
-error (`must-override-unmet`); one nothing reads or writes is left alone.
+For the `notes?: review.notes` spelling in a step's body, read [extra
+inputs](syntax.md#extra-inputs).
 
-`Cast` is the main user of this: its output type is whatever you say it is.
+## When you do not know the shape: `JsonDict`
 
-## The `?` marker
+`JsonDict` accepts any JSON object without saying what is in it. Use it where
+something outside your program hands you an object whose shape you never wrote
+down, like an API response.
 
-`?` after a name means "may be absent", and it goes on the name in every
-place it can appear: an input port (`here?: String`) and a record field
-(`{ role: String, name?: String }`). On an input port it lets the port accept
-a closed pulse; without it, a required input that receives closure skips the
-node and cascades that closure downstream. See [How a weft program
-runs](mental-model.md#the-closed-pulse). On a config key that creates a port
-(`notes?: review.notes`) it marks that created port. See [wires in the
-braces](syntax.md#wires-in-the-braces).
+A `JsonDict` connects to any `Dict[String, V]` and back again. That is the one
+unchecked corner of the type system. The compiler only checks that the keys
+are strings, and never looks at `V` at all, in either direction. If later
+steps depend on particular fields, declare a record and convert into it.
 
-`name: String?` is refused, and the message spells the accepted form. An
-output port takes no `?` at all: a firing that emits nothing on it closes it,
-and there is nothing for a marker to add.
+A record can feed a `JsonDict`, which throws away everything the compiler knew
+about its fields. A `JsonDict` cannot feed a record directly.
 
-`Number | Null` is a different thing: `null` is a value that arrives, `?` is a
-value that does not.
+## Giving a type a name
 
-## The wired-only types
-
-Three types never appear as literals in source, because their values are live
-runtime handles that only exist while something is running.
-
-### `Bus`
-
-A message channel between nodes that are alive at the same time. A `Bus`
-output connects only to a `Bus` input. Message payloads are not type-checked
-by the language; the channel carries what its creator declared it carries.
-
-### `Generator[T]`
-
-A typed, one-directional, terminating stream.
-
-The producer's port accepts being emitted into repeatedly, and each emission is
-one item checked against `T`. The producer's own state lives in ordinary local
-variables across all of them.
-
-The consumer fires **once**, on the first item, and pulls the rest in its own
-code. Or a `Loop` names the port in `over` and pulls one item per iteration.
-The stream ends when the producer's body returns.
-
-One producer feeds one consumer, a stream cannot leave the group it was made
-in, and it takes no literal. Why each of those holds, when to reach for a
-stream over a `List[T]`, and what happens when one side stops early:
-[Live channels](live-channels.md#streams).
-
-### `Access`
-
-The authorized ability to call a third-party service. One type for every
-service, emitted by the node that holds the connection and consumed by the
-nodes that make calls.
-
-Because one type covers every service, the compiler never has to know which
-services exist. Wiring the wrong service's access into a node fails loudly at
-run time.
-
-## The `Cast` node
-
-`Cast` converts a value into the type declared on its output. The inline
-signature pins that type, since the metadata ships the output as
-`MustOverride`.
+Name a type when two values have the same shape but different meanings:
 
 ```weft
-raw = HttpRequest { url: "https://api.example.com/history.json" }
-history = Cast() -> (value: ChatHistory)
-history.value = raw.body
+type CustomerId = String
+type OrderId = String
 ```
 
-The conversion table is checked at compile time, so an impossible pair like
-`JsonDict -> Number` is a compile error rather than a runtime surprise.
+Both hold strings, and a `CustomerId` still will not go into an `OrderId`
+input. The compiler compares the name, not the shape.
 
-What is possible:
+A named value can go into its underlying shape, so a `CustomerId` feeds a
+`String`. Going the other way needs a `Cast`, because a string does not become
+a `CustomerId` just by looking plausible.
 
-- text parses into numbers, booleans, and JSON structures,
-- data stringifies,
-- `Number` and `Boolean` interconvert as 1 and 0,
-- any object shape casts into a record or named type **by validation**: the
-  value is held to the declared structure and a mismatch is an error naming
-  the exact offending field.
+Names work on records and containers too:
 
-So `Cast` is where you say "this dict really is a `ChatHistory`", and the
-runtime checks that before letting it through.
+```weft
+type Profile = { name: String, age: Number }
+type Profiles = List[Profile]
+```
 
-## Compatibility, precisely
+`Profile` feeds that record shape or a `JsonDict`. `Profiles` feeds its list
+shape, but not `JsonDict`, which wants an object.
 
-A connection from a source type `S` to a target type `T` is allowed when every
-value `S` can produce is a value `T` accepts.
+A `type` at the top of a file is visible everywhere in that file. Inside a
+group or a loop it is visible in that body and the bodies inside it. A group's
+or a loop's signature sits outside its own body, so it cannot use a type
+declared inside itself.
 
-- Identical types are compatible.
-- A union is compatible with a target when every member is.
-- `JsonDict` is compatible with any `Dict[String, V]` in both directions.
-- A named type is compatible with `JsonDict` and with its own structural shape,
-  but nothing unnamed is compatible with a named target.
-- Containers are compatible element-wise.
-- A type variable unifies with whatever concrete type reaches it, and stays
-  that type for every other port that shares the variable.
+Declarations can refer to each other in any order. Cycles and unknown names
+fail. A name already visible in that scope cannot be declared again: nothing
+shadows anything.
 
-Anything else is `type-mismatch`, and the message names both types.
+A step's metadata can declare types too, which makes them available to every
+step in the project. Two packages may both declare the same metadata type as
+long as the two definitions agree. If they disagree, the build fails. An
+included file sees the catalog's types and its own, but not the types of the
+file that included it. For how included files see each other, go and read
+[files and reuse](files-and-reuse.md). For declaring types in a step's
+metadata, go and read [custom types](../nodes/custom-types.md).
+
+## Converting a value with `Cast`
+
+Pin `Cast`'s output to the type you want:
+
+```weft
+type Profile = { name: String, age: Number }
+raw = Text { value: "{\"name\":\"Mina\",\"age\":34}" }
+profile = Cast -> (value: Profile) {
+  value: raw.value
+}
+show = Debug { data: profile.value.name }
+```
+
+That parses the JSON and checks the result against `Profile`, naming whatever
+fails. `Cast` also converts between things where the rules allow, such as a
+numeric string into a number.
+
+If the source type and the type you pinned can never convert, the build fails
+with `cast-not-allowed`. For a pair it allows, whether it works still depends
+on the value: `"34"` becomes a number and `"Mina"` does not.
+
+Text goes to a number or a boolean. JSON text goes to a structure. Almost
+anything goes to text, and numbers and booleans go both ways. Converting into
+a record or a named type checks the shape you asked for. Casting a string into
+a `CustomerId` does not mean that customer exists: `Cast` checks the shape,
+never the world.
+
+## When the type comes from what you connect
+
+A step's metadata can use `T`, or `T` followed by digits, for a type the
+compiler works out from what you connect. Ports on the same step using the
+same variable all land on the same type. The same `T` on a different step is
+unrelated. If a `T` never gets resolved at all, the build fails with
+`unresolved-typevar`.
+
+## When weft asks you for the type
+
+`MustOverride` means the step is asking you to write the type yourself.
+`Cast`'s output is one, which is why you pinned it above. Connect a port that
+is still `MustOverride` and you get `must-override-unmet`. A `MustOverride`
+port you never wire can stay as it is.
+
+If you add a port from the graph, it starts as `MustOverride`, which is why
+the editor asks you for a type before the build will go through.
+
+## Channels and access
+
+These carry a capability rather than a value:
+
+| Type | What the receiving step gets |
+|---|---|
+| `Bus` | A channel shared by steps that are alive at the same time. weft checks the handle type and does not check what you send over it. |
+| `Generator[T]` | A stream of `T`, with exactly one producer and one consumer. |
+| `Access` | A connection it can make authorised calls with |
+
+A generator's consumer runs once and pulls items as they turn up, and an empty
+stream is fine. A loop can take one item per iteration. The stream ends when
+the producer finishes or closes it. Two things it cannot do: cross an ordinary
+group boundary, and be written down as a literal. The rest is in [live
+channels](live-channels.md).
+
+`Access` is the same type for every service, so an `Access` arrow passing the
+compiler does not prove a Slack step received Slack access. Which service it
+really is gets checked when the handle is opened at run time. For what happens
+when it has not, read [connections](../connections/overview.md).
+
+## How the compiler compares two types
+
+- Identical types fit. A union fits when every one of its members fits
+something the destination allows.
+- Lists and dictionaries compare what is inside them. A destination record has
+to declare every field the source might send, and receive every field it
+requires.
+- A named source can lose its name going into a compatible plain shape. A named
+destination insists on that same name.
+- Generator element types have to be compatible both ways, and a
+`Generator[Number]` is a stream, so it will not feed a plain `Number`.
+
+For the error at one particular connection, read
+[diagnostics](diagnostics.md).

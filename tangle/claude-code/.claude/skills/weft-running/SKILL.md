@@ -248,5 +248,5 @@ across restarts and start from activation time; history never replays. A
 held-connection trigger (`ReceiveEmail` over IMAP IDLE) and a scheduled one
 (`Cron`) keep no cursor: cron recomputes its next tick from now on every
 fire. Push triggers (webhooks, socket mode, the live nodes) need a public
-address: `weft daemon start --public-url` tunnels it. Signal tokens
+address: `./setup.sh --public-url` tunnels it. Signal tokens
 (`weft token mint`) scope external listeners like the browser extension.

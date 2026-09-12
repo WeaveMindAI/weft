@@ -1,166 +1,145 @@
 # Storage
 
-A running node reads and writes files through `ctx.storage`. Every write takes
-a **scope**, and the scope decides where the file lives and **how long it
-lives**. Pick it by how long you need the file to survive.
+Use `ctx.storage(...)` to save a file and pass its reference to another node.
+Choose execution storage for a run's files, project storage for data reused
+by that project, or shared storage for data used by several projects.
 
-## The scopes
+## Save an output
 
-| Scope | Lives under | Lifetime |
+Inside a node with a `file: Blob` output:
+
+```rust
+use weft::node::NodeOutput;
+use weft::storage::{KeepTtl, StorageScope};
+
+let storage = ctx.storage(StorageScope::Execution);
+let file = storage.put(
+    b"The report is ready.".to_vec(),
+    "text/plain",
+    "report.txt",
+    Some(KeepTtl::Default),
+).await?;
+ctx.pulse_downstream(NodeOutput::new().set("file", file)).await?;
+```
+
+The output contains a stored-file reference. `Some(KeepTtl::Default)` keeps
+its bytes available after the execution so the report can be opened later.
+
+## Choose the scope
+
+| Scope | Storage space | Lifetime |
 |---|---|---|
-| `StorageScope::Execution` | `exec/<run>/` | one run, unless flagged kept |
-| `StorageScope::Project` | `project/<project_id>/` | as long as the project |
-| `StorageScope::Shared { name }` | `shared/<name>/` | as long as the owner |
-| `StorageScope::Asset` | the project's `@asset` files | read-only; a worker write to it is refused |
+| `StorageScope::Execution` | `exec/<run>/` | Cleaned up after the run, unless kept |
+| `StorageScope::Project` | `project/<project_id>/` | Until deleted individually or with the project |
+| `StorageScope::Shared { name }` | `shared/<name>/` | Until explicitly deleted; survives project deletion |
+| `StorageScope::Asset` | Uploaded source assets | Workers can read these but cannot write them |
 
-**`Execution`** is the default, and it is for scratch: intermediate files,
-temporary downloads, anything nothing cares about once the run ends. It sweeps
-itself up.
+Use `Execution` with no keep setting for temporary work. Use `Project` for
+an index or cache shared across that project's runs. Projects belonging to
+the same owner can use the same named `Shared` space, including after one
+of those projects has been deleted.
 
-**`Project`** is for a project's own persistent state: a cache, an index,
-accumulated outputs. It outlives individual runs and is shared across the
-project's executions, and it is **deleted when the project is deleted**.
+The scope you pass controls writes and listings. Reads follow the handle's
+key, but the worker must still have access: execution files belong to their
+run, project files and assets belong to their project, and shared files
+belong to their owner. Keeping an execution file does not make it available
+to nodes in another execution.
 
-**`Shared { name }`** is tied to the owner rather than any project. It
-survives runs and project deletion both. Projects naming the same `name` meet
-in the same space, and first use auto-grants it.
+## Read or stream a file
 
-So if you want a file to survive deleting the project, that is the scope
-argument and nothing else: `Project` means no, `Shared` means yes. Changing
-that one argument is the whole knob.
+Read a file input with `ctx.inputs.get::<FileHandle>("file")?`, then choose
+how much to load:
 
-Reach for `Shared` when it is a dataset the owner reuses across projects, a
-model they paid to build, or anything they would be upset to lose while
-tidying up.
+```rust
+let (metadata, bytes) = storage.get_bytes(&handle).await?;
+let (metadata, stream) = storage.get(&handle).await?;
+let (metadata, stream) = storage.get_range(&handle, range).await?;
+```
 
-## The verbs
+Use `get_bytes` when the whole file fits in memory. Use `get` to process a
+stream, or `get_range` for a byte range. `ByteRange` uses an inclusive start
+and exclusive end; an absent end reads through the end of the file.
+
+For writes, `put_stream` accepts a byte stream. `put_response` copies an
+HTTP response into storage and returns a `StoredFile`; `put` and
+`put_from_url` return a file marker ready to emit. `put_from_url` asks the
+runtime to fetch the URL. You can also use `list()` to inspect your selected
+space and `delete(&handle)` to remove a file.
+
+### Reuse a downloaded file
+
+If the source has a stable identity, supply it before fetching:
 
 ```rust
 let storage = ctx.storage(StorageScope::Project);
-
-storage.put(bytes, mime, filename, keep).await?;
-storage.put_stream(stream, mime, filename, keep).await?;
-storage.put_response(resp, what, mime, filename, keep).await?;  // straight from an HTTP response
-storage.put_from_url(url, filename, keep).await?;               // the runtime fetches it
-storage.identified("whatsapp:m1").put_from_url(url, None, None).await?; // once per identity, see below
-
-storage.get(&handle).await?;
-storage.get_bytes(&handle).await?;
-storage.get_range(&handle, range).await?;
-
-storage.delete(&handle).await?;
-storage.list().await?;
-
-storage.keep(&handle, KeepTtl::Default).await?;
-storage.presign(&handle, ttl_secs).await?;      // a temporary link, always fetchable from your body
-storage.public_link(&handle, ttl_secs).await?;  // an internet-reachable link, or None
+let file = storage.identified("whatsapp:message-123")
+    .put_from_url(url, None, None).await?;
 ```
 
-A stored file arriving on one of your inputs already carries a `url` inside
-its marker, minted for this firing (an hour): the runtime links every file
-input before your body runs, so a body that hands the value to something
-that only fetches URLs needs no call of its own. The link is the
-internet-reachable one when the install serves one (a public address, or a
-bucket declared public), so a provider can fetch it too. Otherwise it is
-signed for the cluster's own address: your body can fetch it, nothing
-outside can, and a node that hands a file to something outside asks
-`public_link` and inlines the bytes when it answers `None`. It is stripped
-from everything you emit, park, or memoize, so the stored form is what
-travels and the journal never holds a link.
-
-Scope governs writes and lists. Key-addressed verbs act on the key's own
-scope, so reading a handle works regardless of which scope you asked for.
-
-If you pull a thing by a stable id (a message, a document at a provider),
-name it: `.identified("<service>:<id>")` before the put. The same identity in
-the same scope is then one file, however many runs ask for it: a
-`put_from_url` asks the store first and fetches nothing when the file is
-there, and two runs fetching at once cannot both land (the second sees a
-conflict and retries). Pair it with `Project` scope so the copy outlives the
-run that first pulled it. The identity is a label, scoped to the scope you
-put in; choose one that names the source, never the content.
+While a file with that identity exists in the chosen storage space,
+`put_from_url` reuses it without downloading another copy. Project scope
+allows reuse across runs. Choose an identity that distinguishes the source
+file, such as the message ID of an attachment.
 
 ## The keep rule
 
-**An Execution-scoped file your node emits must be kept.**
+Keep an execution file when it needs to remain usable after the run.
+Temporary files can pass between nodes without being kept, but an old
+execution's reference cannot display bytes that have already been deleted.
 
-Every Execution write takes `keep: Option<KeepTtl>`. `None` means the file is
-swept shortly after the run ends.
+Execution writes take `keep: Option<KeepTtl>`:
 
-That is right for scratch and wrong for anything you pulse downstream, because
-an emitted reference lands in the journal and renders in the editor long after
-the run, where a swept file shows up as "media expired". So:
+| Setting | Retention |
+|---|---|
+| `None` | Cleanup after the execution |
+| `Some(KeepTtl::Default)` | 30 days, renewed by reads through weft or fresh download links |
+| `Some(KeepTtl::Secs { secs })` | The chosen number of seconds, renewed the same way |
+| `Some(KeepTtl::Never)` | Until explicitly deleted |
 
-- A node producing a user-facing artifact (a generated image, synthesized
-  speech, received media) passes `Some(KeepTtl::Default)`. That is 30 days,
-  and **every access bumps the clock**, so artifacts still in use never expire
-  while abandoned ones age out.
-- A node whose file is cheaply re-fetchable, such as a plain download, may
-  expose a `keep` boolean config input defaulting to off, and pass
-  `keep.then_some(KeepTtl::Default)`, letting the user decide.
-
-The `KeepFile` node extends or pins an execution file's lifetime after the fact.
+Listing files, inspecting metadata or reusing an already-issued URL does
+not renew the countdown. You can change an execution file's retention with
+`storage.keep(&handle, ttl).await?` or the catalog's `KeepFile` node.
+Project, Shared and Asset files reject keep settings because their scopes
+have different retention rules.
 
 ## Files from the graph
 
-A user-supplied file arrives as an ordinary typed input.
+Declare a file input, for example `Image`, and read it as a `FileHandle`.
+The type determines which files the editor accepts; a `file_drop` widget's
+`accept` setting can narrow the selection further.
 
-```json
-"inputs": [
-  { "name": "image", "type": "Image", "required": true }
-]
-```
-
-The type drives the editor's file filter and is what gets written into source;
-a `"widget": { "kind": "file_drop", "accept": "image/png" }` narrows it
-further. Your node reads it with `ctx.inputs.get::<FileHandle>("image")?`.
-
-What lands in source is one clean line:
+A selected local file appears in source as an asset reference:
 
 ```weft
-send = TelegramSendMedia {
-  file: @asset("assets/photo.png", Image)
-}
+show = Debug { data: @asset("assets/photo.png", Image) }
 ```
 
-The [asset sync](../language/files-and-reuse.md#the-asset-sync) runs before
-every build and uploads what the code references. Current source files stay;
-replaced or removed uploads expire after 30 days without access. Your node never
-sees any of it: at run time the value is a normal media value, and `get` and
-`get_bytes` read its bytes whichever handle it carries.
+For upload timing and old-version retention, read
+[Files at run time](../running/files.md#files-your-source-refers-to).
 
-## Media in typed values
+## Send a file to an external service
 
-For converting whole typed values at a provider boundary, see
-[Custom types](custom-types.md#media-inside-a-custom-type).
+Before your body runs, the runtime adds a temporary `url` inside each
+stored-file input marker, requesting a one-hour link. Code that needs a URL
+can read that field directly, but an external provider must be able to
+reach the address.
 
-## The marker stays inside weft
+Call `storage.public_link(&handle, ttl_secs).await?` when the recipient is
+outside the installation. It returns an internet-reachable link or `None`.
+If it returns `None`, send the bytes in a format the service accepts.
+`presign` can also return a link reachable only inside the installation.
+For link expiry and file retention, read
+[Share a file outside weft](../running/files.md#handing-a-file-to-somebody-else).
 
-The `__weft_image__` / `__weft_audio__` / `__weft_blob__` wrapper is how a
-file travels between nodes: it carries the storage key the runtime reads
-by. Anything you hand to something that is not weft (a provider's request
-body, a bridge's action payload, a form spec a browser renders, a live
-item) gets the plain thing that consumer reads: a URL string, a `data:`
-URL, or a plain `{ url, mimeType, filename }` object. `externalize` does
-this for a typed value, `public_link` and `presign` for one file. Wrapping
-a link in a marker and sending it out puts weft's internal shape in an
-external contract, and the consumer, which reads `value.url`, shows
-nothing. The form image field did exactly that once, and the tasks app
-rendered "(no image)" over a link that worked. A link you hand out also has
-a life, so never store one: a form parks the stored file itself, and the
-person who opens it gets a link minted at that moment through the
-signal-token files door, however long the form waited.
+Convert file markers into the recipient's expected format before sending
+them. For files nested in a typed value, use
+[`externalize`](custom-types.md#files-inside-a-record).
 
-## Reaching files outside the editor
+The runtime removes the added URL when a stored-file marker leaves the node
+or is saved. If you copy the URL into a plain string, the runtime cannot
+remove it for you. Save the file reference when a form needs to display the
+file later; the browser can request a fresh link when the form opens,
+provided the stored file still exists.
 
-The stored files are addressable independently of the editor:
-
-```bash
-weft files ls
-weft files inspect <key>
-weft files download <key>
-weft files rm <key>
-weft files usage
-```
-
-So data a project wrote in `Shared` stays reachable after the project is gone.
+To list, download or delete files from a terminal, read
+[Files at run time](../running/files.md#find-one).

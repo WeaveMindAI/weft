@@ -1,106 +1,108 @@
 # Putting a person in the loop
 
-Some steps belong to a human: an approval, or a correction the model should not
-make alone.
+Sometimes a program should stop and ask you before it goes on, and that is
+just another step: you drop a `HumanQuery` in and everything after it waits
+until somebody answers. The question turns up in your browser.
 
-Getting a program to wait for one is normally the expensive part, because
-something has to remember where the flow was and wake it up again without
-losing anything, which usually means a queue, a webhook and a state machine.
+You can try this now without connecting a model or a messaging account.
 
-In weft it is a node.
+## Get the questions on your screen
 
-```weft
-review = HumanQuery {
-  title: "Escalate this ticket?"
-  fields: [{ "kind": "approve_reject", "key": "escalate" }]
-}
-```
+Install **Weft tasks** from
+[Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/weft-tasks/)
+or the
+[Chrome Web Store](https://chromewebstore.google.com/detail/weavemind/mddobmalhoelphnmhbenmbmeibfpoppm).
 
-Wire something into it, wire its outputs onward, and run. The execution
-reaches `review`, suspends, and the worker process **exits** rather than
-blocking.
-
-The task appears wherever a person can answer it. When they do, a fresh worker
-starts, rebuilds the execution's state from the journal, and continues from
-exactly the point it stopped. That gap can be four seconds or four weeks; the
-code is identical and so is the cost, which is one row in a table.
-
-## The ports come from the form
-
-`HumanQuery` has no fixed output ports. Its ports are derived from the fields
-you configured, at compile time.
-
-The `approve_reject` field keyed `escalate` produces two Boolean outputs:
-
-- `review.escalate_approved`
-- `review.escalate_rejected`
-
-You never declare those. Add a `text_input` field keyed `reason` and you get a
-`review.reason` String output alongside them. Change the form and the ports
-change with it, and every wire you had is re-checked against the new shape.
-
-So this compiles or it does not:
-
-```weft
-alert = SlackSendMessage {
-  _should_flow: review.escalate_approved
-  channel: "#oncall"
-  text: classify.response
-}
-```
-
-`_should_flow` is on every node and decides whether it runs. A `false` there
-skips the node, which closes its outputs, which skips everything behind it, so
-rejecting the escalation ends that branch on the spot. That is how branching
-works here, and it is covered properly in
-[How a weft program runs](../language/mental-model.md).
-
-## Where the task shows up
-
-Tasks reach people through the weft browser extension. Build it with:
-
-```bash
-./setup.sh --browser --no-sign
-```
-
-`--no-sign` skips signing the add-on with Mozilla, which you do not need for a
-local install and which fails without AMO API keys.
-
-Load the unpacked build, then connect it to your runtime with a token:
+Now the extension needs a key so it can reach your weft:
 
 ```bash
 weft token mint --name "my laptop"
 ```
 
-That prints a connect URL exactly once, because the server stores only a hash
-of it. Paste it into the extension and pending tasks start arriving.
+`--name` is only a label, so you can tell your tokens apart later. The command
+prints a connect URL once and never again.
 
-A token can also be narrowed to one project or one kind of task, which is how
-you hand a reviewer something that only ever shows them their own queue. That,
-and the per-browser loading steps, are in
-[The browser extension](../running/browser-extension.md).
+Make sure your runtime is up, then open the extension, click the gear for
+**Settings**, paste the URL into **Paste token URL** and click **Add Token**.
+Your browser will ask whether the extension may talk to that address: say yes,
+or it can never reach your weft. It then checks it can actually get through
+before it saves anything, so this will fail if your runtime is stopped.
 
-![A pending approval task in the browser extension](../img/extension-task.png)
+Treat that URL like a password. This one sees every question in your whole
+weft, in every project, until you revoke it. If you want to hand somebody a
+key to one project only, or you lost the URL and need a new one, go and read
+[The browser extension](../running/browser-extension.md#connect-it).
 
-<!-- IMAGE ------------------------------------------------------------------
-file:  docs/src/img/extension-task.png
-kind:  screenshot, ideally a two-panel composite
-brief: Left: the weft browser extension popup showing one pending task, with
-       the title "Escalate this ticket?", the LLM's classification text as
-       context, and Approve / Reject buttons. Right: the VS Code graph view
-       of the same execution with the HumanQuery node visibly in its
-       suspended/waiting state and everything downstream of it still idle.
-       The point is that both sides of the handoff are visible at once.
---------------------------------------------------------------------------- -->
+## Ask before continuing
 
-## Watch the handoff
+Put this in `main.weft`:
 
-Run the program with the graph open. The `HumanQuery` node goes into its
-waiting state and stays there. Answer in the extension and the graph continues
-in front of you.
+```weft
+draft = Text { value: "We can replace the damaged item." }
 
-Answer it tomorrow instead and you get the same result, because the execution
-is rows in a table rather than a process holding state.
-[The journal](../running/the-journal.md) covers what those rows contain.
+review = HumanQuery {
+  title: "Send this answer?"
+  fields: [
+    { "kind": "display", "key": "answer" },
+    { "kind": "approve_reject", "key": "send" }
+  ]
+  answer: draft.value
+}
 
-Next: [when something goes wrong](troubleshooting.md).
+approved = Debug {
+  _should_flow: review.send_approved
+  data: draft.value
+}
+```
+
+`_should_flow` is a step's on switch. Give it a true or false value and the
+step only runs when it is true.
+
+Run it, and before you answer anything, put the graph beside the extension.
+`review` wears its cyan waiting ring, and everything after it is sitting
+still.
+
+![The answer awaiting approval beside the same waiting execution in the graph](../img/extension-task.png)
+
+<!-- IMAGE: extension-task.png. Two panels. Left: the task tab showing
+"Send this answer?" and the draft text with Approve / Reject. Right: the
+same execution in the graph, review waiting in cyan, approved not yet run. -->
+
+Open the extension and **Send this answer?** is waiting in the list. Click it
+and the form opens in its own tab, with the draft text and an Approve and a
+Reject button. Click Approve and `approved` runs. Then run the program a
+second time and click Reject: this time `approved` never runs.
+
+## Where those two outputs came from
+
+You never declared `send_approved`. The form did. A field of kind
+`approve_reject` named `send` gives the step two outputs, `send_approved` and
+`send_rejected`, and only the one you chose fires. The other one closes, which
+means no value will ever come out of it, and any step waiting on that value is
+skipped.
+
+That is why `approved` has `_should_flow: review.send_approved`. So approving
+switches it on and rejecting switches it off. If you want something to happen
+on a rejection instead, wire `send_rejected` into it.
+
+You describe the form once, and that description is what makes the ports.
+Change the fields and the ports change with them. For the rest of that, go and
+read [Triggers](../language/triggers.md#form-derived-ports).
+
+## Answer it tomorrow
+
+Close your laptop and answer the question in the morning. The run will still
+be there.
+
+weft writes the paused run down and lets the worker exit, so a question can sit
+open for a week without holding a process open. When you answer, it picks the
+run back up where it stopped. All you need is your weft running and reachable
+at the moment you answer.
+
+If you want to know what else survives a restart, go and read
+[The journal](../running/the-journal.md). For a form that *starts* a run
+rather than pausing one, go and read [Triggers](../language/triggers.md) and
+look at `HumanTrigger`.
+
+Next, open [a complete Telegram bot](a-bigger-example.md), which puts a model,
+a database and a person in the same program.

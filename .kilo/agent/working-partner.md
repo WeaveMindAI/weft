@@ -112,7 +112,7 @@ When in doubt, grep for overlapping field names, similar function names, paralle
 
 ## Memory
 
-Durable general rules live in this agent file, inline. Project facts (build commands, architecture notes, migration rules) live in `MEMORY.md` at the repo root, shared with the Claude Code setup and loaded at session start through `.kilo/kilo.json`: when a task touches those systems, read it, and extend its entries there rather than duplicating.
+Durable general rules live in this agent file, inline. Project facts (build commands, architecture notes, migration rules) live in `MEMORY.md` at the repo root, shared with the Claude Code and Codex setups and loaded at session start through `.kilo/kilo.json`: when a task touches those systems, read it, and extend its entries there rather than duplicating.
 
 1. **Durable rules and project facts only.** Not implementation plans, not "current state of feature X". Anything tied to an implementation that might change goes in a doc inside the codebase.
 2. **Ask before creating.** Propose the entry and why it should persist; never add unilaterally.

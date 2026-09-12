@@ -3,11 +3,11 @@
 Thank you for considering lending a hand!
 
 It is early days here, so things move fast and plenty is still up for grabs. If
-you think a something in the codebase is wrong, it might well be, so please come and tell us on
+you think something in the codebase is wrong, it might well be, so please come and tell us on
 [Discord](https://discord.com/invite/FGwNu6mDkU).
 
-And if you are not sure whether something is wanted, come ask us: 
-Discord for a quick question, an issue for something that we should keep track of. 
+And if you are not sure whether something is wanted, come ask us:
+Discord for a quick question, an issue for something that we should keep track of.
 
 Everything about how weft *works* is in
 [the book](https://weavemindai.github.io/weft/). This file is about
@@ -16,6 +16,9 @@ working on the codebase.
 ## Set up
 
 Go check [Install](https://weavemindai.github.io/weft/start/install.html).
+As a contributor you additionally need [Node 20 or
+newer](https://nodejs.org/en/download) and [pnpm](https://pnpm.io/installation)
+(`npm i -g pnpm`) to build the extensions from source and running the tests.
 
 If you want two branches open at once, `scripts/add-worktree.sh <branch>`
 branches off the one you are on into `../weft-trees/`, in a folder named after
@@ -62,16 +65,16 @@ and read
 [Testing a node](https://weavemindai.github.io/weft/nodes/testing.html).
 
 By default `run-node-tests.sh` runs the basic and fake tiers, which need
-nothing set up and is free.
-If you want to test with real services `--tier live` runs the nodes against 
-real accounts and **spends real money**, so it remembers what passed and skips 
+nothing set up and are free.
+If you want to test with real services `--tier live` runs the nodes against
+real accounts and **spends real money**, so it remembers what passed and skips
 a package until you change it (you can force a rerun with `--retest` or by wiping
 the cache in `.live-pass-cache` in `target/node-tests`).
 
-The live tier needs a real connection per service. If you signed into one in any editor, 
-it is picked up by itself; Otherwise, for pasted keys, the runner reads
-`WEFT_NODE_TEST_*` from this repo's root `.env`. For the full list of
-variables, and the three ways to hand a test an account, go and read
+The live tier needs a real connection per service. If you signed into one in any editor,
+it is picked up automatically; otherwise, for pasted keys, the runner reads
+`WEFT_NODE_TEST_*` from this repo's root `.env`. The full list of
+variables, and the three ways to hand a test an account, is in
 [Giving the live tier what it needs](https://weavemindai.github.io/weft/nodes/testing.html#giving-the-live-tier-what-it-needs).
 
 When an end-to-end test fails, its project and any pods it made are left in
@@ -84,41 +87,38 @@ are for the outside services. They are `WEFT_E2E_*`, and they are listed in
 A test that fails intermittently is a bug, so put anything timing-sensitive
 through `stress_test!`
 (`crates/weft-core/src/test_support.rs`). You need `futures` as a
-dev-dependency in the crate you call it from. For why we treat it that way, and
-the fixes that look tempting and make it worse, go check
-[Flakes are bugs](https://weavemindai.github.io/weft/running/architecture.html#flakes-are-bugs).
+dev-dependency in the crate you call it from.
 
 ## Writing a node for the standard catalogue
 
 If you want a first contribution, this is a good one. A node is a folder with
-two files in it. You can go and read [the guide](https://weavemindai.github.io/weft/nodes/what-a-node-is.html) 
-for how to write one. If it talks to a service weft has never logged into before,
+two files in it. [The guide](https://weavemindai.github.io/weft/nodes/what-a-node-is.html)
+covers how to write one. If it talks to a service weft has never logged into before,
 it needs an access node beside it holding the login, which is
-[Declaring a service](https://weavemindai.github.io/weft/connections/writing-a-service.html).
+[Declaring a service](https://weavemindai.github.io/weft/connections/writing-a-service.html). You can ask tangle to build one for you, tangle has all the knowledge to build one properly.
 
 A few things we look for in review:
 
-- **The node do one thing**: The test is what somebody reading the graph
+- **The node does one thing**: The test is what somebody reading the graph
   should be able to see. A loop, a retry or a multi-step process they would
   want to watch or resume belongs in the graph rather than hidden inside your
   node, and a node that does two different things depending on what got wired
-  in is usually two nodes. We do accept bunch of complex use case in Rust: a browser agent node
+  in is usually two nodes. We do accept complex use cases in Rust: a browser agent node
   managing its own browser session, an infra node setting itself up. If doing
   it in Rust hides nothing and is clearly simpler, nobody is going to fight you
   over it.
 - **Do not write plumbing**: If you find yourself handling
   a credential, keeping a subscription alive, or anything that feels tedious,
-  that is usually weft missing something. Build it yourself and send a PR, 
+  that is usually weft missing something. Build it yourself and send a PR,
   or open an issue asking for it. For where that line falls today, go check
   [the commandments of plumbing](https://weavemindai.github.io/weft/thinking/plumbing.html).
 - **Never ask for a secret in config**: anything in config is stored in
   the clear and shows up in the inspector. Secrets come from
   [a connection](https://weavemindai.github.io/weft/connections/using-a-connection.html).
-- **Make it user friendly to use** You can go read
+- **Make it easy to use.** You can go read
   [which widget when](https://weavemindai.github.io/weft/nodes/metadata.html#widget).
-- **Say what it shows.** You can go and read
-  [what your node shows in the graph](https://weavemindai.github.io/weft/nodes/showing-things-in-the-graph.html)
-  for what it can put on its own body.
+- **Say what it shows.** [What your node shows in the graph](https://weavemindai.github.io/weft/nodes/showing-things-in-the-graph.html)
+  says what it can put on its own body.
 - **Ship a `fake` test**, in a `tests.rs` beside your `mod.rs`. And if it talks
   to a provider, a `live` one on the cheapest path that still exercises the real
   thing.
@@ -126,12 +126,12 @@ A few things we look for in review:
 ## Adding a provider
 
 A provider is a service whose prices weft knows. For that you need to code a
-**meter**: A wrapper around a client call, that works out what a call cost from the bytes that went out
+**meter**: a wrapper around a client call that works out what a call costs from the bytes that went out
 and came back.
 
 If weft cannot price a service yet and you want every project to get it, open a
-PR putting its meter in `crates/weft-providers/src/providers/`. For the trait,
-and what a meter has to do before we accept it, go and read
+PR putting its meter in `crates/weft-providers/src/providers/`. The trait,
+and what a meter has to do before we accept it, is in
 [Measuring what a call costs](https://weavemindai.github.io/weft/connections/meters.html).
 
 ## Code style
@@ -140,22 +140,22 @@ and what a meter has to do before we accept it, go and read
 too much about backwards compatibility. Delete dead code.
 
 **Check for an existing concept before adding one.** If two structs have
-overlapping fields under different names, they are one concept split in two.
+overlapping fields under different names, they are one concept split in two, try to merge them.
 
 **Fix root causes.** A fix at the source beats a workaround downstream, however
 much smaller the workaround looks.
 
-**Same-language duplicates get merged.** The `// SYNC:` marker is only for a
-concept a language boundary forces you to write twice.
+**Same-language duplicates get merged.** One fact, one place: if you find
+it written twice in the same language, merge the copies.
 
 For why the code is shaped this way, including the no-fallbacks rule, naming by
-contract, and the prose header every file opens with, go and read
+contract, and the prose header every file opens with, go read the
 [Design principles](https://weavemindai.github.io/weft/thinking/design-principles.html).
 
-**No em dashes**, in code and comments as much as in prose. You can go check
+**No em dashes**, in commited code and comments as much as in prose. You can go check
 [why we hunt em dashes](https://weavemindai.github.io/weft/thinking/em-dashes.html).
 
-## Working on the database 
+## Working on the database
 
 Change any table, then:
 
@@ -163,7 +163,7 @@ Change any table, then:
 ./setup.sh --migration add_owner
 ```
 
-The name for the migration file name. Docker has to be running, because the difference with the existing db is worked out in a throwaway Postgres. Then it installs as usual, and applies it. Change the table again and ask again, as often as you like.
+The command names the migration file. Docker has to be running, because the diff against your existing database is computed in a throwaway Postgres. Then it installs as usual and applies the draft. Change the table again and ask again, as often as you like.
 
 What it writes each time is a **draft**: gitignored and yours alone, and your
 database runs it like any other migration. When the shape has settled, collapse
@@ -184,7 +184,7 @@ one command, and it all lands in one transaction, so a refusal leaves your
 tree and your database as they were. Forget the step and the
 `schema_agreement` test fails.
 
-Never edit a released migration by hand unless you really know what you are doing. Ideally ask for another one instead.
+Never edit a released migration by hand: the boot checksums every applied one and refuses the change. Ask for a new migration instead.
 
 ### Running the SQL tests
 
@@ -209,37 +209,71 @@ replaying the released migrations, then names whatever differs.
 These tests are behind the `db-tests` feature, off by default, so a plain
 `cargo test` never builds them.
 
+## The browser extension
+
+Users install it from their browser's store, so nothing here touches them.
+For local work on it: `./setup.sh --browser --no-sign` writes an unpacked
+build per browser under `extension-browser/build/` (Chrome loads it from
+`chrome://extensions` with Developer mode on; Firefox loads the zip
+temporarily from `about:debugging`). A signed Firefox build that survives
+closing the browser needs `web-ext` on your `PATH` and Mozilla AMO keys in
+`.env.extension`; the script stops before building anything if either is
+missing and says where to get them.
+
+Releases are version bumps, nothing else: `./setup.sh --browser --bump` (or
+`--vscode --bump` for the editor) bumps the version, and CI on the pushed
+commit builds, signs and publishes to the stores, recording each store's
+version tag. The full store rules are in the releasing skill
+(`.claude/skills/releasing/SKILL.md`).
+
 ## Working on the cluster
 
 If the cluster looks wrong, the bug is in the code, a manifest, `setup.sh`, or
 the test toolkit. So never `kubectl apply/delete/edit/scale`, never `DROP` or
-`ALTER` the live database, and never hand-roll a port-forward (again unless you really know what you are doing but know you are risking your local cluster).
+`ALTER` the live database, and never hand-roll a port-forward; if you do, accept that you are risking your local cluster.
 
 Fix the source instead, then check with a plain `./setup.sh`. If that does not
 pick your change up, that is a change-detection bug in the script: fix the
 script until a fresh run gets there on its own.
 
-As a last resort, you can `./setup.sh --uninstall --purge` and `./setup.sh` to fully reinstall but know that it will wipe your listeners, infra, and running workers. Before you submit a PR you must install the the previous verison of weft that you are mergin into, and make sure that running your ./setup.sh correclty upgrade the version without any issues.
+As a last resort, you can `./setup.sh --uninstall --purge` and `./setup.sh` to fully reinstall but know that it will wipe your listeners, infra, and running workers. Before you submit a PR you must install the previous version of weft that you are merging into and make sure that running your `./setup.sh` correctly upgrades the version without any issues.
 
 ## Documentation
 
-The book is in [`docs/src/`](docs/src/) and builds with mdBook. For the build
-command and the house style, go and read [`docs/README.md`](docs/README.md).
+### Found something wrong in the docs?
+
+These docs are AI-written. I'm reading through and refining them, but I
+might have missed some spots as they are very long. Mistakes will get through. If you
+spot one, please [open an issue](https://github.com/WeavemindAI/weft/issues)
+with the page and what looks wrong, or come tell us in
+[Discord](https://discord.com/invite/FGwNu6mDkU). You don't need to have the
+correction worked out before raising it. 
+
+If something is hard to understand, we want to know about that too.
+
+The book is in [`docs/src/`](docs/src/) and builds with mdBook. The build
+command and the house style are in [`docs/README.md`](docs/README.md).
 
 ## Working with an AI assistant
 
-Most of this repo is built with one. If you do, everything our
-own assistant works from is in `.claude/`: the rules in `.claude/CLAUDE.md`
-(which imports the root `MEMORY.md`, the project's own facts, at session start),
-the eight mode skills in `.claude/skills/`, the code reviewer we hand review
-work to in `.claude/agents/`, and the five flow commands below in
-`.claude/commands/`. It is written generically, so it works as-is; nothing to
-rename.
+Most of this repo is built with one. The repo ships a complete assistant
+setup for most coding assistants: the `working-partner` persona, the eight
+mode skills, the five flow commands and the code reviewer, as one
+derivation per harness (`.claude/` for Claude Code, `.kilo/` for Kilo Code,
+and more arriving). Each derivation is written for its harness rather than
+translated, nothing is always-loaded, and every harness reads the same root
+`MEMORY.md`, the project's own facts, so the knowledge stays shared.
 
-This repo ships its own complete assistant setup, and it deliberately excludes
-your personal memory: `.claude/settings.json` sets `claudeMdExcludes` for
-`~/.claude/CLAUDE.md` and `~/.claude/rules/`, so only the project's rules load
-here. On Windows, or if your home is elsewhere, add your own pattern to
+In Claude Code, the derivation is `.claude/`: the rules in
+`.claude/CLAUDE.md` (which imports `MEMORY.md` at session start), the eight
+mode skills in `.claude/skills/`, the code reviewer in `.claude/agents/`
+that our review rounds go to, and the five flow commands below in
+`.claude/commands/`.
+
+The setup deliberately excludes your personal memory:
+`.claude/settings.json` sets `claudeMdExcludes` for `~/.claude/CLAUDE.md`
+and `~/.claude/rules/`, so only the project's rules load here. On Windows,
+or if your home is elsewhere, add your own pattern to
 `.claude/settings.local.json`. Run `/context` in a session to confirm what
 actually loaded.
 
@@ -250,22 +284,7 @@ remove your personal copies, or launch with `claude --setting-sources project`
 in this repo. Agents resolve the other way (project-over-user), so the
 project's `code-reviewer` always wins.
 
-## Using Kilo Code instead
-
-The same setup exists as a Kilo Code derivation in `.kilo/`, maintained
-separately on purpose (one instruction set per harness, each used to its full
-potential). Nothing is always-loaded: there is no root `AGENTS.md`. Instead,
-select the `working-partner` agent in the agent picker (bottom left); it is the
-full persona (reply discipline, the fork rule, boundaries, modes, the decision
-framework) as a self-contained system prompt. The eight mode skills live in
-`.kilo/skills/mode-*/SKILL.md` and load on switch through the skill tool, the
-five flow commands are `/flow-*` in `.kilo/command/`, and `code-reviewer`
-exists as a subagent in `.kilo/agent/` for the review rounds. The project's
-`.kilo/kilo.json` defaults the agent to `working-partner`, loads the root
-`MEMORY.md` at session start, and enforces the git safety permissions. Project
-facts stay shared: both harnesses read the root `MEMORY.md`.
-
-If you use something other than Claude Code, hand your assistant the root
+In an assistant we have not shipped a derivation for yet, hand it the root
 `CLAUDE.md` (which pulls in the root `MEMORY.md`), the mode skills in
 `.claude/skills/mode-*/SKILL.md`, and the agent file in `.claude/agents/` as
 context. A few passages name Claude Code's own tools (the Edit tool,
@@ -274,30 +293,30 @@ instruction. The flow commands below are Claude Code slash commands, so typing
 them will do nothing, but the files behind them in `.claude/commands/` are
 prose you can paste in, minus the odd reference to a Claude Code agent.
 
-If you are building a feature, this is our usual workflow. We recommend you use this as this is very effective to write production ready code:
+If you are building a feature, this is our usual workflow:
 
-1. **`/flow-1-init`** first, the assistant catch up to the current state of the codebase.
+1. **`/flow-1-init`** first, so the assistant catches up to the current state of the codebase.
 2. **Then babble.** Say what you want, and go back and forth with your AI assistant
   until you both agree on a shape, try to go deep in the details.
-3. **`/flow-2-plan`** writes that shape into a file under `~/.claude/plans/`.
+3. **Run `/flow-2-plan`**; it writes that shape into a file under `~/.claude/plans/`.
 4. **Read the plan, and ask what it is still unclear about.** Go round again
    until it says what you meant.
-5. I usually run a compaction here
-6. **`/flow-3-implement`** builds the whole thing in one session (I usually switch to strongest model I can here, e.g. Fable)
-7. I usually run a compaction here and stage the changes
-8. **`/flow-4-review`, then `/flow-5-review-check`**, as a pair, and repeat
+5. **Run a compaction.**
+6. **Run `/flow-3-implement`**; it builds the whole thing in one session (I usually switch to the strongest model I can here, e.g. Fable)
+7. **Run a compaction and stage the changes.**
+8. **Run `/flow-4-review`, then `/flow-5-review-check`**, as a pair, and repeat
    the pair until flow-4 turns up nothing.
    `/flow-5-review-check` exists to red-team the fixes `/flow-4-review` just
-   made, this is where bugs often comes from.
+   made; this is where bugs often come from.
 
 A small feature is usually done after one pair; a big one takes several.
 
-From step six on it mostly runs itself. Step back in when a review hits a fork. Usually you will see them at the end of the review flows, make sure to read the last message before going to the next flow.
+From step 6 on it mostly runs itself. Step back in when a review hits a fork. Forks usually surface at the end of the review flows; read the last message before starting the next flow.
 
 ## Pull requests
 
 The checklist is in
-[the PR template](.github/PULL_REQUEST_TEMPLATE.md). Try to keep on PR to one feature.
+[the PR template](.github/PULL_REQUEST_TEMPLATE.md). Try to keep one PR to one feature.
 
 ## How we disagree
 
@@ -312,8 +331,8 @@ Four rules:
 **Attack the idea as hard as you like, never the person.** Ideas, decisions,
 code, situations: hit any of them with everything you have. Swear if you want
 to, it moves people in a way that swallowing what you think and handing over a
-half-baked pleasantry does not. "This is fucking stupid" is fine if you then
-say why. "You are fucking stupid" is not, ever.
+half-baked pleasantry does not. "This is stupid" is fine if you then
+say why. "You are stupid" is not, ever.
 
 **Nobody bails out, however long it takes.** An argument ends when each of you
 can understand where the other is coming from and what the crux was. You do not have
@@ -323,8 +342,7 @@ to agree, but "let us just move on" is not an ending.
 instead of defending your own position while you wait for your turn to talk.
 
 **Heat is for people who know each other.** A blunt argument works between
-people who know the other one cares about them. Somebody who turned up last week has none
-of that yet, so be much more careful and patient with them.
+people who know the other one cares about them. Somebody who turned up last week has none of that yet, so be much more careful and patient with them.
 
 ## Where to talk
 
@@ -340,3 +358,6 @@ of that yet, so be much more careful and patient with them.
 There is also a [code of conduct](CODE_OF_CONDUCT.md).
 
 If you build something with weft, come show us in Discord!
+
+And once you have sent us anything at all, ask us to put you on
+[THANKS.md](THANKS.md), or add yourself in the same pull request.

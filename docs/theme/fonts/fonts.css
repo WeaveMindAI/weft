@@ -1,0 +1,20 @@
+/* Fontsource variable fonts, version 5.3.0. Adjacent licenses cover each family.
+   mdBook's resource helper supplies the fingerprinted asset paths. */
+@font-face {
+  font-family: "Geist";
+  src: url('{{ resource "fonts/geist-latin-wght-normal.woff2" }}') format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Mono";
+  src: url('{{ resource "fonts/geist-mono-latin-wght-normal.woff2" }}') format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Source Serif 4";
+  src: url('{{ resource "fonts/source-serif-4-latin-wght-normal.woff2" }}') format("woff2");
+  font-weight: 200 900;
+  font-display: swap;
+}

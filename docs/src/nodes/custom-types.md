@@ -1,123 +1,117 @@
 # Custom types
 
-A `types` key in any `metadata.json`, a node's own or a package root's shared
-partial, declares named types the whole project may use.
+If several nodes pass the same kind of record around, give it a name.
+A `SupportTicket` input tells you more than `JsonDict`: it says which
+record this node expects, and the declaration says which fields belong in it.
+
+Add a `types` block to a node's metadata or its package's shared metadata:
 
 ```json
 "types": {
-  "ChatHistory": "List[ChatMessage]",
-  "ChatMessage": "{ role: String, content: String | List[Part], name?: String }",
-  "Part": "{ type: String, text?: String, image_url?: { url: Image } }"
+  "SupportTicket": "{ id: String, question: String, screenshot?: Image }",
+  "TicketBatch": "List[SupportTicket]"
 }
 ```
 
-## The four rules
+Then use the name on a port:
 
-**Declarations are global.** Once any metadata declares `ChatHistory`, every
-node's ports and every `.weft` inline signature may name it. Declare a type
-next to the node that owns the concept.
+```json
+{
+  "name": "ticket",
+  "type": "SupportTicket",
+  "required": true
+}
+```
 
-**Named types are nominal.** Only a same-named value wires in. The value wires
-**out** into `JsonDict` freely, so forgetting the name is always safe. The
-user's escape hatch for a hand-built dict is the `Cast` node, which validates
-at run time, so your node can trust that a named input already fits its
-declared structure.
+Put the `types` block at the top level of the metadata. Add the port object
+to the `inputs` array.
 
-**Redeclaring an identical body is absorbed silently.** Two packages may ship
-the same shared type without depending on each other. A **different** body
-under the same name fails the catalog load loudly, so drift between two copies
-is a build error.
+## A name is part of the contract
 
-**Record validation is strict.** A value carrying a key the record does not
-declare is refused. So declare every field the real values carry, with `?` on
-the optional ones. Half-declaring a shape produces a type that rejects real
-data.
+A `SupportTicket` output can feed a `SupportTicket` input.
+An unnamed object does not become a ticket merely because its fields look
+right. To accept an object from an untyped source, use `Cast` and declare
+the target type. The conversion checks its fields at run time.
 
-## What a name buys you
+A named value can flow out to a compatible structural type.
+`SupportTicket` can feed its record shape or `JsonDict`;
+`TicketBatch` can feed a compatible list. A list is not a `JsonDict`.
 
-A named type is a contract that survives being passed around. Without one, a
-chat history is a `JsonDict` and every node that touches it works out the shape
-again for itself, and they do not all reach the same answer.
+The check establishes the declared structure. It does not prove that
+ticket `"T-42"` exists or that its question was answered correctly.
 
-## Media inside a custom type
+For casts and source-level type declarations, read
+[Types](../language/types.md).
 
-A field declared `Image`, `Audio`, `Video`, or `Blob` is a **media slot**. In
-stored form, which is what rides edges and lands in the journal, it holds a
-small stored-file reference, so a conversation carrying forty images stays
-cheap to journal.
+## Where the declaration is visible
 
-A provider wants bytes or URLs. Two storage verbs convert a **whole typed
-value** at that boundary, driven by the declared type, so there is no per-node
-walking code anywhere:
+Metadata types are available throughout the project's catalog and in its
+`.weft` source. Put the declaration beside the node or package that owns
+the concept.
+
+Two packages can repeat the same name with an identical body. Different
+bodies under one name fail catalog loading, so two implementations cannot
+quietly disagree about what `SupportTicket` contains.
+
+Records reject undeclared fields. Use `?` for a field that may be absent,
+and include every field you intend to carry. For example, adding an
+`assignee` property to a value requires adding it to the declaration too.
+
+If you use [package defaults](metadata.md#package-defaults), remember that
+a member's own `types` object replaces the inherited object as a whole.
+
+## Files inside a record
+
+The optional `screenshot` above is an `Image` field. When it holds a
+stored-file reference, the graph carries that reference instead of copying
+the image bytes into the record.
+
+A provider may need a URL or inline data instead. The storage helpers can
+convert all file positions in a typed value, including files nested inside
+lists and records. You still need to call the helper at the provider
+boundary; declaring a type does not make the request for you.
+
+For example, inside a node that declares a `ticket` output:
 
 ```rust
-use weft::storage::media::{ExternalizePolicy, MediaForm};
+use weft::storage::{StorageScope, media::ExternalizePolicy};
 
-let ty = ctx.output_type("history").expect("declared on the port");
-let storage = ctx.storage(StorageScope::Project);
+let ty = ctx.output_type("ticket")
+    .ok_or_else(|| weft::node_error("The ticket output type is missing"))?;
+let storage = ctx.storage(StorageScope::Execution);
 
-// Going out to a provider: each media slot becomes something it can use.
-let wire = storage.externalize(
-    &value,
-    &ty,
-    ExternalizePolicy { audio: MediaForm::Inline, ..ExternalizePolicy::urls() },
+let provider_value = storage
+    .externalize(&ticket, &ty, ExternalizePolicy::urls())
+    .await?;
+```
+
+Here `ticket` is the JSON value you are preparing to send.
+`urls()` requests public links for stored files and uses inline data when
+no public link can be served. Use `ExternalizePolicy::inline()` when the
+consumer requires inline data.
+
+The converted object is for that provider call. Its file fields now hold
+external strings, so keep the original typed value for the graph.
+
+If a response contains media URLs or data URLs in the same declared shape,
+bring those files into storage:
+
+```rust
+let stored_ticket = storage.internalize(&response, &ty, None).await?;
+ctx.pulse_downstream(
+    NodeOutput::new().set("ticket", stored_ticket),
 ).await?;
-
-// Coming back: raw media (a data: URL, an external URL) is stored, and every
-// slot becomes a stored-file value again. Already-stored slots pass through.
-let stored = storage.internalize(&response_value, &ty, None).await?;
 ```
 
-`MediaForm::Url` is a **preference, not a promise**: a slot becomes a public
-link when an internet-reachable address is configured, and falls back to inline
-base64 bytes when none is. Declare `Inline` only for consumers that accept
-nothing else.
+`internalize` stores raw media and replaces those positions with file
+references; already-stored references pass through. It does not validate
+unrelated response fields. Your node still needs to check that the provider
+returned the result it promised.
 
-**Emit only the internalized form.** Public links expire, so one sitting in a
-journal row is a broken link when somebody opens that run later.
+Here `None` leaves newly stored files eligible for cleanup after the
+execution. Pass `Some(KeepTtl::Default)` to keep them for the default
+retention period; import `KeepTtl` from `weft::storage`.
 
-The chat nodes in `catalog/ai` are the worked example: `ChatHistory` carries
-media through an arbitrarily long conversation with one externalize per call
-and one internalize per reply.
-
-## Sharing state across executions
-
-If you are thinking of reaching for a plain Rust `static` in a node's module,
-know that a worker process multiplexes many executions of the same project, so
-every firing of every node in that file sees the same instance for as long as
-the worker lives.
-
-A worker only ever hosts one project, so nothing of another tenant's can reach
-it. So executions reading and writing each other's state through it is a
-feature: caches, pools, warmed clients, a shared buffer one execution fills
-and others drain.
-
-```rust
-/// The process-shared `GeneratorInfo` for a model. Shared because the model's
-/// published rates are cached on the generator, so the price sheet is fetched
-/// once per TTL rather than once per execution.
-fn shared_generator(model: &str) -> GeneratorInfo {
-    static POOL: OnceLock<Mutex<HashMap<String, GeneratorInfo>>> = OnceLock::new();
-    let fresh = GeneratorInfo::openrouter(model);
-    let mut pool = POOL.get_or_init(Mutex::default).lock().expect("generator pool lock");
-    pool.entry(fresh.pricing_key()).or_insert(fresh).clone()
-}
-```
-
-One rule keeps it sound: **it is a per-process layer, not durable state.** It
-dies with the worker, and workers shut down when idle. Other pods never see
-it. Anything that must survive a restart or be visible across pods belongs in
-the durable primitives (`ctx.run`, buses, storage), with the static as at most
-a warm cache in front.
-
-And hold locks only across map lookups, never across an `.await`.
-
-If a piece of state should be private to one execution, key it by
-`ctx.execution_id`.
-
-The same pattern covers repeated storage reads: a node that inlines the same
-bytes on every firing, such as an audio clip re-sent to a provider each
-conversation turn, can keep a byte cache in a static keyed by the file's
-storage key. Values themselves stay single-form, so the journal replays
-without any cache, which makes this a pure optimization you add when a real
-workload measures slow.
+For retention and conversion policies, read [Storage](storage.md).
+For an existing example with nested media, read the
+[chat type declarations](https://github.com/WeavemindAI/weft/blob/mvp/catalog/ai/llm/metadata.json).

@@ -1,82 +1,77 @@
 # Files at run time
 
-Two different things are called "files" in weft.
+A picture a program made can still be there in an old run months later, or it
+can be gone in five minutes. Which one depends on where the step put it and
+whether anything asked to keep it.
 
-**Project assets** live with your source: an image you dropped onto a node, a
-prompt in its own file, a CSV a program reads. They are referenced with
-`@asset` or `@file` and they are part of the project.
-
-**Runtime files** are written by running programs: a generated image, a
-transcription, a cache a project builds.
-
-The [asset sync](../language/files-and-reuse.md#the-asset-sync) is the bridge:
-before every build it makes storage mirror exactly what the code references.
-
-## How long a runtime file lasts
-
-If you want to know when something you wrote will disappear, look at the
-[scope](../nodes/storage.md) it was written with.
-
-| Scope | Path | Deleted when |
-|---|---|---|
-| Execution | `exec/<run>/` | shortly after the run ends, unless kept |
-| Project | `project/<project_id>/` | the project is deleted |
-| Shared | `shared/<name>/` | the owner deletes it |
-
-If you want a file your node emits to survive its own run, mark it kept.
-Otherwise it is swept shortly afterwards and turns up in the editor weeks later
-as expired media.
-
-`KeepTtl::Default` is 30 days and every access bumps the clock, so artifacts
-still in use never expire while abandoned ones age out. The rule and the
-`KeepFile` node are in [Storage](../nodes/storage.md#the-keep-rule).
-
-## Finding one afterwards
-
-If you want to see what a project has written, or pull one file down:
+## Find one
 
 ```bash
 weft files ls
 weft files inspect <key>
-weft files download <key>
-weft files rm <key>
+weft files download <key> --output picture.png
 weft files usage
 ```
 
-The editor has the same thing as a browser, and if you want a stored file's
-address in your source, its picker will paste it in for you.
+The key is the space heading plus the file id underneath it, so
+`project/<project-id>/<file-id>`. Without `--output` you get the stored
+filename. These work from anywhere, not just inside a project. The editor has a
+browser for the same thing, which can also pick a file for a program input.
 
-## Public links
+`weft files rm <key>` deletes one, after asking. A key ending in `/` means a
+whole space, so read it twice before confirming.
 
-If you want somebody outside weft to be able to fetch a stored file, whether
-that is a person you are sharing a generated image with or a provider you are
-handing media to, there are two ways and they are for different jobs.
+## How long they last
 
-- **Presigned**, a signed URL carrying its own credentials. This is the one for
-  handing a provider bytes during a single call.
-- **A public link**, a shorter address protected by an unguessable token and
-  served through the same filtered surface as the trigger paths. This is the
-  one for sharing with a person. See
-  [what the proxy passes](../connections/events.md#what---public-url-actually-does).
+| Where it was written | How long it lives |
+|---|---|
+| Execution, not kept | Cleaned up once that run ends |
+| Execution, kept | The keep period, or forever |
+| Project | Until you delete it, or the project |
+| Shared | Until you delete it, even if the project goes |
 
-Both take a time to live and **both expire**: 15 minutes if you do not say, 7
-days at the most. So never emit either on a port, because the URL outlives its
-own validity in the journal and turns into a broken artifact later. Emit the
-stored file itself and mint the link where it is used.
+Unkept execution files get a five minute grace period before a sweep takes
+them, so do not count on them when you open an old run.
 
-## Media inside typed values
+The default keep is 30 days, and it resets whenever the file is read through
+weft or a fresh download link is made. Listing files, looking at their
+metadata, or reusing a link you already have does not reset anything.
 
-If your type has file-shaped fields inside it, you do not have to walk it. The
-runtime converts the whole value at a provider boundary, which is what keeps a
-conversation carrying forty images cheap to journal.
+To keep an execution file after the fact, put a `KeepFile` step in. Its
+`ttl_days` is 30 by default and zero means forever. It only applies to
+execution files: project and shared files have their own lifetimes and refuse
+it.
 
-See [media inside a custom type](../nodes/custom-types.md#media-inside-a-custom-type).
+For choosing where to write in the first place, read
+[storage](../nodes/storage.md).
 
-## The object store
+## Files your source refers to
 
-Underneath, files live in an S3-compatible object store. Locally that is a
-container the installer runs; elsewhere it is whatever S3 endpoint is
-configured.
+Before a build, weft uploads any local asset that is new or changed, and it
+protects whatever the current program points at.
 
-Nothing in the language or the node API depends on which, because a node writes
-through `ctx.storage` and never names a bucket.
+Swapping a picture in your source does not delete the old upload straight away,
+because old runs still refer to that version. Uploads nothing points at any
+more get a 30 day expiry, reset by reads through weft or fresh links. Deleting
+the project takes its assets with it.
+
+For the markers and when each is read, read
+[files and reuse](../language/files-and-reuse.md).
+
+## Handing a file to somebody else
+
+A step can ask for a temporary link. `presign` gives one the step can use,
+though whether it works from the internet depends on the installation.
+`public_link` gives one that does, or nothing at all if the installation cannot
+provide it.
+
+Links last 15 minutes by default and seven days at most. A signed bucket URL
+can outlive the file it points at. A public relay link holds off the file's own
+expiry until the link dies, which is not the same as keeping it.
+
+So keep the file *reference* in your program's outputs and make a link at the
+moment you hand it over. Save the link as the output instead and every old run
+is left pointing at something expired.
+
+For setting up the public relay, read
+[a public address](../connections/public-address.md).

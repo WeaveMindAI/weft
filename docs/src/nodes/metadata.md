@@ -1,347 +1,358 @@
 # metadata.json
 
-The node's declared surface. Ports, config, presentation, and the handful of
-flags the engine reads.
+Use `metadata.json` to tell weft what your node takes, what it produces
+and how to present it in the editor. The compiler reads this declaration
+without compiling Rust, so the graph can be checked while someone is
+still writing the implementation.
 
-It is data rather than code because the compiler has to know a node's shape
-without compiling its Rust, which is what lets the editor draw a graph and the
-validator check every wire in milliseconds.
-
-Unknown keys are rejected everywhere, so a typo is a load error rather than a
-setting that silently does nothing.
+For a complete first example, use [Your first node](your-first-node.md).
+This page is the reference for extending that declaration.
 
 ## The top level
 
-| Key | What it is |
+`type`, `label` and `description` identify the node and are required.
+The other fields add ports, controls or capabilities. Unknown schema keys
+produce a metadata load error.
+
+| Key | Use it to declare |
 |---|---|
-| `type` | the node type name. PascalCase. This is the node's identity. |
-| `label` | what the editor shows on the box |
-| `description` | one paragraph, saying what the node emits |
-| `tags` | strings, for search and grouping |
-| `icon` | a [Lucide](https://lucide.dev/icons) icon name in PascalCase |
-| `color` | a hex string for the node's accent |
-| `inputs` | the input ports |
-| `outputs` | the output ports |
-| `types` | named custom types this node declares. See [Custom types](custom-types.md). |
-| `requires_infra` | true for [infra nodes](infrastructure.md) |
-| `images` | container image directories, for infra nodes |
-| `publishes` | the service name this node hands out a connection to |
-| `service` | the whole [service recipe](../connections/writing-a-service.md), for access nodes |
-| `accessApps` | a public, secretless OAuth app this project ships |
-| `portsFromConfig` | where a node's ports come from, when they come from its own config |
-| `features` | boolean-ish flags |
-| `display` | what the editor renders inline on the node body |
-| `validate` | declarative validation rules |
+| `type` | The unique node type used in source, such as `WordCount` |
+| `label` | Its name in the editor |
+| `description` | What the node does, shown to people and coding assistants |
+| `tags` | Search terms |
+| `icon` | A Lucide icon name, such as `Type` |
+| `color` | An accent color: a hex value, CSS variable or supported palette token |
+| `inputs` / `outputs` | The port declarations below |
+| `types` | Named [custom types](custom-types.md) |
+| `features` | The behavior flags listed below |
+| `display` | A file to show on the node |
+| `validate` | Additional declarative checks |
+| `portsFromConfig` | Ports derived from a list in the graph's configuration |
+| `requires_infra` | Whether the node provisions infrastructure |
+| `images` | Local image directories, relative to the package root |
+| `publishes` | The service name for a connection the node publishes |
+| `service` | The [connection recipe](../connections/writing-a-service.md) owned by an access node |
+| `accessApps` | Public OAuth app registrations keyed by service name; confidential client secrets are rejected |
 
-`features` holds flags. Anything with structure gets its own top-level key.
+The compiler treats `color` as a presentation hint. An unknown icon name
+renders as a square and logs the missing name in the editor console.
 
-A name Lucide does not ship renders as a plain square, with the reason in the
-console.
+For container declarations and image layout, read
+[Infrastructure nodes](infrastructure.md).
 
 ## Inputs
 
-Every value a node takes from the graph is an input port, one value per port.
-A node never asks the author to pack several values into one list or dict
-first: `PostgresExecuteQuery` once took its parameters as a `List`, and every
-query with two parameters cost the program a Python node whose whole body was
-`return {'params': [a, b]}`. When the set of values is open-ended (a query's
-parameters, a template's holes, a script's variables), the node declares
-`canAddInputPorts` in `features` and the author declares the ports inline:
-`PostgresExecuteQuery(user_id: String) { query: "... WHERE id = $user_id" }`.
-The body reads them with `ctx.inputs.custom()`.
+Put both wired values and configuration in `inputs`. They reach the body
+through the same `ctx.inputs` accessors.
 
 ```json
 {
   "name": "method",
   "type": "String",
   "required": true,
-  "widget": { "kind": "select", "options": ["GET", "POST"] },
   "default": "GET",
+  "widget": { "kind": "select", "options": ["GET", "POST"] },
   "label": "Method",
-  "placeholder": "...",
   "description": "The HTTP verb to use."
 }
 ```
 
+`name` and `type` are required. `required` defaults to false.
+`label`, `description` and `placeholder` help someone fill in the input.
+
+When the node takes a set of values chosen by the program's author, such
+as a script's variables, enable `features.canAddInputPorts`. Each variable
+can then have its own port. In Rust, read those extra values with
+`ctx.inputs.custom()`.
+
 ### `accepts`
 
-Which of the two drivers this input takes. A value written in the source is a
-`literal` (whatever its spelling: in the braces, on its own `n.x = ...` line,
-a `@file` or `@asset` marker); a value another node produces is a `wire` (an
-edge, a dotted value in the braces, an inline node). Leave the key out and the
-input takes both, which is what almost every port wants.
+Most inputs accept either a literal or a wire. Narrow that choice only
+when the node needs it:
 
 ```json
 "accepts": ["wire"]
 ```
 
-An input never adds a form; it only removes one, and only for a reason the
-node can name. `["wire"]` refuses every written value, for a port that needs
-a real node rather than a value (an inference node's `provider`, `history`,
-`params`). `["literal"]` refuses wiring. Getting it wrong is
-`input-accepts`, and the message reads the list back: "`params` accepts:
-wire".
+| Declaration | Allowed source |
+|---|---|
+| Omitted | A literal or a wire |
+| `["wire"]` | A value produced by another node |
+| `["literal"]` | A value written in the source |
 
-Two kinds of port carry no list, because their drivers are not yours to pick.
-A `Bus` or `Generator` port is wire-only by nature (a live handle no human can
-write); the loader forces it, and a list naming `literal` there is an error.
-A port the compiler reads to build the node, the list named in
-`portsFromConfig` or the input carrying the access picker, takes an inline
-typed value only: no wire, no `@file`, no `@asset`, so the node's shape is
-readable in the source without following anything. That is a fixed rule
-nobody writes and no `accepts` loosens.
+`@file` and `@asset` count as literals. A dotted reference in the node's
+braces counts as a wire. An input gets one source; supplying two produces
+`double-driven-port`.
 
-An input has exactly one driver. Two is `double-driven-port`.
+Live `Bus` and `Generator` handles are wire-only. Inputs the compiler
+must read to determine the node's shape, including an access picker and
+the list named by `portsFromConfig`, require an inline value. `accepts`
+cannot loosen those rules.
 
 ### `widget`
 
-Overrides the editor control. Absent, the control derives from the type
-through one central mapping: file types get a drop control, `Boolean` a
-checkbox, `Number` a number box, a `List[String]` the add-one-at-a-time
-list, a `String` a single-line box, and everything else a text area
-holding the value as JSON text. A String field that really holds prose
-(a prompt, a message body) declares `"widget": { "kind": "textarea" }`.
+If you omit `widget`, the editor chooses a control from the type:
+a checkbox for `Boolean`, a number field for `Number`, a single-line
+field for `String`, a text list for `List[String]`, and a file picker
+for file types. Other values use a text area.
 
-A port that holds SEVERAL files (`List[Audio]`, or a `Media | List[Media]`
-that takes one or many) gets the same drop control keeping a list: it
-picks several at once, adds one at a time, and writes one `@asset(...)`
-per file.
+For prose, choose a text area explicitly:
 
-| Kind | For |
+```json
+"widget": { "kind": "textarea" }
+```
+
+| Kind | Options and behavior |
 |---|---|
-| `select` / `multiselect` | a small fixed vocabulary; takes `options`. A written value outside them is a compile error, a wired one fails the firing |
-| `textarea` | a multi-line box, for a String that holds prose |
-| `code` | a code editor; takes `language` |
-| `number` | takes `min` / `max` / `step`; the editor and the compiler hold a written value to them, and the run holds a wired one (a whole-number `step` refuses a fraction) |
-| `datetime` | a calendar-and-clock picker for a String holding one moment; stores ISO-8601 with the picker's zone offset |
-| `password` | a masked field |
-| `file_drop` | narrows the file filter beyond the type; takes `accept` |
-| `text_list` | a list of short text values, added one at a time |
-| `entry_list` | build the list a node's ports come from (see below) |
-| `access` | the connection picker. See [Using a connection](../connections/using-a-connection.md). |
-| `remote_select` | pick a resource inside the connected account |
+| `text` / `textarea` | Single-line or multiline text |
+| `checkbox` | A Boolean control |
+| `number` | `min` and `max` bound values. A positive whole-number `step` requires integers; fractional steps only control the editor increment |
+| `select` / `multiselect` | Fixed `options` offered by the editor; use a validation rule or node code for other restrictions |
+| `code` | A code editor with a `language` |
+| `datetime` | A date and time stored with the selected timezone offset |
+| `password` | Mask the displayed text |
+| `text_list` | Add and remove short strings |
+| `file_drop` | File selection; `type`, `accept` and `multiple` control the accepted files |
+| `entry_list` | Edit the entries used by `portsFromConfig` |
+| `access` | Pick an account connection |
+| `remote_select` | Pick a resource on a connected service |
 
-> **A field whose value names something enumerable is never a bare text
-> field.** If the vocabulary is small and fixed, declare `select`. If the
-> provider can list the choices (model ids, voices, channels, databases,
-> repos), declare `remote_select` so the user searches instead of copying an
-> id out of the provider's docs. Add `free_text: true` when a pasted id is
-> also valid, for example a model route the list has not caught up with.
-> Plain text is for free-form values: a prompt, a URL, a message
-> body.
+A password widget only masks the display. It does not make a value safe to
+store as configuration. Use an access node for credentials.
 
-`remote_select` gets its own treatment in
-[Using a connection](../connections/using-a-connection.md#picking-a-resource).
+If the provider can list channels or models, a `remote_select` saves the
+user from finding and copying an ID. Set `free_text: true` when an ID
+outside the fetched list is also valid. For its sources and dependent
+pickers, read
+[Pick a resource inside the account](../connections/using-a-connection.md#pick-a-resource-inside-the-account).
 
 ### `default`
 
-The value the runtime supplies when nothing else drives the input. Consulted
-at run time, rendered by the editor as the effective value, and **never
-written into source**. `required` plus `default` is satisfiable with no
-driver at all.
+The runtime uses `default` when no wire or literal supplies the input.
+The editor can display that effective value without writing it into the
+source. A required input with a default can therefore be left unwired.
+
+A default does not replace a wired input that closes without a value.
+For that distinction, read
+[The closed pulse](../language/mental-model.md#how-a-branch-stops-the-steps-after-it).
 
 ### `requiresScopes` and `requiresValues`
 
-Only on `Access` inputs. They state what this node needs from a connection.
-See [Using a connection](../connections/using-a-connection.md#declaring-what-your-node-needs).
+On an `Access` input, these declare which permissions and stored values
+the consumer needs. The source contains a connection reference, so the
+compiler alone cannot check the real account's permissions. For the
+declarations and checks, read
+[Declare the requirements on the input](../connections/using-a-connection.md#declare-the-requirements-on-the-input).
 
 ## Outputs
 
 ```json
-{ "name": "ts", "type": "String",
-  "description": "The posted message's timestamp." }
+{
+  "name": "count",
+  "type": "Number",
+  "description": "The number of whitespace-separated words."
+}
 ```
 
-Simpler than inputs: no widget, no default, and no `required`. An output has
-no optionality to declare: a port not present in a firing's output emits no
-pulse, which closes it and skips what is downstream, whatever the metadata
-could have said. That is [the closure
-rule](../language/mental-model.md#the-closed-pulse). A `required` key on an
-output is refused at load, naming the removal.
+Outputs have a `name`, a `type` and an optional `description`.
+They have no widget, default or `required` field.
+
+An ordinary port can emit once per firing. If the body finishes without
+emitting on that port, the runtime closes it. A downstream node that needs
+that value may then skip; an optional input can remain absent. A generator
+port can emit repeatedly and closes when its sequence ends.
+
+Leaving a port out of one emission does not close it immediately.
+For emission and explicit closure, read
+[Reading inputs, emitting outputs](values-and-emission.md).
 
 ## `features`
 
-The complete set, `hidden` aside, which only catalog nodes use:
+```json
+"features": {
+  "canAddInputPorts": true,
+  "optionalCustomInputs": true
+}
+```
 
-| Flag | Meaning |
+| Field | Meaning |
 |---|---|
-| `isTrigger` | this node starts executions from outside |
-| `optionalCustomInputs` | ports created by a wire on this node are optional by default |
-| `customInputType` | the type every WIRED created port takes; a shared variable (`T`) makes them one type. A port created by a config literal takes the literal's own inferred type instead, so a non-string literal on a `String`-typed node is caught at run time by the node, loudly |
-| `liveEndpoint` | names the endpoint serving `/live` for an infra node |
-| `canAddInputPorts` | the `.weft` author may add input ports to this node, by declaring them or by wiring a config key that names no declared port. Without it, an extra port is a compile error. This is how a node takes an open-ended set of values (`ExecPython`, `Format`, `PostgresExecuteQuery`); never a `List` input the author has to assemble. |
-| `canAddOutputPorts` | the same for outputs |
-| `showDebugPreview` | the editor renders the node's latest output inline on its body |
-| `oneOfRequired` | groups of ports where at least one of each group has to arrive, or the node is **skipped**. `[["message", "attachment"]]` means a send needs one or the other. |
-| `castPorts` | this node converts a named input into a named output's declared type, checked against the conversion table at compile time |
+| `isTrigger` | The node registers an event source that can start executions |
+| `canAddInputPorts` | Source may add inputs beyond the metadata declarations |
+| `canAddOutputPorts` | Source may add outputs |
+| `optionalCustomInputs` | Created inputs are optional by default |
+| `customInputType` | The type used for created wired inputs; a shared variable such as `T` ties them together |
+| `oneOfRequired` | Lists of inputs where at least one in each list must have a non-null value; otherwise the node skips |
+| `showDebugPreview` | Show the latest value on the node |
+| `liveEndpoint` | The named infrastructure endpoint that serves `/live` |
+| `castPorts` | The `input` and `output` ports whose types must allow a checked conversion |
+| `hidden` | Hide an internal catalog type from the picker and refuse it in authored source |
+
+For example, `"oneOfRequired": [["message", "attachment"]]` lets a node
+run with either input. A custom input created from a literal takes that
+literal's inferred type; `customInputType` does not override it.
 
 ## `display`
 
-For a node whose firing produces or receives a file worth seeing.
+To display a file on the node, name its port and which side it is on:
 
 ```json
 "display": { "kind": "media", "output": "image" }
 ```
 
-`kind` is `media`, which renders the file by its own mime type (an image
-inline, audio and video with a real player, anything unplayable as a file card
-with a save button), or `link`, which renders the metadata and download card
-only. There is no flag per media type: a newly playable format is a renderer
-change.
+Use `input` instead of `output` for a display sink. Supply exactly one
+side and name a declared port; the catalog rejects an ambiguous or missing
+port.
 
-Name the port **with its side**, exactly one of `output` (a generator showing
-what it made) or `input` (a display sink showing what was wired in), which is
-what keeps a node with a same-named input and output unambiguous. Declaring
-both, neither, or a port that does not exist is refused when the catalog
-loads.
+`media` shows images and playable audio/video, with a file card for other
+formats. `link` always shows the file card. For previews and live status
+panels, read [What your node shows in the graph](showing-things-in-the-graph.md).
 
 ## Package defaults
 
-A package (a directory with `package.toml`) may hold a **partial**
-`metadata.json` at its root: defaults every member node inherits.
+A directory with `package.toml` can also have a partial
+`metadata.json`. Each member inherits keys it does not define itself:
 
-The merge is top-level and key by key: a member gets each key unless its own
-`metadata.json` carries that key, in which case the member's value wins
-wholesale. There is no deep merge.
-
-`type`, `label`, and `description` can never be defaults, because they are one
-node's identity.
-
-If a package's nodes share a `portsFromConfig` vocabulary, a `types` block, or a
-`provider` name, this is where it goes.
-
-```
-catalog/human/
+```text
+nodes/my_package/
   package.toml
-  metadata.json        PARTIAL: { "portsFromConfig": {...} }, shared by both
-  form_helpers.rs      shared code
-  trigger/  metadata.json    HumanTrigger
-  query/    metadata.json    HumanQuery
+  metadata.json         shared types or other defaults
+  first/
+    metadata.json      first node's identity and ports
+    mod.rs
+  second/
+    metadata.json
+    mod.rs
 ```
+
+The merge replaces whole top-level values. If a member defines `types`,
+its entire `types` object wins; the loader does not merge its entries
+with the package's object.
+
+`type`, `label` and `description` cannot be package defaults.
+For how the package's Rust code is shared, read [Packaging](packaging.md).
 
 ## Ports that come from a node's own config
 
-A node can grow its ports from a LIST in its own config: `HumanQuery` from the
-form fields somebody configured, `Switch` from its cases. It declares which
-config key holds that list, and the entry kinds the list may use, under
-`portsFromConfig`. The real ports are derived at compile time from what the
-graph author wrote.
+A form needs an output for each field the program author adds.
+`portsFromConfig` declares how entries in that list become ports.
+
+This fragment adds a String output for each `text_input` entry in
+the node's `fields` input:
 
 ```json
-{
-  "portsFromConfig": {
-    "field": "fields",
-    "specs": [
-      {
-        "kind": "approve_reject",
-        "label": "Approve / Reject",
-        "render": { "component": "buttons", "source": "static" },
-        "fields": [
-          "label",
-          { "key": "approveLabel", "label": "Approve button text", "shape": "typed", "valueType": "String" },
-          { "key": "rejectLabel", "label": "Reject button text", "shape": "typed", "valueType": "String" }
-        ],
-        "addsOutputs": [
-          { "nameTemplate": "{key}_approved", "portType": "Boolean" },
-          { "nameTemplate": "{key}_rejected", "portType": "Boolean" }
-        ]
-      },
-      {
-        "kind": "text_input",
-        "label": "Text input",
-        "render": { "component": "text" },
-        "addsOutputs": [ { "nameTemplate": "{key}", "portType": "String" } ]
-      }
-    ]
-  }
-}
-```
-
-Every entry names its `kind`, and the port it adds under the key its spec asks
-for: `keyField` defaults to `"key"` (a form field), and `Switch` sets it to
-`"port"` so a case reads in its own vocabulary. `{key}` is substituted with
-that name. `T_Auto` as a port type requests a per-entry type variable.
-
-Derivation reads **only** each entry's `kind` and its port name. It does not
-read an entry's `render` from the graph source; that is inherited from the
-spec. An entry may override `render`, but it need not, and the editor emits
-the minimal entry so the source stays lean.
-
-A port name has to be a legal identifier.
-
-### What a kind asks the author for
-
-A kind lists under `fields` the values an entry of that kind has to carry: a
-select's `options`, a case's `value`. Each one declares the SHAPE its value
-must have, which is what the compiler holds it to, and the editor draws a
-control for it from its widget. Nothing between the metadata and the graph
-learns what any key means.
-
-```json
-{ "key": "options", "label": "Options", "required": true,
-  "shape": "typed", "valueType": "List[String]" }
-```
-
-An entry may also be a bare NAME, which is the same declaration with
-everything obvious filled in: a one-line String box, keyed and labelled
-after the name, optional.
-
-```json
-"fields": ["label", "placeholder"]
-```
-
-is exactly
-
-```json
-"fields": [
-  { "key": "label", "label": "Label", "shape": "typed", "valueType": "String" },
-  { "key": "placeholder", "label": "Placeholder", "shape": "typed", "valueType": "String" }
-]
-```
-
-A name of several words reads as words, so `minLength` and `min_length`
-both label as "Min Length". Write the whole declaration when the label is
-not the key (`approveLabel` wants "Approve button text"), when the value
-is not a String, or when it is required.
-
-`shape: "typed"` names a plain weft type in `valueType`. The other shapes are
-measured against the input the entries are matched on, so they only make sense
-on a list whose entries compete (below): `value` (something that input could
-hold), `valueList`, `number`, `element` (one item of a list, or a piece of the
-text), and `regex`, which has to compile.
-
-The control comes from the shape unless the field names a `widget`, using the
-same widget vocabulary an input port uses. A `List[String]` gets `text_list`,
-a `number` shape gets a number box, everything else a text box.
-
-### Entries that compete
-
-When the entries are TRIED IN ORDER and only one wins (a switch's cases, never
-a form's fields), the KIND is the test: one kind per way of matching, each
-asking for the value it compares against. `matchInput` names the input they are
-all matched against, and the kind that takes anything says `catchAll`.
-
-```json
-{
-  "field": "cases",
-  "matchInput": "value",
+"portsFromConfig": {
+  "field": "fields",
   "specs": [
-    { "kind": "equals", "keyField": "port", "label": "is exactly this value",
-      "fields": [{ "key": "value", "label": "Value", "required": true, "shape": "value" }],
-      "addsOutputs": [{ "nameTemplate": "{key}", "portType": "Boolean" }] },
-    { "kind": "between", "keyField": "port", "label": "between these two numbers",
-      "fields": [
-        { "key": "min", "label": "Lowest", "required": true, "shape": "number" },
-        { "key": "max", "label": "Highest", "required": true, "shape": "number" }
-      ],
-      "addsOutputs": [{ "nameTemplate": "{key}", "portType": "Boolean" }] },
-    { "kind": "otherwise", "keyField": "port", "label": "anything else",
-      "catchAll": true,
-      "addsOutputs": [{ "nameTemplate": "{key}", "portType": "Boolean" }] }
+    {
+      "kind": "text_input",
+      "label": "Text input",
+      "render": { "component": "text" },
+      "fields": ["label", "placeholder"],
+      "addsOutputs": [
+        { "nameTemplate": "{key}", "portType": "String" }
+      ]
+    }
   ]
 }
 ```
 
-The compiler holds a `catchAll` entry to being unique and last, since anything
-after it can never be reached. An entry carrying a key its kind never declared
-is a compile error.
+The metadata also needs a declared `fields` input. In the graph, an entry
+such as `{ "kind": "text_input", "key": "reason" }` adds a `reason`
+output. The default `keyField` is `key`; a switch can choose `port`
+instead. Port names must be legal identifiers.
+
+Use `addsInputs` for input ports. Each template substitutes the entry's
+name into `{key}`. A `portType` of `T_Auto` gives the entry its own
+type variable.
+
+### What a kind asks the author for
+
+The `fields` list describes values the author can supply on an entry.
+A bare `"label"` declares an optional String field named `label`.
+Use a full declaration for another type, a custom label or a required field:
+
+```json
+{
+  "key": "options",
+  "label": "Options",
+  "required": true,
+  "shape": "typed",
+  "valueType": "List[String]"
+}
+```
+
+`shape: "typed"` checks the value against `valueType`. You can override
+its editor control with `widget`, using the input widget vocabulary.
+
+The spec's `render` supplies the default form renderer. An entry may
+override it in the graph; it does not need to repeat it.
+
+### Entries that compete
+
+For switch-like entries, `matchInput` names the input they compare against.
+The field shapes can then be relative to that input:
+
+| Shape | Checks |
+|---|---|
+| `value` | One value compatible with the matched input |
+| `valueList` | A list of compatible values |
+| `number` | A number |
+| `element` | One element of the matched list, or a piece of matched text |
+| `regex` | A regular expression that compiles |
+
+Set `catchAll: true` on the fallback kind. The compiler permits one
+catch-all entry and requires it to be last. It also rejects entry keys
+the kind did not declare.
+
+For complete declarations, read the
+[human form metadata](https://github.com/WeavemindAI/weft/blob/mvp/catalog/human/metadata.json)
+and [Switch metadata](https://github.com/WeavemindAI/weft/blob/mvp/catalog/logic/switch/metadata.json).
+
+## Additional validation rules
+
+Use `validate` for a constraint that types alone do not express.
+Each rule says when to report a diagnostic:
+
+```json
+"validate": [
+  {
+    "when": {
+      "kind": "not",
+      "of": { "kind": "config_nonempty", "field": "query" }
+    },
+    "then": {
+      "message": "Write a query before running this node.",
+      "field": "query",
+      "level": "runtime"
+    }
+  }
+]
+```
+
+This fragment assumes the node declares a `query` input. The rule checks
+its written value, so it is appropriate when that input takes a literal.
+It cannot inspect the result of an upstream node.
+
+Each condition uses `kind` plus the fields below.
+
+| `kind` | Other fields | True when |
+|---|---|---|
+| `input_satisfied` | `port` | The input has a wire or a written value that supplies data |
+| `input_wired` | `port` | The input has an incoming wire |
+| `input_source_type` | `port`, `equals` | Every incoming wire comes from the named node type; also true with no wires |
+| `config_present` | `field` | The written value exists and is non-null |
+| `config_nonempty` | `field` | The written value is nonempty; whitespace-only strings count as empty |
+| `config_equals` | `field`, `equals` | The written value equals the supplied JSON value |
+| `config_in_set` | `field`, `values` | The written string appears in `values` |
+| `config_matches` | `field`, `regex` | The written string matches the regular expression |
+| `all` / `any` | `of`, a condition list | All or any of the conditions hold |
+| `not` | `of`, one condition | That condition is false |
+
+Combine `input_source_type` with `input_wired` when the wire itself is
+required.
+
+The default level is `structural`, checked while editing.
+`runtime` defers the diagnostic to validation for a run, including
+`weft validate`. Severity defaults to `error`; it can also be
+`warning`, `info` or `hint`.

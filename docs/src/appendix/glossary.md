@@ -8,7 +8,8 @@ type for every service. What flows on the wire is a small reference, never a
 credential. See [How connections work](../connections/overview.md).
 
 **Access node.** The node that owns the connect for one service and emits an
-`Access` value. Its whole body is one macro.
+`Access` value. Most bodies are one macro; the `connection_optional` ones
+write their own.
 
 **Activation.** Turning a project's triggers on: registers every trigger and
 mints its address. One that cannot be served refuses here, loudly.
@@ -24,7 +25,7 @@ participants, any direction. See
 **Closed pulse.** A pulse carrying no value, meaning "nothing will ever arrive
 here, at this color, at these frames". On a required input it skips the node
 and cascades. This is how branching works. See
-[the closure rule](../language/mental-model.md#the-closed-pulse).
+[the closure rule](../language/mental-model.md#how-a-branch-stops-the-steps-after-it).
 
 **Color.** One execution. A re-run is a new color, so "per color" always means
 per execution.
@@ -33,7 +34,7 @@ per execution.
 access store and holds everything secret. A project's source holds a bare id.
 
 **Dispatcher.** The control plane. Routes events, manages lifecycle, owns the
-journal, hosts every public URL. Never runs user code.
+journal, hosts the trigger and form URLs. Never runs user code.
 
 **Door.** How a connection is obtained. `shared` means a credential this weft
 holds; `own` means the user brings or creates their own.
@@ -83,6 +84,10 @@ a scope's own roots are kicked when the scope starts.
 **Scope** (storage). Which of `Execution`, `Project`, or `Shared` a file is
 written under. It is a lifetime contract, not a folder name.
 
+**Sequential Diffusion Programming.** Building a program stage by stage against
+a real example, then a second, then a third, until new inputs just work.
+[The chapter](../thinking/sdp.md) is the whole methodology.
+
 **Signal.** A wake source: a timer, a form, an endpoint, a subscription, a held
 socket. Registered by a trigger, or awaited mid-flow.
 
@@ -92,26 +97,11 @@ lease per project.
 **Suspension.** A parked firing waiting on a signal. The worker exits. The
 execution costs rows and no compute.
 
-**Trigger.** A node whose firing starts from outside. Two phases: setup at
-activation, then a fire per event.
+**Trigger.** A node that starts an execution from outside. Two phases: setup
+at activation, then a fire per event.
 
 **Unit.** One pod template inside an infra spec. Each has its own status and
 its own stop behavior, and the infra verbs act on one at a time.
 
 **Worker.** The compiled project binary, running as a pod, multiplexing
 executions and shutting down when idle.
-
----
-
-## Two words used in a particular sense
-
-**Egregore.** What emerges from a weft program. An egregore is a thing that
-emerges from a collective's structure, and a weft program is a small collective
-of models, people and long-lived nodes behaving as one thing. It does not have
-to contain a model:
-[what is actually being coordinated](../thinking/design-principles.md#0-what-is-actually-being-coordinated).
-
-**Sequential Diffusion Programming.** Building a program stage by stage against
-a real example, then a second, then a third, until new inputs just work. Named
-for the way the program sharpens pass after pass, the way an image sharpens out
-of noise. See [the chapter](../thinking/sdp.md).

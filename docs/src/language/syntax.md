@@ -1,328 +1,265 @@
 # Syntax
 
-The whole surface, in one page. The language is written mostly by models, so
-the surface is small and strict: there is one way to say each thing, and the
-compiler refuses everything else.
-
-## Declaring a node
+A `.weft` file names some steps and connects them up. This program puts
+`HELLO` in front of you:
 
 ```weft
-name = NodeType
-name = NodeType { config_field: value, ... }
-name = NodeType {}
+message = Text { value: "hello" }
+shout = ExecPython(text: String) -> (text: String) {
+  text: message.value
+  code: "return {'text': text.upper()}"
+}
+show = Debug { data: shout.text }
 ```
 
-`name` is the node's id and must be unique within its scope. `NodeType` must
-exist in the project's `nodes/` catalog.
+`message`, `shout` and `show` are names you choose, and each one has to be
+unique where it sits. `Text`, `ExecPython` and `Debug` are kinds of step from
+the project's `nodes/` folder.
 
-## Connecting
+## Naming a step
+
+`name = NodeType`, and braces if you have anything to put in it:
 
 ```weft
-target.input_port = source.output_port
+message = Text { value: "hello" }
 ```
 
-Read it right to left: the value flows from `source.output_port` into
-`target.input_port`, and the types have to be compatible. Every required input
-must be wired; an optional one (`port?`) may be left alone.
+A step with nothing to configure can drop the braces, so `Debug` and
+`Debug {}` mean the same thing. You still have to supply whatever that step
+requires.
 
-If you only want one key of the value, keep going with dots:
+A name the catalog does not know is `unknown-type`. Writing a name does not
+bring a step into existence; the declaration has to be there.
+
+## Connecting things
+
+Write `source.output` where a value would go:
+
+```weft
+show = Debug { data: message.value }
+```
+
+Or put it on its own line, which is the same connection:
+
+```weft
+show = Debug
+show.data = message.value
+```
+
+Values travel right to left, into the input on the left, and the type has to
+fit.
+
+A required input needs an arrow, a suitable value, or a default the step
+supplies. An optional one can be left alone, though if you do wire it, it
+still waits for its source to produce something or close. See
+[when a step runs](mental-model.md).
+
+To take one field out of a value, keep going with dots:
 
 ```weft
 speed.wpm = reader.profile.stats.wpm
 ```
 
-That is still one wire, from `reader.profile`, and it delivers `stats.wpm`
-read off the value. For what it needs from the type, go and read
-[reading a key off a wire](types.md#reading-a-key-off-a-wire).
+That reads `stats.wpm` off `reader.profile`. For the type rules, read
+[key access](types.md#reading-a-key-off-a-wire).
 
-## Config values
+## Writing values in
 
-Config fields are typed JSON-ish literals.
+Inputs take strings, numbers, true and false, `null`, lists and objects, as
+long as the type allows it. Lists and objects can spread over several lines,
+and commas between fields are optional.
 
 ```weft
-t     = Text     { value: "a string" }
-n     = Range    { to: 10, step: 2 }
-flag  = SomeNode { enabled: true }
-arr   = SomeNode { items: [1, 2, 3] }
-obj   = SomeNode { opts: { "k": "v" } }
-
-multi = SomeNode {
-  fields: [
-    { "kind": "text_input", "key": "name" }
-  ]
+message = Text {
+  value: "hello"
 }
 ```
 
-Multi-line arrays and objects are fine, and the comma between two fields is
-optional, so a field per line with no commas reads the same to the compiler.
-
-### Wires in the braces
-
-A field whose value is `source.port` is a wire, not a config value. It is the
-same edge as the connection line, written inside the node it feeds.
+The same thing on its own line:
 
 ```weft
-reply = TelegramSendMedia {
-  kind: "photo"
-  chatId: ask.chatId          # identical to `reply.chatId = ask.chatId`
-  file: picture.image
-}
+message = Text
+message.value = "hello"
 ```
 
-Both forms compile to one edge, and the editor can rewrite either. Which one
-to write is taste: a node with several wires reads better with them in its
-braces, next to its settings, instead of a stack of lines each starting with
-the same name.
+Some inputs only take arrows and some only take written values; the
+`input-accepts` diagnostic tells you which. Anything the compiler has to read
+in order to work out the step's shape, such as a form's field list, has to be
+written inline: an arrow, `@file` or `@asset` cannot supply it.
 
-A `Group` is the exception. Its braces hold its children, so the only field
-it reads there is `_should_flow`. Its interface ports are driven from
-outside, on their own lines, by a wire or by a value.
+For text kept in another file, and for file references, read
+[files and reuse](files-and-reuse.md).
 
-#### A key that CREATES a port
+### Longer text
 
-On a node type that accepts extra inputs (`ExecPython`, `FirstInOrder`,
-`TagRun`, `StopTagged`), a key
-naming no declared port creates one. A wire gives it the type of whatever feeds
-it, a literal gives it the literal's own type, and a `null` literal is an error
-because it says nothing about the type.
-
-```weft
-step = ExecPython -> (out: String) {
-  code: @file("scripts/step.py")
-  text: draft.answer      # a String port, from the wire
-  limit: 3                # a Number port, from the literal
-  notes?: review.notes    # optional: a closure here does not skip the node
-}
-```
-
-Created ports keep the order they are written in, which is what
-`FirstInOrder` reads: its first input that carried a value is the one it
-emits. Reordering two of its lines changes which branch wins, and it is the
-only place in weft where the order of lines means anything.
-
-The `?` goes on the key, because it describes the port being created rather
-than the wire's source, and it is refused on a key that creates no port (say
-so on the port itself instead: `notes?: String` in the signature).
-
-### Literals on a connection line
-
-When the target is a node's own port and the right side is a literal, the line
-fills that node's config instead of creating an edge.
-
-```weft
-post = SlackSendMessage { channel: "#alerts" }   # in the braces
-post.text = "deploy finished"                    # or on its own line
-```
-
-Both spellings are the same thing, a constant written for the port, and no
-port takes one spelling and refuses the other. What a port can refuse is a
-whole family: a value written in the source (`literal`) or a value another
-node produces (`wire`). Every port takes both unless its node says otherwise
-with `accepts` in its metadata, and getting it wrong is `input-accepts`, with
-the message reading the list back ("`params` accepts: wire"). A port the
-compiler reads to build the node (a form's `fields`, the access picker) is the
-one exception: it takes an inline typed value only, never a wire and never a
-`@file` or `@asset`.
-
-The same line works on a `Group`, a `Loop`, or an `@include` alias: its
-ports are the ones in its signature, and a value on one reaches everything
-inside that reads it.
-
-```weft
-escalation.tone = "formal"
-```
-
-An output never takes a value: a firing emits on it, and you read it as
-`node.port`. Writing one (`step.out = "lit"`, or `out: "lit"` in the braces of
-a node whose signature declares `-> (out: String)`) is refused, and so is a
-group's own output written from inside (`self.result = "lit"`). Drive it from
-a node.
-
-### Multi-line strings
-
-Triple-backtick blocks carry code, templates, anything with newlines in it.
+Triple backticks, for code or anything with newlines in it:
 
 ````weft
-step = ExecPython() -> (out: Number) {
+answer = ExecPython -> (value: Number) {
   code: ```
-    return {'out': 42}
+    return {'value': 42}
   ```
 }
 ````
 
-### Reserved keys
+### Inputs go in, outputs come out
 
-Keys starting with `_` are reserved, and there are exactly three.
+You can write a value into an **input**. **Outputs** get filled by the step
+when it runs, so `answer.value = 42` in that example is an error, and the
+diagnostic is `value-on-output`.
+
+The same holds inside a group. Connect a child's output to `self.result`. If
+you want a constant to come out, use something like `Text` to produce it.
+
+## Declaring ports
+
+Inputs in brackets, outputs after `->`:
+
+```weft
+calc = ExecPython(a: Number, b: Number) -> (sum: Number) {
+  a: 7
+  b: 2
+  code: "return {'sum': a + b}"
+}
+```
+
+`ExecPython` hands your code `a` and `b` and expects a dictionary back, keyed
+by output name.
+
+You can only declare the ports a step leaves open for you. Ports whose types
+are already fixed keep them. Declare inputs, outputs, or both:
+
+```weft
+answer = LlmInference -> (response: String)
+convert = Cast -> (value: Boolean)
+```
+
+Those are fragments: the steps still need their other required inputs before
+they can run. For what you can write in there, read [types](types.md).
+
+### Extra inputs
+
+Some steps, `ExecPython` and `FirstInOrder` among them, let you invent input
+names. Writing a key in the body creates that input and works out its type
+from what you put there:
+
+```weft
+step = ExecPython -> (out: String) {
+  text: draft.answer
+  limit: 3
+  notes?: review.notes
+  code: @file("scripts/step.py")
+}
+```
+
+`limit` becomes a `Number`. `text` takes whatever type `draft.answer` has. A
+bare `null` gives it nothing to work from, so that fails.
+
+The `?` on `notes?` makes it optional, so a closed arrow there does not skip
+the step. That spelling only works when you are creating the port; to make a
+port optional in a full signature, write `notes?: String` there instead.
+
+Extra inputs stay in the order you wrote them, which matters for
+`FirstInOrder`, since it takes the first one that supplied a value. Moving
+those lines changes the answer.
+
+## The three underscore keys
 
 | Key | What it does |
 |---|---|
-| `_label: "..."` | sets the node's display label. A quoted string, settable once, never by wire. |
-| `_tags: ["a", "b"]` | attaches tags, used by signal scoping. |
-| `_should_flow: <wire or false>` | decides whether this node runs at all. |
+| `_label: "Review the draft"` | Puts a label on the box. A string, written once. |
+| `_tags: ["support"]` | Tags the step, including for signal scoping. |
+| `_should_flow: decision.approved` | Decides whether the step runs. Takes true, false, or an arrow. |
 
 <!-- SYNC: reserved keys <-> crates/weft-core/src/exec/skip.rs SHOULD_FLOW_PORT,
      packages/weft-graph/src/protocol.ts SHOULD_FLOW_PORT,
      packages/weft-syntax/weft.tmLanguage.json (reserved-key rule; see its README) -->
 
-Any other leading-underscore key is a compile error, so the namespace stays
-available.
+Any other key starting with `_` is an error.
 
-`_should_flow` is how a branch turns off. Leave it out and the node runs.
-Wire it and the node runs only when what arrives is not `false`; a `false`, or
-a closure (whatever decides never spoke), skips the node, which closes its
-outputs, which skips everything behind it. Writing `_should_flow: false`
-straight into the braces turns one node off without touching anything else.
+`_should_flow` defaults to true. A false value, a literal `false`, or a closed
+arrow skips the step. Being allowed to run does not excuse it from its other
+inputs, and the step's own code never sees this port: weft checks it before
+calling in.
 
 ```weft
-reply = SlackSendMessage {
+send = SlackSendMessage {
   _should_flow: review.approved
+  channel: "#support"
   text: draft.answer
 }
 ```
 
-A `Group` or a `Loop` takes it too, written inside its braces alongside
-everything else, or from outside on the container's name
-(`escalation._should_flow = false`), the same way you would set any of its
-interface ports. A group that does not flow takes everything inside it with
-it, however deeply nested.
+A skipped step closes its outputs, and each step downstream then applies its
+own rules, so a skipped branch can still feed something that accepts an
+alternative. Those rules are in [the mental model](mental-model.md).
+
+## Groups and loops
+
+A group's braces hold its children. Its signature says what the outside can
+see:
 
 ```weft
-escalation = Group(question: String) -> (answer: String) {
-  _should_flow: route.needs_a_person
+shout = Group(text: String) -> (result: String) {
+  # Uppercase the message
+  convert = ExecPython(text: String) -> (text: String) {
+    text: self.text
+    code: "return {'text': text.upper()}"
+  }
+  self.result = convert.text
+}
+shout.text = "hello"
+```
 
-  ...
+Set a group's inputs from outside, as `shout.text` does. `self` means this
+group's own interface. `_should_flow` can go inside the braces too, and when
+it skips a group it skips everything in it.
+
+Loops work similarly with some iteration settings of their own. Read
+[groups](groups.md) and [loops](loops.md).
+
+## Declaring a step where you use it
+
+You can write a step straight into the place its value is wanted, ending with
+`.port` to say which output you mean:
+
+```weft
+show = Debug {
+  data: Text { value: "hello" }.value
 }
 ```
 
-The node itself never sees this port: it is the language deciding whether to
-call the node, not data the node reads.
+That makes the step and the arrow together, exactly as a named declaration
+would. The `.port` on the end is required even when there is only one output.
 
-## Inline port signatures
+## Needing one of several inputs
 
-Some node types let you declare their ports in the declaration itself, with an
-arrow. `ExecPython` is the canonical one.
-
-```weft
-calc = ExecPython(a: Number, b: Number) -> (sum: Number, diff: Number) {
-  code: "return {'sum': a + b, 'diff': a - b}"
-}
-```
-
-Inputs arrive in the code as variables named after each port, and the code
-returns a dict keyed by output port name. A key set to `None`, or missing
-entirely, emits no pulse on that port, which closes it. The compiler
-type-checks these ports exactly like declared ones.
-
-You only write the ports the node leaves open. Anything its metadata already
-types keeps that type, so a signature can be inputs only, outputs only, or a
-single port, and a node whose ports are all pinned needs no signature at all.
-
-```weft
-answer = LlmInference -> (response: String)   # the rest of its ports are typed
-ok     = Cast -> (value: Boolean)             # the whole point of Cast
-```
-
-An empty body is the same as no body, so `Cast -> (value: Boolean) {}` and
-`Cast() -> (value: Boolean)` are the line above with more typing.
-
-## Inline expressions
-
-A node literal can appear directly as a value, with a **mandatory** trailing
-`.port` naming which of its outputs feeds the target.
-
-```weft
-out.data = Text { value: "hi" }.value
-```
-
-That synthesizes an anonymous child node (id `{host}__{field}`, here
-`out__data`) plus the edge into `out.data`. The same form works as a config
-field's value inside a node body, and carries full node syntax including its
-own inline signature and nesting. With a signature, the `.port` reads one of
-the outputs the signature declares:
-
-```weft
-summary.text = ExecPython(m: List[JsonDict]) -> (text: String) {
-  code: "return {'text': ' '.join(x['body'] for x in m)}"
-}.text
-```
-
-Omitting the trailing `.port` is a compile error, because a node with several
-outputs would otherwise be silently ambiguous.
-
-## Comments and descriptions
-
-`#` starts a line comment.
-
-One position is special: if the **first line inside a group or loop body** is a
-plain comment, that line becomes the group's description and tooling shows it
-when the group is collapsed.
-
-```weft
-preprocessor = Group(raw: String) -> (result: String) {
-  # Cleans and transforms text
-  ...
-}
-```
-
-The same rule applies inside an included file's top-level group body. Comments
-outside any group have no special meaning.
-
-The project's name and id live in `weft.toml`, not in the source, so there is
-no header comment to keep in sync.
-
-## Directives
-
-`@require_one_of(a, b)` states that at least one of the named inputs must be
-satisfied, either wired or set to a non-null literal. It goes on its own line
-inside a node body, or inside an inline port signature. A group or loop
-refuses it: a group's inputs are all optional at its boundary, so the
-directive belongs on the node inside that needs one of them.
+`@require_one_of` says a step needs at least one out of a list. This fragment
+uses an existing Slack connection called `slack`:
 
 ```weft
 lookup = SlackFindUser {
-  @require_one_of(email, phone)
+  @require_one_of(email, id)
+  account: slack.access
+  email: "person@example.com"
 }
 ```
 
-It is a compile error when unmet (`require-one-of-unmet`), and it also governs
-runtime skipping: the node is skipped when every port in the group arrives
-closed.
+Every name in there has to be a real input. Supply none of them and the
+compiler says `require-one-of-unmet`. At run time, the step skips if they all
+close without a value.
 
-Catalog nodes declare the same thing in their metadata as `oneOfRequired`, so
-a node author can build the requirement in rather than relying on every caller
-to write the directive.
+It goes in a step's body or its inline signature. A step's author can bake the
+same requirement into its metadata as `oneOfRequired`. Groups and loops reject
+it: put it on the child that needs the value.
 
-## Whitespace and formatting
+## Comments
 
-The parser keeps every byte, including whitespace and comments, in a lossless
-tree. That is why the editor can rewrite one config field through a GUI
-gesture without reformatting your file, and why a round trip through the
-compiler is byte-exact when nothing changed.
+`#` starts a comment. A plain comment as the first thing inside a group or
+loop body becomes its description, which is what the graph shows when it is
+folded shut, as in the `shout` example above. A comment anywhere else is just
+a comment.
 
-There is no formatter, and no formatting rules are enforced.
-
-## The full grammar, informally
-
-```
-file        := decl*
-decl        := IDENT '=' node_expr
-             | IDENT '=' '@include' '(' STRING ')'
-             | connection
-node_expr   := TYPE port_sig? body?
-port_sig    := port_sig_in? port_sig_out?
-port_sig_in := '(' port_decl,* ')'
-port_sig_out:= '->' '(' port_decl,* ')'
-port_decl   := IDENT '?'? ':' type     # `?` (inputs only) = may be absent
-body        := '{' body_item* '}'
-body_item   := IDENT '?'? ':' value     # config field (`?` = the port it
-             |                          #   creates is optional)
-             | IDENT '?'? ':' path      # a wire into this node's port
-             | connection               # inside a group or loop
-             | directive
-             | COMMENT
-connection  := path '=' ( path | value | node_expr '.' IDENT )
-path        := IDENT '.' IDENT | 'self' '.' IDENT
-```
-
-`Group` and `Loop` are node types with bodies containing connections, covered
-in [Groups](groups.md) and [Loops](loops.md).
+The parser keeps your whitespace and comments, so the editor can change one
+field without reformatting everything around it. There is no enforced
+formatting style.

@@ -1,194 +1,161 @@
 # The ctx
 
-One object, handed to every node body, carrying everything a node needs from
-the outside world.
+Inside a node, `ctx` is your access to the graph's inputs and the services
+weft provides. The runtime passes this `ExecutionContext` to `run`
+and to a trigger's `setup_trigger`.
+
+## Read inputs and emit results
 
 ```rust
-async fn run(&self, ctx: ExecutionContext) -> WeftResult<()>
+let text: String = ctx.inputs.get("text")?;
+ctx.pulse_downstream(NodeOutput::new().set("value", text)).await?;
 ```
 
-## Why one object
+`ctx.inputs` contains the firing's wired, literal and defaulted inputs.
+A firing trigger also reads its event from `ctx.wake`.
 
-Left to themselves, two nodes calling two APIs end up with two HTTP clients,
-two retry policies, two ideas about where a token lives, and two different
-bugs. So authentication, storage, buses, journaling, suspension and
-cancellation are built once and reached through this object.
+| To… | Use |
+|---|---|
+| Read a required value | `ctx.inputs.get("name")?` |
+| Read an optional value | `ctx.inputs.opt("name")?` |
+| Emit values | `ctx.pulse_downstream(output).await?` |
+| Emit and wait until the consumer takes the value | `ctx.yield_downstream(output).await?` |
+| Close an output | `ctx.close_port("port").await?` |
+| Build outputs from the declared keys of a JSON object | `ctx.fan_declared(&value)` |
+| Read a resolved output type | `ctx.output_type("port")` |
 
-`ctx.client(&access)` hands back an HTTP client already signed in to the
-service you named, so a node whose connection declares AWS SigV4 as JSON gets
-every request signed without a line of node code.
-
-Where the dividing line runs, and how to argue that it is in the wrong place:
-[the commandments of plumbing](../thinking/plumbing.md).
-
-## Identity
-
-Plain fields, always present.
-
-```rust
-ctx.execution_id
-ctx.project_id
-ctx.node_id
-ctx.node_type
-ctx.node_label      // Option<String>
-ctx.color           // the execution's id
-ctx.frames          // the loop iteration stack
-```
-
-## Values in
-
-```rust
-ctx.inputs      // everything wired, configured, or defaulted
-ctx.wake        // a trigger fire's event payload
-```
-
-Both are `ValueBag`s with the same accessors. Full treatment in
+For defaults, dynamic inputs and emission rules, read
 [Reading inputs, emitting outputs](values-and-emission.md).
 
-## Values out
+## Open an account connection
 
 ```rust
-ctx.pulse_downstream(NodeOutput::new().set("port", value)).await
-ctx.yield_downstream(output).await     // waits until the value was taken
-ctx.close_port("port").await?        // explicitly emit nothing
-ctx.fan_declared(&value)               // fan a JSON object onto same-named ports
-ctx.output_type("port")                // the port's resolved type
+let account: Access = ctx.inputs.get("account")?;
+let conn = ctx.open(&account).await?;
+let client = conn.client();
 ```
 
-## Calling a third party
+The returned client applies the service's authentication and routing.
+Where a meter supports the request, it also records cost information.
+For the client alone, use `ctx.client(&account).await?`.
+For an unauthenticated request, use `ctx.http()`.
+
+The opened connection exposes `identity()` and `owner()`, along with
+`value(name)` and, for single-string credentials, `credential()`.
+Keep credential values out of node outputs and logs. A manually constructed
+client bypasses the connection's routing and metering.
+
+For sockets, longer credential windows and permission requirements, read
+[Using a connection in a node](../connections/using-a-connection.md).
+
+## Store files
 
 ```rust
-let conn = ctx.open(&access).await?;    // resolve + lease for this firing
-conn.client()                            // signed in, and measured if a meter exists
-conn.credential()?                       // the raw string, when there is one
-conn.value("imap_host")?                 // a stored value by name
-conn.socket(url).await?                  // the service's realtime API
-
-ctx.client(&access).await?               // sugar: open, hand back the client
-ctx.http()                               // a plain client, for unauthenticated calls
+let storage = ctx.storage(StorageScope::Execution);
 ```
 
-The node names a service and nothing else. Whether calls are measured, and
-whose money pays, are decided elsewhere and are invisible here.
-[Using a connection](../connections/using-a-connection.md).
+Use the returned handle to `put`, `get` or `presign` files.
+The scope determines where new files live and when they are deleted.
+Execution files can also receive a keep policy.
+For complete calls and file conversion helpers, read [Storage](storage.md).
 
-## Files
+## Wait for an event or reuse a result
 
-```rust
-let storage = ctx.storage(StorageScope::Project);
-storage.put(...).await?;
-storage.get(...).await?;
-storage.presign(...).await?;
-storage.externalize(&value, &ty, policy).await?;
-storage.internalize(&response, &ty, None).await?;
-```
+| To… | Use |
+|---|---|
+| Register a trigger's event source | `ctx.register_signal(spec).await?` |
+| Suspend this firing until an event arrives | `ctx.await_signal(spec).await?` |
+| Reuse an operation's recorded result on replay | `ctx.run("name", closure).await?` |
 
-The scope decides where the file lives **and how long**. [Storage](storage.md).
+A durable wait resumes by replaying the node body. `ctx.run` returns a
+saved result when there is one; an external action can still repeat if the
+worker dies before saving it. Read
+[Surviving a restart](durable-execution.md) before putting side effects
+around waits.
 
-## Pausing
+## Talk to a caller or another node
 
-```rust
-ctx.await_signal(Form { .. }).await?     // park this firing; the worker exits
-ctx.register_signal(ApiEndpoint { .. }).await?   // a trigger's registration
-ctx.run("name", || async { ... }).await? // run once, replay the result forever
-```
+For an HTTP caller, use `ctx.http_caller().await?`. For a WebSocket
+caller, use `ctx.ws_caller().await?`. Both fail when the run has no
+caller of that protocol.
 
-[Surviving a restart](durable-execution.md).
-
-## Talking to a live caller
-
-```rust
-ctx.http_caller().await?      // fails loud if this run has no HTTP caller
-ctx.ws_caller().await?
-ctx.caller()                  // Option<CallerHandle>, the protocol-typed form
-ctx.is_api_call()
-ctx.is_websocket()
-```
-
+If the node supports either protocol, `ctx.caller()` returns an optional
+`CallerHandle`. You can also ask `ctx.is_api_call()`,
+`ctx.is_websocket()` and `ctx.caller_data_type()`.
+For replying and reading messages, read
 [Talking to a live caller](live-callers.md).
 
-## Talking to other nodes
+For a conversation between nodes:
 
 ```rust
-ctx.open_bus("channel", BusOptions::default(), "host").await?
-ctx.join_bus("channel", "guest")?
-ctx.bus_from_input("channel")?
-ctx.set_max_buffered_items("rows", 100_000)?
+let host = ctx.open_bus("channel", BusOptions::default(), "host").await?;
+let guest = ctx.join_bus("channel", "guest")?;
 ```
 
-[Streams and buses in Rust](streams-and-buses.md).
+These are the producer and consumer calls, used in their respective nodes.
+Their guards close the bus when dropped. An observer that should leave it
+open uses `ctx.bus_from_input("channel")?`.
 
-## Infrastructure
+For the complete exchange, including when a participant starts receiving,
+read [Streams and buses in Rust](streams-and-buses.md). That chapter also
+covers generator inputs and `ctx.set_max_buffered_items`.
+
+## Reach infrastructure
+
+`ctx.endpoint("api").await?` resolves an endpoint declared by this node.
+The returned handle offers `url()`, `host_and_port()` and `call(...)`.
+
+For endpoint readiness and passing access to another node, read
+[Infrastructure nodes](infrastructure.md#talking-to-your-infrastructure).
+
+## Cancel or stop other runs
+
+`ctx.is_cancelled()` checks the execution's cancellation flag.
+`ctx.cancellation()` returns the shared flag for blocking work or
+best-effort cleanup. For subprocess handling and the limits of aborting
+an external request, read [Cancellation](cancellation.md).
+
+To label this run and request stops for matching runs in the same project:
 
 ```rust
-let api = ctx.endpoint("api").await?;   // resolves, then waits until it answers
-api.url();
-api.host_and_port()?;
-api.call(EndpointMethod::Get, "/outputs", None).await?;
+ctx.tag_execution(["user_7"]).await?;
+ctx.stop_tagged("user_7", StopSelf::Keep).await?;
 ```
 
-[Infrastructure nodes](infrastructure.md).
-
-## Stopping
-
-```rust
-ctx.is_cancelled()
-ctx.cancellation()      // Arc<CancellationFlag>
-```
-
-Ordinary async Rust is cancellable with no code at all. You need these only
-for subprocesses, blocking CPU work, and resources needing explicit cleanup.
-[Cancellation](cancellation.md).
-
-## Steering other runs
-
-```rust
-ctx.tag_execution(["user_7"]).await?;                 // label this run
-ctx.stop_tagged("user_7", StopSelf::Keep).await?;     // stop the others carrying it
-ctx.stop_tagged("exp_3", StopSelf::Include).await?;   // stop them all, me too
-```
-
-A run can label itself and stop every other run of the project carrying a
-label, including runs parked on a person or a timer. This is how three
-messages from one sender end with only the latest one answered. For the
-ordering rule and what the journal says afterwards, go and read
+`StopSelf::Keep` uses tag-registration order to protect newer runs.
+For the ordering and when a queued stop takes effect, read
 [Stopping other runs](steering-executions.md).
 
-## Logging and errors
+## Log what happened
 
 ```rust
-ctx.log(LogLevel::Info, "message").await?;
-
-// on any non-weft Result or Option:
-something().node_err("doing the thing")?;
-
-// for a bad condition you detected yourself:
-weft::node_bail!("bridge rejected: {reason}");
-
-// the expression form, for map_err / ok_or_else closures:
-Err(weft::node_error(format!("no timestamp in {body}")))
+ctx.log(LogLevel::Info, "Started rendering the image").await?;
 ```
 
-Those are the only error doors: the input accessors stamp their own errors,
-every ctx handle already returns `WeftResult`, and node code never names a
-`WeftError` variant. Worked examples of each are in
-[Values and emission](values-and-emission.md#errors).
+Use `.node_err("reading the response")?` to attach context to another
+library's error. Use `weft::node_bail!` or `weft::node_error` for a
+failure the node detects itself. For examples, read
+[Errors](values-and-emission.md#errors).
 
-## What the ctx will not give you
+## Identify the current firing
 
-There is **no way to ask whose credential you are using**, whether the call
-was billed, or what it cost. A node that could ask could branch on it, and
-then the same node would behave differently for different users.
+| Field | Identifies |
+|---|---|
+| `execution_id` | The execution, as a string |
+| `color` | The same execution, as a UUID |
+| `project_id` | Its project |
+| `node_id` | This node instance |
+| `node_type` | Its catalog type |
+| `node_label` | Its optional display label |
+| `frames` | The loop iteration stack |
 
-There is **no way to construct a client for a connection yourself**. A
-hand-rolled client is invisible to the cost trail and will not carry the
-routing a runtime-supplied credential needs.
+### State shared inside a worker
 
-There is **no way to write to the journal directly**. The journal records what
-happened; it is not a log you post to. `ctx.log` is the log.
+A Rust `static` is shared by node firings in the same worker process.
+That can hold a connection pool or a cache, but another worker will have
+its own copy and a restart loses it.
 
-There is **no lifecycle phase to inspect**. A trigger writes two bodies and
-the engine calls the right one.
-
-Every one of those is missing so that a node cannot behave one way on the
-author's machine and another way in production.
+Use a database or file storage for data that must survive or be shared
+between workers. For data private to one execution,
+include its identity in any cache key and arrange cleanup when that data
+is no longer needed.

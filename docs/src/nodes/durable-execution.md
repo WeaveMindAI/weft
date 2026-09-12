@@ -1,163 +1,149 @@
 # Surviving a restart
 
-A node body can touch the outside world in a way that survives its worker dying
-and a fresh worker picking the execution back up hours or days later. Four
-things it can reach for, and one of them is doing nothing special.
+If a node waits for a person to answer tomorrow, its Rust stack does not
+sit there until tomorrow. weft records the wait. When the answer arrives,
+it runs the body again from the top and supplies the saved answer at the
+same call.
 
-| Primitive | For |
-|---|---|
-| `ctx.register_signal(kind)` | a trigger declaring a persistent endpoint, cron, or feed |
-| `ctx.await_signal(kind)` | a mid-flow wait for a human or an external event |
-| `ctx.run("name", closure)` | non-deterministic or side-effecting work between waits |
-| nothing | pure logic, branching, computing from journaled values |
+That changes how you write the work around a wait. A network request on
+line two can run again even though the user is answering the question on
+line ten.
 
 ## `ctx.await_signal`
 
-Parks **this firing** until the signal fires. The worker exits while parked. A
-fresh worker spawns when the fire arrives.
+Use `ctx.await_signal(kind)` to wait during an existing execution.
+For example, inside a node body that has built a `Form` named `form`
+and declares an `answer` output:
 
 ```rust
-use weft::signal::Form;
-
-async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    let answer = ctx.await_signal(Form {
-        form_type: "human-query".into(),
-        schema: my_form_schema(),
-        title: Some("Approve?".into()),
-        description: None,
-        consumer_kind: Some("human_in_the_loop".into()),
-    }).await?;
-
-    ctx.pulse_downstream(NodeOutput::new().set("answer", answer)).await
-}
+let answer = ctx.await_signal(form).await?;
+ctx.pulse_downstream(NodeOutput::new().set("answer", answer)).await?;
 ```
 
-Other firings of the same execution keep going. Only this one parks.
+If no answer has arrived, the call suspends this firing. Other firings
+can continue. When the body runs again, that call returns the recorded
+answer and the code continues below it.
 
-## The thing to understand: the body re-runs from the top
+For a complete form-building implementation, read
+[HumanQuery](https://github.com/WeavemindAI/weft/blob/mvp/catalog/human/query/mod.rs).
+To use a human step in a program, follow
+[A person in the loop](../start/a-person-in-the-loop.md).
 
-When the fire arrives, the next worker **re-runs the whole body from the
-first line**. The `await_signal` call that parked last time returns instantly
-with the journaled value, and execution continues past it.
+## The body re-runs from the top
 
-So a body with two waits runs three times across its life:
+Suppose a body waits for approval, does some work, then waits for confirmation.
+When each answer arrives after its wait has been registered, the sequence is:
 
-1. First dispatch. Hits wait 0, suspends.
-2. Approval fires. Body re-runs from the top. Wait 0 returns its value. Logic
-   runs. Wait 1 suspends.
-3. Confirmation fires. Body re-runs from the top. Both waits return their
-   values. The body completes.
+1. The first dispatch reaches the approval wait and suspends.
+2. The approval arrives. The body starts again, reads that saved answer,
+   does the work, and suspends at confirmation.
+3. The confirmation arrives. The body starts again, reads both answers,
+   and finishes.
 
-Everything **between** the waits ran three times.
+The code before approval ran three times. The work between the waits ran
+twice. A worker crash can add more attempts.
 
 ## `ctx.run`: reusing a saved result
 
-Anything between waits that is non-deterministic or has a side effect must be
-wrapped.
+If a result must stay the same when the body re-runs, put the work in
+`ctx.run`. Here is a node-body fragment that saves a generated identifier:
 
 ```rust
-async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    // Once saved, every replay returns the same request identifier.
-    let idem = ctx.run("idem", || async {
-        Ok(json!(uuid::Uuid::new_v4().to_string()))
-    }).await?;
-
-    let approval = ctx.await_signal(approval_spec()).await?;
-
-    // Billing must recognize `idem` and refuse to charge it twice.
-    let http = ctx.http();
-    let receipt = ctx.run("call_billing", || async {
-        let resp = http.post("https://api.billing/charge")
-            .json(&json!({ "idem": idem, "approved_by": approval["who"] }))
-            .send().await.node_err("charging the card")?
-            .json::<serde_json::Value>().await.node_err("reading the receipt")?;
-        Ok(resp)
-    }).await?;
-
-    ctx.pulse_downstream(NodeOutput::new().set("receipt", receipt)).await
-}
+let request_id = ctx.run("request_id", || async {
+    Ok(serde_json::json!(uuid::Uuid::new_v4().to_string()))
+}).await?;
 ```
 
-Once the result is saved, later replays return it without invoking the closure.
-Each loop iteration has its own saved results. If the worker dies after an
-external action succeeds but before saving its result, the closure can run
-again. `ctx.run` alone cannot prevent that duplicate action.
+This example needs the `uuid` dependency with its `v4` feature in the
+node's `deps.toml`. On the first attempt the closure generates the value
+and weft saves it. Later attempts return that saved value without invoking
+the closure.
 
-The billing example depends on the billing service treating repeated requests
-with the same `idem` value as one charge. The identifier is saved before the
-billing call begins, so a replay reuses it. Check the receiving service's
-contract; merely sending an identifier does not make a request safe to repeat.
+The same method accepts a closure that makes an HTTP request or writes to
+a database. It returns a JSON value, which can contain the result you need
+afterwards.
 
-The `name` is only for traceability in the journal. The runtime keys on
-call-site **order**, so two `ctx.run` calls may share a name and you may rename
-any call freely.
+There is a failure window to account for: a service can accept your request
+just before the worker crashes, leaving weft without a saved result.
+The next attempt sends the request again. If repeating the action would be
+harmful, the receiving service needs to recognize repeated requests and
+return the original result. Save its request identifier before making the
+call, and use the service's documented duplicate-prevention mechanism.
+An arbitrary identifier in the request does nothing unless the service
+honors it.
 
-### What needs wrapping
-
-| Safe between waits | Wrap in `ctx.run` |
+| Work in the body | How to handle it |
 |---|---|
-| pure logic | `rand::random()`, `Uuid::new_v4()`, `Instant::now()` |
-| branching on values from waits or runs | network calls, database writes, file I/O |
-| reading `ctx.inputs` | environment reads that might change |
-| | anything that could differ between two runs of the same code |
+| Calculations from inputs or saved results | Let them run again |
+| A random value or current time that must remain stable | Save it with `ctx.run` |
+| An external request or persistent write | Save its result with `ctx.run`; account for an interrupted attempt |
+| An environment value that affects later decisions | Save it if it could change between attempts |
 
-## The replay rule
+A saved result does not preserve files on the worker's local disk.
+Recreate temporary files after a restart, or use weft storage and save
+the stored-file reference.
 
-**The sequence of `ctx.await_signal` and `ctx.run` calls must be identical
-across every replay.**
+## Keep the replayed path stable
 
-The runtime checks each call against the journaled sequence, so a mismatch
-fails the node loudly rather than desyncing quietly.
+weft matches `ctx.run` and `ctx.await_signal` calls by their position in
+the firing's recorded sequence. The `ctx.run` name helps you read the
+journal; it is not the lookup key.
 
-So do not make the *number* or *order* of those calls depend on anything that
-could change. Branching between them is fine as long as both arms make the same
-calls, or neither does.
+If a branch depends on a saved answer, it can safely choose different work
+for different answers. Replaying that firing takes the same branch because
+it gets the same answer. A branch based on a fresh random number could
+instead reach a different call in the same position.
+
+The runtime rejects mismatched call positions or kinds. It cannot detect
+every changed intention: two different `ctx.run` calls in the same
+position still look like a run call. Keep the decisions leading to them
+stable.
 
 ### Emitting before a wait is refused
 
-Emitting on, or closing, an output port **before** an `await_signal` is refused
-outright, because the resume replays from the top and would touch the port
-twice.
+Finish your durable waits before emitting or closing any output.
+`await_signal` rejects a firing that has already mentioned an output,
+because replaying it would repeat the emission. It also rejects nodes
+with generator inputs, whose earlier stream reads cannot be replayed.
 
-Emit after all your waits. Or, for a node that wants to stay warm and
-interactive, use a [bus](streams-and-buses.md) instead of suspending.
-
-## `ctx.register_signal`
-
-The trigger form, covered in [Writing a trigger](writing-triggers.md).
-`register_signal` declares a persistent entry point that spawns a fresh
-execution per event; `await_signal` parks the current firing. Which one you get
-is the method you called, never a flag on the kind.
+If the node needs to exchange messages while it stays alive, use a
+[bus](streams-and-buses.md#buses) and wait for messages on that bus.
 
 ## Worker lifetime
 
-A worker pod dies whenever every live firing is parked.
+Suspending a firing does not immediately stop its worker. Other work can
+keep the worker busy, and a live bus or caller can require it to stay
+available. A suspended firing can resume in that same process.
 
-A suspended firing holds no worker, so ten thousand pending approvals cost no
-compute, just journal rows. When a fire arrives, a fresh worker spawns, folds
-the journal, and re-runs every node that has a fire to deliver, with each
-prior wait and run returning instantly from the record.
+When there is no work keeping it alive, the worker can exit after its
+idle period, currently 30 seconds. The suspended execution remains in the
+journal, and a later answer can bring up a worker to continue it.
+Pending approvals therefore do not each need a waiting worker, although
+the runtime's shared services still run.
 
-## Why this matters even without a wait
+For callers that remain connected, read [Live callers](live-callers.md).
 
-Weft's crash guarantee is **at-least-once** for a node whose completion never
-reached disk. The mechanism is in
-[The journal](../running/the-journal.md#the-execution-guarantee).
+## Restarts without a wait
 
-So a body with no `await_signal` anywhere in it is still not exempt: if its
-worker dies mid-node, the replacement runs it again from the top. The rule is
-to use `ctx.run` for saved results and require the receiving service to prevent
-duplicate actions when repeating the work would be harmful.
+The same concern applies to a node with no `await_signal`. If its worker
+dies before completion is recorded, weft can run the body again. Use
+`ctx.run` for results you need to preserve and handle repeated external
+actions as described above.
+
+For what the journal records and how execution resumes, read
+[The execution guarantee](../running/the-journal.md#the-execution-guarantee).
 
 ## A loop with a wait inside a node
 
-A `loop` in your body containing an `await_signal` means the node is
-orchestrating, which is the graph's job, so reach for a weft `Loop` and let
-each iteration fire a node that does one thing.
+A Rust loop containing `await_signal` starts again at iteration zero on
+replay. Earlier waits and saved runs return their recorded results;
+unwrapped work repeats. The loop's decisions must follow the same saved
+values each time.
 
-If a genuine constraint forces the shape on you anyway, here is what you are
-signing up for. A resume re-runs the **whole body** from the top, so your loop
-restarts at iteration zero. Past `await_signal` and `ctx.run` calls replay
-instantly, but every other call runs for real again, once per replay. So an
-unwrapped paid API call inside that loop is charged again on every human
-response: wrap every side-effecting call in `ctx.run`.
+If each iteration is a separate piece of your program, a
+[weft loop](../language/loops.md) makes that structure visible and lets you
+inspect its iterations in the graph.
+
+A trigger has a different entry method: `ctx.register_signal` registers
+a signal that starts executions. For that API, read
+[Writing a trigger](writing-triggers.md).

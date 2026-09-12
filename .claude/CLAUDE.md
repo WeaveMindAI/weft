@@ -116,7 +116,7 @@ When in doubt, grep for overlapping field names, similar function names, paralle
 
 ## Memory Management
 
-This file (`.claude/CLAUDE.md`) holds durable general rules and auto-loads every session. Project facts live in `MEMORY.md` at the repo root, shared with the Kilo setup, and are pulled in at launch by the import below. General rules go in one of those two homes, inline: cross-mode rules here, mode-scoped rules in that mode's skill (which loads on switch). No other locations, no extra files; anything else won't auto-load.
+This file (`.claude/CLAUDE.md`) holds durable general rules and auto-loads every session. Project facts live in `MEMORY.md` at the repo root, shared with the Kilo and Codex setups, and are pulled in at launch by the import below. General rules go in one of those two homes, inline: cross-mode rules here, mode-scoped rules in that mode's skill (which loads on switch). No other locations, no extra files; anything else won't auto-load.
 
 Project facts: @../MEMORY.md
 

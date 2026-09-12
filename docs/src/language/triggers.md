@@ -1,11 +1,11 @@
 # Triggers
 
-A trigger node is what starts an execution from outside. A web request, a
-timer, a form submission, a message landing in Slack, an email arriving.
+A trigger is a step that starts a run from outside: a web request, a timer,
+somebody submitting a form, a message landing in Slack, an email arriving.
 
-It is an ordinary node whose metadata sets `isTrigger: true`. You wire its
-outputs downstream like any node. The difference is that an external event
-fires a fresh execution carrying that event's data.
+It is an ordinary step whose metadata sets `isTrigger: true`, and you wire its
+outputs like any other. The difference is that an event from outside starts a
+fresh run and hands the trigger that event's data.
 
 ```weft
 api = ApiEndpoint { path: "hello" }
@@ -15,43 +15,31 @@ reply.started = api.started
 
 ## Two phases
 
-The language drives a trigger through two phases, and a trigger's body never
-inspects which one it is in. The runtime calls a different function for each.
+A trigger goes through two phases, and its own code never has to ask which one
+it is in, because weft calls a different function for each.
 
-**Trigger setup** happens when you activate the project. The trigger registers
-what it wants to watch: an endpoint path, a cron spec, a subscription to a
-provider's events. Its upstream nodes run during this phase, and whatever they
-delivered is **saved with the registration**.
+**Setup** happens when you activate the project. The trigger registers what it
+wants to watch, such as an endpoint path, a cron spec, or a subscription to a
+provider's events. Everything upstream of it runs now, and whatever those
+steps produced is **saved along with the registration**.
 
-**Fire** happens each time the event occurs. A fresh execution starts, the
-trigger's body runs exactly once, and the event's data arrives on a separate
-channel from its inputs.
+**Fire** happens every time the event actually occurs. A fresh run starts, the
+trigger's code runs once, and the event's data arrives separately from its
+inputs.
 
-That split has a consequence worth knowing. A trigger's inputs are read
-**once, at activation**, and replayed on every fire, so nothing upstream of a
-trigger runs again when it fires, and re-activating the project is what
-refreshes those values. If you want something computed fresh per event, compute
-it **downstream** of the trigger.
+So a trigger's inputs are read **once, at activation**, and replayed on every
+fire. Nothing upstream of a trigger runs again when it fires, and
+re-activating the project is what refreshes those saved values. If you want
+something worked out fresh for each event, put that step **downstream** of the
+trigger.
 
 ## What runs on a fire
 
-One program: the trigger that fired, everything downstream of it, and
-everything upstream of that, stopping at other triggers on the way up. At
-fire time a trigger's outputs are the event, not a function of its inputs
-(those were read once, at activation), so a node that only feeds a trigger
-has nothing to contribute to a fire. Sibling programs it cannot reach do
-not run: every other trigger in the set is kicked with no payload, which
-closes its outputs, and the skip cascade prunes the branches that belong
-to it.
-
-That set is written into the run itself, so it holds on a resume too, and
-the rest of the file is left alone. A database or a provider shared by two
-programs emits down every wire it has, so on every fire a value does reach
-the other program's first node; the runtime drops it there without a
-trace, because that program is not this run's business.
-
-Why the runtime picks the program that way, and what it buys you:
-[What actually runs](mental-model.md#what-actually-runs).
+A fire runs one program, and the run is pinned to it. The set of steps is
+written into the run itself, so it still holds if the run is resumed later,
+and the rest of the file is left alone. For what goes into that set and why,
+go and read [What happens when you hit
+run](mental-model.md#what-happens-when-you-hit-run).
 
 ```mermaid
 flowchart LR
@@ -61,31 +49,37 @@ flowchart LR
     style T2 stroke-dasharray: 4 4
 ```
 
-If you run a project by hand, no trigger fires: every one of them closes, and
-the run exercises only the paths that do not need one. To exercise a trigger's
-path, fire it. The editor can send a hand-written payload.
+If you run a project by hand, no trigger fires. Every one of them closes
+instead, so the run only exercises the paths that do not need an event. The
+editor can send a payload you wrote yourself to fire one on purpose.
 
 ## The built-in kinds
 
 | Node | Fires when |
 |---|---|
-| `ApiEndpoint { path }` | an HTTP request arrives, and a node can answer it live |
+| `ApiEndpoint { path }` | an HTTP request arrives (nodes can answer it live) |
 | `LiveSocket { path }` | a WebSocket connects, and nodes hold a two-way conversation |
 | `Cron { cron, timezone }` | the schedule says so, on that zone's clock (UTC unless you pick one) |
 | `HumanTrigger { fields }` | a person submits a form |
 
-Beyond those, node authors write triggers that subscribe to an event stream,
-poll a URL, or hold an outbound socket, using the runtime's signal kinds. See
-[Writing a trigger](../nodes/writing-triggers.md).
+Beyond those, you can write a trigger that subscribes to an event stream,
+polls a URL, or holds a socket open, using weft's signal kinds. For that, go
+and read [Writing a trigger](../nodes/writing-triggers.md).
 
-For triggers that fire on something happening at a connected service, read
-[Events from a service](../connections/events.md), which explains why some of
-them need your weft reachable from the internet and some do not.
+Some triggers need the outside world to reach your machine, and some do not.
+Anything a provider has to send events *to*, such as a webhook, needs your
+weft to have a public address, which is one command: `./setup.sh --public-url`.
+Anything that dials out instead, such as email over IMAP or Slack in Socket
+Mode, works from behind a home router with nothing set up. Activation is where
+you find out which one you have, and it refuses with "this trigger needs your
+weft to be reachable from the internet" if you need an address and have not
+got one. For which triggers are which, read
+[events from a service](../connections/events.md).
 
 ## Form-derived ports
 
-`HumanTrigger` and `HumanQuery` do not have fixed ports. Their ports come from
-the fields you configured, resolved at compile time.
+`HumanTrigger` and `HumanQuery` have no fixed ports. Theirs come from the form
+fields you configured, worked out when the program is compiled.
 
 ```weft
 review = HumanQuery {
@@ -97,20 +91,17 @@ review = HumanQuery {
 }
 ```
 
-That produces three outputs: `review.escalate_approved` and
-`review.escalate_rejected` as Booleans, and `review.reason` as a String. You
-never declare them, and changing the form changes the ports, with every
-existing wire re-checked against the new shape.
+That gives you three outputs: `review.escalate_approved` and
+`review.escalate_rejected`, both booleans, and `review.reason`, a string. You
+never declare any of them. Change the form and the ports change with it, and
+every wire you already drew gets re-checked against the new shape.
 
 ## What the compiler refuses
 
-| Error | What it stops |
-|---|---|
-| `graph-cycle` | a cycle in the wire graph. Iterate with a `Loop`; exchange feedback over a bus. |
-| `trigger-in-loop` | a trigger inside a `Loop`. A trigger is an entry point, and an entry point per iteration is meaningless. A trigger inside a plain group is fine: it fires there and the run starts from it. |
-| `infra-in-loop` | an infra node inside a `Loop`. Infra is provisioned once for the project, not once per item. |
-| `trigger-into-trigger` | a trigger wired into another trigger. There is no phase in which that delivers. |
-| `trigger-into-infra` | a trigger wired into an infra node. Provisioning happens before any fire exists. |
+There are five complaints a project with triggers can run into: `graph-cycle`,
+`trigger-in-loop`, `infra-in-loop`, `trigger-into-trigger` and
+`trigger-into-infra`. The fix for each is in [What the compiler
+refuses](diagnostics.md).
 
 ## Activation
 
@@ -121,11 +112,11 @@ weft activate            # register every trigger, mint the URLs
 weft deactivate          # drop them
 ```
 
-`activate` prints the live addresses it minted. Re-activating re-registers
-everything and refreshes each trigger's saved input snapshot.
+`activate` prints the live addresses it made. Activating again re-registers
+everything and refreshes each trigger's saved inputs.
 
-If you deactivate a project with work in flight, you have to say what happens
-to it, so `deactivate` takes a mode:
+If you deactivate a project while work is still in flight, you have to say
+what should happen to that work, so `deactivate` takes a mode:
 
 | Mode | What happens to suspended executions |
 |---|---|
@@ -133,13 +124,13 @@ to it, so `deactivate` takes a mode:
 | `hibernate` | kept, resumable when reactivated |
 | `park` | kept, and queued to run on reactivation |
 
-and a `--running-policy` of `wait` or `cancel` decides what happens to
-executions currently mid-flight. [The CLI](../running/cli.md) lists the
-defaults.
+A `--running-policy` of `wait` or `cancel` decides what happens to runs that
+are mid-flight right now. For the defaults, go and read [The
+CLI](../running/cli.md).
 
 ## If a trigger cannot be served, activation stops there
 
-It refuses, naming what is missing, rather than registering into a state where
-it looks active and never fires. That way a misconfigured trigger fails while
-you are looking at it. See
-[Design principles](../thinking/design-principles.md).
+It refuses and names what is missing, rather than registering something that
+looks active and never fires. That way a misconfigured trigger fails while you
+are still looking at it. See [Design
+principles](../thinking/design-principles.md).

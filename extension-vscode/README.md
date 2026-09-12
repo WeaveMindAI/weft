@@ -21,13 +21,13 @@ open at [github.com/WeaveMindAI/weft](https://github.com/WeaveMindAI/weft).
 - **Live diagnostics.** The weft compiler checks your file as you
   type and reports through the Problems panel.
 - **AI streaming edits.** SEARCH/REPLACE blocks streamed by an AI
-  chat apply to the open `.weft` file in real time, with the graph
-  updating as the edit lands.
+  chat apply to the open `.weft` file as they stream, with the graph
+  updating.
 
 ## Requirements
 
 The extension talks to the weft runtime on your machine. If you have
-not installed it yet, go and read
+not installed it yet, read
 [the install guide](https://weavemindai.github.io/weft/start/install.html);
 it is one script. By default the extension connects to
 `http://localhost:9999` (the local daemon); the `weft.dispatcherUrl`

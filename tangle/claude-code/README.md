@@ -33,7 +33,7 @@ to writing the weft code.
 The pipeline is self-verifying at both seams, because no actor in it is
 trusted on its word. The compiler side: a PostToolUse hook re-runs the fast
 validate after every Edit or Write to a `.weft` file or anything under
-`nodes/`, and feeds the structural errors back to the model automatically
+`nodes/`, and feeds the structural errors (and the `level-too-large` warning) back to the model automatically
 (the same feedback loop a language server gives a human, delivered to the
 agent). The specialist side: Tangle re-runs the tests itself, diffs the
 delivered metadata against the report, and reads every test asking how it
@@ -115,8 +115,7 @@ cp -r tangle/claude-code/{CLAUDE.md,.claude} <project>/
 
 A copied install does not follow checkout updates: re-copy after a weft
 update, or replace the copy with symlinks by hand. `VERSION` marks the
-template release; it is meant to track a tag of this repository, and the
-installer can exclude this README from the copy.
+template release; it is meant to track a tag of this repository.
 
 Prerequisites sit on the machine, not in the template: the `weft` CLI on the
 PATH, Docker, and the local daemon from `setup.sh` in the weft checkout (the
@@ -131,4 +130,6 @@ The language reference in the skills must track the compiler. When the
 language changes, the source of truth is
 `docs/src/language/` (verified current at the time of this template) plus the
 compiler and catalog under `crates/` and `catalog/`. Update the skill, bump
-`VERSION`, tag the repository.
+`VERSION`, tag the repository. The skills, commands, and agent bodies are
+shared verbatim with `tangle/kilo-code/`: any prompt change lands in both
+templates in the same edit, or the templates have drifted.

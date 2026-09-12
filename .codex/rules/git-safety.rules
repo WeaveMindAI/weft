@@ -1,0 +1,110 @@
+# Git guardrails for Codex, ported from the Kilo (kilo.json permissions) and
+# Claude (settings.json) setups: the uncommitted working tree is the [user]'s
+# review surface, and nothing may collapse or discard it. These rules govern
+# commands that run outside the sandbox; when several rules match, the most
+# restrictive decision wins.
+
+# Forbidden: commands that discard or collapse the working tree.
+
+prefix_rule(
+    pattern = ["git", "stash"],
+    decision = "forbidden",
+    justification = "git stash collapses the user's review surface; the working tree stays as-is.",
+    match = ["git stash", "git stash pop", "git stash apply"],
+    not_match = ["git status"],
+)
+
+prefix_rule(
+    pattern = ["git", "restore"],
+    decision = "forbidden",
+    justification = "git restore discards working-tree changes; revert the specific lines with edits instead.",
+    match = ["git restore .", "git restore --staged src/main.rs"],
+)
+
+prefix_rule(
+    pattern = ["git", "reset", "--hard"],
+    decision = "forbidden",
+    justification = "git reset --hard throws away uncommitted work.",
+    match = ["git reset --hard", "git reset --hard HEAD~1"],
+    not_match = ["git reset", "git reset --soft HEAD~1"],
+)
+
+prefix_rule(
+    pattern = ["git", "clean", "-f"],
+    decision = "forbidden",
+    justification = "Forced git clean deletes untracked files.",
+    match = ["git clean -f", "git clean -fd", "git clean -fdx"],
+    not_match = ["git clean -n"],
+)
+
+# Prompt: commands that touch history, the review surface, or what is staged.
+
+prefix_rule(
+    pattern = ["git", "commit"],
+    decision = "prompt",
+    justification = "The uncommitted diff is the user's review surface; commit only on their explicit say-so.",
+    match = ["git commit -m 'fix: handle empty input'"],
+)
+
+prefix_rule(
+    pattern = ["git", "add"],
+    decision = "prompt",
+    justification = "Staged-versus-unstaged is the user's review state; never stage on your own.",
+    match = ["git add .", "git add -p"],
+)
+
+prefix_rule(
+    pattern = ["git", "push"],
+    decision = "prompt",
+    justification = "Pushes are published history; explicit approval every time.",
+    match = ["git push", "git push origin main"],
+)
+
+prefix_rule(
+    pattern = ["git", "checkout"],
+    decision = "prompt",
+    justification = "Switching branches or files can touch the review surface; ask first.",
+    match = ["git checkout main", "git checkout -- src/main.rs"],
+)
+
+prefix_rule(
+    pattern = ["git", "switch"],
+    decision = "prompt",
+    justification = "Switching branches can touch the review surface; ask first.",
+    match = ["git switch main"],
+)
+
+prefix_rule(
+    pattern = ["git", "reset"],
+    decision = "prompt",
+    justification = "git reset moves branches or unstages work; ask first.",
+    match = ["git reset", "git reset HEAD~1"],
+)
+
+prefix_rule(
+    pattern = ["git", "clean"],
+    decision = "prompt",
+    justification = "git clean deletes untracked files; ask first.",
+    match = ["git clean -n"],
+)
+
+prefix_rule(
+    pattern = ["git", "merge"],
+    decision = "prompt",
+    justification = "Merges change history state; ask first.",
+    match = ["git merge main"],
+)
+
+prefix_rule(
+    pattern = ["git", "rebase"],
+    decision = "prompt",
+    justification = "Rebases rewrite history; ask first.",
+    match = ["git rebase main"],
+)
+
+prefix_rule(
+    pattern = ["git", "tag"],
+    decision = "prompt",
+    justification = "Tags are named references others may rely on; ask first.",
+    match = ["git tag v1.0.0"],
+)

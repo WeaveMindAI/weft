@@ -1,11 +1,9 @@
 # What the compiler refuses
 
-Every validation error carries a stable slug. This is all of them, grouped by
-what they protect, with the fix.
-
-Parsing errors, and errors from the pass that looks up each node's ports, carry
-no slug. They point at the exact spot in your file and say what is wrong
-there.
+Every validation error carries a stable slug, and this page is all of them,
+grouped by what they protect, with the fix. Parsing errors, and errors from
+the pass that looks up each node's ports, carry no slug: they point at the
+exact spot in your file and say what is wrong there.
 
 > **Reading a diagnostic.** The slug names the rule. The message names the
 > fix. If you find one that names the problem but not the fix, that is a bug
@@ -22,9 +20,9 @@ there.
 | `unknown-target-node` | the right side names a node that does not exist in this scope. |
 | `unknown-source-port` | the node exists; that output port does not. |
 | `unknown-target-port` | the node exists; that input port does not. |
-| `double-driven-port` | one input has two drivers: two wires, or a wire and a literal. An input has exactly one source. |
+| `double-driven-port` | an input wired from upstream **and** set in the node body. An input has exactly one source; remove one. |
 | `input-accepts` | a driver the port does not take: a wire on a port whose `accepts` is `["literal"]`, a written value on one whose `accepts` is `["wire"]`, or a wire or a `@file`/`@asset` on a port the compiler reads to build the node. The message reads the list back. |
-| `duplicate-input-port` | the same input name declared twice on one node. |
+| `duplicate-input-port` | two wires drive the same input. An input has exactly one source. |
 | `duplicate-node-id` | two nodes share an id in one scope. |
 | `should-flow-not-boolean` | a `_should_flow` written down that is not `true` or `false`. A wire may carry any value; a constant is a Boolean. |
 | `undeclared-port-no-custom` | a port was referenced that the node neither declares nor allows you to add. |
@@ -48,24 +46,25 @@ there.
 |---|---|
 | `graph-cycle` | a cycle in the wire graph. Iterate with a `Loop`; exchange feedback over a bus. |
 | `scope-reachability` | a connection reaches across a group boundary. Children reach each other and `self`, nothing else. |
-| `level-too-large` | **a warning.** A level of the graph (the file, or the inside of a group or loop) holds more than fifteen items, nodes or groups. About six per level is what reads; group the nodes cooperating on one job, and nest groups rather than widen the level. The program still runs: this is advice about how it reads. |
+| `level-too-large` | **a warning.** A level of the graph (the file, or the inside of a group or loop) holds more than fifteen items (nodes or groups). For what reads, and why nesting beats widening, see [the readable size](groups.md#the-readable-size). The program still runs: this is advice about how it reads. |
 | `loop-boundary-unpaired` | a loop's internal boundary nodes do not line up. This is an internal invariant; hitting it is a compiler bug worth reporting. |
 
 ## Triggers
 
 | Slug | Meaning |
 |---|---|
-| `trigger-in-loop` | a trigger inside a `Loop`. An entry point per iteration is meaningless. |
+| `trigger-in-loop` | a trigger inside a `Loop`. An entry point per iteration is meaningless. A trigger inside a plain group is fine: it fires there and the run starts from it. |
 | `infra-in-loop` | an infra node inside a `Loop`. Infra is provisioned once for the project, not once per item. |
 | `trigger-into-trigger` | a trigger wired into another trigger. No phase delivers that. |
 | `trigger-into-infra` | a trigger wired into an infra node. Provisioning happens before any fire exists. |
-| `duplicate-port` | two ports on the node share a name on one side, which config-derived ports are the usual way to reach. Give them different names. |
+| `duplicate-port` | two ports on one side of a node share a name, usually two config-derived ports (form fields) given the same key. Give them different names. |
 | `config-ports-not-a-list` | the config key a node derives its ports from does not hold a list. |
 | `config-entry-not-an-object` | an entry of that list is not an object. |
 | `unknown-config-entry-kind` | an entry names a `kind` this node does not offer. |
 | `config-entry-without-a-port` | an entry does not name the port it adds. |
 | `unknown-config-entry-key` | an entry carries a key its kind does not take, usually a mistyped test. |
-| `config-entry-bad-test` | a test carries the wrong shape of value (a number where the matched input is a String, a regex that does not compile). |
+| `config-entry-bad-value` | an entry's field holds a value of the wrong shape (a number where the matched input is a String, a regex that does not compile, a required field set to an empty list that chooses nothing). |
+| `config-entry-missing-value` | an entry omits a field its kind requires. |
 | `duplicate-catch-all` | two entries match anything; the second could never be reached. |
 | `catch-all-not-last` | an entry matches anything and is not last, so the entries after it could never be reached. |
 
@@ -116,9 +115,9 @@ one producer and one taker.
 
 | Slug | Meaning |
 |---|---|
-| `require-one-of-unmet` | an `@require_one_of` group where nothing is satisfied. |
+| `require-one-of-unmet` | an `@require_one_of` listing where nothing is satisfied. |
 | `unknown-type` | **a warning.** A declared node type is not in the project's catalog: a typo, or the node was never built. The message names the type. |
-| `no-required-skip` | **a warning.** Every input a wire feeds on this node is optional and there is no `@require_one_of`, so the node runs even when everything upstream is dead. Usually not what you want; add `@require_one_of`. A node built from written constants alone has no upstream and never gets this. |
+| `no-required-skip` | **a warning.** Every input a wire feeds on this node is optional and there is no `@require_one_of`, so the node runs even when its inputs arrive as `null` values (a closed wire would skip it, but `null` is a value). Usually not what you want; add `@require_one_of`. A node built from written constants alone has no upstream and never gets this, and neither does a node with no outputs (a sink), nor a node whose created inputs are optional by nature (`optionalCustomInputs`, like `FirstInOrder`). |
 | `rule-structural` | a node's own declarative validation rule failed at compile time. The message is the node author's. |
 | `rule-runtime` | a node's own rule flagged something checkable only at run time. The language writes one of these itself: every access node requires a connection picked (unless its recipe declares `connection_optional`), with no rule in its metadata. |
 
@@ -139,7 +138,7 @@ before Run/Activate/Resync (findings land on the action bar, and nothing is
 sent until they are fixed), and `weft validate` runs this mode in the
 terminal.
 
-Both read source on stdin and print JSON. `--file` does not open a file: it
+Both modes run through commands that read source on stdin and print JSON. `--file` does not open a file: it
 names the path the source came from, so `@file` and `@include` resolve against
 the right directory. A finding inside an `@include`d file carries that file's
 path (a `file` key in the JSON), and the terminal output prefixes it as

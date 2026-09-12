@@ -65,3 +65,19 @@ packages/weft-syntax/node_modules
 # Example projects generate build state when opened; never commit it.
 examples/*/.weft/
 tangle/old
+
+# Personal assistant setup (good-writter, prompt-engineer,
+# ruthless-reviewer), ported from the user's global Kilo/Claude config into
+# all three harnesses. Private to this machine, not part of the shared repo.
+# Kilo: the two personas are primary agents, the reviewer a subagent.
+# Claude + Codex: the personas ride as skills (auto-loaded on writing /
+# prompt-design tasks), the reviewer as a subagent.
+.kilo/agent/good-writter.md
+.kilo/agent/prompt-engineer.md
+.kilo/agent/ruthless-reviewer.md
+.claude/skills/good-writter/
+.claude/skills/prompt-engineer/
+.claude/agents/ruthless-reviewer.md
+.agents/skills/good-writter/
+.agents/skills/prompt-engineer/
+.codex/agents/ruthless-reviewer.toml

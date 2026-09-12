@@ -1,158 +1,111 @@
 # Your first node
 
-The smallest node in the standard library, near enough in full.
+Let's give the graph a word counter: text in, the number of words out, so
+`"hello from weft"` gives you `3`. Words are split on whitespace, so
+punctuation stays stuck to whatever it is next to.
 
-## `metadata.json`
+Do this in a practice project whose `main.weft` you can throw away. If you
+need one, [Your first program](../start/first-program.md) makes it.
+
+## Declare what the node takes and produces
+
+Create `nodes/word_count/metadata.json`:
 
 ```json
 {
-  "type": "Text",
-  "label": "Text",
-  "description": "Emit a literal string configured at design time.",
-  "tags": ["basic"],
-  "icon": "Type",
-  "color": "#64748b",
+  "type": "WordCount",
+  "label": "Word count",
+  "description": "Count whitespace-separated words in text.",
   "inputs": [
-    { "name": "value", "type": "String", "required": true,
-      "label": "Value", "description": "The string to emit." }
+    {
+      "name": "text",
+      "type": "String",
+      "required": true,
+      "label": "Text",
+      "widget": { "kind": "textarea" }
+    }
   ],
   "outputs": [
-    { "name": "value", "type": "String",
-      "description": "The configured string." }
+    {
+      "name": "count",
+      "type": "Number",
+      "description": "The number of whitespace-separated words."
+    }
   ]
 }
 ```
 
-## `mod.rs`
+`WordCount` is what you will type in the graph, and it has to be unique across
+the whole catalog, standard nodes included.
+
+The inputs and outputs are what let the compiler check your wiring. The
+description is for whoever reads it next, human or assistant, and it is worth
+saying what the number actually means.
+
+## Write the implementation
+
+Create `nodes/word_count/mod.rs` beside the JSON:
 
 ```rust
-//! Text: emit a literal string configured at design time.
+//! Count words separated by whitespace; punctuation does not split a word.
 
 use async_trait::async_trait;
-
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
-pub struct TextNode;
+pub struct WordCountNode;
 
 #[async_trait]
-impl Node for TextNode {
+impl Node for WordCountNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let value: String = ctx.inputs.get("value")?;
-        ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
-    }
-}
-```
-
-That is a working node. Drop that folder under `nodes/` and `Text` is
-available to every program in the project.
-
-## The four things to notice
-
-**Everything imports from `weft`.** One crate name, one place to look. It is
-the only author-facing name.
-
-**`#[derive(NodeManifest)]` reads the JSON.** At compile time it finds the
-`metadata.json` sitting next to this source file and embeds it. The node's
-type name comes from the JSON's `type` field. You never write `node_type` or
-build a metadata struct by hand, and a missing or malformed JSON is a compile
-error, so the two files cannot drift.
-
-**Reads go through `ctx.inputs`.** One bag, one accessor. It does not matter
-whether the value arrived on a wire, as a literal in the braces, or from the
-input's declared default; the node reads it the same way.
-
-**`pulse_downstream` is the only way out.** Returning a value does nothing.
-Emitting is an explicit call, because a node may emit on several ports, may
-emit repeatedly on a stream port, and may deliberately emit on none.
-
-## Naming
-
-Two conventions the codebase holds to everywhere:
-
-- The `type` in metadata is PascalCase: `Text`, `SlackSendMessage`.
-- The struct is that plus `Node`: `TextNode`, `SlackSendMessageNode`.
-- The folder is snake_case: `text/`, `send_message/`.
-- Ports are camelCase: `threadTs`, `postAt`, `scheduledId`.
-
-## A node that actually does something
-
-Here is the shape almost every real node has. It reads a connection, calls a
-service, and emits what came back.
-
-```rust
-//! Post a message to a Slack channel and emit its timestamp.
-//!
-//! Emitting the permalink is best-effort: a failure to read it back is
-//! logged and the node still succeeds, because failing here would invite
-//! a retry that double-posts.
-
-use async_trait::async_trait;
-
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
-use weft::node::NodeOutput;
-
-#[derive(NodeManifest)]
-pub struct SlackSendMessageNode;
-
-#[async_trait]
-impl Node for SlackSendMessageNode {
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let account: Access = ctx.inputs.get("account")?;
-        let channel: String = ctx.inputs.get("channel")?;
         let text: String = ctx.inputs.get("text")?;
-
-        let slack = ctx.client(&account).await?;
-
-        let posted = slack
-            .post("https://slack.com/api/chat.postMessage")
-            .json(&serde_json::json!({ "channel": channel, "text": text }))
-            .send()
-            .await
-            .node_err("posting the message")?
-            .json::<serde_json::Value>()
-            .await
-            .node_err("decoding Slack's reply")?;
-
-        let ts = posted["ts"].as_str()
-            .ok_or_else(|| weft::node_error("Slack accepted the post but returned no timestamp"))?;
-
-        ctx.pulse_downstream(
-            NodeOutput::new()
-                .set("ts", ts)
-                .set("channel", channel),
-        ).await
+        let count = text.split_whitespace().count();
+        ctx.pulse_downstream(NodeOutput::new().set("count", count)).await
     }
 }
 ```
 
-Everything in it is this node's own business. The token, the refresh, the
-signing, the measurement and whose account is paying all happen below
-`ctx.client(&account)`, where this code cannot see them.
+`NodeManifest` pulls in the metadata sitting next to it at compile time.
+`ctx.inputs.get` gets you the text whether the graph wrote it in or wired it
+from somewhere else, and if it is missing or is not a string you get an error
+naming that input.
 
-## The header comment
+The last line is what actually sends the number. Just returning `Ok(())` would
+end the body having emitted nothing. And nothing here checks the counting: a
+node that always emitted `42` would satisfy every declaration on the page,
+which is what tests are for.
 
-Look at the `//!` block above, and write yours the same way.
+## Put it in a graph
 
-A file header states the module's **responsibility in prose** and records the
-**why** behind anything non-obvious. Not a summary of what the code does: what
-you cannot read from the code is why the permalink failure is swallowed, and
-that is what the comment is for.
+Replace the contents of your practice project's `main.weft` with:
 
-## Adding dependencies
-
-`deps.toml` next to `mod.rs`:
-
-```toml
-[dependencies]
-reqwest = { version = "0.12", features = ["json"] }
+```weft
+count = WordCount { text: "hello from weft" }
+show = Debug { data: count.count }
 ```
 
-`weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow`, `tracing` and
-`uuid` are there already, so a `deps.toml` only names what those do not cover.
-More about it, including how to pull in an OS package:
-[Packaging](packaging.md#dependencies).
+Check it, then run it:
 
-Next: [metadata.json](metadata.md) for the full declared surface, or
-[the ctx](the-ctx.md) for everything a running node can reach.
+```bash
+weft validate --file main.weft < main.weft
+weft run
+```
+
+`validate` checks the wiring without compiling any Rust, and should print
+`{"diagnostics":[]}`. `run` builds the node into the program, so it needs your
+runtime up. In the graph, `count.count` and the Debug result should both be
+`3`.
+
+A duplicate node type means the name is taken, so pick another. If the Rust
+build fails, the diagnostic points into `mod.rs`: a graph that validates says
+nothing about whether the Rust compiles.
+
+## Give it a test
+
+Next, [test it](testing.md), which runs the body against a few inputs on your
+own machine without going near the runtime.
+
+For extra crates or shared helper code, read [Packaging](packaging.md). For
+more input controls and declaration options, read
+[metadata.json](metadata.md).

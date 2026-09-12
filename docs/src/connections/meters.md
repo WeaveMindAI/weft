@@ -1,300 +1,199 @@
 # Measuring what a call costs
 
-A **meter** is the per-provider Rust that computes the real cost of a paid API
-call from the bytes of the request and the response.
+A provider meter turns a request and its observed response into a cost
+record. For an LLM call, it might read token usage; another API might
+report a charge that the meter retrieves afterwards.
 
-The runtime runs the provider's meter around every call made on an opened
-connection's client, so every cost figure in the system is a meter's output. A
-node never states a cost and cannot reach that path.
+The record is only as complete as the provider's evidence and the meter's
+pricing logic. If a response is interrupted before usage arrives and no
+lookup can recover it, the cost is unknown.
 
-## Where a meter lives
+## Add a meter
 
-A meter can live in two places and runs the same way in both. The worker runs
-it, so nothing central has to know it exists.
-
-**In weft**, one file under `crates/weft-providers/src/providers/`. This is a
-provider weft ships and reviews.
-
-**In your own project**, beside the nodes that call the provider: a shared
-`.rs` file at a package root, or the bottom of a bare node's `mod.rs`. That is
-how a project supports a provider weft does not ship yet, with a key you set
-yourself.
-
-Either way, adding a provider is a file plus one line:
+Implement `ProviderMeter` in a Rust module and register its instance:
 
 ```rust
 weft_providers::register_meter!(MY_METER);
-// inside weft's own crate: crate::register_meter!(MY_METER);
 ```
 
-The registry collects every registration at link time, weft's meters and your
-project's alike, since your project compiles into the same worker. Forget the
-line and the provider is simply unsupported: a loud refusal wherever a measured
-call is required, never a silent wrong number.
+`MY_METER` is your meter instance. Put the module in a package's shared
+Rust files or in a bare node's `mod.rs`, so it gets compiled into the
+worker. For a built-in meter, add its module under
+`crates/weft-providers/src/providers/`, declare it in that directory's
+`mod.rs`, and register its instance with `crate::register_meter!`.
 
-The node and the meter connect only through the provider name string, so the
-node never imports the meter.
+The meter's `service()` must match the connection recipe's service name.
+That name connects the two; a processing node does not import the meter.
 
-## Who can pay
+For a worked implementation, read
+[OpenRouter's meter](https://github.com/WeavemindAI/weft/blob/mvp/crates/weft-providers/src/providers/openrouter.rs).
 
-The place a meter lives decides exactly one thing.
+## What happens around a call
 
-**Your own connection**, your key or your signed-in account, works with **any**
-meter wherever it lives.
+On a direct connection, the client checks whether the request falls under
+the meter's `base_url`, then calls `classify` with the HTTP method and
+relative path.
 
-**The platform key**, where app.weavemind.ai pays and the user sets no key, is
-only ever spent on a provider weft ships a meter for, because it can only bill
-for spend it can measure with a meter it has reviewed. Getting a provider onto
-that key means getting its meter shipped in weft, and what that takes is at the
-[end of this page](#getting-a-meter-shipped-in-weft).
+For a billable route, it runs `prepare` on the request body, sends the
+request, and gives an observer the response status and chunks. The
+consumer receives those chunks as they arrive. When the response ends or
+is dropped, `resolve` turns the observation into a cost record.
 
-## The trait
+Billable requests need a buffered body. Even a request with no payload
+must send an explicit empty body, such as `.body(Vec::<u8>::new())`.
+Streaming bodies and absent bodies are refused before sending.
+The response can stream.
+
+## Classify routes explicitly
+
+| Class | Meaning |
+|---|---|
+| `Billable(Fixed)` | A fixed-price operation whose outcome still needs checking |
+| `Billable(Metered)` | Cost depends on measured usage |
+| `BillableSession` | A WebSocket session measured from its frames |
+| `Free` | A route declared to have no charge |
+| `Unknown` | This meter does not recognize the operation |
+
+A successful HTTP status does not always prove that a fixed-price
+operation was charged. Inspect the provider's outcome before recording
+the fixed amount.
+
+Cost-lookup and status routes should be classified according to their own
+price. A free lookup stays `Free` even though it returns the cost of
+another request.
+
+`classify` receives the parsed relative path without a leading slash or
+query string. Match the path segments you support; the original URL
+spelling and its query parameters are unavailable here.
+
+### Runtime-owned credentials
+
+On a direct HTTP connection using a runtime-owned credential, weft checks
+the initial request URL before authentication. URLs outside the meter's
+base or classified `Unknown` are refused. A meter must be registered even
+if every allowed route is free.
+
+Redirect destinations are not checked again. Custom authentication headers
+can follow a redirect to another origin.
+
+Direct WebSocket connections currently apply handshake authentication
+without this route check. Use a trusted provider URL; an unrelated
+destination can receive the authentication too.
+
+On the user's own direct HTTP connection, an unknown route passes through
+unmeasured. A service without a registered meter can also be used with the
+user's credential.
+
+The registry does not distinguish a built-in meter from one supplied by
+the project. Installing a project meter is therefore a trust decision
+about code, not a proof that weft's maintainers reviewed its prices.
+
+A relayed connection sends measurement work to the relay. Its client
+requires a meter to identify the service's base URL and refuses URLs
+outside that base.
+
+## Implement the observation
+
+The main methods are:
+
+| Method | Job |
+|---|---|
+| `service` | Name the connection service |
+| `base_url` | Name its API base |
+| `classify` | Recognize the method and relative route |
+| `prepare` | Adjust a billable request so its usage can be measured |
+| `observe` | Create an observer using the path, query, and prepared request body |
+| `resolve` | Produce a `MeasuredCost` from the observation |
+
+For the exact signatures, read
+[ProviderMeter](https://github.com/WeavemindAI/weft/blob/mvp/crates/weft-providers/src/lib.rs).
+
+`prepare` can enable a provider's usage reporting or remove internal
+estimation fields before sending. Return `Ok(None)` to keep the body
+unchanged. If a required rewrite cannot parse the request, return an error.
+
+A `CallObservation` receives `on_status`, followed by `on_chunk`
+calls, then `end(interrupted)`. Keep the state needed to interpret
+chunk boundaries and extract usage. An observer may retain a bounded copy
+of response data; it must not accumulate an unlimited response in memory
+or hold up the consumer until the whole response arrives.
+
+`resolve` returns:
 
 ```rust
-#[async_trait::async_trait]
-impl ProviderMeter for MyProviderMeter {
-    fn service(&self) -> &'static str;
-    fn base_url(&self) -> &'static str;
-    fn classify(&self, method: &str, path: &str) -> RouteClass;
-    fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
-    async fn ceiling_usd(&self, path: &str, body: &[u8], follow_up: FollowUp<'_>)
-        -> anyhow::Result<f64>;
-    fn observe(&self, path: &str, query: &str, request_body: &[u8])
-        -> Box<dyn CallObservation>;
-    async fn resolve(&self, path: &str, observed: ObservedCall, follow_up: FollowUp<'_>)
-        -> MeasuredCost;
-    fn observe_session(&self, path: &str, query: &str)
-        -> anyhow::Result<Box<dyn SessionObservation>>;
-    fn session_slice_usd(&self, path: &str) -> anyhow::Result<f64>;
-    fn session_max_frame_bytes(&self, path: &str) -> anyhow::Result<usize>;
+MeasuredCost {
+    amount_usd: Some(amount),
+    model: Some(model),
+    metadata: details,
 }
 ```
 
-**`base_url`** is the single authority for where the provider lives. No caller
-ever accepts a host from a request instead; requests are rebuilt against this
-base, so a request cannot be aimed at a host the meter did not name.
+Here `amount` is an `f64`, `model` is a `String`, and `details`
+is JSON containing the evidence useful for inspecting the cost.
 
-**`classify`** maps a method and relative path to a class, matching against the
-**raw path** and never a normalized one. An unknown route can be refused by the
-caller's policy, so traversal (`../`), encoded traversal (`%2e%2e`), userinfo
-(`@host`), and backslash tricks all have to fail to match and come back
-`Unknown`. Matching raw is what gives you that. If a route has a parameterized
-segment, match its prefix and guard the segment's character set, the way
-`elevenlabs.rs` does for `text-to-speech/{voice}`; normalizing first would take
-the protection away.
+Return `amount_usd: None` when you cannot establish the charge.
+Use zero only when the evidence establishes no charge.
 
-**`prepare`** rewrites a billable call's outgoing body so its cost becomes
-reportable at all, for example forcing the provider's usage-accounting opt-in,
-overriding whatever the caller set. It also sheds anything internal with no
-business going upstream. An unparseable body on a route needing a rewrite is a
-loud error, because an unpreparable call would be an unmeasurable spend.
+### Look up a charge after the response
 
-**`ceiling_usd`** is a worst-case price computable **before** the call goes out.
-It must be computed **only** from the request bytes, never from anything the
-caller could hand over separately: a side channel for "here is my conversation,
-for estimation purposes" would let a caller understate what it is about to
-spend. Lean high; the measured actual is the figure that counts. A call that
-cannot be priced is a loud error, never a guess. When the rates live behind the
-provider's own authenticated API, `follow_up` is how the meter asks for them: a
-signed request the meter makes on its own, outside the call it is pricing.
+Some providers report an identifier before they make usage available.
+Use the supplied `FollowUp` client to query their ledger or price API
+from `resolve`.
 
-You only need this if you want the provider on the shared keys. On the user's
-own credential nothing has to be bounded before the call, so the default, which
-refuses, is the right one to leave in place. `session_slice_usd` works the same
-way.
+This client carries the connection's authentication. In the local
+implementation, it has a 30-second timeout, disables redirects, and does
+not include the metering middleware. Its requests therefore do not
+recursively create another measurement.
 
-**`observe`** mints a fresh observer for one call. It is handed the query
-string and the request body as well as the path, because some routes are priced
-from what was sent rather than what came back: a text-to-speech call prices its
-text's characters, and an output format in the query decides bytes per second.
-The observer then sees every byte **as it flows through** to the real consumer,
-so it must never buffer, delay, or reorder chunks, and it must stay small in
-memory however long the stream runs.
+Choose a provider endpoint that does not itself incur an unreported
+charge.
 
-**`resolve`** turns the observation into dollars. If the provider reported the
-cost inline, this is pure. If the provider only answers out of band, **the
-meter** makes that follow-up query itself; the node and its client library are
-never involved and never trusted to do it. A cost that genuinely cannot be
-resolved is an honest `None`, recorded as unknown, **never a fake zero**,
-because a zero would read as a call that cost nothing.
+### Measure a session
 
-**`observe_session`** mints the per-session tap for a route classified as a
-session. It is fed every frame in both directions, answers the running accrued
-cost, and closes into a measured cost. Required for any meter classifying a
-route as a session; the default refuses loudly.
+A `BillableSession` route needs `observe_session`.
+Its observer receives frames in both directions, exposes accumulated cost
+through `accrued_usd`, and returns a `MeasuredCost` when it ends.
 
-**`session_slice_usd`** is the session's version of a ceiling. A session has no
-knowable total before it runs, so instead of reserving the whole thing the
-runtime reserves a slice at a time (price the dearest configuration for a fixed
-span, say one minute) and reserves another as the accrued cost catches up. It
-is only read where a call has to be paid for before it is allowed to start.
+Keep frame parsing separate from the arithmetic so you can test both
+partial exchanges and complete sessions.
 
-**`session_max_frame_bytes`** bounds one frame, sized so a single frame can
-never accrue more than one slice's worth at the route's dearest rate. Account
-for the wire form, such as base64 expansion.
+## Estimates and spending limits
 
-## Route classification, and the double-charge trap
+The trait also exposes `ceiling_usd`, `session_slice_usd`, and
+`session_max_frame_bytes`. `ceiling_usd` estimates a call's upper cost
+before sending it. `session_slice_usd` supplies the amount to reserve at
+a time for a prepaid session, and `session_max_frame_bytes` supplies a
+frame-size limit.
 
-A cost-lookup route looks like a call and must cost nothing.
+The local runtime does not use those methods to reserve a prepaid balance
+or enforce a spending cap. Implementing them does not give an installation
+that behavior. The local cost record measures calls; the provider still
+charges the account associated with the credential.
 
-| Route | Class | Why |
-|---|---|---|
-| `POST chat/completions` | `Billable(Metered)` | the actual spend |
-| `GET generation` | `Free` | the cost **lookup** for a spend |
-| `GET models` | `Free` | the public price catalog |
-| `GET speech-to-text/realtime` | `BillableSession` | a long-lived two-way channel; no total knowable up front |
-| anything else | `Unknown` | cannot be measured, so cannot be billed |
+## Keep pricing current
 
-If the cost-lookup route were billable, a node re-querying its own cost would
-be billed a second time, and the meter's **own** follow-up query would be
-billed too, recursively. Classifying it `Free` makes that impossible, and
-**no "internal call" flag is needed**, because the route table already answers
-it.
+When a provider publishes a machine-readable rate catalog, use it with a
+bounded cache instead of copying a model price list into constants.
+Cover the choices the processing node offers.
 
-A billable route also declares **how** it prices, which doubles as the policy
-for an unresolvable cost:
+If a provider introduces an unsupported billing unit, report unknown cost
+until you can interpret it. Treating an unfamiliar unit as one image or
+one second would produce a plausible but wrong number.
 
-- **Fixed**: one search equals one credit. The price is known without
-  measurement, but whether the call was actually charged is not, since a
-  provider may answer 200 with a failure body it never bills. So fixed routes
-  still resolve through the meter: read the observed status and body and answer
-  the declared price, zero for an unbilled failure, or unknown when the outcome
-  was unreadable.
-- **Metered**: LLM tokens. There is no honest number without measurement, and
-  an unresolvable metered cost is recorded as unknown, never guessed.
+For rate lookup and handling different billing units, read the
+[fal meter](https://github.com/WeavemindAI/weft/blob/mvp/crates/weft-providers/src/providers/fal.rs).
 
-`Unknown` means this meter cannot measure the route, and whether that is
-refused or passed through unmeasured is the caller's policy.
+## Test with recorded exchanges
 
-## The runtime-credential allowlist
+Test route classification, including malformed paths and unsupported
+methods. Test request preparation with both valid and unreadable bodies.
 
-A runtime-supplied credential only ever travels on routes its meter
-**explicitly** classifies: billable, or declared `Free`. An `Unknown` route, or
-a URL outside the meter's base, is refused loudly before the credential is
-attached. Nothing is sent.
+For observation, use recorded provider responses with known expected
+costs. Split streaming responses at awkward byte boundaries, and include
+an interrupted response. The interrupted case should remain unknown
+unless the available evidence or a follow-up lookup establishes the cost.
 
-Three consequences:
-
-- A service cannot open a shared door without a registered meter. **The meter
-  is the allowlist**, so a service whose calls all cost nothing still registers
-  one classifying its routes `Free`.
-- Adding a node that calls a new provider route on a shared door means adding
-  that route to the meter first, with its pricing.
-- A key the **user** pasted is theirs, so unknown routes pass through
-  unmeasured. The gate keys off the credential's origin, never the service.
-
-A multi-route meter opens each method with a match on the route and delegates
-to per-route functions. It never infers the route from a response's shape.
-
-## Cover the provider's whole surface, dynamically
-
-A meter must cover everything the provider's **nodes** let the user ask for.
-
-If a node exposes a model picker, the meter covers **every** model that picker
-can produce. A hard-coded priced-models table turns a valid user choice into a
-refusal, and it is stale the day the provider ships a model.
-
-So fetch the provider's own rate catalog at call time, cached with a TTL,
-instead of copying numbers into constants. Two shipped patterns to copy:
-
-- **OpenRouter**: the billable route accepts any model; rates come from the
-  provider's public price catalog, fetched and cached by the estimator.
-- **fal**: any well-formed model submit is billable; the unit price and billing
-  unit come from fal's authenticated pricing catalog through the meter's signed
-  side-query lane, and the billed quantity is read from the request per unit
-  kind (images, megapixels, seconds), so no per-model knowledge exists
-  anywhere.
-
-Hard-coded rates are acceptable only when the provider publishes no
-machine-readable catalog **and** the rate is a property of the route rather than
-a user-selectable model: a per-page OCR price, a per-hour transcription price.
-Even then, price by family or prefix where the provider versions its models, and
-refuse rather than guess on a name the mapping does not recognize.
-
-## Ceilings are estimates, not blanket caps
-
-A prepaid balance admits a call only if it can cover the ceiling. So a lazy
-worst-case cap blocks users whose budget would comfortably cover the real cost.
-
-Squeeze every pre-call signal before falling back to a provider-wide maximum:
-
-- Price at the **request's** model and tier rate, fetched from the provider's
-  catalog, never at "the dearest model we carry".
-- Count what the request actually asks for: its token estimate, its result
-  count, its page selection, its crawl limit, the content types it enables.
-- When the priced quantity only exists in the response, look for a cheap
-  pre-call proxy (a HEAD for the document's byte size) before reaching for the
-  per-call cap. The cap is the last resort.
-
-Over-estimation is still correct, since the measured figure settles the charge.
-The overshoot just has to shrink as the request tells you more.
-
-## Media estimation metadata
-
-A request's media parts may carry estimation metadata the node's client library
-kept on the wire: duration for audio and video, dimensions for images.
-Read it in `ceiling_usd`, so a declared 90-second clip prices like a
-90-second clip rather than a default guess.
-
-It only ever **sharpens** the ceiling. Lying in it, or omitting it, moves the
-pre-call estimate and never the cost figure, which is always the measured
-actual, so it is not a trust surface.
-
-`prepare` sheds it before the bytes go upstream.
-
-## Tests a meter must ship
-
-**Route classification.** Every route in the table, plus the trick paths
-(`../`, `%2e%2e`, `@host`, backslash, trailing slash, case changes) all
-classifying `Unknown`.
-
-**The double-charge pin.** The cost-lookup route is `Free`.
-
-**`prepare`.** The accounting opt-in is forced even when the caller opted out,
-estimation metadata is shed, garbage bodies error loudly.
-
-**Observation and resolve against recorded real responses.** A meter is a
-function of bytes, so record a real non-streaming response, a real streaming
-response fed in awkward chunk splits to prove reassembly, and a refused call,
-then assert the exact dollars. This is what catches a meter that prices low on
-every call.
-
-**Interruption honesty.** An interrupted observation with nothing to anchor a
-lookup on resolves to unknown.
-
-**Sessions, when the meter has any.** The session route classifies as a
-session; an observation fed recorded frames in both directions accrues and
-closes to the expected dollars; the slice prices the dearest configuration.
-
-## Getting a meter shipped in weft
-
-A meter you already wrote for your own project is most of the work. To be
-shipped in weft, and so usable on the shared keys, it also holds all four of
-these:
-
-1. **Every billable route is priced from published rates or a reported
-   figure**, never guessed. A route whose real cost cannot be known stays
-   `Unknown`, meaning own-key only, with a comment saying why.
-2. **Cost-lookup and status routes are `Free`**, so nothing double-charges.
-3. **No account-asset route is reachable by the platform key.** A route that
-   creates or modifies durable things inside the credential's account (minting
-   a voice, registering an agent, adding a webhook) classifies `Unknown`, never
-   `Free` and never `Billable`, because on the shared key those assets would
-   land in one account everybody shares. Listing routes that only serve pickers
-   may be `Free`. Pair the refusal with an own-account-only capability on the
-   service's permission catalogue, so the editor guides the user to their own
-   account instead of failing at run time.
-4. **The ceiling is the tightest bound the request allows**, and every test
-   below is present, including resolves against recorded real responses.
-
-## Write it as a pure function of bytes
-
-A meter must assume nothing about the process running it.
-
-Write it as a pure function of the request and response bytes plus its own
-follow-up query, and it measures correctly wherever a paid call is measured. No
-globals beyond your own rate caches, no environment reads beyond what the
-follow-up lane hands you.
-
-A meter never touches a credential, so the same meter works on a pasted key and
-on a sign-in.
+For a session meter, feed recorded frames in both directions and check
+the accumulated and final amounts. A test that only repeats the meter's
+own arithmetic will not catch a wrong interpretation of the provider's
+usage fields.

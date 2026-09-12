@@ -1,166 +1,106 @@
 # Live channels: streams and buses
 
-Most wires in a weft program carry one value once. Two port types carry
-something that keeps arriving, and they answer different questions.
+Use a stream when one step produces items for another to work through. Use a
+bus when several running steps need to talk to each other.
 
 | | `Generator[T]` | `Bus` |
 |---|---|---|
-| Direction | one way, producer to consumer | any participant to any participant |
-| Readers | exactly one | any number |
-| Ends | when the producer's body returns | when the creator closes it |
-| Typed payload | yes, every item checked against `T` | no, the channel declares its shape |
-| Crosses a group boundary | no | yes |
+| Data | Items of type `T`, in order | JSON messages or byte frames |
+| Readers | One | Several, each with its own position |
+| Direction | Producer to consumer | Anyone to anyone |
+| End | The producer closes it or finishes | A participant closes it |
+| Across a group boundary | Only through a loop's `over` | Yes |
 
-A stream is a sequence someone is producing. A bus is a conversation between
-things that are alive at the same time.
+## Process items as they arrive
 
-## Streams
-
-A `Generator[T]` port accepts being emitted into repeatedly. Each emission is
-one item.
+`Range` produces numbers one at a time, and this loop doubles each one as it
+turns up rather than waiting for the whole list:
 
 ```weft
-rows = ReadCsv() -> (rows: Generator[Row])
-rows.path = @asset("data/big.csv", Blob)
-
-summarise = SummariseRows
-summarise.rows = rows.rows
-```
-
-The consumer fires **once**, on the first item, and pulls the rest itself at
-its own pace.
-
-Or a `Loop` names the port in `over` and pulls one item per iteration:
-
-```weft
-each = Loop(rows: Generator[Row]) -> (kept: List[Row | Null]) {
-  over: ["rows"]
-  ...
+numbers = Range { to: 5 }
+double = Loop(values: Generator[Number]) -> (results: List[Number | Null]) {
+  over: ["values"]
+  step = ExecPython(n: Number) -> (out: Number) {
+    n: self.values
+    code: "return {'out': n * 2}"
+  }
+  self.results = step.out
 }
-each.rows = reader.rows
+double.values = numbers.values
+show = Debug { data: double.results }
 ```
 
-### Why a stream instead of a list
+A step can also read a stream directly, inside its own code. It runs once and
+pulls items as they come. An empty stream still lets it run and see that
+nothing arrived.
 
-The visible difference is when the second stage starts.
+If you already have the whole collection, use `List[T]`. A stream is for when
+producing and processing should overlap.
 
-With `List[Row]`, the producer builds the whole list, emits it, and only then
-does anything downstream begin. With `Generator[Row]`, the consumer starts on
-item one while the producer is still working on item four hundred.
+## Where a stream can go
 
-For a ten-row query nobody cares. For a query that takes a minute to page
-through, or an LLM streaming tokens, the first result lands in seconds instead
-of after the whole thing finishes.
+One producer, one consumer, and that is it. A connected stream input has to be
+required with no default, and you cannot write a stream down as a value or put
+one inside a list or a record.
 
-If the whole collection exists up front, use `List[T]`. If the items appear
-over time, use `Generator[T]`.
+Producer and consumer have to be in the same scope. An ordinary group will not
+pass a stream through its boundary. A loop can take one through an input named
+in `over`, as above, but cannot carry it between iterations or emit one.
 
-### The rules, and why each exists
+For the loop rules, read
+[Looping over a stream](loops.md#looping-over-a-stream).
 
-- **Exactly one producer, exactly one consumer.** A stream has one taker.
-  Broadcasting is a bus's job.
-- **A stream cannot cross a group boundary**, sit inside a container, or be
-  carried between loop iterations. A stream is a live handle, and those three
-  operations would all mean holding it somewhere its producer cannot reach.
-- **A `Generator` input must be required.** An unwired stream has no meaning.
-- **No literal.** The value is minted at run time.
+## When the consumer falls behind
 
-### Backpressure
+A producer either waits for each item to be taken or lets items pile up in a
+buffer, which holds 4096 untaken items per connection by default. Go past that
+and the producer fails. Waiting for an item to be taken only means the consumer
+received it, not that it finished with it.
 
-A producer that emits without waiting runs ahead of its consumer, and the
-un-taken items buffer on the edge. That buffer is bounded, 4096 items by
-default, and an emission past the bound **fails the producer loudly** rather
-than growing until the pod runs out of memory. A producer that means to run far
-ahead raises its own bound. A producer that
-yields in lock step waits for each item to be taken, so its buffer never grows
-past one.
+### Stopping early can fail the run
 
-### The early-termination edge
+`Range` waits for each number to be taken. Stop its consumer while a number is
+still waiting and that delivery fails, which fails the run. This catches people
+using `max_iters` or `self.done` to end a loop before the range runs out, and
+the fix is to make the range produce only what you need.
 
-A lock-step producer is parked holding an item until the consumer takes it. If
-the consumer stops early, that item can never be taken, and the producer fails
-loudly, failing the execution.
+A producer that does not wait behaves differently: leftovers are dropped when
+the consumer finishes, and it carries on working. Which of the two you get is
+the step author's choice, in
+[Yield or pulse](../nodes/streams-and-buses.md#yield-or-pulse).
 
-So when the **consumer** decides how much of the stream to use, the producer
-must emit fire-and-forget (leftovers are dropped) or be the side that decides
-when to stop. The same rule appears in [Loops](loops.md).
+## Let running steps talk
 
-### An empty stream still runs the consumer
+A bus lets one step send a message while another is still working, so a
+coordinator can go back and forth with several agents instead of waiting for
+one final answer from each.
 
-A producer that closes without yielding anything delivers a stream whose first
-pull answers "finished". The consumer still fires, its loop runs zero times,
-and whatever comes after the loop runs normally.
+One step creates the bus and emits the handle on a `Bus` output. Other steps
+receive that handle down ordinary arrows and can then send and receive on it.
+A handle can cross a group boundary, and a loop can gather handles into
+`List[Bus | Null]`.
 
-## Buses
+The catalog's `LlmStream` uses one for its text updates. For two custom steps
+talking to each other, see the
+[bus chat fixture](https://github.com/WeaveMindAI/weft/tree/mvp/crates/weft-e2e/fixtures/bus_chat).
 
-A bus is an in-process channel between nodes that are alive at the same time.
-One node creates it and emits a marker on a `Bus`-typed output; downstream
-nodes resolve that marker and exchange messages.
+### Wait for the other one to join
 
-```weft
-host = ConversationHost() -> (channel: Bus)
+Handing a step the handle does not mean it is listening yet. If a message has
+to be received, wait for that participant to join before sending it.
 
-guest = ConversationGuest
-guest.channel = host.channel
+Each reader has its own position, and the bus keeps roughly the last 64
+messages. A reader that falls behind that window skips whatever is no longer
+held, and it will not go and fetch them from the journal afterwards. If every
+item must be seen exactly once, that is a stream, not a bus.
 
-observer = ConversationTap
-observer.channel = host.channel
-```
+### Ending it
 
-Three nodes on one channel, all three talking, which is what a stream cannot
-do.
+`open_bus` and `join_bus` hand back a guard that closes the whole bus when it
+drops, including when the step exits with an error. Closing tells the readers
+nothing more is coming. For an observer that should leave without closing it,
+use `bus_from_input`.
 
-### What a bus carries
-
-The creator declares the channel's shape once, and every participant reads it
-back off the handle:
-
-- **payload**: `Json` for chat-shaped traffic, or `Bytes` for media frames,
-  which travel raw end to end with no base64 in between. Frozen at creation.
-- **meta**: whatever a consumer needs to know before the first message, such as
-  an audio stream's sample rate and encoding, instead of every message
-  repeating it.
-- **ephemeral**: keeps payloads out of the journal entirely, for bytes that are
-  transient by nature.
-- **window**: how many frames the bus keeps for a consumer that falls behind,
-  64 by default. Raise it in the node that creates the bus.
-- **journal_window**: how coarsely the trail is recorded, one row per bus per
-  window, one second by default. What travels the bus is untouched.
-
-### Reading a bus
-
-Every reader has its own position, so a responder and an observer both see
-every message. Positions are absolute over the channel's whole life, so a saved
-one keeps naming the same message as the window moves.
-
-When a bus is closed, every reader's pull ends cleanly. Closing is therefore
-the end-of-stream signal, and a producer that forgets to close leaves its
-readers parked forever, which is why the node-side API closes on every exit
-path for you.
-
-### Buses and the graph
-
-A bus is the answer to "these two things need to talk while both are running",
-which the pulse model does not express on its own: a pulse is one delivery in
-one direction.
-
-The canonical shape is a parallel loop that launches N agents, gathers their
-bus markers as `List[Bus | Null]`, and hands that list to a coordinator that
-talks to all of them while they work. See
-[a loop is a launcher, not an owner](loops.md#a-loop-is-a-launcher-not-an-owner).
-
-## Which one do I want
-
-Ask what happens when a second reader appears.
-
-If a second reader would be a bug (each item must be handled once), it is a
-stream. If a second reader is fine or desirable (everyone should see the
-message), it is a bus.
-
-Ask who decides when it ends.
-
-If the producer decides, by finishing, it is a stream. If the conversation
-ends when the participants are done, it is a bus.
-
-The Rust side of both is in
+Whether messages carry JSON or bytes, and what gets journaled, is the step
+author's choice. For that and the reading APIs, read
 [Streams and buses in Rust](../nodes/streams-and-buses.md).

@@ -1,213 +1,138 @@
 # How the runtime is built
 
-Weft runs as four tiers plus a broker, one job each. This page describes how
-they share work and recover from failures. Recovery depends on what reached
-the [journal](the-journal.md#the-execution-guarantee) before a crash.
+Four kinds of process, one job each. The **worker** runs your program. The
+**dispatcher** decides what runs where. **Listeners** wait for events. The
+**supervisor** looks after any service your program asked for. Anything that
+has to survive a crash goes into Postgres, and all four read it back from
+there.
 
 ```mermaid
 flowchart TD
-    CLI["CLI / editor / webhooks"] -->|HTTP| D
-    D["<b>Dispatcher</b><br/>routing, lifecycle, journal<br/>never runs user code"]
-    D -->|HTTP| L["<b>Listener</b><br/>holds live event sources<br/>never touches the database"]
-    D -.->|"task rows"| S["<b>Supervisor</b><br/>runs kubectl for user infra<br/>one lease per project"]
-    D -.->|"task rows"| W["<b>Worker</b><br/>the compiled project binary<br/>a pool per project"]
-    Caller["Live callers"] --> G["Live-connection gateway"] --> W
-    L -->|HTTP| B
-    S -->|HTTP| B
-    W -->|HTTP| B["<b>Broker</b><br/>the only door to the database<br/>for tenant pods"]
+    UI["CLI / editor / webhooks"] --> D["Dispatcher"]
+    D --> L["Listener"]
+    D -.->|"queued work"| S["Infrastructure supervisor"]
+    D -.->|"queued work"| W["Worker: compiled project"]
+    C["Live caller"] --> G["Live gateway"] --> W
+    L --> B["Broker"]
+    S --> B
+    W --> B
     D --> PG[("Postgres")]
     B --> PG
 ```
 
+The dotted arrows are rows in a table, not calls. Workers and supervisors
+claim that work through the broker.
+
+## What happens when an event arrives
+
+A listener holding a timer or a subscription reports the event through the
+broker. The dispatcher works out which run it belongs to and makes sure a
+worker exists.
+
+The worker claims the job, fetches the project definition by its hash, and
+runs the graph, writing what happens into [the journal](the-journal.md) as it
+goes.
+
+An HTTP or WebSocket caller takes a different road: it reaches the worker
+through the live gateway, which holds the caller's connection open while the
+program runs. For that, read [an HTTP endpoint](../start/on-a-url.md).
+
 ## Dispatcher
 
-Routes events, manages worker lifecycle, orchestrates infrastructure, owns the
-journal, aggregates cost.
+The dispatcher answers every request about a project or a run, and decides
+which worker runs what and when workers start and stop. It writes tasks to the
+database rather than calling any particular worker.
 
-It and the broker are the only two things that open a database connection.
-Webhooks, form links and fire tokens reach the dispatcher. Live callers get
-a signed address through a separate public gateway, which connects them to
-their worker.
+It never runs your step code. The CLI reads your local catalog and compiles
+the program before submitting it, so the dispatcher never needs to see your
+`nodes/` directory.
 
-It **never** executes user node code. It never does node-aware work either:
-parsing, validation, and catalog reading are client-side, in the CLI, because
-the dispatcher pod cannot see your `nodes/` folder and should not need to.
+Anything shared lives in Postgres, because the next request may land on a
+different dispatcher pod with nothing in memory.
 
 ## Listener
 
-Holds live event sources: timers, held sockets, subscriptions, IMAP pipes, poll
-loops.
+A listener holds the timers, the open sockets and the other event sources.
+When something arrives, it turns that into a message the dispatcher knows how
+to route. Listeners are the only tier that tells one kind of event source from
+another, so a new kind of trigger is listener code and nothing else. They
+never run your step code.
 
-It is the **only** tier that knows about signal kinds. A new kind of trigger is
-listener code and nothing else; the dispatcher acts on a kind-agnostic action.
+One listener pool serves every project on the installation, and each listener
+reports how close it is to its memory limit, so weft knows where to put the
+next event source.
 
-It never touches Postgres and never executes node code. Listener pods are
-pooled and tenant-agnostic, and report saturation from real memory pressure
-rather than a count, so a pod holding ten cheap timers and one holding one
-expensive stream are measured by what they actually cost.
+## Infrastructure supervisor
 
-## Supervisor
+The supervisor applies your infrastructure specs and watches whether what it
+created is healthy. Before it issues any cluster command it takes a lease on
+the project, and it keeps renewing that lease for as long as the work runs. If
+the lease expires, another supervisor picks the project up.
 
-Runs kubectl for user infrastructure: apply, stop, terminate, and health
-watching.
-
-Each project has exactly one supervisor holding a lease on it, so one process
-issues cluster commands for that project. The lease expires if the pod dies,
-and a sibling claims it. It never touches Postgres and never serves HTTP.
+A supervisor can still die between changing the cluster and recording that it
+did, so the next one works out what to do from what the cluster actually looks
+like rather than trusting the record. For what the verbs do, read
+[infrastructure nodes](../nodes/infrastructure.md).
 
 ## Worker
 
-The compiled project binary. Each project has a pool that adds workers as
-memory pressure grows. Each worker handles multiple executions and shuts
-itself down after thirty seconds with nothing to do.
+A worker is one compiled project binary running as a pod, serving as many runs
+at once as it can. When a project's workers get close to their memory limit,
+weft adds another pod to the pool. Going the other way, a worker with nothing
+left to claim shuts itself down after 30 seconds.
 
-It claims work from a queue, runs the drive loop, writes journal rows, and
-exits when idle. It holds no project definition of its own: each claim fetches
-the definition by hash and caches it by hash.
+It caches every project definition it fetches, keyed by hash.
 
-## The broker
+A suspension can leave a worker free to exit, though other live work or a held
+caller keeps it up. For that difference, read [surviving a
+restart](../nodes/durable-execution.md).
 
-Everything except the dispatcher reaches Postgres through the broker.
+## Who is allowed to talk to what
 
-The broker sits in its own namespace behind a network policy, verifies each
-caller's Kubernetes service-account token, derives what that caller is allowed
-to touch, and only then delegates to the database.
+The dispatcher and the broker talk to Postgres directly. Everything else goes
+through the broker: listeners, supervisors and workers. The broker asks
+Kubernetes to verify the caller's service-account token, then checks what that
+particular service account is allowed to touch.
 
-It also owns the object store, and it is the one place outbound calls to
-tenant-influenced URLs are made: OAuth token exchanges, provider subscribes,
-resource lookups. Its egress policy denies every private range, so a crafted
-URL aimed at an internal address dies at the network layer rather than at a
-validation function somebody has to remember to write.
+The broker also handles storage and connection work, including OAuth exchanges
+and subscription setup. A worker calls the provider itself, so a slow provider
+never queues up behind the broker.
 
-If your object store sits on a private range, `WEFT_STORE_ALLOW_CIDR` is the
-one knob that lets the broker reach it. Keep it as tight as the store needs.
+Network policies limit where the broker can go, with explicit holes for
+Postgres and the Kubernetes API. If your object store sits on a private range
+those rules cannot work out, set `WEFT_STORE_ALLOW_CIDR` to it and the broker
+gets a hole for exactly that.
 
-Tenant pods are untrusted and reach the database only through the broker.
+The local management API has no authentication of its own, so whoever can
+reach it can do anything a project owner can. Keep it off any interface you do
+not control. For the rest of the boundaries, read the [security
+policy](https://github.com/WeavemindAI/weft/blob/mvp/SECURITY.md).
 
-## How they actually talk
+## Recovery
 
-| From | To | Over |
-|---|---|---|
-| dispatcher | listener | HTTP, for registration and inspection |
-| dispatcher | supervisor | **database rows.** The dispatcher writes a command, the supervisor claims it. |
-| dispatcher | worker | **database rows.** Same shape. |
-| listener, supervisor, worker | broker | HTTP |
-| dispatcher | Postgres | directly |
+Ownership records expire unless their holder keeps renewing them, so a
+replacement can claim expired work without needing anything the dead pod had
+in memory.
 
-The dispatcher does not call the supervisor or the worker. It writes a row, and
-whichever pod is free claims it with a locking select, so a worker starting
-late or a dispatcher pod dying between the write and the claim are ordinary.
+Journal writes carry the identity of the worker that made them, and the
+database rejects writes from a worker whose registration has been removed,
+which is what stops an evicted worker carrying on.
 
-## Coordination lives in the database
+Recovery reads the saved events, and what it cannot recover is an external
+action whose result never got written down. For that boundary, read [the
+execution guarantee](the-journal.md#the-execution-guarantee).
 
-No dispatcher pod holds anything the others need. Postgres is the single
-source of truth and a pod's memory is only a cache.
+## Swapping pieces out
 
-Ownership is a **lease**: a row with an expiry, renewed by its owner, claimable
-by anyone once it expires. That is how a listener pod, a supervisor pod, and a
-project's infrastructure each get exactly one owner without a coordination
-service.
+If you are putting weft on something other than Kubernetes, these are the
+seven traits you implement. Nothing else in the runtime changes:
 
-The rule that follows, for anyone changing the dispatcher: before adding an
-in-memory map or counter to shared state, ask what happens if a sibling pod
-handles the next request. If the answer involves a stale read or a lost update,
-it belongs in Postgres.
-
-## Fencing
-
-Every journal write is stamped with the pod that made it, and a database
-trigger rejects writes from a pod whose registration row is gone.
-
-So a worker that was evicted, hung, then woke up cannot corrupt an execution
-that has already been taken over: it writes, the write is rejected, and it
-learns it is dead.
-
-## The seams
-
-The dispatcher carries a small number of trait-shaped decision points, filled
-at construction:
-
-| Seam | Decides |
+| Interface | Decides |
 |---|---|
-| `Authenticator` | which tenant is making this request |
-| `TenantRouter` | which tenant owns this project, for background loops with no request |
-| `PlacementPolicy` | which namespace a worker goes in |
-| `SandboxPolicy` | what runtime class it gets |
-| `WorkerBackend` | how a worker pod is spawned |
-| `ImageBuilder` | how a staged build context becomes a pullable image |
-| `Journal` | where events are written |
-
-## Schema
-
-This section and the one after it are for people changing weft itself. Running
-programs on it needs neither.
-
-Every table is written down twice, and the two answer different questions.
-
-The **canonical `CREATE TABLE`** lives in Rust, in a group beside the code that
-reads and writes the table, and it says what the table is. You edit it in
-place. A new database is built from it in one shot, in one transaction under an
-advisory lock, with a stamp recording what was applied.
-
-A **migration** is one SQL file under `crates/weft-task-store/migrations/`,
-named so the files
-sort in the order they were written, and it says how the table changed. The
-build walks that directory, so nothing registers a migration; the file being
-there is all of it. A database that already exists runs the ones it has not
-seen yet. Each database
-records which files it has run rather than which release it came from, so any
-old database reaches today the same way, and two branches that each add a file
-converge whichever order they merge in.
-
-Editing a file that has already run is refused, since a database that ran the
-old text can never be told about the new one. Change your mind by writing
-another file.
-
-Changing the canonical `CREATE TABLE` with no migration to match fails the
-boot, naming the group. Nothing catches that at compile time, so there is also
-a test, `schema_agreement`, that builds a database each way and compares what
-Postgres ended up holding, down to the columns, indexes, constraints, triggers
-and functions.
-
-## Testing, in four layers
-
-Named explicitly in the codebase, so a test's file tells you what kind it is.
-
-**Layer 1, pure functions.** No I/O at all, sub-millisecond, in a `#[cfg(test)]`
-block next to the function. Most of the test count lives here.
-
-**Layer 2, wire shapes.** Round-trip every cross-process type through its
-serialization. One per public wire struct, next to the type. Catches "renamed a
-field, broke the contract".
-
-**Layer 3, contracts with fakes.** One subsystem's real code against in-memory
-fakes of its I/O, in the crate's `tests/`. Fakes are hand-rolled, behind a
-`test-helpers` feature so they never link into a release binary. **No mock
-libraries**: a macro-generated mock hides what is actually being tested.
-
-**Layer 4, end to end.** Real binaries on a real cluster with real Postgres,
-behind a feature that is off by default, so `cargo test --workspace` compiles
-them and runs none. Run them through `scripts/run-e2e.sh`, which is also where
-[what they need from your `.env`](https://github.com/WeaveMindAI/weft/blob/main/crates/weft-e2e/README.md#credentials-and-what-the-runner-provides-for-you)
-is written down.
-
-Layer 3 is where orchestration bugs surface.
-
-A node's own tests sit across layers 1, 3 and 4 rather than in one of them: its
-`basic` tier is layer 1, `fake` is layer 3, and `live` is layer 4 pointed at a
-real provider account. [Testing a node](../nodes/testing.md) is that side.
-
-### Flakes are bugs
-
-A test that fails intermittently is a bug.
-
-So timing-sensitive tests are written to run **many times at once**. A
-`stress_test!` macro runs the body in many concurrent tasks on a multi-thread
-runtime and reports which iteration broke, so a race shows up on an ordinary
-test run instead of waiting for somebody to notice. Anything touching a
-multi-thread runtime, a notification primitive, a firing order, or a
-stuck-detection deadline goes through it.
-
-Retries, sleeps, longer timeouts, and ignore attributes are never the fix,
-because they only make the test tolerate a race the production code still
-has.
+| `Authenticator` | Which tenant a request belongs to |
+| `TenantRouter` | Which tenant a project belongs to, outside a request |
+| `PlacementPolicy` | Which namespace a worker goes in |
+| `SandboxPolicy` | Which runtime class it gets |
+| `WorkerBackend` | How worker pods get created |
+| `ImageBuilder` | How staged source becomes a runnable image |
+| `Journal` | Which store execution events are written to and read back from |

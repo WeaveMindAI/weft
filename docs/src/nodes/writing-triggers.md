@@ -1,166 +1,174 @@
 # Writing a trigger
 
-A trigger node writes **two bodies** and never inspects any phase. The engine
-calls the right one.
+A trigger has two jobs: register what it is waiting for, then handle each
+event that arrives. Put those jobs in `setup_trigger` and `run`.
+The engine calls them at the appropriate point.
+
+Set this metadata feature:
+
+```json
+"features": { "isTrigger": true }
+```
+
+For example, the catalog's `Cron` node registers a timer in
+`setup_trigger`. Add the `use` declaration at module scope and the method
+inside `impl Node`. Cron's metadata declares `cron` and `timezone` string
+inputs with defaults.
 
 ```rust
-use weft::signal::{ApiEndpoint, LiveConnectionConfig};
+use weft::signal::{Timer, TimerSpec};
 
-#[async_trait]
-impl Node for MyTriggerNode {
-    async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?);
-        ctx.register_signal(ApiEndpoint { common }).await
-    }
-
-    async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        // Runs once per external fire.
-        let value: serde_json::Value = ctx.wake.get("value")?;
-        ctx.pulse_downstream(NodeOutput::new().set("value", value)).await
-    }
+async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    let expression: String = ctx.inputs.get("cron")?;
+    let timezone: String = ctx.inputs.get("timezone")?;
+    ctx.register_signal(Timer {
+        spec: TimerSpec::Cron { expression, timezone },
+    }).await
 }
 ```
 
-If you set `features.isTrigger: true` in the metadata, the engine calls
-`setup_trigger` at registration time instead of `run`.
-
-## The two value sources at fire time
-
-**`ctx.inputs`** is a snapshot of what the trigger's inputs held **when it
-registered**, saved alongside the registration. Nothing upstream runs again
-when the trigger fires:
-[a trigger's inputs are frozen at activation](../language/triggers.md#two-phases).
-
-**`ctx.wake`** is this fire's event payload, as a bag of named fields: the
-HTTP body, the SSE event JSON, the form submission, the timer info.
-
-A trigger that forwards the whole payload reads it at once:
+When the timer fires, the listener supplies `scheduledTime` and
+`actualTime`. The node's `run` method forwards those fields to its
+declared outputs:
 
 ```rust
-let data = serde_json::Value::Object(ctx.wake.object()?.clone());
-ctx.pulse_downstream(ctx.fan_declared(&data)).await
+async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+    let scheduled: serde_json::Value = ctx.wake.get("scheduledTime")?;
+    let actual: serde_json::Value = ctx.wake.get("actualTime")?;
+    ctx.pulse_downstream(
+        NodeOutput::new()
+            .set("scheduledTime", scheduled)
+            .set("actualTime", actual),
+    ).await
+}
 ```
 
-`ctx.wake.object()` fails loudly when the fire delivered no keyed record, so a
-broken delivery can never pass as an empty one.
+You can read the complete
+[Cron node](https://github.com/WeavemindAI/weft/tree/mvp/catalog/triggers/cron)
+for its imports and metadata.
 
-## The signal kinds
+## Inputs and event data
 
-Each is a struct in `weft::signal`. You construct one and pass it to
-`register_signal`.
+At fire time, `ctx.inputs` contains the input values saved when the
+trigger registered. Upstream nodes do not run again for every event.
+If someone changes an input, reactivate the project to register the new
+value. For how that affects a program, read
+[Two phases](../language/triggers.md#two-phases).
 
-Two families, pointing opposite ways. `SocketListen` and `LiveSocket` sound
-alike and are easy to swap by mistake: `SocketListen` dials out to a service,
-`LiveSocket` is what an outside caller dials into.
+`ctx.wake` contains this event's fields. Read required fields with
+`get`, as the timer does above. To forward all matching fields to your
+declared outputs:
 
-### Outbound event sources
+```rust
+let data = ctx.wake.record()?;
+ctx.pulse_downstream(ctx.fan_declared(&data)).await?;
+```
 
-The listener reaches out to something and fires a fresh execution per event.
+`record()` fails if the event is not a keyed record. `fan_declared`
+selects the fields matching the node's declared outputs; it does not
+create new ports from arbitrary event keys.
 
-| Kind | What it does | Use for |
-|---|---|---|
-| `SseSubscribe { url, event_name }` | holds a one-way Server-Sent-Events stream, fires per matching event. Receive only. | a service pushing an SSE feed |
-| `PollEndpoint { url, interval_secs, method?, body?, format?, delta? }` | hits a URL on a timer, fires with the body, or with `delta` once per new item. `method: Post` plus `body` polls a query endpoint; `format: Feed` parses RSS and Atom into `{ "items": [...] }`. No held connection. | a "give me what's new" endpoint: a bot's getUpdates loop, a database query, a feed |
-| `SocketListen { url, minted, handshake?, heartbeat?, heartbeat_secs }` | holds a bidirectional WebSocket alive, sends an optional handshake on open and an optional heartbeat on a schedule, fires per inbound frame | a gateway that needs login and keepalive or it drops you. The op-code protocol is yours, expressed as the literal `handshake` and `heartbeat` frames. |
-| `StreamListen { address, framing, script, replies?, heartbeat?, fire }` | holds a raw TCP or TLS pipe for services speaking neither HTTP nor WebSocket | any wire protocol: IMAP, MQTT, Redis, XMPP |
+A trigger body can be retried after a worker failure. If it performs an
+external action, follow the rules in [Surviving a restart](durable-execution.md).
 
-`StreamListen` is the kind that makes "no per-service engine code" literal. It
-runs a declared connect dialogue (send
-a frame, wait for a matching line), cuts the byte stream by a declared framing
-(delimiter, length prefix, or varint prefix), and fires every unit matching the
-`fire` pattern. Text frames interpolate `{placeholders}` from the attached
-connection, so credentials ride the dialogue without sitting in the spec.
+## Choose a signal kind
 
-The watch is the trigger. The fired body then talks the protocol properly
-itself, with a real library, where code is unrestricted.
-`catalog/email/receive_email` is the worked example, watching a mailbox over
-IMAP IDLE.
+Construct a kind from `weft::signal` and pass it to
+`ctx.register_signal`. The listener maintains the subscription, so your
+trigger body does not need its own background task.
 
-### Inbound live-caller endpoints
-
-An outside caller dials in and holds the connection; nodes talk back through
-[`ctx.caller()`](live-callers.md).
-
-| Kind | For |
+| Event source | Signal kind |
 |---|---|
-| `ApiEndpoint { common }` | an HTTP endpoint people call; a node replies once or streams |
-| `LiveSocket { common }` | an inbound WebSocket; a node holds a two-way conversation |
+| A schedule or a specified time | `Timer` |
+| A submitted form | `Form` |
+| A service's SSE feed | `SseSubscribe` |
+| A URL checked periodically | `PollEndpoint` |
+| An outbound WebSocket connection | `SocketListen` |
+| An outbound TCP or TLS connection | `StreamListen` |
+| An incoming HTTP request | `ApiEndpoint` |
+| An incoming WebSocket connection | `LiveSocket` |
+| Events from a connected provider | `ProviderEvents` |
 
-Both share `LiveConnectionConfig`, built from the node's merged values with
-`LiveConnectionConfig::from_node_fields(ctx.inputs.object()?)`.
+`SocketListen` connects to another service. `LiveSocket` accepts a
+connection from a caller. Choose by which side starts the connection.
 
-The wire protocol is the **kind**, not a config field. The runtime derives it
-from which struct you passed, which is why there is no `protocol:` knob to set
-wrong.
+For the kinds' fields, read their
+[Rust definitions](https://github.com/WeavemindAI/weft/tree/mvp/crates/weft-core/src/signal).
+A form can also be used with `await_signal` to pause an existing execution.
 
-### Always present
+### Polling and outbound streams
 
-`Timer { spec }` for cron, after, and at. `Form { .. }` for a human
-submission, normally used with `await_signal` rather than here.
+`PollEndpoint` can return each response or use a delta rule to emit new
+items. It supports JSON and RSS/Atom feed parsing.
+
+`StreamListen` describes an opening dialogue and how to split the byte
+stream into messages. Its frames can interpolate connection values, so
+credentials need not be written into the dialogue. The
+[ReceiveEmail node](https://github.com/WeavemindAI/weft/tree/mvp/catalog/email/receive_email)
+uses it to watch IMAP events; its fired body uses an email library to fetch
+the messages.
+
+### Incoming callers
+
+`ApiEndpoint` and `LiveSocket` share `LiveConnectionConfig`.
+Inside a trigger's `setup_trigger`, build it from the declared inputs:
+
+```rust
+use weft::NodeErrExt;
+use weft::signal::{ApiEndpoint, LiveConnectionConfig};
+
+let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?)
+    .node_err("reading endpoint settings")?;
+ctx.register_signal(ApiEndpoint { common }).await?;
+```
+
+Use the catalog's
+[API endpoint node](https://github.com/WeavemindAI/weft/tree/mvp/catalog/live/api_endpoint)
+for the accompanying input declarations. For reading the caller's messages
+and sending replies, read [Talking to a live caller](live-callers.md).
 
 ## Reacting to provider events
 
-A trigger that fires when something happens at a connected service registers
-**one** kind, whatever the service is and however its events travel.
+If a service has an event recipe, register `ProviderEvents` with the
+connection, topic, and filters. This fragment belongs in `setup_trigger`
+for a node with an `account` access input and a `channel` string input:
 
 ```rust
-async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-    let account: Access = ctx.inputs.get("account")?;
-    ctx.register_signal(ProviderEvents::new(&account, "messages", vec![
-        Predicate { field: "type".into(), op: PredicateOp::Eq,
-                    value: Some("message".into()) },
-        Predicate { field: "channel".into(), op: PredicateOp::Eq,
-                    value: Some(channel) },
-    ]))
-    .await
-}
+use weft::Access;
+use weft::signal::{Predicate, PredicateOp, ProviderEvents};
+
+let account: Access = ctx.inputs.get("account")?;
+let channel: String = ctx.inputs.get("channel")?;
+let events = ProviderEvents::new(&account, "messages", vec![
+    Predicate {
+        field: "type".into(),
+        op: PredicateOp::Eq,
+        value: Some("message".into()),
+    },
+    Predicate {
+        field: "channel".into(),
+        op: PredicateOp::Eq,
+        value: Some(channel.into()),
+    },
+]);
+ctx.register_signal(events).await?;
 ```
 
-The parts, and where each one's knowledge lives:
+Here `messages`, `type`, and `channel` are names declared by the
+service's event recipe, as in the Slack recipe. Filters apply to those
+named fields before an execution starts. If the recipe needs values for
+its subscription request, such as a file ID to watch, pass them with
+`.with_params(...)`.
 
-- **The connection** says whose events. Whether weft holds an outbound line to
-  the service or takes its pushes at a public address is decided by the runtime
-  from what the connection can do, and your code is the same either way.
-- **The topic** (`"messages"`) names one of the event topologies the service's
-  recipe declares. One service may declare several; `slack` declares
-  `messages`, `reactions`, `interactions` and `files`.
-- **The filters** are predicates over the topic's **named** fields, evaluated
-  before anything fires, so a non-matching event costs no execution. Translate
-  the node's plain config inputs into predicates here; anything the grammar
-  cannot express runs as ordinary code in `run`, after the fire.
-- Topics whose subscribe call needs node-supplied values, such as the Drive
-  file to watch, pass them with `.with_params(...)`.
+The runtime chooses the recipe's available transport and handles the
+subscription. Your node does not need separate webhook and socket
+implementations. If the connection cannot support the subscription, or
+a push-only provider needs a public address that the runtime lacks,
+registration fails. For setup and those errors, read
+[Events from a service](../connections/events.md).
 
-Everything mechanical is the runtime's: holding the socket, acknowledging
-frames, verifying push signatures, and subscribing, renewing and stopping
-provider-side watch channels.
-
-Registration fails **loudly** when the trigger cannot be served: the connection
-lacks a value the dial-out transport needs, or the install has no public
-address for a push-only service. The error names the fix, and
-[Events from a service](../connections/events.md) is the user-facing side of
-it.
-
-## The scope decision
-
-Which **scope** a trigger subscribes at is a node split:
-[one node, one process](what-a-node-is.md#one-node-one-process).
-`ProviderEvents::app_wide()` is how the app-owner node states which one it
-is.
-
-## A trigger that just fires
-
-The simplest kinds take their fields directly:
-
-```rust
-use weft::signal::SseSubscribe;
-
-ctx.register_signal(SseSubscribe {
-    url: events_url,
-    event_name: "message.received".into(),
-}).await?;
-```
-
-`register_signal` returns once the dispatcher acknowledges. Any public URL is
-derived from the signal's own path, so nodes never get one handed back and
-never have to store one.
+By default, the subscription covers the connected account. Use
+`.app_wide()` only for a node whose job is to receive events across the
+accounts that installed its app. That scope requires the recipe's
+outbound socket transport. Give these different jobs distinct node types
+so the graph makes clear whose events can start work.

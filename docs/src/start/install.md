@@ -1,6 +1,11 @@
 # Install
 
-One script builds everything and leaves a working runtime on your machine.
+You need [Docker](https://docs.docker.com/get-docker/),
+[kubectl](https://kubernetes.io/docs/tasks/tools/),
+[kind](https://kind.sigs.k8s.io/) and [Rust](https://rustup.rs/).
+Use VS Code for the graph editor.
+
+From a terminal:
 
 ```bash
 git clone https://github.com/WeaveMindAI/weft.git
@@ -8,110 +13,86 @@ cd weft
 ./setup.sh
 ```
 
-On a clean checkout the first run downloads the CLI, the extension and the
-container images from the latest published build, creates a local Kubernetes
-cluster, and starts the runtime; no Rust or Node toolchain needed. Once you
-change any file, the script compiles from source instead (which needs the
-toolchains below), and later runs redo only what changed.
+The script checks prerequisites and prints instructions for anything missing.
+It does not install those tools for you.
 
-## What you need first
+The installer starts a local Kubernetes cluster and the weft runtime, adds
+`weft` under `~/.local/bin`, and installs the VS Code extension. If it cannot
+reach VS Code, it prints the path of the extension package and instructions
+for installing it manually.
 
-The script checks for what your run needs before it starts and names every
-missing tool at once.
+If your shell cannot find `weft` afterwards, add the PATH line printed by the
+installer to your shell configuration. Then go to
+[Your first program](first-program.md).
 
-| Tool | Why | Get it |
-|---|---|---|
-| `docker` | runs Postgres and the cluster | [docs.docker.com](https://docs.docker.com/get-docker/) |
-| `kubectl` | talks to the local cluster | [kubernetes.io](https://kubernetes.io/docs/tasks/tools/) |
-| `kind` | the local cluster itself | [kind.sigs.k8s.io](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) |
-| `cargo` | compiles the CLI and the runtime, once you have local changes | [rustup.rs](https://rustup.rs/) |
-| `node` 20+ and `pnpm` | builds the VS Code extension, once you have local changes | [nodejs.org](https://nodejs.org/en/download), then `npm i -g pnpm` |
+## Which build you get
 
-If you are on macOS you also need a newer Bash than the one Apple ships:
-`brew install bash`.
+The installer can download the CLI and VS Code extension when your checkout
+is unchanged and its commit matches the published build. Otherwise it builds
+them locally and tells you why.
 
-And if you only want part of it, the flags below skip the rest and skip their
-checks with them. If a published binary turns out broken, `--from-source`
-compiles the CLI and the extension locally even on a clean checkout.
+If the installer asks for extension build tools, follow the source setup in
+[Contributing](https://github.com/WeaveMindAI/weft/blob/mvp/CONTRIBUTING.md#set-up).
 
-## What you get
+## Add human questions
 
-One binary, `weft`, symlinked into `~/.local/bin`. If that is not on your
-`PATH`, the script prints the exact line to add to your shell config.
+Install **Weft tasks** separately from
+[Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/weft-tasks/) or the
+[Chrome Web Store](https://chromewebstore.google.com/detail/weavemind/mddobmalhoelphnmhbenmbmeibfpoppm).
+You do not need it for the first program. When you reach
+[the human-step walkthrough](a-person-in-the-loop.md), you will connect it to
+your runtime and answer a question from your program.
 
-The runtime itself is not a binary on your machine: the dispatcher and the
-workers run as containers in the local cluster, which is why the script builds
-images as well as compiling. Plus the VS Code extension, where the graph view
-and the live execution view live.
+## Choose what to install
 
-The script leaves the runtime up, so by the time it finishes the daemon is
-listening on port 9999 and you can go straight to your first program.
+The default installs the CLI, runtime and VS Code extension. To select parts,
+combine these flags:
 
-## Picking a subset
-
-Flags combine, so `--cli --daemon` does both and skips the editor.
-
-| If you want | Pass |
+| What you want | Command |
 |---|---|
-| just the `weft` command | `--cli` |
-| just the runtime rebuilt and restarted | `--daemon` |
-| just the VS Code extension | `--vscode` |
-| just the browser extension, which is opt-in because it signs with Mozilla and builds every browser target | `--browser` |
-| the CLI compiled much faster, while you are iterating | `--debug` |
-| the binary somewhere other than `~/.local` | `--prefix PATH` |
-| everything but the daemon refresh | `--no-daemon` |
-| an extension release: bumps its version, which is what makes CI publish the pushed commit to the stores | `--bump` (with `--vscode` and/or `--browser`; the default install covers `--vscode`) |
+| CLI only | `./setup.sh --cli` |
+| Runtime only | `./setup.sh --daemon` |
+| VS Code extension only | `./setup.sh --vscode` |
+| CLI and runtime, without the editor | `./setup.sh --cli --daemon` |
+| A different install prefix | `./setup.sh --prefix /your/path` |
 
-## Your settings file
+Source-build and release flags belong in
+[Contributing](https://github.com/WeaveMindAI/weft/blob/mvp/CONTRIBUTING.md).
 
-Weft reads a `.env` next to your project, and there is nothing in it you need
-to get started. Two settings are worth knowing about before you store anything
-you care about: `CREDENTIAL_ENCRYPTION_KEY`, which seals stored credentials at
-rest and boots with a development key until you set it, and
-`WEFT_PUBLIC_TUNNEL_TOKEN`, if you want a permanent public address rather than
-a fresh random one each time. The full list is
-[the environment](../running/cli.md#the-environment).
+## Keep your data through an update
 
-A malformed `.env` fails the boot rather than being half applied.
+After you update the checkout, run `./setup.sh` again. It compares the code
+and installed state, applies database migrations, and refreshes the parts
+that changed. You do not need to uninstall first.
 
-## Removing it
+The cluster contains your project containers, including databases created by
+infrastructure nodes. A cluster rebuild can destroy their disks. If the
+installer requires `--rebuild-cluster`, read its data-loss notice before
+proceeding. The runtime's own Postgres data is stored separately under
+`~/.local/share/weft/postgres-data` and survives that rebuild.
 
-There are two levels of it, depending on whether you want your work back
-afterwards.
+For what runs locally and where the data lives, read
+[How the runtime is built](../running/architecture.md).
+
+## Remove weft
+
+To remove the CLI and VS Code extension and stop the daemon:
 
 ```bash
-./setup.sh --uninstall            # take the tools away, keep the work
-./setup.sh --uninstall --purge    # take everything
+./setup.sh --uninstall
 ```
 
-`--uninstall` stops the daemon, removes the VS Code extension, and drops the
-`weft` symlink. It deliberately keeps the cluster, the database, the object
-store and its volume, the built images, the BuildKit cache, and `target/`. Run
-`./setup.sh` again and your projects and their whole execution history are back
-in seconds.
+This keeps the cluster and its remaining pods, stored data, images and build
+caches. The browser extension stays installed too. You can reinstall with
+`./setup.sh` and reuse the preserved data. If the script cannot remove the
+VS Code extension, it prints the manual command.
 
-Neither is ever needed to apply an update. `./setup.sh` brings an existing
-install to whatever the code now says: the schema, the images, the manifests,
-the ingress and gateway controllers, and the object store's container. The one
-thing it never does on its own is rebuild the cluster: when the cluster's
-shape or your `kind` version has moved, it stops and asks for
-`--rebuild-cluster`, because every project's own database lives inside the
-cluster's node and dies with it. Your system database survives a rebuild
-either way; its files live in `~/.local/share/weft/postgres-data` rather than
-inside the cluster.
+To also discard the local runtime data and cluster:
 
-`--purge` is the real clean slate: the cluster goes, the images go, the
-database volume goes. Reach for it when you want to prove a fresh machine would
-work.
+```bash
+./setup.sh --uninstall --purge
+```
 
-## A note on the cluster
-
-Weft runs your programs as pods on Kubernetes, including on your laptop, where
-the cluster is a single `kind` node inside Docker. That is what lets a project
-ask for a Postgres, a headless browser, or a model server as a node you drop on
-the graph, and get a real container with health checks and a lifecycle.
-
-You never write YAML. You will not think about the cluster again until you read
-[Infrastructure nodes](../nodes/infrastructure.md).
-
-Next: [your first program](first-program.md).
+A purge deletes the cluster, runtime database, object-store data and weft
+images and caches. Use it only when you intend to lose that local state.
+Your project source files remain in their directories.

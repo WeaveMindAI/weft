@@ -1,0 +1,18 @@
+{
+  "description": "weft project hooks. The SessionStart hook injects the shared project memory (MEMORY.md at the repo root) as developer context, so every Codex session starts with the same facts as the Kilo and Claude setups. additionalContextLimit is 0 because the output is exactly MEMORY.md, which is bounded by its own 200-line / 25-KB budget.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat \"$(git rev-parse --show-toplevel)/MEMORY.md\"",
+            "statusMessage": "Loading MEMORY.md",
+            "additionalContextLimit": 0
+          }
+        ]
+      }
+    ]
+  }
+}

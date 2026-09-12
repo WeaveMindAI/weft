@@ -1,29 +1,30 @@
-# Putting it on a URL
+# An HTTP endpoint
 
-So far the program runs when you ask it to. A **trigger** node makes it run
-when the outside world asks instead.
+A request can start a weft execution and receive its answer over the same
+connection. Use `ApiEndpoint` to create the entry point, then let a node
+read the request and reply.
+
+This example echoes the request body as JSON. Ask Tangle to build it, or
+follow the two-file node example below.
 
 Replace `main.weft` with:
 
 ```weft
 api = ApiEndpoint { path: "hello" }
-reply = Reply
-
-reply.started = api.started
+reply = Reply { started: api.started }
 ```
 
-Every HTTP request that hits that path fires a fresh execution.
+`ApiEndpoint` is in the catalog. `Reply` is the node you will add now.
 
-`Reply` does not exist yet, so you are about to write it. A node is a folder
-under `nodes/` with two files in it.
+## Add the reply node
+
+Create its directory inside the project:
 
 ```bash
 mkdir -p nodes/reply
 ```
 
-## The declaration
-
-`nodes/reply/metadata.json` says what the node looks like from outside.
+Put this declaration in `nodes/reply/metadata.json`:
 
 ```json
 {
@@ -34,23 +35,19 @@ mkdir -p nodes/reply
   "icon": "Send",
   "color": "#06b6d4",
   "inputs": [
-    { "name": "started", "type": "Boolean", "required": false,
+    { "name": "started", "type": "Boolean", "required": true,
       "description": "Kick from the ApiEndpoint trigger." }
   ],
   "outputs": [
     { "name": "done", "type": "Boolean",
-      "description": "Fires true once the response has been sent." }
+      "description": "Fires true once the response has been submitted." }
   ],
   "requires_infra": false
 }
 ```
 
-Ports, types, and enough presentation for the editor to draw the box. This is
-data, not code, which is why the compiler can read a node's shape without
-compiling a single line of its Rust.
-
-## The code
-
+The declaration gives the compiler the node's inputs and outputs, and gives
+the editor its label and appearance. Now put the implementation in
 `nodes/reply/mod.rs`:
 
 ```rust
@@ -80,64 +77,58 @@ impl Node for ReplyNode {
 }
 ```
 
-The only parsing in there is reading the body you were handed.
+`ctx.http_caller()` gives this node the execution's HTTP connection.
+`request_parts()` reads the request the runtime received; `respond()` sends
+the answer. The `started` wire makes the reply node wait for the endpoint's
+kick. The connection itself belongs to the execution and is reached through
+the ctx.
 
-`ctx.http_caller()` hands you a live handle to whoever is waiting on the other
-end of the socket. The trigger declared the endpoint; the runtime holds the
-connection open and routes it to the worker running this execution.
+`NodeManifest` reads the adjacent metadata at compile time. The node's Rust
+code still has to implement what that declaration promises. For the full
+node-authoring path, read [Your first node](../nodes/your-first-node.md).
 
-`#[derive(NodeManifest)]` is what connects the two files. It reads the
-`metadata.json` sitting next to this source at compile time and embeds it. A
-missing or malformed file is a compile error, so the declaration and the code
-cannot drift apart.
+## Activate and call it
 
-## Turn it on
+Save the files and run:
 
 ```bash
 weft activate
 ```
 
-`activate` compiles the project, registers it, and prints the live URL. A
-project with triggers has to be activated; one without them just runs.
-
-Then call it from anywhere:
+Activation builds the program and registers its trigger. Find `api` in the graph and copy the address shown on the node. From your local machine:
 
 ```bash
-curl -X POST "<the URL activate printed>" \
-     -H "content-type: application/json" \
-     -d '{"message":"hi"}'
+curl -X POST "<address from the api panel>" \
+  -H "content-type: application/json" \
+  -d '{"message":"hi"}'
 ```
+
+The response is:
 
 ```json
 {"you_sent":{"message":"hi"}}
 ```
 
-Each request is a full execution with its own color and its own row in the
-editor's execution list. `weft follow <project>` streams them
-live as they arrive.
+Send another request and you get another execution. Open **weft → Executions**
+to inspect either run.
 
-![The executions list filling up as requests arrive](../img/executions-list.png)
+![Two HTTP requests shown as separate executions in the sidebar](../img/executions-list.png)
 
-<!-- IMAGE ------------------------------------------------------------------
-file:  docs/src/img/executions-list.png
-kind:  gif (about 8 seconds) or screenshot
-brief: The VS Code sidebar's Weft executions tree, with several executions
-       appearing one after another as curl requests land, each showing its
-       colour id, its status (running then completed), and its timestamp.
-       If a gif: fire four or five requests so rows appear in sequence and the
-       running one flips to completed. Beside it, the graph view showing the
-       most recent execution replayed.
---------------------------------------------------------------------------- -->
+<!-- IMAGE: executions-list.png. Show two completed calls to this hello
+endpoint and the reply inspector containing you_sent. Brief in img/README.md. -->
 
-## What just happened underneath
+## What stays up
 
-Activating the project told the runtime: when a request arrives at this path,
-start an execution of this program and hand the held connection to whichever
-worker picks it up. Nothing in your program is listening.
+The gateway accepts requests even when no worker is running. A request can
+start a worker, so the first call after an idle period includes that startup.
+An idle worker exits after thirty seconds without claimable work.
 
-So the endpoint exists whether or not any worker is running. When a request
-arrives cold the runtime starts one, which is why the first request after an
-idle period is slower. Workers shut themselves down after thirty seconds with
-nothing to do.
+The HTTP connection is live state. If its worker dies, the runtime cannot
+restore that connection. By default, a caller disconnect also cancels the
+execution. For streaming responses, WebSocket conversations and work that may
+outlive its caller, read [Talking to a live caller](../nodes/live-callers.md).
 
-Next: [putting a person in the loop](a-person-in-the-loop.md).
+The local gateway address is for your local setup. The `--public-url` tunnel
+used for provider events exposes a different, filtered surface; it does not
+publish every `ApiEndpoint`. For how these addresses differ, read
+[A public address](../connections/public-address.md).
