@@ -32,31 +32,10 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: SpawnPodPayload = serde_json::from_value(task.payload.clone())?;
 
-        // Resolve binary_hash at spawn time (not enqueue time) so the
-        // most recent hash is used even when the build finished after
-        // the task was queued. The binary_hash is the worker image
-        // tag suffix; the definition_hash (runtime project shape)
-        // reaches the worker via its per-execution broker fetch, not
-        // via this image-selection path.
-        let project_uuid: uuid::Uuid = payload.project_id.parse().map_err(|e| {
-            anyhow::anyhow!("spawn_pod: bad project_id {}: {e}", payload.project_id)
-        })?;
-        // `None` here means "no binary hash recorded for this
-        // project yet" (sync hasn't landed). spawn_pod is enqueued
-        // by sync AFTER it writes the hash; a None means the
-        // ordering invariant is broken. Fail loud instead of
-        // silently using `""` (which would tag the pod with empty
-        // image hash and pass any hash-equality check trivially).
-        let want_hash = state
-            .projects
-            .running_binary_hash(project_uuid)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "spawn_pod: no running_binary_hash for project {project_uuid}; \
-                     sync ordering invariant broken"
-                )
-            })?;
+        // Pending work chooses its image, including older runs resuming after
+        // a rebuild. A project edit cannot retarget this spawn task.
+        let want_hash = task.binary_hash.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("spawn_pod task has no requested binary identity"))?;
 
         // Idempotency: if an ADMITTABLE pod already exists, nothing to
         // do. "Admittable" is the ONE predicate every spawn-enqueuer
@@ -73,7 +52,7 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
             &state.pg_pool,
             &payload.project_id,
             weft_platform_traits::SATURATION_MEM_FRACTION,
-            Some(&want_hash),
+            Some(want_hash),
         )
         .await?
         .is_some()
@@ -95,7 +74,7 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
             &payload.project_id,
             &payload.namespace,
             &payload.owner_dispatcher,
-            Some(&want_hash),
+            Some(want_hash),
             "worker",
             None,
         )
@@ -126,7 +105,7 @@ impl TaskExecutor<DispatcherState> for SpawnPodExecutor {
             tenant: payload.tenant,
             namespace: payload.namespace.clone(),
             owner_dispatcher: payload.owner_dispatcher.clone(),
-            binary_hash: Some(want_hash),
+            binary_hash: Some(want_hash.to_string()),
             // Worker verifies live-connection routing tokens with this.
             caller_token_secret_hex: hex::encode(state.caller_token_secret.as_ref()),
         };

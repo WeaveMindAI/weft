@@ -1,3 +1,4 @@
+#[cfg(feature = "runtime")]
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,14 @@ pub struct SignalSpec {
     /// everything.
     #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
     pub match_predicates: Vec<crate::signal::Predicate>,
+}
+
+/// Preparing an entry captures it; waiting on a signal registers a live token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RegisterSignalResult {
+    Captured,
+    Registered { token: String },
 }
 
 impl SignalSpec {
@@ -212,6 +221,12 @@ pub struct SignalRouting {
 #[derive(Debug, Clone)]
 pub struct ExecutionSnapshot {
     pub color: Color,
+    /// The immutable selection and supplied inputs recorded at birth.
+    pub selection: Option<crate::project::selection::RunSelection>,
+    pub program: Option<crate::project::hash::ProgramIdentity>,
+    /// Chosen history includes bodies of zero-iteration loops, which have no
+    /// firing record on which to store an origin.
+    pub inherited_origins: std::collections::BTreeMap<String, Color>,
     pub pulses: crate::pulse::PulseTable,
     pub executions: crate::exec::NodeExecutionTable,
     pub suspensions: HashMap<String, SuspensionInfo>,
@@ -314,6 +329,11 @@ pub enum CorruptionSite {
     /// at all (the display read surfaces it; state-rebuilding reads
     /// refuse the whole log instead).
     UndecodableRow,
+    /// Not one row but the whole run: the code it ran cannot be found,
+    /// so nothing that needs the program can be worked out. Every value
+    /// is missing at once, which is why it is its own site: it belongs
+    /// beside the run rather than inside one node.
+    MissingProgram,
 }
 
 /// One entry in the per-(node, frames) replay sequence rebuilt by
@@ -443,4 +463,48 @@ pub enum LoopTerminationReason {
     /// outward emit failure): the engine closed the loop's outward
     /// ports and terminated the instance.
     Failed,
+}
+
+/// Which lifecycle phase this invocation belongs to. Three-runtime
+/// model: infra setup provisions long-lived resources (infra pods),
+/// trigger setup captures settings for listeners, and fire runs the
+/// regular execution subgraph. Activation arms the captured listeners.
+///
+/// Engine/journal vocabulary only: nodes never see it. The engine
+/// routes each phase to the right `Node` method from the manifest
+/// (`setup_trigger` for a trigger at TriggerSetup, `run` otherwise;
+/// a trigger is skipped at InfraSetup).
+///
+/// - `InfraSetup`: an infra node is being provisioned.
+/// - `TriggerSetup`: a trigger node (or its upstream) is being set
+///   up. The trigger captures the wake signal and its input values.
+/// - `Fire`: the normal fire-time execution. The firing trigger
+///   receives the wake payload, its outputs flow downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+// SYNC: Phase <-> extension-vscode/src/sidebar/executions.ts ExecutionSummary.phase
+pub enum Phase {
+    InfraSetup,
+    TriggerSetup,
+    Fire,
+}
+
+impl Phase {
+    /// Stable wire/storage tag. Matches the serde rename so the
+    /// JSON form and the DB form agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InfraSetup => "infra_setup",
+            Self::TriggerSetup => "trigger_setup",
+            Self::Fire => "fire",
+        }
+    }
+    /// written as text (the DB column, a CLI flag) comes through here,
+    /// so the set of names has one definition.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == tag)
+    }
+
+    /// Every phase, for a caller that has to offer the choice.
+    pub const ALL: [Phase; 3] = [Self::InfraSetup, Self::TriggerSetup, Self::Fire];
 }

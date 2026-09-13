@@ -252,11 +252,16 @@ pub async fn program_for_cancel(
     color: Color,
 ) -> anyhow::Result<Option<Arc<ProjectDefinition>>> {
     let lookup = crate::projection::execution_program(state, color).await?;
-    if let crate::projection::ProgramLookup::Unreadable(reason) = &lookup {
+    // Both unpaintable states are worth saying out loud here, and
+    // `unpaintable` is the one place that knows which they are: an
+    // unreadable row and a retired program both end with the terminal
+    // written and no per-node cancels, and a person reading the log
+    // needs to know which of the two they are looking at.
+    if let Some((site, reason)) = lookup.unpaintable() {
         tracing::warn!(
             target: "weft_dispatcher::cancel",
-            %color, %reason,
-            "cancelling a run whose program cannot be read: the terminal is written, the \
+            %color, %reason, ?site,
+            "cancelling a run whose program cannot be folded: the terminal is written, the \
              per-node cancels cannot be derived"
         );
     }
@@ -294,10 +299,6 @@ pub(crate) enum TerminalOutcome {
     Completed,
     Failed,
     Cancelled,
-}
-
-pub(crate) async fn has_terminal_event(pool: &sqlx::PgPool, color: Color) -> anyhow::Result<bool> {
-    Ok(terminal_outcome(pool, color).await?.is_some())
 }
 
 /// Overlay the honest `waiting_for_input` status onto a batch of
@@ -356,6 +357,16 @@ pub async fn get(
     let mut batch = [summary];
     overlay_suspended(&state, &mut batch).await?;
     let [summary] = batch;
+    // The waits ride with the status they produced: a run reads as
+    // `waiting_for_input` because these rows exist, and they exist
+    // before the journal's `NodeSuspended` lands (the node registers
+    // its wait, then returns), so a client that learns the run is
+    // parked learns from the same read what it is parked on.
+    let waiting = if summary.status == "waiting_for_input" {
+        parked_waits(&state, color).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        Vec::new()
+    };
     Ok(Json(serde_json::json!({
         "color": summary.color.to_string(),
         "project_id": summary.project_id,
@@ -365,11 +376,42 @@ pub async fn get(
         "started_at": summary.started_at,
         "completed_at": summary.completed_at,
         "tags": summary.tags,
+        "waiting": waiting,
     })))
+}
+
+/// One wait a parked run holds: the node, the token that answers it,
+/// and the signal kind (a `timer` is woken, anything else expects a
+/// value).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParkedWait {
+    pub node: String,
+    pub token: String,
+    pub kind: String,
+}
+
+/// The waits of `color`, from the resume-signal rows that make it
+/// `waiting_for_input`, in registration order.
+async fn parked_waits(state: &DispatcherState, color: Color) -> anyhow::Result<Vec<ParkedWait>> {
+    let signals = state.journal.signal_list_for_color(color).await?;
+    waits_of(&signals, color)
+}
+
+fn waits_of(signals: &[crate::journal::SignalRegistration], color: Color) -> anyhow::Result<Vec<ParkedWait>> {
+    signals
+        .iter()
+        .filter(|s| s.is_resume && s.color == Some(color))
+        .map(|s| {
+            let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&s.spec_json)?;
+            Ok(ParkedWait { node: s.node_id.clone(), token: s.token.clone(), kind: spec.kind })
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
 pub struct LogLineOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inherited_from: Option<Color>,
     pub at_unix: u64,
     pub level: String,
     /// The firing this line is about: the node, and the loop
@@ -423,14 +465,13 @@ pub async fn list_logs(
     }
     // The journal's error names the color and `weft clean` when a row
     // no longer decodes; the reader gets it, not a bare 500.
-    let entries = state
-        .journal
-        .logs_for(color, limit)
+    let entries = crate::projection::execution_logs(&state, color, limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let lines = entries
         .into_iter()
         .map(|e| LogLineOut {
+            inherited_from: e.inherited_from,
             at_unix: e.at_unix,
             level: e.level,
             node: e.node,
@@ -441,22 +482,24 @@ pub async fn list_logs(
     Ok(Json(LogsOut { limit, lines }))
 }
 
-/// Replay a past execution: returns every journaled event the SSE
-/// stream would have emitted live, shaped as `DispatcherEvent` so the
-/// webview's live-SSE handler can process them with the same code
-/// path. Bus events (joined/left/message) ride along too, so the
-/// inspector's IRC log renders on replay exactly as it did live.
-///
-/// Terminal events (`ExecutionCompleted` / `ExecutionFailed` /
-/// `ExecutionCancelled`) are NOT synthesized from the execution
-/// summary. They are already in the journal log when the execution
-/// settled (the summary's status is itself derived from the presence
-/// of that journal row), and `ExecutionProjector` projects them
-/// faithfully (carrying the real outputs / error / reason). Synthesizing
-/// a duplicate from the summary would emit a lossy second terminal
-/// (empty payloads) that overrides the real one on the receiving
-/// side. A still-running execution has no terminal in the log; the
-/// live SSE delivers it when it lands.
+/// Complete ordered output evidence, including streams and inherited results.
+pub async fn outputs(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(color_str): Path<String>,
+) -> Result<Json<weft_core::run_spec::Expected>, (StatusCode, String)> {
+    let color: Color = color_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
+    authorize_execution(&*state.journal, &caller.0, color).await?;
+    let sources = crate::projection::reconstruct_execution(&state, color).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read output history: {error:#}")))?;
+    let wires = sources[&color].output_wires()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let nodes = sources[&color].project().nodes.iter().map(|node| node.id.clone()).collect();
+    Ok(Json(weft_core::run_spec::Expected { wires, nodes, focus: Vec::new() }))
+}
+
+/// Replay journaled history through the same projection as live events.
+/// Terminals come from the journal, never a synthesized second completion.
 pub async fn replay(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -475,7 +518,7 @@ pub async fn replay(
     // Lossy read: the inspector renders what exists, and every row
     // that no longer decodes lands below as its own JournalCorruption
     // entry, naming `weft clean`, instead of taking the response down.
-    let (raw_events, mut undecodable) =
+    let (raw_events, unreadable_rows) =
         state.journal.events_log_lossy(color).await.map_err(|e| {
             tracing::error!(
                 target: "weft_dispatcher::api",
@@ -487,21 +530,43 @@ pub async fn replay(
     // Only the database itself fails the read; a program that cannot
     // be found paints the run as unreadable, the way the live bridge
     // does for the same journal, and names `weft clean` below.
-    let program = match crate::projection::execution_program(&state, color).await.map_err(|e| {
+    // Everything the reader must be TOLD about this run, with the site
+    // that places it on screen.
+    let mut corruptions: Vec<(weft_core::primitive::CorruptionSite, String)> = unreadable_rows
+        .into_iter()
+        .map(|reason| (weft_core::primitive::CorruptionSite::UndecodableRow, reason))
+        .collect();
+    let found = crate::projection::execution_program(&state, color).await.map_err(|e| {
         tracing::error!(
             target: "weft_dispatcher::api",
             %color, error = %e,
             "replay: looking up the run's program failed"
         );
         StatusCode::INTERNAL_SERVER_ERROR
-    })? {
-        crate::projection::ProgramLookup::Unreadable(reason) => {
-            undecodable.push(reason);
-            crate::projection::ProgramLookup::Unreadable(String::new())
+    })?;
+    let program = {
+        match found.unpaintable() {
+            // The reason travels with the run, at its own site: a row
+            // that no longer decodes is one missing value, a missing
+            // program is every value at once and belongs beside the run
+            // rather than inside a node.
+            Some((site, reason)) => {
+                corruptions.push((site, reason.to_string()));
+                found.without_reason()
+            }
+            None => found,
         }
-        found => found,
     };
-    let mut projector = crate::projection::ExecutionProjector::new(color, program, project_id.clone());
+    let rows: Vec<weft_journal::ExecEvent> = raw_events.iter().map(|r| r.event.clone()).collect();
+    let inheritance = match crate::projection::execution_inheritance(&state, &rows, &program).await {
+        Ok(chain) => chain,
+        Err(reason) => {
+            corruptions.push((weft_core::primitive::CorruptionSite::UndecodableRow, reason));
+            weft_journal::SeedChain::default()
+        }
+    };
+    let mut projector = crate::projection::ExecutionProjector::new(color, program, project_id.clone())
+        .with_inheritance(inheritance);
     let mut out: Vec<crate::events::LiveEvent> = Vec::new();
     for record in raw_events {
         let projected = projector.project(&record.event);
@@ -512,11 +577,11 @@ pub async fn replay(
     }
     // A row the fold could not apply is painted as its corruption, at
     // the row, by the projector; the rows that never decoded follow.
-    for reason in undecodable {
+    for (site, reason) in corruptions {
         out.push(crate::events::IdentifiedEvent::transient(DispatcherEvent::JournalCorruption {
             color,
             project_id: project_id.clone(),
-            site: weft_core::primitive::CorruptionSite::UndecodableRow,
+            site,
             reason,
         }));
     }
@@ -581,7 +646,7 @@ pub async fn latest_for_project(
     let query = ExecutionQuery {
         limit: 1,
         offset: 0,
-        project_id: Some(id_str),
+        project_id: Some(id.to_string()),
         started_after: None,
         started_before: None,
         phase: None,
@@ -595,25 +660,106 @@ pub async fn latest_for_project(
     page.executions.into_iter().next().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
+/// `POST /executions/{color}/wake/{node}`: resolve a pure time wait
+/// now. The node's registered suspension for this color must be a
+/// timer (`weft_core::signal::Timer::TAG`); the fire carries the
+/// payload a timer tick carries (`scheduledTime` = `actualTime` = now)
+/// through the same lifecycle gate every fire passes. Any other kind
+/// is refused naming it: a wait that expects a value is answered with
+/// one (`weft fire`-less: the form URL, the extension), never skipped.
+pub async fn wake(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((color_str, node)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let color: Color = color_str.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad color".to_string()))?;
+    // Authorization only: the color's own waits are read below, and the
+    // wall this crosses is the caller's tenancy, not the project id.
+    authorize_execution(&*state.journal, &caller.0, color).await?;
+    let waits = parked_waits(&state, color)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signals: {e}")))?;
+    let Some(wait) = waits.into_iter().find(|w| w.node == node) else {
+        // Bounded, like every other caller string this surface echoes: the
+        // node name is a raw path segment, so an enormous one would come
+        // straight back in the body.
+        let node = weft_core::truncate_user_string(&node, 256);
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("'{node}' is not waiting on anything in {color}; `weft events {color} --node {node}` shows what it did"),
+        ));
+    };
+    if wait.kind != <weft_core::signal::Timer as weft_core::signal::Signal>::TAG {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "'{node}' is waiting on a {} signal, which expects a value; answer it (its form, in the browser extension or through its signal URL) instead of waking it",
+                wait.kind
+            ),
+        ));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let payload = serde_json::json!({ "scheduledTime": now, "actualTime": now });
+    crate::api::signal::fire_registered_signal(&state, &wait.token, payload).await
+}
+
+/// Remove one run, and sweep the version its removal left bare.
+///
+/// The sweep is HERE and not in whoever asked. Deleting the last run of
+/// a version is what makes that version bare, and a bare version shows
+/// in `weft tree` with nothing under it and a status of `unknown`, for
+/// ever, with no verb that reaches it. The CLI used to do the sweep
+/// itself, which left the editor's own delete not doing it at all, and
+/// the CLI could only sweep the project it was standing in, which for
+/// `weft clean <color>` (a color can be cleaned from anywhere) was
+/// frequently the wrong one.
+///
+/// Answers the project and what was swept, so a caller can say so.
 pub async fn delete_execution(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(color_str): Path<String>,
-) -> Result<StatusCode, StatusCode> {
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let color: Color = color_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let project_id = clean_execution(&state, &caller.0, color).await?;
+    // The run IS deleted, which is what was asked for, so a sweep that
+    // cannot run is said out loud and does not fail the delete: the
+    // reaper and the next `weft clean` both reach the same rows.
+    let swept = match project_id.parse::<uuid::Uuid>() {
+        Ok(id) => crate::api::versions::sweep_bare_versions(&state, id).await.unwrap_or_else(|(status, message)| {
+            tracing::warn!(
+                target: "weft_dispatcher::versions",
+                %color, project_id = %project_id, %status, %message,
+                "the run is deleted; the version it may have left bare could not be swept"
+            );
+            Vec::new()
+        }),
+        Err(_) => Vec::new(),
+    };
+    Ok(axum::Json(serde_json::json!({ "project": project_id, "swept": swept })))
+}
+
+/// THE removal of one execution (`weft clean <color>`, and each run a
+/// prune drops): its storage folder, then its journal, its tags, its
+/// resume tokens, and its row in the version tree, together.
+pub(crate) async fn clean_execution(
+    state: &DispatcherState,
+    caller: &crate::tenant::TenantId,
+    color: Color,
+) -> Result<String, StatusCode> {
     // The gate already read the owning row; keep it rather than asking
     // again. Its tenant is the one the storage prefix was WRITTEN
     // under, so the wipe below addresses the same bytes the run
     // created even for a project that has since been removed (asking
     // the project store for the tenant would fail exactly there).
-    let owner = authorize_execution(&*state.journal, &caller.0, color).await.map_err(|(s, _)| s)?;
+    let owner = authorize_execution(&*state.journal, caller, color).await.map_err(|(s, _)| s)?;
     // Wipe the execution's storage folder (kept survivors included:
     // `weft clean <color>` IS the explicit removal verb for them)
     // BEFORE the journal rows go, while the color's row still exists.
     // A spent color's storage address dies with its journal history;
     // every failure below aborts so a retry can still wipe, never
     // orphaning the prefix.
-    crate::storage::wipe_prefix(&state, &format!("{}/exec/{color}/", owner.tenant))
+    crate::storage::wipe_prefix(state, &format!("{}/exec/{color}/", owner.tenant))
         .await
         .map_err(|e| {
             tracing::error!(
@@ -623,12 +769,97 @@ pub async fn delete_execution(
             );
             StatusCode::SERVICE_UNAVAILABLE
         })?;
+    // The version tree's row for this run goes first, dropped by the
+    // store that owns that table.
+    //
+    // Before the journal, because the journal row is what makes this
+    // call REACHABLE: `authorize_execution` reads `execution_color`,
+    // which `delete_execution` removes. Deleting the journal first and
+    // failing here left a tree row with no journal, and then `weft
+    // clean` answered 404 for ever (no owner row to authorize against)
+    // while every later prune refused the subtree because a run with no
+    // terminal row reads as still in flight. This way round, a failure
+    // leaves everything reachable and the same command retries: the
+    // tree delete is idempotent.
+    state.versions.delete_run(color).await.map_err(|e| {
+        tracing::error!(
+            target: "weft_dispatcher::versions",
+            %color, error = %e,
+            "could not drop this run from the version tree; nothing was deleted, retry"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     state
         .journal
         .delete_execution(color)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(StatusCode::NO_CONTENT)
+    // This may have been the last run keeping a removed project's code
+    // and tree rows on file. A failure here leaves rows nobody reads and
+    // nothing else, and the reaper's `retired_rows` sweep comes back for
+    // them, so it is logged rather than failing a clean that has already
+    // done its work.
+    if let Err(e) = crate::api::project::retire_what_no_run_needs(state, &owner.project_id).await {
+        tracing::warn!(
+            target: "weft_dispatcher::projection",
+            %color, project_id = %owner.project_id, error = %e,
+            "could not retire what this run was the last to need; the reaper will retry"
+        );
+    }
+    Ok(owner.project_id)
+}
+
+#[cfg(test)]
+mod waits_tests {
+    use super::*;
+
+    fn signal(token: &str, color: Option<Color>, node: &str, is_resume: bool, kind: &str) -> crate::journal::SignalRegistration {
+        crate::journal::SignalRegistration {
+            source_version: None,
+            setup_color: None,
+            program: None,
+            token: token.into(),
+            tenant_id: "t".into(),
+            project_id: "p".into(),
+            color,
+            node_id: node.into(),
+            is_resume,
+            spec_json: serde_json::json!({ "kind": kind }).to_string(),
+            access_id: None,
+            consumer_kind: None,
+            tags: vec![],
+            port_snapshot: None,
+            consumer_payload: None,
+            surface_kind: "public_entry".into(),
+            mount_path: None,
+            auth_kind: "none".into(),
+            auth_config: None,
+            kind_state: serde_json::Value::Object(Default::default()),
+            kind_state_seq: 0,
+            listener_pod: None,
+        }
+    }
+
+    /// A run's waits are its own resume signals, in order; entry
+    /// signals and another run's waits are not.
+    #[test]
+    fn a_runs_waits_are_its_resume_signals() {
+        let (mine, other) = (Color::new_v4(), Color::new_v4());
+        let signals = vec![
+            signal("e", None, "tick", false, "timer"),
+            signal("a", Some(mine), "hold", true, "timer"),
+            signal("b", Some(other), "review", true, "form"),
+            signal("c", Some(mine), "review", true, "form"),
+        ];
+        let waits = waits_of(&signals, mine).unwrap();
+        assert_eq!(
+            waits,
+            vec![
+                ParkedWait { node: "hold".into(), token: "a".into(), kind: "timer".into() },
+                ParkedWait { node: "review".into(), token: "c".into(), kind: "form".into() },
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1,18 +1,29 @@
-// Executions sidebar: flat list of every execution the dispatcher
-// knows about, newest first. Each execution exposes its id, status,
-// timing, and containing project; the view-in-graph and delete
-// actions hang off the individual tree items. Clearing all is a
-// tree-level action.
-//
-// We keep the tree flat (rather than project → execution children)
-// because the common case is "I just ran something, show me the
-// latest run regardless of which project it was on." A header node
-// up top shows which project the current graph is pinned to.
+// Executions sidebar, two modes on one provider. Flat: every execution
+// the dispatcher knows about, newest first, whichever project it was
+// on ("I just ran something, show me the latest run"). By version: the
+// pinned project's version tree (`weft tree --json`), root versions,
+// child versions, each expanding to its runs with status, seed, scope
+// and example, head and the version on disk marked. The view-in-graph
+// and delete actions hang off the individual items; branch, checkpoint,
+// prune, diff and freeze hang off the version-mode items.
 
 import * as vscode from 'vscode';
 
+import { runWeftJson } from '../cli';
 import type { DispatcherClient } from '../dispatcher';
 import type { WeftProject } from './projects';
+import {
+  buildVersionTree,
+  runDescription,
+  runScopedTo,
+  versionLabel,
+  versionMarks,
+  type RunSummary,
+  type TreeJson,
+  type VersionTreeNode,
+} from './version-tree';
+
+export type ExecutionsMode = 'flat' | 'byVersion';
 
 // SYNC: ExecutionSummary <-> crates/weft-dispatcher/src/journal/mod.rs (ExecutionSummary), weavemind/website/src/routes/(app)/executions/+page.ts (Execution)
 export interface ExecutionSummary {
@@ -22,6 +33,7 @@ export interface ExecutionSummary {
   status: string;
   /** A trigger fire or manual run (`fire`), or one of the two setup
    *  runs an activate / resync / infra start makes. */
+  // SYNC: ExecutionSummary.phase <-> crates/weft-core/src/primitive.rs Phase
   phase: 'fire' | 'trigger_setup' | 'infra_setup';
   started_at: number;
   completed_at?: number | null;
@@ -53,7 +65,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   // was started under: a pin CHANGE must start a fresh fetch, not
   // join the old pin's.
   private inFlightRefresh:
-    | { projectId: string | undefined; promise: Promise<string | undefined> }
+    | { projectId: string | undefined; mode: ExecutionsMode; promise: Promise<string | undefined> }
     | undefined;
   // Monotonic rebuild ordering: only a rebuild at least as new as the
   // last committed one may write, so an older same-pin rebuild
@@ -65,12 +77,62 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   // last successful list: blanking it would render "no executions"
   // for what is actually "could not reach the dispatcher".
   private lastError: string | undefined;
+  /// Flat newest-first, or the pinned project's version tree.
+  private mode: ExecutionsMode = 'flat';
+  /// The last tree fetched for the pinned project (by-version mode).
+  private tree: TreeJson | undefined;
+  /// Which project `tree` belongs to. A tree is only ever reused for the
+  /// project it was read in: reusing it across a pin change drew one
+  /// project's version tree under another project's name, and handed that
+  /// project's version ids to branch, diff-with-head and the graph
+  /// banner.
+  private treeProjectId: string | undefined;
+  /// The group the editor is focused inside (an include's alias chain),
+  /// so the runs scoped to it are marked. Set by the graph view.
+  private focusedGroup: string | null = null;
 
   constructor(private readonly client: DispatcherClient) {}
+
+  currentMode(): ExecutionsMode {
+    return this.mode;
+  }
+
+  /** Switch modes; the loaded flat page is kept for the way back. */
+  toggleMode(): void {
+    this.mode = this.mode === 'flat' ? 'byVersion' : 'flat';
+    // Switching INTO the version view reads the tree now, whatever the
+    // floor says: the person just asked to see it.
+    this.treeFetchedAt = 0;
+    // Redrawn immediately, before the read. The person pressed a button,
+    // so the view has to answer; waiting for the refresh to commit meant
+    // that with the dispatcher down (where the refresh changes nothing)
+    // the button did nothing at all and said nothing either.
+    this._onDidChange.fire();
+    void this.refresh();
+  }
+
+  setFocusedGroup(group: string | null): void {
+    if (this.focusedGroup === group) return;
+    this.focusedGroup = group;
+    this._onDidChange.fire();
+  }
+
+  /** The tree last fetched, for the commands that need head or a
+   *  run's version (branch, diff with head, the graph banner). */
+  currentTree(): TreeJson | undefined {
+    return this.tree;
+  }
 
   setPinnedProject(project: WeftProject | undefined): void {
     if (this.pinnedProject?.id === project?.id) return;
     this.pinnedProject = project;
+    this.tree = undefined;
+    this.treeProjectId = undefined;
+    this.treeFetchedAt = 0;
+    this.cache = [];
+    this.total = 0;
+    this.lastError = undefined;
+    this._onDidChange.fire();
     // Always refresh on pin changes so the tree shows the new
     // project's runs immediately instead of waiting for the first
     // event to arrive (which might never if the project is idle).
@@ -94,12 +156,16 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     return this.cache.find((e) => e.status === 'running' && e.project_id === projectId)?.color;
   }
 
-  private scheduleRefresh(): void {
+  /** How often the version tree may be re-read from the CLI. */
+  private static readonly TREE_MIN_INTERVAL_MS = 2000;
+  private treeFetchedAt = 0;
+
+  private scheduleRefresh(delayMs = 250): void {
     if (this.refreshDebounceTimer) clearTimeout(this.refreshDebounceTimer);
     this.refreshDebounceTimer = setTimeout(() => {
       this.refreshDebounceTimer = undefined;
       void this.refresh();
-    }, 250);
+    }, delayMs);
   }
 
   /** Called by extension.ts when the panel is disposed. In-flight
@@ -137,7 +203,15 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   refresh(): Promise<string | undefined> {
     const target = this.pinnedProject?.id;
     const inFlight = this.inFlightRefresh;
-    if (inFlight && inFlight.projectId === target) return inFlight.promise;
+    // The MODE is part of what a rebuild answers, so joining one that
+    // started in the other mode is not the same question. Toggling to
+    // "by version" used to join a flat rebuild already in flight, which
+    // fetched no tree and committed `tree: undefined`, and the view then
+    // drew "no versions yet" for a project that has them until some
+    // unrelated refresh happened along.
+    if (inFlight && inFlight.projectId === target && inFlight.mode === this.mode) {
+      return inFlight.promise;
+    }
     return this.startRefresh(target);
   }
 
@@ -148,7 +222,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     const promise = this.doRefresh(target, seq).finally(() => {
       if (this.inFlightRefresh?.promise === promise) this.inFlightRefresh = undefined;
     });
-    this.inFlightRefresh = { projectId: target, promise };
+    this.inFlightRefresh = { projectId: target, mode: this.mode, promise };
     return promise;
   }
 
@@ -164,7 +238,30 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     let rebuilt: ExecutionSummary[] | undefined;
     let total = 0;
     let error: string | undefined;
+    let tree: TreeJson | undefined;
+    let treeFetchedAt = this.treeFetchedAt;
     try {
+      // The version tree is the pinned project's alone (it needs the
+      // files on disk to say which version they are), read through the
+      // CLI in that folder.
+      if (this.mode === 'byVersion' && this.pinnedProject) {
+        // The tree comes from a CLI PROCESS, so it gets a floor of its
+        // own. A refresh is debounced 250ms and every dispatcher event
+        // schedules one, so a single running execution emitting node
+        // events was spawning `weft tree --json` about four times a
+        // second for as long as it ran. Inside the floor the last answer
+        // is reused and one more refresh is booked for when the floor
+        // lifts, so the view still ends up current.
+        const age = Date.now() - this.treeFetchedAt;
+        const reusable = this.tree && this.treeProjectId === projectId;
+        if (reusable && age < ExecutionsProvider.TREE_MIN_INTERVAL_MS) {
+          tree = this.tree;
+          this.scheduleRefresh(ExecutionsProvider.TREE_MIN_INTERVAL_MS - age);
+        } else {
+          tree = await runWeftJson<TreeJson>(['tree', '--json'], this.pinnedProject.rootPath);
+          treeFetchedAt = Date.now();
+        }
+      }
       rebuilt = [];
       const seen = new Set<string>();
       for (let offset = 0; offset < this.loaded; offset += ExecutionsProvider.PAGE_SIZE) {
@@ -187,19 +284,53 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       return undefined;
     }
     this.settledSeq = seq;
+    const before = this.drawnState();
     if (rebuilt) {
       this.cache = rebuilt;
       this.total = total;
+      this.tree = tree;
+      // Set with the tree and only here, where the sequence guard has
+      // already agreed this answer is the current one: marking it at
+      // fetch time would label a DISCARDED refresh's project onto the
+      // tree still in hand, and the next refresh would reuse it.
+      this.treeProjectId = tree ? projectId : undefined;
+      this.treeFetchedAt = treeFetchedAt;
       this.lastError = undefined;
     } else {
-      // Fire only when the error CHANGES: getChildren retries on
-      // expand while the list is empty, so a repeat failure firing
-      // the tree again would loop fetch -> fail -> fire -> fetch.
-      if (this.lastError === error) return projectId;
       this.lastError = error;
     }
+    // Fire only when what is DRAWN changed.
+    //
+    // `getChildren` re-reads whenever the list is empty, because
+    // expanding is the natural retry, so an answer that changes nothing
+    // and still fires puts the view in a loop: fetch, same answer, fire,
+    // expand, fetch. That bit both an empty project (a successful answer
+    // with no executions, for ever) and a repeated failure.
+    if (this.drawnState() === before) return projectId;
     this._onDidChange.fire();
     return projectId;
+  }
+
+  /// Everything the view draws, as one string, for deciding whether a
+  /// refresh actually changed anything.
+  private drawnState(): string {
+    const runs = this.tree?.runs.map((r) => `${r.color}:${r.status}:${r.example ?? ''}`).join(',') ?? '';
+    const versions = this.tree?.versions.map((v) => `${v.id}:${v.parent_id ?? ''}:${v.label ?? ''}`).join(',') ?? '';
+    const head = this.tree ? `${this.tree.head.head_version ?? ''}/${this.tree.head.head_run ?? ''}` : '';
+    return [
+      this.mode,
+      this.pinnedProject?.id ?? '',
+      this.focusedGroup ?? '',
+      this.total,
+      this.loaded,
+      this.lastError ?? '',
+      this.cache.map((e) => `${e.color}:${e.status}`).join(','),
+      versions,
+      runs,
+      head,
+      this.tree?.disk_version ?? '',
+      this.tree?.head.activation_version ?? '',
+    ].join('|');
   }
 
   /** Grow the window by one page and rebuild through the ONE rebuild
@@ -220,11 +351,40 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     return n;
   }
 
-  async getChildren(): Promise<vscode.TreeItem[]> {
+  async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
+    if (element instanceof VersionNode) {
+      const headRun = this.tree?.head.head_run ?? null;
+      return [
+        ...element.node.runs.map(
+          (r) =>
+            new RunNode(
+              r,
+              element.node.version.id,
+              this.pinnedProject?.id ?? '',
+              headRun,
+              runScopedTo(r, this.focusedGroup),
+            ),
+        ),
+        ...element.node.children.map((c) => new VersionNode(c)),
+      ];
+    }
+    if (element) return [];
     // Re-fetch on expand whenever the list is empty, error row
     // included: expanding IS the natural retry, and the in-flight
     // collapse in refresh() prevents a fetch storm.
     if (this.cache.length === 0) await this.refresh();
+    if (this.mode === 'byVersion') {
+      const nodes: vscode.TreeItem[] = [];
+      if (this.lastError) nodes.push(new ListErrorNode(this.lastError));
+      if (!this.pinnedProject) {
+        nodes.push(new HintNode('Pin a project to see its version tree'));
+        return nodes;
+      }
+      const roots = this.tree ? buildVersionTree(this.tree) : [];
+      if (roots.length === 0) nodes.push(new HintNode('No versions yet: `weft run` or `weft checkpoint` records one'));
+      for (const root of roots) nodes.push(new VersionNode(root));
+      return nodes;
+    }
     const nodes: vscode.TreeItem[] = [];
     // A failed fetch is on screen, not just in the console: the rows
     // below it are the last successful list, not the current truth.
@@ -247,6 +407,84 @@ class ListErrorNode extends vscode.TreeItem {
     this.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('errorForeground'));
     this.tooltip = message;
     this.contextValue = 'weftExecutionListError';
+  }
+}
+
+/** A one-line hint row (no project pinned, no versions yet). */
+class HintNode extends vscode.TreeItem {
+  constructor(message: string) {
+    super(message, vscode.TreeItemCollapsibleState.None);
+    this.iconPath = new vscode.ThemeIcon('info');
+    this.contextValue = 'weftExecutionHint';
+  }
+}
+
+/** One version of the pinned project, expanding to its runs and the
+ *  versions edited from it. */
+export class VersionNode extends vscode.TreeItem {
+  constructor(public readonly node: VersionTreeNode) {
+    super(versionLabel(node), vscode.TreeItemCollapsibleState.Expanded);
+    this.id = `version:${node.version.id}`;
+    const marks = versionMarks(node);
+    this.description = marks.join('  ·  ');
+    this.iconPath = new vscode.ThemeIcon(
+      node.isHead ? 'git-commit' : 'circle-outline',
+      node.isDisk ? new vscode.ThemeColor('charts.green') : undefined,
+    );
+    this.tooltip = new vscode.MarkdownString(
+      [
+        `**version** ${node.version.id}`,
+        ...(node.version.label ? [`**label** ${node.version.label}`] : []),
+        ...(node.version.parent_id ? [`**parent** ${node.version.parent_id}`] : ['**root**']),
+        `**created** ${new Date(node.version.created_at * 1000).toLocaleString()}`,
+        ...(marks.length > 0 ? [`**marks** ${marks.join(', ')}`] : []),
+      ].join('\n\n'),
+    );
+    this.contextValue = 'weftVersion';
+  }
+}
+
+/** One run under a version. Opens in the graph like a flat row; carries
+ *  its version so the graph can say when the code on disk differs. */
+export class RunNode extends vscode.TreeItem {
+  readonly summary: ExecutionSummary;
+  constructor(
+    public readonly run: RunSummary,
+    public readonly versionId: string,
+    /// The project whose tree this run hangs in. Carried because
+    /// "view in graph" needs a project to switch to, and a run row on
+    /// its own does not name one.
+    projectId: string,
+    headRun: string | null,
+    scopedToFocus: boolean,
+  ) {
+    super(`${scopedToFocus ? '◉ ' : ''}${run.color.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
+    this.id = `run:${run.color}`;
+    this.summary = {
+      color: run.color,
+      project_id: projectId,
+      entry_node: run.spec?.name ?? '',
+      status: run.status,
+      phase: 'fire',
+      started_at: run.started_at,
+      completed_at: run.completed_at,
+      tags: [],
+    };
+    this.description = runDescription(run, headRun);
+    this.tooltip = new vscode.MarkdownString(
+      [
+        `**run** ${run.color}`,
+        `**version** ${versionId}`,
+        `**status** ${run.status}`,
+        ...(run.seed_color ? [`**seed** ${run.seed_color} (stale: ${run.stale.join(', ') || 'none'})`] : []),
+        ...(run.spec ? [`**spec** ${run.spec.name}`] : []),
+        ...(run.example ? [`**example** ${run.example}`] : []),
+        `**started** ${new Date(run.started_at * 1000).toLocaleString()}`,
+      ].join('\n\n'),
+    );
+    this.contextValue = `weftRun-${run.status.toLowerCase()}`;
+    this.iconPath = statusThemeIcon(run.status);
+    this.command = { command: 'weft.viewExecution', title: 'View', arguments: [this] };
   }
 }
 

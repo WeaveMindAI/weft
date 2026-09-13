@@ -1,48 +1,52 @@
 # syntax=docker/dockerfile:1.6
 # Shared builder base for every per-project worker image.
 #
-# This image moves the always-present, project-INDEPENDENT cost out of
-# every per-project worker build and pays it ONCE:
+# This image moves the project-INDEPENDENT cost out of every per-project
+# worker build and pays it ONCE:
 #   1. apt build packages + rustup + the pinned toolchain, and
-#   2. the COMPILED weft engine workspace (`weft-engine` and every
-#      third-party crate it pulls: tokio, sqlx, reqwest, clap,
-#      tracing-subscriber, hex, ...), built `--release` into
+#   2. the COMPILED stock worker: the full-library worker crate an
+#      untouched project builds (the weft engine workspace, every
+#      third-party crate it and the stdlib packages pull in, and one
+#      `pkg_<package>` crate per stdlib package), built `--release` into
 #      `/weft/target`.
 #
-# Why precompile the workspace here (the load-bearing speedup): every
-# generated worker crate path-depends on `/weft/crates/weft-engine`
-# (+ weft-core, weft-broker-client, weft-platform-traits) and shares
-# the workspace `Cargo.lock`, so its ENTIRE fixed dependency set is a
-# subset of what `cargo build --release` of this workspace compiles.
-# A per-project build that points `CARGO_TARGET_DIR` at this baked
-# `/weft/target` and reuses this `Cargo.lock` finds every engine +
-# dependency rlib already fingerprinted-fresh, so it compiles ONLY the
-# project-specific crates (the `pkg_<node>` packages + the top worker
-# crate). That is the difference between a ~70s cold engine compile on
-# every project and a few-seconds project-only compile.
+# Why precompile the whole stock worker and not just the engine: the
+# package crates pull in dependencies of their own (`sqlx`, `pyo3`,
+# `tungstenite`, ...) and change how cargo unifies the features of the
+# shared ones, so a base holding only the engine's dependency tree left
+# every first build on a host recompiling the engine, most of that tree
+# and every package crate (measured at 1m07 on a warm machine). The
+# stock worker is emitted by the same codegen a project build uses, at
+# the same paths (`/work` for the crate, `/weft/project-nodes` for the
+# node sources, `pkg_<package>-<content slot>` for each package crate),
+# so a per-project build that seeds its compile cache from this baked
+# `/weft/target` finds every package crate it did not edit or add
+# fingerprint-fresh and compiles only its own packages and the thin top
+# crate.
 #
-# Sharing is safe by construction: the engine + deps are byte-identical
-# across all projects (same workspace source, same lock, same
-# toolchain), so reuse is correctness-preserving, not a cross-project
-# leak. Only the per-project `pkg_<node>` crates vary, and those are
-# never baked here; they compile fresh in each per-project build under
-# the same target dir, where cargo's content fingerprint keeps them
-# correctly partitioned.
+# Sharing is safe by construction: a package crate's directory is named
+# by the digest of its sources, so an edited stock package is a
+# different unit, never a stale hit on this one; the engine and the
+# dependencies are byte-identical across projects (same workspace
+# source, same lock, same toolchain).
 #
 # Rebuild trigger: the base image tag is content-addressed on the
 # WORKER CRATE CLOSURE (`codegen::worker_workspace_crates`: the only
 # workspace crates a worker links) plus `Cargo.toml`, `Cargo.lock`,
-# `rust-toolchain.toml` and this Dockerfile (see
-# `hash::compute_builder_base_hash`). Edit the engine and the tag
-# changes, so the setup script rebuilds this base and per-project
-# worker Dockerfiles automatically `FROM` the new tag; edit a
-# non-worker crate (CLI, dispatcher, tests) and nothing here moves.
+# `rust-toolchain.toml`, the stdlib packages' `deps.toml` files (they
+# decide the dependency tree and its feature unification) and this
+# Dockerfile (see `hash::compute_builder_base_hash`). Edit the engine
+# or a package's dependencies and the tag changes, so the setup script
+# rebuilds this base and per-project worker Dockerfiles automatically
+# `FROM` the new tag; edit a node's body, a non-worker crate (CLI,
+# dispatcher, tests) and nothing here moves (a node body edit only
+# changes that package's slot, which the next build compiles on its own).
 #
 # Build context: NOT the repo root. The CLI stages
 # `.weft-base-context/` (`build::stage_builder_base_context`) holding
 # exactly the closure crates, a workspace manifest scoped to them, the
-# lock, the toolchain pin, and the generated warm-up crate. The COPY
-# paths below read from that staged layout.
+# lock, the toolchain pin, the stock worker crate and the stdlib
+# sources. The COPY paths below read from that staged layout.
 
 FROM debian:bookworm-slim
 
@@ -50,6 +54,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ca-certificates curl build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+# What the stdlib packages declare they compile with (`[system.build]`
+# in their deps.toml; rendered by `build::stage_builder_base_context`
+# from the same tables a project's builder stage reads). A project
+# FROMing this image installs only the packages its own nodes add.
+{{install_build_system_packages}}
 
 # rustup with `--default-toolchain none`: the pinned toolchain comes
 # from `rust-toolchain.toml`, materialized on the first `cargo`
@@ -66,20 +76,19 @@ COPY rust-toolchain.toml ./
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Precompile the WARM-UP crate into the shared `/weft/target`. The warm-up
-# crate (generated by `codegen::emit_warmup_crate`) has EXACTLY the
-# project-independent dependency set every worker carries: the engine path deps
-# (`../weft/crates/*`, resolving to `/weft/crates/*`) plus the fixed crates.io
-# deps. Building it at `/work` with `CARGO_TARGET_DIR=/weft/target` and the
-# workspace lock pre-cooks every engine + dependency rlib with the SAME crate
-# identity + feature unification a real worker triggers, so a per-project build
-# (same fixed deps, same lock, same target dir, also at `/work`) reuses them and
-# compiles only its `pkg_<node>` crates + the thin top crate.
+# Precompile the stock worker into the shared `/weft/target`. Its crate
+# (`.weft-warmup`, emitted by `codegen::emit` for the stock project) has
+# the engine path deps (`../weft/crates/*`, resolving to `/weft/crates/*`),
+# the fixed crates.io deps and one path dep per stdlib package crate.
+# Building it at `/work` with the workspace lock and the stdlib at
+# `/weft/project-nodes` pre-cooks every rlib with the SAME crate identity
+# and feature unification a real worker triggers, so a per-project build
+# (same layout, same lock, same target dir) reuses them.
 #
 # The compile runs against a PERSISTENT cache mount and the result is
 # then copied into `/weft/target` as a real image layer. Two reasons
 # for that split:
-#   - the layer: per-project builds point CARGO_TARGET_DIR at
+#   - the layer: per-project builds seed their compile cache from
 #     `/weft/target`, so the precompiled rlibs must live in the image
 #     itself (a cache mount would be invisible to them);
 #   - the cache: successive base builds (every engine edit mints a new
@@ -96,7 +105,12 @@ COPY crates ./crates
 # therefore the baked layer, since the whole cache is copied in)
 # accumulates every dependency version and toolchain ever built:
 # cargo never removes superseded artifacts, so the image would grow
-# without bound across months of iteration.
+# without bound across months of iteration. Inside one key, the package
+# crates are the part that churns (every node edit is a new slot), so
+# the same sweep a project build runs (`weft-cache-gc.sh`, emitted into
+# the crate) drops the slots no base build has linked for 30 days
+# before the cache is copied into the layer; `{{worker_binary}}` is the
+# top crate's binary name it keeps.
 #
 # The registry cache id is the base's own, NOT shared with per-project
 # worker builds: both sides mount `sharing=locked`, so a shared id
@@ -105,11 +119,23 @@ COPY crates ./crates
 # artifacts this build needs into its own cache.
 # The toolchain materializes implicitly on this first `cargo`
 # invocation (rustup reads `rust-toolchain.toml`).
+#
+# `/work` and `/weft/project-nodes` are removed once compiled: a
+# per-project build COPYs its own crate and node sources to the same
+# paths, and leftovers from the stock worker (a package the project
+# removed, a slot it no longer has) would sit beside them. Cargo judges
+# freshness by path and mtime, and the staging mirrors the sources'
+# mtimes, so the rlibs stay fresh for the files the project puts back.
 COPY .weft-warmup /work
+COPY project-nodes /weft/project-nodes
+{{build_env_lines}}
 RUN --mount=type=cache,id=weft-builder-base-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=weft-builder-base-target-{{target_cache_key}},target=/cache/target,sharing=locked \
     cp /weft/Cargo.lock /work/Cargo.lock \
     && cd /work \
     && CARGO_TARGET_DIR=/cache/target cargo build --release \
+    && ( sh /work/weft-cache-gc.sh /cache/target/release 30 /work {{worker_binary}} \
+         || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 ) \
     && mkdir -p /weft/target \
-    && cp -a /cache/target/. /weft/target/
+    && cp -a /cache/target/. /weft/target/ \
+    && rm -rf /work /weft/project-nodes

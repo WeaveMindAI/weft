@@ -6,16 +6,14 @@
 //! two-hashers-drift hazard.
 //!
 //! Three project-level hashes split the user-visible drift signals
-//! cleanly along their reason for changing, plus one pure content hash
-//! of the uploaded source set (`compute_source_hash`) used as the
-//! create-time storage key + build-dedup key BEFORE any compile:
+//! cleanly along their reason for changing:
 //!
 //! - **`compute_binary_hash`**: hashes everything that affects the
 //!   WORKER BINARY's bytes. Drives the worker docker image tag.
 //!   Inputs:
-//!     - `weft.toml` `[build]` section choices (base image, custom
-//!       Dockerfile template) plus the package name (the binary's
-//!       crate name).
+//!     - `weft.toml` `[build.worker]` choices (base image, custom
+//!       Dockerfile template). Nothing else in weft.toml reaches the
+//!       binary: every worker compiles as the crate `weft-worker`.
 //!     - the SET of referenced node types (the codegen-emitted
 //!       static dispatch table references each by name; adding /
 //!       removing a node TYPE changes the binary, but changing a
@@ -89,217 +87,12 @@
 //! runs the engine has no fingerprint of its own; engine identity is
 //! captured by hashing the worker crate closure's sources directly.
 
-use sha2::{Digest, Sha256};
 
-use weft_core::project::ProjectDefinition;
-
-/// Public type for a hex-encoded SHA-256 digest. 64 chars.
-pub type SourceHash = String;
-
-/// Hash the runtime project shape: the canonical
-/// `ProjectDefinition` (topology + configs + edges + infra flags),
-/// serialized deterministically. Flips on every user edit to
-/// `main.weft` that affects the runtime graph; does NOT flip on
-/// pure-comment / pure-formatting edits or canvas drags, because
-/// source spans and layout positions are stripped before hashing.
-///
-/// Used as the resync drift signal AND as the identity key the
-/// worker fetches the definition with at execution claim time
-/// (`(project_id, definition_hash)`).
-///
-/// PURE over the definition (no filesystem access), so it is NOT gated
-/// behind the `build` feature: the browser WASM build calls it for
-/// live-preview diagnostics, and the dispatcher calls it after compile.
-///
-/// Non-semantic fields are stripped before hashing, at their known
-/// structural levels (never inside `config`, where a user value
-/// could legitimately use the same key names):
-/// - top level: `createdAt` / `updatedAt` (stamped `Utc::now()` on
-///   every compile; hashing them would flip the hash per build).
-/// - per node: `span` / `headerSpan` / `configSpans` / `portLiteralSpans`
-///   (source text coordinates: comments or formatting shift them without
-///   changing the runtime graph) and `position` (canvas layout from a drag).
-/// - per node: `fileRefs` (records that a config field came from
-///   `@file("path", Type)`; the RESOLVED value already lives in `config`,
-///   which IS hashed, so the path here is editor-routing metadata: renaming
-///   the file with identical content must not flip the hash) and
-///   `includePath` (an interface-parse-only pointer to an `@include`d file;
-///   the file's PATH is non-semantic, its expanded topology is what runs)
-///   and `sourceFile` (the absolute path a diagnostic anchors to; the same
-///   project compiled from two directories must hash the same).
-/// - per edge: `span` / `sourceFile`. Per group: `span` / `headerSpan` /
-///   `portLiteralSpans` / `sourceFile` / `description` (the authored
-///   `# ...` comment: prose, not shape).
-/// - per port (any of `inputs` / `outputs` / `inPorts` / `outPorts`):
-///   `declaredType` (header spelling) and the catalog prose an input
-///   mirrors from its metadata: `description`, `label`, `placeholder`.
-///   None of it is runtime shape.
-///
-/// `publishedService` IS hashed, and it is the one enriched field that
-/// carries ANOTHER node's metadata (the recipe a publishing node hands
-/// connections out against). It has to be: the worker reads the recipe
-/// from the definition, and no other hash covers a node the project's
-/// graph does not reference. The cost is that editing that recipe, even
-/// cosmetically, flips this hash for every project that publishes it.
-pub fn compute_definition_hash(project: &ProjectDefinition) -> anyhow::Result<SourceHash> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"weft-definition-v1\n");
-    let mut value = serde_json::to_value(project)
-        .map_err(|e| anyhow::anyhow!("serialize ProjectDefinition: {e}"))?;
-    // Field names are the camelCase `#[serde(rename)]` wire names. A
-    // ProjectDefinition ALWAYS serializes to a JSON object; if it somehow didn't,
-    // silently skipping the strips would hash the un-stripped value (timestamps
-    // included) and produce a wrong, unstable hash. Fail loud instead.
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("ProjectDefinition did not serialize to a JSON object"))?;
-    // `id` is the project's DB identity, NOT part of the runtime shape. It is
-    // already the OTHER half of the `(project_id, definition_hash)` identity key,
-    // so hashing it here too is redundant. Worse, it makes the hash context-
-    // dependent: the browser WASM parse computes the live-preview hash with the
-    // NIL uuid (the id is not a parse input), while the build/dispatcher computes
-    // the stored hash with the real project id. If `id` were hashed, those two
-    // would NEVER agree and the "out of sync / resync" light would be stuck on.
-    for key in ["id", "createdAt", "updatedAt"] {
-        obj.remove(key);
-    }
-    strip_keys(obj.get_mut("nodes"), NODE_HASH_STRIPS);
-    strip_keys(obj.get_mut("edges"), EDGE_HASH_STRIPS);
-    strip_keys(obj.get_mut("groups"), GROUP_HASH_STRIPS);
-    strip_port_presentation(obj.get_mut("nodes"));
-    strip_port_presentation(obj.get_mut("groups"));
-    canonicalize_key_order(&mut value);
-    let json = serde_json::to_vec(&value)
-        .map_err(|e| anyhow::anyhow!("re-serialize ProjectDefinition: {e}"))?;
-    hasher.update(&json);
-    Ok(hex(&hasher.finalize()))
-}
-
-/// Hash the uploaded source FILE SET, deterministically, with no
-/// compile and no workspace. PURE over `(path, content)` pairs, so the
-/// dispatcher can compute it the moment a `/projects/create` body
-/// arrives, BEFORE any build. It is the create-time storage key for a
-/// project version's files (`project_file.source_hash`) and the build
-/// dedup key. A workspace/toolchain bump is NOT visible here (it isn't
-/// in the user's files), so the builder-base tag carries that axis: a
-/// build is correct on a content-hit because the build recompiles
-/// against whatever workspace the builder-base image baked.
-///
-/// Files are sorted by path so a reordered upload hashes identically;
-/// each entry folds in `path` then `content`, framed like
-/// [`hash_path`] so reading a file's bytes off disk vs out of a row
-/// produces the same digest.
-pub fn compute_source_hash(files: &[(String, String)]) -> SourceHash {
-    let mut sorted: Vec<&(String, String)> = files.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut hasher = Sha256::new();
-    hasher.update(b"weft-source-v1\n");
-    for (path, content) in sorted {
-        hasher.update(b"file:");
-        hasher.update(path.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(content.as_bytes());
-        hasher.update(b"\n");
-    }
-    hex(&hasher.finalize())
-}
-
-/// The non-semantic keys stripped before hashing, shared by
-/// [`compute_definition_hash`] and the infra slice hasher so the two
-/// digests can never disagree on what "semantic" means.
-const NODE_HASH_STRIPS: &[&str] = &[
-    "span",
-    "headerSpan",
-    "configSpans",
-    "portLiteralSpans",
-    "position",
-    "fileRefs",
-    "includePath",
-    "sourceFile",
-];
-const EDGE_HASH_STRIPS: &[&str] = &["span", "sourceFile"];
-// `description` is the group's authored `# ...` comment: prose, never
-// the runtime shape, so rewording it must not light a resync.
-const GROUP_HASH_STRIPS: &[&str] = &["span", "headerSpan", "portLiteralSpans", "sourceFile", "description"];
-
-/// Remove the per-port PRESENTATION members from every port list of
-/// every element. `declaredType` records how the source HEADER spells a
-/// port (the editor's round-trip anchor); `description`, `label` and
-/// `placeholder` are catalog prose mirrored onto the instance. None is
-/// the runtime shape, so the same runtime graph written with or without
-/// a redundant header line, or against a catalog whose wording changed,
-/// must hash identically (the editor's header healing, or a reworded
-/// label, would otherwise flip the hash and light a resync for a
-/// cosmetic change).
-const PORT_HASH_STRIPS: &[&str] = &["declaredType", "description", "label", "placeholder"];
-fn strip_port_presentation(array: Option<&mut serde_json::Value>) {
-    let Some(serde_json::Value::Array(items)) = array else { return };
-    for item in items {
-        for list in ["inputs", "outputs", "inPorts", "outPorts"] {
-            if let Some(serde_json::Value::Array(ports)) = item.get_mut(list) {
-                for port in ports {
-                    if let Some(obj) = port.as_object_mut() {
-                        for key in PORT_HASH_STRIPS {
-                            obj.remove(*key);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Remove `keys` from every object in a JSON array. Top level of
-/// each element only: deliberately does NOT recurse into `config`.
-fn strip_keys(array: Option<&mut serde_json::Value>, keys: &[&str]) {
-    let Some(serde_json::Value::Array(items)) = array else { return };
-    for item in items {
-        if let Some(obj) = item.as_object_mut() {
-            for key in keys {
-                obj.remove(*key);
-            }
-        }
-    }
-}
-
-/// Rebuild every object in `value`, recursively, with its keys sorted
-/// by name. Hashed JSON MUST pass through this before serializing:
-/// serde_json's map is a BTreeMap (already sorted) by default but an
-/// insertion-ordered map under its `preserve_order` feature, and that
-/// feature flips with the build (`minillmlib` enables it, feature
-/// unification spreads it to any build that includes `weft-providers`,
-/// while a build without it, like the standalone CLI's, leaves it off).
-/// Without this normalization the same project would hash differently
-/// depending on which binary computed it, and the "out of sync /
-/// resync" light would be stuck on between them.
-fn canonicalize_key_order(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(obj) => {
-            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(obj).into_iter().collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            for (_, v) in entries.iter_mut() {
-                canonicalize_key_order(v);
-            }
-            *obj = entries.into_iter().collect();
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                canonicalize_key_order(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // write! into the reused buffer, no per-byte String allocation.
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
+/// The canonical form of a program and the pure digests over it live in
+/// core, so the dispatcher and the browser parse build read the same
+/// bytes this crate's build hashes fold: the definition hash, the
+/// per-node slice hash, and the hex encoding.
+pub use weft_core::project::hash::{compute_definition_hash, hex, SourceHash};
 
 // ---- filesystem-bound hashes (the build path) ----
 //
@@ -313,7 +106,6 @@ pub use fs_hashes::*;
 
 #[cfg(feature = "build")]
 mod fs_hashes {
-    use std::collections::{BTreeMap, HashSet};
     use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result};
@@ -322,7 +114,9 @@ mod fs_hashes {
     use weft_catalog::{is_node_tree_excluded, FsCatalog};
     use weft_core::project::ProjectDefinition;
 
-    use super::{hex, strip_keys, SourceHash};
+    use super::{hex, SourceHash};
+    use weft_core::project::hash::hash_definition_slice;
+    use weft_core::project::{infra_ids, upstream_closure, EdgeIndex};
     use crate::project::Project;
 
     /// Dockerfile (relative to the weft root) that builds the shared
@@ -363,6 +157,17 @@ mod fs_hashes {
             BUILDER_BASE_DOCKERFILE,
             &weft_root.join(BUILDER_BASE_DOCKERFILE),
         )?;
+        // The stdlib packages' dependency declarations. The builder base
+        // compiles the stock worker, whose dependency tree (and the
+        // feature unification of every shared crate in it) is the fixed
+        // set plus what these files add; a change here makes the baked
+        // rlibs and the host compile cache dead weight, a node body edit
+        // does not (that only moves one package's content slot).
+        let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("{e}"))?;
+        for path in walk_dir(&stdlib)?.into_iter().filter(|p| p.file_name().is_some_and(|n| n == "deps.toml")) {
+            let rel = path.strip_prefix(&stdlib).map_err(|_| anyhow::anyhow!("{} is outside the stdlib", path.display()))?;
+            hash_path(hasher, &format!("catalog/{}", rel.display()), &path)?;
+        }
         Ok(())
     }
 
@@ -370,8 +175,8 @@ mod fs_hashes {
     /// the worker docker tag suffix; the dispatcher selects the spawn
     /// image by this hash.
     ///
-    /// Scoped to exactly the codegen-emitted-static surface: weft.toml
-    /// (build config + crate name), the SET of referenced node TYPES
+    /// Scoped to exactly the codegen-emitted-static surface: weft.toml's
+    /// `[build.worker]` section, the SET of referenced node TYPES
     /// (the static dispatch table in `registry.rs` references each by
     /// name), each referenced node's package root (mod.rs, deps.toml,
     /// shared files), and the weft workspace (the engine the binary
@@ -388,17 +193,24 @@ mod fs_hashes {
         project: &Project,
         weft_root: &Path,
         catalog: &FsCatalog,
+        node_set: crate::codegen::NodeSet,
     ) -> Result<SourceHash> {
         let project_root = project.root.as_path();
         let mut hasher = Sha256::new();
-        hasher.update(b"weft-binary-v1\n");
+        hasher.update(b"weft-binary-v2\n");
         hash_image_recipe(&mut hasher, project)?;
 
         // SET of referenced node TYPES: the dispatch table in registry.rs
         // is generated from this. The ORDER doesn't matter (we sort), and
         // the per-node config values live in main.weft (hashed by the
         // definition hash, not here).
-        let referenced = crate::codegen::collect_node_types(definition);
+        // The choice itself is hashed too, so the tag says what the
+        // image was built AS: `weft status` can tell a full build from
+        // a referenced one instead of guessing from the type list.
+        let referenced = crate::codegen::node_types_for(definition, catalog, node_set);
+        hasher.update(b"node_set:");
+        hasher.update(node_set.hash_marker().as_bytes());
+        hasher.update(b"\n");
         hasher.update(b"node_types:\n");
         for nt in &referenced {
             hasher.update(b"  ");
@@ -430,6 +242,42 @@ mod fs_hashes {
         Ok(hex(&hasher.finalize()))
     }
 
+    /// Production implementation identity per node type. Package helpers and
+    /// dependencies are shared by its members; unrelated packages stay independent.
+    pub fn implementation_hashes(
+        definition: &ProjectDefinition,
+        project: &Project,
+        weft_root: &Path,
+        catalog: &FsCatalog,
+        node_set: crate::codegen::NodeSet,
+    ) -> Result<std::collections::BTreeMap<String, SourceHash>> {
+        let mut shared = Sha256::new();
+        shared.update(b"weft-implementation-v1\n");
+        hash_worker_build_env(&mut shared, weft_root)?;
+        hash_image_recipe(&mut shared, project)?;
+        hash_type_registry(&mut shared, catalog);
+        // Fingerprints describe the compiled worker, whose type set can be
+        // wider than this graph. Built-in boundaries always ship in the engine.
+        let mut types = crate::codegen::node_types_for(definition, catalog, node_set);
+        types.extend(crate::weft_compiler::RESERVED_TYPE_KEYWORDS.iter().map(|t| (*t).to_string()));
+        let mut packages: std::collections::BTreeMap<Vec<PathBuf>, SourceHash> = std::collections::BTreeMap::new();
+        let mut result = std::collections::BTreeMap::new();
+        for node_type in types {
+            let roots = catalog.package_roots_for(&[node_type.clone()].into_iter().collect());
+            let hash = if let Some(hash) = packages.get(&roots) {
+                hash.clone()
+            } else {
+                let mut hasher = shared.clone();
+                hash_package_roots(&mut hasher, &roots, &[&project.root, weft_root])?;
+                let hash = hex(&hasher.finalize());
+                packages.insert(roots, hash.clone());
+                hash
+            };
+            result.insert(node_type, hash);
+        }
+        Ok(result)
+    }
+
     /// Fold the catalog's full nominal type registry into the digest
     /// (sorted, so map order can never flip it). Shared by the binary
     /// hash and the node-test hash: both bake this registry into their
@@ -449,16 +297,16 @@ mod fs_hashes {
 
     /// Hash the image RECIPE a staged build renders through
     /// `worker_image::emit`: `weft.toml`'s build choices (base image,
-    /// custom template path, crate name) and, when a custom template
+    /// custom template path) and, when a custom template
     /// is set, the template file's own content. Shared by the binary
     /// hash and the node-test hash so every image-naming digest covers
     /// the same recipe inputs; a base-image or template edit flips
     /// both instead of silently serving a stale cached image.
     fn hash_image_recipe(hasher: &mut Sha256, project: &Project) -> Result<()> {
         let project_root = project.root.as_path();
-        // Project configs live in main.weft, not weft.toml, so this
-        // stays image-scoped.
-        hash_path(hasher, "weft.toml", &project_root.join("weft.toml"))?;
+        // Names, IDs and dispatcher addresses do not change executable code.
+        hasher.update(b"worker_build:\n");
+        hasher.update(serde_json::to_vec(&project.manifest.build.worker)?);
 
         // A custom Dockerfile template's CONTENT shapes the image too;
         // weft.toml only carries its path, so an edit to the template
@@ -490,26 +338,28 @@ mod fs_hashes {
     /// roots): both fold "the node trees that matter" into a digest the
     /// same way, over the same node-tree walk policy (`walk_dir`).
     fn hash_package_roots(hasher: &mut Sha256, roots: &[PathBuf], bases: &[&Path]) -> Result<()> {
-        let mut sorted: Vec<&PathBuf> = roots.iter().collect();
-        sorted.sort();
-        sorted.dedup();
-        for root in sorted {
-            let rel = bases
+        let mut labeled = std::collections::BTreeMap::new();
+        for root in roots {
+            let label = bases
                 .iter()
-                .find_map(|b| root.strip_prefix(b).ok())
+                .enumerate()
+                .find_map(|(index, base)| root.strip_prefix(base).ok().map(|path| format!("{index}/{}", path.to_string_lossy())))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "package root {} is outside the project and weft roots; \
                          hashing its absolute path would make the digest machine-local",
                         root.display()
                     )
-                })?
-                .to_string_lossy()
-                .into_owned();
+                })?;
+            labeled.insert(label, root);
+        }
+        // Sort by portable labels, not absolute paths whose order can change
+        // when a project and the weft checkout move independently.
+        for (label, root) in labeled {
             hasher.update(b"package:");
-            hasher.update(rel.as_bytes());
+            hasher.update(label.as_bytes());
             hasher.update(b"\n");
-            hash_path(hasher, &rel, root)?;
+            hash_path(hasher, &label, root)?;
         }
         Ok(())
     }
@@ -589,7 +439,7 @@ mod fs_hashes {
         // running bridge pod). Same canonical form as the definition hash:
         // spans / positions / file-ref paths stripped, nodes and edges
         // sorted, so a comment or a canvas drag cannot flip it either.
-        let closure = closure_with_upstream(project, |n| n.requires_infra);
+        let closure = upstream_closure(project, &EdgeIndex::build(project), &infra_ids(project));
         hash_definition_slice(&mut hasher, project, &closure)?;
         hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
 
@@ -638,6 +488,26 @@ mod fs_hashes {
         hasher.update(b"weft-builder-base-v1\n");
         hash_worker_build_env(&mut hasher, weft_root)?;
         Ok(hex(&hasher.finalize()))
+    }
+
+    /// Name of the BuildKit cache every worker `cargo build` on this host
+    /// compiles into (`weft_worker_cache_key` in the rendered Dockerfile).
+    /// One cache per (build environment, builder): the same inputs as
+    /// the builder base, plus `builder` (the prebuilt base, or the raw
+    /// image a from-scratch builder stage installs its toolchain on: C
+    /// artifacts compiled against one distro's headers must never be
+    /// linked by another). Inside the cache, cargo tells the generated
+    /// package crates apart by their content-addressed directory
+    /// (`codegen::write_package_crates`) and everything else by
+    /// fingerprint.
+    pub fn compute_worker_cache_key(weft_root: &Path, builder: &str) -> Result<String> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"weft-worker-cache-v1\n");
+        hasher.update(b"builder:");
+        hasher.update(builder.as_bytes());
+        hasher.update(b"\n");
+        hash_worker_build_env(&mut hasher, weft_root)?;
+        Ok(hex(&hasher.finalize()).chars().take(16).collect())
     }
 
     /// Recursive directory walk that returns every regular file under
@@ -782,171 +652,6 @@ mod fs_hashes {
         Ok(())
     }
 
-    /// Fold the closure's slice of the definition into the hasher: the
-    /// closure's nodes and the edges between them, in the definition
-    /// hash's canonical form (same non-semantic strips, see
-    /// [`compute_definition_hash`]), sorted by id so source order and
-    /// unrelated graph edits cannot move the digest.
-    fn hash_definition_slice(
-        hasher: &mut Sha256,
-        project: &ProjectDefinition,
-        closure: &HashSet<String>,
-    ) -> Result<()> {
-        let mut nodes: Vec<serde_json::Value> = project
-            .nodes
-            .iter()
-            .filter(|n| closure.contains(&n.id))
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .map_err(|e| anyhow::anyhow!("serialize infra-closure node: {e}"))?;
-        nodes.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        let mut edges: Vec<serde_json::Value> = project
-            .edges
-            .iter()
-            .filter(|e| closure.contains(&e.source) && closure.contains(&e.target))
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()
-            .map_err(|e| anyhow::anyhow!("serialize infra-closure edge: {e}"))?;
-        edges.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        let mut slice = serde_json::json!({ "nodes": nodes, "edges": edges });
-        strip_keys(slice.get_mut("nodes"), super::NODE_HASH_STRIPS);
-        strip_keys(slice.get_mut("edges"), super::EDGE_HASH_STRIPS);
-        super::strip_port_presentation(slice.get_mut("nodes"));
-        super::canonicalize_key_order(&mut slice);
-        hasher.update(b"definition-slice:");
-        hasher.update(
-            &serde_json::to_vec(&slice)
-                .map_err(|e| anyhow::anyhow!("serialize infra-closure slice: {e}"))?,
-        );
-        hasher.update(b"\n");
-        Ok(())
-    }
-
-    /// Closure: every node matching `seed` plus every node upstream
-    /// (transitively) via incoming edges. Used by `compute_infra_hash`
-    /// to scope the hash input to "what affects the infra subgraph."
-    fn closure_with_upstream(
-        project: &ProjectDefinition,
-        seed: impl Fn(&weft_core::project::NodeDefinition) -> bool,
-    ) -> HashSet<String> {
-        let by_id: BTreeMap<&str, &weft_core::project::NodeDefinition> = project
-            .nodes
-            .iter()
-            .map(|n| (n.id.as_str(), n))
-            .collect();
-
-        let mut frontier: Vec<String> = project
-            .nodes
-            .iter()
-            .filter(|n| seed(n))
-            .map(|n| n.id.clone())
-            .collect();
-        let mut closure: HashSet<String> = HashSet::new();
-        while let Some(id) = frontier.pop() {
-            if !closure.insert(id.clone()) {
-                continue;
-            }
-            for edge in &project.edges {
-                if edge.target == id && by_id.contains_key(edge.source.as_str())
-                    && !closure.contains(&edge.source) {
-                        frontier.push(edge.source.clone());
-                    }
-            }
-        }
-        closure
-    }
-
-    #[cfg(test)]
-    mod infra_slice_tests {
-        use super::*;
-
-        /// Three-node project: `a -> b` where `b` is infra, plus an
-        /// unrelated `x`. Closure = {a, b}. The caller varies one
-        /// node's config to probe what moves the slice digest.
-        fn project(a_cfg: &str, b_cfg: &str, x_cfg: &str, b_x: f64) -> ProjectDefinition {
-            let node = |id: &str, cfg: &str, infra: bool, x: f64| {
-                serde_json::json!({
-                    "id": id, "nodeType": "T", "label": null,
-                    "config": {"v": cfg},
-                    "position": {"x": x, "y": 0.0},
-                    "inputs": [], "outputs": [], "features": {},
-                    "scope": [], "groupBoundary": null,
-                    "requiresInfra": infra, "images": [],
-                })
-            };
-            serde_json::from_value(serde_json::json!({
-                "id": "00000000-0000-0000-0000-000000000000",
-                "nodes": [
-                    node("a", a_cfg, false, 0.0),
-                    node("b", b_cfg, true, b_x),
-                    node("x", x_cfg, false, 0.0),
-                ],
-                "edges": [{
-                    "id": "a.out->b.in", "source": "a", "target": "b",
-                    "sourceHandle": "out", "targetHandle": "in",
-                }],
-                "groups": [],
-                "createdAt": "2026-01-01T00:00:00Z",
-                "updatedAt": "2026-01-01T00:00:00Z",
-            }))
-            .expect("test ProjectDefinition")
-        }
-
-        fn slice_digest(p: &ProjectDefinition) -> String {
-            let closure = closure_with_upstream(p, |n| n.requires_infra);
-            let mut hasher = Sha256::new();
-            hash_definition_slice(&mut hasher, p, &closure).unwrap();
-            hex(&hasher.finalize())
-        }
-
-        #[test]
-        fn a_config_edit_outside_the_closure_does_not_move_the_hash() {
-            assert_eq!(
-                slice_digest(&project("a1", "b1", "x1", 0.0)),
-                slice_digest(&project("a1", "b1", "CHANGED", 0.0)),
-            );
-        }
-
-        #[test]
-        fn a_closure_config_edit_moves_the_hash() {
-            let base = slice_digest(&project("a1", "b1", "x1", 0.0));
-            assert_ne!(base, slice_digest(&project("CHANGED", "b1", "x1", 0.0)));
-            assert_ne!(base, slice_digest(&project("a1", "CHANGED", "x1", 0.0)));
-        }
-
-        #[test]
-        fn a_canvas_drag_does_not_move_the_hash() {
-            assert_eq!(
-                slice_digest(&project("a1", "b1", "x1", 0.0)),
-                slice_digest(&project("a1", "b1", "x1", 500.0)),
-            );
-        }
-
-        /// A literal's SPAN is a source-text coordinate: a comment
-        /// added above the node shifts it without changing the graph,
-        /// and the Upgrade button must not light up for that.
-        #[test]
-        fn a_shifted_port_literal_span_does_not_move_the_hash() {
-            let mut with_span = project("a1", "b1", "x1", 0.0);
-            with_span.nodes[1].port_literals.insert("v".into(), serde_json::json!("lit"));
-            let mut shifted = with_span.clone();
-            use weft_core::project::{ConfigFieldSpan, Span};
-            let span_at = |line| ConfigFieldSpan::inline(Span {
-                start_line: line,
-                start_column: 3,
-                end_line: line,
-                end_column: 9,
-            });
-            with_span.nodes[1].port_literal_spans.insert("v".into(), span_at(2));
-            shifted.nodes[1].port_literal_spans.insert("v".into(), span_at(7));
-            assert_eq!(slice_digest(&with_span), slice_digest(&shifted));
-            assert_eq!(
-                super::super::compute_definition_hash(&with_span).unwrap(),
-                super::super::compute_definition_hash(&shifted).unwrap(),
-            );
-        }
-    }
-
     /// Load + enrich a project to a `ProjectDefinition` AND return the
     /// catalog it was enriched against, without running cargo / docker.
     /// Returns both because every caller (drift hashes, infra build) needs
@@ -999,11 +704,120 @@ mod fs_hashes {
     }
 
     impl std::error::Error for CompileLoadError {}
+
+    #[cfg(test)]
+    mod package_identity_tests {
+        use super::*;
+
+        #[test]
+        fn implementation_identity_matches_the_compiled_type_set() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
+            let project = Project::load(dir.path()).unwrap();
+            let catalog = FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let empty: ProjectDefinition = serde_json::from_value(serde_json::json!({"id":project.id(),"nodes":[],"edges":[]})).unwrap();
+            let mut grouped = empty.clone();
+            grouped.nodes.push(serde_json::from_value(serde_json::json!({
+                "id":"g__in", "nodeType":"Passthrough", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
+                "groupBoundary":{"groupId":"g","role":"In"}
+            })).unwrap());
+            for set in [crate::codegen::NodeSet::Full, crate::codegen::NodeSet::Referenced] {
+                let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
+                let after = implementation_hashes(&grouped, &project, root, &catalog, set).unwrap();
+                assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
+                assert!(before.contains_key("Passthrough"));
+                if matches!(set, crate::codegen::NodeSet::Full) { assert!(before.contains_key("Text")); }
+            }
+        }
+
+        #[test]
+        fn worker_cache_key_is_stable_per_builder() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let prebuilt = compute_worker_cache_key(root, "builder-base").unwrap();
+            assert_eq!(prebuilt.len(), 16);
+            assert_eq!(compute_worker_cache_key(root, "builder-base").unwrap(), prebuilt);
+            assert_ne!(
+                compute_worker_cache_key(root, "alpine:3.19").unwrap(),
+                prebuilt,
+                "a from-scratch builder on another distro gets its own cache"
+            );
+        }
+
+        #[test]
+        fn repeated_full_builds_and_config_edits_keep_the_same_image_identity() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
+            let project = Project::load(dir.path()).unwrap();
+            let catalog = FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let mut graph: ProjectDefinition = serde_json::from_value(serde_json::json!({
+                "id":project.id(), "nodes":[{"id":"text", "nodeType":"Text", "config":{"value":"before"}, "position":{"x":0,"y":0}}], "edges":[]
+            })).unwrap();
+            let hash = |graph: &ProjectDefinition| compute_binary_hash(graph, &project, root, &catalog, crate::codegen::NodeSet::Full).unwrap();
+            let initial = hash(&graph);
+            assert_eq!(hash(&graph), initial);
+            graph.nodes[0].config = serde_json::json!({"value":"after"});
+            assert_eq!(hash(&graph), initial, "config belongs to the execution definition");
+            graph.nodes[0].node_type = "Format".into();
+            assert_eq!(hash(&graph), initial, "all catalog implementations were already compiled");
+        }
+
+        fn digest(roots: &[PathBuf], bases: &[&Path]) -> String {
+            let mut hash = Sha256::new();
+            hash_package_roots(&mut hash, roots, bases).unwrap();
+            hex(&hash.finalize())
+        }
+
+        #[test]
+        fn moving_checkouts_does_not_change_package_order_or_identity() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut hashes = Vec::new();
+            for (project_name, weft_name) in [("a-project", "z-weft"), ("z-project", "a-weft")] {
+                let project = temp.path().join(project_name);
+                let weft = temp.path().join(weft_name);
+                let roots = [project.join("nodes/local"), weft.join("catalog/shared")];
+                for (root, text) in roots.iter().zip(["local body", "shared helper"]) {
+                    std::fs::create_dir_all(root).unwrap();
+                    std::fs::write(root.join("mod.rs"), text).unwrap();
+                }
+                let hash = digest(&roots, &[&project, &weft]);
+                assert_eq!(hash, digest(&[roots[1].clone(), roots[0].clone(), roots[0].clone()], &[&project, &weft]));
+                hashes.push(hash);
+            }
+            assert_eq!(hashes[0], hashes[1]);
+        }
+
+        #[test]
+        fn package_helpers_and_dependencies_invalidate_only_their_package() {
+            let temp = tempfile::tempdir().unwrap();
+            let a = temp.path().join("nodes/a");
+            let b = temp.path().join("nodes/b");
+            for root in [&a, &b] {
+                std::fs::create_dir_all(root).unwrap();
+                std::fs::write(root.join("mod.rs"), "node body").unwrap();
+            }
+            let hash = |root: &PathBuf| digest(std::slice::from_ref(root), &[temp.path()]);
+            let unchanged = hash(&b);
+            let mut previous = hash(&a);
+            for file in ["helper.rs", "deps.toml"] {
+                std::fs::write(a.join(file), "new dependency").unwrap();
+                let next = hash(&a);
+                assert_ne!(previous, next);
+                assert_eq!(hash(&b), unchanged);
+                previous = next;
+            }
+            std::fs::create_dir_all(a.join("target")).unwrap();
+            std::fs::write(a.join("target/output"), "build artifact").unwrap();
+            assert_eq!(previous, hash(&a));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weft_core::project::ProjectDefinition;
 
     /// Builds a `ProjectDefinition` via JSON so the test isn't
     /// coupled to every field of every internal struct (config_spans,
@@ -1160,8 +974,8 @@ mod tests {
         let mut b = serde_json::json!({});
         b["alpha"] = serde_json::json!(true);
         b["zeta"] = serde_json::json!({ "x": [{ "a": 3, "b": 2 }], "y": 1 });
-        super::canonicalize_key_order(&mut a);
-        super::canonicalize_key_order(&mut b);
+        weft_core::project::hash::canonicalize_key_order(&mut a);
+        weft_core::project::hash::canonicalize_key_order(&mut b);
         assert_eq!(
             serde_json::to_string(&a).unwrap(),
             serde_json::to_string(&b).unwrap(),
@@ -1178,33 +992,5 @@ mod tests {
         let a = compute_definition_hash(&project_at("2024-01-01T00:00:00Z", "hi")).unwrap();
         let b = compute_definition_hash(&project_at("2024-01-01T00:00:00Z", "bye")).unwrap();
         assert_ne!(a, b, "config edit must flip the hash");
-    }
-
-    /// The content source hash is pure over the file set and order-
-    /// independent: the dispatcher computes it on `/projects/create`
-    /// before any compile, and must derive the SAME key from the rows it
-    /// fetches at build time regardless of row order.
-    #[test]
-    fn source_hash_is_order_independent() {
-        let a = compute_source_hash(&[
-            ("main.weft".into(), "graph {}".into()),
-            ("nodes/x/mod.rs".into(), "fn x() {}".into()),
-        ]);
-        let b = compute_source_hash(&[
-            ("nodes/x/mod.rs".into(), "fn x() {}".into()),
-            ("main.weft".into(), "graph {}".into()),
-        ]);
-        assert_eq!(a, b, "file order must not change the source hash");
-    }
-
-    /// Source hash flips on any content or path change, so a build
-    /// dedup keyed by it can't serve a stale image for edited source.
-    #[test]
-    fn source_hash_flips_on_content_and_path() {
-        let base = compute_source_hash(&[("main.weft".into(), "graph {}".into())]);
-        let edited = compute_source_hash(&[("main.weft".into(), "graph { a }".into())]);
-        let renamed = compute_source_hash(&[("other.weft".into(), "graph {}".into())]);
-        assert_ne!(base, edited, "content edit must flip the source hash");
-        assert_ne!(base, renamed, "path change must flip the source hash");
     }
 }

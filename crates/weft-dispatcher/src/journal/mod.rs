@@ -24,6 +24,60 @@ use serde_json::Value;
 
 use weft_core::Color;
 
+/// A successful setup, independent of whether its listeners are armed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TriggerBake {
+    pub project_id: String,
+    pub source_version: String,
+    pub program: weft_core::project::hash::ProgramIdentity,
+    pub color: Color,
+    pub captured: std::collections::BTreeMap<String, TriggerCapture>,
+    pub at_unix: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TriggerCapture {
+    pub spec: weft_core::primitive::SignalSpec,
+    pub ports: Value,
+}
+
+impl TriggerBake {
+    pub fn summary(&self) -> weft_core::run_spec::BakeSummary {
+        weft_core::run_spec::BakeSummary { program: self.program.clone(), captured: self.captured.keys().cloned().collect(),
+            color: self.color, at_unix: self.at_unix }
+    }
+
+    /// Only a successful setup can replace saved settings. A closed group gate
+    /// leaves its trigger absent from this capture, including on a refresh.
+    pub fn from_events(events: &[ExecEvent]) -> anyhow::Result<Option<Self>> {
+        let Some(ExecEvent::ExecutionStarted { color, project_id, program: Some(program), definition_hash, source_version: Some(source_version),
+            phase: weft_core::context::Phase::TriggerSetup, .. }) = events.first() else {
+            anyhow::bail!("trigger setup has no original program or source identity");
+        };
+        anyhow::ensure!(definition_hash.as_ref() == Some(&program.definition_hash),
+            "trigger setup {color} has conflicting program identities");
+        anyhow::ensure!(events.iter().all(|event| event.color() == *color),
+            "trigger setup {color} contains another run's history");
+        let Some(terminal) = events.iter().find(|event| event.is_execution_terminal()) else {
+            anyhow::bail!("trigger setup {color} has not finished");
+        };
+        let ExecEvent::ExecutionCompleted { at_unix, .. } = terminal else { return Ok(None); };
+        let mut captured = std::collections::BTreeMap::new();
+        for event in events.iter().take_while(|event| !event.is_execution_terminal()) {
+            if let ExecEvent::TriggerCaptured { color: captured_color, node_id, spec, port_snapshot, .. } = event {
+                anyhow::ensure!(captured_color == color && port_snapshot.is_object(), "invalid trigger capture in setup {color}");
+                weft_core::signal::validate_spec(spec).map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(captured.insert(node_id.clone(), TriggerCapture {
+                    spec: spec.clone(), ports: port_snapshot.clone(),
+                }).is_none(), "trigger '{node_id}' captured twice in setup {color}");
+            }
+        }
+        Ok(Some(Self { project_id: project_id.clone(), program: program.clone(), color: *color,
+            source_version: source_version.clone(),
+            captured, at_unix: *at_unix }))
+    }
+}
+
 /// Outcome of looking up a value derived from a color's first
 /// `ExecutionStarted` row. `NotFound` = no such row (the color is
 /// unknown). `Corrupt` = the row exists but its stored JSON no
@@ -43,6 +97,14 @@ pub enum ColorLookup<T> {
 
 #[async_trait]
 pub trait Journal: Send + Sync {
+    async fn is_trigger_setup_pending(&self, color: Color) -> anyhow::Result<bool>;
+
+    /// Publish one complete setup and release its birth-time ownership atomically.
+    /// A failed/cancelled setup releases ownership without replacing any bake.
+    async fn finish_trigger_setup(&self, color: Color, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
+
+    async fn trigger_bakes(&self, project_id: &str) -> anyhow::Result<Vec<TriggerBake>>;
+
     // ----- Event log (state source of truth) -------------------------
 
     /// Append one event to the execution's log. Append-only; only
@@ -98,6 +160,7 @@ pub trait Journal: Send + Sync {
         start: &ExecEvent,
         kicks: &[ExecEvent],
         task: weft_task_store::tasks::NewTask,
+        expected_activation: Option<Color>,
     ) -> anyhow::Result<()>;
 
     /// The live-connection variant of [`Journal::start_execution`]: the birth
@@ -210,6 +273,14 @@ pub trait Journal: Send + Sync {
         color: Color,
     ) -> anyhow::Result<ColorLookup<String>>;
 
+    /// Every program version the runs this journal still holds were
+    /// started against, for one project. What a project removal (and
+    /// the last `weft clean` after it) reads to know which recorded
+    /// programs are still needed: the journal outlives the project, so
+    /// the programs its runs point at have to as well, or the rows are
+    /// there and unreadable.
+    async fn definition_hashes_in_use(&self, project_id: &str) -> anyhow::Result<Vec<String>>;
+
     /// The LAST `limit` log lines of a color, oldest first: every
     /// event `LogEntry::from_event` projects (node log lines and the
     /// failures the journal recorded), in the order they were written
@@ -241,6 +312,29 @@ pub trait Journal: Send + Sync {
         &self,
         color: Color,
     ) -> anyhow::Result<Option<ExecutionSummary>>;
+
+    /// Every color `project_id` ever started.
+    ///
+    /// The question retirement asks: a version-tree row whose color is
+    /// not in here describes a run nothing can read. Separate from
+    /// [`Self::execution_summaries_for_project`] because that one decodes
+    /// every birth payload, every terminal payload and every tag array to
+    /// build a status nobody here looks at, and the reaper asks this
+    /// hourly for every removed project it still holds rows for.
+    async fn colors_for_project(&self, project_id: &str) -> anyhow::Result<Vec<Color>>;
+
+    /// Every execution of `project_id`, by color, in ONE read.
+    ///
+    /// `weft tree` and the editor's version sidebar need a status per
+    /// recorded run, and asking `execution_summary` per run meant a
+    /// round trip each: a project with a thousand runs did a thousand
+    /// point lookups on every refresh. A color the journal has never
+    /// heard of is simply absent from the map, which is the same answer
+    /// `execution_summary` gives as `None`.
+    async fn execution_summaries_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<std::collections::HashMap<Color, ExecutionSummary>>;
 
     /// Every execution color of `tenant`'s that starts with `prefix`
     /// (the first characters of a uuid, as a person types them). At most
@@ -322,6 +416,15 @@ pub trait Journal: Send + Sync {
         tokens: &[String],
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
+    /// The RESUME registrations of one color: what that execution is
+    /// parked on.
+    ///
+    /// Every poll of a parked run and every `weft wake` asks this. Asked
+    /// as "every signal of the project, then filter", it read every
+    /// registration the project has, with its kind state, its port
+    /// snapshot and its consumer payload, to answer with three fields.
+    async fn signal_list_for_color(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>>;
+
     /// All signals currently registered for a project.
     async fn signal_list_for_project(
         &self,
@@ -351,6 +454,11 @@ pub trait Journal: Send + Sync {
 /// Durable replacement for the in-RAM `SignalTracker` row.
 #[derive(Debug, Clone)]
 pub struct SignalRegistration {
+    pub source_version: Option<String>,
+    /// Setup whose completed capture armed this entry; absent for suspensions.
+    pub setup_color: Option<Color>,
+    /// The code armed with these settings. Rebaking cannot retarget a listener.
+    pub program: Option<weft_core::project::hash::ProgramIdentity>,
     pub token: String,
     pub tenant_id: String,
     pub project_id: String,
@@ -603,6 +711,7 @@ pub struct SignalToken {
 /// ones and is `None` for a run-level line.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
+    pub inherited_from: Option<Color>,
     pub at_unix: u64,
     pub level: String,
     pub node: Option<String>,
@@ -662,6 +771,7 @@ impl LogEntry {
     pub fn corrupt_row(written_at_unix: u64, error: String) -> LogEntry {
         LogEntry {
             at_unix: written_at_unix,
+            inherited_from: None,
             level: "error".into(),
             node: None,
             frames: Vec::new(),
@@ -691,6 +801,7 @@ impl LogEntry {
             ExecEvent::LogLine { node_id, frames, level, message, at_unix, at_unix_ms, seq, .. } => {
                 LogEntry {
                     at_unix: *at_unix,
+                    inherited_from: None,
                     level: level.clone(),
                     // Rows written before the line carried its node read as
                     // an empty id; they are run-level lines from here on.
@@ -702,6 +813,7 @@ impl LogEntry {
                 }
             }
             ExecEvent::NodeFailed { node_id, frames, error, at_unix, .. } => LogEntry {
+                inherited_from: None,
                 at_unix: *at_unix,
                 level: "error".into(),
                 node: Some(node_id.clone()),
@@ -711,6 +823,7 @@ impl LogEntry {
                 seq: None,
             },
             ExecEvent::NodeCancelled { node_id, frames, reason, at_unix, .. } => LogEntry {
+                inherited_from: None,
                 at_unix: *at_unix,
                 level: "warn".into(),
                 node: Some(node_id.clone()),
@@ -721,6 +834,7 @@ impl LogEntry {
             },
             ExecEvent::PortTypeMismatch { node_id, frames, port, expected, actual, at_unix, .. } => {
                 LogEntry {
+                    inherited_from: None,
                     at_unix: *at_unix,
                     level: "warn".into(),
                     node: Some(node_id.clone()),
@@ -734,6 +848,7 @@ impl LogEntry {
                 }
             }
             ExecEvent::ExecutionFailed { error, at_unix, .. } => LogEntry {
+                inherited_from: None,
                 at_unix: *at_unix,
                 level: "error".into(),
                 node: None,
@@ -743,6 +858,7 @@ impl LogEntry {
                 seq: None,
             },
             ExecEvent::ExecutionCancelled { reason, at_unix, .. } => LogEntry {
+                inherited_from: None,
                 at_unix: *at_unix,
                 level: "warn".into(),
                 node: None,
@@ -768,6 +884,52 @@ impl LogEntry {
         "execution_failed",
         "execution_cancelled",
     ];
+}
+
+#[cfg(test)]
+mod bake_tests {
+    use super::*;
+
+    fn completed() -> Vec<ExecEvent> {
+        let color = Color::new_v4();
+        vec![
+            ExecEvent::ExecutionStarted {
+                color, project_id: "p".into(), entry_node: "trigger".into(),
+                phase: weft_core::context::Phase::TriggerSetup,
+                definition_hash: Some("graph".into()),
+                program: Some(weft_core::project::hash::ProgramIdentity {
+                    definition_hash: "graph".into(), binary_hash: "binary".into(), implementations: Default::default(),
+                }),
+                source_version: Some("source".into()), node_test: false, subgraph: None, seed: None, at_unix: 1,
+            },
+            ExecEvent::ExecutionCompleted { color, at_unix: 2 },
+        ]
+    }
+
+    #[test]
+    fn closed_gates_publish_an_empty_bake_but_incomplete_setups_do_not() {
+        let rows = completed();
+        let bake = TriggerBake::from_events(&rows).unwrap().unwrap();
+        assert!(bake.captured.is_empty());
+        assert!(TriggerBake::from_events(&rows[..1]).is_err());
+        let mut failed = rows;
+        failed[1] = ExecEvent::ExecutionCancelled {
+            color: bake.color, reason: "cancelled".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 2,
+        };
+        assert!(TriggerBake::from_events(&failed).unwrap().is_none());
+    }
+
+    #[test]
+    fn bake_refuses_mixed_run_history_and_conflicting_program_identity() {
+        let mut rows = completed();
+        rows[1] = ExecEvent::ExecutionCompleted { color: Color::new_v4(), at_unix: 2 };
+        assert!(TriggerBake::from_events(&rows).unwrap_err().to_string().contains("another run"));
+        let mut rows = completed();
+        if let ExecEvent::ExecutionStarted { definition_hash, .. } = &mut rows[0] {
+            *definition_hash = Some("another graph".into());
+        }
+        assert!(TriggerBake::from_events(&rows).unwrap_err().to_string().contains("conflicting program"));
+    }
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ export interface RawStatusPayload {
     binary_drift?: boolean;
     definition_drift?: boolean;
     infra_drift?: boolean;
+    activation_drift?: boolean;
   };
   available_actions?: string[];
   preservation?: { parked?: number; suspended?: number };

@@ -223,6 +223,9 @@
 	function costLabel(firing: {
 		costUsd: number;
 		costUnknown?: boolean;
+		inheritedFrom?: string;
+		inheritedCostUsd?: number;
+		inheritedCostUnknown?: boolean;
 		credentialOwner?: 'their-own' | 'ours' | 'mixed';
 	}): string {
 		let amount: string;
@@ -241,6 +244,14 @@
 					: firing.credentialOwner === 'mixed'
 						? ' (mixed keys)'
 						: '';
+		if (firing.inheritedFrom) return amount + origin + ' (reused, no new charge)';
+		const reused = firing.inheritedCostUsd ?? 0;
+		if (reused > 0 || firing.inheritedCostUnknown) {
+			const historical = firing.inheritedCostUnknown
+				? (reused > 0 ? formatCost(reused) + ' + unknown' : 'unknown cost')
+				: formatCost(reused);
+			return amount + origin + '; includes ' + historical + ' reused';
+		}
 		return amount + origin;
 	}
 
@@ -335,6 +346,12 @@
 					{#if selected.input && typeof selected.input === 'object' && Object.keys(selected.input as Record<string, unknown>).length > 0}
 						{#each Object.entries(selected.input as Record<string, unknown>) as [key, value]}
 							{@const file = parseFileValue(value)}
+							{@const provided = selected.providedPorts?.includes(key)}
+							{@const backup = selected.backupPorts?.includes(key)}
+							{@const origin = selected.inheritedPorts?.[key]}
+							{#if backup || provided || origin}
+								<div class="text-[10px] text-sky-700 px-1">{key}: {backup ? 'backup used' : provided ? 'supplied output' : 'reused input'}{origin ? ` from run ${origin}` : ''}</div>
+							{/if}
 							{#if file}
 								<FileCard label={key} {file} />
 							{:else}
@@ -362,6 +379,11 @@
 					<CopyButton text={detailsText} />
 				</div>
 				<div class="overflow-auto flex-1 p-3 space-y-3">
+					{#if selected.inheritedFrom}
+						<div class="rounded border border-sky-200 bg-sky-50 p-2.5 text-[11px] text-sky-800">
+							Inherited from run {selected.inheritedFrom.slice(0, 8)}: this firing was reused, not run again.
+						</div>
+					{/if}
 					{#if selected.portWarnings && selected.portWarnings.length > 0}
 						<div class="rounded border border-amber-200 bg-amber-50 p-2.5">
 							<div class="text-[10px] font-semibold text-amber-700 mb-1">Output type mismatch</div>

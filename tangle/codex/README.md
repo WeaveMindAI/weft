@@ -11,7 +11,7 @@ for other assistants.
 The persona is a plain `AGENTS.md` at the project root, which is Codex's own
 native format rather than a compatibility shim. Skills sit in
 `.agents/skills/`, and the five specialists are TOML files in
-`.codex/agents/`. The five commands are skills as well: Codex deprecated its
+`.codex/agents/`. The six commands are skills as well: Codex deprecated its
 custom-prompts directory in favour of skills, which the CLI invokes with `$name`.
 
 Two things this copy uses.
@@ -33,7 +33,7 @@ Codex injects at the next safe point.
 
 ## What is here
 
-Tangle is one persona plus eleven skills, five specialists and five commands.
+Tangle is one persona plus thirteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

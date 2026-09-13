@@ -1,7 +1,7 @@
 # Publish everything a `./setup.sh` can consume, on every push to the release
 # branch:
 #
-#   - the four system images + the worker builder-base, pushed to ghcr under
+#   - the four system images, worker builder-base and full-library worker, pushed to ghcr under
 #     their content-addressed tags (the SAME tags a local install computes, so
 #     a clean checkout pulls instead of compiling; any local edit changes the
 #     hash and builds locally), one native build per architecture stitched

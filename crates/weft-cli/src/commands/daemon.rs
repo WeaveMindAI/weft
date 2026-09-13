@@ -551,6 +551,8 @@ async fn reconcile(rebuild: bool, rebuild_cluster: bool) -> Result<()> {
     let mut pending = PendingStamps::default();
     let changes = apply_platform_state(cfg, &imgs, &mut pending).await?;
 
+    recover_failed_dispatcher_update(&cfg.system_namespace, &imgs.dispatcher).await?;
+
     // The dispatcher exists (or was scaled back up) after the apply,
     // and a spec change (a new image tag rides the manifest) is
     // already rolling; wait before deciding the explicit rolls so a
@@ -823,6 +825,74 @@ async fn wait_workload_ready(kind: &str, name: &str, namespace: &str) -> Result<
              Inspect it: kubectl --context {ctx} -n {namespace} describe {kind}/{name}\n\
              and:        kubectl --context {ctx} -n {namespace} logs {kind}/{name}"
         );
+    }
+    Ok(())
+}
+
+/// The kubelet's `waiting` reasons for a pod that will not come up on its
+/// own: the process crashes, or its image cannot be pulled or configured.
+const STUCK_WAITING_REASONS: [&str; 4] =
+    ["CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError"];
+
+/// StatefulSet updates wait for an unhealthy old pod even after its template
+/// has been corrected. Replace only a stuck pod on a superseded image;
+/// a failure on the requested image must remain visible for diagnosis.
+fn dispatcher_needs_replacement(pod: &serde_json::Value, owner_uid: &str, image: &str) -> bool {
+    if !pod["metadata"]["deletionTimestamp"].is_null() {
+        return false;
+    }
+    let owned = pod["metadata"]["ownerReferences"].as_array().is_some_and(|owners| {
+        owners.iter().any(|owner| owner["uid"] == owner_uid && owner["controller"] == true)
+    });
+    let ready = pod["status"]["conditions"].as_array().is_some_and(|conditions| {
+        conditions.iter().any(|condition| condition["type"] == "Ready" && condition["status"] == "True")
+    });
+    owned && !ready && pod["spec"]["containers"].as_array().is_some_and(|containers| {
+        containers.iter().any(|container| {
+            container["name"] == "dispatcher"
+                && container["image"].as_str().is_some_and(|old| old != image)
+                && pod["status"]["containerStatuses"].as_array().is_some_and(|statuses| {
+                    statuses.iter().any(|status| status["name"] == container["name"]
+                        && status["state"]["waiting"]["reason"].as_str()
+                            .is_some_and(|reason| STUCK_WAITING_REASONS.contains(&reason)))
+                })
+        })
+    })
+}
+
+async fn recover_failed_dispatcher_update(namespace: &str, image: &str) -> Result<()> {
+    let output = kubectl(&["-n", namespace, "get", "statefulset/weft-dispatcher", "-o", "json"])
+        .output().await?;
+    anyhow::ensure!(output.status.success(), "inspect dispatcher update: {}", String::from_utf8_lossy(&output.stderr));
+    let statefulset: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let owner = statefulset["metadata"]["uid"].as_str().context("dispatcher StatefulSet has no UID")?;
+    let output = kubectl(&["-n", namespace, "get", "pods", "-o", "json"]).output().await?;
+    anyhow::ensure!(output.status.success(), "inspect dispatcher pods: {}", String::from_utf8_lossy(&output.stderr));
+    let pods: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    for pod in pods["items"].as_array().context("pod list has no items")? {
+        if !dispatcher_needs_replacement(pod, owner, image) {
+            continue;
+        }
+        let name = pod["metadata"]["name"].as_str().context("dispatcher pod has no name")?;
+        let uid = pod["metadata"]["uid"].as_str().context("dispatcher pod has no UID")?;
+        // The UID alone pins the pod that was inspected: a replacement the
+        // controller already made has a new one. Its resourceVersion is
+        // not pinned, because the kubelet rewrites a crashing pod's status
+        // on every backoff, and a stale version would turn this into a
+        // conflict on exactly the pods it exists to replace.
+        let options = serde_json::json!({
+            "apiVersion": "v1", "kind": "DeleteOptions",
+            "preconditions": { "uid": uid }
+        });
+        let file = tempfile::NamedTempFile::new()?;
+        serde_json::to_writer(file.as_file(), &options)?;
+        eprintln!("replacing stuck dispatcher {name} from a superseded image");
+        // Graceful deletion preserves shutdown guarantees. The precondition
+        // forbids deleting a replacement.
+        let path = format!("/api/v1/namespaces/{namespace}/pods/{name}");
+        let output = kubectl(&["delete", "--raw", &path, "-f", file.path().to_str().context("delete options path is not UTF-8")?])
+            .output().await?;
+        anyhow::ensure!(output.status.success(), "replace stale dispatcher {name}: {}; rerun setup to inspect its current state", String::from_utf8_lossy(&output.stderr));
     }
     Ok(())
 }
@@ -1848,6 +1918,7 @@ async fn ensure_cluster(cfg: &ClusterConfig, rebuild_cluster: bool) -> Result<()
             anyhow::ensure!(status.success(), "kind delete cluster failed with {status}");
             return create_cluster(cfg, &config, &want).await;
         }
+        ensure_cluster_nodes_running(cfg).await?;
         // The kind cluster exists, but the kubeconfig CONTEXT can be absent even so:
         // a reset/rotated kubeconfig, a different `$KUBECONFIG`, or a prior partial
         // run leaves the node running with no `kind-<name>` context. Everything
@@ -1870,6 +1941,26 @@ async fn ensure_cluster(cfg: &ClusterConfig, rebuild_cluster: bool) -> Result<()
     create_cluster(cfg, &config, &want).await
 }
 
+/// Start existing cluster nodes and preserve automatic startup after host reboots.
+async fn ensure_cluster_nodes_running(cfg: &ClusterConfig) -> Result<()> {
+    let out = images::quiet_stdout("kind")
+        .args(["get", "nodes", "--name", &cfg.cluster_name]).output().await?;
+    anyhow::ensure!(out.status.success(), "kind get nodes failed with {}", out.status);
+    let names = String::from_utf8(out.stdout)?;
+    anyhow::ensure!(!names.trim().is_empty(), "cluster '{}' has no nodes", cfg.cluster_name);
+    for node in names.lines().map(str::trim).filter(|name| !name.is_empty()) {
+        let status = images::docker().args(["update", "--restart", "unless-stopped", node]).status().await?;
+        anyhow::ensure!(status.success(), "setting restart policy for {node} failed with {status}");
+        let out = images::docker().args(["inspect", "--format", "{{.State.Running}}", node]).output().await?;
+        anyhow::ensure!(out.status.success(), "inspecting cluster node {node} failed with {}", out.status);
+        if String::from_utf8_lossy(&out.stdout).trim() != "true" {
+            let status = images::docker().args(["start", node]).status().await?;
+            anyhow::ensure!(status.success(), "starting cluster node {node} failed with {status}");
+        }
+    }
+    Ok(())
+}
+
 /// Build the node from `config` and record the fingerprint it was built from.
 async fn create_cluster(cfg: &ClusterConfig, config: &str, fingerprint: &str) -> Result<()> {
     // The config bind-mounts this directory into the node, and kind
@@ -1886,6 +1977,7 @@ async fn create_cluster(cfg: &ClusterConfig, config: &str, fingerprint: &str) ->
     if !status.success() {
         anyhow::bail!("kind create cluster failed with {status}");
     }
+    ensure_cluster_nodes_running(cfg).await?;
     // Stamped only after the node is up: a failed create must not leave a
     // fingerprint claiming this shape is live.
     std::fs::create_dir_all(data_dir())?;
@@ -3338,6 +3430,39 @@ fn signal_term(pid: i32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dispatcher_recovery_only_replaces_crashing_owned_old_images() {
+        let pod = serde_json::json!({
+            "metadata": { "ownerReferences": [{ "uid": "owner", "controller": true }] },
+            "spec": { "containers": [{ "name": "dispatcher", "image": "old" }] },
+            "status": {
+                "conditions": [{ "type": "Ready", "status": "False" }],
+                "containerStatuses": [{ "name": "dispatcher", "state": { "waiting": { "reason": "CrashLoopBackOff" } } }]
+            }
+        });
+        assert!(super::dispatcher_needs_replacement(&pod, "owner", "new"));
+        assert!(!super::dispatcher_needs_replacement(&pod, "other", "new"));
+        assert!(!super::dispatcher_needs_replacement(&pod, "owner", "old"));
+        let mut healthy = pod.clone();
+        healthy["status"]["conditions"][0]["status"] = serde_json::json!("True");
+        assert!(!super::dispatcher_needs_replacement(&healthy, "owner", "new"));
+        let mut starting = pod.clone();
+        starting["status"]["containerStatuses"][0]["state"] = serde_json::json!({ "running": {} });
+        assert!(!super::dispatcher_needs_replacement(&starting, "owner", "new"));
+        let mut unpullable = pod.clone();
+        unpullable["status"]["containerStatuses"][0]["state"] = serde_json::json!({ "waiting": { "reason": "ImagePullBackOff" } });
+        assert!(super::dispatcher_needs_replacement(&unpullable, "owner", "new"));
+        let mut creating = pod.clone();
+        creating["status"]["containerStatuses"][0]["state"] = serde_json::json!({ "waiting": { "reason": "ContainerCreating" } });
+        assert!(!super::dispatcher_needs_replacement(&creating, "owner", "new"));
+        let mut deleting = pod.clone();
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-09-13T12:00:00Z");
+        assert!(!super::dispatcher_needs_replacement(&deleting, "owner", "new"));
+        let mut sidecar = pod;
+        sidecar["spec"]["containers"][0]["name"] = serde_json::json!("sidecar");
+        sidecar["status"]["containerStatuses"][0]["name"] = serde_json::json!("sidecar");
+        assert!(!super::dispatcher_needs_replacement(&sidecar, "owner", "new"));
+    }
     use super::{
         apiserver_clusterip, canonical_tunnel_hostname, check_cidr, configured_dns_ip,
         endpoint_host, parse_pooled_listing, rolls_for, split_yaml_documents,

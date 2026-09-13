@@ -33,9 +33,18 @@ impl Node for FalEditImageNode {
         let mask: Option<FileHandle> = ctx.inputs.opt("mask")?;
         let params = ctx.inputs.raw("params").cloned();
 
+        // Two families, two spellings of the same argument: the flux
+        // kontext line takes `image_url` (one string), OpenAI's edit
+        // endpoint takes `image_urls` (a list) and answers 422 without
+        // it. Send both; each model reads the key it knows and ignores
+        // the other. A model that refuses the one it does not know is not
+        // a dead end: `params: { "image_urls": null }` takes it back off,
+        // which is what a null extra means.
+        let image_url = media_url(&ctx, &image).await?;
         let mut payload = json!({
             "prompt": prompt,
-            "image_url": media_url(&ctx, &image).await?,
+            "image_url": image_url.clone(),
+            "image_urls": [image_url],
         });
         if let Some(mask) = &mask {
             payload["mask_url"] = json!(media_url(&ctx, mask).await?);

@@ -63,12 +63,13 @@ commands are the expert's hand on the same loop.
 | `.kilo/skills/weft-safety/` | on demand, when a program talks to a model or acts on the world | the swiss cheese model, the free layers built by default (a defensive prompt, one more key on the call already being made, limits at the interface), the layers that add a call or a person offered once when the stakes are real, the gate and human-check wiring |
 | `.kilo/skills/weft-node-authoring/` | on demand, around dispatches | the dispatch protocol and review checklist for Tangle, and the authoring manual the specialist reads |
 | `.kilo/skills/weft-running/` | on demand, when running or debugging | the CLI map, the daemon, journal inspection, the debugging playbook |
+| `.kilo/skills/weft-sdp/` | on demand, when growing a program stage by stage | seeded runs, specs that run one piece with values handed in, firing a trigger without activating, the version tree, freezing and checking examples, every refusal and the verb that answers it |
 | `.kilo/skills/weft-editor/` | on demand, about the VS Code interface | the graph view: toolbar, action bar, palette, gestures, groups and loops, inspector, labels verbatim |
 | `.kilo/skills/weft-connections/` | on demand, about accounts | the connect flow door by door, permissions, the browser extension, a public URL |
 | `.kilo/skills/weft-consumers/` | on demand, when building a consumer of a program's signals | the api token, the dispatcher doors, the listing and form shapes, how a new kind reaches consumers, the reference extension |
 | `.kilo/skills/weft-onboarding/` | on demand, when asked to teach | the guided tour: plain-word vocabulary and the itinerary |
 | `.kilo/skills/weft-updating/` | on demand, when weft itself updates | the git pull plus setup.sh walk, what an update touches and preserves, and fixing a failed one |
-| `.kilo/command/` | `/weft-check`, `/weft-run`, `/weft-debug`, `/weft-new-node`, `/weft-live-test` | the expert's hand: the loop's steps on demand, live tests with informed consent |
+| `.kilo/command/` | `/weft-check`, `/weft-run`, `/weft-grow`, `/weft-debug`, `/weft-new-node`, `/weft-live-test` | the expert's hand: the loop's steps on demand, live tests with informed consent |
 | `.kilo/plugin/weft-validation.ts` | after every edit | the compiler answers every edit: fast validate on the touched source, structural errors and the level warning fed back to the model automatically |
 | `.kilo/agent/catalog-scout.md` | when dispatched | research only: sweeps the catalog, reports exact node specs |
 | `.kilo/agent/prompt-engineer.md` | when dispatched | writes and overhauls the program's LLM prompts, running the WeaveMind prompt-building playbook verbatim as its mind; its brief carries the job, the model, the data, the output shape |

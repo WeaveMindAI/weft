@@ -10,7 +10,7 @@ for other assistants.
 
 The persona is `.github/copilot-instructions.md`. Skills sit in
 `.github/skills/`, the five specialists are `.agent.md` files in
-`.github/agents/`, and the five commands are prompt files in
+`.github/agents/`, and the six commands are prompt files in
 `.github/prompts/` (invoked as `/weft-check` and so on).
 
 Copilot's custom agents take a `tools` list, so the three research
@@ -30,7 +30,7 @@ so it survives being re-registered under the other spelling.
 
 ## What is here
 
-Tangle is one persona plus eleven skills, five specialists and five commands.
+Tangle is one persona plus thirteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

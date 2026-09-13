@@ -1,25 +1,14 @@
-//! `register_signal` task: a dispatcher Pod places the signal on a
-//! pooled listener (`ListenerPool::place_signal` picks the least-loaded
-//! non-saturated pod or spawns one), registers it there, then INSERTs the
-//! durable `signal` row WITH its holder + generation (`signal_insert`
-//! takes a `SignalPlacement`, so the row is born pointing at the pod, no
-//! separate placement write), and returns the minted token to the worker.
-//! The freshly-placed pod is protected from the idle reaper by its spawn
-//! grace (`listener_pod.grace_until_unix`) for the window between
-//! placement and the `signal_insert`, so the reaper cannot tear it down
-//! mid-register.
-//!
-//! Producers: the worker calls `task_client::enqueue` (in weft-engine)
-//! when it hits `ctx.register_signal` or `ctx.await_signal`. The
-//! worker blocks on the task's terminal state and reads the resulting
-//! token from `task.result`.
+//! Trigger setup captures SignalSpec and input ports in the journal without
+//! contacting a listener. Activation arms the completed capture. Suspensions
+//! arm immediately and return the token the worker waits on. Both arming paths
+//! persist placement and registration together, protected by listener grace.
 //!
 //! Idempotency: dedup keyed on `(color, node_id, frames, is_resume,
 //! call_index)` so a Pod-crash retry converges on the same task. The
 //! task's body is itself idempotent: entry rows reuse a stable token
 //! per `(project_id, node_id)`, resume rows mint per-suspension.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -55,11 +44,6 @@ pub struct RegisterSignalPayload {
     pub port_snapshot: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterSignalResult {
-    pub token: String,
-}
-
 pub struct RegisterSignalExecutor;
 
 /// The stored mount path for a public-entry surface, namespaced by the owning
@@ -93,6 +77,34 @@ fn mount_path_for(
 impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: RegisterSignalPayload = serde_json::from_value(task.payload.clone())?;
+        if !payload.is_resume {
+            core_signal::validate_spec(&payload.spec).map_err(anyhow::Error::msg)?;
+            let color = payload.color.parse()?;
+            let rows = state.journal.events_log(color).await?;
+            anyhow::ensure!(matches!(rows.first(), Some(weft_journal::ExecEvent::ExecutionStarted {
+                phase: weft_core::context::Phase::TriggerSetup, program: Some(_), ..
+            })), "entry capture requires a trigger-setup run with a pinned program");
+            anyhow::ensure!(payload.frames.is_empty() && payload.call_index == 0, "entry capture cannot occur inside a loop or register more than once");
+            let found = crate::projection::execution_program(state, color).await?;
+            let project = found.program().context("entry capture has no original program")?;
+            anyhow::ensure!(project.nodes.iter().any(|node| node.id == payload.node_id && node.features.is_trigger),
+                "entry capture must come from a trigger in its original program");
+            let ports = payload.port_snapshot.context("entry capture requires its input port snapshot")?;
+            anyhow::ensure!(ports.is_object(), "entry capture ports must be an object");
+            state.journal.record_event_dedup(&weft_journal::ExecEvent::TriggerCaptured {
+                color, node_id: payload.node_id.clone(), spec: payload.spec, port_snapshot: ports,
+                at_unix: crate::lease::now_unix() as u64,
+            }, &format!("trigger_capture:{color}:{}", payload.node_id)).await?;
+            return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured)?);
+        }
+        let token = Self::arm(state, payload).await?;
+        Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Registered { token })?)
+    }
+}
+
+impl RegisterSignalExecutor {
+    /// Arm a captured entry or a live suspension through the same placement path.
+    pub(crate) async fn arm(state: &DispatcherState, payload: RegisterSignalPayload) -> Result<String> {
         let color: weft_core::Color = payload
             .color
             .parse()
@@ -194,6 +206,39 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         // and its register task is dedup'd, so no concurrent placer.
         let placement_generation =
             crate::listener::next_generation(&state.pg_pool, &token).await?;
+        // Validate durable source facts before creating a listener subscription.
+        let spec_json = serde_json::to_string(&payload.spec)?;
+
+        // Look up the registering node's _tags from the project
+        // definition so the signal row carries them. Tags drive the
+        // signal-token enumeration filter; charset already validated
+        // at parse time.
+        let project_uuid: uuid::Uuid = project_id
+            .parse()
+            .map_err(|e| anyhow::anyhow!("project_id parse: {e}"))?;
+        // Unfold the lookup. Both "project missing" and "node not in
+        // project" used to collapse to empty tags, which downstream
+        // signal-row enumeration filters by tag : so the trigger
+        // would silently never fire. Fail explicitly on either case.
+        let project_def = crate::projection::execution_program(state, color).await?
+            .program().context("register_signal: original program is unavailable")?;
+        let node = project_def
+            .nodes
+            .iter()
+            .find(|n| n.id == payload.node_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "register_signal: node_id='{}' not in project_id={project_uuid}",
+                    payload.node_id
+                )
+            })?;
+        let tags = node.tags();
+        let events = state.journal.events_log(color).await?;
+        let (program, source_version) = match events.first() {
+            Some(weft_journal::ExecEvent::ExecutionStarted { program, source_version, .. }) => (program.clone(), source_version.clone()),
+            _ => anyhow::bail!("register_signal: execution has no birth"),
+        };
+
         let (listener_pod, (routing, kind_state, rendered)) = state
             .listeners
             .place_signal(
@@ -305,41 +350,12 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
             Some(rendered)
         };
 
-        let spec_json = serde_json::to_string(&payload.spec)?;
-
-        // Look up the registering node's _tags from the project
-        // definition so the signal row carries them. Tags drive the
-        // signal-token enumeration filter; charset already validated
-        // at parse time.
-        let project_uuid: uuid::Uuid = project_id
-            .parse()
-            .map_err(|e| anyhow::anyhow!("project_id parse: {e}"))?;
-        // Unfold the lookup. Both "project missing" and "node not in
-        // project" used to collapse to empty tags, which downstream
-        // signal-row enumeration filters by tag : so the trigger
-        // would silently never fire. Fail explicitly on either case.
-        let project_def = state
-            .projects
-            .project(project_uuid)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("register_signal: project_id={project_uuid} not registered")
-            })?;
-        let node = project_def
-            .nodes
-            .iter()
-            .find(|n| n.id == payload.node_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "register_signal: node_id='{}' not in project_id={project_uuid}",
-                    payload.node_id
-                )
-            })?;
-        let tags = node.tags();
-
         let insert_result = state
             .journal
             .signal_insert(&crate::journal::SignalRegistration {
+                setup_color: (!payload.is_resume).then_some(color),
+                source_version,
+                program,
                 token: token.clone(),
                 tenant_id: tenant.to_string(),
                 project_id,
@@ -452,7 +468,7 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
                 .await?;
         }
 
-        Ok(serde_json::to_value(RegisterSignalResult { token })?)
+        Ok(token)
     }
 }
 

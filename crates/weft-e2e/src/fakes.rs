@@ -191,6 +191,99 @@ impl BytesFake {
     }
 }
 
+/// A fake provider with a QUEUE shape: money is committed when a job is
+/// submitted, and the amount is only stated on a later read.
+///
+/// The shape every "submit now, pay later" provider has, and the one the
+/// worker's open-charge machinery exists for. The rig owns both ends, so
+/// a test can submit a job and then decide whether its answer is ever
+/// read back: that is the difference between a spend with a figure on it
+/// and a spend the trail has to record as unknown.
+pub struct QueueFake {
+    base_url: String,
+    state: QueueState,
+    _server: AbortOnDrop,
+}
+
+#[derive(Clone)]
+struct QueueState {
+    next_id: Arc<std::sync::atomic::AtomicUsize>,
+    submits: Arc<std::sync::atomic::AtomicUsize>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// What every read of this fake answers: `Some(units)` states a
+    /// billed count, `None` says "still running", which is how a test
+    /// produces a spend nobody can put a figure on. Set once at
+    /// `start` and never changed, so it needs no lock: it used to be
+    /// behind one for a `finish_with` that no test called.
+    units: Option<u32>,
+}
+
+impl QueueFake {
+    /// Bind the fake. `units` is what a read reports once the job has
+    /// finished; `None` leaves every read saying "still running", which
+    /// is how a test produces a spend nobody can put a figure on.
+    pub async fn start(units: Option<u32>) -> Result<Self> {
+        let state = QueueState {
+            next_id: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            submits: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            units,
+        };
+        let (gateway, listener, port) = bind_host("queue").await?;
+        let app = Router::new()
+            .route("/submit", axum::routing::post(queue_submit))
+            .route("/result/{id}", get(queue_result))
+            .with_state(state.clone());
+        Ok(Self {
+            base_url: format!("http://{gateway}:{port}"),
+            state,
+            _server: serve_axum(listener, app),
+        })
+    }
+
+    /// The cluster-reachable base a connection's stored base points at.
+    pub fn base(&self) -> String {
+        self.base_url.clone()
+    }
+
+    /// How many jobs were submitted (money committed).
+    pub fn submits(&self) -> usize {
+        self.state.submits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many times an answer was read back.
+    pub fn reads(&self) -> usize {
+        self.state.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+}
+
+/// The header a read states the billed count in, the way a real queue
+/// provider does.
+// SYNC: QUEUE_UNITS_HEADER <-> crates/weft-e2e/fixtures/metering_queue/nodes/queue_job/mod.rs UNITS_HEADER
+// (the fixture's meter declares this header; renaming one side alone
+// makes the meter observe nothing and the test report an unpriced spend,
+// naming neither file)
+pub const QUEUE_UNITS_HEADER: &str = "x-queue-units";
+
+async fn queue_submit(State(state): State<QueueState>) -> impl IntoResponse {
+    state.submits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let id = state.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    axum::Json(serde_json::json!({ "request_id": format!("job-{id}") }))
+}
+
+async fn queue_result(State(state): State<QueueState>) -> impl IntoResponse {
+    state.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    match state.units {
+        Some(units) => (
+            [(QUEUE_UNITS_HEADER, units.to_string())],
+            axum::Json(serde_json::json!({ "status": "COMPLETED" })),
+        )
+            .into_response(),
+        None => axum::Json(serde_json::json!({ "status": "IN_PROGRESS" })).into_response(),
+    }
+}
+
 async fn bytes_handler(State(state): State<BytesState>) -> impl IntoResponse {
     state.served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     (

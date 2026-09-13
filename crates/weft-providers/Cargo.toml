@@ -23,6 +23,9 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
+# The response headers a meter reads its authoritative figure from
+# (fal states the billed quantity in `X-Fal-Billable-Units`).
+http = "1"
 # The ElevenLabs session observer reads the session URL's query (audio
 # format, add-on flags): the negotiated parameters price the bytes.
 url = { workspace = true }

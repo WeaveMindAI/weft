@@ -19,8 +19,11 @@ const DEFAULT_GRACE_MINUTES: u32 = 15;
 
 /// Resolve the trigger-deactivation choice (mode + grace + running
 /// policy) from explicit flags, falling back to interactive prompts
-/// on a human terminal. In `--json` mode, missing values are an
-/// error: the caller (the extension) must pass them explicitly.
+/// on a human terminal. Off a terminal, or in `--json` mode, a missing
+/// `--mode` is an error (the caller must choose; a script never gets a
+/// wipe it did not ask for). A missing grace takes the default in `--json`
+/// mode; a terminal is asked (Enter accepts the default); off a terminal
+/// the grace prompt refuses, naming `--grace`.
 ///
 /// Returns a JSON object matching the wire
 /// `DeactivateSpec` shape (`mode`, `runningPolicy`, optional
@@ -38,11 +41,12 @@ pub fn prompt_trigger_deactivation(
     drain_timeout: Option<u64>,
 ) -> anyhow::Result<serde_json::Value> {
     // Mode resolution priority: explicit --mode flag > interactive
-    // prompt (human terminal only) > error (json mode).
+    // prompt (human terminal only) > error (a script, or `--json`).
+    let scripted = json || !crate::prompt::is_interactive();
     let mode = match mode {
         Some(m) => m.to_string(),
-        None if json => anyhow::bail!(
-            "{verb_label}: project is active, --mode required \
+        None if scripted => anyhow::bail!(
+            "{verb_label}: --mode required \
              (one of: wipe, hibernate, park)"
         ),
         None => prompt_mode()?,
@@ -51,9 +55,10 @@ pub fn prompt_trigger_deactivation(
         anyhow::bail!("invalid mode '{mode}'; must be one of: wipe, hibernate, park");
     }
 
-    // Grace window: only meaningful for hibernate. Prompt if the
-    // user picked hibernate interactively without --grace; otherwise
-    // fall back to default. Non-hibernate mode ignores grace entirely.
+    // Grace window: only meaningful for hibernate. `--json` (the editor)
+    // takes the documented default; anyone else without --grace is
+    // asked, and `prompt_grace` refuses off a terminal naming the flag,
+    // so a shell script never gets a window it did not choose.
     let grace_minutes = match (mode.as_str(), grace) {
         ("hibernate", Some(g)) => Some(g),
         ("hibernate", None) if json => Some(DEFAULT_GRACE_MINUTES),
@@ -137,11 +142,6 @@ async fn run_inner(
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
 ) -> anyhow::Result<()> {
-    let (client, id, name) = match project {
-        Some(id) => (ctx.client(), id.clone(), id),
-        None => super::resolve_project(ctx)?,
-    };
-
     // No `--mode` in `--json` is refused by `prompt_trigger_deactivation`
     // (a script never gets a wipe it did not ask for); on a terminal it
     // prompts.
@@ -153,6 +153,11 @@ async fn run_inner(
         running_policy.as_deref(),
         drain_timeout,
     )?;
+
+    let (client, id, name) = match project {
+        Some(id) => (ctx.client(), id.clone(), id),
+        None => super::resolve_project(ctx)?,
+    };
 
     let path = format!("/projects/{id}/deactivate");
     // The dispatcher's `/deactivate` endpoint takes the canonical
@@ -219,4 +224,20 @@ fn prompt_mode() -> anyhow::Result<String> {
         "3" | "park" => "park".into(),
         other => anyhow::bail!("aborted: unrecognized choice '{other}'"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prompt_trigger_deactivation;
+
+    #[test]
+    fn scripts_must_choose_deactivation_without_getting_a_default_wipe() {
+        let error = prompt_trigger_deactivation(true, "deactivate", None, None, None, None)
+            .unwrap_err().to_string();
+        assert!(error.contains("--mode required"), "{error}");
+        let park = prompt_trigger_deactivation(true, "deactivate", Some("park"), None, None, None)
+            .unwrap();
+        assert_eq!(park["mode"], "park");
+        assert_eq!(park["runningPolicy"], "wait");
+    }
 }

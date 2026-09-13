@@ -99,6 +99,40 @@ impl DispatcherClient {
         Ok(())
     }
 
+    /// PUT with a JSON body, returning JSON.
+    pub async fn put_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.put(&url).json(body).send().await.with_context(|| format!("PUT {url}"))?;
+        Self::check(resp).await?.json().await.context("parse response")
+    }
+
+    /// PUT with a JSON body, discard the response (a 204).
+    pub async fn put_with_body(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.put(&url).json(body).send().await.with_context(|| format!("PUT {url}"))?;
+        Self::check(resp).await?;
+        Ok(())
+    }
+
+    /// DELETE returning JSON (a prune answers what it removed).
+    pub async fn delete_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.delete(&url).send().await.with_context(|| format!("DELETE {url}"))?;
+        Self::check(resp).await?.json().await.context("parse response")
+    }
+
+    /// POST with a JSON body, handing back the status and the body
+    /// text whatever the status: for a caller that reads a structured
+    /// refusal (the run endpoint's 422 carries a JSON `Refusal`) and
+    /// treats every other failure as `check` would.
+    pub async fn post_json_status(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<(u16, String)> {
+        let url = format!("{}{}", self.base, path);
+        let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status.as_u16(), text))
+    }
+
     /// DELETE carrying a JSON body and returning JSON (the storage
     /// files endpoint takes its key/prefix selector in the body).
     pub async fn delete_with_body(

@@ -21,6 +21,7 @@ pub mod events;
 pub mod runtime_storage;
 pub mod runtime_store;
 pub mod scope;
+pub mod signal_placement;
 pub mod state;
 
 use std::sync::Arc;

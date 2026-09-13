@@ -16,7 +16,10 @@ import { HttpError } from './dispatcher';
 import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
-import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
+import { exampleNameProblem, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
+import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
+import * as nodeFs from 'node:fs';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
 import { isLiveDataItem, signalDisplayToLiveItems } from '../../packages/weft-graph/src/live-data';
 import * as nodePath from 'node:path';
@@ -67,6 +70,10 @@ export class GraphViewController {
   private parseSeq = 0;
   // Host-side callbacks wired by extension.ts.
   private runHandler: ((targets: string[]) => void) | undefined;
+  /// Told the group the user stands in (an include's alias chain, or
+  /// null at the top level) on every navigation, so the Executions view
+  /// marks the runs scoped to it.
+  private navHandler: ((focusedGroup: string | null) => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
   private openSourceHandler: ((location?: SourceLocation) => void) | undefined;
@@ -136,6 +143,59 @@ export class GraphViewController {
   /** Called by extension.ts so sidebar-initiated runs and action-bar
    *  clicks route through the same business logic. */
   setRunHandler(fn: (targets: string[]) => void): void { this.runHandler = fn; }
+  setNavHandler(fn: (focusedGroup: string | null) => void): void { this.navHandler = fn; }
+
+  /** Tell the graph which version the followed run ran and which one
+   *  the files on disk are, so it can say when they differ.
+   *
+   *  Remembered, and re-sent by the ready handler, because the panel may
+   *  not be listening yet: clicking "view in graph" on a run of a project
+   *  that is not open creates the panel and posts this immediately after,
+   *  which the webview never saw, so the "this run is from older code"
+   *  banner never appeared on exactly the path it was written for. */
+  setExecVersion(color: string, version: string | null, diskVersion: string | null): void {
+    this.execVersionFor = this.watchedProjectId;
+    this.lastExecVersion = { kind: 'execVersion', color, version, diskVersion };
+    void this.panel?.webview.postMessage(this.lastExecVersion satisfies HostMessage);
+  }
+
+  /** Re-send the last version message, for a panel that has just mounted.
+   *
+   *  Only for the PROJECT it was about. The controller outlives both the
+   *  panel and the file it shows, so an unguarded re-send put a banner
+   *  naming one project's run over another project's graph, with nothing
+   *  to clear it (the webview only drops the version when a new run
+   *  starts). The project and not the file, because the banner is about
+   *  the RUN: navigating into an include changes the file and follows the
+   *  same run, so the banner has to survive that. */
+  resendExecVersion(): void {
+    if (this.lastExecVersion && this.execVersionFor === this.watchedProjectId) {
+      void this.panel?.webview.postMessage(this.lastExecVersion satisfies HostMessage);
+    }
+  }
+
+  /** Drop the remembered run banner, and take it off a live panel.
+   *
+   *  Revealing the panel for another project does not tear it down, so
+   *  the guard on the re-send is not enough on its own: the webview is
+   *  still showing the old project's banner and nothing else would ever
+   *  clear it. A version of `null` is how the webview is told there is no
+   *  followed run here. */
+  private forgetExecVersion(): void {
+    if (!this.lastExecVersion) return;
+    const color = this.lastExecVersion.color;
+    this.lastExecVersion = undefined;
+    this.execVersionFor = undefined;
+    void this.panel?.webview.postMessage({
+      kind: 'execVersion',
+      color,
+      version: null,
+      diskVersion: null,
+    } satisfies HostMessage);
+  }
+  private lastExecVersion: { kind: 'execVersion'; color: string; version: string | null; diskVersion: string | null } | undefined;
+  /// Which project `lastExecVersion` describes a run of.
+  private execVersionFor: string | undefined;
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
   setOpenSourceHandler(fn: (location?: SourceLocation) => void): void { this.openSourceHandler = fn; }
@@ -192,6 +252,7 @@ export class GraphViewController {
 
   /** Public so execFollower can push events into the panel. */
   post(msg: HostMessage): void {
+    if (msg.kind === 'execReset') this.forgetExecVersion();
     this.panel?.webview.postMessage(msg);
   }
 
@@ -233,6 +294,11 @@ export class GraphViewController {
     // panel (live poll, infra status, trigger status).
     const resolved = projectId ?? readProjectIdFromToml(doc.uri.fsPath);
     if (resolved) this.watchedProjectId = resolved;
+    // A banner about another project's run goes now, before the graph
+    // under it changes.
+    if (this.execVersionFor !== undefined && this.execVersionFor !== this.watchedProjectId) {
+      this.forgetExecVersion();
+    }
     // Graph takes ViewColumn.Active so the .weft text doesn't
     // show by default. The "Source" button opens the text in
     // ViewColumn.Beside (column 2). We don't try to swap them
@@ -247,9 +313,9 @@ export class GraphViewController {
       return;
     }
 
-    // Learn the storage origin before rendering the CSP, so an
-    // <img>/<video> can stream directly from the box.
-    await this.loadStorageOrigin();
+    // Learn the media origin before rendering the CSP, so an
+    // <img>/<video> can stream the bytes a minted link points at.
+    this.loadStorageOrigin();
 
     this.panel = vscode.window.createWebviewPanel(
       'weft.graph',
@@ -1083,6 +1149,28 @@ export class GraphViewController {
       case 'runProject':
         this.runHandler?.(msg.targets ?? []);
         break;
+      case 'resolveSpec':
+        void this.resolveSpec(msg.requestId, msg.spec, msg.seeded);
+        break;
+      case 'listSpecs':
+        this.postSpecs();
+        break;
+      case 'runSpec':
+        void this.runSpec(msg.spec, msg.seeded);
+        break;
+      case 'saveSpec':
+        void this.saveSpec(msg.spec).catch((err) => {
+          void vscode.window.showErrorMessage(
+            `Weft: could not save the example: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+        break;
+      case 'runSpecFile':
+        void this.dispatchVerb('run', [msg.name]);
+        break;
+      case 'branchTo':
+        void this.dispatchVerb('branch', [msg.reference]);
+        break;
       case 'infraStart':
         void this.dispatchVerb('infra', ['start']);
         break;
@@ -1238,26 +1326,13 @@ export class GraphViewController {
     await this.triggerParse();
   }
 
-  /// Fetch the storage origin the webview CSP must allow so media
-  /// streams directly from the box. Best-effort: on failure the origin
-  /// stays empty and image previews can't load (their node shows the
-  /// "unavailable" fallback at the point of use, which is the visible
-  /// signal). We do NOT block panel boot or pop a modal, since a
-  /// storage-less project never previews media; the failure is logged
-  /// so a developer can see the real cause (dispatcher unreachable /
-  /// too old) rather than guessing from a blank preview.
-  private async loadStorageOrigin(): Promise<void> {
-    try {
-      const resp = await this.client.get<{ public_base_url: string }>('/storage/public-base');
-      this.storageOrigin = originOf(resp.public_base_url);
-    } catch (err) {
-      this.storageOrigin = '';
-      console.warn(
-        '[weft] storage origin unavailable; inline media previews will show a fallback ' +
-          'until the graph is reopened with the dispatcher reachable',
-        err,
-      );
-    }
+  /// The origin the webview CSP must allow so inline media can load.
+  /// A file link is minted on whichever address the request went out
+  /// on, so that address IS the origin to allow, and reading it off
+  /// the client we are about to call cannot disagree with where the
+  /// link comes back pointing.
+  private loadStorageOrigin(): void {
+    this.storageOrigin = originOf(this.client.getBaseUrl());
   }
 
   /// Drive one storage-plane verb for the webview: POST the body to the
@@ -1870,6 +1945,163 @@ export class GraphViewController {
     await this.open(target, undefined, true);
   }
 
+  /// The root of the project the watched document belongs to.
+  private projectRoot(): string | undefined {
+    const doc = this.watchedDoc;
+    if (!doc) return undefined;
+    return findProjectRoot(doc.uri.fsPath) ?? undefined;
+  }
+
+  /// Resolve a spec through the parse server (the dispatcher's own
+  /// resolver over the buffer as it is), answering the dialog; a server
+  /// failure is a refusal that names it, never a silent dialog.
+  private async resolveSpec(requestId: number, spec: RunSpec, seeded: boolean): Promise<void> {
+    const doc = this.watchedDoc;
+    let result: ResolveSpecResponse;
+    if (!doc) {
+      result = { refusal: { errors: ['no .weft file is open'] } };
+    } else {
+      try {
+        const bakes = spec.fire && this.watchedProjectId
+          ? await this.client.get<BakeSummary[]>(`/projects/${this.watchedProjectId}/trigger-bakes`)
+          : [];
+        result = await this.parseServer.request<ResolveSpecResponse>({
+          kind: 'resolveSpec',
+          source: doc.getText(),
+          file: doc.uri.fsPath,
+          spec,
+          seeded,
+          bakes,
+        });
+      } catch (err) {
+        result = { refusal: { errors: [err instanceof Error ? err.message : String(err)] } };
+      }
+    }
+    void this.panel?.webview.postMessage({ kind: 'specResolved', requestId, result } satisfies HostMessage);
+  }
+
+  /// The project's `examples/*.json`, read off the disk (they are checked
+  /// in, and the CLI reads the same files).
+  private postSpecs(): void {
+    const root = this.projectRoot();
+    const specs: RunSpec[] = [];
+    if (root) {
+      const dir = nodePath.join(root, 'examples');
+      let names: string[] = [];
+      try {
+        names = nodeFs.readdirSync(dir).filter((n) => n.endsWith('.json')).sort();
+      } catch (err) {
+        // An `examples/` that cannot be read is not "no examples". The
+        // menu would have said so and the person would have gone looking
+        // for a missing file that is sitting right there.
+        const code = (err as { code?: string }).code;
+        if (code !== 'ENOENT') {
+          void vscode.window.showWarningMessage(
+            `Weft: could not read examples/ (${err instanceof Error ? err.message : String(err)}), so the Run menu is empty.`,
+          );
+        }
+        names = [];
+      }
+      const broken: string[] = [];
+      for (const file of names) {
+        try {
+          const spec = parseRunSpec(parseSuppliedJson(nodeFs.readFileSync(nodePath.join(dir, file), 'utf8')));
+          // Named by its FILE, always. `weft run <name>` resolves
+          // `examples/<name>.json`, so the name written inside the file
+          // is not what runs it: a file whose two names differed ran a
+          // different example or none, and two files sharing an inner
+          // name collided on the menu's key, which takes the graph down
+          // with a duplicate-key error.
+          specs.push({ ...spec, name: file.replace(/\.json$/, '') });
+        } catch (err) {
+          broken.push(`${file} (${err instanceof Error ? err.message : String(err)})`);
+        }
+      }
+      if (broken.length > 0) {
+        void vscode.window.showWarningMessage(
+          `Weft: ${broken.length} file(s) in examples/ do not parse and are not listed: ${broken.join(', ')}`,
+        );
+      }
+    }
+    void this.panel?.webview.postMessage({ kind: 'specsListed', specs } satisfies HostMessage);
+  }
+
+  /// Run a spec from the dialog as a one-off: the flags it spells, the
+  /// seed checkbox included (the dialog resolved it WITH seeding to
+  /// decide it was runnable, so dropping the flag refuses an input the
+  /// person was just told is covered).
+  private async runSpec(spec: RunSpec, seeded?: boolean): Promise<void> {
+    await this.dispatchVerb('run', specToRunArgs(spec, seeded === true));
+  }
+
+  /// Write a spec to `examples/<name>.json`. It does NOT run: saving used
+  /// to run it too, so writing down a spec you were not ready for started
+  /// a real execution.
+  ///
+  /// The name becomes a file name and `weft run <name>` resolves it by
+  /// file name, so it is checked here rather than joined blindly: a name
+  /// carrying a separator or a `..` wrote outside `examples/`, and one
+  /// carrying anything else the CLI does not resolve saved a file the Run
+  /// menu could never run.
+  private async saveSpec(spec: RunSpec): Promise<void> {
+    spec = parseRunSpec(spec);
+    // The spec's OWN name. It used to travel twice, as `spec.name` and
+    // as a second field copied from it, and the host then wrote the
+    // second one INTO the spec, so the message did not say which won.
+    const clean = spec.name.trim();
+    // The SAME rule the CLI applies, shared as one function, and checked
+    // here as well as in the dialog: a spec can arrive from any sender
+    // on this channel, and this is where the file name is joined.
+    const problem = exampleNameProblem(clean);
+    if (problem) {
+      void vscode.window.showErrorMessage(`Weft: '${spec.name}' cannot name an example: ${problem}.`);
+      return;
+    }
+    const root = this.projectRoot();
+    if (!root) {
+      void vscode.window.showErrorMessage('Weft: no project to save the spec into.');
+      return;
+    }
+    const dir = nodePath.join(root, 'examples');
+    const path = nodePath.join(dir, `${clean}.json`);
+    // Ordinary saved parameters can be replaced after confirmation.
+    // Frozen evidence is replaced only by explicitly freezing a new run.
+    let existed = false;
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.file(path));
+      existed = true;
+    } catch (err) {
+      // Only "it is not there" means it is not there. A permissions or
+      // unavailable answer swallowed as "nothing there" skips the
+      // question below and destroys whatever is in the file.
+      if ((err as vscode.FileSystemError)?.code !== 'FileNotFound') throw err;
+    }
+    if (existed) {
+      const saved = parseRunSpec(parseSuppliedJson(Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(path))).toString('utf8')));
+      if (saved.expected || saved.frozen_from) {
+        void vscode.window.showErrorMessage(`Weft: examples/${clean}.json is frozen. Save under another name, or use weft freeze after accepting a new run.`);
+        return;
+      }
+      const replace = await vscode.window.showWarningMessage(
+        `examples/${clean}.json already exists. Replace its saved run parameters?`,
+        { modal: true },
+        'Replace',
+      );
+      if (replace !== 'Replace') return;
+    }
+    const text = `${JSON.stringify({ ...spec, name: clean }, null, 2)}\n`;
+    // The directory after the question, so declining leaves nothing
+    // behind that was not there before.
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(path), Buffer.from(text, 'utf8'));
+    void vscode.window.showInformationMessage(
+      existed
+        ? `Weft: replaced examples/${clean}.json. The Run menu lists it.`
+        : `Weft: saved examples/${clean}.json. The Run menu lists it.`,
+    );
+    this.postSpecs();
+  }
+
   /// Pop the include back-stack (Return button): reopen the previous file.
   private async navigateBack(): Promise<void> {
     const previous = this.navStack.pop();
@@ -1894,6 +2126,7 @@ export class GraphViewController {
       fileName,
       execPrefix,
     });
+    this.navHandler?.(this.navStack.length === 0 ? null : this.navStack.map((f) => f.alias).join('.'));
   }
 
   /** Fetch every node type available in the current project scope
@@ -1956,6 +2189,8 @@ export class GraphViewController {
     this.disposables = [];
     this.panel = undefined;
     this.watchedDoc = undefined;
+    this.lastExecVersion = undefined;
+    this.execVersionFor = undefined;
   }
 
   private renderHtml(): string {

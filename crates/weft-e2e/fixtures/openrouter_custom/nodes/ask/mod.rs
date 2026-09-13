@@ -89,6 +89,8 @@ impl ProviderMeter for OpenRouterCustomMeter {
         OPENROUTER.classify(method, path)
     }
     fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        // OpenRouter is the one provider that DOES rewrite (it sheds the
+        // caller's media metadata), so this delegation stays.
         OPENROUTER.prepare(path, body)
     }
     async fn ceiling_usd(&self, path: &str, body: &[u8], follow_up: FollowUp<'_>) -> anyhow::Result<f64> {

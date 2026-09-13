@@ -1,8 +1,8 @@
 # Tangle
 
 Tangle is the AI builder that lives inside a weft project. It is not a
-product and not a plugin: it is a persona, eleven skills, five specialists
-and five commands, written as files that an AI coding assistant loads when
+product and not a plugin: it is a persona, thirteen skills, five specialists
+and six commands, written as files that an AI coding assistant loads when
 the user opens the project.
 
 One folder here per assistant. `weft new <name> --assistant <one of them>`

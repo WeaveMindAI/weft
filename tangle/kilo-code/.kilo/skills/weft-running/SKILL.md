@@ -19,9 +19,18 @@ happens in it is journaled, node by node, with the values on the wires.
 
 | Command | What it does |
 |---|---|
-| `weft build` | compile, resolve assets, build the worker image (content-addressed) |
+| `weft build` | compile, resolve assets, build the worker image (content-addressed) and register the project with the dispatcher. Starts nothing. Also the repair when the dispatcher no longer holds the code a past run ran: registering records the compiled program under its own hash, which is the hash the run names, so unchanged files make it readable again. It adds nothing to the version tree; `weft checkpoint` does that |
 | `weft validate --file main.weft < main.weft` | strict compile + validate, diagnostics as JSON, nothing runs |
-| `weft run [--target <id>]...` | register and fire one execution; follows it live unless `--detach`. With targets, only those nodes and what they need run (the union when you name several, independent branches included); nothing past a target and no sibling branch, even one sharing a root like the database. Without targets, every root fires and triggers close their outputs |
+| `weft run [<example>] [--referenced] [--seed] [--root] [--from <node>=<ports-json>]... [--emit <node>=<ports-json>]... [--target <id>]... [--before <id>]... [--group <id>=<ports-json>] [--fire <trigger>=<wake-json>] [--save <name>]` | build and start one execution; `--detach` returns its color. `--from` supplies backup inputs at a start, `--emit` supplies outputs without executing that node. Real producers take precedence over backups, and under `--seed` the earlier run's result IS a real producer: a `--from` value at a node history already feeds goes unused (the run says so in a warning). To hand a new value in, run without `--seed`, or `--emit` the upstream output instead. `--target` includes the endpoint; `--before` excludes it. `--group` selects a whole group or included file, with its input payload. `--fire` runs exactly one trigger using a matching bake. Ordinary groups can be cut precisely; loops stay whole. `--seed-before` / `--seed-until` bound compatible reuse. Named examples supply saved starting parameters; current code runs. Clear and replacement rules are in `weft-sdp` |
+| `weft checkpoint [<label>]` | record the files as a version under head, no run, no build; `already at <id>` when identical |
+| `weft branch <version\|label\|color>` | restore that version's files and move head (a checkpoint label names its version; a color makes that run the next seed). Refuses on a dirty tree naming the files; `--discard` overrides |
+| `weft tree` | the version tree: versions with what changed, their runs beneath, head marked (`--json` adds `disk_version`) |
+| `weft diff <ref> <ref> [--full]` | compare observed outputs for human or AI review, including frozen focus nodes. A ref is a color, its unambiguous prefix or `example:<name>`. Differences are evidence and do not fail the command |
+| `weft freeze <name> [<run>] [--expect <node>]...` | save that run's starting parameters and observed outputs in `examples/<name>.json`; default is head's run. `--expect` marks nodes to focus on during review. Run and diff leave the accepted file intact; freeze again after accepting its replacement |
+| `weft examples` | list saved parameters and frozen examples; inspect them, rerun with `weft run <name>`, then compare with `weft diff` |
+| `weft bake [--referenced]` | prepare trigger inputs without arming listeners. A manual `--fire` requires a matching bake; use `--referenced` here when the run uses `--referenced`. Activation also prepares and records a bake before arming |
+| `weft wake <color> <node>` | resolve a pure time wait now; refused for a wait expecting a value, naming its kind |
+| `weft prune <version>` | delete a version, everything under it, and their runs; asks first, `--yes` for scripts. Refuses on head's version, under a frozen example's origin, and while a run in the subtree is running |
 | `weft stop <color>` | cancel an execution |
 | `weft status` | registration, build state, listener, infra, drift |
 | `weft ps` | every registered project |
@@ -30,7 +39,7 @@ happens in it is journaled, node by node, with the values on the wires.
 | `weft logs [color]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run) |
 | `weft follow <project>` | live events for a project |
 | `weft activate` / `weft deactivate` | turn triggers on / off. They ask on a terminal; you have no terminal, so pass the answer: `weft deactivate --mode <wipe\|hibernate\|park>` (required without a terminal on an active project; `--running-policy <wait\|cancel>` defaults to `wait`) (see The three modes below) |
-| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. On an active project it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
+| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. Only for an ACTIVE project (a parked or hibernated one refuses: bring it back with `weft activate`), and it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
 | `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` | the project's long-running infra (Postgres, bridges) |
 | `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension. `mint` prints the connect URL, then the bare token on its own line for a script |
 | `weft daemon start` / `status` / `logs` | the local runtime |
@@ -40,18 +49,21 @@ happens in it is journaled, node by node, with the values on the wires.
 | `weft test-node <target>` | run node self-tests (`--tier live` spends money, asks first) |
 | `weft connect` | the editor's Connect panel as a CLI verb: `--list` the stored connections, `--node <id> --grant <id>` to pick one for a node, connect new accounts through both doors, `--upgrade`, `--forget`, `--disconnect` |
 | `weft rm [--all] [--force] --yes` | unregister the project, terminate infra, reclaim data. Asks first; you have no terminal, so pass `--yes`, and only after the user confirmed |
-| `weft clean --yes` | journal and image cleanup. Deleting runs asks first; same rule, `--yes` after the user confirmed |
+| `weft clean --yes` | journal and image cleanup, per subject, and naming a subject takes all of it: a color takes that one run, `--project <id>` takes a whole project's history (removing a project leaves its runs behind, so this is how you erase them), no subject at all takes everything older than `--keep-days` (30 by default), `--all` takes the lot. A version the deletion left bare (no runs, nothing under it, no checkpoint name, not head) goes with the runs; a named checkpoint never does. The `--images` and `--build-cache` forms touch no journal rows. Deleting runs asks first; you have no terminal, so pass `--yes`, and only after the user confirmed |
 
 How a run picks which nodes execute is in the `weft-language` skill. A
-trigger only fires on its event once the project is activated. `--json` is a
-global flag, and it means two things. The long commands (`build`, `run`,
+trigger only fires on its event once the project is activated; to try a
+trigger's program before activating, prepare it with `weft bake`, then run
+`weft run --fire '<trigger>=<wake-json>'` (the `weft-sdp` skill). `--json` is a
+global flag, and it means two things. The long commands (`build`, `bake`, `run`,
 `activate`, `deactivate`, `resync`, `infra`, `rm`, the cancels) stream
 progress as one JSON object per line. The readers (`status`, `ps`,
 `executions`, `events`, `logs`, `files`, `listener inspect`, `token`,
-`stop`, `connect`) print what the dispatcher answered, which is what you
-want for `jq` instead of parsing the human columns, and `test-node`
-prints its reports as one JSON array. `new`, `follow`, `daemon`,
-`catalog`, `clean` and `update` ignore it.
+`stop`, `connect`, `tree`, `examples`, `diff`, `checkpoint`,
+`branch`, `freeze`, `prune`, `wake`) print what the dispatcher answered,
+which is what you want for `jq` instead of parsing the human columns, and
+`test-node` prints its reports as one JSON array. `new`, `follow`,
+`daemon`, `catalog`, `clean` and `update` ignore it.
 
 When you wait on something long (a build, the daemon coming up, a run
 settling), never sit in a loop you cannot leave. Start the long thing
@@ -63,6 +75,20 @@ timer or a person is not going to finish on its own, and an open-ended
 If you do loop on a check, cap it: `timeout 30 bash -c 'until <check>; do
 sleep 5; done'`, and when the cap trips, read the state and say what it
 is waiting on rather than looping again.
+
+## When a past run shows no values
+
+A run's rows say what happened, not what it meant: the editor works out
+every input and output by replaying those rows against the code the run
+ran. So a run whose code the dispatcher no longer holds paints all its
+nodes with none of their values, and the reason is said on the run
+itself. Do not go hunting for a bug in the viewer, and do not read the
+empty graph as "the node produced nothing".
+
+The code is kept as long as any run points at it, so this is rare. If the
+files are still on disk, `weft build` puts the program back under the hash
+the run names and it reads as it did. If they are not, the run is readable
+only as its shape, and `weft clean <color>` removes it.
 
 ## The build and run flow
 
@@ -241,7 +267,7 @@ failing node and the wrong value.
    run's tags, so you can see which runs shared the tag). `Caller
    disconnected` means the live caller this run was answering dropped its
    connection. Anything else is the runtime's own reason, printed as words
-   (a worker pod shutting down, a build superseding a queued run's image).
+   (a worker pod shutting down).
 6. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
    bug (usually a wire the compiler could not catch). The `execution_failed`
    line names every firing left holding a pulse and the wired ports it never

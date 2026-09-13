@@ -169,11 +169,28 @@ which runs those two nodes and what they need, and nothing else: the run
 is held to the targets' upstream, so a root they share with another branch
 (a database the whole file reads) never drags that branch in, and nothing
 past a target runs either. Several targets run the union of what each
-needs, independent branches side by side. Any node can be a target. A
-target inside a group brings the whole group, and whatever feeds the
-group's inputs runs first, the same as when the group starts in a full
-run. In the graph, right-click a node and choose **Set as target**; the
+needs, independent branches side by side. A target inside an ordinary
+group selects only the work needed through that node, with the group's
+flow gate still applied. Loops stay whole; an interior cut is refused.
+In the graph, right-click a node and choose **Set as target**; the
 Run button then says how many targets it is aimed at.
+
+You can also start in the middle, or run one piece with values handed in:
+
+```bash
+weft run --from classify='{"text":"..."}' --target reply
+weft run --group triage='{"text":"..."}'
+```
+
+An input crossing into the selected work can use a compatible saved value
+with `--seed`, or a backup at the named start. Real execution values win
+over backups; a running producer is awaited. Widen the start when the
+producer needs to run again. Missing values follow normal port closure
+rules, including required-input skips. The editor labels a value you
+supplied `provided by hand`. If you want to know
+which flag picks which part of the graph, or how to fire a trigger by hand,
+go and read [Versions, seeded runs and frozen
+examples](../running/versions.md#running-one-group-or-one-node-onward).
 
 An aimed run answers to what it would execute, reading "what it would
 execute" as the joined upstream walk from every target at once:
@@ -192,11 +209,9 @@ execute" as the joined upstream walk from every target at once:
 
 **A trigger fire** runs one program: the trigger that fired, everything
 downstream of it, and everything upstream of that, stopping at other
-triggers on the way up. At fire time a trigger's outputs are the event, not
-a function of its inputs, which were read once at activation, so a node that
-only feeds a trigger has nothing to contribute. Every other trigger in that
-set is kicked with no payload, which closes its outputs, and
-[the skip cascade](#the-closed-pulse) prunes the branches that belong to it.
+triggers on the way up. Its input settings come from matching preparation,
+and its wake payload belongs to this event. A node that only prepared the
+trigger is not rerun to fire it. Other triggers are not fired.
 
 A node the fired trigger cannot reach belongs to another program in the same
 file, and a value that spills into it from a shared node (one database feeding
@@ -205,9 +220,9 @@ per trigger, and a middle section both of them need is picked up by whichever
 one fired without you saying so. What that buys you when laying a project out:
 [one file, several programs](../start/reading-the-graph.md#one-file-several-programs).
 
-A group or a loop is reached as a whole. When a scope's boundary settles, the
-launcher kicks every root inside it at the scope's frames, and a run aimed at
-a node inside a group brings the whole group.
+An ordinary group dispatches only selected work after its boundary and flow
+gate settle. This applies to manual cuts, trigger programs and preparation
+for listeners or infra. Loops stay whole; an interior cut is refused.
 
 ## When it ends
 

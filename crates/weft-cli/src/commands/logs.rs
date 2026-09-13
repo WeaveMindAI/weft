@@ -78,7 +78,10 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
             .and_then(|v| v.as_str())
             .map(|n| format!(" {n}{}:", frames_suffix(entry)))
             .unwrap_or_default();
-        println!("[{}] {level:>5}{node} {msg}", local_time(at));
+        let inherited = entry.get("inherited_from").and_then(|v| v.as_str())
+            .map(|color| format!(" [inherited from {}]", super::versions::short(color)))
+            .unwrap_or_default();
+        println!("[{}] {level:>5}{node}{inherited} {msg}", local_time(at));
     }
     // The dispatcher answers the tail, so a full page means the run
     // may have written more than this; a cut log must never read as

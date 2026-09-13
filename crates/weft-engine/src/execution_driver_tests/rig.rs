@@ -158,6 +158,15 @@
         }
     }
 
+    struct ProjectHistory(HashMap<(String, String), ProjectDefinition>);
+
+    #[async_trait]
+    impl crate::context::ProjectClient for ProjectHistory {
+        async fn fetch_definition(&self, project_id: &str, expected_hash: &str) -> anyhow::Result<Option<ProjectDefinition>> {
+            Ok(self.0.get(&(project_id.into(), expected_hash.into())).cloned())
+        }
+    }
+
     /// Seed + drive one execution: ExecutionStarted(Fire) + a kick per
     /// entry node, then `run_one_execution`. Returns the outcome and
     /// every journaled event.
@@ -248,9 +257,11 @@
             project_id: project.id.to_string(),
             entry_node: kicks[0].to_string(),
             phase: weft_core::context::Phase::Fire,
-            definition_hash: Some("test-hash".into()),
-            node_test: false,
-            subgraph: subgraph.map(|s| s.iter().map(|n| n.to_string()).collect()),
+            definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
+            program: None, source_version: None, node_test: false,
+            subgraph: subgraph.map(|s| weft_core::project::selection::RunSelection::restricted(
+                &project, s.iter().map(|n| n.to_string()).collect()).expect("valid test selection")),
+            seed: None,
             at_unix: 0,
         }];
         for kick in kicks {
@@ -297,24 +308,22 @@
     /// the scope that skipped it). Record ids, timestamps, logs and
     /// costs are local to each side and are not compared.
     ///
-    /// A run bounded to a subgraph is the one shape where the pulses
-    /// legitimately differ (an out-of-scope node's pulses are absorbed
-    /// live with no row, and refold Pending, to be absorbed the same
-    /// silent way again), so for such a run (read off its birth row)
-    /// the pulses are left out and everything else is still compared.
+    /// Selected and seeded runs obey the same equality, including
+    /// which supplied values were used and their original runs.
     pub(super) fn assert_fold_matches_live(
         project: &ProjectDefinition,
         events: &[ExecEvent],
+        chain: &weft_journal::SeedChain,
         live: &Drove,
     ) {
         /// One pulse as compared: node, id, status, closed, close
         /// error, frames, port, value (as its JSON text, so the row
         /// orders totally).
-        type PulseRow = (String, uuid::Uuid, String, bool, Option<String>, Vec<u32>, String, String);
+        type PulseRow = (String, uuid::Uuid, String, bool, Option<String>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, ordinal, status,
         /// error, suspension token, port warnings, absorbed pulses.
         type RecordRow =
-            (String, Vec<u32>, usize, NodeExecutionStatus, Option<String>, Option<String>, String, Vec<uuid::Uuid>);
+            (String, Vec<u32>, usize, NodeExecutionStatus, Option<String>, Option<String>, String, Vec<uuid::Uuid>, String, Option<uuid::Uuid>, String, Vec<String>);
         /// One gather port as compared: per iteration index, the write
         /// (a value as JSON text, or the closed slot).
         type GatherRow = (String, Vec<(u32, String)>);
@@ -340,8 +349,7 @@
         type KickRow = (String, Vec<u32>, bool, bool, Option<String>, Option<String>, Option<String>);
         let birth = events.first().expect("journal has rows");
         let color = birth.color();
-        let subgraph_bounded = matches!(birth, ExecEvent::ExecutionStarted { subgraph: Some(_), .. });
-        let snap = weft_journal::fold_to_snapshot(color, Arc::new(project.clone()), events);
+        let snap = weft_journal::fold_seeded(color, Arc::new(project.clone()), chain, events).expect("journal folds");
         assert!(snap.corruptions.is_empty(), "the fold rejected a row the run wrote: {:?}", snap.corruptions);
         let json_pairs = |m: &HashMap<String, Arc<serde_json::Value>>| -> Vec<(String, String)> {
             let mut v: Vec<_> = m.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
@@ -362,6 +370,9 @@
                             p.frames.iter().map(|f| f.index).collect::<Vec<_>>(),
                             p.target_port.clone(),
                             p.value.to_string(),
+                            p.provided,
+                            p.backup,
+                            p.inherited_from,
                         )
                     })
                 })
@@ -369,7 +380,7 @@
             v.sort();
             v
         };
-        if !subgraph_bounded {
+        {
             let live_pulses = pulses(&live.pulses);
             let fold_pulses = pulses(&snap.pulses);
             assert_eq!(
@@ -388,6 +399,8 @@
                     recs.iter().map(move |r| {
                         let mut absorbed = r.pulses_absorbed.clone();
                         absorbed.sort();
+                        let mut closed_outputs: Vec<_> = r.closed_output_ports.iter().cloned().collect();
+                        closed_outputs.sort();
                         (
                             node.clone(),
                             r.frames.iter().map(|f| f.index).collect::<Vec<_>>(),
@@ -397,6 +410,10 @@
                             r.callback_id.clone(),
                             format!("{:?}", r.port_warnings),
                             absorbed,
+                            weft_core::project::hash::canonical_json(&serde_json::to_value(&r.received).unwrap()),
+                            r.inherited_from,
+                            serde_json::to_string(&r.skip_reason).unwrap(),
+                            closed_outputs,
                         )
                     })
                 })
@@ -493,6 +510,34 @@
         (drove, events)
     }
 
+    /// Drive a SEEDED run: the journal already holds `ancestor_rows`
+    /// (the seed runs, under their own colors) and the child's birth
+    /// rows are `rows`. Answers the outcome and the child's own rows.
+    pub(super) async fn drive_seeded(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        color: Color,
+        ancestor_rows: Vec<ExecEvent>,
+        definitions: Vec<ProjectDefinition>,
+        rows: Vec<ExecEvent>,
+    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        let journal = Arc::new(MemJournal::default());
+        for row in ancestor_rows.iter().chain(rows.iter()) {
+            journal.record_event(row, None).await.unwrap();
+        }
+        let project = Arc::new(project);
+        let mut clients = clients(journal.clone());
+        clients.project = Arc::new(ProjectHistory(definitions.into_iter().map(|definition| {
+            let key = (definition.id.to_string(), weft_core::project::hash::compute_definition_hash(&definition).unwrap());
+            (key, definition)
+        }).collect()));
+        let drove = drive_on(project, catalog, color, journal.clone(), clients, CancellationFlag::new_arc(), None)
+            .await
+            .expect("run_one_execution ok");
+        let events = journal.events_for_color(color).await.expect("mem journal");
+        (drove.outcome, events)
+    }
+
     /// The rig's fake clients over `journal`.
     pub(super) fn clients(journal: Arc<MemJournal>) -> EngineClients {
         EngineClients {
@@ -505,6 +550,7 @@
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            open_charges: crate::metering::OpenCharges::new(),
             steering: Arc::new(NoopSteering),
         }
     }
@@ -525,6 +571,7 @@
         cancellation: Arc<CancellationFlag>,
         caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
     ) -> anyhow::Result<Drove> {
+        let projects = clients.project.clone();
         let drove = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             run_one_execution_observed(
@@ -542,8 +589,19 @@
         .await
         .expect("the drive hung: a loud-failure contract regressed into a hang")?;
         if !matches!(drove.outcome, ExecutionOutcome::AlreadySettled) {
-            let events = journal.events.lock().unwrap().clone();
-            assert_fold_matches_live(&project, &events, &drove);
+            // The run's own rows, folded over what it inherits (the
+            // journal may hold the seed's rows under another color).
+            let events = journal.events_for_color(color).await.expect("mem journal");
+            let chain = weft_journal::seed_chain(&events, |c| journal.events_for_color(c), |id, hash| {
+                let projects = projects.clone();
+                async move {
+                    projects.fetch_definition(&id, &hash).await?.map(Arc::new)
+                        .ok_or_else(|| anyhow::anyhow!("test seed program {id}/{hash} was not registered"))
+                }
+            })
+                .await
+                .expect("the seed chain reads");
+            assert_fold_matches_live(&project, &events, &chain, &drove);
         }
         Ok(drove)
     }

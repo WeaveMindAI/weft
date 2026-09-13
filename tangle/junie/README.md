@@ -9,7 +9,7 @@ for other assistants.
 ## What is different here
 
 The persona is `.junie/AGENTS.md`. Skills sit in `.junie/skills/`, the five
-specialists are subagents in `.junie/agents/`, and the five commands are
+specialists are subagents in `.junie/agents/`, and the six commands are
 `.junie/commands/`.
 
 Two things about this one are genuinely different.
@@ -30,13 +30,13 @@ and says so in the persona: running `weft validate` after every edit is
 Tangle's own discipline here.
 
 The commands use Junie's named template arguments (`$args`), so
-`/weft-live-test args="TelegramSendMedia"`. The two commands whose argument is
+`/weft-live-test args="TelegramSendMedia"`. The three commands whose argument is
 optional carry no placeholder at all, because Junie will not run a command
 until every template argument has a value.
 
 ## What is here
 
-Tangle is one persona plus eleven skills, five specialists and five commands.
+Tangle is one persona plus thirteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

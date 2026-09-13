@@ -159,8 +159,9 @@
                     entry_node: "producer".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    node_test: false,
+                    program: None, source_version: None, node_test: false,
                     subgraph: None,
+                    seed: None,
                     at_unix: 0,
                 },
                 None,
@@ -302,7 +303,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            node_test: false, subgraph: None, at_unix: 0,
+            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: "waiter".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -554,7 +555,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            node_test: false, subgraph: None, at_unix: 0,
+            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             color, node_id: creator.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1042,7 +1043,7 @@
             journal.record_event(&ExecEvent::ExecutionStarted {
                 color, project_id: pid.clone(), entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            node_test: false, subgraph: None, at_unix: 0,
+            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
                 color, node_id: "payer".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1177,7 +1178,7 @@
     /// Tasks fake for await_signal tests. `enqueue_dedup` of a
     /// RegisterSignal mints a deterministic token (recording it so the
     /// test can inject the matching `SuspensionResolved`) and
-    /// `wait_for_terminal` hands back a `RegisterSignalReply { token }`.
+    /// `wait_for_terminal` hands back a registered signal result.
     /// Every other task kind is unreachable in these tests.
     struct AwaitTasks {
         // (task_id -> token) so wait_for_terminal returns the same token
@@ -1239,7 +1240,7 @@
                 .expect("token for task id");
             Ok(weft_task_store::tasks::TaskOutcome {
                 status: weft_task_store::tasks::TaskStatus::Complete,
-                result: Some(serde_json::json!({ "token": token })),
+                result: Some(serde_json::json!({ "kind": "registered", "token": token })),
                 error: None,
             })
         }
@@ -1288,8 +1289,9 @@
                     entry_node: entry,
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    node_test: false,
+                    program: None, source_version: None, node_test: false,
                     subgraph: None,
+                    seed: None,
                     at_unix: 0,
                 },
                 None,
@@ -2043,8 +2045,9 @@
                     entry_node: entry.into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    node_test: false,
+                    program: None, source_version: None, node_test: false,
                     subgraph: None,
+                    seed: None,
                     at_unix: 0,
                 },
                 None,
@@ -2372,7 +2375,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             color, project_id: project.id.to_string(), entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
-            node_test: false, subgraph: None, at_unix: 0,
+            program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {
@@ -2765,4 +2768,3 @@
              (independent cursor per firing); got {gathered:?}"
         );
     }
-

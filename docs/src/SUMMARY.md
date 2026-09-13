@@ -59,6 +59,7 @@
 - [The CLI](running/cli.md)
 - [How the runtime is built](running/architecture.md)
 - [The journal](running/the-journal.md)
+- [Versions, seeded runs and frozen examples](running/versions.md)
 - [Files at run time](running/files.md)
 - [The browser extension](running/browser-extension.md)
 

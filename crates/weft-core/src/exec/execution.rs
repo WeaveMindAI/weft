@@ -44,10 +44,9 @@ impl NodeExecutionStatus {
 
 /// Record of one node-firing execution. Pulses stay pure data
 /// carriers; every bit of execution metadata (status, cost, logs,
-/// timing) lives here. What the firing RECEIVED is the pulses it
-/// absorbed, and what it HANDED OUT is the pulses it emitted: neither
-/// is copied onto the record (the journal fold derives both for the
-/// screen from the pulse table and the emission rows).
+/// timing) lives here. The received input records what the firing used,
+/// even after stream pulses are consumed. Outputs are reconstructed from
+/// emission rows; the record retains which ports were mentioned and closed.
 ///
 /// Suspend-then-resume keeps the same record. The `status`
 /// transitions through Running ↔ WaitingForInput on the same
@@ -57,8 +56,12 @@ impl NodeExecutionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeExecution {
     pub id: uuid::Uuid,
+    /// Effective inputs at this firing, derived once under its own birth
+    /// context. Inherited display never reinterprets them through a child cut.
+    pub received: super::ready::FiringInput,
     pub node_id: String,
     pub status: NodeExecutionStatus,
+    pub skip_reason: Option<super::skip::SkipReason>,
     /// Input pulses consumed by this dispatch.
     pub pulses_absorbed: Vec<uuid::Uuid>,
     /// This firing's rank among the records at its `(node, color,
@@ -89,8 +92,17 @@ pub struct NodeExecution {
     /// record so the worker and the fold read one thing.
     #[serde(default)]
     pub mentioned_ports: HashSet<String>,
+    /// Explicit output closures, including generator ends already delivered.
+    #[serde(default)]
+    pub closed_output_ports: HashSet<String>,
     pub color: Color,
     pub frames: LoopFrames,
+    /// The run this record was inherited from, when a seeded run reused
+    /// it instead of firing the node again (`ExecutionStarted.seed`).
+    /// `None` for a firing of this run's own. The record still carries
+    /// THIS run's `color` (the table is this run's); the origin is here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from: Option<Color>,
 }
 
 /// A non-terminal, per-port problem on a single firing. Today the sole
@@ -103,6 +115,12 @@ pub struct PortWarning {
     pub expected: String,
     /// The inferred type of the value the node actually tried to emit.
     pub actual: String,
+}
+
+impl PortWarning {
+    pub fn message(&self) -> String {
+        format!("output '{}': expected {}, received {}", self.port, self.expected, self.actual)
+    }
 }
 
 /// One entry per node, growing as each dispatch records its lifecycle.

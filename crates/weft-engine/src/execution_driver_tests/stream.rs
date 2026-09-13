@@ -33,7 +33,7 @@
     use weft_core::error::WeftResult;
     use weft_core::generator::Generator;
     use weft_core::node::{Node, NodeOutput};
-    use weft_core::{ExecutionContext, ProjectDefinition};
+    use weft_core::{ExecutionContext, ProjectDefinition, Phase};
     use weft_journal::ExecEvent;
 
     type Log = Arc<StdMutex<Vec<String>>>;
@@ -180,6 +180,50 @@
     }
 
     // ----- Plain stream flow -------------------------------------------
+
+    weft_core::stress_test!(
+        name: stream_backup_uses_only_clean_absence_and_matches_replay,
+        runs: 16,
+        worker_threads: 4,
+        async fn body() {
+            for (selected, count, failed) in [(true, 0, false), (true, 2, false), (true, 1, true), (false, 0, false)] {
+                let project = stream_project();
+                let color = uuid::Uuid::new_v4();
+                let log: Log = Arc::new(StdMutex::new(Vec::new()));
+                let cat = catalog(vec![
+                    ("Yielder", Box::new(Yielder { count, delivered: false, fail_after: failed.then_some(0), log: log.clone() })),
+                    ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
+                ]);
+                let mut selection = weft_core::project::selection::RunSelection::whole(&project);
+                if !selected { selection.nodes.remove("producer"); }
+                selection.input.entry("consumer".into()).or_default().insert("in".into(), json!([8, 9]));
+                let root = if selected { "producer" } else { "consumer" };
+                let rows = vec![
+                    ExecEvent::ExecutionStarted {
+                        color, project_id: project.id.to_string(), entry_node: root.into(),
+                        phase: Phase::Fire, definition_hash: Some("test-hash".into()), program: None, source_version: None, node_test: false,
+                        subgraph: Some(selection), seed: None, at_unix: 0,
+                    },
+                    ExecEvent::NodeKicked { color, node_id: root.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+                ];
+                let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, color, rows, CancellationFlag::new_arc()).await;
+                let drove = drove.expect("stream run drives");
+                super::engine_test_rig::assert_fold_matches_live(&project, &events, &weft_journal::SeedChain::default(), &drove);
+                let entries = log.lock().unwrap().clone();
+                let takes: Vec<_> = entries.iter().filter(|entry| entry.starts_with("took ")).cloned().collect();
+                if failed {
+                    assert!(node_failed_error(&events, "consumer").is_some());
+                    assert!(takes.is_empty());
+                } else {
+                    assert!(matches!(drove.outcome, ExecutionOutcome::Completed), "{:?}", drove.outcome);
+                    assert_eq!(takes, if count == 0 { vec!["took 8", "took 9"] } else { vec!["took 0", "took 1"] });
+                    assert!(entries.iter().any(|entry| entry == "stream finished"));
+                }
+                assert_eq!(started_count(&events, "consumer"), 1);
+                assert_eq!(started_count(&events, "producer"), usize::from(selected));
+            }
+        }
+    );
 
     weft_core::stress_test!(
         name: stream_items_flow_in_order_and_dispatch_the_consumer_once,

@@ -48,6 +48,18 @@ pub struct DispatcherState {
     /// other DB-backed primitives can share connections without
     /// extending the Journal trait into a kitchen sink.
     pub pg_pool: sqlx::PgPool,
+    /// Connections used ONLY to hold a project's transition lock.
+    ///
+    /// A Postgres advisory lock lives in a transaction, so holding one
+    /// holds a connection, and that connection does no work: every query
+    /// the locked operation makes takes a SECOND connection. Taken from
+    /// the work pool, that is a deadlock waiting for a busy day. Sixteen
+    /// `weft run`s at once on sixteen unrelated projects, with nothing to
+    /// wait for, each grabbed a lock connection until the pool was gone,
+    /// and then every one of them waited for a connection none of them
+    /// would release until it got one. A pool of its own makes holding a
+    /// lock cost nothing that doing the work needs.
+    pub lock_pool: sqlx::PgPool,
     pub workers: Arc<dyn WorkerBackend>,
     /// Builds a project's latest saved source on demand so a verb (`run` /
     /// `activate` / infra start) can just be clicked on a not-yet-built (or
@@ -58,6 +70,9 @@ pub struct DispatcherState {
     /// does not hold those.
     pub ensure_built: Option<Arc<dyn ProjectBuilder>>,
     pub projects: ProjectStore,
+    /// The version tree (`crate::versions`): every version a project has
+    /// been, every run under one, and head.
+    pub versions: crate::versions::VersionStore,
     pub events: EventBus,
     /// Spawns pooled listener pods.
     pub listener_backend: Arc<dyn ListenerBackend>,

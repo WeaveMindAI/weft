@@ -223,13 +223,52 @@ where
     with_advisory_lock(pg_pool, advisory_key(POOL_SCALEDOWN_DOMAIN, pool_scope), body).await
 }
 
-/// Convenience wrapper: hold the per-project transition lock for
-/// `project_id`, BLOCKING behind the current holder (transitions are
-/// microsecond-short, so a brief queue beats a spurious rejection at
-/// the lock layer; the state-level rejection happens inside `body`,
-/// which re-reads the row under the lock).
+/// How often a caller waiting for a project's transition lock says so.
+///
+/// There is NO deadline on the wait. Most holders are short (a few
+/// writes and an enqueue), but `teardown_project_namespace_if_no_infra`
+/// holds this lock around a namespace teardown against the cluster, and
+/// a teardown behind finalizers routinely runs past a minute. A deadline
+/// there fails a `weft run` or a `weft checkpoint` that was never
+/// wedged, only behind real infrastructure work, which is the one thing
+/// the project's rules say never gets a deadline. What a long wait gets
+/// instead is a breadcrumb at this interval, so a genuinely stuck
+/// project is visible rather than silent.
+const PROJECT_LOCK_BREADCRUMB: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Turn a failure of [`with_project_transition_lock`] into the answer an
+/// HTTP caller should get.
+///
+/// Every caller of that lock goes through here so the three of them
+/// cannot disagree about the same failure. One kind is left: the lock's
+/// own database work failed, which is a server error. WAITING is not a
+/// failure and never arrives here, because the wait has no deadline (see
+/// [`PROJECT_LOCK_BREADCRUMB`]).
+pub fn lock_answer(what: &str, e: anyhow::Error) -> (axum::http::StatusCode, String) {
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"))
+}
+
+/// Hold the per-project transition lock for `project_id`, waiting behind
+/// the current holder. The state-level rejection happens inside `body`,
+/// which re-reads the row under the lock.
+///
+/// `lock_pool` is the dispatcher's LOCK pool, never the work pool. An
+/// advisory lock lives in a transaction, so holding one holds a
+/// connection that then does nothing, while every query the locked body
+/// makes takes another. From one shared pool that is a deadlock waiting
+/// for a busy day: as many concurrent operations as the pool is wide,
+/// each holding a lock, none able to get a connection to do its work,
+/// and so none able to finish and release. That is reachable with no
+/// contention at all, one operation per project on as many projects as
+/// the pool is wide. See `DispatcherState::lock_pool`.
+///
+/// The wait POLLS a try-lock instead of blocking inside Postgres. A
+/// blocking `pg_advisory_xact_lock` waits in the server, so every waiter
+/// would pin a connection of the lock pool for as long as it waits, and
+/// a burst on one project would exhaust the lock pool for every project
+/// on the Pod. A waiter holds nothing between attempts.
 pub async fn with_project_transition_lock<T, F, Fut>(
-    pg_pool: &sqlx::postgres::PgPool,
+    lock_pool: &sqlx::postgres::PgPool,
     project_id: &str,
     body: F,
 ) -> anyhow::Result<T>
@@ -237,12 +276,55 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    with_advisory_lock_blocking(
-        pg_pool,
-        advisory_key(PROJECT_TRANSITION_DOMAIN, project_id),
-        body,
-    )
-    .await
+    let key = advisory_key(PROJECT_TRANSITION_DOMAIN, project_id);
+    let waiting_since = std::time::Instant::now();
+    let mut said_at = std::time::Duration::ZERO;
+    let mut backoff = std::time::Duration::from_millis(5);
+    // Acquire first, then run the body once: the transaction holding the
+    // lock has to outlive the loop, and the body is `FnOnce`.
+    let tx = loop {
+        let mut tx = lock_pool.begin().await?;
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *tx)
+            .await?;
+        if got {
+            break tx;
+        }
+        // Rolled back BEFORE the sleep, so the connection goes back to
+        // the pool while this caller waits.
+        let _ = tx.rollback().await;
+        // A breadcrumb instead of a deadline. An infra sync holds this
+        // lock across a cluster teardown, so a long wait is ordinary and
+        // failing it would fail work that was never wedged; what a long
+        // wait must not be is silent.
+        let waited = waiting_since.elapsed();
+        if waited.saturating_sub(said_at) >= PROJECT_LOCK_BREADCRUMB {
+            said_at = waited;
+            tracing::info!(
+                target: "weft_dispatcher::lease",
+                %project_id,
+                waited_secs = waited.as_secs(),
+                "still waiting for this project's transition lock; another lifecycle or \
+                 version-tree operation holds it. `weft status` shows what the project is \
+                 doing, and an infra sync is the one that routinely holds it this long"
+            );
+        }
+        // Jittered, because a try-lock loop has no queue: without it a
+        // burst of waiters on one project converges on the same tick and
+        // retries in lockstep for ever, so the one that has waited
+        // longest is no likelier to win than the one that just arrived.
+        let jitter = std::time::Duration::from_micros(
+            (uuid::Uuid::new_v4().as_u128() as u64)
+                % (backoff.as_micros() as u64).max(1),
+        );
+        tokio::time::sleep(backoff + jitter).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(200));
+    };
+    let result = body().await;
+    // The xact lock dies with the transaction, panic or not.
+    let _ = tx.rollback().await;
+    result
 }
 
 #[cfg(test)]

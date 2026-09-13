@@ -107,6 +107,13 @@ export class DispatcherClient {
     this.baseUrl = url;
   }
 
+  /// The address this client reaches the dispatcher at. The webview's
+  /// CSP needs it: a minted file link comes back on whichever host the
+  /// request went out on, so the origin to allow is this one.
+  getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
   async get<T>(path: string, signal?: AbortSignal): Promise<T> {
     const res = await fetch(`${this.baseUrl}${path}`, { signal });
     if (!res.ok) throw await httpError('GET', path, res);

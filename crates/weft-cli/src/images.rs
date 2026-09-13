@@ -2,8 +2,9 @@
 //! by the CLI so the user runs `weft daemon start` / `weft infra up` and
 //! the right images land in the cluster. No external shell scripts.
 //!
-//! Every shared image (the four system services + the worker builder
-//! base) is content-addressed: the tag is a hash of everything the
+//! Every shared image (the four system services, the worker builder
+//! base and the full-library worker every untouched stock project runs
+//! on) is content-addressed: the tag is a hash of everything the
 //! image is built from, so a present tag IS the right content. Ensuring
 //! one is a three-step ladder: already present locally -> done; pull
 //! the same tag from the registry (CI pushes every tag it builds from a
@@ -433,6 +434,7 @@ pub enum BaseFailure {
 pub struct SharedImages {
     pub system: SystemImages,
     pub builder_base: Option<String>,
+    pub worker: Option<String>,
 }
 
 impl SharedImages {
@@ -450,6 +452,9 @@ impl SharedImages {
         ];
         if let Some(base) = &self.builder_base {
             refs.push(base);
+        }
+        if let Some(worker) = &self.worker {
+            refs.push(worker);
         }
         refs
     }
@@ -531,7 +536,193 @@ pub async fn ensure_all_shared_images(
         "shared image build failed:\n  {}",
         failures.join("\n  ")
     );
-    Ok(SharedImages { system: imgs, builder_base: base })
+    let worker = if base.is_some() {
+        Some(ensure_standard_worker(rebuild, ref_suffix).await?)
+    } else {
+        None
+    };
+    Ok(SharedImages { system: imgs, builder_base: base, worker })
+}
+
+/// The stock project the standard worker is built from, with the two
+/// answers the CLI needs off it: its image ref and its staged build.
+struct StandardWorkerProject(weft_compiler::build::StockProject);
+
+impl StandardWorkerProject {
+    fn new() -> Result<Self> {
+        Ok(Self(weft_compiler::build::StockProject::materialize()?))
+    }
+
+    /// The image name a stock project's full build resolves to, computed
+    /// without generating or staging anything.
+    fn image_ref(&self) -> Result<String> {
+        let root = weft_compiler::build::resolve_weft_root()
+            .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
+        let hash = weft_compiler::hash::compute_binary_hash(
+            &self.0.definition,
+            &self.0.project,
+            &root,
+            &self.0.catalog,
+            weft_compiler::codegen::NodeSet::Full,
+        )?;
+        Ok(qualified_ref(weft_compiler::build::WORKER_IMAGE_REPO, &hash))
+    }
+
+    /// Codegen and stage the full-library build context, FROM `base`.
+    fn stage(&self, base: &str) -> Result<weft_compiler::build::StagedImageBuild> {
+        Ok(weft_compiler::build::build_project(
+            &self.0.project,
+            &self.0.definition,
+            &self.0.catalog,
+            base,
+            weft_compiler::codegen::NodeSet::Full,
+        )?)
+    }
+}
+
+/// The full-library worker's content-addressed ref for the current checkout:
+/// the image every untouched stock project runs on. Computed once per
+/// process: the answer is a function of the checkout, and asking it
+/// means compiling the stock program and walking the whole catalog.
+pub fn standard_worker_ref() -> Result<String> {
+    static REF: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(known) = REF.get() {
+        return Ok(known.clone());
+    }
+    // Only an answer is kept: a failure (a catalog mid-update, a full
+    // temp dir) is reported and asked again next time.
+    let computed = StandardWorkerProject::new()?.image_ref()?;
+    Ok(REF.get_or_init(|| computed).clone())
+}
+
+/// Materialize the full-library worker under its content-addressed ref
+/// (present -> pull -> build FROM the already-ensured builder base).
+async fn ensure_standard_worker(rebuild: bool, suffix: Option<&str>) -> Result<String> {
+    let stock = StandardWorkerProject::new()?;
+    let image = stock.image_ref()?;
+    let target = suffixed_ref(&image, suffix);
+    if rebuild || (!image_present(&target).await? && !docker_pull(&target).await?) {
+        let build = stock.stage(&suffixed_ref(&builder_base_ref()?, suffix))?;
+        let dockerfile = build.build_context.join("Dockerfile");
+        docker_build(&target, &dockerfile, &build.build_context, &[], None).await?;
+    }
+    Ok(image)
+}
+
+/// Give a worker image the registry already holds its bare local name
+/// (`weft-worker:<hash>`), on host docker and on the kind node, so the
+/// project build's presence check finds it and skips compiling. Returns
+/// `false`, touching nothing, when the registry is disabled, when the bare
+/// name already exists locally without a registry copy (a local build the
+/// caller streams into kind itself), or when the registry has no such image.
+/// Only worth asking for the standard worker's ref: the registry holds
+/// the images CI builds, never a project's own hash.
+///
+/// The kind node gets the image by pulling the qualified ref itself
+/// (`kind_load`'s registry path: a pulled multi-arch image does not survive
+/// `docker save`), then the bare name is added on the node with `ctr`.
+pub async fn import_published_worker(local_ref: &str, cluster: Option<&str>) -> Result<bool> {
+    let Some(registry) = image_registry() else { return Ok(false) };
+    let (repo, hash) = ref_repo_tag(local_ref)?;
+    let published = qualified_ref_with(Some(&registry), repo, hash);
+    if !image_present(&published).await?
+        && (image_present(local_ref).await? || !docker_pull(&published).await?)
+    {
+        return Ok(false);
+    }
+    if let Some(cluster) = cluster {
+        kind_load(cluster, &published, false).await?;
+        let node = format!("{cluster}-control-plane");
+        let node_ref = format!("docker.io/library/{local_ref}");
+        if !kind_node_has_tag(cluster, local_ref).await {
+            let output = docker().args(["exec", &node, "ctr", "-n", "k8s.io", "images", "tag", "--force", &published, &node_ref])
+                .output().await?;
+            anyhow::ensure!(output.status.success(), "name published worker on kind: {}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
+    let output = docker().args(["tag", &published, local_ref]).output().await?;
+    anyhow::ensure!(output.status.success(), "name published worker locally: {}", String::from_utf8_lossy(&output.stderr));
+    Ok(true)
+}
+
+/// One BuildKit record of a worker compile cache mount, as `docker
+/// buildx du --verbose` lists it: there is one per cache key (build
+/// environment and builder), and a key retired by a toolchain bump keeps
+/// its record, and its bytes, until something prunes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileCacheRecord {
+    pub id: String,
+    /// The cache key (`hash::compute_worker_cache_key`) in the mount id.
+    pub key: String,
+    pub size: String,
+    /// Whole days since BuildKit last used it, read off its "Last used"
+    /// line (`0` for anything under a day).
+    pub idle_days: u64,
+}
+
+/// Every worker compile cache mount on this host.
+pub async fn worker_compile_caches() -> Result<Vec<CompileCacheRecord>> {
+    let output = docker().args(["buildx", "du", "--verbose"]).output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "docker buildx du exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(compile_caches_in(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// Drop one BuildKit record by id (`docker buildx prune --filter id=`),
+/// and check it is gone: prune exits 0 whether or not it reclaimed
+/// anything, so a record it declined to touch would otherwise be
+/// reported as dropped on every run.
+pub async fn prune_build_record(id: &str) -> Result<()> {
+    let output = docker().args(["buildx", "prune", "--force", "--filter", &format!("id={id}")]).output().await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "docker buildx prune {id} exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    anyhow::ensure!(
+        worker_compile_caches().await?.iter().all(|cache| cache.id != id),
+        "docker buildx prune left record {id} in place; `docker buildx prune --all` removes it by hand"
+    );
+    Ok(())
+}
+
+/// The worker compile cache records in `docker buildx du --verbose`
+/// output: blank-line separated `Key: value` blocks whose description
+/// names a mount id starting with `WORKER_CACHE_MOUNT_ID_PREFIX`.
+fn compile_caches_in(du_verbose: &str) -> Vec<CompileCacheRecord> {
+    let wanted = format!("with id \"/{}", weft_compiler::worker_image::WORKER_CACHE_MOUNT_ID_PREFIX);
+    du_verbose.split("\n\n").filter_map(|record| {
+        let field = |key: &str| record.lines().find_map(|line| line.strip_prefix(key)).map(str::trim);
+        let description = field("Description:")?;
+        let key_start = description.find(&wanted)? + wanted.len();
+        let key = description[key_start..].split('"').next()?.to_string();
+        Some(CompileCacheRecord {
+            id: field("ID:")?.to_string(),
+            key,
+            size: field("Size:")?.to_string(),
+            idle_days: idle_days(field("Last used:").unwrap_or("")),
+        })
+    }).collect()
+}
+
+/// Whole days in a BuildKit "Last used" phrase ("56 minutes ago", "3
+/// days ago", "2 weeks ago", "About an hour ago", "Never"). Anything not
+/// counted in days or longer is under a day.
+fn idle_days(last_used: &str) -> u64 {
+    let mut words = last_used.split_whitespace();
+    let Some(count) = words.next().and_then(|n| n.parse::<u64>().ok()) else { return 0 };
+    match words.next().map(|unit| unit.trim_end_matches('s')) {
+        Some("day") => count,
+        Some("week") => count * 7,
+        Some("month") => count * 30,
+        Some("year") => count * 365,
+        _ => 0,
+    }
 }
 
 /// THE one `docker build` invocation, BuildKit on. Every image the CLI
@@ -949,7 +1140,7 @@ pub fn node_images_matching(
 /// failure reads as "absent" so the caller just re-loads. A bare ref
 /// (no registry) is stored by containerd under its docker-canonical
 /// `docker.io/library/` spelling, so both spellings match.
-async fn kind_node_has_tag(cluster: &str, image_ref: &str) -> bool {
+pub(crate) async fn kind_node_has_tag(cluster: &str, image_ref: &str) -> bool {
     let Ok(groups) = kind_node_image_tag_groups(cluster).await else {
         return false;
     };
@@ -963,7 +1154,63 @@ async fn kind_node_has_tag(cluster: &str, image_ref: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standard_worker_matches_independent_projects_and_changes_with_node_code() {
+        let base = super::builder_base_ref().unwrap();
+        let stock_project = super::StandardWorkerProject::new().unwrap();
+        let stock = stock_project.stage(&base).unwrap();
+        let stock_ref = stock_project.image_ref().unwrap();
+        let (_, stock_hash) = super::ref_repo_tag(&stock_ref).unwrap();
+        assert_eq!(stock_hash, stock.content_hash, "the ref computed without staging names the staged build");
+        let dir = tempfile::tempdir().unwrap();
+        let mut project = weft_compiler::project::Project::init(dir.path(), "a-different-project").unwrap();
+        std::fs::write(dir.path().join("main.weft"), "answer = Text { value: \"different graph\" }\n").unwrap();
+        let (definition, catalog) = weft_compiler::hash::load_enriched_project(&project).unwrap();
+        let root = weft_compiler::build::resolve_weft_root().unwrap();
+        let hash = |project: &weft_compiler::project::Project, catalog: &weft_catalog::FsCatalog| {
+            weft_compiler::hash::compute_binary_hash(&definition, project, &root, catalog,
+                weft_compiler::codegen::NodeSet::Full).unwrap()
+        };
+        assert_eq!(hash(&project, &catalog), stock.content_hash,
+            "project names, IDs and graphs must share the finished library image");
+        let staged = weft_compiler::build::build_project(&project, &definition, &catalog, &base,
+            weft_compiler::codegen::NodeSet::Full).unwrap();
+        for relative in ["Dockerfile", "build/Cargo.toml", "build/src/main.rs", "build/src/registry.rs"] {
+            assert_eq!(std::fs::read(stock.build_context.join(relative)).unwrap(),
+                std::fs::read(staged.build_context.join(relative)).unwrap(), "{relative}");
+        }
+        project.manifest.build.worker.base_image = Some("alpine:3.21".into());
+        assert_ne!(hash(&project, &catalog), stock.content_hash, "custom runtime needs its own image");
+        project.manifest.build.worker.base_image = None;
+        let source = dir.path().join("nodes/base_catalog/basic/text/mod.rs");
+        let mut code = std::fs::read_to_string(&source).unwrap();
+        code.push_str("\n// Locally edited node.\n");
+        std::fs::write(&source, code).unwrap();
+        assert_ne!(hash(&project, &catalog), stock.content_hash, "local node edits must compile separately");
+    }
     use super::*;
+
+    /// Records as `docker buildx du --verbose` printed them on a host that
+    /// had built workers under two cache keys (captured verbatim, fields
+    /// this parser ignores trimmed).
+    #[test]
+    fn every_compile_cache_key_is_read_off_the_buildkit_records() {
+        let du = "ID:           p490dco22moj9u55682dm3enh\nParents:\n - x\nCreated at:   2026-09-13 17:34:56 +0000 UTC\nMutable:      true\nReclaimable:  true\nShared:       false\nSize:         421.7MB\n\
+                  Description:  cached mount /root/.cargo/registry from exec /bin/sh -c cargo build --release with id \"/weft-worker-cargo-registry\"\nUsage count:  6\nLast used:    11 seconds ago\nType:         exec.cachemount\n\n\
+                  ID:           z5k0h7hhdmaktflss7bsyjs7u\nMutable:      true\nSize:         1.982GB\n\
+                  Description:  cached mount /cache/target from exec /bin/sh -c ( [ -f /cache/target/.weft-seeded ] || ! [ -d /weft/target ] ) && cargo build --release with id \"/weft-worker-target-9af3f2c5f9da6eaa\"\nUsage count:  6\nLast used:    11 seconds ago\nType:         exec.cachemount\n\n\
+                  ID:           hve80t8pw8n1ackgqj82wn30e\nSize:         6.1GB\n\
+                  Description:  cached mount /cache/target from exec /bin/sh -c cargo build --release with id \"/weft-worker-target-0123456789abcdef\"\nUsage count:  2\nLast used:    5 weeks ago\nType:         exec.cachemount\n";
+        assert_eq!(compile_caches_in(du), vec![
+            CompileCacheRecord { id: "z5k0h7hhdmaktflss7bsyjs7u".into(), key: "9af3f2c5f9da6eaa".into(), size: "1.982GB".into(), idle_days: 0 },
+            CompileCacheRecord { id: "hve80t8pw8n1ackgqj82wn30e".into(), key: "0123456789abcdef".into(), size: "6.1GB".into(), idle_days: 35 },
+        ]);
+        assert!(compile_caches_in("ID: c\nSize: 1MB\nDescription: something else\n").is_empty());
+        assert_eq!(idle_days("About an hour ago"), 0);
+        assert_eq!(idle_days("3 days ago"), 3);
+        assert_eq!(idle_days("2 months ago"), 60);
+        assert_eq!(idle_days("Never"), 0);
+    }
 
     /// The ref is `<registry>/<repo>:<tag>` and drops to a bare
     /// `<repo>:<tag>` when the registry is disabled: the bare shape is

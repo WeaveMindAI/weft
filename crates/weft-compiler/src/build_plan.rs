@@ -62,6 +62,8 @@ pub struct BuildPlan {
     /// Worker image identity: engine + node impls + build env. The worker ref is
     /// `TagPolicy::worker_ref(binary_hash)`.
     pub binary_hash: String,
+    /// Production fingerprints, kept with this worker image at registration.
+    pub implementations: std::collections::BTreeMap<String, String>,
     /// Runtime shape identity: topology + config. Drives resync (definition drift).
     pub definition_hash: String,
     /// Infra closure identity: infra-node sources + engine. Drives infra upgrade.
@@ -101,8 +103,10 @@ pub fn plan_build_from(
     catalog: &weft_catalog::FsCatalog,
     builder_base_image: &str,
     tags: &dyn TagPolicy,
+    node_set: crate::codegen::NodeSet,
 ) -> CompileResult<BuildPlan> {
     let weft_root = crate::build::resolve_weft_root()?;
+    let implementations = crate::hash::implementation_hashes(definition, project, &weft_root, catalog, node_set)?;
 
     let definition_hash = crate::hash::compute_definition_hash(definition)
         .map_err(|e| e.context("compute definition hash"))?;
@@ -116,7 +120,8 @@ pub fn plan_build_from(
     // from the already-resolved definition. `build_project` does NOT recompile
     // from source: it validates + codegens this definition, whose `@asset`
     // refs the caller already resolved into concrete file values.
-    let staged = crate::build::build_project(project, definition, catalog, builder_base_image)?;
+    let staged =
+        crate::build::build_project(project, definition, catalog, builder_base_image, node_set)?;
     let binary_hash = staged.content_hash.clone();
 
     let mut images = vec![PlannedImage {
@@ -145,6 +150,7 @@ pub fn plan_build_from(
     Ok(BuildPlan {
         definition_json,
         binary_hash,
+        implementations,
         definition_hash,
         infra_hash,
         images,

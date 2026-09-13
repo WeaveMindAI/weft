@@ -18,6 +18,20 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) {
     }
 }
 
+/// The emitted package crate's directory: `<ident>-<slot>`, where the
+/// slot is a content digest (`codegen::write_package_crates`), so tests
+/// find it by its prefix.
+fn package_dir(root: &std::path::Path, ident: &str) -> std::path::PathBuf {
+    let prefix = format!("{ident}-");
+    let mut found: Vec<_> = std::fs::read_dir(root)
+        .expect("emitted crate root")
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one {prefix}* directory: {found:?}");
+    found.remove(0)
+}
+
 fn stdlib() -> FsCatalog {
     FsCatalog::discover(&weft_catalog::stdlib_root().expect("stdlib root"))
         .expect("stdlib discovers")
@@ -59,7 +73,7 @@ fn emitted_test_crate_has_the_expected_shape() {
         "weft-engine's dep entry enables node-tests:\n{root_toml}"
     );
 
-    let pkg_toml = std::fs::read_to_string(dir.path().join("pkg_slack/Cargo.toml")).unwrap();
+    let pkg_toml = std::fs::read_to_string(package_dir(dir.path(), "pkg_slack").join("Cargo.toml")).unwrap();
     assert!(
         pkg_toml.contains("node-tests = []"),
         "the package crate declares the feature:\n{pkg_toml}"
@@ -75,7 +89,7 @@ fn emitted_test_crate_has_the_expected_shape() {
     assert!(dir.path().join("Cargo.lock").is_file(), "workspace lock seeded");
     assert!(dir.path().join("rust-toolchain.toml").is_file(), "toolchain pinned");
 
-    let lib_rs = std::fs::read_to_string(dir.path().join("pkg_slack/src/lib.rs")).unwrap();
+    let lib_rs = std::fs::read_to_string(package_dir(dir.path(), "pkg_slack").join("src/lib.rs")).unwrap();
     assert!(
         lib_rs.contains("/catalog/slack/send_message/mod.rs"),
         "local mode includes real absolute node paths:\n{lib_rs}"
@@ -112,11 +126,38 @@ fn container_mode_includes_are_mount_rooted() {
         &EmitPaths::Container { nodes_root: project_dir.path().join("nodes") },
     )
     .expect("emit");
-    let lib_rs = std::fs::read_to_string(dir.path().join("pkg_slack/src/lib.rs")).unwrap();
+    let lib_rs = std::fs::read_to_string(package_dir(dir.path(), "pkg_slack").join("src/lib.rs")).unwrap();
     assert!(
         lib_rs.contains("/weft/project-nodes/slack/send_message/mod.rs"),
         "container includes are mount-rooted:\n{lib_rs}"
     );
+}
+
+/// The package crate's directory is named by its content: the same
+/// package emits to the same slot twice (so two projects share one
+/// rlib in the host's compile cache), and one edited byte in a node's
+/// source moves it (so an edited copy never passes for the stock one).
+#[test]
+fn a_package_crate_slot_follows_its_content() {
+    let weft_root = weft_catalog::weft_repo_root().expect("weft root");
+    let paths = EmitPaths::Local { weft_root };
+    let stock = stdlib();
+    let first = tempfile::tempdir().expect("temp dir");
+    let second = tempfile::tempdir().expect("temp dir");
+    emit_test_crate(first.path(), &stock, "slack", &paths).expect("emit");
+    emit_test_crate(second.path(), &stock, "slack", &paths).expect("emit");
+    let slot = |root: &std::path::Path| package_dir(root, "pkg_slack").file_name().unwrap().to_owned();
+    assert_eq!(slot(first.path()), slot(second.path()), "same content, same slot");
+
+    let project = staged_slack_project();
+    let source = project.path().join("nodes/slack/send_message/mod.rs");
+    let mut code = std::fs::read_to_string(&source).expect("node source");
+    code.push_str("\n// edited\n");
+    std::fs::write(&source, code).expect("edit node source");
+    let edited = FsCatalog::discover(&project.path().join("nodes")).expect("discover edited copy");
+    let third = tempfile::tempdir().expect("temp dir");
+    emit_test_crate(third.path(), &edited, "slack", &paths).expect("emit");
+    assert_ne!(slot(first.path()), slot(third.path()), "an edited node moves the slot");
 }
 
 /// Re-emitting into a dirty directory yields a clean tree: the crate
@@ -137,7 +178,7 @@ fn re_emission_wipes_stale_files() {
     )
     .expect("emit over dirty dir");
     assert!(!stale.exists(), "stale package dirs are wiped on re-emission");
-    assert!(dir.path().join("pkg_slack").is_dir());
+    assert!(package_dir(dir.path(), "pkg_slack").is_dir());
 }
 
 /// The test hash is the image's staleness rule: stable on unchanged
@@ -274,15 +315,22 @@ fn worker_emission_declares_but_never_enables_node_tests() {
     let catalog = FsCatalog::discover(&project_dir.path().join("nodes"))
         .expect("staged catalog discovers");
     let dir = tempfile::tempdir().expect("temp dir");
-    weft_compiler::codegen::emit(&project, project_dir.path(), dir.path(), &catalog, "probe")
-        .expect("worker emission");
+    weft_compiler::codegen::emit(
+        &project,
+        project_dir.path(),
+        dir.path(),
+        &catalog,
+        "probe",
+        weft_compiler::codegen::NodeSet::Referenced,
+    )
+    .expect("worker emission");
 
     let worker_toml = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
     assert!(
         !worker_toml.contains("node-tests"),
         "the worker root must never enable node-tests:\n{worker_toml}"
     );
-    let pkg_toml = std::fs::read_to_string(dir.path().join("pkg_slack/Cargo.toml")).unwrap();
+    let pkg_toml = std::fs::read_to_string(package_dir(dir.path(), "pkg_slack").join("Cargo.toml")).unwrap();
     assert!(
         pkg_toml.contains("node-tests = []"),
         "the package crate declares the feature so the cfg name is known:\n{pkg_toml}"

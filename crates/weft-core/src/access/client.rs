@@ -18,8 +18,9 @@ use std::collections::BTreeMap;
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
+use crate::project::hash::sha256_hex;
 use super::hex_of;
 use super::spec::{AuthStep, SignKind, Template};
 
@@ -564,9 +565,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    hex_of(&Sha256::digest(data))
-}
 
 /// AWS Signature Version 4 (S3, R2, every S3-compatible store).
 ///

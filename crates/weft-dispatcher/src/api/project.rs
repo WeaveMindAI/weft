@@ -13,35 +13,14 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::project::{downstream_closure, infra_ids, run_subgraph, subgraph_roots, trigger_ids, EdgeIndex};
+use weft_core::project::{infra_ids, trigger_ids};
 use weft_core::ProjectDefinition;
 
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 
-/// One root node that needs to be "kicked into life" at the start of
-/// an execution: a node with no wired inputs in the active subgraph
-/// (a firing trigger, a manual-run entry, an InfraSetup root). The
-/// dispatcher journals one `ExecEvent::NodeKicked` per `Kick`; the
-/// worker's fold turns these into the `kicked` set the scheduler
-/// dispatches at frames=[].
-///
-/// `payload` is the wake event's data (HTTP body, SSE message JSON,
-/// form submission, timer info) ONLY for the firing trigger. Every
-/// other kicked root has `payload: None`.
-#[derive(Debug, Clone)]
-pub struct Kick {
-    pub node_id: String,
-    /// This kick is the firing trigger of the execution. Explicit (see
-    /// `ExecEvent::NodeKicked::firing` for why payload presence can't
-    /// carry it).
-    pub firing: bool,
-    pub payload: Option<Value>,
-    /// The firing trigger's setup-time port snapshot (from its signal
-    /// row). `None` for every other kicked root.
-    pub port_snapshot: Option<Value>,
-}
+pub use weft_core::run_spec::KickPlan as Kick;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProjectSummary {
@@ -213,6 +192,8 @@ pub async fn list(
 /// dumb store of the compiled artifact.
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
+    pub implementations: Option<std::collections::BTreeMap<String, String>>,
+    pub source: Option<weft_core::project::hash::Manifest>,
     pub id: uuid::Uuid,
     pub name: String,
     /// Free-text project description (metadata only). The CLI has no notion of
@@ -300,6 +281,8 @@ pub async fn register(
             // Registration precedes /infra/sync, which is what writes the infra
             // image tags; nothing to persist here.
             None,
+            req.implementations.as_ref(),
+            req.source.as_ref(),
         )
         .await
         .map_err(|e| register_internal_error(format!("register_with_hashes: {e}")))?;
@@ -317,21 +300,26 @@ pub async fn register(
     Ok(registered_summary(summary))
 }
 
+/// Answers through `StatusError` so "no project you may see under this
+/// id" carries the `x-weft-not-found: project` marker. A client asking
+/// whether a project is known yet (the CLI's checkpoint, before it
+/// registers the source) must be able to tell that apart from a
+/// version-skewed dispatcher missing the route.
 pub async fn get(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<String>,
-) -> Result<Json<ProjectSummary>, StatusCode> {
-    let id = id.parse::<uuid::Uuid>().map_err(|_| StatusCode::BAD_REQUEST)?;
-    authorize_project(&state, &caller.0, id)
-        .await
-        .map_err(|(s, _)| s)?;
+) -> Result<Json<ProjectSummary>, StatusError> {
+    let id = id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".to_string()))?;
+    authorize_project_marked(&state, &caller.0, id).await?;
     let summary = state
         .projects
         .get(id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get project: {e}")))?
+        .ok_or(StatusError::NotMyProject)?;
     Ok(Json(ProjectSummary::from(summary)))
 }
 
@@ -420,6 +408,22 @@ pub async fn remove(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("remove: {e}")))?;
     if removed {
+        // The journal keeps this project's runs on purpose, so what
+        // describes those runs stays with them: the code each one ran,
+        // and its row in the version tree. Everything nothing points at
+        // goes now.
+        if let Err(e) = retire_what_no_run_needs(&state, &id.to_string()).await {
+            // Logged, not fatal: the removal has happened. The reaper's
+            // `retired_rows` sweep comes back for whatever is left, which
+            // is what keeps this from being junk nobody can ever reach
+            // (the project row is gone, so `rm` will not run again, and
+            // with no runs left neither will `weft clean`).
+            tracing::warn!(
+                target: "weft_dispatcher::project",
+                project_id = %id, error = %e,
+                "could not retire what no surviving run needs; the reaper will retry"
+            );
+        }
         Ok(StatusCode::NO_CONTENT)
     } else {
         // A concurrent rm dropped the row after our gate: still rm's
@@ -428,27 +432,44 @@ pub async fn remove(
     }
 }
 
-#[derive(Debug, Deserialize)]
-// A field this struct no longer has (an old client's `entry_node`) is a
-// loud 422, never a silently different run than the caller asked for.
-#[serde(deny_unknown_fields)]
-pub struct RunRequest {
-    /// Run only what these nodes need: their upstream closure (a scope
-    /// brings its whole body), which is both the set of roots kicked
-    /// and the boundary the run is held to. Several targets run the
-    /// union of their closures. Empty means the whole project, which
-    /// is the ordinary run. Any node can be a target; an unknown name
-    /// is refused.
-    #[serde(default)]
-    pub targets: Vec<String>,
-    /// Initial payload for the entry node's first pulse.
-    #[serde(default)]
-    pub payload: Value,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RunResponse {
-    pub color: String,
+/// Drop everything a REMOVED project left behind that no surviving run
+/// needs: the programs those runs were started against, and their rows in
+/// the version tree.
+///
+/// Both halves, because they describe the same surviving run. The program
+/// is what its inputs and outputs are derived from, and the tree row is
+/// which version it was on, what it inherited, which example it checked
+/// and what the check concluded. Keeping one and dropping the other left
+/// a run half-readable.
+///
+/// Callers: the removal itself, `weft clean` (which may have just deleted
+/// the last run that needed either), and the reaper's periodic sweep,
+/// which is what makes a failure here recoverable rather than permanent
+/// junk. On a project that still exists both stores keep everything, so
+/// calling it there is a no-op rather than a mistake.
+pub(crate) async fn retire_what_no_run_needs(
+    state: &DispatcherState,
+    project_id: &str,
+) -> anyhow::Result<u64> {
+    let id: uuid::Uuid = project_id.parse()?;
+    // The cheap discriminator first. Both stores refuse to drop anything
+    // while the project row is there, so on a live project everything
+    // below is thrown away, and `definition_hashes_in_use` is not cheap:
+    // it reads and decodes every birth row of the project. `weft clean`
+    // calls this unconditionally and `prune` calls clean once per run in
+    // the subtree, so pruning N runs paid for N full scans, all of them
+    // wasted.
+    if state.projects.get(id).await?.is_some() {
+        return Ok(0);
+    }
+    let in_use = state.journal.definition_hashes_in_use(project_id).await?;
+    let definitions = state.projects.retire_unused_definitions(id, &in_use).await?;
+    // The colors the JOURNAL still holds. A tree row outside that set
+    // describes a run nothing can read, and with the project row gone
+    // nothing else could ever delete it.
+    let known = state.journal.colors_for_project(project_id).await?;
+    let versions = state.versions.retire_unused_versions(id, &known).await?;
+    Ok(definitions + versions)
 }
 
 /// The project's CURRENT definition as one coherent (hash, shape)
@@ -463,7 +484,7 @@ pub struct RunResponse {
 pub(crate) async fn coherent_definition(
     state: &DispatcherState,
     id: uuid::Uuid,
-) -> Result<(String, ProjectDefinition), (StatusCode, String)> {
+) -> Result<(weft_core::project::hash::ProgramIdentity, ProjectDefinition), (StatusCode, String)> {
     // Verb auto-build: when a builder is present, make the project's latest saved
     // source runnable BEFORE reading the running definition,
     // so clicking run/infra on a not-yet-built (or edited-since-built) project builds
@@ -473,25 +494,26 @@ pub(crate) async fn coherent_definition(
     // configured (the CLI already built + registered), this is skipped and the
     // existing "register first" precondition below still stands.
     crate::transition::ensure_built_gated(state, id).await?;
-    let hash = state
+    let program = state
         .projects
-        .running_definition_hash(id)
+        .running_program_identity(id)
         .await
         .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("running_definition_hash: {e}"))
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("running program identity: {e}"))
         })?
         .ok_or_else(|| {
             (
                 StatusCode::PRECONDITION_FAILED,
                 format!(
-                    "project {id} has no definition_hash; register the project before \
+                    "project {id} has no production code identity; register the project before \
                      starting an execution"
                 ),
             )
         })?;
+    let hash = &program.definition_hash;
     let json = state
         .projects
-        .definition_for_hash(id, &hash)
+        .definition_for_hash(id, hash)
         .await
         .map_err(|e| {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("definition_for_hash: {e}"))
@@ -511,217 +533,9 @@ pub(crate) async fn coherent_definition(
             format!("parse recorded definition {hash}: {e}"),
         )
     })?;
-    Ok((hash, project))
+    Ok((program, project))
 }
 
-/// Start a fresh execution for a registered project.
-///
-/// Manual-run semantics: kick every root of the graph (a node no wire
-/// feeds, outside any scope; a scope's own roots are the scope
-/// launcher's, fired when the scope starts) and let pulses run
-/// whatever they reach. `body.targets` narrows the run to the named
-/// nodes' upstream closure: only its roots are kicked, and the run is
-/// bounded to it.
-pub async fn run(
-    State(state): State<DispatcherState>,
-    caller: CallerTenant,
-    Path(id): Path<String>,
-    Json(body): Json<RunRequest>,
-) -> Result<Json<RunResponse>, (StatusCode, String)> {
-    let id = id.parse::<uuid::Uuid>().map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
-    authorize_project(&state, &caller.0, id).await?;
-    // Enforce against the reconciliation BEFORE the auto-build: a
-    // stale tab firing `run` into a transitional project (activating /
-    // building / infra mid-flip) is rejected here, and never triggers
-    // a build as a side effect of a rejected verb.
-    require_action(&state, id, &["run"]).await?;
-    let (definition_hash, project) = coherent_definition(&state, id).await?;
-    let project_id = id.to_string();
-
-    // The whole graph, or what the named targets need.
-    for target in &body.targets {
-        // Caller-supplied strings, bounded before they echo back.
-        let shown = weft_core::truncate_user_string(target, 256);
-        if !project.nodes.iter().any(|n| &n.id == target) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("no node '{shown}' in this project"),
-            ));
-        }
-    }
-    let subgraph = if body.targets.is_empty() {
-        RunSubgraph::whole(&project)
-    } else {
-        RunSubgraph::of(&project, &body.targets)
-    };
-
-    // Pre-flight, scoped to what THIS run executes: every
-    // `requires_infra` node inside the subgraph must be Running (the
-    // node body's `ctx.endpoint(...)` deep in execute() would fail
-    // with a confusing "endpoint not available" otherwise). Infra
-    // outside the subgraph never runs here, so it does not gate: a
-    // maintenance branch with no infra fires whether or not the rest
-    // of the project's infra is up.
-    // Only an AIMED run gates a subset of the infra: an untargeted run
-    // gates the whole graph, because pulses will flow wherever the
-    // wiring takes them.
-    let bound = if body.targets.is_empty() { None } else { Some(&subgraph.nodes) };
-    let missing = missing_infra_nodes(&state, &project_id, &project, bound).await?;
-    if !missing.is_empty() {
-        return Err((
-            StatusCode::PRECONDITION_REQUIRED,
-            format!(
-                "infra not running for: {}. Run `weft infra start` first.",
-                missing.join(", ")
-            ),
-        ));
-    }
-
-    let kicks = subgraph.root_kicks(&project, &body.payload, None);
-    if kicks.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "computed subgraph has no roots; graph may be cyclic or malformed".into(),
-        ));
-    }
-
-    let color = uuid::Uuid::new_v4();
-
-    // ExecutionStarted carries a single `entry_node`. When the
-    // subgraph has many roots, the first kick's node wins for display
-    // purposes; the NodeKicked events below carry the full root set.
-    let entry_node_for_journal = kicks[0].node_id.clone();
-
-    // Event-sourced log: ExecutionStarted + one NodeKicked per root.
-    // The worker's journal fold turns these into the kicked set the
-    // scheduler dispatches at frames=[]. The enqueue targets the worker
-    // pool; the cold-start trigger spawns a Pod for this project if none
-    // is alive, and the worker's claim loop folds the journal and runs.
-    //
-    // `definition_hash` is snapshotted on ExecutionStarted AND on
-    // the enqueued task payload (same value, from the same
-    // `coherent_definition` pair the kicks were computed from). The
-    // journal field is the load-bearing one: a resume task enqueued
-    // LATER (after the user has edited and re-registered) reads the
-    // hash from the journal's ExecutionStarted, NOT from the project
-    // row, so a suspended execution is always resumed against the
-    // shape it was started on.
-    start_queued_execution(
-        &state,
-        color,
-        &id.to_string(),
-        weft_core::context::Phase::Fire,
-        &entry_node_for_journal,
-        &kicks,
-        &definition_hash,
-        // An AIMED run journals its subgraph as the boundary: the
-        // targets' upstream closure, closed over scopes. The engine
-        // holds the run to it and absorbs, silently, a pulse into
-        // anything outside, so a root shared with another branch (a
-        // database feeding the whole file) never drags that branch in.
-        // "Start only from what these nodes need" means exactly that
-        // set. An untargeted run journals None: the user asked for the
-        // whole file, and pulses go wherever the wiring takes them.
-        bound,
-    )
-    .await?;
-
-    // The journal bridge publishes the recorded start with the same identity
-    // replay uses. A second direct notification would be an indistinguishable
-    // duplicate with no journal identity, so there is only one delivery path.
-
-    Ok(Json(RunResponse { color: color.to_string() }))
-}
-
-/// The subgraph one execution runs: the upstream closure of its
-/// targets with triggers as terminators, closed over scopes (a node
-/// inside a group brings the whole group: everything inside a scope
-/// runs when the scope starts), next to the edge index and trigger
-/// set every consumer of it needs. Built once per request; manual runs
-/// and trigger fires both go through it, so "what runs" and "what gets
-/// kicked" can never disagree.
-// SYNC: RunSubgraph::of <-> packages/weft-graph/src/webview/lib/run-targets.ts runTargetFacts
-struct RunSubgraph {
-    edge_idx: EdgeIndex,
-    triggers: HashSet<String>,
-    /// Every node the execution dispatches; journaled as its scope.
-    nodes: HashSet<String>,
-}
-
-impl RunSubgraph {
-    /// The edge index and trigger set alone, for a caller (the fire
-    /// path) that has to pick its targets before it can aim.
-    fn graph_base(project: &ProjectDefinition) -> (EdgeIndex, HashSet<String>) {
-        (EdgeIndex::build(project), trigger_ids(project).into_iter().collect())
-    }
-
-    fn aimed(
-        project: &ProjectDefinition,
-        edge_idx: EdgeIndex,
-        triggers: HashSet<String>,
-        targets: &[String],
-    ) -> Self {
-        let nodes = run_subgraph(project, &edge_idx, targets, &triggers);
-        Self { edge_idx, triggers, nodes }
-    }
-
-    fn of(project: &ProjectDefinition, targets: &[String]) -> Self {
-        let (edge_idx, triggers) = Self::graph_base(project);
-        Self::aimed(project, edge_idx, triggers, targets)
-    }
-
-    /// The whole graph: an untargeted manual run.
-    fn whole(project: &ProjectDefinition) -> Self {
-        let (edge_idx, triggers) = Self::graph_base(project);
-        let nodes = project.nodes.iter().map(|n| n.id.clone()).collect();
-        Self { edge_idx, triggers, nodes }
-    }
-
-    /// One `Kick` per root of the subgraph: a node with no in-subgraph
-    /// parent that sits outside every scope (a scope's own roots are
-    /// fired by the scope launcher when the scope starts, never here),
-    /// plus every trigger (always a root: it was a terminator, and a
-    /// trigger inside a group is still kicked by its fire).
-    ///
-    /// `firing = Some((trigger, snapshot))` is fire time: only that
-    /// trigger carries the payload (its wake body) and the snapshot.
-    ///
-    /// `firing = None` is a manual run: there is no firing trigger, so
-    /// every trigger in the subgraph is kicked payload-less, which the
-    /// engine turns into "close all its output ports" so trigger-fed
-    /// branches prune via the skip cascade. A non-null `payload` lands
-    /// on every non-trigger root (per-target mocks); plain manual runs
-    /// pass `Value::Null` ("kick alive").
-    fn root_kicks(
-        &self,
-        project: &ProjectDefinition,
-        payload: &Value,
-        firing: Option<(&str, Option<&Value>)>,
-    ) -> Vec<Kick> {
-        subgraph_roots(project, &self.edge_idx, &self.nodes, &self.triggers)
-            .into_iter()
-            .map(|id| match firing {
-                Some((firing_id, snapshot)) if id == firing_id => Kick {
-                    node_id: id,
-                    firing: true,
-                    payload: Some(payload.clone()),
-                    port_snapshot: snapshot.cloned(),
-                },
-                Some(_) => Kick { node_id: id, firing: false, payload: None, port_snapshot: None },
-                None => Kick {
-                    payload: if payload.is_null() || self.triggers.contains(&id) {
-                        None
-                    } else {
-                        Some(payload.clone())
-                    },
-                    node_id: id,
-                    firing: false,
-                    port_snapshot: None,
-                },
-            })
-            .collect()
-    }
-}
 
 /// For each `requires_infra` node in the project, list the
 /// `is_trigger` nodes that have it in their upstream closure.
@@ -741,7 +555,7 @@ pub use weft_core::project::compute_trigger_deps;
 ///
 /// Returns an empty vec if the project has no infra nodes (the
 /// caller short-circuits : no InfraSetup execution needed).
-pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
+pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Result<Vec<Kick>, String> {
     setup_kicks(project, infra_ids(project))
 }
 
@@ -752,28 +566,27 @@ pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
 ///
 /// Returns an empty vec if the project has no triggers (activate is
 /// a no-op in that case).
-pub fn compute_trigger_setup_kicks(project: &ProjectDefinition) -> Vec<Kick> {
+pub fn compute_trigger_setup_kicks(project: &ProjectDefinition) -> Result<Vec<Kick>, String> {
     setup_kicks(project, trigger_ids(project))
 }
 
 /// A setup phase kicks the roots of `seeds`' run subgraph, payload-less
 /// and with no terminators (a trigger's setup needs its inputs). The
 /// engine bounds the same phase with the same subgraph.
-fn setup_kicks(project: &ProjectDefinition, seeds: Vec<String>) -> Vec<Kick> {
+fn setup_kicks(project: &ProjectDefinition, seeds: Vec<String>) -> Result<Vec<Kick>, String> {
     if seeds.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let edge_idx = EdgeIndex::build(project);
-    let in_subgraph = run_subgraph(project, &edge_idx, &seeds, &HashSet::new());
-    subgraph_roots(project, &edge_idx, &in_subgraph, &HashSet::new())
+    let selection = weft_core::project::selection::RunSelection::setup(project, &seeds)?;
+    Ok(selection.roots(project)
         .into_iter()
         .map(|id| Kick {
-            node_id: id,
+            node: id,
             firing: false,
             payload: None,
             port_snapshot: None,
         })
-        .collect()
+        .collect())
 }
 
 /// Non-terminal InfraSetup colors for the project. The journaled
@@ -847,36 +660,65 @@ async fn start_queued_execution(
     phase: weft_core::context::Phase,
     entry_node: &str,
     kicks: &[Kick],
-    definition_hash: &str,
+    program: &weft_core::project::hash::ProgramIdentity,
+    subgraph: Option<&weft_core::project::selection::RunSelection>,
+    seed: Option<weft_journal::Seed>,
+    expected_activation: Option<weft_core::Color>,
+) -> Result<(), (StatusCode, String)> {
+    let id = project_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("project id: {e}")))?;
+    let source_version = super::versions::record_program_source(state, id, program).await?;
+    start_queued_execution_with(state, color, project_id, phase, entry_node, kicks, &[], program, subgraph, seed, expected_activation, Some(&source_version))
+        .await
+}
+
+/// THE one way a queued execution is born: its birth rows in one
+/// transaction with its execute task. `extra_rows` are birth facts
+/// beyond the kicks (a scoped run's provided values as `PortEmitted
+/// { provided: true }`), written right after them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_queued_execution_with(
+    state: &DispatcherState,
+    color: weft_core::Color,
+    project_id: &str,
+    phase: weft_core::context::Phase,
+    entry_node: &str,
+    kicks: &[Kick],
+    extra_rows: &[weft_journal::ExecEvent],
+    program: &weft_core::project::hash::ProgramIdentity,
     // A manual run's computed subgraph, journaled so the engine skips
     // everything outside it and a resume rebuilds the same boundary.
     // `None` for the setup phases (they compute their scope engine-side)
     // and for anything that runs the whole graph.
-    subgraph: Option<&HashSet<String>>,
+    subgraph: Option<&weft_core::project::selection::RunSelection>,
+    // What the run inherits (`weft run --seed`); `None` from nothing.
+    seed: Option<weft_journal::Seed>,
+    expected_activation: Option<weft_core::Color>,
+    source_version: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
     let now = crate::lease::now_unix() as u64;
+    let definition_hash = &program.definition_hash;
     let tenant = state
         .tenant_router
         .tenant_for_project(project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let task = crate::task_kinds::execute::execution_task_spec(
-        &state.pg_pool,
         weft_task_store::TaskKind::Execute,
         project_id,
         color,
         definition_hash,
+        &program.binary_hash,
         Some(tenant.as_str()),
         None,
         None,
     )
-    .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execute task spec: {e}")))?;
-    let (start, kick_events) =
-        execution_birth_events(color, project_id, phase, entry_node, kicks, definition_hash, subgraph, now);
+    let (start, mut kick_events) =
+        execution_birth_events(color, project_id, phase, entry_node, kicks, definition_hash, Some(program), subgraph, seed, source_version, now);
+    kick_events.extend_from_slice(extra_rows);
     state
         .journal
-        .start_execution(&start, &kick_events, task)
+        .start_execution(&start, &kick_events, task, expected_activation)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start execution: {e}")))?;
     Ok(())
@@ -890,6 +732,7 @@ async fn start_queued_execution(
 /// row is deterministic). The COMMIT differs per path (one transaction
 /// here, dedup-keyed writes in route_entry, an admission transaction for
 /// a live fire); the events do not.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execution_birth_events(
     color: weft_core::Color,
     project_id: &str,
@@ -897,7 +740,12 @@ pub(crate) fn execution_birth_events(
     entry_node: &str,
     kicks: &[Kick],
     definition_hash: &str,
-    subgraph: Option<&HashSet<String>>,
+    program: Option<&weft_core::project::hash::ProgramIdentity>,
+    subgraph: Option<&weft_core::project::selection::RunSelection>,
+    // The run this one inherits from (`weft run --seed`); `None` for a
+    // run from nothing, which is every fire and every setup phase.
+    seed: Option<weft_journal::Seed>,
+    source_version: Option<&str>,
     at_unix: u64,
 ) -> (weft_journal::ExecEvent, Vec<weft_journal::ExecEvent>) {
     let start = weft_journal::ExecEvent::ExecutionStarted {
@@ -906,19 +754,16 @@ pub(crate) fn execution_birth_events(
         entry_node: entry_node.to_string(),
         phase,
         definition_hash: Some(definition_hash.to_string()),
-        node_test: false,
-        subgraph: subgraph.map(|s| {
-            let mut v: Vec<String> = s.iter().cloned().collect();
-            v.sort();
-            v
-        }),
+        program: program.cloned(), source_version: source_version.map(str::to_string), node_test: false,
+        subgraph: subgraph.cloned(),
+        seed,
         at_unix,
     };
     let kick_events = kicks
         .iter()
         .map(|kick| weft_journal::ExecEvent::NodeKicked {
             color,
-            node_id: kick.node_id.clone(),
+            node_id: kick.node.clone(),
             firing: kick.firing,
             payload: kick.payload.clone(),
             port_snapshot: kick.port_snapshot.clone(),
@@ -937,7 +782,7 @@ pub(crate) fn execution_birth_events(
 /// `within` narrows the check to the named nodes: a targeted run only touches
 /// its own upstream subgraph, so infra outside it has no bearing on that run
 /// and must not gate it. `None` checks the whole project (activate does).
-async fn missing_infra_nodes(
+pub(crate) async fn missing_infra_nodes(
     state: &DispatcherState,
     project_id: &str,
     project: &ProjectDefinition,
@@ -978,8 +823,10 @@ pub async fn start_infra_setup(
     // One coherent (hash, shape) pair: the kicks below and the
     // journaled/enqueued hash must come from the SAME definition (see
     // `coherent_definition`).
-    let (definition_hash, project) = coherent_definition(state, project_id_uuid).await?;
-    let kicks = compute_infra_setup_kicks(&project);
+    let (program, project) = coherent_definition(state, project_id_uuid).await?;
+    let selection = weft_core::project::selection::RunSelection::setup(&project, &infra_ids(&project))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let kicks = compute_infra_setup_kicks(&project).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     if kicks.is_empty() {
         return Ok(None);
     }
@@ -990,15 +837,21 @@ pub async fn start_infra_setup(
     // completion event.
     let events = state.events.subscribe_project(&project_id).await;
 
-    start_queued_execution(
+    // Infra reconciliation already holds the project transition lock.
+    let source_version = super::versions::record_program_source_locked(state, project_id_uuid, &program).await?;
+    start_queued_execution_with(
         state,
         color,
         &project_id,
         weft_core::context::Phase::InfraSetup,
-        &kicks[0].node_id,
+        &kicks[0].node,
         &kicks,
-        &definition_hash,
+        &[],
+        &program,
+        Some(&selection),
         None,
+        None,
+        Some(&source_version),
     )
     .await?;
     Ok(Some(InfraSetupRun { color, events, project_id }))
@@ -1111,9 +964,10 @@ pub async fn await_infra_setup(
 /// pushes a pulse into the OTHER program's consumers too. Unbounded,
 /// those consumers hold a partial input set forever and the run ends
 /// Stuck after all its real work completed. Bounded, they never appear.
+#[derive(Debug)]
 pub struct TriggerFire {
     pub kicks: Vec<Kick>,
-    pub subgraph: HashSet<String>,
+    pub subgraph: weft_core::project::selection::RunSelection,
 }
 
 /// Kicks for a trigger fire.
@@ -1138,38 +992,33 @@ pub struct TriggerFire {
 /// (a sibling branch fed by another trigger or by static sources
 /// alone) is someone else's work; this fire must not re-run it.
 ///
-/// Returns `None` if the fired trigger reaches no output; the caller
-/// treats that as "nothing to run."
+/// The trigger itself runs even when it has no downstream consumer.
 pub fn compute_trigger_fire(
     project: &ProjectDefinition,
     firing_node_id: &str,
     payload: &Value,
     port_snapshot: Option<&Value>,
-) -> Option<TriggerFire> {
+) -> Result<TriggerFire, String> {
     // All trigger nodes register signals during TriggerSetup; that set
     // is what fires route to.
-    let (edge_idx, triggers) = RunSubgraph::graph_base(project);
+    let triggers: HashSet<String> = trigger_ids(project).into_iter().collect();
     if !triggers.contains(firing_node_id) {
-        return None;
+        return Err(format!("'{firing_node_id}' is not a trigger"));
     }
 
     // Targets = everything the FIRED trigger reaches downstream (the
     // trigger itself included, so a trigger with nothing behind it
     // still fires and runs alone).
-    let reachable = downstream_closure(project, &edge_idx, firing_node_id);
-    let targets: Vec<String> = project
-        .nodes
-        .iter()
-        .filter(|n| reachable.contains(&n.id))
-        .map(|n| n.id.clone())
-        .collect();
 
     // Upstream closure from all of that, stopping at triggers (include
     // the trigger but do not walk through its incoming edges). Only the
     // firing trigger's kick carries the wake payload and the snapshot.
-    let subgraph = RunSubgraph::aimed(project, edge_idx, triggers, &targets);
-    let kicks = subgraph.root_kicks(project, payload, Some((firing_node_id, port_snapshot)));
-    Some(TriggerFire { kicks, subgraph: subgraph.nodes })
+    let selection = weft_core::project::selection::RunSelection::carve(project,
+        &weft_core::project::selection::SelectionBounds {
+            fire: Some(firing_node_id.into()), ..Default::default()
+        })?;
+    let kicks = Kick::for_selection(project, &selection, Some((firing_node_id, payload)), port_snapshot);
+    Ok(TriggerFire { kicks, subgraph: selection })
 }
 
 #[derive(Debug, Serialize)]
@@ -1292,6 +1141,12 @@ pub struct ProjectDrift {
     /// `binary_drift`; the next execution picks up the new
     /// definition via the worker's broker fetch.
     pub definition_drift: bool,
+    /// "The listeners fire an older program." The registrations pin
+    /// the exact code and graph they were made against; a rebuild or a
+    /// definition edit since then leaves them firing the old one until
+    /// `weft resync`. The verb list offers `resync` on this bit, and a
+    /// human reading `weft status` needs the reason spelled out too.
+    pub activation_drift: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1324,6 +1179,11 @@ pub struct StatusQuery {
     /// "the worker image needs rebuilding" drift.
     #[serde(default, rename = "desiredBinaryHash")]
     pub desired_binary_hash: Option<String>,
+    /// The same build's binary hash with the whole catalog compiled in
+    /// (`weft run --full`). A running image built either way is
+    /// current: drift means the running hash matches neither.
+    #[serde(default, rename = "desiredFullBinaryHash")]
+    pub desired_full_binary_hash: Option<String>,
     /// Definition hash the CLI computed for the current canonical
     /// `ProjectDefinition`. Compared against
     /// `project.running_definition_hash` to surface "the project
@@ -1380,7 +1240,7 @@ impl IntoResponse for StatusError {
             StatusError::NotMyProject => (
                 StatusCode::NOT_FOUND,
                 [("x-weft-not-found", "project")],
-                "project not found",
+                crate::authenticator::NO_SUCH_PROJECT,
             )
                 .into_response(),
             StatusError::Other(code, msg) => (code, msg).into_response(),
@@ -1517,12 +1377,15 @@ pub async fn status(
         .running_infra_hash(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_infra_hash: {e}")))?;
-    let drift = compute_drift(
+    let mut drift = compute_drift(
         &query,
         binary_hash.as_deref(),
         definition_hash.as_deref(),
         infra_hash.as_deref(),
     );
+    let activated = state.projects.activation_program(id).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("activation program: {error}")))?;
+    drift.activation_drift = activation_has_drifted(&query, binary_hash.as_deref(), definition_hash.as_deref(), activated.as_ref(), drift.definition_drift);
     let available_actions = compute_available_actions(&ActionInputs {
         lifecycle: &snapshot.lifecycle,
         transition: snapshot.transition,
@@ -1555,6 +1418,7 @@ pub async fn status(
             infra_drift: drift.infra_drift,
             binary_drift: drift.binary_drift,
             definition_drift: drift.definition_drift,
+            activation_drift: drift.activation_drift,
         },
         available_actions,
         preservation: snapshot.preservation,
@@ -1757,7 +1621,7 @@ pub(crate) async fn require_action(
         orphaned_infra: snapshot.orphaned_infra,
         infra_rollup: &snapshot.infra_rollup,
         infra_busy: snapshot.infra_busy,
-        drift: &DriftBits { infra_drift: true, binary_drift: true, definition_drift: true },
+        drift: &DriftBits { infra_drift: true, binary_drift: true, definition_drift: true, activation_drift: true },
         preservation: &snapshot.preservation,
         running_count: snapshot.running_count,
     });
@@ -1815,7 +1679,9 @@ fn compute_drift(
     // hash. No running hash means the project was never built /
     // activated; the action bar shouldn't surface drift then.
     let binary_drift = match (query.desired_binary_hash.as_deref(), running_binary_hash) {
-        (Some(want), Some(have)) => want != have,
+        (Some(want), Some(have)) => {
+            want != have && query.desired_full_binary_hash.as_deref() != Some(have)
+        }
         _ => false,
     };
     let definition_drift = match (
@@ -1830,14 +1696,30 @@ fn compute_drift(
         _ => false,
     };
     DriftBits {
+        activation_drift: false,
         infra_drift,
         binary_drift,
         definition_drift,
     }
 }
 
+/// Whether the listeners' registrations pin a program other than the
+/// one the user is looking at. A registration pins the exact code
+/// identity it was made from; a project activated before that identity
+/// was recorded (`activation_program` is null) has only the graph hash
+/// to go by, so it falls back to `definition_drift`.
+fn activation_has_drifted(query: &StatusQuery, registered_binary: Option<&str>, registered_definition: Option<&str>, activated: Option<&weft_core::project::hash::ProgramIdentity>, definition_drift: bool) -> bool {
+    let Some(activated) = activated else { return definition_drift };
+    let desired_binary = query.desired_binary_hash.as_deref().or(registered_binary);
+    let desired_definition = query.desired_definition_hash.as_deref().or(registered_definition);
+    desired_definition != Some(activated.definition_hash.as_str())
+        || (desired_binary != Some(activated.binary_hash.as_str())
+            && query.desired_full_binary_hash.as_deref() != Some(activated.binary_hash.as_str()))
+}
+
 #[derive(Default, Clone, Copy)]
 pub(crate) struct DriftBits {
+    pub activation_drift: bool,
     pub infra_drift: bool,
     pub binary_drift: bool,
     pub definition_drift: bool,
@@ -1971,17 +1853,14 @@ fn compute_available_actions(inputs: &ActionInputs<'_>) -> Vec<String> {
     match inputs.lifecycle.status {
         ProjectStatus::Active => {
             out.push("deactivate".to_string());
-            // Resync if the project's RUNTIME shape drifted (config /
-            // topology edit). Binary drift alone does NOT light
-            // resync: a binary-only change rebuilds the image but
-            // doesn't need the user to re-register triggers; the next
-            // run picks up the new image.
-            if inputs.drift.definition_drift {
+            // Registrations pin both the graph and the worker code. Either
+            // change needs resync before listeners can fire the new program.
+            if inputs.drift.activation_drift {
                 out.push("resync".to_string());
             }
         }
         ProjectStatus::Registered | ProjectStatus::Inactive => {
-            if inputs.has_triggers && infra_ready {
+            if inputs.has_triggers {
                 let has_preserved =
                     inputs.preservation.parked + inputs.preservation.suspended > 0;
                 if has_preserved && inputs.lifecycle.status == ProjectStatus::Inactive {
@@ -2075,6 +1954,41 @@ pub struct ActivateRequest {
     pub reactivate_choice: Option<String>,
 }
 
+/// Prepare trigger settings without changing the project's listening state.
+pub async fn bake(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id_str): Path<String>,
+) -> Result<Json<crate::journal::TriggerBake>, (StatusCode, String)> {
+    let id = id_str.parse::<uuid::Uuid>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
+    authorize_project(&state, &caller.0, id).await?;
+    crate::transition::ensure_built_gated(&state, id).await?;
+    let (program, project) = coherent_definition(&state, id).await?;
+    prepare_trigger_setup(&state, id, &project).await?;
+    let kicks = compute_trigger_setup_kicks(&project).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    if kicks.is_empty() {
+        return Err((StatusCode::PRECONDITION_FAILED, "project has no trigger setup to bake".into()));
+    }
+    Ok(Json(run_trigger_setup(&state, id, &project, kicks, &program, None).await?))
+}
+
+async fn prepare_trigger_setup(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    project: &ProjectDefinition,
+) -> Result<(), (StatusCode, String)> {
+    let project_id = id.to_string();
+    let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_ids(project))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let nodes = selection.nodes.iter().cloned().collect();
+    if !missing_infra_nodes(state, &project_id, project, Some(&nodes)).await?.is_empty() {
+        let _ = super::infra::sync_inner(state.clone(), id, super::infra::SyncRequest::default()).await?;
+    }
+    reconcile_worker(state, &project_id, crate::infra_lifecycle_command::RunningPolicy::Wait,
+        weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS).await
+}
+
 pub async fn activate(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -2162,10 +2076,11 @@ struct ActivateWindowError {
 async fn activate_trigger_setup_window(
     state: &DispatcherState,
     id: uuid::Uuid,
+    activation: uuid::Uuid,
     project_id: &str,
     choice: &str,
     project: &ProjectDefinition,
-    definition_hash: &str,
+    program: &weft_core::project::hash::ProgramIdentity,
 ) -> Result<(), ActivateWindowError> {
     // Failures up to (not including) run_trigger_setup haven't touched
     // signal state, so they only need the status un-stuck.
@@ -2183,34 +2098,38 @@ async fn activate_trigger_setup_window(
 
     // Apply the reactivate choice's destructive effect now that we
     // hold the exclusive Activating transition (validated by caller).
-    apply_reactivate_choice(state, project_id, choice).await.map_err(unstick)?;
+    apply_reactivate_choice(state, project_id, activation, choice).await.map_err(unstick)?;
 
-    // Sweep any prior TriggerSetup colors that leaked from a failed
-    // previous activate. Safe because we won `try_begin_activating`:
-    // no sibling activate is in flight, so every non-terminal
-    // trigger_setup color here is a leftover from a dead prior
-    // activate, never a concurrent one.
-    sweep_superseded_trigger_setup_colors(state, project_id)
-        .await
-        .map_err(|e| {
-            unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("sweep superseded ts colors: {e}")))
-        })?;
-
-    // Run TriggerSetup. From here on signals are in flux, so a failure
-    // wipes (the rollback cancels the setup run the row recorded). Its
-    // register_signal tasks UPSERT entry rows on (project_id,
-    // node_id), so existing rows from before a deactivate get
-    // spec/mount/auth refreshed in place; the token survives, so
-    // parked_fires still attached drain cleanly later.
-    let kicks = compute_trigger_setup_kicks(project);
+    // Capture first, then arm that completed capture. Arming refreshes
+    // existing entry rows while retaining their tokens and parked fires.
+    let kicks = compute_trigger_setup_kicks(project).map_err(|error| unstick((StatusCode::BAD_REQUEST, error)))?;
+    let mut captured = std::collections::BTreeMap::new();
     if !kicks.is_empty() {
-        run_trigger_setup(state, id, kicks, definition_hash).await.map_err(
+        let bake = run_trigger_setup(state, id, project, kicks, program, Some(activation)).await.map_err(
             |(status, msg)| ActivateWindowError {
                 status,
                 msg,
                 rollback: ActivateRollback::WipeSignals,
             },
         )?;
+        let mut tx = activation_write(state, project_id, activation).await
+            .map_err(|e| unstick((StatusCode::CONFLICT, e.to_string())))?;
+        sqlx::query("UPDATE project SET activation_version = $2, activation_program = $3 WHERE id::text = $1")
+            .bind(project_id).bind(&bake.source_version).bind(sqlx::types::Json(&bake.program)).execute(&mut *tx).await
+            .map_err(|e| unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("record activation source: {e}"))))?;
+        tx.commit().await.map_err(|e| unstick((StatusCode::INTERNAL_SERVER_ERROR, format!("record activation source: {e}"))))?;
+        for (node_id, capture) in &bake.captured {
+            crate::task_kinds::register_signal::RegisterSignalExecutor::arm(state,
+                crate::task_kinds::register_signal::RegisterSignalPayload {
+                    color: bake.color.to_string(), node_id: node_id.clone(), frames: Vec::new(),
+                    spec: capture.spec.clone(), is_resume: false, call_index: 0,
+                    port_snapshot: Some(capture.ports.clone()),
+                }).await.map_err(|error| ActivateWindowError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR, msg: format!("arm trigger '{node_id}': {error:#}"),
+                    rollback: ActivateRollback::WipeSignals,
+                })?;
+        }
+        captured = bake.captured;
     }
 
     // From here trigger-setup succeeded but signals are registered, so
@@ -2224,7 +2143,7 @@ async fn activate_trigger_setup_window(
 
     // Drop orphan entry rows: nodes that previously had triggers but
     // no longer do (user edited source while deactivated).
-    drop_orphan_entry_rows(state, project_id, project)
+    drop_orphan_entry_rows(state, project_id, activation, &captured)
         .await
         .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("drop_orphan_entry_rows: {e}"))))?;
 
@@ -2249,7 +2168,7 @@ async fn activate_trigger_setup_window(
     // flip hands back is only bookkeeping being cleared.
     let cas_ok = state
         .projects
-        .end_activating(id, &crate::project_store::ProjectLifecycle::active())
+        .end_activating(id, activation, &crate::project_store::ProjectLifecycle::active(), false)
         .await
         .map_err(|e| wipe((StatusCode::INTERNAL_SERVER_ERROR, format!("end_activating: {e}"))))?
         .is_some();
@@ -2295,7 +2214,7 @@ pub async fn activate_inner(
     // trigger checks here AND the kicks the activate window computes
     // must come from the definition recorded under the hash that
     // trigger-setup will journal (see `coherent_definition`).
-    let (running_definition_hash, project) = coherent_definition(state, id).await?;
+    let (program, project) = coherent_definition(state, id).await?;
     let project_id = id.to_string();
 
     // Activate is the trigger-setup verb. A project without any
@@ -2314,21 +2233,6 @@ pub async fn activate_inner(
         ));
     }
 
-    // Pre-flight: every requires_infra node must be Running. A
-    // Stopped / Failed / Flaky node is just as bad as a missing one
-    // from TriggerSetup's POV (the worker will try `endpoint_url`
-    // and the broker will return None).
-    let missing = missing_infra_nodes(state, &project_id, &project, None).await?;
-    if !missing.is_empty() {
-        return Err((
-            StatusCode::PRECONDITION_REQUIRED,
-            format!(
-                "infra not running for: {}. Run `weft infra start` first.",
-                missing.join(", ")
-            ),
-        ));
-    }
-
     // A binary-hash change must kill the stale-image worker before
     // the activate's TriggerSetup exec runs, otherwise it's
     // dispatched against a worker that doesn't know about the new
@@ -2340,13 +2244,7 @@ pub async fn activate_inner(
     // Wait policy: activate never silently kills running work; stale
     // workers drain (no new admissions, in-flight finishes) up to the
     // default cap before being replaced.
-    reconcile_worker(
-        state,
-        &project_id,
-        crate::infra_lifecycle_command::RunningPolicy::Wait,
-        weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-    )
-    .await?;
+    prepare_trigger_setup(state, id, &project).await?;
 
     // Validate (don't yet apply) the reactivate choice. Validation is
     // a pure rejection and belongs in the read-only pre-flight; the
@@ -2372,14 +2270,12 @@ pub async fn activate_inner(
     // Activating, and reports whether THIS call won. A losing caller
     // (a concurrent activate from another dispatcher Pod, a double-
     // click, CLI + extension racing) bails here with 409 BEFORE
-    // the orphan sweep. This is
-    // what makes the sweep below correct: having won the exclusive
-    // transition, any non-terminal trigger_setup color we then see
-    // is genuinely an orphan from a dead prior activate, never a
-    // sibling activate's in-flight color.
+    // any signal cleanup. Every later write is guarded by this activation's
+    // reserved color, including after a cancellation starts a newer activation.
+    let activation = uuid::Uuid::new_v4();
     let won = state
         .projects
-        .try_begin_activating(id)
+        .try_begin_activating(id, activation)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("try_begin_activating: {e}")))?;
     if !won {
@@ -2407,8 +2303,8 @@ pub async fn activate_inner(
     // block with ONE rollback site below. A future step added here
     // can't forget the un-stick.
     let setup = activate_trigger_setup_window(
-        state, id, &project_id, choice, &project,
-        &running_definition_hash,
+        state, id, activation, &project_id, choice, &project,
+        &program,
     )
     .await;
     if let Err(ActivateWindowError { status, msg, rollback }) = setup {
@@ -2420,21 +2316,13 @@ pub async fn activate_inner(
         // Both are idempotent and safe if a concurrent cancel/success
         // already moved us out of Activating (the inner CAS no-ops).
         let rb = match rollback {
-            ActivateRollback::UnstickOnly => match unstick_activating(state, id).await {
-                // An un-stick-only rollback runs before setup started, so
-                // the row can hold no setup color. One coming back means a
-                // step after `run_trigger_setup` was mapped to the wrong
-                // rollback: say so, and still never leave the run live.
-                Ok(Some(Some(color))) => {
-                    tracing::error!(
-                        target: "weft_dispatcher::activate",
-                        project_id = %id, %color,
-                        "unstick-only rollback found a recorded setup run; cancelling it \
-                         (a post-setup failure must roll back with WipeSignals)"
-                    );
+            ActivateRollback::UnstickOnly => match unstick_activating(state, id, activation).await {
+                // The reserved color may not have started yet. Cancellation
+                // is harmless for an ownerless color and fences any born run.
+                Ok(true) => {
                     crate::api::execution::cancel_color(
                         state,
-                        color,
+                        activation,
                         &weft_core::exec::CancelCause::Runtime {
                             detail: "the activation failed and rolled back its setup run".into(),
                         },
@@ -2450,7 +2338,7 @@ pub async fn activate_inner(
                 // spawned is cancelled by that failure, not by anyone's
                 // decision.
                 wipe_activating_state(
-                    state, id, &project_id,
+                    state, id, &project_id, activation,
                     &weft_core::exec::CancelCause::Runtime {
                         detail: "the activation failed and rolled back its setup run".into(),
                     },
@@ -2872,44 +2760,6 @@ pub(crate) async fn drain_one_token(
     outcome
 }
 
-/// Cancel every non-terminal TriggerSetup run of `project_id` that
-/// nobody is driving any more, every one attempted before any error
-/// is reported. The current activation's own run is never among them:
-/// its color is on the project row (`activating_ts_color`), and the
-/// caller cancels it first with the cause it knows. Everything found
-/// here is a leftover of an older activation whose driver died before
-/// it could cancel its run, and the one truth the sweep can vouch for
-/// about such a run is that a newer activation superseded it. A row
-/// this table cannot parse is schema drift: the journal read fails
-/// loud rather than skipping a run the sweep exists to catch.
-async fn sweep_superseded_trigger_setup_colors(
-    state: &DispatcherState,
-    project_id: &str,
-) -> anyhow::Result<()> {
-    let colors = state
-        .journal
-        .list_non_terminal_colors_for_project(
-            project_id,
-            Some(weft_core::context::Phase::TriggerSetup),
-        )
-        .await?;
-    if colors.is_empty() {
-        return Ok(());
-    }
-    tracing::info!(
-        target: "weft_dispatcher::activate",
-        project_id, ?colors,
-        "cancelling trigger_setup runs left by older activations"
-    );
-    let superseded = weft_core::exec::CancelCause::Runtime {
-        detail: "a newer activation superseded this trigger setup run".into(),
-    };
-    let targets: Vec<(weft_core::Color, &weft_core::exec::CancelCause)> =
-        colors.iter().map(|c| (*c, &superseded)).collect();
-    crate::api::execution::cancel_colors(state, &targets).await?;
-    Ok(())
-}
-
 /// Sweep entry-trigger rows whose node no longer exists in the
 /// project source. Called after TriggerSetup so any node the user
 /// removed-while-parked has its leftover signal row dropped.
@@ -2918,19 +2768,34 @@ async fn sweep_superseded_trigger_setup_colors(
 async fn drop_orphan_entry_rows(
     state: &DispatcherState,
     project_id: &str,
-    project: &ProjectDefinition,
+    activation: uuid::Uuid,
+    captured: &std::collections::BTreeMap<String, crate::journal::TriggerCapture>,
 ) -> anyhow::Result<()> {
-    let live_node_ids: std::collections::HashSet<&str> =
-        project.nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut tx = activation_write(state, project_id, activation).await?;
     let signals = state.journal.signal_list_for_project(project_id).await?;
-    let orphans: Vec<crate::journal::SignalRegistration> = signals
+    let orphans: Vec<String> = signals
         .into_iter()
-        .filter(|s| !s.is_resume && !live_node_ids.contains(s.node_id.as_str()))
+        .filter(|s| !s.is_resume && !captured.contains_key(&s.node_id))
+        .map(|s| s.token)
         .collect();
-    crate::api::signal::delete_signals(state, &orphans)
-        .await
-        .map_err(|(_, msg)| anyhow::anyhow!("delete_signals: {msg}"))?;
+    let removed = crate::journal::postgres::remove_signals(&mut *tx, &orphans).await?;
+    tx.commit().await?;
+    state.listeners.unregister_many(&state.pg_pool, &removed).await;
     Ok(())
+}
+
+/// Hold the activation identity while changing its persistent signal state.
+async fn activation_write(
+    state: &DispatcherState,
+    project_id: &str,
+    activation: uuid::Uuid,
+) -> anyhow::Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+    let mut tx = state.pg_pool.begin().await?;
+    let found: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT id FROM project WHERE id = $1::uuid AND status = 'activating' AND activating_ts_color = $2 FOR UPDATE",
+    ).bind(project_id).bind(activation).fetch_optional(&mut *tx).await?;
+    anyhow::ensure!(found.is_some(), "activation {activation} no longer owns project {project_id}");
+    Ok(tx)
 }
 
 /// Apply an activate `reactivate_choice`'s destructive effect on the
@@ -2944,24 +2809,40 @@ async fn drop_orphan_entry_rows(
 async fn apply_reactivate_choice(
     state: &DispatcherState,
     project_id: &str,
+    activation: uuid::Uuid,
     choice: &str,
 ) -> Result<(), (StatusCode, String)> {
+    let mut tx = activation_write(state, project_id, activation).await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    let mut cancelled = Vec::new();
+    let mut removed = Vec::new();
     match choice {
-        "execute_parked_keep_suspended" => Ok(()),
+        "execute_parked_keep_suspended" => {},
         "keep_suspended_only" => {
             sqlx::query(
                 "UPDATE signal SET parked_fires = '[]'::jsonb \
                  WHERE project_id = $1 AND jsonb_array_length(parked_fires) > 0",
             )
             .bind(project_id)
-            .execute(&state.pg_pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clear parked: {e}")))?;
-            Ok(())
         }
-        "wipe_all" => wipe_project_signals(state, project_id).await,
+        "wipe_all" => {
+            cancelled = state.journal.list_non_terminal_colors_for_project(project_id, None).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list activation cleanup: {e}")))?;
+            removed = crate::journal::postgres::remove_project_signals(&mut *tx, project_id).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("clear activation signals: {e}")))?;
+        }
         _ => unreachable!("reactivate_choice validated by caller"),
     }
+    tx.commit().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("apply activation choice: {e}")))?;
+    state.listeners.unregister_many(&state.pg_pool, &removed).await;
+    let cause = weft_core::exec::CancelCause::User;
+    let targets: Vec<_> = cancelled.iter().map(|color| (*color, &cause)).collect();
+    crate::api::execution::cancel_colors(state, &targets).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation's prior runs: {e}")))?;
+    Ok(())
 }
 
 /// Un-stick a project from Activating: CAS Activating → Inactive
@@ -2976,63 +2857,39 @@ async fn apply_reactivate_choice(
 /// project returns to Inactive with its prior suspended/parked
 /// signals intact; the next activate retries cleanly).
 ///
-/// Returns the setup color the activation had recorded when the CAS
-/// wins (`Some(None)` if setup never started), `None` when it lost.
+/// Returns whether this activation still owned the project.
 async fn unstick_activating(
     state: &DispatcherState,
     id: uuid::Uuid,
-) -> Result<Option<Option<weft_core::Color>>, (StatusCode, String)> {
+    activation: uuid::Uuid,
+) -> Result<bool, (StatusCode, String)> {
     state
         .projects
-        .end_activating(id, &crate::project_store::ProjectLifecycle::wiped())
+        .end_activating(id, activation, &crate::project_store::ProjectLifecycle::wiped(), false)
         .await
+        .map(|ended| ended.is_some())
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("end_activating: {e}")))
 }
 
-/// Cancel-activate / TriggerSetup-failure cleanup: un-stick the
-/// status (via `unstick_activating`) AND wipe signal state (cancel TS
-/// color + sweep orphan TS colors + drop all signal rows). Used once
-/// trigger-setup has started, so signals are in flux and must go.
-/// Idempotent: a partial run leaves the next call with less work, and
-/// if the un-stick CAS loses (a concurrent activate-success/cancel
-/// already left Activating) it returns early WITHOUT wiping.
-///
-/// The current activation's setup run comes off the project row, where
-/// the activation recorded it before starting the run, and it comes out
-/// of the un-stick itself (one atomic step, so a driver racing this
-/// cannot slip a run in between). `cause` names why THAT run is being
-/// cancelled, and the three callers each carry a different truth: the
-/// failed activate's rollback (runtime), a person's cancel-activate
-/// (user), the reaper's stuck-activation wipe (the activation's driver
-/// died). The journal repeats it verbatim, so it must be the caller's
-/// truth, never a guess made here. Setup runs left by OLDER activations
-/// are not this activation's story; the sweep journals them as
-/// superseded.
+/// End the named activation and delete its signal rows atomically. Listener
+/// cleanup receives only those deleted rows, so a newer activation's tokens
+/// survive. The caller supplies the cause of the setup run's cancellation.
 pub(crate) async fn wipe_activating_state(
     state: &DispatcherState,
     id: uuid::Uuid,
     project_id: &str,
+    activation: uuid::Uuid,
     cause: &weft_core::exec::CancelCause,
 ) -> Result<(), (StatusCode, String)> {
-    // Un-stick FIRST, and take the setup color out of the same step. If
-    // we lose the CAS, activate already finished cleanly (or a sibling
-    // cancel did the wipe); do not touch signals.
-    let Some(ts_color) = unstick_activating(state, id).await? else {
+    let Some(removed) = state.projects.end_activating(
+        id, activation, &crate::project_store::ProjectLifecycle::wiped(), true,
+    ).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation: {e}")))? else {
         return Ok(());
     };
-    if let Some(c) = ts_color {
-        crate::api::execution::cancel_color(state, c, cause)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel_color: {e}")))?;
-    }
-    // Everything else still running setup belongs to an older, dead
-    // activation.
-    sweep_superseded_trigger_setup_colors(state, project_id)
+    state.listeners.unregister_many(&state.pg_pool, &removed).await;
+    crate::api::execution::cancel_color(state, activation, cause)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("sweep ts: {e}")))?;
-    // Drop every signal row + unregister from the listener via the
-    // shared helper (DB-first-listener-second ordering).
-    crate::api::signal::delete_signals_for_project(state, project_id).await?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel activation {project_id}: {e}")))?;
     Ok(())
 }
 
@@ -3201,68 +3058,78 @@ pub async fn resync(
         .ok_or_else(|| (StatusCode::NOT_FOUND, "project not found".into()))?;
     let project_id = id.to_string();
 
-    // 1. Deactivate, ONLY when the project is actually Active, with
-    //    the user's spec (the shared picker asked both questions:
-    //    what happens to incoming signals, and what happens to
-    //    running executions). An inactive project has nothing to
-    //    deactivate; activate's own UPSERT + orphan-row sweep
-    //    reconcile its signals.
+    // 1. Refuse unless the project is Active. Resync means "the
+    //    listeners fire an older program; register them against this
+    //    one": on a hibernated or parked project there is nothing
+    //    registered to bring across, and silently turning it into an
+    //    activate would revive a project the user parked on purpose.
+    //    Then deactivate with the user's spec (the shared picker asked
+    //    both questions: what happens to incoming signals, and what
+    //    happens to running executions).
     let lifecycle = state
         .projects
         .lifecycle(id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("lifecycle: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    if lifecycle.status == ProjectStatus::Active {
-        let Some(spec) = body.trigger_deactivation.as_ref() else {
-            return Err((
-                StatusCode::PRECONDITION_REQUIRED,
-                "project is active; triggerDeactivation { mode, runningPolicy, \
-                 graceMinutes?, drainTimeoutSecs? } required so the user can choose \
-                 how triggers come down (same picker as the standalone Deactivate)"
-                    .into(),
-            ));
-        };
-        execute_trigger_deactivation(&state, id, spec).await?;
-        if spec.running_policy == crate::infra_lifecycle_command::RunningPolicy::Wait {
-            // Wait for the drain through THE shared loop, capped at
-            // the spec's cap; stragglers past it are cancelled with
-            // the ONE cancel helper, and the ONE landing CAS flips
-            // the row before the reactivate.
-            let cap = spec
-                .drain_timeout_secs
-                .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-            let clock = weft_platform_traits::SystemClock;
-            let outcome = weft_platform_traits::drain_until_zero(
-                &clock,
-                std::time::Duration::from_secs(cap),
-                "resync",
-                || async {
-                    running_count(&state, &project_id, None)
-                        .await
-                        .map(|n| n as i64)
-                        .map_err(|e| {
-                            (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}"))
-                        })
-                },
-            )
-            .await?;
-            if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
-                tracing::warn!(
-                    target: "weft_dispatcher::api::project",
-                    project_id = %project_id,
-                    still_running,
-                    drain_timeout_secs = cap,
-                    "resync drain cap reached; cancelling remaining executions"
-                );
-                cancel_running_non_suspended(&state, &project_id, None).await?;
-            }
-            crate::journal_bridge::try_finish_drain(&state, &project_id, None)
-                .await
-                .map_err(|e| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("try_finish_drain: {e}"))
-                })?;
+    if lifecycle.status != ProjectStatus::Active {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "this project is not active (its mode is {}), and resync only re-registers \
+                 an active project; `weft activate` brings it up on the current source",
+                lifecycle.mode_label()
+            ),
+        ));
+    }
+    let Some(spec) = body.trigger_deactivation.as_ref() else {
+        return Err((
+            StatusCode::PRECONDITION_REQUIRED,
+            "project is active; triggerDeactivation { mode, runningPolicy, \
+             graceMinutes?, drainTimeoutSecs? } required so the user can choose \
+             how triggers come down (same picker as the standalone Deactivate)"
+                .into(),
+        ));
+    };
+    execute_trigger_deactivation(&state, id, spec).await?;
+    if spec.running_policy == crate::infra_lifecycle_command::RunningPolicy::Wait {
+        // Wait for the drain through THE shared loop, capped at
+        // the spec's cap; stragglers past it are cancelled with
+        // the ONE cancel helper, and the ONE landing CAS flips
+        // the row before the reactivate.
+        let cap = spec
+            .drain_timeout_secs
+            .unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
+        let clock = weft_platform_traits::SystemClock;
+        let outcome = weft_platform_traits::drain_until_zero(
+            &clock,
+            std::time::Duration::from_secs(cap),
+            "resync",
+            || async {
+                running_count(&state, &project_id, None)
+                    .await
+                    .map(|n| n as i64)
+                    .map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, format!("running_count: {e}"))
+                    })
+            },
+        )
+        .await?;
+        if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
+            tracing::warn!(
+                target: "weft_dispatcher::api::project",
+                project_id = %project_id,
+                still_running,
+                drain_timeout_secs = cap,
+                "resync drain cap reached; cancelling remaining executions"
+            );
+            cancel_running_non_suspended(&state, &project_id, None).await?;
         }
+        crate::journal_bridge::try_finish_drain(&state, &project_id, None)
+            .await
+            .map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("try_finish_drain: {e}"))
+            })?;
     }
 
     // 2. Reactivate precondition: every requires_infra node must be
@@ -3463,7 +3330,7 @@ pub async fn reconcile_worker(
     // namespace (parallel load re-scales via cold_start on demand).
     // Dedup key matches cold_start's so a concurrent sweep collapses
     // on us.
-    let dedup = format!("{project_id}:spawn");
+    let dedup = format!("{project_id}:{want_hash}:spawn");
     let payload = serde_json::json!({
         "project_id": project_id,
         "tenant": placement.tenant.as_str(),
@@ -3480,7 +3347,7 @@ pub async fn reconcile_worker(
             color: None,
             tenant_id: Some(placement.tenant.as_str().to_string()),
             target_pod_name: None,
-            binary_hash: None,
+            binary_hash: Some(want_hash.clone()),
             payload,
         },
     )
@@ -3782,7 +3649,11 @@ pub async fn cancel_running(
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id_str;
+    // The canonical form, never the caller's text: every row stores
+    // `id.to_string()`, while `parse_str` also accepts uppercase,
+    // braced and unhyphenated spellings. Keying rows off the raw path
+    // would authorize on one id and query on another.
+    let project_id = id.to_string();
     cancel_running_non_suspended(&state, &project_id, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3851,7 +3722,11 @@ pub async fn cancel_activate(
         .parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad id".into()))?;
     authorize_project(&state, &caller.0, id).await?;
-    let project_id = id_str;
+    // The canonical form, never the caller's text: every row stores
+    // `id.to_string()`, while `parse_str` also accepts uppercase,
+    // braced and unhyphenated spellings. Keying rows off the raw path
+    // would authorize on one id and query on another.
+    let project_id = id.to_string();
     let lifecycle = state
         .projects
         .lifecycle(id)
@@ -3869,7 +3744,9 @@ pub async fn cancel_activate(
     }
     // The in-flight setup run's color comes off the project row inside
     // the helper. The cause is the person's: they pressed Cancel.
-    wipe_activating_state(&state, id, &project_id, &weft_core::exec::CancelCause::User).await?;
+    let activation = lifecycle.activating_ts_color.ok_or((StatusCode::INTERNAL_SERVER_ERROR,
+        "activating project has no reserved setup identity".into()))?;
+    wipe_activating_state(&state, id, &project_id, activation, &weft_core::exec::CancelCause::User).await?;
     state
         .events
         .publish(DispatcherEvent::ProjectDeactivated { project_id })
@@ -4036,32 +3913,33 @@ pub(crate) async fn running_count(
 async fn run_trigger_setup(
     state: &DispatcherState,
     project_id_uuid: uuid::Uuid,
+    project: &ProjectDefinition,
     kicks: Vec<Kick>,
     // The hash of the SAME definition the caller computed `kicks`
     // from (one `coherent_definition` pair). Reading the project
     // row's hash here instead would race a concurrent re-register:
     // kicks from shape A journaled under hash B.
-    definition_hash: &str,
-) -> Result<(), (StatusCode, String)> {
+    program: &weft_core::project::hash::ProgramIdentity,
+    activation: Option<uuid::Uuid>,
+) -> Result<crate::journal::TriggerBake, (StatusCode, String)> {
     let project_id = project_id_uuid.to_string();
-    let color = uuid::Uuid::new_v4();
+    let color = activation.unwrap_or_else(uuid::Uuid::new_v4);
+    let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_ids(project))
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
     // Subscribe BEFORE journaling+enqueueing so the worker can't beat us to
     // the completion event.
     let mut events = state.events.subscribe_project(&project_id).await;
 
-    // Record the color on the project row BEFORE the run exists, so an
-    // activation that dies between the two leaves nothing unaccounted
-    // for (a recorded color with no run is cancelled as a no-op, and
-    // the re-check after the start below covers the run that arrives
-    // later). The write is guarded on the status: a refusal means
-    // cancel-activate or the reaper already ended this activation
-    // under us, and the run must not start.
-    let recorded = state
+    // The activation reserved this color when it began. A cancelled
+    // driver cannot replace a newer activation's identity.
+    let recorded = activation.is_none() || state
         .projects
-        .set_activating_ts_color(project_id_uuid, color)
+        .lifecycle(project_id_uuid)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("record ts color: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read activation: {e}")))?
+        .is_some_and(|l| l.status == crate::project_store::ProjectStatus::Activating
+            && l.activating_ts_color == Some(color));
     if !recorded {
         return Err((
             StatusCode::CONFLICT,
@@ -4078,20 +3956,18 @@ async fn run_trigger_setup(
         color,
         &project_id,
         weft_core::context::Phase::TriggerSetup,
-        &kicks[0].node_id,
+        &kicks[0].node,
         &kicks,
-        definition_hash,
+        program,
+        Some(&selection),
         None,
+        activation,
     )
     .await?;
 
-    // The birth has no status guard of its own, so re-check AFTER it:
-    // if the activation ended between the record above and the start
-    // (cancel-activate or the reaper un-stuck the row and found only a
-    // color with no run to cancel), the run now exists and is ours to
-    // end. Whichever side saw the run last cancels it; both cancels are
-    // idempotent, so a run never survives its activation.
-    let still_ours = state
+    // Cancellation may happen immediately after the atomic birth commits.
+    // Recheck ownership so this driver also cancels a run born during that race.
+    let still_ours = activation.is_none() || state
         .projects
         .lifecycle(project_id_uuid)
         .await
@@ -4127,7 +4003,7 @@ async fn run_trigger_setup(
             Ok(crate::events::DispatcherEvent::ExecutionCompleted { color: c, .. })
                 if c == color =>
             {
-                return Ok(());
+                break;
             }
             Ok(crate::events::DispatcherEvent::ExecutionFailed { color: c, error, .. })
                 if c == color =>
@@ -4151,7 +4027,7 @@ async fn run_trigger_setup(
                 // The journal is authoritative: re-query rather than
                 // fail the trigger-setup on a transient lag.
                 match crate::api::execution::terminal_outcome(&state.pg_pool, color).await {
-                    Ok(Some(crate::api::execution::TerminalOutcome::Completed)) => return Ok(()),
+                    Ok(Some(crate::api::execution::TerminalOutcome::Completed)) => break,
                     Ok(Some(crate::api::execution::TerminalOutcome::Failed)) => {
                         return Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4181,6 +4057,14 @@ async fn run_trigger_setup(
             }
         }
     }
+    let events = state.journal.events_log(color).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("read trigger setup: {error:#}")))?;
+    let bake = crate::journal::TriggerBake::from_events(&events)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| (StatusCode::CONFLICT, "trigger setup did not complete successfully".into()))?;
+    state.journal.finish_trigger_setup(color, Some(&bake)).await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("publish trigger bake: {error:#}")))?;
+    Ok(bake)
 }
 
 /// After a trigger-setup sub-exec, collect every persisted signal
@@ -4255,15 +4139,13 @@ mod trigger_kick_tests {
     }
 
     fn ids(kicks: &[Kick]) -> Vec<String> {
-        let mut v: Vec<String> = kicks.iter().map(|k| k.node_id.clone()).collect();
+        let mut v: Vec<String> = kicks.iter().map(|k| k.node.clone()).collect();
         v.sort();
         v
     }
 
-    fn sorted(set: &HashSet<String>) -> Vec<String> {
-        let mut v: Vec<String> = set.iter().cloned().collect();
-        v.sort();
-        v
+    fn sorted(set: &weft_core::project::selection::RunSelection) -> Vec<String> {
+        set.nodes.iter().cloned().collect()
     }
 
     fn fire(p: &ProjectDefinition, node: &str, payload: Value) -> TriggerFire {
@@ -4329,7 +4211,7 @@ mod trigger_kick_tests {
         );
         assert_eq!(sorted(&subgraph), vec!["a", "b", "c", "out", "trigger_x"]);
         for k in &kicks {
-            if k.node_id == "trigger_x" {
+            if k.node == "trigger_x" {
                 assert_eq!(k.payload, Some(Value::String("payload".into())));
             } else {
                 assert_eq!(k.payload, None);
@@ -4354,12 +4236,32 @@ mod trigger_kick_tests {
         assert_eq!(ids(&kicks), vec!["trigger_x".to_string(), "trigger_y".to_string()]);
         assert_eq!(sorted(&subgraph), vec!["out", "trigger_x", "trigger_y"]);
         for k in &kicks {
-            if k.node_id == "trigger_x" {
+            if k.node == "trigger_x" {
                 assert_eq!(k.payload, Some(Value::String("fire".into())));
             } else {
                 assert_eq!(k.payload, None);
             }
         }
+    }
+
+    #[test]
+    fn a_fire_carves_out_the_other_trigger_s_own_path() {
+        // TriggerX ──► StepX      TriggerY ──► StepY
+        // Nothing joins the two, so firing one records a subgraph holding
+        // only its own path: the graph view dims the rest of the program
+        // for that execution, the same way it does for an authored cut.
+        let p = project(
+            &[
+                ("trigger_x", true, &[]),
+                ("step_x", false, &[]),
+                ("trigger_y", true, &[]),
+                ("step_y", false, &[]),
+            ],
+            &[("trigger_x", "step_x"), ("trigger_y", "step_y")],
+        );
+        let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::Null);
+        assert_eq!(ids(&kicks), vec!["trigger_x".to_string()]);
+        assert_eq!(sorted(&subgraph), vec!["step_x", "trigger_x"]);
     }
 
     #[test]
@@ -4373,41 +4275,6 @@ mod trigger_kick_tests {
         let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::Null);
         assert_eq!(ids(&kicks), vec!["trigger_x".to_string()]);
         assert_eq!(sorted(&subgraph), vec!["dead_end", "trigger_x"]);
-    }
-
-    #[test]
-    fn a_manual_run_kicks_no_root_inside_a_scope() {
-        // g__in (nothing feeds it) ──► g.a ──► g__out ──► out
-        // g.seed (no wire feeds it, inside g)
-        // top (no wire feeds it, outside every scope)
-        // The untargeted run kicks the top-level roots, the group's In
-        // boundary among them; the body's seed is the scope launcher's
-        // to start, so it is never a kick. An aimed run at a member
-        // brings the whole scope and kicks the same boundary.
-        let mut p = project(
-            &[
-                ("top", false, &[]),
-                ("g__in", false, &[]),
-                ("g.a", false, &["g"]),
-                ("g.seed", false, &["g"]),
-                ("g__out", false, &[]),
-                ("out", false, &[]),
-            ],
-            &[("g__in", "g.a"), ("g.a", "g__out"), ("g__out", "out")],
-        );
-        // The boundaries carry their role, the way the compiler
-        // flattens them: that is what closes a member over its scope.
-        for (id, role) in [("g__in", GroupBoundaryRole::In), ("g__out", GroupBoundaryRole::Out)] {
-            let node = p.nodes.iter_mut().find(|n| n.id == id).expect(id);
-            node.group_boundary = Some(GroupBoundary { group_id: "g".into(), role });
-        }
-        let kicks = RunSubgraph::whole(&p).root_kicks(&p, &Value::Null, None);
-        assert_eq!(ids(&kicks), vec!["g__in".to_string(), "top".to_string()]);
-
-        let aimed = RunSubgraph::of(&p, &["g.a".to_string()]);
-        assert_eq!(sorted(&aimed.nodes), vec!["g.a", "g.seed", "g__in", "g__out"], "a member brings its scope");
-        let kicks = aimed.root_kicks(&p, &Value::Null, None);
-        assert_eq!(ids(&kicks), vec!["g__in".to_string()]);
     }
 
     /// A trigger sitting in the middle of a group fires there: it is
@@ -4445,9 +4312,9 @@ mod trigger_kick_tests {
         assert_eq!(
             sorted(&subgraph),
             vec!["cfg", "g.a", "g.join", "g.trig", "g__in", "g__out", "out"],
-            "the run is the trigger's program: its group whole, and what feeds the group"
+            "the run includes the join's dependencies and the selected group path"
         );
-        let firing: Vec<&str> = kicks.iter().filter(|k| k.firing).map(|k| k.node_id.as_str()).collect();
+        let firing: Vec<&str> = kicks.iter().filter(|k| k.firing).map(|k| k.node.as_str()).collect();
         assert_eq!(firing, vec!["g.trig"], "the trigger is the one firing kick");
         assert_eq!(
             ids(&kicks),
@@ -4458,12 +4325,11 @@ mod trigger_kick_tests {
     }
 
     #[test]
-    fn a_scope_the_fire_touches_comes_whole() {
+    fn a_scope_the_fire_touches_excludes_unrelated_members() {
         // TriggerX ──► g__in ──► g.a ──► g__out ──► Out
         //              g.seed (no wire feeds it; the scope launcher's)
-        // The fire reaches the group's In boundary; the whole body is
-        // in the program then, the unwired seed included, and the seed
-        // is never a kick of the run (its scope kicks it when it starts).
+        // Reaching the group's input follows only connected work.
+        // Its unwired seed is outside this trigger's program.
         let p = project(
             &[
                 ("trigger_x", true, &[]),
@@ -4477,16 +4343,15 @@ mod trigger_kick_tests {
         );
         let TriggerFire { kicks, subgraph } = fire(&p, "trigger_x", Value::Null);
         assert_eq!(ids(&kicks), vec!["trigger_x".to_string()], "the body's seed is not the run's root");
-        assert_eq!(sorted(&subgraph), vec!["g.a", "g.seed", "g__in", "g__out", "out", "trigger_x"]);
+        assert_eq!(sorted(&subgraph), vec!["g.a", "g__in", "g__out", "out", "trigger_x"]);
     }
 
     #[test]
     fn setup_phases_reach_a_trigger_or_infra_node_inside_a_group() {
         // cfg ──► g__in ──► g.db (infra, unwired inside the body)
         //                   g.trig (trigger, unwired inside the body)
-        // Both setup phases seed through the scope: the kick is the
-        // group's In boundary (and the Out boundary, which nothing
-        // feeds), and the source of the group's input runs first.
+        // Each setup keeps its own target and enclosing gate. Neither
+        // the unused group input nor its source joins the selection.
         let mut p = project(
             &[
                 ("cfg", false, &[]),
@@ -4502,19 +4367,24 @@ mod trigger_kick_tests {
             node.group_boundary = Some(GroupBoundary { group_id: "g".into(), role });
         }
         p.nodes.iter_mut().find(|n| n.id == "g.db").unwrap().requires_infra = true;
-        assert_eq!(ids(&compute_infra_setup_kicks(&p)), vec!["cfg".to_string(), "g__out".to_string()]);
-        assert_eq!(ids(&compute_trigger_setup_kicks(&p)), vec!["cfg".to_string(), "g__out".to_string()]);
+        p.groups.push(serde_json::from_value(serde_json::json!({
+            "id": "g", "kind": "group", "nodeIds": ["g.db", "g.trig"]
+        })).unwrap());
+        assert_eq!(ids(&compute_infra_setup_kicks(&p).unwrap()), vec!["g.db".to_string(), "g__in".to_string()]);
+        assert_eq!(ids(&compute_trigger_setup_kicks(&p).unwrap()), vec!["g.trig".to_string(), "g__in".to_string()]);
+        p.groups[0].kind = weft_core::project::GroupKind::Loop { loop_config: serde_json::json!({}) };
+        assert!(compute_infra_setup_kicks(&p).unwrap_err().contains("inside loop"));
+        assert!(compute_trigger_setup_kicks(&p).unwrap_err().contains("inside loop"));
+        assert!(compute_trigger_fire(&p, "g.trig", &Value::Null, None).unwrap_err().contains("inside loop"));
     }
 
     #[test]
-    fn firing_non_trigger_returns_empty() {
-        // Defensive: caller must never pass a non-trigger id. We
-        // return empty rather than silently fabricating kicks.
+    fn firing_non_trigger_returns_an_error() {
         let p = project(
             &[("a", false, &[]), ("out", false, &[])],
             &[("a", "out")],
         );
-        assert!(compute_trigger_fire(&p, "a", &Value::Null, None).is_none());
+        assert!(compute_trigger_fire(&p, "a", &Value::Null, None).unwrap_err().contains("not a trigger"));
     }
 
     /// Two programs in one file sharing an upstream node (a database, a
@@ -4600,7 +4470,7 @@ mod infra_kick_and_dep_tests {
     }
 
     fn kick_ids(kicks: &[Kick]) -> Vec<String> {
-        let mut v: Vec<String> = kicks.iter().map(|k| k.node_id.clone()).collect();
+        let mut v: Vec<String> = kicks.iter().map(|k| k.node.clone()).collect();
         v.sort();
         v
     }
@@ -4612,7 +4482,7 @@ mod infra_kick_and_dep_tests {
             &[("text", false, false), ("compute", false, false), ("infra", false, true)],
             &[("text", "compute"), ("compute", "infra")],
         );
-        let kicks = compute_infra_setup_kicks(&p);
+        let kicks = compute_infra_setup_kicks(&p).unwrap();
         // The kick is the upstream root (text), NOT the infra node.
         assert_eq!(kick_ids(&kicks), vec!["text".to_string()]);
     }
@@ -4628,7 +4498,7 @@ mod infra_kick_and_dep_tests {
             ],
             &[("text", "infra")],
         );
-        let kicks = compute_infra_setup_kicks(&p);
+        let kicks = compute_infra_setup_kicks(&p).unwrap();
         assert_eq!(kick_ids(&kicks), vec!["text".to_string()]);
     }
 
@@ -4637,14 +4507,14 @@ mod infra_kick_and_dep_tests {
         // A parameterless infra node (no upstream edges) IS its own
         // root: has to kick something to fire.
         let p = project(&[("infra", false, true)], &[]);
-        let kicks = compute_infra_setup_kicks(&p);
+        let kicks = compute_infra_setup_kicks(&p).unwrap();
         assert_eq!(kick_ids(&kicks), vec!["infra".to_string()]);
     }
 
     #[test]
     fn infra_kicks_empty_when_no_infra_nodes() {
         let p = project(&[("a", false, false), ("b", false, false)], &[("a", "b")]);
-        assert!(compute_infra_setup_kicks(&p).is_empty());
+        assert!(compute_infra_setup_kicks(&p).unwrap().is_empty());
     }
 
     #[test]
@@ -4654,7 +4524,7 @@ mod infra_kick_and_dep_tests {
             &[("text", false, false), ("infraA", false, true), ("infraB", false, true)],
             &[("text", "infraA"), ("text", "infraB")],
         );
-        let kicks = compute_infra_setup_kicks(&p);
+        let kicks = compute_infra_setup_kicks(&p).unwrap();
         // text is the only root reaching both.
         assert_eq!(kick_ids(&kicks), vec!["text".to_string()]);
     }
@@ -4760,6 +4630,13 @@ mod run_subgraph_tests {
     use super::infra_kick_and_dep_tests::project;
     use super::*;
 
+    /// The fire-side aim: what a fire that reached `targets` runs.
+    fn aimed_at(p: &ProjectDefinition, targets: &[&str]) -> weft_core::project::selection::RunSelection {
+        weft_core::project::selection::RunSelection::carve(p, &weft_core::project::selection::SelectionBounds {
+            target: targets.iter().map(|s| s.to_string()).collect(), ..Default::default()
+        }).unwrap()
+    }
+
     /// Diamond: src feeds two branches, only one is aimed at. The
     /// other branch's exclusive nodes stay out of the subgraph, so
     /// they are neither infra-gated nor dispatched.
@@ -4775,7 +4652,7 @@ mod run_subgraph_tests {
             ],
             &[("src", "a"), ("a", "out1"), ("src", "b"), ("b", "out2")],
         );
-        let sub = RunSubgraph::of(&p, &["out1".to_string()]);
+        let sub = aimed_at(&p, &["out1"]);
         let mut nodes: Vec<&str> = sub.nodes.iter().map(|s| s.as_str()).collect();
         nodes.sort();
         assert_eq!(nodes, vec!["a", "out1", "src"]);
@@ -4794,12 +4671,14 @@ mod run_subgraph_tests {
             ],
             &[("setup", "trig"), ("trig", "mid"), ("mid", "out")],
         );
-        let sub = RunSubgraph::of(&p, &["out".to_string()]);
+        let sub = aimed_at(&p, &["out"]);
         assert!(sub.nodes.contains("trig"));
         assert!(!sub.nodes.contains("setup"), "the trigger's own upstream stays out");
 
-        let kicks = sub.root_kicks(&p, &serde_json::json!({ "mock": 1 }), None);
-        let trig = kicks.iter().find(|k| k.node_id == "trig").expect("trigger is a root");
+        let resolved = weft_core::run_spec::resolve_spec(&weft_core::run_spec::RunSpec {
+            target: vec!["out".into()], ..weft_core::run_spec::RunSpec::whole("x")
+        }, &p).unwrap();
+        let trig = resolved.kicks.iter().find(|k| k.node == "trig").expect("trigger is a root");
         assert!(trig.payload.is_none(), "a manual run kicks triggers payload-less");
         assert!(!trig.firing);
     }
@@ -4816,15 +4695,14 @@ mod run_subgraph_tests {
             ],
             &[("trig", "out"), ("other", "out")],
         );
-        let sub = RunSubgraph::of(&p, &["out".to_string()]);
         let payload = serde_json::json!({ "msg": "hi" });
         let snapshot = serde_json::json!({ "port": "v" });
-        let kicks = sub.root_kicks(&p, &payload, Some(("trig", Some(&snapshot))));
-        let trig = kicks.iter().find(|k| k.node_id == "trig").unwrap();
+        let kicks = compute_trigger_fire(&p, "trig", &payload, Some(&snapshot)).unwrap().kicks;
+        let trig = kicks.iter().find(|k| k.node == "trig").unwrap();
         assert!(trig.firing);
         assert_eq!(trig.payload.as_ref(), Some(&payload));
         assert_eq!(trig.port_snapshot.as_ref(), Some(&snapshot));
-        let other = kicks.iter().find(|k| k.node_id == "other").unwrap();
+        let other = kicks.iter().find(|k| k.node == "other").unwrap();
         assert!(!other.firing);
         assert!(other.payload.is_none() && other.port_snapshot.is_none());
     }
@@ -4965,12 +4843,10 @@ mod available_actions_tests {
     }
 
     #[test]
-    fn inactive_infra_resting_gates_run_and_activate_on_infra() {
-        // Source declares infra, nothing provisioned: run/activate
-        // are rejected until infra is running; start is the way up.
+    fn inactive_infra_resting_allows_activation_to_prepare_infra() {
         assert_actions(
             &Case { has_infra: true, infra_rollup: "none", ..Case::default() },
-            &["infra_start"],
+            &["activate", "infra_start"],
         );
     }
 
@@ -4993,11 +4869,11 @@ mod available_actions_tests {
     }
 
     #[test]
-    fn inactive_infra_degraded_offers_repair_verbs_only() {
+    fn inactive_infra_degraded_allows_activation_to_prepare_infra() {
         for rollup in ["failed", "flaky", "partial"] {
             assert_actions(
                 &Case { has_infra: true, infra_rollup: rollup, ..Case::default() },
-                &["infra_start", "infra_stop", "infra_terminate"],
+                &["activate", "infra_start", "infra_stop", "infra_terminate"],
             );
         }
     }
@@ -5006,7 +4882,7 @@ mod available_actions_tests {
     fn inactive_infra_stopped_offers_start_and_terminate() {
         assert_actions(
             &Case { has_infra: true, infra_rollup: "stopped", ..Case::default() },
-            &["infra_start", "infra_terminate"],
+            &["activate", "infra_start", "infra_terminate"],
         );
     }
 
@@ -5020,11 +4896,26 @@ mod available_actions_tests {
         assert_actions(
             &Case {
                 lifecycle: active,
-                drift: DriftBits { definition_drift: true, ..Default::default() },
+                drift: DriftBits { activation_drift: true, ..Default::default() },
                 ..Case::default()
             },
             &["run", "deactivate", "resync"],
         );
+    }
+
+    #[test]
+    fn a_build_does_not_erase_activation_drift() {
+        let program = weft_core::project::hash::ProgramIdentity {
+            binary_hash: "old-code".into(), definition_hash: "same-graph".into(), implementations: Default::default(),
+        };
+        let query = StatusQuery { desired_binary_hash: Some("new-code".into()), desired_definition_hash: Some("same-graph".into()), ..Default::default() };
+        assert!(activation_has_drifted(&query, Some("new-code"), Some("same-graph"), Some(&program), false));
+        assert!(activation_has_drifted(&StatusQuery::default(), Some("new-code"), Some("same-graph"), Some(&program), false));
+        assert!(!activation_has_drifted(&StatusQuery::default(), Some("old-code"), Some("same-graph"), Some(&program), false));
+        // Activated before the code identity was recorded: only the graph
+        // hash can speak, so an upgrade does not light resync on its own.
+        assert!(!activation_has_drifted(&query, Some("new-code"), Some("same-graph"), None, false));
+        assert!(activation_has_drifted(&query, Some("new-code"), Some("same-graph"), None, true));
     }
 
     #[test]

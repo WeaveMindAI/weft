@@ -23,6 +23,11 @@ async fn an_untargeted_run_kicks_every_root() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("aimed_run", disp).await?;
 
+    let built = project.weft(&["build", "--json"]).await?;
+    project.mark_registered();
+    anyhow::ensure!(built.contains("\"phase\":\"build_skip\"") && !built.contains("\"phase\":\"build_start\""),
+        "an unchanged standard-library project must use the prepared worker without compiling: {built}");
+
     let settled = run::run_and_settle(&mut project).await?;
     settled.completed()?;
     settled.assert_completed("left_src")?;
@@ -85,7 +90,7 @@ async fn any_node_is_a_target_and_an_unknown_name_is_refused() -> anyhow::Result
         .await
         .expect_err("an unknown target must refuse the run");
     let msg = format!("{err:#}");
-    anyhow::ensure!(msg.contains("no node 'nope'"), "{msg}");
+    anyhow::ensure!(msg.contains("unknown node 'nope'"), "{msg}");
 
     project.finish().await
 }

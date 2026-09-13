@@ -1118,6 +1118,16 @@ export interface LoopIteration {
 // SYNC: CredentialOwner <-> crates/weft-core/src/access/mod.rs CredentialOwner
 export type CredentialOwner = 'their-own' | 'ours';
 
+/// The parent run and the original run supplying each reused result.
+// SYNC: Seed <-> crates/weft-journal/src/events.rs Seed
+export interface Seed {
+  parent: string;
+  origins: Record<string, string>;
+}
+
+import type { RunSpec, ResolveSpecResponse } from './run-spec';
+export type { RunSpec, ResolveSpecResponse } from './run-spec';
+
 export interface NodeExecEvent {
   nodeId: string;
   state: NodeExecutionStatus;
@@ -1151,6 +1161,20 @@ export interface NodeExecEvent {
   /// needed closed) with it.
   skipReason?: SkipReason;
   output?: unknown;
+  /// The run this firing was taken from when the execution was seeded
+  /// (`weft run --seed`) and reused it instead of firing the node
+  /// again. The graph marks the node inherited. Absent on the run's
+  /// own firings.
+  // SYNC: inheritedFrom <-> crates/weft-dispatcher/src/events.rs DispatcherEvent inherited_from
+  inheritedFrom?: string;
+  /// Input ports whose value a person provided (a scoped run's
+  /// `--from node='{"port":value}'`), on `running`. The inspector paints
+  /// them as provided by hand.
+  // SYNC: providedPorts <-> crates/weft-dispatcher/src/events.rs DispatcherEvent provided_ports
+  providedPorts?: string[];
+  // SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
+  backupPorts?: string[];
+  inheritedPorts?: Record<string, string>;
 }
 
 /// Live loop event surfaced through the dispatcher SSE stream. Mirrors
@@ -1296,7 +1320,11 @@ export type CorruptionSite =
   | 'LoopIterationLaunched'
   | 'LoopOutFired'
   | 'LoopTerminated'
-  | 'UndecodableRow';
+  | 'UndecodableRow'
+  /// Not one row: the whole run. The code it ran is no longer
+  /// recorded, so no value can be worked out from the journal. Shown
+  /// beside the run, not inside a node.
+  | 'MissingProgram';
 
 /// One item rendered in a node's body panel. Two distinct feeds
 /// produce items: infra `/live` (infra-pod telemetry) and signal
@@ -1485,6 +1513,7 @@ export interface ActionAvailability {
 export type ActionVerb =
   | 'run'
   | 'activate'
+  | 'bake'
   | 'cancel_activate'
   | 'cancel_build'
   | 'reactivate'
@@ -1511,6 +1540,9 @@ export type CliPhase =
   | 'build_done'
   | 'image_push_start'
   | 'image_push_done'
+  /// The stale-image sweep after an ensure dropped something. Detail
+  /// carries `images`, the refs untagged. Never sent for an empty sweep.
+  | 'images_reclaimed'
   | 'dispatcher_call_start'
   | 'dispatcher_call_done'
   | 'infra_provision_start'
@@ -1520,6 +1552,9 @@ export type CliPhase =
   /// Periodic heartbeat while an infra verb waits on the supervisor
   /// (unbounded: draining executions). Detail carries `elapsedSeconds`.
   | 'infra_wait'
+  /// Something the person should know that is not a failure; the verb
+  /// carries on and still ends `complete`. Detail carries `message`.
+  | 'warning'
   | 'complete'
   | 'error';
 
@@ -1532,7 +1567,9 @@ export type BarPhase = CliPhase | 'preflight';
 /// One NDJSON line emitted by the CLI in --json mode.
 export interface CliEvent {
   ts_unix: number;
-  verb: ActionVerb;
+  /// Absent on the one event a verb with no progress channel (a reader
+  /// such as `events` or `logs`) emits under `--json`: its `error`.
+  verb?: ActionVerb;
   phase: CliPhase;
   detail?: Record<string, unknown>;
 }
@@ -1726,6 +1763,19 @@ export type HostMessage =
   /// The run tagged itself (`ctx.tag_execution`). `tags` is one call's
   /// list; the webview accumulates the run's set.
   | { kind: 'execTags'; color: string; tags: string[] }
+  /// The run's scope, off its birth row: the node set it is held to
+  /// (`null` = the whole graph), so every other node paints as not in
+  /// this run, and the run it was seeded from with what it re-ran.
+  // SYNC: execScope <-> crates/weft-dispatcher/src/events.rs DispatcherEvent::ExecutionStarted (subgraph, seed)
+  | { kind: 'execScope'; color: string; subgraph: string[] | null; seed: Seed | null }
+  /// Which version the followed run ran, and which version the files on
+  /// disk are (`null` when the disk matches no recorded version), so the
+  /// graph can say "this run is from version X, your code differs".
+  | { kind: 'execVersion'; color: string; version: string | null; diskVersion: string | null }
+  /// The answer to a `resolveSpec` request.
+  | { kind: 'specResolved'; requestId: number; result: ResolveSpecResponse }
+  /// The project's `examples/*.json`, for the Run menu.
+  | { kind: 'specsListed'; specs: RunSpec[] }
   | { kind: 'catalogAll'; catalog: Record<string, CatalogEntry> }
   /// The node catalog (full set, from `weft describe-nodes`) failed to
   /// load, or loaded with soft warnings. Distinct from `parseError`:
@@ -1897,12 +1947,26 @@ export type WebviewMessage =
   /// file's graph in the panel.
   | { kind: 'navigateBack' }
   | { kind: 'log'; level: 'info' | 'warn' | 'error'; message: string }
-  /// Run the project. `targets` narrows the run to those output nodes'
-  /// upstream subgraphs; absent or empty runs every output node, which
-  /// is the ordinary case. Only output nodes may appear here: the
-  /// dispatcher refuses anything else, so the graph must not offer a
-  /// middle node as a target.
+  /// Run the project. Any node can be a target: include it and its
+  /// upstream dependencies. Absent or empty targets select the whole graph.
   | { kind: 'runProject'; targets?: string[] }
+  /// Resolve a spec against the current program through the parse server
+  /// (the dispatcher's own resolver), so the dialog shows every missing
+  /// input before the run starts. Answered by `specResolved`.
+  | { kind: 'resolveSpec'; requestId: number; spec: RunSpec; seeded: boolean }
+  /// Run a spec as a one-off, as the flags it spells (`specToRunArgs`).
+  /// `seeded` is the dialog's seed checkbox, and it must travel: the
+  /// dialog resolves the spec WITH seeding to decide it is runnable.
+  | { kind: 'runSpec'; spec: RunSpec; seeded?: boolean }
+  /// Write a spec to `examples/<name>.json` and nothing else. Saving used
+  /// to run it too, so writing one down started a real execution.
+  | { kind: 'saveSpec'; spec: RunSpec }
+  /// Run `examples/<name>.json` (`weft run <name>`).
+  | { kind: 'runSpecFile'; name: string }
+  /// List the project's specs (answered by `specsListed`).
+  | { kind: 'listSpecs' }
+  /// Restore the version of a run or a version id (`weft branch <ref>`).
+  | { kind: 'branchTo'; reference: string }
   | { kind: 'infraStart' }
   /// Project-level infra Stop / Terminate. `deactivation` is set iff
   /// the project is Active: the shared picker (in the webview) chose

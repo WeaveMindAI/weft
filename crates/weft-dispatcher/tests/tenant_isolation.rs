@@ -32,7 +32,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
 
 async fn register(store: &MockProjectStore, id: Uuid, name: &str, tenant: &str) {
     store
-        .register_with_hashes(definition(id), name, "", tenant, None, None, None, None)
+        .register_with_hashes(definition(id), name, "", tenant, None, None, None, None, None, None)
         .await
         .expect("register");
 }
@@ -81,7 +81,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
     register(&store, shared_id, "a-owned", TENANT_A).await;
 
     let takeover = store
-        .register_with_hashes(definition(shared_id), "b-grab", "", TENANT_B, None, None, None, None)
+        .register_with_hashes(definition(shared_id), "b-grab", "", TENANT_B, None, None, None, None, None, None)
         .await;
     assert!(takeover.is_err(), "cross-tenant re-register must be refused");
     assert_eq!(
@@ -92,7 +92,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
 
     // The owner CAN re-register its own project (idempotent update).
     store
-        .register_with_hashes(definition(shared_id), "a-owned-v2", "", TENANT_A, None, None, None, None)
+        .register_with_hashes(definition(shared_id), "a-owned-v2", "", TENANT_A, None, None, None, None, None, None)
         .await
         .expect("owner re-register allowed");
 }
@@ -213,6 +213,73 @@ async fn signal_tokens_are_scoped_to_the_caller_tenant() {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+/// A removed project's past runs keep the code they ran.
+///
+/// A run's journal holds what happened, not what it meant: every input
+/// and output is worked out by folding those rows against the program
+/// the run ran. Delete the program and the rows are still there and
+/// every value is underivable, so the graph paints a run with nothing
+/// in it and the person reading it goes looking for a bug in the
+/// viewer. That is what used to happen to every past run of every
+/// removed project, silently, because the program history was deleted
+/// along with the project row.
+///
+/// So: removing a project keeps the versions its surviving runs were
+/// started against, and drops the ones nothing points at. Cleaning the
+/// last run that needed one takes it too, because a program nobody can
+/// reach is junk the user cannot see or delete.
+#[tokio::test]
+async fn a_removed_projects_runs_keep_the_code_they_ran() {
+    let store = MockProjectStore::new();
+    let journal = MockJournal::new();
+    let project = Uuid::new_v4();
+    let project_id = project.to_string();
+    register(&store, project, "doomed", TENANT_A).await;
+    journal.set_project_tenant(&project_id, TENANT_A);
+
+    // Two recorded versions; only one of them ever ran.
+    store
+        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("ran"), None, None, None, None)
+        .await
+        .expect("record the version that ran");
+    store
+        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("never-ran"), None, None, None, None)
+        .await
+        .expect("record a version nothing ran");
+    let color = Uuid::new_v4();
+    let mut birth = started(color, &project_id);
+    if let weft_journal::ExecEvent::ExecutionStarted { definition_hash, .. } = &mut birth {
+        *definition_hash = Some("ran".to_string());
+    }
+    journal.record_event(&birth).await.unwrap();
+
+    store.remove(project).await.expect("remove project");
+    let in_use = journal.definition_hashes_in_use(&project_id).await.unwrap();
+    assert_eq!(in_use, vec!["ran".to_string()], "the journal names the version its run used");
+    let dropped = store.retire_unused_definitions(project, &in_use).await.unwrap();
+    assert_eq!(dropped, 1, "the version nothing ran is dropped");
+    assert!(
+        store.definition_for_hash(project, "ran").await.unwrap().is_some(),
+        "the version the surviving run was started against stays readable"
+    );
+    assert_eq!(
+        store.definition_for_hash(project, "never-ran").await.unwrap(),
+        None,
+        "and the one nothing points at is gone"
+    );
+
+    // `weft clean` on that last run: now nothing needs the version.
+    journal.delete_execution(color).await.unwrap();
+    let in_use = journal.definition_hashes_in_use(&project_id).await.unwrap();
+    assert!(in_use.is_empty(), "no run left to need a version");
+    store.retire_unused_definitions(project, &in_use).await.unwrap();
+    assert_eq!(
+        store.definition_for_hash(project, "ran").await.unwrap(),
+        None,
+        "the last run gone takes its code with it"
+    );
+}
+
 fn started(color: Uuid, project_id: &str) -> weft_journal::ExecEvent {
     weft_journal::ExecEvent::ExecutionStarted {
         color,
@@ -220,8 +287,9 @@ fn started(color: Uuid, project_id: &str) -> weft_journal::ExecEvent {
         entry_node: "entry".to_string(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("h".to_string()),
-        node_test: false,
+        program: None, source_version: None, node_test: false,
         subgraph: None,
+        seed: None,
         at_unix: 0,
     }
 }

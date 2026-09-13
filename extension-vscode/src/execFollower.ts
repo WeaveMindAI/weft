@@ -26,6 +26,7 @@ import type {
   LoopIteration,
   LoopTerminationReason,
   NodeExecEvent,
+  Seed,
   SkipReason,
 } from '../../packages/weft-graph/src/protocol';
 
@@ -36,14 +37,18 @@ export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
 // SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 // SYNC: event_id <-> crates/weft-dispatcher/src/events.rs IdentifiedEvent
 export type DispatcherEvent = { event_id: string } & (
-  | { kind: 'execution_started'; color: string; entry_node: string; project_id: string; at_unix: number }
-  | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; project_id: string; at_unix: number }
-  | { kind: 'node_suspended'; color: string; node: string; frames: LoopIteration[]; token: string; project_id: string; at_unix: number }
-  | { kind: 'node_resumed'; color: string; node: string; frames: LoopIteration[]; token: string | null; value: unknown; project_id: string; at_unix: number }
-  | { kind: 'node_cancelled'; color: string; node: string; frames: LoopIteration[]; reason: string; project_id: string; at_unix: number }
-  | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; project_id: string; at_unix: number }
-  | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; project_id: string; at_unix: number }
-  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; reason: SkipReason; project_id: string; at_unix: number }
+  | { kind: 'execution_started'; color: string; entry_node: string; subgraph?: string[]; seed?: Seed; project_id: string; at_unix: number }
+  // `inherited_from` is set when the firing was taken from the run this
+  // one was seeded from (`weft run --seed`); `provided_ports` names the
+  // input ports supplied at a run's `--from` or `--group` start.
+  // SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
+  | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_suspended'; color: string; node: string; frames: LoopIteration[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_resumed'; color: string; node: string; frames: LoopIteration[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_cancelled'; color: string; node: string; frames: LoopIteration[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; reason: SkipReason; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'port_type_mismatch'; color: string; node: string; frames: LoopIteration[]; port: string; expected: string; actual: string; project_id: string; at_unix: number }
   | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown; at_unix: number }
   | { kind: 'execution_failed'; color: string; project_id: string; error: string; at_unix: number }
@@ -76,7 +81,8 @@ export type DispatcherEvent = { event_id: string } & (
   // to the exact firing. amount_usd null = the meter could not resolve the
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
-  | { kind: 'cost_reported'; color: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
+  // SYNC: inherited cost <-> crates/weft-dispatcher/src/events.rs CostReported
+  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -296,6 +302,10 @@ export class ExecutionFollower implements vscode.Disposable {
           frames: e.frames,
           input: e.input,
           closedPorts: e.closed_ports,
+          providedPorts: e.provided_ports,
+          backupPorts: e.backup_ports,
+          inheritedPorts: e.inherited_ports,
+          inheritedFrom: e.inherited_from,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
@@ -310,6 +320,7 @@ export class ExecutionFollower implements vscode.Disposable {
           atUnix: e.at_unix,
           state: 'waiting_for_input',
           frames: e.frames,
+          inheritedFrom: e.inherited_from,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
@@ -327,6 +338,7 @@ export class ExecutionFollower implements vscode.Disposable {
           state: 'running',
           resumed: true,
           frames: e.frames,
+          inheritedFrom: e.inherited_from,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
@@ -338,6 +350,7 @@ export class ExecutionFollower implements vscode.Disposable {
           state: 'cancelled',
           frames: e.frames,
           error: e.reason,
+          inheritedFrom: e.inherited_from,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
@@ -349,6 +362,7 @@ export class ExecutionFollower implements vscode.Disposable {
           state: 'completed',
           frames: e.frames,
           output: e.output,
+          inheritedFrom: e.inherited_from,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
@@ -360,6 +374,7 @@ export class ExecutionFollower implements vscode.Disposable {
           state: 'failed',
           frames: e.frames,
           error: e.error,
+          inheritedFrom: e.inherited_from,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
@@ -372,6 +387,7 @@ export class ExecutionFollower implements vscode.Disposable {
           frames: e.frames,
           closedPorts: e.closed_ports,
           skipReason: e.reason,
+          inheritedFrom: e.inherited_from,
         };
         this.post({ kind: 'execEvent', event: execEvent });
         break;
@@ -604,6 +620,8 @@ export class ExecutionFollower implements vscode.Disposable {
       // switch exhaustive so a new variant fails to compile here
       // until a reviewer routes it explicitly.
       case 'execution_started':
+        this.post({ kind: 'execScope', color: e.color, subgraph: e.subgraph ?? null, seed: e.seed ?? null });
+        break;
       case 'infra_status_changed':
       case 'infra_flaky':
       case 'infra_recovered':

@@ -2280,54 +2280,11 @@ pub async fn signal_list_for_pod(
     // The listener is a trusted control-plane caller; it rehydrates the
     // signals placed on its own pod (mixed tenants). No per-tenant scope
     // check: placement (`listener_pod`) is the authority for what this
-    // pod holds, and each returned row carries its own tenant.
-    use sqlx::Row;
-    let rows = sqlx::query(
-        "SELECT token, tenant_id, node_id, spec_json, is_resume, color, \
-                surface_kind, mount_path, auth_kind, auth_config, \
-                kind_state, kind_state_seq, placement_generation \
-         FROM signal WHERE listener_pod = $1",
-    )
-    .bind(&req.pod_name)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
-    // try_get on a NOT NULL column should never fail; if it does the
-    // row shape has drifted from the schema. Surface that loudly
-    // rather than silently returning empty strings to the listener.
-    let out = rows
-        .into_iter()
-        .map(|r| -> Result<SignalRowWire, anyhow::Error> {
-            let surface_str: String = r.try_get("surface_kind")?;
-            let surface_kind = weft_broker_client::protocol::SignalSurfaceKind::parse(
-                &surface_str,
-            )
-            .ok_or_else(|| anyhow::anyhow!("unknown surface_kind '{surface_str}'"))?;
-            let auth_str: String = r.try_get("auth_kind")?;
-            let auth_kind = weft_broker_client::protocol::SignalAuthKind::parse(&auth_str)
-                .ok_or_else(|| anyhow::anyhow!("unknown auth_kind '{auth_str}'"))?;
-            Ok(SignalRowWire {
-                token: r.try_get("token")?,
-                // Each row carries its own tenant (the pod holds mixed
-                // tenants); the listener stamps it on the rehydrated
-                // registry entry so held-event fires are correctly
-                // tenanted.
-                tenant_id: r.try_get("tenant_id")?,
-                node_id: r.try_get("node_id")?,
-                spec_json: r.try_get("spec_json")?,
-                is_resume: r.try_get("is_resume")?,
-                color: r.try_get("color")?,
-                surface_kind,
-                mount_path: r.try_get("mount_path")?,
-                auth_kind,
-                auth_config: r.try_get("auth_config")?,
-                kind_state: r.try_get("kind_state")?,
-                kind_state_seq: r.try_get("kind_state_seq")?,
-                placement_generation: r.try_get("placement_generation")?,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| internal(anyhow::anyhow!("signal row decode: {e}")))?;
+    // pod holds, and each returned row carries its own tenant. Which
+    // placed rows belong in a registry is `signals_held_by_pod`'s rule.
+    let out = crate::signal_placement::signals_held_by_pod(&state.pool, &req.pod_name)
+        .await
+        .map_err(internal)?;
     Ok(Json(SignalListForPodResponse { rows: out }))
 }
 

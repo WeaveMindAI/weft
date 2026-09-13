@@ -110,6 +110,8 @@
 	let descExpanded = $state(false);
 
 	const executions = $derived(data.executions ?? []);
+	/// The latest launch of this container was taken from the seed run.
+	const inherited = $derived(Boolean(executions[executions.length - 1]?.inheritedFrom));
 	// Aggregated bus logs over every node inside the group; the
 	// group's inspector shows the combined IRC view per bus.
 	const busLogs = $derived(data.busLogs ?? []);
@@ -544,7 +546,7 @@
 	{@render flowDock(14)}
 {/if}
 
-<div class="expanded-container" class:selected>
+<div class="expanded-container" class:selected class:node-inherited-glow={inherited}>
 	<div class="expanded-header">
 		<span class="header-icon">
 			{#if isLoopNodeType(data.nodeType)}
@@ -840,7 +842,7 @@
 	<Handle type="target" position={Position.Left} id={SIMPLIFIED_IN_HANDLE}
 		style="top: 50%; {simplifiedDotStyle(containerColor)}" />
 {/if}
-<div class="simplified-node rounded-lg select-none" class:selected
+<div class="simplified-node rounded-lg select-none" class:selected class:node-inherited-glow={inherited}
 	style="width: 100%; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; padding: {SIMPLIFIED_SQUARE_PAD_PX}px; background: rgba(255,255,255,0.95); border: 1px solid {selected ? containerColor : 'rgba(0,0,0,0.08)'}; box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);">
 	<div class="absolute top-1 right-1 flex items-center gap-0.5 nodrag nopan">
 		<ExecutionInspector {executions} {busLogs} {journalCorruptions} {executionTags} {runTerminal} {loopEvents} label={data.label || 'Group'} />
@@ -865,7 +867,7 @@
 {:else}
 <!-- ═══════════════ COLLAPSED: looks like a regular node ═══════════════ -->
 {@render flowDock(18)}
-<div class="collapsed-node" class:selected>
+<div class="collapsed-node" class:selected class:node-inherited-glow={inherited}>
 	<!-- Color accent bar -->
 	<div class="collapsed-accent"></div>
 

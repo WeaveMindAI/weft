@@ -49,6 +49,14 @@ pub struct Project {
     /// registered/finished bookkeeping + the Drop warning, so this CLI fixture
     /// and an API-driven HTTP fixture share ONE teardown policy.
     teardown: Teardown,
+    /// Extra working directories this project handed out
+    /// ([`Self::second_checkout`]), removed with `dir` at teardown.
+    /// They sit beside `dir` rather than inside it, because a copy of a
+    /// tree cannot live in that tree, so nothing else would ever remove
+    /// them: every test that asked for one used to leave its whole
+    /// source tree (and, with the catalog, the generated catalog too)
+    /// behind in the system temp dir for good.
+    extra_dirs: std::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl Project {
@@ -89,6 +97,7 @@ impl Project {
             dir,
             disp,
             teardown: Teardown::new(id, fixture, recovery_hint),
+            extra_dirs: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -110,6 +119,84 @@ impl Project {
     /// Run `weft <args>` in this project, requiring success, returning stdout.
     pub async fn weft(&self, args: &[&str]) -> Result<String> {
         cli_ok(&self.dir, args).await
+    }
+
+    /// A SECOND checkout of this same project: a copy of the working
+    /// directory, carrying the same `weft.toml` and so the same project
+    /// id.
+    ///
+    /// This is what makes a two-session race expressible. One working
+    /// directory cannot hold two different edits at once, so running two
+    /// commands from one directory tests two sessions doing the SAME
+    /// thing; the interesting race is two people who edited differently
+    /// and both saved. Run commands in the returned directory with
+    /// `weft_e2e::client::cli`.
+    pub fn second_checkout(&self) -> Result<PathBuf> {
+        // A fresh path per call. Deriving it from the project's directory
+        // name alone gave two calls in one test the SAME directory, and
+        // the second copy then merged into the first instead of being an
+        // independent checkout.
+        let other = self.dir.parent().unwrap_or(&self.dir).join(format!(
+            "{}-second-{}",
+            self.dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&other)?;
+        self.extra_dirs.lock().expect("extra dirs").push(other.clone());
+        // The same copy the rig uses to stage a fixture, so the second
+        // checkout is source only: no `.weft`, no build output.
+        copy_tree(&self.dir, &other)
+            .with_context(|| format!("copy {} to {}", self.dir.display(), other.display()))?;
+        Ok(other)
+    }
+
+    /// A second checkout WITH the built-in node catalog, for a test whose
+    /// commands compile.
+    ///
+    /// `second_checkout` copies source only, and the catalog is generated
+    /// rather than committed, so a plain copy has no `Text`, `Cast` or
+    /// `Debug`: anything that compiles in it fails with unknown node
+    /// types. A test that only checkpoints never noticed, because a
+    /// checkpoint of an already-registered project compiles nothing, and
+    /// it also silently recorded a DIFFERENT installed-weft identity in
+    /// its manifest (the catalog hash of an empty folder), which is a
+    /// manifest difference no edit of the test's caused.
+    pub async fn second_checkout_with_catalog(&self) -> Result<PathBuf> {
+        let other = self.second_checkout()?;
+        cli_ok(&other, &["catalog", "update"])
+            .await
+            .with_context(|| format!("catalog update for the second checkout at {}", other.display()))?;
+        Ok(other)
+    }
+
+    /// Run `weft <args>` EXPECTING a refusal: errors if it succeeds,
+    /// otherwise returns stdout and stderr together so the test asserts
+    /// on the refusal's message.
+    pub async fn weft_refused(&self, args: &[&str]) -> Result<String> {
+        let out = crate::client::cli(&self.dir, args).await?;
+        anyhow::ensure!(!out.success, "`{}` unexpectedly succeeded:\n{}", out.invocation, out.stdout);
+        Ok(format!("{}\n{}", out.stdout, out.stderr))
+    }
+
+    /// Write a project file (a path relative to the project root), the
+    /// edit a person makes between two runs.
+    pub fn write_file(&self, rel: &str, contents: &str) -> Result<()> {
+        let path = self.dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        std::fs::write(&path, contents).with_context(|| format!("write {}", path.display()))
+    }
+
+    /// Read a project file back, to see what `weft branch` put there.
+    pub fn read_file(&self, rel: &str) -> Result<String> {
+        let path = self.dir.join(rel);
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    }
+
+    /// Whether a project file exists on disk.
+    pub fn has_file(&self, rel: &str) -> bool {
+        self.dir.join(rel).is_file()
     }
 
     /// Substitute `placeholder` with `value` everywhere in the project's
@@ -228,13 +315,14 @@ impl Project {
         Ok(format!("local/{path}"))
     }
 
-    /// Build the project's worker image (the real compile path). `weft build`
-    /// compiles and builds the image but does not register with the dispatcher;
-    /// registration happens through a mutating verb (a run or activate). Running
-    /// build explicitly first means a later run/activate's build gate is a
-    /// no-op. Optional: a plain run builds on its own.
-    pub async fn build(&self) -> Result<()> {
-        self.weft(&["build"]).await.map(|_| ())
+    /// Build the project's worker image and register it (the real
+    /// compile path), starting nothing. A later run or activate then
+    /// finds everything current and does no build of its own. Optional:
+    /// a plain run builds on its own.
+    pub async fn build(&mut self) -> Result<()> {
+        self.weft(&["build"]).await?;
+        self.teardown.mark_registered();
+        Ok(())
     }
 
     /// Activate the project (build + register + enable triggers). Required for
@@ -284,6 +372,11 @@ impl Project {
             cli_ok(&self.dir, &["rm", &id, "--yes"])
                 .await
                 .with_context(|| format!("teardown: weft rm {id}"))?;
+        }
+        let extras: Vec<PathBuf> = std::mem::take(&mut *self.extra_dirs.lock().expect("extra dirs"));
+        for extra in extras {
+            std::fs::remove_dir_all(&extra)
+                .with_context(|| format!("teardown: remove temp dir {}", extra.display()))?;
         }
         std::fs::remove_dir_all(&self.dir)
             .with_context(|| format!("teardown: remove temp dir {}", self.dir.display()))?;

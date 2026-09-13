@@ -70,7 +70,15 @@ pub trait ProjectStoreOps: Send + Sync {
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
         infra_image_tags: Option<&InfraImageTags>,
+        implementations: Option<&std::collections::BTreeMap<String, String>>,
+        source: Option<&weft_core::project::hash::Manifest>,
     ) -> anyhow::Result<StoredProjectSummary>;
+
+    /// Sources registered with this exact running program. Refuse a concurrent build.
+    async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest>;
+
+    /// Read graph and worker identity from one database snapshot.
+    async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>>;
 
     // Every reader returns `Result<Option<T>>` or `Result<Vec<T>>`:
     // `Ok(None)` / `Ok(vec![])` means "no such row" (legal), `Err`
@@ -145,6 +153,9 @@ pub trait ProjectStoreOps: Send + Sync {
     /// `running_binary_hash`.
     async fn running_definition_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
+    /// The exact program last activated, independent of subsequent builds.
+    async fn activation_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>>;
+
     /// Look up a definition by hash. Returns `Ok(None)` when no
     /// version with that hash was recorded. Used by the broker's
     /// `fetch_definition` handler: workers and listeners pass
@@ -156,6 +167,33 @@ pub trait ProjectStoreOps: Send + Sync {
         id: uuid::Uuid,
         hash: &str,
     ) -> anyhow::Result<Option<String>>;
+
+    /// Forget every program version recorded for a REMOVED project
+    /// except the ones named. What a project removal and the last
+    /// `weft clean` after it call with the versions the surviving runs
+    /// were started against, so a deleted project leaves behind exactly
+    /// what keeps its past runs readable and nothing else. Answers how
+    /// many versions it dropped.
+    ///
+    /// Refuses on a project that still exists: while it is registered
+    /// its own running version is in play and the caller cannot know
+    /// what is safe to drop.
+    async fn retire_unused_definitions(
+        &self,
+        id: uuid::Uuid,
+        still_in_use: &[String],
+    ) -> anyhow::Result<u64>;
+
+    /// Every project id that still has recorded programs while the
+    /// project itself is gone.
+    ///
+    /// What the reaper sweeps. Retiring on removal is best-effort (the
+    /// removal has already happened and must not fail over unread rows),
+    /// and once the project row is gone no request can ever reach those
+    /// rows again: `weft rm` refuses a project it cannot find, and with no
+    /// runs left `weft clean` has nothing to be called on either. This is
+    /// what keeps a single failed retirement from being junk forever.
+    async fn projects_with_orphan_definitions(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
 
     /// Read the stored infra hash. Same Result contract as
     /// `running_binary_hash`.
@@ -208,32 +246,20 @@ pub trait ProjectStoreOps: Send + Sync {
     /// Stamps the transition heartbeat so the stuck-transition reaper
     /// can tell a live activation (driver bumping) from an orphaned
     /// one (driver pod died).
-    async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+    /// Reserve the setup color as the activation's identity from its first step.
+    async fn try_begin_activating(&self, id: uuid::Uuid, color: uuid::Uuid) -> anyhow::Result<bool>;
 
-    /// Record the TriggerSetup color the CURRENT activation is about
-    /// to start (see `ProjectLifecycle::activating_ts_color`). Guarded
-    /// on `status = activating`: `Ok(false)` means the activation is
-    /// no longer in flight (cancelled or reaped under the driver), and
-    /// the caller must not start the run.
-    async fn set_activating_ts_color(
-        &self,
-        id: uuid::Uuid,
-        color: uuid::Uuid,
-    ) -> anyhow::Result<bool>;
-
-    /// End the activation: CAS `Activating` -> `to` and hand back the
-    /// setup color the activation had recorded, in ONE atomic step, so
-    /// the driver's guarded record and this un-stick cannot interleave
-    /// (the row is locked before it is read, and a record that lands
-    /// after this wins is refused by its status guard). `Ok(None)` when
-    /// the CAS lost (already out of Activating); `Ok(Some(color))` when
-    /// it won, `color` being what the row held (`None` if setup had not
-    /// started).
+    /// End only the named activation. When removing signals, delete them
+    /// before releasing the project row so a newer activation cannot lose
+    /// its registrations to this cleanup. Return removed rows for listener
+    /// unregistration, or None if this activation no longer owns the project.
     async fn end_activating(
         &self,
         id: uuid::Uuid,
+        color: uuid::Uuid,
         to: &ProjectLifecycle,
-    ) -> anyhow::Result<Option<Option<uuid::Uuid>>>;
+        remove_signals: bool,
+    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>>;
 
     /// Read the project's verb-transition marker (the build axis,
     /// orthogonal to `status`). `Ok(None)` = no such project.
@@ -363,15 +389,9 @@ pub struct ProjectLifecycle {
     /// false; only `deactivate_project_with_mode(by_health=true)`
     /// (the claimer's health-park path) sets it true.
     pub deactivated_by_health: bool,
-    /// While `status = Activating`: the color of the TriggerSetup run
-    /// this activation started, recorded BEFORE the run is started so
-    /// a driver that dies in between leaves nothing unaccounted for.
-    /// Whoever ends the activation from outside (a person's
-    /// cancel-activate, the reaper repairing a dead driver) reads it
-    /// to cancel that exact run with the true cause; any other
-    /// non-terminal setup run of the project is a leftover from an
-    /// older, dead activation. `None` before setup starts and in every
-    /// other status (every lifecycle write outside Activating clears it).
+    /// Reserved when activation begins, before setup is queued. The driver,
+    /// cancellation, and reaper use this identity to guard every lifecycle
+    /// write. None outside Activating.
     pub activating_ts_color: Option<uuid::Uuid>,
 }
 
@@ -557,6 +577,7 @@ pub struct StuckTransition {
     pub id: uuid::Uuid,
     pub status: ProjectStatus,
     pub transition: ProjectTransition,
+    pub activating_ts_color: Option<uuid::Uuid>,
 }
 
 /// Cloneable handle to whatever the dispatcher uses as project
@@ -610,7 +631,7 @@ impl PostgresProjectStore {
 /// boot's `apply_core_schema` applies this group via the schema guard.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "project",
-    tables: &["project", "project_definition"],
+    tables: &["project", "project_definition", "project_code"],
     // project: one row per registered project. Lifecycle is the
     // status enum plus three orthogonal axes that the gate,
     // enumeration filter, and reaper read from a single source
@@ -674,6 +695,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 running_binary_hash TEXT,
                 running_definition_hash TEXT,
                 running_infra_hash TEXT,
+                running_source JSONB,
                 accepting_fires BOOLEAN NOT NULL DEFAULT TRUE,
                 fires_visible_to_consumers BOOLEAN NOT NULL DEFAULT TRUE,
                 fires_deadline_unix BIGINT,
@@ -746,7 +768,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- status-guarded: this replaces the old boot-time
                 -- blind bulk downgrade, which wiped live status for
                 -- every tenant's projects on any Pod restart.
-                transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0
+                transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0,
+                -- The version tree's HEAD (`crate::versions`): the version
+                -- the next checkpoint or run parents on, the run the next
+                -- `--seed` inherits from (NULL when head is a bare
+                -- version), and the version the triggers were activated
+                -- on (NULL while inactive). Moved by checkpoint, run,
+                -- branch and activate; nothing lives on disk.
+                head_version TEXT,
+                head_run UUID,
+                activation_version TEXT,
+                activation_program JSONB
             )"#,
         "CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)",
         // Append-only definition-version history. Workers fetch by
@@ -768,13 +800,27 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // another Pod's live state. A constructor-time bulk downgrade
         // would run in EVERY replica on EVERY boot and reset live
         // status for all tenants (a multi-Pod correctness bug).
+        r#"CREATE TABLE IF NOT EXISTS project_code (
+            project_id UUID NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            binary_hash TEXT NOT NULL,
+            implementations JSONB NOT NULL,
+            PRIMARY KEY (project_id, binary_hash)
+        )"#,
         r#"CREATE TABLE IF NOT EXISTS project_definition (
             project_id UUID NOT NULL,
             definition_hash TEXT NOT NULL,
             project_json TEXT NOT NULL,
             recorded_at_unix BIGINT NOT NULL,
-            PRIMARY KEY (project_id, definition_hash),
-            FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
+            PRIMARY KEY (project_id, definition_hash)
+            -- Deliberately NO foreign key to `project`. An execution's
+            -- journal outlives the project it ran (that is the point of
+            -- a journal), and a run without the program it ran against
+            -- cannot be read back: the rows are there and every input
+            -- and output is underivable, so the graph paints an empty
+            -- run and the reader goes hunting for a bug in the viewer.
+            -- The history is therefore kept as long as anything points
+            -- at it, and `retire_unused_definitions` drops the versions
+            -- no surviving run needs once the project itself is gone.
         )"#,
     ],
     seed: &[],
@@ -818,6 +864,8 @@ async fn advance_running_hashes(
     };
     let rows = sqlx::query(
         "UPDATE project SET \
+             running_source = CASE WHEN ($1 IS NOT NULL AND running_binary_hash IS DISTINCT FROM $1) \
+                OR ($2 IS NOT NULL AND running_definition_hash IS DISTINCT FROM $2) THEN NULL ELSE running_source END, \
              running_binary_hash     = COALESCE($1, running_binary_hash), \
              running_definition_hash = COALESCE($2, running_definition_hash), \
              running_infra_hash      = COALESCE($3, running_infra_hash), \
@@ -867,6 +915,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
         infra_image_tags: Option<&InfraImageTags>,
+        implementations: Option<&std::collections::BTreeMap<String, String>>,
+        source: Option<&weft_core::project::hash::Manifest>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name = name.to_string();
@@ -939,6 +989,16 @@ impl ProjectStoreOps for PostgresProjectStore {
             .execute(&mut *tx)
             .await?;
         }
+        if let Some(implementations) = implementations {
+            let binary = binary_hash.ok_or_else(|| anyhow::anyhow!("implementation fingerprints require a worker binary hash"))?;
+            let encoded = serde_json::to_value(implementations)?;
+            let inserted = sqlx::query(
+                "INSERT INTO project_code (project_id, binary_hash, implementations) VALUES ($1, $2, $3) \
+                 ON CONFLICT (project_id, binary_hash) DO UPDATE SET implementations = EXCLUDED.implementations \
+                 WHERE project_code.implementations = EXCLUDED.implementations"
+            ).bind(id).bind(binary).bind(encoded).execute(&mut *tx).await?;
+            anyhow::ensure!(inserted.rows_affected() == 1, "worker hash {binary} already has different implementation fingerprints");
+        }
         // Runnable stamp + infra tags in ONE statement inside this same tx, so a
         // build that registers-and-stamps never leaves a runnable
         // project with missing/half-written infra tags. Plain registration
@@ -952,6 +1012,11 @@ impl ProjectStoreOps for PostgresProjectStore {
             infra_image_tags,
         )
         .await?;
+        if binary_hash.is_some() || definition_hash.is_some() {
+            sqlx::query("UPDATE project SET running_source = $2 WHERE id = $1")
+                .bind(id).bind(source.map(serde_json::to_value).transpose()?)
+                .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(StoredProjectSummary {
             id,
@@ -959,6 +1024,25 @@ impl ProjectStoreOps for PostgresProjectStore {
             description,
             status: project_status_from_str(&status_str)?,
         })
+    }
+
+    async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT running_source FROM project WHERE id = $1 AND running_binary_hash = $2 AND running_definition_hash = $3 AND running_source IS NOT NULL"
+        ).bind(id).bind(&program.binary_hash).bind(&program.definition_hash).fetch_optional(&self.pool).await?;
+        let (source,) = row.ok_or_else(|| anyhow::anyhow!("project sources are missing or changed during preparation; register the project and retry"))?;
+        Ok(serde_json::from_value(source)?)
+    }
+
+    async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+        let row: Option<(String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT p.running_definition_hash, p.running_binary_hash, c.implementations \
+             FROM project p JOIN project_code c ON c.project_id = p.id AND c.binary_hash = p.running_binary_hash \
+             WHERE p.id = $1 AND p.running_definition_hash IS NOT NULL"
+        ).bind(id).fetch_optional(&self.pool).await?;
+        row.map(|(definition_hash, binary_hash, implementations)| Ok(weft_core::project::hash::ProgramIdentity {
+            definition_hash, binary_hash, implementations: serde_json::from_value(implementations)?,
+        })).transpose()
     }
 
     async fn tenant_for(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -1009,10 +1093,16 @@ impl ProjectStoreOps for PostgresProjectStore {
     }
 
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query("DELETE FROM project WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM trigger_setup WHERE project_id = $1")
+            .bind(id.to_string()).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1")
+            .bind(id.to_string()).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1062,6 +1152,13 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.and_then(|(h,)| h))
     }
 
+    async fn activation_program(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+        let value: Option<Option<sqlx::types::Json<weft_core::project::hash::ProgramIdentity>>> = sqlx::query_scalar(
+            "SELECT activation_program FROM project WHERE id = $1",
+        ).bind(id).fetch_optional(&self.pool).await?;
+        Ok(value.flatten().map(|value| value.0))
+    }
+
     async fn definition_for_hash(
         &self,
         id: uuid::Uuid,
@@ -1076,6 +1173,37 @@ impl ProjectStoreOps for PostgresProjectStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(j,)| j))
+    }
+
+    async fn projects_with_orphan_definitions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT DISTINCT pd.project_id FROM project_definition pd \
+             WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = pd.project_id)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    async fn retire_unused_definitions(
+        &self,
+        id: uuid::Uuid,
+        still_in_use: &[String],
+    ) -> anyhow::Result<u64> {
+        // The guard is part of the same statement as the delete, so a
+        // project registered again in between cannot have its history
+        // dropped by a removal that was already under way.
+        let done = sqlx::query(
+            "DELETE FROM project_definition \
+             WHERE project_id = $1 \
+               AND NOT (definition_hash = ANY($2)) \
+               AND NOT EXISTS (SELECT 1 FROM project WHERE id = $1)",
+        )
+        .bind(id)
+        .bind(still_in_use)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
     }
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -1126,6 +1254,8 @@ impl ProjectStoreOps for PostgresProjectStore {
                  deactivated_by_health = $5, \
                  drain_deadline_unix = $6, \
                  activating_ts_color = $7, \
+                 activation_version = CASE WHEN $1 IN ('inactive', 'deactivating') THEN NULL ELSE activation_version END, \
+                 activation_program = CASE WHEN $1 IN ('inactive', 'deactivating') THEN NULL ELSE activation_program END, \
                  updated_at = $8 \
              WHERE id = $9 \
                AND status <> 'activating' \
@@ -1181,9 +1311,12 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+    async fn try_begin_activating(&self, id: uuid::Uuid, color: uuid::Uuid) -> anyhow::Result<bool> {
         let activating = ProjectLifecycle::activating();
         let now = crate::lease::now_unix();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM project WHERE id = $1 FOR UPDATE")
+            .bind(id).execute(&mut *tx).await?;
         let res = sqlx::query(
             "UPDATE project \
              SET status = $1, \
@@ -1192,10 +1325,13 @@ impl ProjectStoreOps for PostgresProjectStore {
                  fires_deadline_unix = $4, \
                  deactivated_by_health = $5, \
                  drain_deadline_unix = NULL, \
-                 activating_ts_color = NULL, \
+                 activating_ts_color = $8, \
+                 activation_version = NULL, \
+                 activation_program = NULL, \
                  updated_at = $6, \
                  transition_heartbeat_unix = $6 \
-             WHERE id = $7 AND status <> 'activating' AND transition = 'none'",
+             WHERE id = $7 AND status <> 'activating' AND transition = 'none' \
+             AND NOT EXISTS (SELECT 1 FROM trigger_setup WHERE project_id = $7::text)",
         )
         .bind(activating.status.as_str())
         .bind(activating.accepting_fires)
@@ -1204,40 +1340,25 @@ impl ProjectStoreOps for PostgresProjectStore {
         .bind(activating.deactivated_by_health)
         .bind(now)
         .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    async fn set_activating_ts_color(
-        &self,
-        id: uuid::Uuid,
-        color: uuid::Uuid,
-    ) -> anyhow::Result<bool> {
-        let res = sqlx::query(
-            "UPDATE project SET activating_ts_color = $1 WHERE id = $2 AND status = 'activating'",
-        )
         .bind(color)
-        .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
     async fn end_activating(
         &self,
         id: uuid::Uuid,
+        color: uuid::Uuid,
         to: &ProjectLifecycle,
-    ) -> anyhow::Result<Option<Option<uuid::Uuid>>> {
-        // `FOR UPDATE` in the CTE locks the row BEFORE its color is read,
-        // so a concurrent `set_activating_ts_color` either committed
-        // first (and is returned here) or waits on the lock and is then
-        // refused by its own status guard. The UPDATE re-checks the
-        // status on the locked row: a lost CAS returns no row.
+        remove_signals: bool,
+    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
+        let mut tx = self.pool.begin().await?;
         let row: Option<(Option<uuid::Uuid>,)> = sqlx::query_as(
             "WITH prev AS ( \
                  SELECT id, activating_ts_color FROM project \
-                 WHERE id = $8 AND status = 'activating' FOR UPDATE \
+                 WHERE id = $8 AND status = 'activating' AND activating_ts_color = $9 FOR UPDATE \
              ) \
              UPDATE project \
              SET status = $1, \
@@ -1247,6 +1368,8 @@ impl ProjectStoreOps for PostgresProjectStore {
                  deactivated_by_health = $5, \
                  drain_deadline_unix = $6, \
                  activating_ts_color = NULL, \
+                 activation_version = CASE WHEN $1 = 'active' THEN activation_version ELSE NULL END, \
+                 activation_program = CASE WHEN $1 = 'active' THEN activation_program ELSE NULL END, \
                  updated_at = $7 \
              FROM prev \
              WHERE project.id = prev.id AND project.status = 'activating' \
@@ -1260,9 +1383,14 @@ impl ProjectStoreOps for PostgresProjectStore {
         .bind(to.drain_deadline_unix)
         .bind(crate::lease::now_unix())
         .bind(id)
-        .fetch_optional(&self.pool)
+        .bind(color)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(row.map(|(color,)| color))
+        let removed = if row.is_some() && remove_signals {
+            crate::journal::postgres::remove_project_signals(&mut *tx, &id.to_string()).await?
+        } else { Vec::new() };
+        tx.commit().await?;
+        Ok(row.map(|_| removed))
     }
 
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
@@ -1328,8 +1456,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         // driver-backed transitional states by string. Adding a new
         // driver-backed transitional state means adding it HERE too;
         // the Rust exhaustiveness checker cannot flag this SQL.
-        let rows: Vec<(uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT id, status, transition FROM project \
+        let rows: Vec<(uuid::Uuid, String, String, Option<uuid::Uuid>)> = sqlx::query_as(
+            "SELECT id, status, transition, activating_ts_color FROM project \
              WHERE (status = 'activating' \
                     OR transition IN ('building', 'cancelling_build')) \
                AND transition_heartbeat_unix < $1",
@@ -1338,11 +1466,12 @@ impl ProjectStoreOps for PostgresProjectStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(id, status, transition)| {
+            .map(|(id, status, transition, activating_ts_color)| {
                 Ok(StuckTransition {
                     id,
                     status: project_status_from_str(&status)?,
                     transition: project_transition_from_str(&transition)?,
+                    activating_ts_color,
                 })
             })
             .collect()
@@ -1458,8 +1587,10 @@ impl ProjectStoreOps for PostgresProjectStore {
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub struct MockProjectStore {
+    sources: RwLock<HashMap<uuid::Uuid, weft_core::project::hash::Manifest>>,
     inner: RwLock<HashMap<uuid::Uuid, (String, ProjectStatus, ProjectDefinition)>>,
     binary_hashes: RwLock<HashMap<uuid::Uuid, String>>,
+    implementations: RwLock<HashMap<(uuid::Uuid, String), std::collections::BTreeMap<String, String>>>,
     definition_hashes: RwLock<HashMap<uuid::Uuid, String>>,
     infra_hashes: RwLock<HashMap<uuid::Uuid, String>>,
     /// In-memory mirror of the `project_definition` history table:
@@ -1486,8 +1617,10 @@ pub struct MockProjectStore {
 impl MockProjectStore {
     pub fn new() -> Self {
         Self {
+            sources: RwLock::new(HashMap::new()),
             inner: RwLock::new(HashMap::new()),
             binary_hashes: RwLock::new(HashMap::new()),
+            implementations: RwLock::new(HashMap::new()),
             definition_hashes: RwLock::new(HashMap::new()),
             infra_hashes: RwLock::new(HashMap::new()),
             definition_versions: RwLock::new(HashMap::new()),
@@ -1525,6 +1658,8 @@ impl ProjectStoreOps for MockProjectStore {
         // referenced-images keep-set); accepted to satisfy the trait,
         // ignored.
         _infra_image_tags: Option<&InfraImageTags>,
+        implementations: Option<&std::collections::BTreeMap<String, String>>,
+        source: Option<&weft_core::project::hash::Manifest>,
     ) -> anyhow::Result<StoredProjectSummary> {
         let id = project.id;
         let name_owned = name.to_string();
@@ -1546,6 +1681,13 @@ impl ProjectStoreOps for MockProjectStore {
         // it, mirroring the Postgres conflict arm.
         let has_infra = weft_core::has_infra(&project);
         // Serialize for the history row before moving `project`.
+        if let Some(implementations) = implementations {
+            let binary = binary_hash.ok_or_else(|| anyhow::anyhow!("implementation fingerprints require a worker binary hash"))?;
+            let mut stored = self.implementations.write().await;
+            let key = (id, binary.to_string());
+            anyhow::ensure!(stored.get(&key).is_none_or(|old| old == implementations), "worker hash {binary} already has different implementation fingerprints");
+            stored.insert(key, implementations.clone());
+        }
         let project_json = serde_json::to_string(&project)?;
         // Mirror Postgres exactly: the upsert's conflict arm does NOT
         // touch `status` (an Active project stays active through a
@@ -1599,12 +1741,31 @@ impl ProjectStoreOps for MockProjectStore {
         if let Some(h) = infra_hash {
             self.infra_hashes.write().await.insert(id, h.to_string());
         }
+        if binary_hash.is_some() || definition_hash.is_some() {
+            let mut sources = self.sources.write().await;
+            match source {
+                Some(source) => { sources.insert(id, source.clone()); }
+                None => { sources.remove(&id); }
+            }
+        }
         Ok(StoredProjectSummary {
             id,
             name: name_owned,
             description: description_owned,
             status,
         })
+    }
+
+    async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+        let Some(binary_hash) = self.binary_hashes.read().await.get(&id).cloned() else { return Ok(None) };
+        let Some(definition_hash) = self.definition_hashes.read().await.get(&id).cloned() else { return Ok(None) };
+        let Some(implementations) = self.implementations.read().await.get(&(id, binary_hash.clone())).cloned() else { return Ok(None) };
+        Ok(Some(weft_core::project::hash::ProgramIdentity { definition_hash, binary_hash, implementations }))
+    }
+
+    async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
+        anyhow::ensure!(self.running_program_identity(id).await?.as_ref() == Some(program), "project changed during preparation; register the project and retry");
+        self.sources.read().await.get(&id).cloned().ok_or_else(|| anyhow::anyhow!("project sources are missing; register the project and retry"))
     }
 
     async fn tenant_for(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -1646,16 +1807,22 @@ impl ProjectStoreOps for MockProjectStore {
 
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         // Mirror Postgres FK CASCADE: removing a project clears every
-        // per-id side-map (binary/definition/infra hashes,
-        // definition_versions history, lifecycles, tenants, has_infra,
-        // namespaces, transitions). Without this the mock diverges from
-        // production: a test that re-registers under the same id, or asserts
-        // cleanup, would see ghost state Postgres does not have.
+        // per-id side-map (binary/definition/infra hashes, lifecycles,
+        // tenants, has_infra, namespaces, transitions). Without this the
+        // mock diverges from production: a test that re-registers under
+        // the same id, or asserts cleanup, would see ghost state
+        // Postgres does not have.
+        //
+        // `definition_versions` is the exception, exactly as in
+        // Postgres: the recorded programs have NO foreign key to the
+        // project, because the journal outlives it and a run cannot be
+        // read back without the program it ran.
+        // `retire_unused_definitions` is what drops them.
         let was_present = self.inner.write().await.remove(&id).is_some();
+        self.sources.write().await.remove(&id);
         self.binary_hashes.write().await.remove(&id);
         self.definition_hashes.write().await.remove(&id);
         self.infra_hashes.write().await.remove(&id);
-        self.definition_versions.write().await.retain(|(p, _), _| *p != id);
         self.lifecycles.write().await.remove(&id);
         self.tenants.write().await.remove(&id);
         self.has_infra.write().await.remove(&id);
@@ -1708,10 +1875,12 @@ impl ProjectStoreOps for MockProjectStore {
             }
         }
         if let Some(h) = binary_hash {
-            self.binary_hashes.write().await.insert(id, h.to_string());
+            let old = self.binary_hashes.write().await.insert(id, h.to_string());
+            if old.as_deref() != Some(h) { self.sources.write().await.remove(&id); }
         }
         if let Some(h) = definition_hash {
-            self.definition_hashes.write().await.insert(id, h.to_string());
+            let old = self.definition_hashes.write().await.insert(id, h.to_string());
+            if old.as_deref() != Some(h) { self.sources.write().await.remove(&id); }
         }
         if let Some(h) = infra_hash {
             self.infra_hashes.write().await.insert(id, h.to_string());
@@ -1727,6 +1896,12 @@ impl ProjectStoreOps for MockProjectStore {
         Ok(self.definition_hashes.read().await.get(&id).cloned())
     }
 
+    async fn activation_program(&self, _id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+        // Activation is a PostgreSQL transaction; this source-store fake has
+        // no completed activation. Lifecycle integration tests use PostgreSQL.
+        Ok(None)
+    }
+
     async fn definition_for_hash(
         &self,
         id: uuid::Uuid,
@@ -1738,6 +1913,30 @@ impl ProjectStoreOps for MockProjectStore {
             .await
             .get(&(id, hash.to_string()))
             .cloned())
+    }
+
+    async fn projects_with_orphan_definitions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
+        let live = self.inner.read().await;
+        let versions = self.definition_versions.read().await;
+        let mut ids: Vec<uuid::Uuid> =
+            versions.keys().map(|(id, _)| *id).filter(|id| !live.contains_key(id)).collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn retire_unused_definitions(
+        &self,
+        id: uuid::Uuid,
+        still_in_use: &[String],
+    ) -> anyhow::Result<u64> {
+        if self.inner.read().await.contains_key(&id) {
+            return Ok(0);
+        }
+        let mut versions = self.definition_versions.write().await;
+        let before = versions.len();
+        versions.retain(|(p, hash), _| *p != id || still_in_use.contains(hash));
+        Ok((before - versions.len()) as u64)
     }
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -1833,7 +2032,7 @@ impl ProjectStoreOps for MockProjectStore {
         Ok(true)
     }
 
-    async fn try_begin_activating(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+    async fn try_begin_activating(&self, id: uuid::Uuid, color: uuid::Uuid) -> anyhow::Result<bool> {
         let mut lifecycles = self.lifecycles.write().await;
         let mut inner = self.inner.write().await;
         let mut transitions = self.transitions.write().await;
@@ -1851,6 +2050,7 @@ impl ProjectStoreOps for MockProjectStore {
             return Ok(false);
         }
         *lifecycle = ProjectLifecycle::activating();
+        lifecycle.activating_ts_color = Some(color);
         if let Some(entry) = inner.get_mut(&id) {
             entry.1 = ProjectStatus::Activating;
         }
@@ -1861,41 +2061,26 @@ impl ProjectStoreOps for MockProjectStore {
         Ok(true)
     }
 
-    async fn set_activating_ts_color(
-        &self,
-        id: uuid::Uuid,
-        color: uuid::Uuid,
-    ) -> anyhow::Result<bool> {
-        let mut lifecycles = self.lifecycles.write().await;
-        let Some(lifecycle) = lifecycles.get_mut(&id) else {
-            return Ok(false);
-        };
-        if lifecycle.status != ProjectStatus::Activating {
-            return Ok(false);
-        }
-        lifecycle.activating_ts_color = Some(color);
-        Ok(true)
-    }
-
     async fn end_activating(
         &self,
         id: uuid::Uuid,
+        color: uuid::Uuid,
         to: &ProjectLifecycle,
-    ) -> anyhow::Result<Option<Option<uuid::Uuid>>> {
+        _remove_signals: bool,
+    ) -> anyhow::Result<Option<Vec<crate::journal::SignalRegistration>>> {
         let mut lifecycles = self.lifecycles.write().await;
         let mut inner = self.inner.write().await;
         let Some(lifecycle) = lifecycles.get_mut(&id) else {
             return Ok(None);
         };
-        if lifecycle.status != ProjectStatus::Activating {
+        if lifecycle.status != ProjectStatus::Activating || lifecycle.activating_ts_color != Some(color) {
             return Ok(None);
         }
-        let prev = lifecycle.activating_ts_color;
         *lifecycle = to.clone();
         if let Some(entry) = inner.get_mut(&id) {
             entry.1 = to.status;
         }
-        Ok(Some(prev))
+        Ok(Some(Vec::new()))
     }
 
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
@@ -1984,6 +2169,7 @@ impl ProjectStoreOps for MockProjectStore {
                     id: *id,
                     status: lifecycle.status,
                     transition,
+                    activating_ts_color: lifecycle.activating_ts_color,
                 });
             }
         }

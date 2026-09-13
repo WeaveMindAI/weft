@@ -89,6 +89,8 @@ pub struct Task {
     pub project_id: Option<String>,
     pub color: Option<String>,
     pub tenant_id: Option<String>,
+    /// Requested executable, retained when claimed and handed to a spawn handler.
+    pub binary_hash: Option<String>,
     /// How many times this row has been claimed, INCLUDING the claim
     /// that returned this value. 1 on the first claim; > 1 means a
     /// prior claim existed (lease expired, or the claimer surrendered
@@ -415,31 +417,6 @@ pub async fn admit_live_execution_in(
         .execute(&mut *conn)
         .await?;
 
-    // Pick the least-pressured admittable worker. Same predicate as
-    // `worker_pod::pick_admittable_for_project`: alive, not draining, below
-    // saturation, on the CURRENT image, least-pressured first (a spawning
-    // pod reads 0 until its first heartbeat, so it is correctly preferred).
-    let chosen: Option<(String, String)> = sqlx::query_as(
-        r#"SELECT wp.pod_name, wp.namespace
-           FROM worker_pod wp
-           WHERE wp.project_id = $1
-             AND wp.status IN ('spawning', 'alive')
-             AND wp.role = 'worker'
-             AND NOT wp.draining
-             AND wp.mem_pressure < $2
-             AND ($3::TEXT IS NULL OR wp.binary_hash = $3)
-           ORDER BY wp.mem_pressure ASC, wp.created_at_unix ASC, wp.pod_name ASC
-           LIMIT 1"#,
-    )
-    .bind(project_id)
-    .bind(saturation)
-    .bind(spec.binary_hash.as_deref())
-    .fetch_optional(&mut *conn)
-    .await?;
-    let Some((pod_name, namespace)) = chosen else {
-        return Ok(LiveAdmitOutcome::Saturated);
-    };
-
     // A retry of the same handshake finds its task already live; return the
     // SAME pod it was admitted to, never insert a second task for the color.
     // LEFT JOIN so a task whose pod row was already GC'd is STILL found (an
@@ -472,6 +449,13 @@ pub async fn admit_live_execution_in(
             )),
         };
     }
+
+    let chosen = crate::worker_pod::pick_admittable_for_project(
+        &mut *conn, project_id, saturation, spec.binary_hash.as_deref(),
+    ).await?;
+    let Some((pod_name, namespace)) = chosen else {
+        return Ok(LiveAdmitOutcome::Saturated);
+    };
 
     let id = Uuid::new_v4();
     let now = unix_now();
@@ -551,7 +535,7 @@ pub async fn claim_one(
     // Dispatcher-target claims aren't affected: dispatcher pods have no
     // `worker_pod` row at all, so the EXISTS check is gated on target.
     let row = sqlx::query(
-        r#"SELECT id, kind, status, project_id, color, tenant_id, attempts, payload
+        r#"SELECT id, kind, status, project_id, color, tenant_id, binary_hash, attempts, payload
            FROM task
            WHERE target = $1
              AND ($2::TEXT IS NULL OR project_id = $2)
@@ -1095,6 +1079,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
     let project_id: Option<String> = row.try_get("project_id")?;
     let color: Option<String> = row.try_get("color")?;
     let tenant_id: Option<String> = row.try_get("tenant_id")?;
+    let binary_hash: Option<String> = row.try_get("binary_hash")?;
     let attempts: i32 = row.try_get("attempts")?;
     let payload: Value = row.try_get("payload")?;
     Ok(Task {
@@ -1104,6 +1089,7 @@ fn row_to_task(row: sqlx::postgres::PgRow) -> Result<Task> {
         project_id,
         color,
         tenant_id,
+        binary_hash,
         attempts,
         payload,
     })
@@ -1184,6 +1170,7 @@ mod wire_tests {
             project_id: None,
             color: None,
             tenant_id: None,
+            binary_hash: Some("original-image".into()),
             attempts: 2,
             payload: serde_json::json!(null),
         };
@@ -1195,6 +1182,7 @@ mod wire_tests {
         assert_eq!(back.project_id, original.project_id);
         assert_eq!(back.color, original.color);
         assert_eq!(back.tenant_id, original.tenant_id);
+        assert_eq!(back.binary_hash, original.binary_hash);
         assert_eq!(back.attempts, original.attempts);
         assert_eq!(back.payload, original.payload);
         assert!(json.contains("\"status\":\"pending\""));

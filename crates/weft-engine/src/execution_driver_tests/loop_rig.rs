@@ -85,6 +85,7 @@
                 frames: vec![],
                 port: port.clone(),
                 value: Arc::new(value.clone()),
+                provided: false,
                 at_unix: 0,
             });
         }
@@ -387,8 +388,7 @@
         let group = ReadyGroup {
             frames: Vec::new(),
             color: uuid::Uuid::nil(),
-            input: bag(outer_input),
-            closed_ports: Vec::new(),
+            received: weft_core::exec::ready::FiringInput { input: bag(outer_input), ..Default::default() },
             skip: None,
             pulse_ids: Vec::new(),
             error: None,
@@ -460,6 +460,7 @@
                             frames: frames.clone(),
                             port,
                             value: Arc::new(value),
+                            provided: false,
                             at_unix: 0,
                         },
                         None,
@@ -473,8 +474,7 @@
         let group = ReadyGroup {
             frames,
             color,
-            input: bag(writes),
-            closed_ports,
+            received: weft_core::exec::ready::FiringInput { input: bag(writes), closed_ports, ..Default::default() },
             skip: None,
             pulse_ids: Vec::new(),
             error: None,

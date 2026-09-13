@@ -20,6 +20,14 @@
       "Shell(weft cancel-build)",
       "Shell(weft cancel-running)",
       "Shell(weft stop)",
+      "Shell(weft checkpoint)",
+      "Shell(weft branch)",
+      "Shell(weft tree)",
+      "Shell(weft diff)",
+      "Shell(weft freeze)",
+      "Shell(weft examples)",
+      "Shell(weft bake)",
+      "Shell(weft wake)",
       "Shell(weft node-test-hash)",
       "Shell(weft token)",
       "Shell(weft listener)"
@@ -32,7 +40,8 @@
       "Shell(weft rm)",
       "Shell(weft clean)",
       "Shell(weft infra)",
-      "Shell(weft files)"
+      "Shell(weft files)",
+      "Shell(weft prune)"
     ]
   }
 }

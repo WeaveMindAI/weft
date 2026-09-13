@@ -55,6 +55,12 @@ export async function createBridge(authDir, webhookManager, messageStore) {
   let sock = null;
   let currentQrBase64 = null;
   let reconnectAttempts = 0;
+  // Consecutive restart-required closes. The first few are the handover
+  // after a scan and are answered instantly; past that WhatsApp is
+  // saying the same thing over and over, and hammering it is not the
+  // answer.
+  let restartsInARow = 0;
+  const MAX_RESTARTS_IN_A_ROW = 3;
   // Guards against stacked reconnects. Two `connection.update`
   // events fired in quick succession (network blip + WhatsApp's
   // own re-handshake) previously spawned two parallel setTimeout
@@ -167,6 +173,7 @@ export async function createBridge(authDir, webhookManager, messageStore) {
       state.status = 'connected';
       currentQrBase64 = null;
       reconnectAttempts = 0;
+      restartsInARow = 0;
       connecting = false;
 
       const me = sock.user;
@@ -213,9 +220,36 @@ export async function createBridge(authDir, webhookManager, messageStore) {
 
       if (shouldReconnect) {
         state.status = 'disconnected';
-        reconnectAttempts++;
-        const delay = Math.min(3000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
-        console.log(`[bridge] Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+        // 515 (`restartRequired`) is what WhatsApp sends the moment a
+        // scan SUCCEEDS: the pairing is written and the socket has to be
+        // dialled again at once to finish it. It is not a failure, so it
+        // never rides the backoff ladder. Waiting even a few seconds
+        // loses the fresh session, and the re-dial then comes back 401,
+        // which the branch below reads as a logout and wipes the pairing
+        // the user just scanned. That is the QR -> loading -> QR loop.
+        const restartRequired = statusCode === DisconnectReason.restartRequired;
+        // A restart-required is answered at once, and that is exactly why
+        // it needs a count of its own. Zeroing the ladder on every one of
+        // them meant WhatsApp answering the same way twice in a row got an
+        // immediate re-dial each time, for ever, with the log printing
+        // "attempt 0" every iteration so the loop looked like one ordinary
+        // post-scan restart. After a few in a row it is not a handover any
+        // more, so it joins the ordinary ladder.
+        if (restartRequired) {
+          restartsInARow++;
+        } else {
+          restartsInARow = 0;
+          reconnectAttempts++;
+        }
+        const handover = restartRequired && restartsInARow <= MAX_RESTARTS_IN_A_ROW;
+        const delay = handover
+          ? 0
+          : Math.min(3000 * Math.pow(2, Math.max(reconnectAttempts, restartsInARow) - 1), MAX_RECONNECT_DELAY);
+        console.log(
+          handover
+            ? `[bridge] Restart required, re-dialling now (${restartsInARow} in a row)`
+            : `[bridge] Reconnecting in ${delay}ms (attempt ${reconnectAttempts}, ${restartsInARow} restarts in a row)`,
+        );
         if (reconnectTimer !== null) {
           clearTimeout(reconnectTimer);
         }

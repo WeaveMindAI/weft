@@ -53,8 +53,18 @@ enum Cmd {
         #[arg(long = "assistant", value_name = "NAME")]
         assistants: Vec<String>,
     },
-    /// Compile the current project to a native rust binary.
-    Build,
+    /// Compile the current project into its worker image and register it
+    /// with the dispatcher, without running anything. Also how you put
+    /// back code the dispatcher no longer has: registering records the
+    /// compiled program under its own hash, which is the hash a past run
+    /// names, so unchanged files make that run readable again. It adds
+    /// nothing to the version tree; `weft checkpoint` does that.
+    Build {
+        /// Compile only nodes used by the graph. By default every catalog
+        /// node is compiled, so adding an unchanged node needs no rebuild.
+        #[arg(long)]
+        referenced: bool,
+    },
     /// Build (if stale) the shared worker builder-base image and print its
     /// content-addressed tag. The base bakes the precompiled engine + deps that
     /// every per-project worker build reuses; this is the same base-ensure a
@@ -66,7 +76,7 @@ enum Cmd {
     },
     /// Make every shared image exist locally: the four system images
     /// (dispatcher, listener, broker, infra-supervisor) plus the worker
-    /// builder-base, each under its content-addressed registry ref
+    /// builder-base and full-library worker, each under its content-addressed registry ref
     /// (present -> pull -> build). `--push` then pushes every ref to
     /// its registry; the release workflow runs this on each push to the
     /// release branch, which is what lets every install pull instead of
@@ -154,25 +164,138 @@ enum Cmd {
     },
     /// Run the current project via the dispatcher. Streams logs until
     /// completion, including across waits, unless `--detach` is set.
+    /// Every run records the code it ran as a version in the project's
+    /// tree (`weft tree`).
     ///
     /// Rebuilding while executions are in flight is non-disruptive:
     /// in-flight work finishes on workers baked from its own image,
     /// and this run lands on a fresh current-image worker.
     Run {
+        /// Load `examples/<name>.json`; explicit run flags edit its settings.
+        spec: Option<String>,
         #[arg(long)]
         detach: bool,
+        /// Compile only nodes used by the graph. Default: the whole catalog.
+        #[arg(long)]
+        referenced: bool,
+        /// Reuse from head's run every node whose slice of the program
+        /// did not change (and completed), re-running only the rest.
+        #[arg(long)]
+        seed: bool,
+        /// With --seed: reuse through this node, inclusively. Repeatable.
+        #[arg(long, value_name = "node-id")]
+        seed_until: Vec<String>,
+        /// With --seed: reuse up to this node, excluding it. Repeatable.
+        #[arg(long, value_name = "node-id")]
+        seed_before: Vec<String>,
+        /// Start a new tree: the version parents on nothing and nothing
+        /// is seeded.
+        #[arg(long)]
+        root: bool,
+        /// Start the cut at this node, optionally supplying backup inputs
+        /// as node='{"port": value}'. Repeatable; real input values win,
+        /// and with --seed an unchanged start is reused like any other node.
+        #[arg(long, value_name = "node[=json]")]
+        from: Vec<String>,
         /// Run only this node and what it needs (repeatable: several
-        /// targets run the union of what each needs). A run normally
-        /// kicks every root of the graph; an aimed run is held to the
-        /// targets' upstream, so a root shared with another branch
-        /// never drags that branch in. Any node can be a target.
+        /// targets run the union of what each needs). Composes with
+        /// --from: from a plus target z is the path between.
         #[arg(long, value_name = "node-id")]
         target: Vec<String>,
+        /// Run what this node needs and NOT the node (repeatable). The
+        /// way to run a program up to the act you do not want performed:
+        /// `--before post` runs everything the posting step needs and
+        /// stops there.
+        #[arg(long, value_name = "node-id")]
+        before: Vec<String>,
+        /// Run one group (or `@include`d file, by its alias) alone, with
+        /// its boundary inputs provided.
+        #[arg(long, value_name = "group[=json]")]
+        group: Option<String>,
+        /// Fire exactly one trigger with this wake payload, using a matching
+        /// bake without activating listeners: `trigger=<json>`.
+        #[arg(long, value_name = "trigger=json")]
+        fire: Vec<String>,
+        /// Stand in for a node: node='{"port": value}' declares what it
+        /// would have emitted, and the node itself does not run. The way
+        /// past a step whose act you do not want repeated (a trigger you
+        /// have not activated, an infra step), to get at what comes
+        /// after it.
+        #[arg(long, value_name = "node=json")]
+        emit: Vec<String>,
+        /// Write the scope flags as `examples/<name>.json` before running.
+        #[arg(long, value_name = "name")]
+        save: Option<String>,
+        /// Clear a saved setting before applying explicit flags: from,
+        /// emit, target, before, group, or fire. Repeatable.
+        #[arg(long, value_name = "field")]
+        clear: Vec<String>,
+    },
+    /// Record the project's files as a version under head, with no run
+    /// and no build: a point to branch back to.
+    Checkpoint {
+        label: Option<String>,
+        /// Start a new tree: the version parents on nothing.
+        #[arg(long)]
+        root: bool,
+    },
+    /// Restore a version's files (a color means its version) and move
+    /// head there. A color sets the run the next `--seed` inherits from.
+    Branch {
+        /// A version id or a run color, or the start of one.
+        reference: String,
+        /// Throw away uncommitted changes instead of refusing.
+        #[arg(long)]
+        discard: bool,
+    },
+    /// The project's version tree: every version with what changed
+    /// against its parent, its runs beneath, head marked.
+    Tree,
+    /// Compare what two runs put on their wires. A ref is a color (or
+    /// the start of one) or `example:<name>`.
+    Diff {
+        left: String,
+        right: String,
+        /// Every differing wire with both values, instead of per node.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Write `examples/<name>.json` from a run (default: head's run):
+    /// its starting parameters, the answers people gave, and outputs
+    /// accepted for review. Replaces an existing example in full.
+    Freeze {
+        name: String,
+        color: Option<String>,
+        /// Emphasize these output nodes in later diffs. Repeat for several nodes.
+        #[arg(long = "expect")]
+        expect: Vec<String>,
+    },
+    /// List saved examples, their frozen status, and their latest run.
+    Examples,
+    /// Delete a version, every version under it, and all their runs.
+    Prune {
+        /// A version id, or the start of one.
+        version: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Resolve a pure time wait now. A wait that expects a value is
+    /// refused, naming its kind.
+    Wake {
+        color: String,
+        node: String,
     },
     /// Subscribe to the dispatcher's SSE stream for a project.
     Follow { project: String },
     /// Cancel an execution by color.
     Stop { color: String },
+    /// Prepare and save trigger settings without listening for events.
+    Bake {
+        project: Option<String>,
+        /// Compile only nodes used by the graph, matching `run --referenced`.
+        #[arg(long, conflicts_with = "project")]
+        referenced: bool,
+    },
     /// Activate a project. Without a project id, discovers the cwd
     /// project, compiles + registers it first, then activates.
     ///
@@ -187,10 +310,9 @@ enum Cmd {
         #[arg(long = "reactivate-choice", value_name = "choice")]
         reactivate_choice: Option<String>,
     },
-    /// Deactivate a registered project. By default WIPEs (drops
-    /// signals + cancels suspended runs); pass `--mode hibernate`
-    /// or `--mode park` to preserve in-flight HumanQuery work
-    /// across the inactive window.
+    /// Deactivate a registered project. Choose --mode wipe, hibernate,
+    /// or park explicitly in scripts; a terminal prompts when it is omitted.
+    /// Wipe cancels suspended work; hibernate and park preserve it.
     ///
     /// `--running-policy` controls how in-flight executions are
     /// handled: `wait` (default) leaves running executions to
@@ -681,7 +803,7 @@ enum DaemonAction {
     #[command(visible_alias = "restart")]
     Start {
         /// Force-rebuild every shared image (the four system images
-        /// and the worker builder base), skipping the
+        /// and the worker builder base and full-library worker), skipping the
         /// present-and-pull check. For when a local image is corrupt
         /// or hand-modified.
         #[arg(long)]
@@ -764,6 +886,15 @@ impl InfraAction {
     }
 }
 
+/// Full builds are the default; --referenced opts into a graph-specific image.
+fn node_set(referenced: bool) -> weft_compiler::codegen::NodeSet {
+    if referenced {
+        weft_compiler::codegen::NodeSet::Referenced
+    } else {
+        weft_compiler::codegen::NodeSet::Full
+    }
+}
+
 /// The tri-state the daemon persists: flagged on, flagged off, or
 /// unflagged (keep the persisted choice).
 fn public_url_choice(on: bool, off: bool) -> Option<bool> {
@@ -809,7 +940,31 @@ fn parse_phase(text: &str) -> Result<weft_core::context::Phase, String> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    // The flags are parsed out here so a failure anywhere below can be
+    // reported the way the caller asked for it: `--json` gets one
+    // error event on stdout, a terminal gets one `error:` line.
+    if let Err(e) = prelude() {
+        progress::report_plain_error(false, &e);
+        return std::process::ExitCode::FAILURE;
+    }
+    let cli = Cli::parse();
+    let json = cli.json;
+    match run(cli).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // A verb's progress channel already reported this one; a
+        // second report would be the same message again.
+        Err(e) if e.is::<progress::Reported>() => std::process::ExitCode::FAILURE,
+        Err(e) => {
+            progress::report_plain_error(json, &e);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Everything that has to happen before the flags are read: the
+/// `.env` feeds the flags that read the environment.
+fn prelude() -> anyhow::Result<()> {
     weft_core::net::install_crypto_provider();
     // Local overrides (the sealing key, ports, paths) come from the
     // nearest `.env` up from the invoking directory. Real env vars win
@@ -828,13 +983,15 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with_writer(std::io::stderr)
         .init();
+    Ok(())
+}
 
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> anyhow::Result<()> {
     let ctx = commands::Ctx::new(cli.dispatcher, cli.json);
 
     match cli.command {
         Cmd::New { name, assistants } => commands::new::run(ctx, name, assistants).await,
-        Cmd::Build => commands::build::run(ctx).await,
+        Cmd::Build { referenced } => commands::build::run(ctx, node_set(referenced)).await,
         Cmd::BuildBase { quiet } => commands::build::run_build_base(quiet).await,
         Cmd::BuildImages { push, push_suffix, print } => {
             commands::build::run_build_images(push, push_suffix, print).await
@@ -856,9 +1013,34 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { detach, target } => commands::run::run(ctx, detach, target).await,
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, fire, emit, save, clear } => {
+            commands::run::run(
+                ctx,
+                commands::run::RunArgs {
+                    spec,
+                    detach,
+                    node_set: Some(node_set(referenced)),
+                    seed,
+                    seed_until,
+                    seed_before,
+                    root,
+                    flags: commands::versions::RunFlags { from, target, before, group, fire, emit, clear },
+                    save,
+                },
+            )
+            .await
+        }
+        Cmd::Checkpoint { label, root } => commands::checkpoint::run(ctx, label, root).await,
+        Cmd::Branch { reference, discard } => commands::branch::run(ctx, reference, discard).await,
+        Cmd::Tree => commands::tree::run(ctx).await,
+        Cmd::Diff { left, right, full } => commands::diff::run(ctx, left, right, full).await,
+        Cmd::Freeze { name, color, expect } => commands::freeze::run(ctx, name, color, expect).await,
+        Cmd::Examples => commands::examples::run(ctx).await,
+        Cmd::Prune { version, yes } => commands::prune::run(ctx, version, yes).await,
+        Cmd::Wake { color, node } => commands::wake::run(ctx, color, node).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { color } => commands::stop::run(ctx, color).await,
+        Cmd::Bake { project, referenced } => commands::bake::run(ctx, project, node_set(referenced)).await,
         Cmd::Activate { project, reactivate_choice } => {
             commands::activate::run(ctx, project, reactivate_choice).await
         }
@@ -948,5 +1130,46 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod command_contract_tests {
+    use super::*;
+
+    #[test]
+    fn builds_use_the_full_catalog_unless_referenced_is_requested() {
+        for command in ["run", "build", "bake"] {
+            for referenced in [false, true] {
+                let mut args = vec!["weft", command];
+                if referenced { args.push("--referenced"); }
+                let cli = Cli::try_parse_from(args).unwrap();
+                let flag = match cli.command {
+                    Cmd::Run { referenced, .. } | Cmd::Build { referenced } | Cmd::Bake { referenced, .. } => referenced,
+                    _ => panic!("build command"),
+                };
+                assert_eq!(node_set(flag), if referenced { weft_compiler::codegen::NodeSet::Referenced } else { weft_compiler::codegen::NodeSet::Full });
+            }
+            assert!(Cli::try_parse_from(["weft", command, "--full"]).is_err());
+        }
+    }
+
+    #[test]
+    fn obsolete_check_input_and_rerun_commands_are_rejected() {
+        for args in [
+            vec!["weft", "check"],
+            vec!["weft", "run", "--input", "node.port=1"],
+            vec!["weft", "run", "--rerun", "node"],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn frozen_review_focus_is_repeatable() {
+        let cli = Cli::try_parse_from(["weft", "freeze", "accepted", "--expect", "answer", "--expect", "summary"]).unwrap();
+        let Cmd::Freeze { name, expect, .. } = cli.command else { panic!("freeze command") };
+        assert_eq!(name, "accepted");
+        assert_eq!(expect, ["answer", "summary"]);
     }
 }

@@ -36,18 +36,25 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // project with an asset in it, and the drift banner would never
     // clear. Asset resolution also publishes the current references,
     // including an empty set when the last asset was removed.
-    let (desired_binary, desired_definition, desired_infra) =
+    let (desired_binary, desired_full_binary, desired_definition, desired_infra) =
         match weft_compiler::hash::load_enriched_project(project) {
             Ok((mut def, catalog)) => {
                 let resolved = crate::commands::assets::resolve_project_assets(
                     &ctx.client(),
                     &project.root,
                     &mut def,
+                    None,
+                    true,
                 )
                 .await;
+                // Both node sets: a worker built with the full catalog is as
+                // current as one built from the referenced set, and the
+                // dispatcher accepts either as "not drifted".
+                use weft_compiler::codegen::NodeSet;
                 match resolved {
                     Ok(()) => (
-                        weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog).ok(),
+                        weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced).ok(),
+                        weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full).ok(),
                         weft_compiler::hash::compute_definition_hash(&def).ok(),
                         weft_compiler::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
                             .ok(),
@@ -55,10 +62,10 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     // An asset that cannot resolve is what a build will
                     // refuse; status stays display-only and reports no
                     // desired hashes rather than a made-up drift.
-                    Err(_) => (None, None, None),
+                    Err(_) => (None, None, None, None),
                 }
             }
-            Err(_) => (None, None, None),
+            Err(_) => (None, None, None, None),
         };
 
     let mut path = format!("/projects/{project_id}/status");
@@ -69,6 +76,12 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         path.push(sep);
         sep = '&';
         path.push_str("desiredBinaryHash=");
+        path.push_str(h);
+    }
+    if let Some(h) = desired_full_binary.as_deref() {
+        path.push(sep);
+        sep = '&';
+        path.push_str("desiredFullBinaryHash=");
         path.push_str(h);
     }
     if let Some(h) = desired_definition.as_deref() {
@@ -147,50 +160,50 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     if let Some(execs) = data.get("executions") {
         let total = execs.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
         println!("  executions: {total} total");
-        let (Some(color), Some(status)) = (
+        if let (Some(color), Some(status)) = (
             execs.get("last_color").and_then(|v| v.as_str()),
             execs.get("last_status").and_then(|v| v.as_str()),
-        ) else {
-            print_drift(&data);
-            return Ok(());
-        };
-        let at = execs.get("last_completed_at").and_then(|v| v.as_u64());
-        match at {
-            Some(ts) => {
-                let age = unix_now().saturating_sub(ts);
-                println!("    last: {color} ({status}, completed {age}s ago)");
+        ) {
+            match execs.get("last_completed_at").and_then(|v| v.as_u64()) {
+                Some(ts) => {
+                    let age = unix_now().saturating_sub(ts);
+                    println!("    last: {color} ({status}, completed {age}s ago)");
+                }
+                None => println!("    last: {color} ({status}, in flight)"),
             }
-            None => println!("    last: {color} ({status}, in flight)"),
         }
     }
     print_drift(&data);
+    // The same verb list the editor's action bar offers, so a terminal
+    // reader sees what the project accepts right now (and that `resync`
+    // is on the table when the listeners lag behind the code).
+    if let Some(actions) = data.get("available_actions").and_then(|v| v.as_array()) {
+        let verbs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        if !verbs.is_empty() {
+            println!("  actions: {}", verbs.join(", "));
+        }
+    }
 
     Ok(())
 }
 
+/// Every drift bit the dispatcher set, each with the verb that clears
+/// it. Silent when nothing drifted.
 fn print_drift(data: &serde_json::Value) {
-    let drift = match data.get("drift") {
-        Some(d) => d,
-        None => return,
-    };
-    let infra = drift.get("infra_drift").and_then(|v| v.as_bool()).unwrap_or(false);
-    let binary = drift.get("binary_drift").and_then(|v| v.as_bool()).unwrap_or(false);
-    let definition = drift
-        .get("definition_drift")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !infra && !binary && !definition {
+    let Some(drift) = data.get("drift") else { return };
+    let bit = |name: &str| drift.get(name).and_then(|v| v.as_bool()).unwrap_or(false);
+    let lines = [
+        (bit("infra_drift"), "infra: source has changed; `weft infra upgrade` rebuilds it"),
+        (bit("binary_drift"), "binary: worker code has changed; the next run or `weft build` rebuilds the image"),
+        (bit("definition_drift"), "definition: project shape has changed; the next run picks it up"),
+        (bit("activation_drift"), "activation: the listeners fire an older program; `weft resync` re-registers them against this one"),
+    ];
+    if lines.iter().all(|(set, _)| !set) {
         return;
     }
     println!("  drift:");
-    if infra {
-        println!("    infra: source has changed; click Upgrade to rebuild infra");
-    }
-    if binary {
-        println!("    binary: worker code has changed; next run rebuilds the image");
-    }
-    if definition {
-        println!("    definition: project shape has changed; click Resync to re-register");
+    for (_, line) in lines.iter().filter(|(set, _)| *set) {
+        println!("    {line}");
     }
 }
 

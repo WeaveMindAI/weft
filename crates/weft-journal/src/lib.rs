@@ -8,12 +8,14 @@
 
 pub mod events;
 pub mod fold;
+pub mod seed;
 pub mod tags;
 pub mod traits;
 pub mod write;
 
-pub use events::ExecEvent;
+pub use events::{ExecEvent, Seed};
 pub use fold::{fold_to_snapshot, FiringView, Fold, FoldEffects};
+pub use seed::{fold_seeded, seed_chain, SeedChain};
 
 /// Decode one journal row, or the loud message every reader shares:
 /// the color, the reason, and the recovery (`weft clean`). THE single

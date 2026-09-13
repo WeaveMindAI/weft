@@ -14,8 +14,11 @@ use std::sync::Arc;
 use weft_core::exec::boundary::{BoundaryDispatch, BoundaryOutcome};
 use weft_core::exec::NodeExecutionStatus;
 use weft_core::primitive::LoopInstanceKey;
+use weft_core::project::boundary_in_id;
 use weft_core::ProjectDefinition;
-use weft_journal::{ExecEvent, Fold, FoldEffects};
+use std::collections::BTreeMap;
+
+use weft_journal::{ExecEvent, Fold, FoldEffects, SeedChain};
 
 use crate::events::DispatcherEvent;
 
@@ -27,16 +30,16 @@ pub enum ProgramLookup {
     /// row pins no definition hash), or a color that never started. A
     /// node row on such a color is a writer bug.
     NoProgram,
-    /// The birth row pins a hash, but the definition history it points
-    /// into is gone: the project was removed (the history is deleted
-    /// with the project row, and a project registered again under the
-    /// same id starts a fresh one), while the execution's rows outlive
-    /// it on purpose. The run reads without its program.
-    Deleted,
-    /// The program cannot be found and no retry will change that: the
-    /// birth row no longer decodes, the owner row is gone, or the
-    /// stored definition no longer reads. `weft clean` removes the run.
+    /// The journal cannot be read back: the birth row no longer
+    /// decodes, the owner row is gone, or the stored definition no
+    /// longer parses. `weft clean` removes the run.
     Unreadable(String),
+    /// The run is readable and the code it ran is not recorded any
+    /// more, so nothing a fold would derive can be shown. Its own state
+    /// because it is the one a person meets: the rows are all there and
+    /// every value is missing, which looks exactly like a broken viewer
+    /// until somebody says otherwise.
+    ProgramGone(String),
 }
 
 impl ProgramLookup {
@@ -44,7 +47,39 @@ impl ProgramLookup {
     pub fn program(&self) -> Option<Arc<ProjectDefinition>> {
         match self {
             Self::Found(p) => Some(p.clone()),
-            Self::NoProgram | Self::Deleted | Self::Unreadable(_) => None,
+            Self::NoProgram | Self::Unreadable(_) | Self::ProgramGone(_) => None,
+        }
+    }
+
+    /// The same state, with the reason emptied.
+    ///
+    /// For a reader that has already published the reason and must not
+    /// publish it twice. It lives here because the alternative, a
+    /// `match` beside each such reader, was written twice with a `_`
+    /// arm that quietly relabels any state it does not name: a third
+    /// unpaintable state would have been reported as an undecodable row
+    /// in both places, which is the distinction these states exist to
+    /// keep.
+    pub fn without_reason(&self) -> Self {
+        match self {
+            Self::Found(p) => Self::Found(p.clone()),
+            Self::NoProgram => Self::NoProgram,
+            Self::Unreadable(_) => Self::Unreadable(String::new()),
+            Self::ProgramGone(_) => Self::ProgramGone(String::new()),
+        }
+    }
+
+    /// Why this run cannot be painted whole, and where the reason
+    /// belongs on screen. `None` when it can (or when it has no
+    /// program to miss). Every reader publishes this; a run that paints
+    /// empty for no stated reason is the bug that sends people hunting
+    /// through the viewer.
+    pub fn unpaintable(&self) -> Option<(weft_core::primitive::CorruptionSite, &str)> {
+        use weft_core::primitive::CorruptionSite;
+        match self {
+            Self::Unreadable(reason) => Some((CorruptionSite::UndecodableRow, reason)),
+            Self::ProgramGone(reason) => Some((CorruptionSite::MissingProgram, reason)),
+            Self::Found(_) | Self::NoProgram => None,
         }
     }
 }
@@ -58,15 +93,41 @@ pub struct ExecutionProjector {
     /// published when this projection was opened); with a warning for
     /// a run that never had one, where a node row is a writer bug.
     fold: Option<Fold>,
-    node_rows_expected: bool,
+    /// Whether the reason this run cannot be painted whole has already
+    /// been said. Consulted only when there is no fold: a run whose
+    /// program is gone or unreadable had its reason published when the
+    /// projection was opened, so a node row here is skipped quietly,
+    /// while a run that never had a program gets a warning, because a
+    /// node row on one of those is a writer bug.
+    reason_already_published: bool,
     color: weft_core::Color,
     project_id: String,
+    /// What a seeded run inherits, handed in by the opener (which
+    /// read the seed chain off the journal) and painted right after
+    /// the birth row, marked with the run each row came from.
+    inheritance: SeedChain,
 }
 
 impl ExecutionProjector {
     pub fn new(color: weft_core::Color, program: ProgramLookup, project_id: String) -> Self {
-        let node_rows_expected = matches!(program, ProgramLookup::Deleted | ProgramLookup::Unreadable(_));
-        Self { fold: program.program().map(|p| Fold::new(color, p)), node_rows_expected, color, project_id }
+        let reason_already_published = program.unpaintable().is_some();
+        Self {
+            fold: program.program().map(|p| Fold::new(color, p)),
+            reason_already_published,
+            color,
+            project_id,
+            inheritance: SeedChain::default(),
+        }
+    }
+
+    /// The seed chain this run inherits from (`weft_journal::seed_chain`
+    /// over its birth row). Painted when the birth row is projected:
+    /// every inherited row lands on the screen before the run's own,
+    /// as it sits in the fold, so a seeded run reads whole instead of
+    /// as three nodes with values and twelve empty ones.
+    pub fn with_inheritance(mut self, chain: SeedChain) -> Self {
+        self.inheritance = chain;
+        self
     }
 
     /// Whether this projection folds at all. One that does not costs
@@ -93,6 +154,40 @@ impl ExecutionProjector {
     /// and a made-up event would contradict the corruption. The same
     /// event reaches the live screen and the replay, at the row.
     pub fn project(&mut self, ev: &ExecEvent) -> Vec<DispatcherEvent> {
+        let mut out = self.project_row(ev);
+        if let ExecEvent::ExecutionStarted { seed: Some(seed), at_unix, .. } = ev {
+            let chain = std::mem::take(&mut self.inheritance);
+            if let Some(fold) = &mut self.fold {
+                // Every ancestor is reconstructed once, here, and both
+                // consumers read from that one reconstruction.
+                let inherited = chain.materialize().and_then(|sources| {
+                    let effects = weft_journal::seed::import_origins(fold, seed, &sources, *at_unix)?;
+                    let boundaries = paint_inherited_boundaries(fold, &effects, self.color, &self.project_id, *at_unix);
+                    let mut events = inherited_events(&chain, &sources, seed, self.color, &self.project_id)?;
+                    events.extend(boundaries);
+                    Ok(events)
+                });
+                match inherited {
+                    Ok(events) => {
+                        out.extend(events);
+                    }
+                    Err(error) => {
+                        self.fold = None;
+                        self.reason_already_published = true;
+                        out.push(DispatcherEvent::JournalCorruption {
+                            color: self.color, project_id: self.project_id.clone(),
+                            site: weft_core::primitive::CorruptionSite::NodeLifecycle, reason: format!("cannot reconstruct seed history: {error:#}"),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// One of this execution's own rows through its fold and onto the screen.
+    fn project_row(&mut self, ev: &ExecEvent) -> Vec<DispatcherEvent> {
+        let inherited_from = None;
         let project_id = self.project_id.clone();
         let color = self.color;
         let at_unix = ev.at_unix();
@@ -100,7 +195,7 @@ impl ExecutionProjector {
             Some(fold) => fold.apply(ev),
             None => {
                 if needs_program(ev) {
-                    if !self.node_rows_expected {
+                    if !self.reason_already_published {
                         tracing::warn!(
                             target: "weft_dispatcher::projection",
                             %color, kind = ev.kind_str(),
@@ -124,10 +219,12 @@ impl ExecutionProjector {
                 })
                 .collect()
         } else { match ev {
-            ExecEvent::ExecutionStarted { entry_node, .. } => {
+            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, .. } => {
                 vec![DispatcherEvent::ExecutionStarted {
                     color, at_unix,
                     entry_node: entry_node.clone(),
+                    subgraph: subgraph.as_ref().map(|s| s.nodes.iter().cloned().collect()),
+                    seed: seed.clone(),
                     project_id,
                 }]
             }
@@ -139,6 +236,10 @@ impl ExecutionProjector {
                     frames: frames.clone(),
                     input: view.input,
                     closed_ports: view.closed_ports,
+                    provided_ports: view.provided_ports,
+                    backup_ports: view.backup_ports,
+                    inherited_ports: view.inherited_ports,
+                    inherited_from,
                     project_id,
                 }]
             }
@@ -153,6 +254,7 @@ impl ExecutionProjector {
                     node: node_id.clone(),
                     frames: frames.clone(),
                     output,
+                    inherited_from,
                     project_id,
                 }]
             }
@@ -162,6 +264,7 @@ impl ExecutionProjector {
                     node: node_id.clone(),
                     frames: frames.clone(),
                     error: error.clone(),
+                    inherited_from,
                     project_id,
                 }]
             }
@@ -173,6 +276,7 @@ impl ExecutionProjector {
                     frames: frames.clone(),
                     closed_ports: view.closed_ports,
                     reason: Some(reason.clone()),
+                    inherited_from,
                     project_id,
                 }]
             }
@@ -195,6 +299,7 @@ impl ExecutionProjector {
                     node: node_id.clone(),
                     frames: frames.clone(),
                     token: token.clone(),
+                    inherited_from,
                     project_id,
                 }]
             }
@@ -205,6 +310,7 @@ impl ExecutionProjector {
                     frames: frames.clone(),
                     token: token.clone(),
                     value: effects.resumed_value.clone(),
+                    inherited_from,
                     project_id,
                 }]
             }
@@ -214,6 +320,7 @@ impl ExecutionProjector {
                     node: node_id.clone(),
                     frames: frames.clone(),
                     reason: reason.clone(),
+                    inherited_from,
                     project_id,
                 }]
             }
@@ -257,6 +364,7 @@ impl ExecutionProjector {
             } => {
                 vec![DispatcherEvent::CostReported {
                     color, at_unix,
+                    inherited_from: None,
                     project_id,
                     node_id: node_id.clone(),
                     frames: frames.clone(),
@@ -435,7 +543,9 @@ impl ExecutionProjector {
         // editor reads the group's state from. Its forwarded values
         // sniff for bus participants like any other emission.
         for boundary in &effects.boundaries {
-            out.extend(boundary_events(color, &self.project_id, at_unix, boundary));
+            if let Some(view) = self.fold.as_ref().and_then(|fold| fold.boundary_view(boundary)) {
+                out.extend(boundary_events(color, &self.project_id, at_unix, boundary, &view, inherited_from));
+            }
         }
         out
     }
@@ -447,8 +557,85 @@ impl ExecutionProjector {
             .unwrap_or(weft_journal::FiringView {
                 input: serde_json::Value::Object(Default::default()),
                 closed_ports: Vec::new(),
+                provided_ports: Vec::new(),
+                backup_ports: Vec::new(),
+                inherited_ports: Default::default(),
             })
     }
+}
+
+fn paint_inherited_boundaries(fold: &Fold, effects: &FoldEffects, color: weft_core::Color, project_id: &str, at_unix: u64) -> Vec<DispatcherEvent> {
+    let mut events = Vec::new();
+    for boundary in &effects.boundaries {
+        if let Some(view) = fold.boundary_view(boundary) {
+            events.extend(boundary_events(color, project_id, at_unix, boundary, &view, None));
+        }
+    }
+    events
+}
+
+/// Paint selected original firings under their own program, including their
+/// suspension and resume history. These rows never enter the child's fold.
+///
+/// `sources` is the chain's reconstruction (`SeedChain::materialize`),
+/// which already refused any ancestor whose own seed names a run that
+/// came after it, so every ancestor's seed resolves inside it.
+fn inherited_events(
+    chain: &SeedChain,
+    sources: &BTreeMap<weft_core::Color, Fold>,
+    seed: &weft_journal::events::Seed,
+    child: weft_core::Color,
+    project_id: &str,
+) -> anyhow::Result<Vec<DispatcherEvent>> {
+    let mut out = Vec::new();
+    for ancestor in &chain.ancestors {
+        if seed.origins.values().any(|origin| *origin == ancestor.color) {
+            let mut source = ExecutionProjector::new(
+                ancestor.color, ProgramLookup::Found(ancestor.project.clone()), project_id.to_owned(),
+            );
+            for row in &ancestor.rows {
+                let mut events = source.project_row(row);
+                if let ExecEvent::ExecutionStarted { seed: Some(parent), at_unix, .. } = row {
+                    let fold = source.fold.as_mut().expect("original program supplied");
+                    let effects = weft_journal::seed::import_origins(fold, parent, sources, *at_unix)?;
+                    events.extend(paint_inherited_boundaries(fold, &effects, ancestor.color, project_id, *at_unix));
+                }
+                for mut event in events {
+                    match &mut event {
+                        DispatcherEvent::NodeStarted { color, node, inherited_from, .. }
+                        | DispatcherEvent::NodeSuspended { color, node, inherited_from, .. }
+                        | DispatcherEvent::NodeResumed { color, node, inherited_from, .. }
+                        | DispatcherEvent::NodeCompleted { color, node, inherited_from, .. }
+                        | DispatcherEvent::NodeSkipped { color, node, inherited_from, .. } => {
+                            if seed.origins.get(node) != Some(&ancestor.color) { continue; }
+                            *color = child;
+                            *inherited_from = Some(ancestor.color);
+                            out.push(event);
+                        }
+                        DispatcherEvent::JournalCorruption { reason, .. } => anyhow::bail!(
+                            "original run {} cannot be projected: {reason}", ancestor.color,
+                        ),
+                        DispatcherEvent::LoopInstantiated { color, group_id, .. }
+                        | DispatcherEvent::LoopIterationLaunched { color, group_id, .. }
+                        | DispatcherEvent::LoopOutFired { color, group_id, .. }
+                        | DispatcherEvent::LoopTerminated { color, group_id, .. } => {
+                            if seed.origins.get(&boundary_in_id(group_id)) != Some(&ancestor.color) { continue; }
+                            *color = child;
+                            out.push(event);
+                        }
+                        DispatcherEvent::CostReported { color, node_id, inherited_from, .. } => {
+                            if seed.origins.get(node_id) != Some(&ancestor.color) { continue; }
+                            *color = child;
+                            *inherited_from = Some(ancestor.color);
+                            out.push(event);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Whether a row is about a firing the fold has to know: a row that
@@ -482,6 +669,8 @@ fn boundary_events(
     project_id: &str,
     at_unix: u64,
     boundary: &BoundaryDispatch,
+    view: &weft_journal::FiringView,
+    inherited_from: Option<weft_core::Color>,
 ) -> Vec<DispatcherEvent> {
     let BoundaryOutcome::Fired { status, input, closed_ports, output, skip_reason, error, .. } =
         &boundary.outcome
@@ -497,6 +686,10 @@ fn boundary_events(
         frames: frames.clone(),
         input: serde_json::Value::Object(weft_core::exec::ready::owned_bag(input)),
         closed_ports: closed_ports.clone(),
+        provided_ports: view.provided_ports.clone(),
+        backup_ports: view.backup_ports.clone(),
+        inherited_ports: view.inherited_ports.clone(),
+        inherited_from,
         project_id: project_id.to_string(),
     }];
     out.push(match status {
@@ -507,6 +700,7 @@ fn boundary_events(
             frames,
             closed_ports: closed_ports.clone(),
             reason: skip_reason.clone(),
+            inherited_from,
             project_id: project_id.to_string(),
         },
         NodeExecutionStatus::Failed => DispatcherEvent::NodeFailed {
@@ -515,6 +709,7 @@ fn boundary_events(
             node,
             frames,
             error: error.clone().expect("a failed boundary carries its error"),
+            inherited_from,
             project_id: project_id.to_string(),
         },
         _ => DispatcherEvent::NodeCompleted {
@@ -527,6 +722,7 @@ fn boundary_events(
                 .filter(|bag| !bag.is_empty())
                 .map(|bag| serde_json::Value::Object(weft_core::exec::ready::owned_bag(bag)))
                 .unwrap_or(serde_json::Value::Null),
+            inherited_from,
             project_id: project_id.to_string(),
         },
     });
@@ -605,6 +801,74 @@ fn sniff_bus_participants(
 /// `ProgramLookup` variant, so no reader wedges on one color. A RESUME
 /// never comes through here: a worker that cannot find its program
 /// fails loudly (`route_entry::definition_for`).
+/// What a seeded run inherits, read off its birth row and the seeds'
+/// journals: the chain the projector paints before the run's own rows.
+/// Empty for a run with no seed or no program. A seed that cannot be
+/// read (cleaned, or its chain loops) is a reason the run paints
+/// without its inheritance; the caller publishes it as the run's
+/// corruption, naming `weft clean`, and the run's own rows still paint.
+pub async fn execution_inheritance(
+    state: &crate::state::DispatcherState,
+    rows: &[ExecEvent],
+    program: &ProgramLookup,
+) -> Result<weft_journal::SeedChain, String> {
+    if program.program().is_none() {
+        return Ok(weft_journal::SeedChain::default());
+    }
+    weft_journal::seed_chain(rows, |seed| state.journal.events_log(seed), |project_id, hash| async move {
+        let json = state.projects.definition_for_hash(project_id.parse()?, &hash).await?
+            .ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {project_id}"))?;
+        Ok(std::sync::Arc::new(serde_json::from_str(&json)?))
+    })
+        .await
+        .map_err(|e| format!("this run inherits from a seed that cannot be read: {e:#}"))
+}
+
+/// Read the selected firings' original logs together with this run's own tail.
+pub async fn execution_logs(
+    state: &crate::state::DispatcherState,
+    color: weft_core::Color,
+    limit: u32,
+) -> anyhow::Result<Vec<crate::journal::LogEntry>> {
+    let mut logs = state.journal.logs_for(color, limit).await?;
+    let inherited = async {
+        let rows = state.journal.events_log(color).await?;
+        let Some(ExecEvent::ExecutionStarted { seed: Some(seed), .. }) = rows.first() else { return Ok(Vec::new()); };
+        let program = execution_program(state, color).await?;
+        anyhow::ensure!(program.program().is_some(), "inherited logs need the run's original program");
+        let chain = execution_inheritance(state, &rows, &program).await.map_err(anyhow::Error::msg)?;
+        Ok::<_, anyhow::Error>(inherited_logs(&chain, seed))
+    }.await;
+    match inherited {
+        Ok(inherited) => logs.extend(inherited),
+        Err(error) => logs.push(crate::journal::LogEntry::corrupt_row(0, format!("cannot read inherited log history: {error:#}"))),
+    }
+    Ok(crate::journal::LogEntry::tail(logs, limit))
+}
+
+fn inherited_logs(chain: &SeedChain, seed: &weft_journal::Seed) -> Vec<crate::journal::LogEntry> {
+    chain.ancestors.iter().flat_map(|ancestor| ancestor.rows.iter().filter_map(|event| {
+        let mut line = crate::journal::LogEntry::from_event(event)?;
+        if seed.origins.get(line.node.as_ref()?) != Some(&ancestor.color) { return None; }
+        line.inherited_from = Some(ancestor.color);
+        Some(line)
+    })).collect()
+}
+
+/// Strict reconstruction for seeding and complete output review.
+pub async fn reconstruct_execution(
+    state: &crate::state::DispatcherState,
+    color: weft_core::Color,
+) -> anyhow::Result<std::collections::BTreeMap<weft_core::Color, weft_journal::Fold>> {
+    let found = execution_program(state, color).await?;
+    let program = found.program()
+        .ok_or_else(|| anyhow::anyhow!("run {color} has no readable original program"))?;
+    let rows = state.journal.events_log(color).await?;
+    let mut chain = execution_inheritance(state, &rows, &found).await.map_err(anyhow::Error::msg)?;
+    chain.ancestors.push(weft_journal::seed::Ancestor { color, project: program, rows });
+    chain.materialize()
+}
+
 pub async fn execution_program(
     state: &crate::state::DispatcherState,
     color: weft_core::Color,
@@ -635,19 +899,27 @@ pub async fn execution_program(
         }
     };
     let Some(json) = state.projects.definition_for_hash(project_uuid, &hash).await? else {
-        // The history is deleted with its project (`project_definition`
-        // cascades on the project row) and a project registered again
-        // under the same id after that starts a fresh history, while
-        // the execution's rows outlive both on purpose. So a missing
-        // hash is never told apart from a removed project by whether a
-        // project row exists now: the run reads without its program.
+        // A definition is kept for as long as any run points at it, so
+        // reaching here means it was pruned along with the last run
+        // that used it, or this journal predates that rule (until
+        // then the history died with the project row and every past
+        // run of a removed project went quiet). Either way the rows
+        // are there and their values are not derivable, which is a
+        // thing to SAY rather than to log where nobody looks.
         tracing::warn!(
             target: "weft_dispatcher::projection",
             %color, project_id = %owner.project_id, %hash,
-            "no recorded definition for this execution's hash (the project was removed); the run \
-             is shown without the values its journal would derive"
+            "no recorded definition for this execution's hash; the run is shown without the \
+             values its journal would derive"
         );
-        return Ok(ProgramLookup::Deleted);
+        return Ok(ProgramLookup::ProgramGone(format!(
+            "the code this run ran (project {}, version {hash}) is no longer recorded, so its \
+             inputs and outputs cannot be worked out from the journal. What each node did is \
+             still here; the values are not. If you still have those files, `weft build` in the \
+             project folder registers that program again, under the very hash this run names, and \
+             it reads as it did. If you do not, `weft clean {color}` removes the run.",
+            owner.project_id
+        )));
     };
     match serde_json::from_str(&json) {
         Ok(program) => Ok(ProgramLookup::Found(Arc::new(program))),
@@ -713,10 +985,24 @@ mod tests {
     /// terminal lands, the per-node cancels cannot be derived).
     #[test]
     fn only_a_found_program_is_a_program() {
+        use weft_core::primitive::CorruptionSite;
         assert!(ProgramLookup::Found(program()).program().is_some());
         assert!(ProgramLookup::NoProgram.program().is_none());
-        assert!(ProgramLookup::Deleted.program().is_none());
         assert!(ProgramLookup::Unreadable("bad hash".into()).program().is_none());
+        assert!(ProgramLookup::ProgramGone("no longer recorded".into()).program().is_none());
+        // And each unpaintable state reports its OWN site, which is what
+        // the graph reads to tell "this row is corrupt" from "the code
+        // this whole run ran is gone".
+        assert!(ProgramLookup::Found(program()).unpaintable().is_none());
+        assert!(ProgramLookup::NoProgram.unpaintable().is_none());
+        assert_eq!(
+            ProgramLookup::Unreadable("bad hash".into()).unpaintable().map(|(site, _)| site),
+            Some(CorruptionSite::UndecodableRow)
+        );
+        assert_eq!(
+            ProgramLookup::ProgramGone("gone".into()).unpaintable().map(|(site, _)| site),
+            Some(CorruptionSite::MissingProgram)
+        );
     }
 
     /// The row painted nothing but its corruption(s).
@@ -741,6 +1027,7 @@ mod tests {
             frames: vec![],
             port: port.into(),
             value: Arc::new(value),
+            provided: false,
             at_unix: 1,
         }
     }
@@ -754,8 +1041,9 @@ mod tests {
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("h".into()),
-                node_test: false,
+                program: None, source_version: None, node_test: false,
                 subgraph: None,
+                seed: None,
                 at_unix: 0,
             },
             ExecEvent::NodeKicked { color: color(), node_id: "src".into(), firing: true, payload: None, port_snapshot: None, at_unix: 0 },
@@ -783,6 +1071,82 @@ mod tests {
             .flat_map(|r| projector.project(r))
             .map(|e| serde_json::to_value(e).expect("event json"))
             .collect()
+    }
+
+    #[test]
+    fn inherited_firing_keeps_answers_in_order_under_its_original_program() {
+        let mut rows = run_rows(true);
+        for node in ["src", "sink"] {
+            rows.push(ExecEvent::LogLine {
+                color: color(), node_id: node.into(), frames: vec![], level: "info".into(),
+                message: format!("original {node}"), at_unix: 2, at_unix_ms: Some(2000), seq: Some(1),
+            });
+            rows.push(ExecEvent::CostReported {
+                color: color(), node_id: node.into(), frames: vec![], cost_id: node.into(),
+                service: "provider".into(), model: None, amount_usd: Some(0.25), billed: false,
+                origin: weft_core::CredentialOwner::TheirOwn, metadata: Value::Null, at_unix: 2,
+            });
+        }
+        rows.splice(3..3, [
+            ExecEvent::NodeSuspended {
+                color: color(), node_id: "src".into(), frames: vec![], token: "answer".into(), at_unix: 1,
+            },
+            ExecEvent::SuspensionResolved { color: color(), token: "answer".into(), value: json!("approved"), at_unix: 1 },
+            ExecEvent::NodeResumed {
+                color: color(), node_id: "src".into(), frames: vec![], token: Some("answer".into()), at_unix: 1,
+            },
+        ]);
+        let chain = SeedChain { ancestors: vec![weft_journal::seed::Ancestor {
+            color: color(), project: program(), rows,
+        }] };
+        let child = uuid::Uuid::new_v4();
+        let seed = weft_journal::events::Seed {
+            parent: color(), origins: [("src".into(), color())].into(),
+        };
+        let events: Vec<Value> = inherited_events(&chain, &chain.materialize().unwrap(), &seed, child, "p").unwrap()
+            .into_iter().map(|event| serde_json::to_value(event).unwrap()).collect();
+        let logs = inherited_logs(&chain, &seed);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].message, "original src");
+        assert_eq!(logs[0].inherited_from, Some(color()));
+        assert_eq!(kinds(&events), vec![
+            ("node_started".into(), "src".into()),
+            ("node_suspended".into(), "src".into()),
+            ("node_resumed".into(), "src".into()),
+            ("node_completed".into(), "src".into()),
+            ("cost_reported".into(), "".into()),
+        ]);
+        assert_eq!(events[2]["value"], "approved");
+        assert_eq!(events[3]["output"]["out"], 9);
+        assert_eq!(events[4]["node_id"], "src");
+        assert_eq!(events[4]["amount_usd"], 0.25);
+        for event in events {
+            assert_eq!(event["color"], child.to_string());
+            assert_eq!(event["inherited_from"], color().to_string());
+        }
+    }
+
+    #[test]
+    fn a_boundary_created_by_seed_inputs_is_visible_in_the_next_seed() {
+        let middle = uuid::Uuid::new_v4();
+        let child = uuid::Uuid::new_v4();
+        let mut birth = run_rows(true).remove(0);
+        if let ExecEvent::ExecutionStarted { color: c, seed, .. } = &mut birth {
+            *c = middle;
+            *seed = Some(weft_journal::events::Seed {
+                parent: color(), origins: [("src".into(), color())].into(),
+            });
+        }
+        let chain = SeedChain { ancestors: vec![
+            weft_journal::seed::Ancestor { color: color(), project: program(), rows: run_rows(true) },
+            weft_journal::seed::Ancestor { color: middle, project: program(), rows: vec![birth] },
+        ] };
+        let seed = weft_journal::events::Seed { parent: middle, origins: [("g__in".into(), middle)].into() };
+        let events: Vec<Value> = inherited_events(&chain, &chain.materialize().unwrap(), &seed, child, "p").unwrap()
+            .into_iter().map(|event| serde_json::to_value(event).unwrap()).collect();
+        assert_eq!(kinds(&events), vec![("node_started".into(), "g__in".into()), ("node_completed".into(), "g__in".into())]);
+        assert_eq!(events[1]["output"], json!({"x": 9}));
+        assert!(events.iter().all(|event| event["inherited_from"] == middle.to_string()));
     }
 
     fn kinds(events: &[Value]) -> Vec<(String, String)> {
@@ -904,8 +1268,9 @@ mod tests {
                 entry_node: "probe".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: None,
-                node_test: true,
+                program: None, source_version: None, node_test: true,
                 subgraph: None,
+                seed: None,
                 at_unix: 0,
             },
             started("probe", 1),

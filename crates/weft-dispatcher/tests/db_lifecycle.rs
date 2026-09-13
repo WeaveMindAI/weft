@@ -33,6 +33,7 @@ use weft_dispatcher::api::signal::{
 use weft_dispatcher::journal::postgres::PostgresJournal;
 use weft_dispatcher::journal::{Journal, SignalPlacement, SignalRegistration};
 use weft_dispatcher::listener::{ListenerBackend, ListenerHandle, ListenerPool};
+use weft_dispatcher::versions::VersionStoreOps;
 
 const TENANT: &str = "tenant-1";
 
@@ -69,6 +70,8 @@ async fn seed_project(
             TENANT,
             Some(binary_hash),
             Some("def-1"),
+            None,
+            None,
             None,
             None,
         )
@@ -108,6 +111,9 @@ async fn listener_pod_exists(pool: &PgPool, pod_name: &str) -> bool {
 /// A minimal entry-signal registration for the placement tests.
 fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
     SignalRegistration {
+        source_version: None,
+        setup_color: None,
+        program: None,
         token: token.to_string(),
         tenant_id: TENANT.to_string(),
         project_id: project_id.to_string(),
@@ -150,26 +156,27 @@ impl ListenerBackend for FakeBackend {
 
 // ----- task stamping (the enqueue reads the project row) -------------------
 
-/// `enqueue_execute` stamps the task row with the project's CURRENT
-/// `running_binary_hash` (read from the real `project` table: this is
-/// the statement that shipped with a `uuid = text` bind error and only
-/// failed on the live cluster).
+/// Birth and resume retain the original image across project edits.
 #[sqlx::test]
-async fn enqueue_execute_stamps_the_current_image(pool: PgPool) {
-    let (_journal, projects) = setup(&pool).await;
+async fn execution_birth_and_resume_pin_the_original_image(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
 
     let color = weft_core::Color::new_v4();
-    weft_dispatcher::task_kinds::execute::enqueue_execute(
-        &pool,
-        &id.to_string(),
-        color,
-        "def-1",
-        Some(TENANT),
-    )
-    .await
-    .expect("enqueue_execute");
+    let program = weft_core::project::hash::ProgramIdentity {
+        definition_hash: "def-1".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
+    };
+    let start = weft_journal::ExecEvent::ExecutionStarted {
+        color, project_id: id.to_string(), entry_node: "entry".into(),
+        phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
+        program: Some(program), source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 1,
+    };
+    let task = weft_dispatcher::task_kinds::execute::execution_task_spec(
+        weft_task_store::TaskKind::Execute, &id.to_string(), color, "def-1", "bin-A", Some(TENANT), None, None,
+    ).unwrap();
+    seed_project(&projects, id, "bin-B").await;
+    journal.start_execution(&start, &[], task, None).await.unwrap();
 
     let (kind, binary_hash): (String, Option<String>) = sqlx::query_as(
         "SELECT kind, binary_hash FROM task WHERE color = $1",
@@ -184,6 +191,10 @@ async fn enqueue_execute_stamps_the_current_image(pool: PgPool) {
         Some("bin-A"),
         "the execute task must carry the image it was enqueued for"
     );
+    weft_dispatcher::task_kinds::execute::enqueue_resume(&pool, &id.to_string(), color, "def-1", Some(TENANT)).await.unwrap();
+    let resume_hash: String = sqlx::query_scalar("SELECT binary_hash FROM task WHERE color = $1 AND kind = 'resume'")
+        .bind(color.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(resume_hash, "bin-A");
 }
 
 // ----- listener reap vs placement (the advisory-lock handshake) ------------
@@ -357,6 +368,153 @@ async fn reap_and_stamp_race_has_exactly_one_winner(pool: PgPool) {
 
 // ----- atomic execution birth ------------------------------------------
 
+#[sqlx::test]
+async fn registered_sources_belong_to_the_exact_program(pool: PgPool) {
+    let (_, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    let implementations = std::collections::BTreeMap::new();
+    let source = std::collections::BTreeMap::from([("main.weft".into(), "original-file".into())]);
+    projects.register_with_hashes(empty_project(id), "sources", "", TENANT,
+        Some("binary"), Some("graph"), None, None, Some(&implementations), Some(&source)).await.unwrap();
+    let program = projects.running_program_identity(id).await.unwrap().unwrap();
+    assert_eq!(projects.program_source(id, &program).await.unwrap(), source);
+    projects.set_running_hashes(id, Some("binary"), Some("graph"), None, None).await.unwrap();
+    assert_eq!(projects.program_source(id, &program).await.unwrap(), source);
+    projects.set_running_hashes(id, Some("different-binary"), None, None, None).await.unwrap();
+    assert!(projects.program_source(id, &program).await.is_err());
+    let changed = weft_core::project::hash::ProgramIdentity { binary_hash: "different-binary".into(), ..program };
+    assert!(projects.program_source(id, &changed).await.is_err(), "changing code cannot relabel old sources");
+}
+
+fn trigger_setup_birth(id: Uuid, color: Uuid) -> (weft_journal::ExecEvent, weft_task_store::tasks::NewTask) {
+    let program = weft_core::project::hash::ProgramIdentity {
+        definition_hash: "def-1".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
+    };
+    let start = weft_journal::ExecEvent::ExecutionStarted {
+        color, project_id: id.to_string(), entry_node: "entry".into(),
+        phase: weft_core::context::Phase::TriggerSetup, definition_hash: Some("def-1".into()),
+        program: Some(program), source_version: Some("source".into()), node_test: false, subgraph: None, seed: None, at_unix: 1,
+    };
+    let task = weft_dispatcher::task_kinds::execute::execution_task_spec(
+        weft_task_store::TaskKind::Execute, &id.to_string(), color, "def-1", "bin-A", Some(TENANT), None, None,
+    ).unwrap();
+    (start, task)
+}
+
+#[sqlx::test]
+async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let versions = weft_dispatcher::versions::PostgresVersionStore::new(pool.clone());
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    sqlx::query("INSERT INTO project_version (project_id, id, manifest, created_at) VALUES ($1, 'source', '{}', 0)")
+        .bind(id).execute(&pool).await.unwrap();
+    let color = Uuid::new_v4();
+    let (birth, task) = trigger_setup_birth(id, color);
+    journal.start_execution(&birth, &[], task, None).await.unwrap();
+    assert!(versions.delete_versions(id, &["source".into()]).await.is_err());
+    let complete = weft_journal::ExecEvent::ExecutionCompleted { color, at_unix: 2 };
+    journal.record_event(&complete).await.unwrap();
+    assert!(versions.delete_versions(id, &["source".into()]).await.is_err(), "publication still owns this source");
+    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth, complete]).unwrap().unwrap();
+    journal.finish_trigger_setup(color, Some(&bake)).await.unwrap();
+    versions.delete_versions(id, &["source".into()]).await.unwrap();
+    assert!(journal.trigger_bakes(&id.to_string()).await.unwrap().is_empty());
+    assert!(versions.version(id, "source").await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    seed_listener_pod(&pool, "activation-listener", "dispatcher").await;
+    let placement = SignalPlacement { listener_pod: "activation-listener".into(), generation: 1 };
+    let first = Uuid::new_v4();
+    assert!(projects.try_begin_activating(id, first).await.unwrap());
+    let mut entry = entry_signal("old-entry", id);
+    entry.setup_color = Some(first);
+    journal.signal_insert(&entry, &placement).await.unwrap();
+    let removed = projects.end_activating(id, first,
+        &weft_dispatcher::project_store::ProjectLifecycle::wiped(), true).await.unwrap().unwrap();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].token, "old-entry");
+    assert!(journal.signal_get("old-entry").await.unwrap().is_none());
+    let (late_birth, late_task) = trigger_setup_birth(id, first);
+    assert!(journal.start_execution(&late_birth, &[], late_task, Some(first)).await.is_err(),
+        "a cancelled activation cannot later start as a standalone bake");
+    assert!(journal.events_log(first).await.unwrap().is_empty());
+
+    let second = Uuid::new_v4();
+    assert!(projects.try_begin_activating(id, second).await.unwrap());
+    entry.token = "new-entry".into();
+    entry.setup_color = Some(second);
+    journal.signal_insert(&entry, &placement).await.unwrap();
+    sqlx::query("UPDATE project SET activation_version = 'second-source' WHERE id = $1")
+        .bind(id).execute(&pool).await.unwrap();
+    for to in [weft_dispatcher::project_store::ProjectLifecycle::wiped(),
+        weft_dispatcher::project_store::ProjectLifecycle::active()] {
+        assert!(projects.end_activating(id, first, &to, true).await.unwrap().is_none());
+        assert!(journal.signal_get("new-entry").await.unwrap().is_some());
+        assert_eq!(projects.lifecycle(id).await.unwrap().unwrap().activating_ts_color, Some(second));
+        let version: Option<String> = sqlx::query_scalar("SELECT activation_version FROM project WHERE id = $1")
+            .bind(id).fetch_one(&pool).await.unwrap();
+        assert_eq!(version.as_deref(), Some("second-source"));
+    }
+    assert!(projects.end_activating(id, second,
+        &weft_dispatcher::project_store::ProjectLifecycle::active(), false).await.unwrap().is_some());
+}
+
+#[sqlx::test]
+async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    sqlx::query("INSERT INTO project_version (project_id, id, manifest, created_at) VALUES ($1, 'source', '{}', 0)")
+        .bind(id).execute(&pool).await.unwrap();
+    let first = Uuid::new_v4();
+    let (birth, task) = trigger_setup_birth(id, first);
+    journal.start_execution(&birth, &[], task, None).await.unwrap();
+    assert!(!projects.try_begin_activating(id, Uuid::new_v4()).await.unwrap());
+    let second = Uuid::new_v4();
+    let (second_birth, second_task) = trigger_setup_birth(id, second);
+    assert!(journal.start_execution(&second_birth, &[], second_task.clone(), None).await.is_err());
+    assert!(journal.events_log(second).await.unwrap().is_empty());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE color = $1")
+        .bind(second.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 0, "a refused setup cannot leave queued work");
+    let complete = weft_journal::ExecEvent::ExecutionCompleted { color: first, at_unix: 2 };
+    journal.record_event(&complete).await.unwrap();
+    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth.clone(), complete]).unwrap().unwrap();
+    journal.finish_trigger_setup(first, Some(&bake)).await.unwrap();
+    assert!(projects.try_begin_activating(id, second).await.unwrap());
+    let (other_birth, other_task) = trigger_setup_birth(id, Uuid::new_v4());
+    assert!(journal.start_execution(&other_birth, &[], other_task, None).await.is_err());
+    journal.start_execution(&second_birth, &[], second_task, Some(second)).await.unwrap();
+    seed_listener_pod(&pool, "bake-listener", "dispatcher").await;
+    let placement = SignalPlacement { listener_pod: "bake-listener".into(), generation: 1 };
+    let mut entry = entry_signal("baked-entry", id);
+    entry.program = Some(bake.program.clone());
+    entry.source_version = Some(bake.source_version.clone());
+    entry.setup_color = Some(first);
+    assert!(journal.signal_insert(&entry, &placement).await.is_err(), "a superseded setup cannot arm");
+    entry.setup_color = Some(second);
+    journal.signal_insert(&entry, &placement).await.unwrap();
+    let armed = journal.signal_get("baked-entry").await.unwrap().unwrap();
+    assert_eq!(armed.program, entry.program);
+    assert_eq!(armed.source_version, entry.source_version);
+    assert_eq!(armed.setup_color, Some(second));
+    projects.end_activating(id, second, &weft_dispatcher::project_store::ProjectLifecycle::active(), false).await.unwrap();
+    assert!(journal.signal_insert(&entry, &placement).await.is_err(), "no late registration after activation ends");
+    journal.finish_trigger_setup(second, None).await.unwrap();
+    assert_eq!(journal.trigger_bakes(&id.to_string()).await.unwrap()[0].color, first);
+    journal.delete_execution(first).await.unwrap();
+    assert_eq!(journal.trigger_bakes(&id.to_string()).await.unwrap()[0].color, first);
+    assert!(journal.trigger_bakes(&Uuid::new_v4().to_string()).await.unwrap().is_empty());
+    projects.remove(id).await.unwrap();
+    assert!(journal.trigger_bakes(&id.to_string()).await.unwrap().is_empty());
+}
+
 /// The birth of an execution (`ExecutionStarted` + `execution_color` seed +
 /// kicks + the execute task) is ONE transaction: a failure anywhere rolls
 /// everything back. Witness: starting for a project with NO row fails the
@@ -376,8 +534,9 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         entry_node: "entry".into(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
-        node_test: false,
+        program: None, source_version: None, node_test: false,
         subgraph: None,
+        seed: None,
         at_unix: now,
     };
     let kick = weft_journal::ExecEvent::NodeKicked {
@@ -400,7 +559,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         payload: json!({}),
     };
     let err = journal
-        .start_execution(&start, std::slice::from_ref(&kick), task.clone())
+        .start_execution(&start, std::slice::from_ref(&kick), task.clone(), None)
         .await
         .expect_err("missing project must fail the birth");
     assert!(format!("{err:#}").contains("has no row"), "{err:?}");
@@ -435,8 +594,9 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         entry_node: "entry".into(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("def-1".into()),
-        node_test: false,
+        program: None, source_version: None, node_test: false,
         subgraph: None,
+        seed: None,
         at_unix: now,
     };
     let task2 = weft_task_store::tasks::NewTask {
@@ -446,7 +606,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         ..task
     };
     journal
-        .start_execution(&start2, &[], task2)
+        .start_execution(&start2, &[], task2.clone(), None)
         .await
         .expect("birth for a registered project");
     let (events2,): (i64,) =
@@ -461,6 +621,16 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         .await
         .expect("count tasks");
     assert_eq!((events2, tasks2), (1, 1), "a successful birth commits the event AND the task");
+
+    sqlx::query("DELETE FROM task WHERE color = $1").bind(color2.to_string()).execute(&pool).await.unwrap();
+    journal.start_execution(&start2, &[], task2.clone(), None).await.unwrap();
+    let live_error = journal.start_live_execution(&start2, &[], task2, 0.8).await.unwrap_err();
+    assert!(live_error.to_string().contains("already started"), "{live_error:#}");
+    let births: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exec_event WHERE color = $1 AND kind = 'execution_started'")
+        .bind(color2.to_string()).fetch_one(&pool).await.unwrap();
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE color = $1")
+        .bind(color2.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!((births, tasks), (1, 0), "finished admission cannot create a second execution");
 }
 
 // =====================================================================
@@ -1255,4 +1425,3 @@ async fn a_failed_dispatch_restamps_its_head_in_place(pool: PgPool) {
         "both refused restamps left the queue exactly as it was"
     );
 }
-

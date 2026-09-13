@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -53,20 +54,28 @@ pub struct Pulse {
     /// `value` is always `Null` when `closed`; the field is for
     /// serialisation symmetry only.
     pub closed: bool,
-    /// Only ever `Some` on a closure (`closed: true`) targeting a
-    /// generator port: the closure is the stream's end, and this says
-    /// the producer FAILED with this error rather than finishing
-    /// cleanly. A consumer pull that takes a failed end gets the error;
-    /// a clean end (`None`) reads as "stream finished". Ordinary
-    /// closures never carry it: their consumers act on the closure
-    /// itself (skip / missing input), never on why upstream ended.
+    /// The producer failed or its output was refused. Stream consumers
+    /// receive this error at the end; scalar consumers retain ordinary
+    /// closure behavior. Neither may replace this error with a backup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_error: Option<String>,
+    /// A supplied output or a used input backup, including its stream end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub provided: bool,
+    /// Derived from this execution's input backup after the real supplier
+    /// ended without data. Kept after absorption so replay cannot select
+    /// the same backup twice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub backup: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from: Option<Color>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PulseStatus {
     Pending,
+    /// A supplied emission waiting for its source's enclosing group gate.
+    Gated,
     /// Handed to a LIVE in-process sink (a running consumer's generator
     /// feed, a loop's stream queue) but not yet taken. Invisible to
     /// readiness (the consumer is already running; a re-dispatch would
@@ -115,6 +124,9 @@ impl Pulse {
             status: PulseStatus::Pending,
             closed: false,
             close_error: None,
+            provided: false,
+            backup: false,
+            inherited_from: None,
         }
     }
 
@@ -154,6 +166,9 @@ impl Pulse {
             status: PulseStatus::Pending,
             closed: true,
             close_error,
+            provided: false,
+            backup: false,
+            inherited_from: None,
         }
     }
 
@@ -163,6 +178,44 @@ impl Pulse {
     }
 }
 
-/// All in-flight pulses, keyed by destination node. Every scheduler
-/// iteration iterates this structure.
-pub type PulseTable = BTreeMap<String, Vec<Pulse>>;
+/// Pending values plus bounded per-stream consumption history. Removing an
+/// item frees its payload without forgetting that this stream supplied data.
+#[derive(Debug, Clone, Default)]
+pub struct PulseTable {
+    buckets: BTreeMap<String, Vec<Pulse>>,
+    consumed_streams: HashSet<(Color, crate::frames::FiringLocation, String)>,
+}
+
+impl PulseTable {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn stream_was_consumed(&self, color: Color, node: &str, port: &str, frames: &LoopFrames) -> bool {
+        self.consumed_streams.contains(&(color, crate::frames::FiringLocation::new(node, frames.clone()), port.into()))
+    }
+
+    /// Call only after validating that every id belongs to this bucket.
+    /// The live router and journal fold share this consumption operation.
+    pub fn remove_consumed(&mut self, node: &str, ids: &[uuid::Uuid]) {
+        let bucket = self.buckets.get_mut(node).expect("consumed pulse bucket exists");
+        for pulse in bucket.iter().filter(|p| ids.contains(&p.id)) {
+            self.consumed_streams.insert((pulse.color,
+                crate::frames::FiringLocation::new(node, pulse.frames.clone()), pulse.target_port.clone()));
+        }
+        bucket.retain(|p| !ids.contains(&p.id));
+    }
+}
+
+impl Deref for PulseTable {
+    type Target = BTreeMap<String, Vec<Pulse>>;
+    fn deref(&self) -> &Self::Target { &self.buckets }
+}
+
+impl DerefMut for PulseTable {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.buckets }
+}
+
+impl<const N: usize> From<[(String, Vec<Pulse>); N]> for PulseTable {
+    fn from(values: [(String, Vec<Pulse>); N]) -> Self {
+        Self { buckets: BTreeMap::from(values), consumed_streams: HashSet::new() }
+    }
+}

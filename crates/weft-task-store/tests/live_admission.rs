@@ -320,6 +320,12 @@ async fn admit_is_idempotent_per_color(pool: PgPool) {
         .expect("chosen");
     assert_eq!(first.pod_name, retry.pod_name, "same pod on retry");
     assert_eq!(live_load(&pool, "pod-a").await, 1, "no duplicate task");
+    set_pressure(&pool, "pod-a", 1.0).await;
+    set_draining(&pool, "pod-a").await.expect("drain");
+    let retry = admit_live_execution(&pool, PROJECT, &color, TENANT, None, &live_payload(&color), SAT)
+        .await.expect("existing admission survives pool saturation").expect("original pod");
+    assert_eq!(retry.pod_name, first.pod_name);
+    assert_eq!(live_load(&pool, "pod-a").await, 1);
 }
 
 // ----- placement helper (regular executions) -------------------------------

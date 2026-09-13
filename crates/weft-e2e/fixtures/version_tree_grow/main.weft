@@ -1,0 +1,57 @@
+# Growing a program stage by stage: every shape a scoped run, a review or
+# a wake has to handle, in one file.
+#
+#   src -> triage (an @include) -> shout      a group proved on its own
+#   src -> review (HumanQuery)  -> gate       a run that parks on a person
+#   src -> hold (Wait)          -> late       a timer a wake resolves
+#   nums -> echoes (Loop)       -> total      a loop that goes stale whole
+#
+# Nothing is wired across the four branches, so `--target` picks one.
+
+src = Text { value: @file("prompts/greeting.txt") }
+
+triage = @include("triage.weft")
+triage.text = src.value
+
+shout = Debug
+shout.data = triage.loud
+
+review = HumanQuery {
+  title: "Ship it?"
+  fields: [{
+    "kind": "display",
+    "key": "context"
+  }, {
+    "kind": "approve_reject",
+    "key": "decision"
+  }]
+}
+review.context = src.value
+
+gate = Debug
+gate.data = review.decision_approved
+
+hold = Wait { seconds: 3600 }
+hold.value = src.value
+
+late = Debug
+late.data = hold.value
+
+nums = ExecPython() -> (items: List[Number]) {
+  code: "return {'items': [1, 2]}"
+}
+
+echoes = Loop(values: List[Number]) -> (results: List[Number | Null]) {
+  parallel: false
+  over: ["values"]
+
+  step = ExecPython(n: Number) -> (out: Number) {
+    code: "return {'out': n * 2}"
+  }
+  step.n = self.values
+  self.results = step.out
+}
+echoes.values = nums.items
+
+total = Debug
+total.data = echoes.results

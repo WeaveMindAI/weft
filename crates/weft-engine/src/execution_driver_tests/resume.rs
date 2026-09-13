@@ -60,6 +60,7 @@
                 frames: vec![],
                 port: "out".into(),
                 value: Arc::new(json!("x")),
+                provided: false,
                 at_unix: 0,
             },
             started("n"),
@@ -215,8 +216,9 @@
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("test-hash".into()),
-                node_test: false,
+                program: None, source_version: None, node_test: false,
                 subgraph: None,
+                seed: None,
                 at_unix: 0,
             },
             // A resume of a firing the journal never opened.

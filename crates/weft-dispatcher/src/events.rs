@@ -73,7 +73,20 @@ const NOTIFY_CHANNEL: &str = "weft_dispatcher_events";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DispatcherEvent {
-    ExecutionStarted { color: Color, entry_node: String, project_id: String, at_unix: u64 },
+    /// `subgraph` is the node set the run is held to (`None` for the
+    /// whole graph): the graph paints every other node as not in this
+    /// run. `seed` names the run this one inherits from and what it
+    /// re-ran, for the run's banner.
+    ExecutionStarted {
+        color: Color,
+        entry_node: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subgraph: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<weft_journal::Seed>,
+        project_id: String,
+        at_unix: u64,
+    },
     ExecutionCompleted { color: Color, project_id: String, outputs: serde_json::Value, at_unix: u64 },
     ExecutionFailed { color: Color, project_id: String, error: String, at_unix: u64 },
     /// `cause` is the structured who-or-what behind the cancel (`reason`
@@ -92,19 +105,42 @@ pub enum DispatcherEvent {
     /// the tags on the run. `tags` is this call's list, not the run's
     /// cumulative set.
     ExecutionTagged { color: Color, project_id: String, tags: Vec<String>, at_unix: u64 },
-    NodeStarted { color: Color, node: String, frames: LoopFrames, input: serde_json::Value, closed_ports: Vec<String>, project_id: String, at_unix: u64 },
-    NodeSuspended { color: Color, node: String, frames: LoopFrames, token: String, project_id: String, at_unix: u64 },
-    NodeResumed { color: Color, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, project_id: String, at_unix: u64 },
-    NodeCancelled { color: Color, node: String, frames: LoopFrames, reason: String, project_id: String, at_unix: u64 },
-    NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, project_id: String, at_unix: u64 },
-    NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, project_id: String, at_unix: u64 },
+    /// Every node event carries `inherited_from` when the firing was
+    /// not this run's own but taken from the run it was seeded from
+    /// (`weft run --seed`): the row is the seed's, painted here so the
+    /// graph shows the reused value and marks it inherited. Absent on
+    /// the wire for the run's own firings. `provided_ports` on a start
+    /// names input ports receiving supplied values; absent when none.
+    NodeStarted {
+        color: Color,
+        node: String,
+        frames: LoopFrames,
+        input: serde_json::Value,
+        closed_ports: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        provided_ports: Vec<String>,
+        // SYNC: input origins <-> extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        backup_ports: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        inherited_ports: std::collections::BTreeMap<String, Color>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherited_from: Option<Color>,
+        project_id: String,
+        at_unix: u64,
+    },
+    NodeSuspended { color: Color, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: String, at_unix: u64 },
+    NodeResumed { color: Color, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: String, at_unix: u64 },
+    NodeCancelled { color: Color, node: String, frames: LoopFrames, reason: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: String, at_unix: u64 },
+    NodeCompleted { color: Color, node: String, frames: LoopFrames, output: serde_json::Value, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: String, at_unix: u64 },
+    NodeFailed { color: Color, node: String, frames: LoopFrames, error: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: String, at_unix: u64 },
     /// `reason` says WHY: the author's `_should_flow` said no, or an
     /// input the node needed never arrived. A decision and a consequence
     /// look identical on the graph without it.
     /// `None` only for a journal row written before the field existed
     /// (the UI renders "reason not recorded"); every live writer sends
     /// `Some`.
-    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, project_id: String, at_unix: u64 },
+    NodeSkipped { color: Color, node: String, frames: LoopFrames, closed_ports: Vec<String>, reason: Option<weft_core::exec::skip::SkipReason>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<Color>, project_id: String, at_unix: u64 },
     /// A node emitted a value whose type is incompatible with the
     /// declared (possibly narrowed) type of `port`. The engine refused
     /// the value and closed the port (downstream sees null); the node did
@@ -163,6 +199,9 @@ pub enum DispatcherEvent {
     /// meter could not resolve the figure (an honest unknown).
     CostReported {
         color: Color,
+        // SYNC: inherited cost <-> extension-vscode/src/execFollower.ts DispatcherEvent cost_reported
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherited_from: Option<Color>,
         project_id: String,
         node_id: String,
         frames: LoopFrames,

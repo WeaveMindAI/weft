@@ -5,7 +5,7 @@
 //! broker: it mints presigned URLs and the worker moves bytes direct to/from the
 //! bucket.
 //!   POST   /v1/storage/upload/begin      mint the key, charge a known size, open the upload
-//!   POST   /v1/storage/upload/parts      reserve + presign the next part(s), exact size signed
+//!   POST   /v1/storage/upload/parts      reserve + presign the NAMED part(s), exact size signed
 //!   POST   /v1/storage/upload/part-done  record a landed part's etag
 //!   POST   /v1/storage/upload/complete   assemble + flip the file live
 //!   POST   /v1/storage/upload/resume     re-presign the parts that never landed
@@ -102,6 +102,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
         .route("/v1/storage/admin/asset-references", post(admin_asset_references))
         .route("/v1/storage/admin/tenant-usage", post(admin_tenant_usage))
         .route("/v1/storage/admin/files/{*key}", delete(admin_delete_file))
+        .route("/v1/storage/admin/meta/{*key}", get(admin_meta))
         .route("/v1/storage/admin/presign", post(admin_presign))
         .route("/v1/storage/admin/download-link", post(admin_download_link))
         .route("/v1/storage/admin/relay/{token}", axum::routing::get(admin_relay))
@@ -256,19 +257,36 @@ async fn upload_begin(
         .map_err(map_err)?;
     match begun {
         crate::runtime_store::BeginUpload::Ready { key, part_size } => {
-            Ok(Json(UploadBeginResponse { key, part_size, already_stored: false }))
+            Ok(Json(UploadBeginResponse { key, part_size, already_stored: false, resume: false }))
         }
         // An identified begin whose scope already holds that identity:
         // the caller's own dedup answer, so it uploads nothing and reads
         // the file it named. There is no part size because there are no
         // parts to send.
         crate::runtime_store::BeginUpload::AlreadyStored { key } => {
-            Ok(Json(UploadBeginResponse { key, part_size: 0, already_stored: true }))
+            Ok(Json(UploadBeginResponse {
+                key,
+                part_size: 0,
+                already_stored: true,
+                resume: false,
+            }))
+        }
+        // Already part way up: the caller carries on with it rather than
+        // being refused until the leftovers are cleared.
+        crate::runtime_store::BeginUpload::Resume { key, part_size } => {
+            Ok(Json(UploadBeginResponse {
+                key,
+                part_size,
+                already_stored: false,
+                resume: true,
+            }))
         }
     }
 }
 
-/// `POST /v1/storage/upload/parts`: reserve + presign the next part(s). Each
+/// `POST /v1/storage/upload/parts`: reserve + presign the parts the caller
+/// NAMES (a part number is the part's position, so asking twice reserves
+/// once; see `weft_core::storage::UploadPartsRequest`). Each
 /// returned URL is signed with the part's exact size; a stream that would
 /// cross the byte quota is rejected here (and the upload aborted).
 async fn upload_parts(
@@ -282,7 +300,7 @@ async fn upload_parts(
         .reserve_parts(
             &caller,
             &req.key,
-            &req.sizes,
+            &req.parts,
             state.entitlements.as_ref(),
             PresignAudience::Internal,
         )
@@ -325,11 +343,11 @@ async fn upload_resume(
 ) -> Result<Json<UploadResumeResponse>, ApiError> {
     let caller = worker_caller(&state, &headers).await?;
     let store = store(&state)?;
-    let (part_size, missing) = store
-        .resume_upload(&caller, &req.key, PresignAudience::Internal)
+    let (part_size, missing, reserved_bytes) = store
+        .resume_upload(&caller, &req.key, state.entitlements.as_ref(), PresignAudience::Internal)
         .await
         .map_err(map_err)?;
-    Ok(Json(UploadResumeResponse { part_size, missing }))
+    Ok(Json(UploadResumeResponse { part_size, missing, reserved_bytes }))
 }
 
 /// `POST /v1/storage/upload/abort`: cancel an in-flight upload, freeing its
@@ -380,6 +398,16 @@ async fn get_meta(
     let store = store(&state)?;
     let parsed = wall(&caller, &key)?;
     Ok(Json(store.meta(&parsed).await.map_err(map_err)?))
+}
+
+async fn admin_meta(
+    State(state): State<Arc<BrokerState>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<StoredFileMeta>, ApiError> {
+    control_plane(&state, &headers).await?;
+    let parsed = key::parse_key(&key).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(store(&state)?.meta(&parsed).await.map_err(map_err)?))
 }
 
 async fn delete_file(
@@ -608,10 +636,13 @@ async fn admin_upload_begin(
         .map_err(map_err)?;
     Ok(Json(match begun {
         crate::runtime_store::BeginUpload::Ready { key, part_size } => {
-            UploadBeginResponse { key, part_size, already_stored: false }
+            UploadBeginResponse { key, part_size, already_stored: false, resume: false }
         }
         crate::runtime_store::BeginUpload::AlreadyStored { key } => {
-            UploadBeginResponse { key, part_size: 0, already_stored: true }
+            UploadBeginResponse { key, part_size: 0, already_stored: true, resume: false }
+        }
+        crate::runtime_store::BeginUpload::Resume { key, part_size } => {
+            UploadBeginResponse { key, part_size, already_stored: false, resume: true }
         }
     }))
 }
@@ -639,7 +670,7 @@ async fn admin_upload_parts(
         .reserve_parts(
             &caller,
             &req.inner.key,
-            &req.inner.sizes,
+            &req.inner.parts,
             state.entitlements.as_ref(),
             PresignAudience::External,
         )
@@ -684,11 +715,11 @@ async fn admin_upload_resume(
     control_plane(&state, &headers).await?;
     let store = store(&state)?;
     let caller = editor_caller_for_key(&req.tenant, &req.inner.key)?;
-    let (part_size, missing) = store
-        .resume_upload(&caller, &req.inner.key, PresignAudience::External)
+    let (part_size, missing, reserved_bytes) = store
+        .resume_upload(&caller, &req.inner.key, state.entitlements.as_ref(), PresignAudience::External)
         .await
         .map_err(map_err)?;
-    Ok(Json(UploadResumeResponse { part_size, missing }))
+    Ok(Json(UploadResumeResponse { part_size, missing, reserved_bytes }))
 }
 
 async fn admin_upload_abort(

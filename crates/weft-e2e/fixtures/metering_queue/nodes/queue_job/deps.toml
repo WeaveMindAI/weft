@@ -1,0 +1,5 @@
+[dependencies]
+# The node builds its own requests on the connection's client and reads
+# JSON back, so it declares `reqwest` with the `json` feature rather than
+# relying on another crate in the graph having turned it on.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

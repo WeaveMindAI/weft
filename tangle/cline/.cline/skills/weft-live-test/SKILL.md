@@ -1,6 +1,6 @@
 ---
 name: weft-live-test
-description: "COMMAND, not reference: Walk the user through setting up and running a node's live test. Run this when the user asks for this step by name, optionally naming the node type or package name. The eleven `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Walk the user through setting up and running a node's live test. Run this when the user asks for this step by name, optionally naming the node type or package name. The thirteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 Run the live tier of a node's self-tests, with the user's informed consent. The node type or package is the one the user named when they asked. The local tiers (basic, fake) already passed when the node was built; the live tier calls the real service with a real credential and can spend money, which is why it is run here, by the user's choice, and not by the node specialist.

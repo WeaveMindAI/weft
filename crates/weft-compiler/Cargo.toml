@@ -26,9 +26,8 @@ weft-catalog = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Project source / drift hashing (the `hash` module). The pure
-# `compute_definition_hash` / `compute_source_hash` are always available
-# (the browser WASM parse build needs `compute_definition_hash`); the
-# filesystem-bound hashes are gated behind `build`.
+# `compute_definition_hash` is always available (the browser WASM parse
+# build needs it); the filesystem-bound hashes are gated behind `build`.
 sha2 = { workspace = true }
 rowan = { workspace = true }
 thiserror = { workspace = true }

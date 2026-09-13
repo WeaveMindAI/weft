@@ -44,6 +44,7 @@ pub mod supervisor_pool;
 pub mod task_kinds;
 pub mod tenant;
 pub mod transition;
+pub mod versions;
 
 /// Dispatcher-side aliases over the shared task-store surface.
 /// Executors `impl TaskExecutor<DispatcherState>` directly using the

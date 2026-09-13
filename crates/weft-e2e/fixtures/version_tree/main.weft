@@ -1,0 +1,34 @@
+# The version tree and the runs on it: one chain plus a trigger program.
+#
+#   src -> mid -> out          (the chain a seeded run inherits from)
+#   tick -> stamp              (a trigger fired by hand from a spec)
+#   sched -> wired -> beat     (a trigger whose OWN port is wired)
+#
+# `src` reads its text from prompts/greeting.txt, so editing that file is
+# an edit upstream of everything. A seed-before cut at `out` reuses
+# the chain's earlier results and runs `out` again.
+
+src = Text { value: @file("prompts/greeting.txt") }
+
+mid = Cast -> (value: String) {
+  value: src.value
+}
+
+out = Debug
+out.data = mid.value
+
+tick = Cron { cron: "0 0 * * * *" }
+
+stamp = Debug
+stamp.data = tick.scheduledTime
+
+# A trigger whose own input comes off a wire, the shape a bridge feeds
+# (`ask = BaileyReceive { endpointUrl: bridge.endpointUrl }`). Bake captures
+# these inputs without listening. Activation also arms the schedule.
+# Emit supplies outputs without running the trigger body.
+sched = Text { value: "0 0 * * * *" }
+
+wired = Cron { cron: sched.value }
+
+beat = Debug
+beat.data = wired.scheduledTime

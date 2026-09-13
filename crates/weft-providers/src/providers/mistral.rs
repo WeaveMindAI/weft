@@ -69,11 +69,6 @@ impl ProviderMeter for MistralMeter {
         }
     }
 
-    fn prepare(&self, _path: &str, _body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        // The page count always rides the response; nothing to opt into.
-        Ok(None)
-    }
-
     async fn ceiling_usd(
         &self,
         _path: &str,

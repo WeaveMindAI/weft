@@ -116,7 +116,10 @@ pub fn video_url(answer: &Value) -> Option<&str> {
 
 /// Merge the node's raw `params` object (model-specific extras) onto
 /// `payload`. The declared knobs win: an extra may add fields the
-/// blessed model's knobs don't cover, never silently override one.
+/// blessed model's knobs don't cover, never silently override one. An
+/// extra whose value is `null` removes that key from the request, which
+/// is how a caller drops a field the node sends for another model family's
+/// sake.
 pub fn merge_params(payload: &mut Value, params: Option<&Value>) -> WeftResult<()> {
     let Some(params) = params else { return Ok(()) };
     let Some(extra) = params.as_object() else {
@@ -124,7 +127,16 @@ pub fn merge_params(payload: &mut Value, params: Option<&Value>) -> WeftResult<(
     };
     let base = payload.as_object_mut().expect("payloads are objects");
     for (k, v) in extra {
-        if !base.contains_key(k) {
+        // A declared knob still wins over an extra of the same name, which
+        // is the rule this function exists to hold. The one thing `params`
+        // may do to a key the node filled in is TAKE IT OFF, by naming it
+        // `null`: the node sends both spellings of the image argument
+        // because different fal model families read different ones, and a
+        // model that refuses the unknown one answered 422 with nothing the
+        // person could do about it from the node's inputs.
+        if v.is_null() {
+            base.remove(k);
+        } else if !base.contains_key(k) {
             base.insert(k.clone(), v.clone());
         }
     }

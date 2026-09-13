@@ -23,13 +23,19 @@ use weft_broker::runtime_store::{
     DEFAULT_KEEP_TTL_SECS, DEFAULT_PART_SIZE_BYTES, EXEC_LINGER_TTL_SECS,
 };
 use weft_core::storage::key::CallerAuth;
-use weft_core::storage::{bytes_stream, ByteRange, KeepTtl, StorageScope, StoredFileMeta};
+use weft_core::storage::{bytes_stream, ByteRange, KeepTtl, PartAsk, StorageScope, StoredFileMeta};
 use weft_platform_traits::clock::{Clock, FakeClock};
 use weft_platform_traits::object_store::fake::FakeObjectStore;
 use weft_platform_traits::{ObjectStore, PresignAudience};
 
 /// Every contract test here drives the WORKER upload path, whose part URLs are
 /// presigned for the in-cluster (Internal) endpoint. Named once so the many
+/// One part asked for by number and size. A part number IS the part's
+/// position in the file, so a test that reserves the first part says 1.
+fn ask(part_number: i32, size_bytes: u64) -> PartAsk {
+    PartAsk { part_number, size_bytes }
+}
+
 /// `reserve_parts` / `resume_upload` call sites read cleanly. (The External
 /// audience, the editor upload's browser-facing URLs, is exercised at Layer 4
 /// in `weft-e2e/tests/config_media.rs`.)
@@ -119,7 +125,9 @@ async fn upload_parts(
     while offset < bytes.len() {
         let end = (offset + part_size as usize).min(bytes.len());
         let slice = bytes.slice(offset..end);
-        let parts = s.reserve_parts(caller, key, &[slice.len() as u64], budget, WORKER).await?;
+        let part_number = (offset / part_size as usize) as i32 + 1;
+        let parts =
+            s.reserve_parts(caller, key, &[ask(part_number, slice.len() as u64)], budget, WORKER).await?;
         let part = &parts[0];
         let etag = bucket.put_part(&part.url, slice).expect("fake part PUT");
         s.record_part(caller, key, part.part_number, &etag).await?;
@@ -189,6 +197,9 @@ async fn begin_via(
         BeginUpload::Ready { key, part_size } => Ok((key, part_size)),
         BeginUpload::AlreadyStored { .. } => {
             panic!("an unidentified uuid-id begin never answers already-stored")
+        }
+        BeginUpload::Resume { .. } => {
+            panic!("only a content-addressed begin can answer resumable")
         }
     }
 }
@@ -329,7 +340,7 @@ async fn a_zero_byte_part_reservation_is_rejected(pool: PgPool) {
     let (key, _ps) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), None)
         .await
         .unwrap();
-    let err = s.reserve_parts(&w, &key, &[0], &big(), WORKER).await.unwrap_err();
+    let err = s.reserve_parts(&w, &key, &[ask(1, 0)], &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
@@ -437,15 +448,15 @@ async fn a_streaming_upload_that_crosses_the_cap_is_aborted(pool: PgPool) {
         .await
         .unwrap();
     // First full part fits under the cap.
-    s.reserve_parts(&w, &key, &[part_size], &cap, WORKER).await.expect("first part fits");
+    s.reserve_parts(&w, &key, &[ask(1, part_size)], &cap, WORKER).await.expect("first part fits");
     assert_eq!(s.tenant_usage("t1").await.unwrap().1, part_size, "in-flight bytes are charged");
     // The next full part would cross the cap: rejected AND the upload aborted.
-    let err = s.reserve_parts(&w, &key, &[part_size], &cap, WORKER).await.unwrap_err();
+    let err = s.reserve_parts(&w, &key, &[ask(2, part_size)], &cap, WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::QuotaExceeded(_)), "{err:?}");
     assert!(bucket.in_progress_uploads().is_empty(), "multipart aborted");
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "reservation freed");
     // The upload is gone: further reservations are rejected.
-    let err = s.reserve_parts(&w, &key, &[1], &cap, WORKER).await.unwrap_err();
+    let err = s.reserve_parts(&w, &key, &[ask(1, 1)], &cap, WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
@@ -458,7 +469,7 @@ async fn a_part_with_the_wrong_byte_count_is_rejected_by_the_signed_length(pool:
     let (key, _part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(5))
         .await
         .unwrap();
-    let parts = s.reserve_parts(&w, &key, &[5], &big(), WORKER).await.unwrap();
+    let parts = s.reserve_parts(&w, &key, &[ask(1, 5)], &big(), WORKER).await.unwrap();
     let err = bucket.put_part(&parts[0].url, body(b"way too many bytes")).unwrap_err();
     assert!(err.to_string().contains("signature mismatch"), "{err}");
     let err = bucket.put_part(&parts[0].url, body(b"srt")).unwrap_err();
@@ -475,12 +486,12 @@ async fn part_sizes_must_slice_the_declared_total_exactly(pool: PgPool) {
         .await
         .unwrap();
     // The only valid slicing of a 10-byte declared total is one 10-byte part.
-    let err = s.reserve_parts(&w, &key, &[7], &big(), WORKER).await.unwrap_err();
+    let err = s.reserve_parts(&w, &key, &[ask(1, 7)], &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
-    let parts = s.reserve_parts(&w, &key, &[10], &big(), WORKER).await.unwrap();
+    let parts = s.reserve_parts(&w, &key, &[ask(1, 10)], &big(), WORKER).await.unwrap();
     assert_eq!(parts[0].size_bytes, 10);
     // Nothing can be reserved after the final part.
-    let err = s.reserve_parts(&w, &key, &[1], &big(), WORKER).await.unwrap_err();
+    let err = s.reserve_parts(&w, &key, &[ask(2, 1)], &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
 }
 
@@ -493,8 +504,8 @@ async fn resume_re_presigns_exactly_the_missing_parts(pool: PgPool) {
     let (key, part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), None)
         .await
         .unwrap();
-    let p1 = &s.reserve_parts(&w, &key, &[part_size], &big(), WORKER).await.unwrap()[0];
-    let p2 = &s.reserve_parts(&w, &key, &[5], &big(), WORKER).await.unwrap()[0];
+    let p1 = &s.reserve_parts(&w, &key, &[ask(1, part_size)], &big(), WORKER).await.unwrap()[0];
+    let p2 = &s.reserve_parts(&w, &key, &[ask(2, 5)], &big(), WORKER).await.unwrap()[0];
     let etag2 = bucket.put_part(&p2.url, body(b"tail!")).unwrap();
     s.record_part(&w, &key, p2.part_number, &etag2).await.unwrap();
 
@@ -502,11 +513,21 @@ async fn resume_re_presigns_exactly_the_missing_parts(pool: PgPool) {
     let err = s.complete_upload(&w, &key).await.unwrap_err();
     assert!(err.to_string().contains("resume"), "{err}");
 
-    let (resumed_part_size, missing) = s.resume_upload(&w, &key, WORKER).await.unwrap();
+    let (resumed_part_size, missing, carved) = s.resume_upload(&w, &key, &big(), WORKER).await.unwrap();
     assert_eq!(resumed_part_size, part_size);
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].part_number, p1.part_number);
     assert_eq!(missing[0].size_bytes, part_size);
+    // The missing part is the FIRST one, with a landed part after it, so
+    // what has landed is not a prefix of the file. The offset is the
+    // part's own place, not the number of bytes that happen to be
+    // stored: an uploader told "5 bytes are in" would have sent the file
+    // from byte 5 under part 1 and stored a scrambled object under an
+    // honest content hash.
+    assert_eq!(missing[0].offset_bytes, 0);
+    // And new parts would begin after everything already carved, which
+    // is past the missing part, not where it ends.
+    assert_eq!(carved, part_size + 5);
 
     // Land it through the fresh URL and complete.
     let head = bytes::Bytes::from(vec![9u8; part_size as usize]);
@@ -525,7 +546,7 @@ async fn record_part_is_idempotent_and_rejects_unreserved_parts(pool: PgPool) {
     let (key, _ps) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(3))
         .await
         .unwrap();
-    let part = &s.reserve_parts(&w, &key, &[3], &big(), WORKER).await.unwrap()[0];
+    let part = &s.reserve_parts(&w, &key, &[ask(1, 3)], &big(), WORKER).await.unwrap()[0];
     let etag = bucket.put_part(&part.url, body(b"abc")).unwrap();
     s.record_part(&w, &key, part.part_number, &etag).await.unwrap();
     // Re-reporting the same part is fine (retry of a lost response).
@@ -836,12 +857,19 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
     };
     assert_eq!(key, format!("t1/asset/p1/{sha}"));
 
-    // Re-beginning while the first upload is PENDING is a loud conflict
-    // (another sync is mid-upload; rerun once it settles).
-    assert!(matches!(
-        s.begin_upload(&w, &asset_spec(Some(sha_static)), &big()).await,
-        Err(RuntimeStoreError::Conflict(_))
-    ));
+    // Re-beginning while the first upload is PENDING hands back that same
+    // upload to carry on with, under the store's own key. It used to be a
+    // loud conflict, which left the second publish of one asset failing for
+    // as long as the first one's leftovers sat there. Carrying on is safe
+    // because a part is reserved by NUMBER and both writers hold identical
+    // bytes (the key is their hash).
+    let BeginUpload::Resume { key: resume_key, part_size: resume_part_size } =
+        s.begin_upload(&w, &asset_spec(Some(sha_static)), &big()).await.unwrap()
+    else {
+        panic!("a pending upload of the same content is resumable");
+    };
+    assert_eq!(resume_key, key, "the store's own key, not one the caller guessed");
+    assert_eq!(resume_part_size, part_size);
 
     upload_parts(&s, &bucket, &w, &key, part_size, &bytes::Bytes::from_static(b"weft"), &big())
         .await
@@ -1043,11 +1071,11 @@ async fn upload_verbs_reject_a_key_begin_never_minted(pool: PgPool) {
     let (s, _bucket, _c) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
     let key = "t1/exec/c1/forged";
-    let err = s.reserve_parts(&w, key, &[1], &big(), WORKER).await.unwrap_err();
+    let err = s.reserve_parts(&w, key, &[ask(1, 1)], &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
     let err = s.record_part(&w, key, 1, "\"etag\"").await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
-    let err = s.resume_upload(&w, key, WORKER).await.unwrap_err();
+    let err = s.resume_upload(&w, key, &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::NotFound(_)), "{err:?}");
     let err = s.complete_upload(&w, key).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::NotFound(_)), "{err:?}");
@@ -1067,7 +1095,7 @@ async fn an_abandoned_upload_is_reaped_after_grace(pool: PgPool) {
     let (key, _ps) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(6))
         .await
         .unwrap();
-    let part = &s.reserve_parts(&w, &key, &[6], &big(), WORKER).await.unwrap()[0];
+    let part = &s.reserve_parts(&w, &key, &[ask(1, 6)], &big(), WORKER).await.unwrap()[0];
     let etag = bucket.put_part(&part.url, body(b"orphan")).unwrap();
     s.record_part(&w, &key, part.part_number, &etag).await.unwrap();
     assert_eq!(s.tenant_usage("t1").await.unwrap().1, 6, "in-flight charge visible");
@@ -1091,9 +1119,9 @@ async fn progress_defers_the_abandoned_reap(pool: PgPool) {
     let (key, part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "slow", None, &big(), None)
         .await
         .unwrap();
-    for _ in 0..3 {
+    for n in 1..=3 {
         clock.advance(Duration::from_secs((PENDING_RESERVE_GRACE_SECS - 10) as u64));
-        s.reserve_parts(&w, &key, &[part_size], &big(), WORKER).await.expect("still alive");
+        s.reserve_parts(&w, &key, &[ask(n, part_size)], &big(), WORKER).await.expect("still alive");
         assert_eq!(s.sweep_expired().await.unwrap(), 0, "progressing upload not reaped");
     }
 }
@@ -1108,7 +1136,7 @@ async fn terminate_sweep_reaps_an_abandoned_exec_upload(pool: PgPool) {
     let (key, _ps) = begin_via(&s, &w, &StorageScope::Execution, "b", "f", None, &big(), Some(6))
         .await
         .unwrap();
-    let part = &s.reserve_parts(&w, &key, &[6], &big(), WORKER).await.unwrap()[0];
+    let part = &s.reserve_parts(&w, &key, &[ask(1, 6)], &big(), WORKER).await.unwrap()[0];
     bucket.put_part(&part.url, body(b"orphan")).unwrap();
     let (swept, lingering) = s.sweep_exec("t1", "c1").await.unwrap();
     assert_eq!((swept, lingering), (1, 0), "the abandoned exec upload is swept, no linger");
@@ -1148,9 +1176,9 @@ async fn a_completed_file_is_immutable(pool: PgPool) {
     let meta = put_via(&s, &bucket, &w, &StorageScope::Execution, "text/plain", "a.txt", None, &big(), body(b"original"))
         .await
         .unwrap();
-    let err = s.reserve_parts(&w, &meta.key, &[3], &big(), WORKER).await.unwrap_err();
+    let err = s.reserve_parts(&w, &meta.key, &[ask(1, 3)], &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
-    let err = s.resume_upload(&w, &meta.key, WORKER).await.unwrap_err();
+    let err = s.resume_upload(&w, &meta.key, &big(), WORKER).await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
     let err = s.record_part(&w, &meta.key, 1, "\"e\"").await.unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
@@ -1232,4 +1260,96 @@ async fn sweep_reap_failure_self_heals_on_retry(pool: PgPool) {
     assert_eq!(s.sweep_expired().await.unwrap(), 1);
     assert!(bucket.is_empty(), "object reclaimed on retry");
     assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "nothing left charged");
+}
+
+#[sqlx::test]
+async fn naming_a_part_twice_reserves_it_once(pool: PgPool) {
+    // Two publishes of the same content upload IDENTICAL bytes (the key is
+    // the content's hash), and they used to each ask for "the next part",
+    // between them reserve more parts than the file has, and both fail on a
+    // total that no longer added up, leaving the upload unfinishable until
+    // the hourly sweep removed it. Naming the part is what makes the second
+    // asker agree with the first.
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, part_size) =
+        begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(9)).await.unwrap();
+    assert!(part_size >= 9, "this test wants a single-part file");
+
+    let first = s.reserve_parts(&w, &key, &[ask(1, 9)], &big(), WORKER).await.unwrap();
+    let second = s.reserve_parts(&w, &key, &[ask(1, 9)], &big(), WORKER).await.unwrap();
+    assert_eq!(first[0].part_number, 1);
+    assert_eq!(second[0].part_number, 1, "the same part, not the next one");
+    assert_eq!(second[0].offset_bytes, 0);
+    // One row, so the reserved total still slices the declared size and the
+    // upload can be completed.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file_part WHERE key = $1")
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "asking twice reserved once");
+
+    // Either URL lands the part, and the upload completes.
+    let etag = bucket.put_part(&second[0].url, body(b"nine byte")).unwrap();
+    s.record_part(&w, &key, 1, &etag).await.unwrap();
+    let meta = s.complete_upload(&w, &key).await.unwrap();
+    assert_eq!(meta.size_bytes, 9);
+}
+
+#[sqlx::test]
+async fn a_stream_part_is_charged_once_however_often_it_is_named(pool: PgPool) {
+    // A stream is charged per part as it is reserved, so a re-ask must not
+    // charge again: a retry would otherwise inch the tenant's usage up every
+    // time.
+    let (s, _bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, part_size) =
+        begin_via(&s, &w, &StorageScope::Project, "b", "stream", None, &big(), None).await.unwrap();
+    s.reserve_parts(&w, &key, &[ask(1, part_size)], &big(), WORKER).await.unwrap();
+    let after_first = s.tenant_usage("t1").await.unwrap().1;
+    s.reserve_parts(&w, &key, &[ask(1, part_size)], &big(), WORKER).await.unwrap();
+    assert_eq!(s.tenant_usage("t1").await.unwrap().1, after_first, "charged once");
+}
+
+#[sqlx::test]
+async fn reserved_stream_part_size_cannot_change(pool: PgPool) {
+    let (s, _bucket, _clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "stream", None, &big(), None).await.unwrap();
+    s.reserve_parts(&w, &key, &[ask(1, 1)], &big(), WORKER).await.unwrap();
+    let before = s.tenant_usage("t1").await.unwrap();
+    assert!(s.reserve_parts(&w, &key, &[ask(1, part_size)], &big(), WORKER).await.is_err());
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), before);
+    let (_, missing, _) = s.resume_upload(&w, &key, &big(), WORKER).await.unwrap();
+    assert_eq!(missing[0].size_bytes, 1);
+}
+
+#[sqlx::test]
+async fn known_size_parts_keep_their_offsets_when_reserved_out_of_order(pool: PgPool) {
+    let (s, bucket, _clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, part_size) = begin_via(&s, &w, &StorageScope::Project, "b", "large", None, &big(), Some(20 * 1024 * 1024)).await.unwrap();
+    let second = s.reserve_parts(&w, &key, &[ask(2, part_size)], &big(), WORKER).await.unwrap();
+    assert_eq!(second[0].offset_bytes, part_size);
+    let (_, missing, carved) = s.resume_upload(&w, &key, &big(), WORKER).await.unwrap();
+    assert_eq!(missing.iter().map(|part| part.part_number).collect::<Vec<_>>(), vec![1, 2]);
+    assert_eq!(missing[0].offset_bytes, 0);
+    assert_eq!(carved, 2 * part_size);
+    let first = s.reserve_parts(&w, &key, &[ask(1, part_size)], &big(), WORKER).await.unwrap();
+    assert_eq!(first[0].offset_bytes, 0);
+    let (_, missing, _) = s.resume_upload(&w, &key, &big(), WORKER).await.unwrap();
+    assert_eq!(missing.iter().find(|part| part.part_number == 2).unwrap().offset_bytes, part_size);
+    let mut parts = missing;
+    let total = 20_u64 * 1024 * 1024;
+    let tail: Vec<_> = (3..=total.div_ceil(part_size) as i32).map(|number| {
+        ask(number, part_size.min(total - (number as u64 - 1) * part_size))
+    }).collect();
+    if !tail.is_empty() { parts.extend(s.reserve_parts(&w, &key, &tail, &big(), WORKER).await.unwrap()); }
+    for part in parts {
+        let bytes = vec![part.part_number as u8; part.size_bytes as usize];
+        let etag = bucket.put_part(&part.url, body(&bytes)).unwrap();
+        s.record_part(&w, &key, part.part_number, &etag).await.unwrap();
+    }
+    assert_eq!(s.complete_upload(&w, &key).await.unwrap().size_bytes, total);
 }

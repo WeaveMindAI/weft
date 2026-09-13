@@ -247,8 +247,9 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
                         // definition; `None` makes a resume against
                         // this color fail loudly as an unknown hash.
                         definition_hash: None,
-                        node_test: true,
+                        program: None, source_version: None, node_test: true,
                         subgraph: None,
+                        seed: None,
                         at_unix: crate::lease::now_unix() as u64,
                     },
                     &format!("node_test_started:{color}"),

@@ -29,7 +29,8 @@ import { afterTabModelSettles, isReviewDoc, openTextTabPaths, textTabsForPath } 
 import { ActionBarStore } from './actionBarState';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
-import { ExecutionsProvider, ExecutionNode, type ExecutionSummary } from './sidebar/executions';
+import { ExecutionsProvider, ExecutionNode, RunNode, VersionNode, type ExecutionSummary } from './sidebar/executions';
+import { runWeftJson } from './cli';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
@@ -91,6 +92,10 @@ export function activate(context: vscode.ExtensionContext) {
     // remount; the webview's copy of its status does not. Re-seed it
     // so the pin pill / catch-up banner render the real state.
     autoFollow.emitStatus();
+    // And which version the followed run ran, for the same reason. A
+    // click on "view in graph" for a project that was not open creates
+    // this panel and posts that message before the webview is listening.
+    graphView.resendExecVersion();
   });
 
   const follower = new ExecutionFollower(
@@ -220,6 +225,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   graphView.setRunHandler((targets) => runPinned(targets));
+  graphView.setNavHandler((group) => executionsProvider.setFocusedGroup(group));
   graphView.setFollowTogglePinHandler(() => autoFollow.togglePin());
   graphView.setFollowCatchUpHandler(() => autoFollow.catchUpToLatest());
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
@@ -251,6 +257,15 @@ export function activate(context: vscode.ExtensionContext) {
     // (so an in-flight verb's events keep accumulating in the
     // background); listeners only see the pinned project's view.
     actionBar.setPinnedProject(project.id);
+    await showGraphFor(project);
+  }
+
+  /// Bring the graph up on a project's entry file: it creates the panel
+  /// when there is none and reveals it when it is buried behind other
+  /// tabs. Every path that wants the user LOOKING at a project goes
+  /// through here, so "view in graph" on an already-pinned project puts
+  /// the graph in front of them exactly like pinning a new one does.
+  async function showGraphFor(project: WeftProject): Promise<void> {
     const doc = await vscode.workspace.openTextDocument(project.entryPath);
     await graphView.open(doc, project.id);
     void graphView.refreshActionAvailability();
@@ -986,15 +1001,103 @@ export function activate(context: vscode.ExtensionContext) {
     return weftOutputChannel;
   }
 
-  async function viewExecution(summary: ExecutionSummary): Promise<void> {
+  async function viewExecution(summary: ExecutionSummary, version?: string): Promise<void> {
     // Find (or hint) the project that produced this execution and
     // switch the graph to it, then pin auto-follow on it. The
     // controller handles the replay itself.
     const match = projectsProvider.projects().find((p) => p.id === summary.project_id);
-    if (match && pinnedProject?.id !== match.id) {
+    if (!match) {
+      void vscode.window.showErrorMessage(
+        `Weft: the project this run belongs to (${summary.project_id || 'unknown'}) is not one of the ` +
+          'Weft projects open here, so there is no graph to show it on. Open its folder first.',
+      );
+      return;
+    }
+    // Pinning opens the graph; when it is already the pinned project,
+    // the panel may still be closed or buried, so put it in front
+    // either way. Clicking a run is a request to LOOK at it.
+    if (pinnedProject?.id !== match.id) {
       await pinProject(match);
+    } else {
+      await showGraphFor(match);
     }
     autoFollow.pinToExecution(summary.color);
+    // A run opened from the version tree tells the graph which version
+    // it ran and which one the disk is, so it can say when they differ.
+    if (version !== undefined) {
+      const tree = executionsProvider.currentTree();
+      graphView.setExecVersion(summary.color, version, tree?.disk_version ?? null);
+    }
+  }
+
+  /// A version-tree verb through the CLI in the pinned project's folder:
+  /// the readers and the tree verbs print one JSON line under `--json`,
+  /// so they run outside the action-bar pump. The list refreshes after.
+  async function treeVerb(args: string[]): Promise<unknown> {
+    if (!pinnedProject) {
+      void vscode.window.showInformationMessage('Pin a Weft project first.');
+      return undefined;
+    }
+    try {
+      const out = await runWeftJson<unknown>([...args, '--json'], pinnedProject.rootPath);
+      await executionsProvider.refresh();
+      return out;
+    } catch (err) {
+      void vscode.window.showErrorMessage(`weft ${args.join(' ')}: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
+  /// The version or run a tree item names (a version by id, a run by color).
+  function treeReference(n: VersionNode | RunNode): string {
+    return n instanceof VersionNode ? n.node.version.id : n.run.color;
+  }
+
+  async function branchHere(n: VersionNode | RunNode): Promise<void> {
+    const reference = treeReference(n);
+    const out = await treeVerb(['branch', reference]);
+    if (out) void vscode.window.showInformationMessage(`Weft: branched to ${reference.slice(0, 8)}; the files on disk are that version now.`);
+  }
+
+  async function checkpointLabel(): Promise<void> {
+    const label = await vscode.window.showInputBox({ prompt: 'Checkpoint label (the files on disk become a version under head)' });
+    if (label === undefined) return;
+    const out = (await treeVerb(['checkpoint', ...(label ? [label] : [])])) as { version?: string; created?: boolean } | undefined;
+    if (out?.version) {
+      void vscode.window.showInformationMessage(out.created ? `Weft: checkpoint ${out.version.slice(0, 8)}` : `Weft: already at ${out.version.slice(0, 8)}`);
+    }
+  }
+
+  async function pruneVersion(n: VersionNode): Promise<void> {
+    const id = n.node.version.id;
+    const confirm = await vscode.window.showWarningMessage(
+      `Delete version ${id.slice(0, 8)}, every version under it, and all their runs?`,
+      { modal: true },
+      'Prune',
+    );
+    if (confirm !== 'Prune') return;
+    await treeVerb(['prune', id, '--yes']);
+  }
+
+  async function diffWithHead(n: RunNode): Promise<void> {
+    const head = executionsProvider.currentTree()?.head.head_run;
+    if (!head) {
+      void vscode.window.showInformationMessage('Weft: head has no run to diff against.');
+      return;
+    }
+    const out = await treeVerb(['diff', n.run.color, head, '--full']);
+    if (!out) return;
+    const channel = getWeftOutputChannel();
+    channel.appendLine(`weft diff ${n.run.color.slice(0, 8)} ${head.slice(0, 8)}`);
+    channel.appendLine(JSON.stringify(out, null, 2));
+    channel.show(true);
+  }
+
+  async function freezeRun(n: RunNode): Promise<void> {
+    const name = await vscode.window.showInputBox({ prompt: 'Example name (writes examples/<name>.json from this run)' });
+    if (!name) return;
+    const out = await treeVerb(['freeze', name, n.run.color]);
+    if (out) void vscode.window.showInformationMessage(`Weft: froze examples/${name}.json from ${n.run.color.slice(0, 8)}.`);
   }
 
   /** Returns true when the row is gone. False = the delete was
@@ -1074,9 +1177,15 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand('weft.stopProject', () => stopAction()),
 
-    vscode.commands.registerCommand('weft.viewExecution', (n: ExecutionNode | ExecutionSummary) =>
-      viewExecution('summary' in n ? n.summary : n),
+    vscode.commands.registerCommand('weft.viewExecution', (n: ExecutionNode | RunNode | ExecutionSummary) =>
+      n instanceof RunNode ? viewExecution(n.summary, n.versionId) : viewExecution('summary' in n ? n.summary : n),
     ),
+    vscode.commands.registerCommand('weft.toggleExecutionsMode', () => executionsProvider.toggleMode()),
+    vscode.commands.registerCommand('weft.branchHere', (n: VersionNode | RunNode) => branchHere(n)),
+    vscode.commands.registerCommand('weft.checkpointLabel', () => checkpointLabel()),
+    vscode.commands.registerCommand('weft.pruneVersion', (n: VersionNode) => pruneVersion(n)),
+    vscode.commands.registerCommand('weft.diffWithHead', (n: RunNode) => diffWithHead(n)),
+    vscode.commands.registerCommand('weft.freezeRun', (n: RunNode) => freezeRun(n)),
     vscode.commands.registerCommand('weft.deleteExecution', (n: ExecutionNode | ExecutionSummary) =>
       deleteExecution('summary' in n ? n.summary : n),
     ),
@@ -1302,4 +1411,3 @@ function getDispatcherUrl(): string {
     vscode.workspace.getConfiguration('weft').get<string>('dispatcherUrl') ?? 'http://localhost:9999'
   );
 }
-

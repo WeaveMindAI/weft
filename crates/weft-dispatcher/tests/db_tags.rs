@@ -54,7 +54,7 @@ fn rig_project(id: Uuid) -> ProjectDefinition {
 
 async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
     projects
-        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None)
+        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None)
         .await
         .expect("register project");
 }
@@ -76,8 +76,11 @@ async fn start_execution(
             entry_node: "start".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("def-1".into()),
+            program: None,
             node_test,
+            source_version: None,
             subgraph: None,
+            seed: None,
             at_unix: 1,
         })
         .await
@@ -296,6 +299,9 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_color(pool: 
 /// A resume (form) signal parked on `color`.
 fn resume_signal(token: &str, project_id: Uuid, color: weft_core::Color) -> SignalRegistration {
     SignalRegistration {
+        source_version: None,
+        setup_color: None,
+        program: None,
         token: token.to_string(),
         tenant_id: TENANT.to_string(),
         project_id: project_id.to_string(),

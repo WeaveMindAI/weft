@@ -27,6 +27,44 @@ pub struct PostgresJournal {
     pool: PgPool,
 }
 
+/// Retention reads the durable reference without interpreting execution
+/// state (an older row's selection format must neither keep nor free
+/// its code). A malformed reference refuses cleanup, since deletion must
+/// be safe: only an explicit `null` (a run with no program, such as a
+/// node self-test) means "nothing to keep"; a missing key is a row this
+/// reader does not understand.
+fn retained_definition(payload: &str) -> anyhow::Result<Option<String>> {
+    let row: serde_json::Value = serde_json::from_str(payload)?;
+    let fields = row.as_object().context("birth row is not an object")?;
+    // The SQL already selects birth rows by the `kind` column; the payload
+    // saying the same is the check that column and payload agree.
+    anyhow::ensure!(fields.get("kind").and_then(serde_json::Value::as_str) == Some("execution_started"), "row is not an execution birth");
+    match fields.get("definition_hash") {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(hash)) => Ok(Some(hash.clone())),
+        Some(_) => anyhow::bail!("birth row's definition_hash is not a string"),
+        None => anyhow::bail!("birth row carries no definition_hash field"),
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::retained_definition;
+
+    #[test]
+    fn retention_reads_only_the_program_reference_and_refuses_a_broken_one() {
+        for selection in [r#"["mid"]"#, r#"{"nodes":["mid"]}"#] {
+            let row = format!(r#"{{"kind":"execution_started","entry_node":"mid","subgraph":{selection},"definition_hash":"kept"}}"#);
+            assert_eq!(retained_definition(&row).unwrap().as_deref(), Some("kept"));
+        }
+        assert_eq!(retained_definition(r#"{"kind":"execution_started","definition_hash":null}"#).unwrap(), None);
+        for row in ["broken", "[]", r#"{"kind":"execution_started","definition_hash":42}"#, r#"{"kind":"node_started"}"#,
+            r#"{"kind":"execution_started","entry_node":"mid"}"#] {
+            assert!(retained_definition(row).is_err(), "{row}");
+        }
+    }
+}
+
 /// The `execution_color.phase` column as a phase. The column is NOT
 /// NULL and only ever written from `Phase::as_str`, so an unreadable
 /// value is corruption of the same row whose payload already failed to
@@ -198,11 +236,26 @@ impl PostgresJournal {
     /// every pending migration across every group runs in one global id
     /// order rather than this crate's group jumping the queue.
     pub async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
+        Self::connect_pool_sized(database_url, 16, std::time::Duration::from_secs(5)).await
+    }
+
+    /// The same, with the pool's own size and acquire timeout.
+    ///
+    /// The work pool and the LOCK pool want different numbers. A lock is
+    /// held for the length of an operation and its connection does no
+    /// work, so a lock taken from the work pool is a connection the
+    /// operation itself then has to wait for; the two are separated so
+    /// that cannot happen (see `lease::with_project_transition_lock`).
+    pub async fn connect_pool_sized(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: std::time::Duration,
+    ) -> anyhow::Result<PgPool> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let pool = loop {
             match PgPoolOptions::new()
-                .max_connections(16)
-                .acquire_timeout(std::time::Duration::from_secs(5))
+                .max_connections(max_connections)
+                .acquire_timeout(acquire_timeout)
                 .connect(database_url)
                 .await
             {
@@ -296,6 +349,18 @@ impl PostgresJournal {
         Ok(())
     }
 
+    /// Serialize execution admission and check the durable birth, whose
+    /// lifetime extends beyond its initial execute task.
+    async fn execution_already_started(tx: &mut sqlx::PgConnection, start: &ExecEvent) -> anyhow::Result<bool> {
+        let ExecEvent::ExecutionStarted { color, .. } = start else {
+            anyhow::bail!("execution admission requires a birth event");
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("execution_birth:{color}")).execute(&mut *tx).await?;
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM exec_event WHERE color = $1 AND kind = 'execution_started')")
+            .bind(color.to_string()).fetch_one(&mut *tx).await?)
+    }
+
     /// Write an `ExecutionStarted` event AND its `execution_color` seed on the
     /// caller's transaction (the two must commit together; see
     /// `record_with_seed`'s doc). A missing project row fails the whole write
@@ -305,11 +370,14 @@ impl PostgresJournal {
         event: &ExecEvent,
         dedup_key: Option<&str>,
     ) -> anyhow::Result<()> {
-        let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, node_test, .. } =
+        let ExecEvent::ExecutionStarted { color, project_id, at_unix, phase, node_test, source_version, .. } =
             event
         else {
             anyhow::bail!("write_started_in requires an ExecutionStarted event");
         };
+        if let Some(version) = source_version {
+            crate::versions::retain_source_version(tx, project_id, version).await?;
+        }
         weft_journal::record_event_in(&mut *tx, event, None, dedup_key)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -352,8 +420,27 @@ impl PostgresJournal {
         tx: &mut sqlx::PgConnection,
         start: &ExecEvent,
         kicks: &[ExecEvent],
+        expected_activation: Option<Color>,
     ) -> anyhow::Result<()> {
         Self::write_started_in(tx, start, None).await?;
+        if let ExecEvent::ExecutionStarted { color, project_id, phase: weft_core::context::Phase::TriggerSetup, .. } = start {
+            // Serialize with activation's lifecycle claim. Ownership is born
+            // with the task, so a dead requester cannot leave an owner without work.
+            let lifecycle: (String, Option<uuid::Uuid>) = sqlx::query_as(
+                "SELECT status, activating_ts_color FROM project WHERE id = $1 FOR UPDATE",
+            ).bind(project_id.parse::<uuid::Uuid>()?).fetch_one(&mut *tx).await?;
+            if let Some(expected) = expected_activation {
+                anyhow::ensure!(expected == *color && lifecycle.0 == "activating" && lifecycle.1 == Some(expected),
+                    "activation {expected} ended before trigger setup could start");
+            }
+            anyhow::ensure!(lifecycle.0 != "activating" || lifecycle.1 == Some(*color),
+                "project is already activating; wait for it to finish or cancel activation");
+            let claimed = sqlx::query(
+                "INSERT INTO trigger_setup (project_id, color) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            ).bind(project_id).bind(color.to_string()).execute(&mut *tx).await?;
+            anyhow::ensure!(claimed.rows_affected() == 1,
+                "project already has a trigger setup running; wait for it or stop that execution");
+        }
         for kick in kicks {
             weft_journal::record_event_in(&mut *tx, kick, None, None)
                 .await
@@ -368,8 +455,23 @@ impl PostgresJournal {
 /// boot's one `apply_core_schema` pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "exec_event",
-    tables: &["exec_event", "signal_token", "signal", "execution_color", "execution_tag"],
+    tables: &["exec_event", "signal_token", "signal", "execution_color", "execution_tag", "trigger_setup", "trigger_bake"],
     ddl: &[
+        r#"CREATE TABLE IF NOT EXISTS trigger_setup (
+            project_id TEXT PRIMARY KEY,
+            color TEXT NOT NULL UNIQUE
+        )"#,
+        // One bake per (project, program identity). The key is the
+        // identity's digest (`ProgramIdentity::digest`): the identity
+        // itself lists one hash per compiled node type and does not fit
+        // a btree entry once a worker carries the whole catalog. The
+        // full identity travels inside `bake_json`.
+        r#"CREATE TABLE IF NOT EXISTS trigger_bake (
+            project_id TEXT NOT NULL,
+            program_hash TEXT NOT NULL,
+            bake_json TEXT NOT NULL,
+            PRIMARY KEY (project_id, program_hash)
+        )"#,
         // exec_event: append-only journal. `dedup_key` is the
         // idempotency knob writers that may retry (dispatcher tasks
         // that crash mid-execution) populate; the partial UNIQUE
@@ -413,6 +515,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // spec_json per-request.
         r#"CREATE TABLE IF NOT EXISTS signal (
             token TEXT PRIMARY KEY,
+            program_json JSONB,
+            setup_color UUID,
+            source_version TEXT,
             tenant_id TEXT NOT NULL,
             project_id TEXT NOT NULL,
             color TEXT,
@@ -599,6 +704,33 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 
 #[async_trait]
 impl Journal for PostgresJournal {
+    async fn is_trigger_setup_pending(&self, color: Color) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM trigger_setup WHERE color = $1)")
+            .bind(color.to_string()).fetch_one(&self.pool).await?)
+    }
+
+    async fn finish_trigger_setup(&self, color: Color, bake: Option<&super::TriggerBake>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let owner: Option<(String,)> = sqlx::query_as(
+            "DELETE FROM trigger_setup WHERE color = $1 RETURNING project_id",
+        ).bind(color.to_string()).fetch_optional(&mut *tx).await?;
+        if let (Some((project_id,)), Some(bake)) = (owner, bake) {
+            anyhow::ensure!(bake.project_id == project_id && bake.color == color, "bake does not belong to its setup");
+            sqlx::query("INSERT INTO trigger_bake (project_id, program_hash, bake_json) VALUES ($1, $2, $3) \
+                ON CONFLICT (project_id, program_hash) DO UPDATE SET bake_json = EXCLUDED.bake_json")
+                .bind(project_id).bind(bake.program.digest())
+                .bind(serde_json::to_string(bake)?).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn trigger_bakes(&self, project_id: &str) -> anyhow::Result<Vec<super::TriggerBake>> {
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT bake_json FROM trigger_bake WHERE project_id = $1")
+            .bind(project_id).fetch_all(&self.pool).await?;
+        rows.into_iter().map(|(value,)| serde_json::from_str(&value).map_err(Into::into)).collect()
+    }
+
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
         // Single canonical row shape lives in weft-journal so the
         // dispatcher, engine, and listener all INSERT identical rows;
@@ -636,8 +768,13 @@ impl Journal for PostgresJournal {
         start: &ExecEvent,
         kicks: &[ExecEvent],
         task: weft_task_store::tasks::NewTask,
+        expected_activation: Option<Color>,
     ) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
+        if Self::execution_already_started(&mut tx, start).await? {
+            tx.commit().await?;
+            return Ok(());
+        }
         // Enqueue FIRST and only write the birth on a FRESH insert, exactly
         // like `start_live_execution` gates on `Admitted`: "one birth per
         // color" holds by construction even if a caller ever replays a color
@@ -645,7 +782,7 @@ impl Journal for PostgresJournal {
         // ExecutionStarted itself carries no dedup key).
         let outcome = weft_task_store::tasks::enqueue_dedup_in(&mut tx, task).await?;
         if matches!(outcome, weft_task_store::tasks::DedupOutcome::Inserted(_)) {
-            Self::write_birth_in(&mut tx, start, kicks).await?;
+            Self::write_birth_in(&mut tx, start, kicks, expected_activation).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -660,13 +797,17 @@ impl Journal for PostgresJournal {
     ) -> anyhow::Result<weft_task_store::tasks::LiveAdmitOutcome> {
         use weft_task_store::tasks::LiveAdmitOutcome;
         let mut tx = self.pool.begin().await?;
+        let born = Self::execution_already_started(&mut tx, start).await?;
         let outcome =
             weft_task_store::tasks::admit_live_execution_in(&mut tx, &task, saturation).await?;
+        anyhow::ensure!(!born || matches!(outcome, LiveAdmitOutcome::AlreadyAdmitted(_)),
+            "live execution {} already started and no longer has an active admission; open a new connection",
+            start.color());
         // Only a FRESH admission births the execution: `Saturated` wrote
         // nothing (the caller retries), and `AlreadyAdmitted`'s original
         // admission already committed the birth.
         if matches!(outcome, LiveAdmitOutcome::Admitted(_)) {
-            Self::write_birth_in(&mut tx, start, kicks).await?;
+            Self::write_birth_in(&mut tx, start, kicks, None).await?;
         }
         tx.commit().await?;
         Ok(outcome)
@@ -839,6 +980,30 @@ impl Journal for PostgresJournal {
             ColorLookup::NotFound => ColorLookup::NotFound,
             ColorLookup::Corrupt => ColorLookup::Corrupt,
         })
+    }
+
+    async fn definition_hashes_in_use(&self, project_id: &str) -> anyhow::Result<Vec<String>> {
+        // Read off the birth rows themselves rather than any copy of
+        // them: this answer decides what gets DELETED. Only the program
+        // reference matters here; an older execution's selection format
+        // must not prevent retention of its code or cleanup of unused code.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT ec.color, ev.payload_json FROM execution_color ec \
+             JOIN exec_event ev ON ev.color = ec.color \
+             WHERE ec.project_id = $1 AND ev.kind = 'execution_started'",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: Vec<String> = Vec::new();
+        for (color, payload) in rows {
+            if let Some(hash) = retained_definition(&payload)
+                .with_context(|| format!("cannot read the program reference on the birth row of color {color}; retaining its code"))?
+            { out.push(hash); }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     async fn logs_for(&self, color: Color, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
@@ -1031,6 +1196,88 @@ impl Journal for PostgresJournal {
         }
     }
 
+    async fn colors_for_project(&self, project_id: &str) -> anyhow::Result<Vec<Color>> {
+        // `execution_color` is the mirror every color gets when it is
+        // born, written in the same transaction as the birth row, so it
+        // answers "did this project ever start this color" without
+        // touching a payload.
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT color FROM execution_color WHERE project_id = $1")
+                .bind(project_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (text,) in rows {
+            match text.parse::<Color>() {
+                Ok(color) => out.push(color),
+                // Said out loud rather than skipped in silence: the
+                // caller asked by project, so it has no color to ask
+                // with instead, and a row nothing can name is what makes
+                // a version-tree row undeletable.
+                Err(e) => tracing::error!(
+                    target: "weft_dispatcher::journal",
+                    %project_id, color = %text, error = %e,
+                    "an execution_color row's color is not a uuid; it is left out of every \
+                     answer that asks which colors this project has"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    async fn execution_summaries_for_project(
+        &self,
+        project_id: &str,
+    ) -> anyhow::Result<std::collections::HashMap<Color, ExecutionSummary>> {
+        // The same shape as `execution_summary`, once for the project
+        // instead of once per color.
+        // `DISTINCT ON (s.color) ... ORDER BY s.color, s.id ASC` pins the
+        // FIRST `execution_started` row of each color, which is what the
+        // per-color read and the paged listing both pin with their own
+        // `ORDER BY id ASC LIMIT 1`. Without it a color with two birth rows
+        // answered twice and whichever came back last won, so this read and
+        // `execution_summary` could describe the same run differently.
+        let rows: Vec<(String, String, String, i64, String, Option<String>, Vec<String>)> =
+            sqlx::query_as(&format!(
+                "SELECT DISTINCT ON (s.color) \
+                        s.color, ec.project_id, ec.phase, ec.started_at_unix, s.payload_json, t.payload_json, {TAGS_LATERAL} \
+                 FROM exec_event s \
+                 JOIN execution_color ec ON ec.color = s.color \
+                 LEFT JOIN LATERAL ( \
+                     SELECT payload_json FROM exec_event \
+                     WHERE color = s.color \
+                       AND kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
+                     ORDER BY id DESC LIMIT 1 \
+                 ) t ON TRUE \
+                 WHERE s.kind = 'execution_started' AND ec.project_id = $1 \
+                 ORDER BY s.color, s.id ASC"
+            ))
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for (color_text, project, phase_text, started_at, started_payload, terminal_payload, tags) in rows {
+            let Ok(color) = color_text.parse::<Color>() else {
+                // A color column that is not a uuid is a corrupt row, and
+                // the caller asked by project so it has no color to look up
+                // instead. Said out loud: the run reads as `unknown` in the
+                // tree either way, and silence would leave nobody a way to
+                // find out why.
+                tracing::error!(
+                    target: "weft_dispatcher::journal",
+                    project_id, color = %color_text,
+                    "an execution_started row carries a color that is not a uuid; that run cannot \
+                     be summarised"
+                );
+                continue;
+            };
+            let summary = summary_from_payloads(color, &started_payload, terminal_payload, tags)
+                .unwrap_or_else(|e| corrupt_summary(color, project, &phase_text, started_at, &e));
+            out.insert(color, summary);
+        }
+        Ok(out)
+    }
+
     async fn list_non_terminal_colors_for_project(
         &self,
         project_id: &str,
@@ -1123,6 +1370,8 @@ impl Journal for PostgresJournal {
         // for, and a later stop writes fresh cancel rows into a deleted
         // journal, resurrecting a ghost run.
         let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM trigger_setup WHERE color = $1")
+            .bind(color.to_string()).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM exec_event WHERE color = $1")
             .bind(color.to_string())
             .execute(&mut *tx)
@@ -1146,6 +1395,9 @@ impl Journal for PostgresJournal {
             .bind(color.to_string())
             .execute(&mut *tx)
             .await?;
+        // The run's row in the version tree is the version store's to
+        // drop (`VersionStoreOps::delete_run`), called beside this by
+        // `clean_execution`. The journal owns the journal.
         tx.commit().await?;
         Ok(())
     }
@@ -1199,18 +1451,31 @@ impl Journal for PostgresJournal {
             .bind(crate::listener::pod_lock_key(&placement.listener_pod))
             .execute(&mut *tx)
             .await?;
+        if let Some(setup) = sig.setup_color {
+            let lifecycle: (String, Option<uuid::Uuid>) = sqlx::query_as(
+                "SELECT status, activating_ts_color FROM project WHERE id = $1 FOR UPDATE",
+            ).bind(sig.project_id.parse::<uuid::Uuid>()?).fetch_one(&mut *tx).await?;
+            anyhow::ensure!(!sig.is_resume && lifecycle.0 == "activating" && lifecycle.1 == Some(setup),
+                "activation ended before trigger '{}' could be armed", sig.node_id);
+        }
+        if let Some(version) = &sig.source_version {
+            crate::versions::retain_source_version(&mut tx, &sig.project_id, version).await?;
+        }
         let res = sqlx::query(
             "INSERT INTO signal \
              (token, tenant_id, project_id, color, node_id, is_resume, \
               spec_json, access_id, created_at, consumer_kind, tags, port_snapshot, \
               consumer_payload, \
               surface_kind, mount_path, auth_kind, auth_config, kind_state, \
-              kind_state_seq, listener_pod, placement_generation) \
+              kind_state_seq, listener_pod, placement_generation, program_json, setup_color, source_version) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-                    $17, $18, $19, $20, $21 \
+                    $17, $18, $19, $20, $21, $22, $23, $24 \
              WHERE EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $20) \
              ON CONFLICT (token) DO UPDATE SET \
                  spec_json = EXCLUDED.spec_json, \
+                 program_json = EXCLUDED.program_json, \
+                 setup_color = EXCLUDED.setup_color, \
+                 source_version = EXCLUDED.source_version, \
                  access_id = EXCLUDED.access_id, \
                  consumer_kind = EXCLUDED.consumer_kind, \
                  tags = EXCLUDED.tags, \
@@ -1249,6 +1514,9 @@ impl Journal for PostgresJournal {
         .bind(sig.kind_state_seq)
         .bind(&placement.listener_pod)
         .bind(placement.generation)
+        .bind(sig.program.as_ref().map(serde_json::to_value).transpose()?)
+        .bind(sig.setup_color)
+        .bind(&sig.source_version)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1305,11 +1573,15 @@ impl Journal for PostgresJournal {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_TOKENS_RETURNING)
-            .bind(tokens)
+        remove_signals(&self.pool, tokens).await
+    }
+
+    async fn signal_list_for_color(&self, color: Color) -> anyhow::Result<Vec<SignalRegistration>> {
+        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_WHERE_COLOR_RESUME)
+            .bind(color.to_string())
             .fetch_all(&self.pool)
             .await
-            .context("signal_remove_many: read a signal row")?;
+            .context("signal_list_for_color: read a signal row")?;
         rows.into_iter().map(row_to_signal).collect()
     }
 
@@ -1341,13 +1613,28 @@ impl Journal for PostgresJournal {
         &self,
         project_id: &str,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
-        let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_PROJECT_RETURNING)
-            .bind(project_id)
-            .fetch_all(&self.pool)
-            .await
-            .context("signal_remove_for_project: read a signal row")?;
-        rows.into_iter().map(row_to_signal).collect()
+        remove_project_signals(&self.pool, project_id).await
     }
+}
+
+pub(crate) async fn remove_project_signals<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    project_id: &str,
+) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_PROJECT_RETURNING)
+        .bind(project_id).fetch_all(executor).await
+        .context("remove project signals: read a signal row")?;
+    rows.into_iter().map(row_to_signal).collect()
+}
+
+pub(crate) async fn remove_signals<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    tokens: &[String],
+) -> anyhow::Result<Vec<SignalRegistration>> {
+    let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_TOKENS_RETURNING)
+        .bind(tokens).fetch_all(executor).await
+        .context("remove signals: read a signal row")?;
+    rows.into_iter().map(row_to_signal).collect()
 }
 
 /// The columns every signal read hands back, in `SignalRow` order,
@@ -1363,7 +1650,7 @@ macro_rules! signal_columns {
             $p, "consumer_kind, ", $p, "tags, ", $p, "port_snapshot, ",
             $p, "consumer_payload, ", $p, "surface_kind, ", $p, "mount_path, ",
             $p, "auth_kind, ", $p, "auth_config, ", $p, "kind_state, ",
-            $p, "kind_state_seq, ", $p, "listener_pod"
+            $p, "kind_state_seq, ", $p, "listener_pod, ", $p, "program_json, ", $p, "setup_color, ", $p, "source_version"
         )
     };
 }
@@ -1371,6 +1658,9 @@ pub(crate) use signal_columns;
 
 const SIGNAL_SELECT_WHERE_TOKEN: &str =
     concat!("SELECT ", signal_columns!(""), " FROM signal WHERE token = $1");
+
+const SIGNAL_SELECT_WHERE_COLOR_RESUME: &str =
+    concat!("SELECT ", signal_columns!(""), " FROM signal WHERE color = $1 AND is_resume");
 
 const SIGNAL_SELECT_WHERE_PROJECT: &str =
     concat!("SELECT ", signal_columns!(""), " FROM signal WHERE project_id = $1");
@@ -1393,6 +1683,9 @@ const SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING: &str = concat!(
 /// the row exceeds sqlx's 16-tuple cap.
 #[derive(sqlx::FromRow)]
 pub(crate) struct SignalRow {
+    pub(crate) setup_color: Option<uuid::Uuid>,
+    pub(crate) source_version: Option<String>,
+    pub(crate) program_json: Option<serde_json::Value>,
     pub(crate) token: String,
     pub(crate) tenant_id: String,
     pub(crate) project_id: String,
@@ -1453,6 +1746,9 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
         },
     };
     Ok(SignalRegistration {
+        setup_color: row.setup_color,
+        source_version: row.source_version,
+        program: row.program_json.map(serde_json::from_value).transpose()?,
         token: row.token,
         tenant_id: row.tenant_id,
         project_id: row.project_id,

@@ -333,7 +333,7 @@
     <div class="card header-card">
       <div class="card-header">
         <div class="header-dot" class:loading class:connected={!loading && connected} class:disconnected={!loading && !connected}></div>
-        <span class="header-title">WeaveMind</span>
+        <span class="header-title">Weft tasks</span>
         {#if loading}
           <span class="status-badge loading">Connecting</span>
         {:else if connected}
@@ -514,7 +514,7 @@
           </div>
           {#if tokens.length === 0}
             <p class="disconnected-title">No tokens configured</p>
-            <p class="hint">Add a token to connect this extension to your WeaveMind projects.</p>
+            <p class="hint">Add a token to connect this extension to your weft projects.</p>
             <button class="btn btn-primary" style="margin-top: 10px" onclick={() => showSettings = true}>
               Open Settings
             </button>
@@ -523,7 +523,7 @@
                  and why (a missing grant included, with its Grant
                  access button); this card is the summary. -->
             <p class="disconnected-title">Connection failed</p>
-            <p class="hint">Could not reach the server. Check that WeaveMind is running and your tokens are valid.</p>
+            <p class="hint">Could not reach the server. Check that weft is running and your tokens are valid.</p>
             <button class="btn btn-secondary" style="margin-top: 10px" onclick={refresh}>
               Retry
             </button>

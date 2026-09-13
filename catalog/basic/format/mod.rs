@@ -115,6 +115,10 @@ pub fn holes(pieces: &[Piece]) -> Vec<String> {
 fn rendered(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
+        Value::Number(number) if number.is_f64() => {
+            let number = number.as_f64().expect("floating-point number");
+            if number == 0.0 { "0".into() } else { number.to_string() }
+        }
         other => other.to_string(),
     }
 }

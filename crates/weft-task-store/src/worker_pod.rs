@@ -611,8 +611,8 @@ pub async fn count_alive_named(pool: &PgPool, pod_names: &[String]) -> Result<i6
 /// `binary_hash`: when set, only pods baked from that image qualify
 /// (new work must never land on a stale-image worker whose binary lacks
 /// the current graph's node impls); `None` skips the check.
-pub async fn pick_admittable_for_project(
-    pool: &PgPool,
+pub async fn pick_admittable_for_project<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     project_id: &str,
     saturation: f64,
     binary_hash: Option<&str>,
@@ -625,13 +625,13 @@ pub async fn pick_admittable_for_project(
              AND NOT draining
              AND mem_pressure < $2
              AND ($3::TEXT IS NULL OR binary_hash = $3)
-           ORDER BY mem_pressure ASC, created_at_unix ASC
+           ORDER BY mem_pressure ASC, created_at_unix ASC, pod_name ASC
            LIMIT 1"#,
     )
     .bind(project_id)
     .bind(saturation)
     .bind(binary_hash)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row)
 }

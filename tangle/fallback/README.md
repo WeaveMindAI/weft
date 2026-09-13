@@ -22,7 +22,7 @@ assistant for exactly that reason.
 Because it cannot know what the host supports, the persona is written to work
 either way. It says that if you can dispatch a subagent, the five specialists
 are dispatches, and if you cannot, they are five jobs you do yourself, one at
-a time, with the scope limits and refusals still binding. The eleven skills
+a time, with the scope limits and refusals still binding. The thirteen skills
 are described as files to open at the moment they are needed, so they work
 with or without a skill loader.
 
@@ -31,7 +31,7 @@ hands after every edit.
 
 ## What is here
 
-Tangle is one persona plus eleven skills, five specialists and five commands.
+Tangle is one persona plus thirteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

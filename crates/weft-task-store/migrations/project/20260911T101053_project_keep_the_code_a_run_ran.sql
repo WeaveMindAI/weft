@@ -1,0 +1,1 @@
+ALTER TABLE project_definition DROP CONSTRAINT project_definition_project_id_fkey;

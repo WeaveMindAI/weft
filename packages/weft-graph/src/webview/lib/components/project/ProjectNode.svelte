@@ -151,6 +151,25 @@
 	// the node's own type color) instead of a `''` sentinel that fell
 	// through every switch and silently returned undefined.
 	const displayedStatus = $derived<NodeExecutionStatus | undefined>(latestExecution?.status);
+	/// The ONE ring this node shows, picked here rather than left to the
+	/// stylesheet. An inherited firing is also a completed (or failed)
+	/// one, so both classes used to land on the node and which ring the
+	/// person saw came down to which rule the bundler emitted last. In
+	/// order: what the node is doing now, then a failure, then a firing
+	/// taken from the seed instead of run again, then a plain success.
+	const glowClass = $derived(
+		displayedStatus === 'running'
+			? 'node-running-glow'
+			: displayedStatus === 'waiting_for_input'
+				? 'node-waiting-glow'
+				: displayedStatus === 'failed'
+					? 'node-failed-glow'
+					: latestExecution?.inheritedFrom
+						? 'node-inherited-glow'
+						: displayedStatus === 'completed'
+							? 'node-completed-glow'
+							: '',
+	);
 	// Per-bus IRC log this node took part in. Empty `[]` for nodes
 	// that never touched a bus.
 	const busLogs = $derived(data.busLogs ?? []);
@@ -1486,7 +1505,7 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div
 		bind:this={nodeElement}
-		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
+		class="project-node simplified-node rounded-lg select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
 		style="
 			width: 100%;
 			height: 100%;
@@ -1576,7 +1595,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
 	bind:this={nodeElement}
-	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {displayedStatus === 'running' ? 'node-running-glow' : ''} {displayedStatus === 'waiting_for_input' ? 'node-waiting-glow' : ''} {displayedStatus === 'failed' ? 'node-failed-glow' : displayedStatus === 'completed' ? 'node-completed-glow' : ''} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
+	class="project-node rounded min-w-[200px] select-none transition-all duration-200 {glowClass} {selected ? 'node-selected' : ''} {data.runTarget ? 'node-run-target' : ''}"
 	style="
 		--run-target-color: {typeConfig.color};
 		width: 100%;
@@ -2189,19 +2208,6 @@
 		border-radius: 0.375rem;
 		background-color: rgba(96, 165, 250, 0.08);
 	}
-	:global(.node-running-glow) {
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(245, 158, 11, 0.4) !important;
-	}
-	:global(.node-waiting-glow) {
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(6, 182, 212, 0.45) !important;
-	}
-	:global(.node-completed-glow) {
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(16, 185, 129, 0.3) !important;
-	}
-	:global(.node-failed-glow) {
-		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 4px 12px rgba(0, 0, 0, 0.05), 0 0 0 2px rgba(239, 68, 68, 0.4) !important;
-	}
-	
 	/* Debug node data display - single resizable box */
 	.debug-data-container {
 		margin: 0;

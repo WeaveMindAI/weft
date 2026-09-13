@@ -19,7 +19,8 @@ import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:c
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import { WeftCliError } from './cli';
-import type { EditOp, TextEdit } from '../../packages/weft-graph/src/protocol';
+import type { EditOp, RunSpec, TextEdit } from '../../packages/weft-graph/src/protocol';
+import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 
 /** Which validation tier a `validate` request runs. `structural` = graph
  *  shape only (the Problems panel); `runtime` = additionally the rules
@@ -49,7 +50,15 @@ export type ParseServerRequest =
   /** Edit ops, applied in order to `source`. */
   | ({ kind: 'edit'; ops: EditOp[] } & ParseServerRequestBase)
   /** A raw text edit to replay (the undo/redo path). */
-  | ({ kind: 'applyEdit'; textEdit: TextEdit } & ParseServerRequestBase);
+  | ({ kind: 'applyEdit'; textEdit: TextEdit } & ParseServerRequestBase)
+  /// Resolve a run spec against the parsed program: the dispatcher's own
+  /// resolver, so the spec dialog refuses what the run would refuse.
+  | ({
+      kind: 'resolveSpec';
+      spec: RunSpec;
+      seeded: boolean;
+      bakes?: BakeSummary[];
+    } & ParseServerRequestBase);
 
 // SYNC: ServerResponseEnvelope <-> crates/weft-cli/src/commands/parse.rs ServerResponse
 interface ServerResponseEnvelope {

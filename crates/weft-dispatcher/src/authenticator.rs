@@ -135,6 +135,15 @@ impl FromRequestParts<DispatcherState> for ControlPlaneCaller {
     }
 }
 
+/// What a caller is told when no project they may see holds an id.
+/// "Never registered" and "belongs to somebody else" get the SAME
+/// words, so nobody can probe which ids exist elsewhere. The words name
+/// the usual cause, because a bare "not found" leaves a person staring
+/// at a project that is plainly right there on their disk: the
+/// dispatcher has simply never been told about it.
+pub const NO_SUCH_PROJECT: &str = "this dispatcher holds no project under that id; \
+     if the project is new, `weft run` or `weft activate` registers it";
+
 /// Authorize a caller against a project: the project must exist AND belong to
 /// the caller's tenant. Returns the same `NOT_FOUND` for "no such project" and
 /// "exists but belongs to another tenant" so a caller cannot probe which
@@ -154,7 +163,7 @@ pub async fn authorize_project(
     match state.projects.tenant_for(id).await {
         Ok(Some(owner)) if owner == caller.as_str() => Ok(()),
         // Missing OR cross-tenant: indistinguishable to the caller.
-        Ok(_) => Err((StatusCode::NOT_FOUND, "not found".to_string())),
+        Ok(_) => Err((StatusCode::NOT_FOUND, NO_SUCH_PROJECT.to_string())),
         Err(e) => {
             tracing::warn!(
                 target: "weft_dispatcher::auth",

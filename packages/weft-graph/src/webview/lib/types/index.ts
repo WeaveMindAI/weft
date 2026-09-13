@@ -433,6 +433,9 @@ export interface NodeExecution {
 	skipReason?: import('../../../protocol').SkipReason;
 	output?: unknown;
 	costUsd: number;
+	/// Portion of a container's total belonging to reused member firings.
+	inheritedCostUsd?: number;
+	inheritedCostUnknown?: boolean;
 	/// At least one of this firing's cost records could not be resolved
 	/// to a figure (amount null). Rendered as an explicit "unknown" so an
 	/// unresolved cost is never mistaken for a free call.
@@ -458,6 +461,13 @@ export interface NodeExecution {
 	/// the engine closed the port instead. The node did NOT fail.
 	// SYNC: PortWarning <-> crates/weft-core/src/exec/execution.rs PortWarning
 	portWarnings?: PortWarning[];
+	/// The run this firing was taken from (a seeded run reused it).
+	inheritedFrom?: string;
+	/// Input ports whose value a person provided (a scoped run).
+	providedPorts?: string[];
+	// SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent
+	backupPorts?: string[];
+	inheritedPorts?: Record<string, string>;
 }
 
 /// A non-terminal, per-port problem on a single firing (output-type
@@ -492,6 +502,16 @@ export interface ExecutionTerminal {
  */
 export interface ExecutionState {
 	isRunning: boolean;
+	/** The node set the followed run is held to; `null` for the whole
+	 *  graph, `undefined` before the run's birth arrived. A node outside
+	 *  it is "not in this run": dimmed, no status badge. */
+	scope?: string[] | null;
+	/** The run this one was seeded from and what it re-ran, or `null`
+	 *  for a run from nothing. */
+	seed?: import('../../../protocol').Seed | null;
+	/** The version the run ran and the version the files on disk are,
+	 *  when the host knows them (a run opened from the version tree). */
+	version?: { version: string | null; diskVersion: string | null };
 	/** The tags the run put on itself (`ctx.tag_execution`), in claim
 	 *  order, deduplicated. The handle a sibling's `ctx.stop_tagged`
 	 *  selects on; shown on the run in the inspector. */

@@ -138,7 +138,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
     project.mark_registered();
     let s = status::fetch(&disp, &pid).await?;
     s.assert_actions_exactly(&["infra_start"])?;
-    assert_verb_rejected(&disp, &format!("/projects/{pid}/run"), "infra resting").await?;
+    assert_run_rejected(&disp, &pid, "infra resting").await?;
 
     // Provision, then hold a run open.
     infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
@@ -171,7 +171,7 @@ async fn infra_stop_drains_and_cancel_halts() -> anyhow::Result<()> {
         s.available_actions() == vec!["infra_cancel"]
     })
     .await?;
-    assert_verb_rejected(&disp, &format!("/projects/{pid}/run"), "infra stop draining").await?;
+    assert_run_rejected(&disp, &pid, "infra stop draining").await?;
     anyhow::ensure!(
         exec_status(&disp, color).await? == "running",
         "the Wait drain must not kill the running execution"
@@ -253,7 +253,7 @@ async fn deactivate_drain_resume_cancel_and_resync() -> anyhow::Result<()> {
     })
     .await?
     .assert_actions_exactly(&["cancel_running", "resume_active"])?;
-    assert_verb_rejected(&disp, &format!("/projects/{pid}/run"), "deactivating").await?;
+    assert_run_rejected(&disp, &pid, "deactivating").await?;
 
     // Change your mind: POST /activate rolls Deactivating -> Active. The
     // held execution is untouched.
@@ -351,18 +351,17 @@ async fn active_infra_stop_auto_deactivates_and_recovers() -> anyhow::Result<()>
         s.status() == "inactive" && s.infra_rollup() == "stopped"
     })
     .await?;
-    s.assert_actions_exactly(&["infra_start", "infra_terminate"])?;
-    assert_verb_rejected(&disp, &format!("/projects/{pid}/run"), "infra stopped").await?;
-    assert_verb_rejected(&disp, &format!("/projects/{pid}/activate"), "infra stopped").await?;
+    s.assert_actions_exactly(&["activate", "infra_start", "infra_terminate"])?;
+    assert_run_rejected(&disp, &pid, "infra stopped").await?;
 
-    // Start again: the full set returns (activate included: triggers +
-    // running infra).
-    infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
-    status::fetch(&disp, &pid)
-        .await?
-        .assert_actions_exactly(&["run", "activate", "infra_stop", "infra_terminate"])?;
+    // This service is outside trigger preparation, so activation leaves it stopped.
     project.activate().await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    let s = status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+    anyhow::ensure!(s.infra_rollup() == "stopped", "activation must leave unrelated infra stopped");
+    s.assert_actions_exactly(&["deactivate", "infra_start", "infra_terminate"])?;
+    infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?
+        .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
 
     // The revived deployment actually fires end to end.
     let before = run::execution_colors(&disp, &pid).await?;
@@ -378,7 +377,7 @@ async fn active_infra_stop_auto_deactivates_and_recovers() -> anyhow::Result<()>
         .await?;
     status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
     infra::terminate_and_wait_gone(&project, INFRA_NODE).await?;
-    status::fetch(&disp, &pid).await?.assert_actions_exactly(&["infra_start"])?;
+    status::fetch(&disp, &pid).await?.assert_actions_exactly(&["activate", "infra_start"])?;
 
     project.finish().await
 }

@@ -278,8 +278,16 @@ pub async fn clean(
         if !confirm(format!("execution {c}"))? {
             return Ok(());
         }
-        client.delete(&format!("/executions/{c}")).await?;
+        let deleted = client.delete_json(&format!("/executions/{c}")).await?;
         println!("deleted {c}");
+        // The sweep of whatever version this run left bare happens on the
+        // dispatcher, inside the delete: the run's own project is the one
+        // to sweep, and a color can be cleaned from anywhere, so no
+        // client is in a position to know it. This just reports it.
+        let swept = deleted.get("swept").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        if swept > 0 {
+            println!("dropped {swept} bare versions");
+        }
         return Ok(());
     }
 
@@ -315,6 +323,7 @@ pub async fn clean(
         return Ok(());
     }
     let mut count = 0usize;
+    let mut swept = 0usize;
     loop {
         let mut offset = 0u64;
         let mut deleted_this_pass = 0usize;
@@ -331,11 +340,22 @@ pub async fn clean(
                 if cutoff.is_none_or(|c| started < c) {
                     // A failed delete must not hide how far the sweep
                     // got: what is already gone stays gone.
-                    if let Err(e) = client.delete(&format!("/executions/{color}")).await {
-                        anyhow::bail!(
+                    match client.delete_json(&format!("/executions/{color}")).await {
+                        // The dispatcher sweeps each run's own project as
+                        // it deletes it, so a bulk clean spanning several
+                        // projects leaves none of them holding a bare
+                        // version. This only adds up what it did.
+                        Ok(answer) => {
+                            swept += answer
+                                .get("swept")
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                        }
+                        Err(e) => anyhow::bail!(
                             "deleted {count} executions, then deleting {color} failed: {e}. \
                              Re-run to continue the sweep."
-                        );
+                        ),
                     }
                     count += 1;
                     deleted_this_pass += 1;
@@ -350,12 +370,25 @@ pub async fn clean(
             break;
         }
     }
+    // What was deleted is reported FIRST. The sweep below can fail (a
+    // `--project` the dispatcher will not parse, a project that is not
+    // registered), and failing before this line threw away the one number
+    // the person needed: the rows are already gone, and the loop above
+    // goes to real trouble to keep that count honest when a delete fails
+    // part way.
     match days {
         Some(d) => println!("deleted {count} executions{scope} older than {d}d"),
         None => println!("deleted {count} executions{scope} (all)"),
     }
+    // Versions left with no runs, no descendants, no label, and not
+    // head went with the runs, project by project, as each run was
+    // deleted; a labelled checkpoint is never swept.
+    if swept > 0 {
+        println!("dropped {swept} bare versions");
+    }
     Ok(())
 }
+
 
 /// Reclaim the images a build produces (worker images, infra images,
 /// old builder bases under `--all`) that nothing runs any more. Five
@@ -411,11 +444,17 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     // `images::referenced_images`: worker hashes + infra refs). Loud
     // error if the daemon is down; guessing "nothing is referenced"
     // would nuke live images.
-    let referenced = crate::images::referenced_images(&ctx.client()).await?;
+    let mut referenced = crate::images::referenced_images(&ctx.client()).await?;
     // The host scope, settled BEFORE any layer runs: a scoped clean
     // that cannot name its project must delete nothing, not run the
     // global layers and report the error afterwards.
     let scope = if all {
+        // The full-library worker carries no project label, so only the
+        // unscoped sweep can meet it; it is every stock project's image
+        // and stays whether or not a project references it right now.
+        let standard = crate::images::standard_worker_ref()?;
+        let (_, hash) = crate::images::ref_repo_tag(&standard)?;
+        referenced.worker_hashes.insert(hash.to_string());
         println!("reclaiming worker images no live project references");
         HostScope::All
     } else {
@@ -442,6 +481,13 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
         layer("infra images", host_infra_sweep(&referenced).await);
         layer("kind node images", node_sweep(&referenced).await);
         layer("builder-base images", builder_base_sweep().await);
+        layer("retired compile caches", retired_compile_cache_sweep().await);
+    }
+    // The compile cache every worker build shares is not an image, but it
+    // is disk, so it is never invisible. Reading its size is not a reclaim:
+    // a failure to read it is said, never counted against the sweep.
+    if let Err(error) = report_compile_cache_size().await {
+        eprintln!("could not read the worker compile cache size: {error:#}");
     }
     if failures.is_empty() {
         return Ok(());
@@ -479,8 +525,12 @@ async fn host_worker_sweep(
     scope: &HostScope,
 ) -> anyhow::Result<()> {
     let repo = weft_compiler::build::WORKER_IMAGE_REPO;
+    let listing = match scope {
+        HostScope::All => host_image_listing(&[]).await?,
+        HostScope::Project(_) => host_image_listing(&["--filter", &scope.label_filter()]).await?,
+    };
     let stale = crate::images::host_images_matching(
-        &host_image_listing(&["--filter", &scope.label_filter()]).await?,
+        &listing,
         |r, t| r == repo && !referenced.is_referenced(r, t),
     );
     if stale.is_empty() {
@@ -726,6 +776,52 @@ async fn reclaim_host_images(images: &[String]) -> anyhow::Result<Reclaimed> {
         );
     }
     Ok(done)
+}
+
+/// What the shared worker compile cache takes on disk, per cache key,
+/// and how to drop it.
+async fn report_compile_cache_size() -> anyhow::Result<()> {
+    let caches = crate::images::worker_compile_caches().await?;
+    if caches.is_empty() {
+        println!("worker compile cache: no BuildKit record (nothing built on this host, or already pruned)");
+        return Ok(());
+    }
+    let sizes: Vec<String> = caches.iter().map(|cache| {
+        if cache.idle_days == 0 { cache.size.clone() } else { format!("{} (unused for {} days)", cache.size, cache.idle_days) }
+    }).collect();
+    println!(
+        "worker compile cache: {} across {} key(s); a build drops the per-project crates no build on this host \
+         has linked for {} days, `weft clean --images --all` drops retired caches unused that long, \
+         `weft clean --build-cache` drops everything now",
+        sizes.join(" + "),
+        caches.len(),
+        weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS
+    );
+    Ok(())
+}
+
+/// Layer (`--all` only): compile caches under a RETIRED key that no build
+/// has used for the retention period. The key changes with the build
+/// environment or the builder, and nothing ever mounts the old one again,
+/// so its own sweep never runs; this is the only thing that reclaims it.
+/// The current checkout's key is never dropped, however long since the
+/// last build: it is the one the next build wants.
+async fn retired_compile_cache_sweep() -> anyhow::Result<()> {
+    let retention = u64::from(weft_compiler::worker_image::WORKER_CACHE_RETENTION_DAYS);
+    let weft_root = weft_compiler::build::resolve_weft_root()?;
+    let current = weft_compiler::hash::compute_worker_cache_key(&weft_root, "builder-base")?;
+    let mut failures = Vec::new();
+    for cache in crate::images::worker_compile_caches().await? {
+        if cache.key == current || cache.idle_days < retention {
+            continue;
+        }
+        println!("dropping a retired worker compile cache unused for {} days ({})", cache.idle_days, cache.size);
+        if let Err(error) = crate::images::prune_build_record(&cache.id).await {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
 }
 
 /// `docker buildx prune` reclaims BuildKit's intermediate layers.

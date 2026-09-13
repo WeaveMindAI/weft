@@ -333,12 +333,14 @@ impl CallObservation for BatchObservation {
     }
 
     fn end(self: Box<Self>, interrupted: bool) -> crate::ObservedCall {
-        let success = (200..300).contains(&self.status);
-        let usd: Option<f64> = if !success {
-            // A refused call bills nothing.
-            Some(0.0)
-        } else {
-            match &self.pricing {
+        let usd: Option<f64> = match crate::providers::verdict_for_status(self.status) {
+            // Refused before doing anything: bills nothing.
+            crate::providers::StatusVerdict::KnownZero => Some(0.0),
+            // A 5xx is not a refusal. ElevenLabs may have generated and
+            // billed the audio with the error coming from in front of
+            // it, so zero would claim a real spend was free.
+            crate::providers::StatusVerdict::Unknown => None,
+            crate::providers::StatusVerdict::Accepted => match &self.pricing {
                 BatchPricing::FromRequest { usd } => Some(*usd),
                 // A cut output stream under-measures the audio the
                 // provider generated and billed: honestly unknown.
@@ -430,10 +432,6 @@ impl ProviderMeter for ElevenLabsMeter {
             Some(_) => RouteClass::Billable(crate::Pricing::Metered),
             None => RouteClass::Unknown,
         }
-    }
-
-    fn prepare(&self, _path: &str, _body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        Ok(None)
     }
 
     async fn ceiling_usd(

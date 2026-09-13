@@ -75,6 +75,9 @@ pub fn mime_from_filename(name: &str) -> &'static str {
         Some("txt") => "text/plain",
         Some("json") => "application/json",
         Some("zip") => "application/zip",
+        // The files a version snapshot publishes: program text, node
+        // source, manifests. Text to the store, whatever the extension.
+        Some("weft" | "toml" | "rs" | "sql" | "md" | "py" | "sh") => "text/plain",
         _ => "application/octet-stream",
     }
 }
@@ -534,15 +537,46 @@ pub struct UploadBeginResponse {
     pub part_size: u64,
     #[serde(default)]
     pub already_stored: bool,
+    /// This content is already part way up under `key`: carry on with it
+    /// (`/storage/upload/resume`) instead of sending it from the start.
+    ///
+    /// Content-addressed keys only, which is every asset: the key IS the
+    /// hash of the bytes, so an upload already in flight under it holds
+    /// the same bytes this caller has. Carrying on is safe even while
+    /// another uploader is doing the same, because a part is reserved by
+    /// NUMBER (see [`UploadPartsRequest`]) and both writers put identical
+    /// bytes in it.
+    #[serde(default)]
+    pub resume: bool,
 }
 
-/// `POST /v1/storage/upload/parts`: reserve + presign the next parts, in
-/// order, sized exactly as the caller will upload them. Part numbers are
-/// assigned by the server, consecutively.
+/// `POST /v1/storage/upload/parts`: reserve + presign parts, each NAMED by
+/// its number and sized exactly as the caller will upload it.
+///
+/// The caller names the number rather than asking for "the next one", and
+/// that is what makes a reservation idempotent: part 3 of a key is always
+/// the same bytes of the same file, so asking for it twice reserves it
+/// once. Two publishes of the SAME content (the key is the content's
+/// hash, so they are uploading identical bytes) used to each ask for "the
+/// next part", between them reserve more parts than the file has, and
+/// both fail on a total that no longer added up, leaving the upload
+/// unfinishable until the hourly sweep removed it. Now they both ask for
+/// part 3, both write the same bytes to it, and whichever completes
+/// first is the answer for both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadPartsRequest {
     pub key: String,
-    pub sizes: Vec<u64>,
+    pub parts: Vec<PartAsk>,
+}
+
+/// One part a caller is about to upload: which part of the file it is,
+/// and how many bytes it will PUT.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PartAsk {
+    /// 1-based, and it IS the position: part `n` of an upload whose part
+    /// size is `p` carries the file's bytes from `(n - 1) * p`.
+    pub part_number: i32,
+    pub size_bytes: u64,
 }
 
 /// One reserved part: its assigned number, its exact byte size, and the
@@ -551,6 +585,19 @@ pub struct UploadPartsRequest {
 pub struct PresignedPart {
     pub part_number: i32,
     pub size_bytes: u64,
+    /// Where in the FILE this part's bytes start.
+    ///
+    /// Stated by the store, because only the store knows the layout: the
+    /// part numbers it has already reserved and how big each one is. An
+    /// uploader that worked the offset out for itself had to assume the
+    /// parts it was handed are one contiguous run at the end of what has
+    /// landed, and a resume can hand it a part from the MIDDLE (any part
+    /// whose PUT failed while a later one succeeded). Sending the wrong
+    /// bytes under the right part number is not caught anywhere
+    /// downstream (complete only checks the sizes add up, and the content
+    /// hash is taken over what was read locally), so the store would end
+    /// up holding a scrambled object under an honest content hash.
+    pub offset_bytes: u64,
     pub url: String,
 }
 
@@ -587,6 +634,18 @@ pub struct UploadResumeRequest {
 pub struct UploadResumeResponse {
     pub part_size: u64,
     pub missing: Vec<PresignedPart>,
+    /// How much of the file the store has already carved into parts,
+    /// landed and missing together.
+    ///
+    /// Where the NEW parts begin. `missing` says what still has to be
+    /// sent of what was already carved, and this says where the carving
+    /// stopped, which are two different lengths whenever a part in the
+    /// middle is the missing one. An uploader that started reserving
+    /// again from the end of the last part it sent would reserve bytes
+    /// the store had already carved, and the upload could then never be
+    /// completed (the reserved sizes stop adding up to the declared
+    /// size).
+    pub reserved_bytes: u64,
 }
 
 /// `POST /v1/storage/upload/abort`: cancel an in-flight upload, freeing its
@@ -1033,19 +1092,35 @@ mod tests {
         assert!(back.inner.keys.is_empty(), "empty retires the last source asset");
         assert!(serde_json::from_value::<AssetReferencesRequest>(json!({"project": "p1"})).is_err());
         // The `Tenanted<T>` wrapper flattens the inner worker envelope, so the
-        // wire shape is one flat object: `{tenant, key, sizes}` for parts, etc.
+        // wire shape is one flat object: `{tenant, key, parts}` for parts, etc.
         let parts = Tenanted {
             tenant: "alice".to_string(),
-            inner: UploadPartsRequest { key: "alice/project/p1/f".into(), sizes: vec![5, 3] },
+            inner: UploadPartsRequest {
+                key: "alice/project/p1/f".into(),
+                parts: vec![
+                    PartAsk { part_number: 1, size_bytes: 5 },
+                    PartAsk { part_number: 2, size_bytes: 3 },
+                ],
+            },
         };
         let v = serde_json::to_value(&parts).unwrap();
         assert_eq!(
             v,
-            json!({"tenant": "alice", "key": "alice/project/p1/f", "sizes": [5, 3]})
+            json!({
+                "tenant": "alice",
+                "key": "alice/project/p1/f",
+                "parts": [
+                    {"part_number": 1, "size_bytes": 5},
+                    {"part_number": 2, "size_bytes": 3},
+                ],
+            })
         );
         let back: Tenanted<UploadPartsRequest> = serde_json::from_value(v).unwrap();
         assert_eq!(back.tenant, "alice");
-        assert_eq!(back.inner.sizes, vec![5, 3]);
+        // The part NUMBER travels: it is the part's position in the file,
+        // so asking twice reserves once.
+        assert_eq!(back.inner.parts[1].part_number, 2);
+        assert_eq!(back.inner.parts[1].size_bytes, 3);
 
         let begin = AdminUploadBeginRequest {
             tenant: "alice".into(),
@@ -1350,21 +1425,31 @@ mod tests {
             key: "t/exec/c/1".into(),
             part_size: 8 << 20,
             already_stored: false,
+            resume: false,
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
             v,
-            json!({"key": "t/exec/c/1", "part_size": 8_388_608u64, "already_stored": false})
+            json!({
+                "key": "t/exec/c/1",
+                "part_size": 8_388_608u64,
+                "already_stored": false,
+                "resume": false,
+            })
         );
-        // `already_stored` defaults false on the wire, so a begin reply
-        // without the field parses as a fresh reservation.
+        // Both flags default false on the wire, so a begin reply without
+        // them parses as a fresh reservation.
         let back: UploadBeginResponse =
             serde_json::from_value(json!({"key": "t/exec/c/1", "part_size": 1})).unwrap();
         assert!(!back.already_stored);
+        assert!(!back.resume);
 
-        let p = PresignedPart { part_number: 2, size_bytes: 5, url: "u".into() };
+        let p = PresignedPart { part_number: 2, size_bytes: 5, offset_bytes: 8, url: "u".into() };
         let v = serde_json::to_value(UploadPartsResponse { parts: vec![p.clone()] }).unwrap();
-        assert_eq!(v, json!({"parts": [{"part_number": 2, "size_bytes": 5, "url": "u"}]}));
+        assert_eq!(
+            v,
+            json!({"parts": [{"part_number": 2, "size_bytes": 5, "offset_bytes": 8, "url": "u"}]})
+        );
 
         let d: PartDoneRequest = serde_json::from_value(json!({
             "key": "k", "part_number": 1, "etag": "\"abc\"",
@@ -1373,13 +1458,32 @@ mod tests {
         // The etag survives verbatim, quotes included.
         assert_eq!(d.etag, "\"abc\"");
 
-        let res = UploadResumeResponse { part_size: 8, missing: vec![p] };
+        let res = UploadResumeResponse { part_size: 8, missing: vec![p], reserved_bytes: 13 };
         let back: UploadResumeResponse =
             serde_json::from_value(serde_json::to_value(&res).unwrap()).unwrap();
-        assert_eq!(back.missing.len(), 1);
         assert_eq!(back.part_size, 8);
+        // The offset rides with the part, so a resume can hand back a
+        // part from the middle of the file and the uploader still writes
+        // the right bytes under it.
+        assert_eq!(back.missing[0].offset_bytes, 8);
+        // And new parts begin past every part already carved, which is
+        // not where the missing one ends.
+        assert_eq!(back.reserved_bytes, 13);
+        // Required, both of them: an answer that leaves the offset out
+        // and is read as zero writes the start of the file into a part
+        // that stands for somewhere else in it.
+        assert!(
+            serde_json::from_value::<UploadResumeResponse>(serde_json::json!({
+                "part_size": 8,
+                "missing": [{"part_number": 1, "size_bytes": 8, "url": "u"}],
+                "reserved_bytes": 8,
+            }))
+            .is_err(),
+            "offset_bytes must be required"
+        );
     }
 
+    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn bytes_stream_round_trip() {
         let b = bytes::Bytes::from_static(b"hello");
