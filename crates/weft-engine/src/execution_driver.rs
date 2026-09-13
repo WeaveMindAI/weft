@@ -450,6 +450,18 @@ async fn drive_color(
             "color {color} has journal events but no ExecutionStarted; \
              journal is malformed"
         ))?;
+    // A setup phase is bounded by construction (the dispatcher
+    // journals `RunSelection::setup` over its triggers or infra
+    // nodes). A setup row with no subgraph would dispatch the whole
+    // business graph and paint everything downstream of a trigger as
+    // skipped, so it is refused instead of run.
+    if phase != weft_core::context::Phase::Fire && run_subgraph.is_none() {
+        anyhow::bail!(
+            "color {color} is a {} run whose ExecutionStarted carries no subgraph; \
+             the dispatcher contract is broken",
+            phase.as_str()
+        );
+    }
     // The subgraph the run set out to execute (a trigger fire, or a
     // manual run aimed at targets); resumes rebuild the same boundary
     // from the same row.

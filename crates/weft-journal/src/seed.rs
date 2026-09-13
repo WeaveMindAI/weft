@@ -44,6 +44,17 @@ impl SeedChain {
         for ancestor in &self.ancestors {
             let mut fold = Fold::new(ancestor.color, ancestor.project.clone()).with_output_history();
             apply_history(&mut fold, &ancestor.rows, &sources)?;
+            // An ancestor is a finished run being read for its outputs:
+            // a row its own program refuses means those outputs cannot
+            // be trusted, so the child refuses to inherit. The child's
+            // OWN corruptions stay on its snapshot for the driver to
+            // word and journal as the run's terminal.
+            anyhow::ensure!(
+                fold.snapshot().corruptions.is_empty(),
+                "seed ancestor {} has corrupt history: {:?}",
+                fold.color(),
+                fold.snapshot().corruptions
+            );
             sources.insert(ancestor.color, fold);
         }
         Ok(sources)
@@ -74,7 +85,6 @@ fn apply_history(fold: &mut Fold, rows: &[ExecEvent], sources: &BTreeMap<Color, 
     fold.apply(birth);
     if let Some(seed) = seed_of(rows) { import_origins(fold, seed, sources, birth.at_unix())?; }
     for row in &rows[1..] { fold.apply(row); }
-    anyhow::ensure!(fold.snapshot().corruptions.is_empty(), "run {} has corrupt history: {:?}", fold.color(), fold.snapshot().corruptions);
     Ok(())
 }
 

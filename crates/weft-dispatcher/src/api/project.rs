@@ -685,10 +685,12 @@ pub(crate) async fn start_queued_execution_with(
     kicks: &[Kick],
     extra_rows: &[weft_journal::ExecEvent],
     program: &weft_core::project::hash::ProgramIdentity,
-    // A manual run's computed subgraph, journaled so the engine skips
-    // everything outside it and a resume rebuilds the same boundary.
-    // `None` for the setup phases (they compute their scope engine-side)
-    // and for anything that runs the whole graph.
+    // The run's subgraph, journaled so the engine dispatches nothing
+    // outside it and a resume rebuilds the same boundary. Every trigger
+    // fire, targeted manual run and setup phase carries one (a setup
+    // phase's is `RunSelection::setup` over its triggers or infra
+    // nodes, and the engine refuses a setup row without it); `None`
+    // only for a manual run of the whole graph.
     subgraph: Option<&weft_core::project::selection::RunSelection>,
     // What the run inherits (`weft run --seed`); `None` from nothing.
     seed: Option<weft_journal::Seed>,
