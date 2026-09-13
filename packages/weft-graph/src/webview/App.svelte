@@ -32,7 +32,7 @@
     leftPanel?: Snippet<[EditorContext]>;
     rightPanel?: Snippet<[EditorContext]>;
     // Host-injected controls at the START of the editor's floating toolbar
-    // (before Live / Source), handed the full EditorContext. A web host can put
+    // (before Live), handed the full EditorContext. A web host can put
     // a "back to projects" button here so it sits inline with the editor's own
     // buttons; VS Code injects nothing. Absent = nothing rendered.
     toolbarLeading?: Snippet<[EditorContext]>;
@@ -279,7 +279,6 @@
   let followMode = $state<'latest' | 'pinned'>('latest');
   let followColor = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
-  let sourceOpen = $state(false);
 
   // Action-bar state: single source of truth for what the bar
   // renders. The host's ActionBarStore pushes every transition;
@@ -768,10 +767,6 @@
         );
         return;
       }
-      if (msg.kind === 'sourceState') {
-        sourceOpen = msg.open;
-        return;
-      }
       if (msg.kind === 'actionBarState') {
         actionBarState = msg.state;
         return;
@@ -985,8 +980,6 @@
     get executionState() { return executionState; },
     get error() { return error; },
     get diagnostics() { return diagnostics; },
-    get sourceOpen() { return sourceOpen; },
-    toggleSource() { send({ kind: 'openSource' }); },
     editActiveSource(source: string) { send({ kind: 'editActiveSource', source }); },
     // The proper applyEdits RPC: it registers a pending resolver, so the host's
     // `editApplied` reply carries the post-edit truth back into `project` (the
@@ -1056,8 +1049,6 @@
             pendingCount={followPendingCount}
             onTogglePin={() => send({ kind: 'followTogglePin' })}
             onCatchUp={() => send({ kind: 'followCatchUp' })}
-            onOpenSource={() => send({ kind: 'openSource' })}
-            sourceOpen={sourceOpen}
             {navDepth}
             {navFileName}
             {onNavigateBack}

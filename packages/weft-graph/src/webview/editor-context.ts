@@ -46,15 +46,6 @@ export interface EditorContext {
   /// squiggles; empty when the source is clean. Distinct from `error` (a single
   /// human string for the banner): these carry positions for the editor gutter.
   readonly diagnostics: readonly Diagnostic[];
-  /// Whether the SOURCE view is open. The editor's toolbar Source button toggles
-  /// it (via the host); a left-slot code panel reads this to show/hide itself, so
-  /// the toolbar button and the panel share one open/closed state.
-  readonly sourceOpen: boolean;
-
-  /// Toggle the source view (the same intent as the toolbar Source button).
-  /// Lets an injected panel (a code view's own collapse button) drive the shared
-  /// open/closed state without reaching past the context.
-  toggleSource(): void;
 
   /// Apply a DIRECT edit to the active file's `.weft` source (an editable code
   /// panel). The host re-parses and the editor adopts the result as external

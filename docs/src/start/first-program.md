@@ -25,12 +25,9 @@ first eight characters. A color is how you point at one particular run later.
 
 ## See the program as a graph
 
-Open the `hello` folder in VS Code and open `main.weft`. You get the graph: two
-boxes joined by an arrow. If you already had the file open as text, that tab
-closes when the graph opens.
-
-The **Source** button at the top left of the canvas puts the text back, beside
-the graph:
+Open the `hello` folder in VS Code and open `main.weft`. The text opens on the
+left and the graph opens beside it: two boxes joined by an arrow. This is the
+same file both ways:
 
 ```weft
 greeting = Text { value: "hello world" }
@@ -98,7 +95,8 @@ press `Ctrl+Enter` to run.
 
 ### Write it
 
-Click **Source** and replace the file with this:
+Go to the text (if you closed it, the code button at the top right of the
+graph brings it back) and replace the file with this:
 
 ```weft
 greeting = Text { value: "Ada" }

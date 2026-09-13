@@ -4,8 +4,8 @@ Before anything else: if you have Tangle, hand it the problem. `/weft-debug`
 reads the failed run, follows it back to the step that broke, and tells you
 what it found. That is usually faster than anything below.
 
-If you would rather look yourself, start with what actually failed. The
-installer, the compiler, or a run. Each has its own place to look.
+If you would rather look yourself, start with what failed: the installer,
+the compiler, or a run. Each has its own place to look.
 
 ## A step went red
 
@@ -75,8 +75,8 @@ If you stopped it, `weft daemon start` brings it back. If it refuses to start,
 read the error before you start reinstalling things: it usually names a
 missing tool, a port already in use, or a database that needs a migration.
 
-If something else already has port 9999, move weft to another one. Set both of
-these wherever you run weft, and keep them set for later commands:
+If something else already has local port 9999, forward weft on another one. Set
+both of these in your shell, and keep them set for later commands:
 
 ```bash
 export WEFT_DISPATCHER_PORT=19999

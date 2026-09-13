@@ -25,7 +25,7 @@ import { ParseServer } from './parseServer';
 import { runPreflight, PREFLIGHT_VERBS, type PreflightBlock } from './preflight';
 import { registerStreamingEditApi } from './streamingEdits';
 import { canonicalPath, weftPositionToVsCode } from './locations';
-import { afterTabModelSettles, isReviewDoc, openTextTabPaths, textTabsForPath } from './tabs';
+import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import { ActionBarStore } from './actionBarState';
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
@@ -33,7 +33,7 @@ import { ExecutionsProvider, ExecutionNode, type ExecutionSummary } from './side
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
-import type { ActionVerb, ActionErrorDetails, CliEvent } from '../../packages/weft-graph/src/protocol';
+import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation } from '../../packages/weft-graph/src/protocol';
 import { emptyActionAvailability, parseStatusPayload } from '../../packages/weft-graph/src/status';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -251,9 +251,34 @@ export function activate(context: vscode.ExtensionContext) {
     // (so an in-flight verb's events keep accumulating in the
     // background); listeners only see the pinned project's view.
     actionBar.setPinnedProject(project.id);
-    const doc = await vscode.workspace.openTextDocument(project.entryPath);
-    await graphView.open(doc, project.id);
     void graphView.refreshActionAvailability();
+  }
+
+  /// The registered project whose ENTRY file is `doc`, if any. Canonical on
+  /// both sides: the editor may hold the symlinked workspace spelling while
+  /// the project registry holds another.
+  function entryProjectOf(doc: vscode.TextDocument): WeftProject | undefined {
+    const docPath = canonicalPath(doc.uri.fsPath);
+    return projectsProvider.projects().find((p) => canonicalPath(p.entryPath) === docPath);
+  }
+
+  /// Pin the project `doc` is the entry of, when that actually CHANGES the
+  /// pin. Re-focusing the already-pinned entry must not re-pin: that would
+  /// tear down the live follow and drop the working event stream just
+  /// because the user clicked the tab.
+  async function pinIfEntry(doc: vscode.TextDocument): Promise<void> {
+    const found = entryProjectOf(doc);
+    if (found && pinnedProject?.id !== found.id) await pinProject(found);
+  }
+
+  /// Bring a project on screen from outside its file (a sidebar row, an
+  /// execution row): its entry as a text tab in the first group and the
+  /// graph beside it, the same layout opening the file by hand gives.
+  async function showProject(project: WeftProject): Promise<void> {
+    if (pinnedProject?.id !== project.id) await pinProject(project);
+    const doc = await vscode.workspace.openTextDocument(project.entryPath);
+    await vscode.window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.One });
+    await graphView.open(doc, project.id, vscode.ViewColumn.Beside);
   }
 
   /// User clicked Run. Run is just a CLI verb like the others now;
@@ -991,9 +1016,7 @@ export function activate(context: vscode.ExtensionContext) {
     // switch the graph to it, then pin auto-follow on it. The
     // controller handles the replay itself.
     const match = projectsProvider.projects().find((p) => p.id === summary.project_id);
-    if (match && pinnedProject?.id !== match.id) {
-      await pinProject(match);
-    }
+    if (match) await showProject(match);
     autoFollow.pinToExecution(summary.color);
   }
 
@@ -1063,12 +1086,12 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('weft.refreshExecutions', () => executionsProvider.refresh()),
     vscode.commands.registerCommand('weft.openInEditor', (p: ProjectNode | WeftProject) => {
       const project = 'project' in p ? p.project : p;
-      return pinProject(project);
+      return showProject(project);
     }),
     vscode.commands.registerCommand('weft.runProject', (p?: ProjectNode | WeftProject) => {
       if (p) {
         const project = 'project' in p ? p.project : p;
-        return pinProject(project).then(() => runPinned());
+        return showProject(project).then(() => runPinned());
       }
       return runPinned();
     }),
@@ -1085,45 +1108,47 @@ export function activate(context: vscode.ExtensionContext) {
       executionsProvider.loadMore(),
     ),
 
-    // Legacy commands kept so keybindings/URIs that reference them
-    // still work.
-    vscode.commands.registerCommand('weft.openGraphView', async () => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor || editor.document.languageId !== 'weft') {
-        void vscode.window.showInformationMessage('Open a .weft file first.');
-        return;
-      }
-      await graphView.open(editor.document);
-    }),
+    // The two title-bar buttons on a `.weft` text editor (package.json
+    // `editor/title`), the markdown-preview pair: graph in this group, or
+    // graph beside. Also the only way a closed graph comes back.
+    vscode.commands.registerCommand('weft.openGraph', () => openGraphOfActiveEditor(vscode.ViewColumn.Active)),
+    vscode.commands.registerCommand('weft.openGraphToSide', () => openGraphOfActiveEditor(vscode.ViewColumn.Beside)),
+    // The two title-bar buttons on the graph panel (package.json
+    // `editor/title`, keyed on the panel id): code in this group, or code
+    // beside.
+    vscode.commands.registerCommand('weft.openSource', () => openSource('active')),
+    vscode.commands.registerCommand('weft.openSourceToSide', () => openSource('beside')),
   );
 
-  // .weft files default to the graph view, not the text editor.
-  // When a .weft becomes the active text editor AND the graph
-  // panel doesn't exist yet (cold open via Ctrl+P, explorer
-  // double-click, restored editor on startup), pin its project,
-  // open the graph in the same column, and close the underlying
-  // text tab. The user can summon the text via the graph's
-  // "Open source" button when they want it.
-  // The `.weft` text views the user opened ON PURPOSE (the Source button,
-  // a diagnostic's file:line click). Every other active `.weft` text
-  // editor is a click that should drive the graph instead of showing
-  // code. A SET because the diagnostic path can open a different file
-  // than the Source button did, and opening the second must not silently
-  // demote the first back to a graph-driving click. Identified by URI so
-  // it's robust to which column VS Code happens to place tabs in.
-  const sourceViewPaths = new Set<string>();
-  graphView.setOpenSourceHandler(async (location) => {
+  async function openGraphOfActiveEditor(column: vscode.ViewColumn): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== 'weft') {
+      void vscode.window.showInformationMessage('Open a .weft file first.');
+      return;
+    }
+    await pinIfEntry(editor.document);
+    await graphView.open(editor.document, entryProjectOf(editor.document)?.id, column);
+  }
+
+  // A diagnostic's file:line click in the graph opens that file beside it.
+  graphView.setOpenSourceHandler((location) => openSource('beside', location));
+
+  /// Open the `.weft` the graph is showing as a plain text tab: in the
+  /// graph's own group ('active') or the group beside it ('beside'). A tab
+  /// already showing the file is revealed wherever it is, so repeated
+  /// clicks never pile up tabs. The text tab is an ordinary editor from
+  /// then on: nothing here closes it or watches it.
+  async function openSource(placement: 'active' | 'beside', location?: SourceLocation): Promise<void> {
     // With a location (a diagnostic click in the error modal), open THAT
     // file at the position. Otherwise open the source of the file the graph
     // is CURRENTLY showing, which tracks include navigation (greeter.weft
     // when navigated in), falling back to the pinned entry.
     const rawTarget = location?.file ?? graphView.currentFilePath() ?? pinnedProject?.entryPath;
     if (!rawTarget) return;
-    // Canonicalized ONCE, used everywhere below (the registration, the
-    // tab lookup, the open): the compiler emits resolved paths while the
-    // workspace may be reached through a symlink, and mixing spellings
-    // would open a second tab of an already-open file or register a
-    // path the active-editor listener then fails to recognize.
+    // Canonicalized ONCE, used everywhere below (the tab lookup, the
+    // open): the compiler emits resolved paths while the workspace may be
+    // reached through a symlink, and mixing spellings would open a second
+    // tab of an already-open file.
     const target = canonicalPath(rawTarget);
     // The webview names the file; the host only ever opens files of the
     // pinned project. Anything else is a message this handler was never
@@ -1139,142 +1164,63 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
     }
-    // Registered BEFORE the open: showTextDocument fires the active-
-    // editor listener below before this handler resumes, and an
-    // unregistered path there would drive the graph instead of showing
-    // the code. A failed open unregisters in the catch, so the path
-    // cannot strand in the set with no tab to ever close it; but only
-    // when THIS call registered it, so a failed re-click (the file
-    // deleted under a still-open tab) cannot demote that live tab back
-    // to a graph-driving click.
-    const wasRegistered = sourceViewPaths.has(target);
-    sourceViewPaths.add(target);
     try {
       const position = location
         ? weftPositionToVsCode(location.line, location.column)
         : undefined;
       const selection = position ? new vscode.Range(position, position) : undefined;
-      // Already open somewhere? Reveal the existing tab instead of
-      // creating a new one. Otherwise repeated clicks pile up tabs.
       const existing = textTabsForPath(target)[0];
-      if (existing) {
-        const column = existing.group.viewColumn;
-        // Open the URI the tab actually holds (possibly the symlinked
-        // workspace spelling), never the canonical one: a different
-        // URI would open a SECOND tab of the same file beside it, the
-        // exact pile-up this branch exists to prevent.
-        const doc = await vscode.workspace.openTextDocument(existing.uri);
-        await vscode.window.showTextDocument(doc, {
-          preview: false,
-          viewColumn: column,
-          preserveFocus: false,
-          ...(selection ? { selection } : {}),
-        });
-      } else {
-        // Source opens in `Beside` (column 2). The graph webview
-        // stays in column 1.
-        //
-        // We tried hard to get source-on-the-LEFT, graph-on-the-
-        // right via `panel.reveal(Two)` then `showTextDocument(One)`,
-        // but moving a webview between columns destroys its iframe
-        // (microsoft/vscode#141001) and the canvas blanks out. There
-        // is also no built-in command to swap editor GROUPS
-        // (microsoft/vscode#85123, closed as backlog). So we settle
-        // for the inverse layout the platform supports: graph on
-        // the left, source on the right.
-        const doc = await vscode.workspace.openTextDocument(target);
-        await vscode.window.showTextDocument(doc, {
-          preview: false,
-          viewColumn: vscode.ViewColumn.Beside,
-          ...(selection ? { selection } : {}),
-        });
-      }
+      // Open the URI an existing tab actually holds (possibly the
+      // symlinked workspace spelling), never the canonical one: a
+      // different URI would open a SECOND tab of the same file beside it.
+      const doc = await vscode.workspace.openTextDocument(existing?.uri ?? target);
+      await vscode.window.showTextDocument(doc, {
+        preview: false,
+        viewColumn: existing
+          ? existing.group.viewColumn
+          : placement === 'beside' ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active,
+        ...(selection ? { selection } : {}),
+      });
     } catch (err) {
-      if (!wasRegistered) sourceViewPaths.delete(target);
       // A diagnostic can outlive its file (deleted, renamed): the click
       // must say so, not silently do nothing.
       void vscode.window.showErrorMessage(`Weft: cannot open ${target}: ${err instanceof Error ? err.message : String(err)}`);
     }
-  });
+  }
 
-  // When a Source-view tab is closed, forget it: clicking that file again
-  // should then drive the graph (it's no longer the deliberate code view).
-  // Prune from the CLOSED tabs only: a full re-scan on every tab event
-  // would race the open path (the path is registered before the tab
-  // exists, across two awaits) and silently unregister it.
+  // A `.weft` opened as text gets its graph beside it, the way a markdown
+  // preview does, and only ONCE: on the tab being created, never on it
+  // becoming active. So a graph the user closed stays closed while they go
+  // on editing; only the title-bar buttons bring it back. With a graph
+  // already up there is nothing to create: its own active-editor listener
+  // repoints it at whichever `.weft` the user focuses. A tab restored at
+  // startup fires no open event, so it too waits for the button.
   context.subscriptions.push(
-    vscode.window.tabGroups.onDidChangeTabs((e) => {
-      // The set holds canonical paths; a tab may hold the symlinked
-      // workspace spelling. The still-open scan runs ONCE per event
-      // (not per closed tab): closing a group of N tabs would
-      // otherwise pay N full tab-group scans of realpath calls.
-      let stillOpen: Set<string> | undefined;
-      for (const tab of e.closed) {
+    vscode.window.tabGroups.onDidChangeTabs(async (e) => {
+      for (const tab of e.opened) {
         if (!(tab.input instanceof vscode.TabInputText)) continue;
-        const p = canonicalPath(tab.input.uri.fsPath);
-        if (!sourceViewPaths.has(p)) continue;
-        stillOpen ??= openTextTabPaths();
-        if (!stillOpen.has(p)) sourceViewPaths.delete(p);
+        if (graphView.isOpen()) return;
+        const doc = await vscode.workspace.openTextDocument(tab.input.uri);
+        // A revision from source control is read, never edited; no graph.
+        if (doc.languageId !== 'weft' || isReviewDoc(doc, tab)) continue;
+        await graphView.open(doc, entryProjectOf(doc)?.id, vscode.ViewColumn.Beside);
       }
     }),
   );
 
+  // Focusing a project's entry file pins that project (event stream,
+  // follow, action bar). Only the pin: the graph is the listener above's
+  // business, and the text tab is left exactly as the user has it.
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor(async (ed) => {
       if (!ed || ed.document.languageId !== 'weft') return;
-
-      // A `.weft` should be viewed as a GRAPH, not code: clicking any `.weft`
-      // (entry or nested) drives the graph view. The one exception is the
-      // deliberate "Source" view (the Source button), tracked by URI: that
-      // editor is intentional code viewing, leave it entirely alone.
-      // Resolved once; the project lookup below reuses it.
-      const docPath = canonicalPath(ed.document.uri.fsPath);
-      if (sourceViewPaths.has(docPath)) return;
-
-      // Reading a diff is reviewing, not editing: popping the graph over it
-      // would take away the comparison the reader opened. Wait a tick so
-      // the tab model reflects this focus change, then make sure the
-      // editor is still the active one.
+      // Reading a diff is reviewing, not editing. Wait a tick so the tab
+      // model reflects this focus change, then make sure the editor is
+      // still the active one.
       await afterTabModelSettles();
       if (vscode.window.activeTextEditor !== ed) return;
       if (isReviewDoc(ed.document)) return;
-
-      const docUri = ed.document.uri;
-      const closeStrayTextTab = async () => {
-        const tabs = textTabsForPath(docUri.fsPath).map((e) => e.tab);
-        if (tabs.length > 0) await vscode.window.tabGroups.close(tabs);
-      };
-
-      const found = projectsProvider
-        .projects()
-        // Canonical on both sides: the editor may hold the symlinked
-        // workspace spelling while the project registry holds another.
-        .find((p) => canonicalPath(p.entryPath) === docPath);
-
-      // Known project entry whose pin actually CHANGES: pinProject is the
-      // ONE pinning routine (event stream repoint, follow reset, action-bar
-      // slot, graph open). Re-focusing the already-pinned entry must not
-      // re-pin: that would tear down the live follow and drop the working
-      // event stream just because the user clicked the tab.
-      if (found && pinnedProject?.id !== found.id) {
-        await pinProject(found);
-        await closeStrayTextTab();
-        return;
-      }
-
-      if (graphView.isOpen()) {
-        // The click popped a stray text tab over the graph; the graph's own
-        // handler already switched to this file, so reveal it and clean up.
-        graphView.reveal();
-        await closeStrayTextTab();
-        return;
-      }
-
-      // Cold open with the pin unchanged: a nested non-entry `.weft`, or the
-      // pinned entry whose graph panel was closed. Show the graph without
-      // re-pinning (the follow and stream keep running untouched).
-      await graphView.open(ed.document, found?.id);
-      await closeStrayTextTab();
+      await pinIfEntry(ed.document);
     }),
   );
 

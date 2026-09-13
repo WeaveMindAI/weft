@@ -140,7 +140,7 @@ narrow what a token can ever see:
 | Variable | Default | Set it when |
 |---|---|---|
 | `WEFT_DISPATCHER_URL` | `http://localhost:9999` | the runtime is not on this machine, or you moved its port |
-| `WEFT_HTTP_PORT` | `9999` | something else already has 9999 |
+| `WEFT_DISPATCHER_PORT` | `9999` | something else already has the local port; pair it with `WEFT_DISPATCHER_URL` |
 | `CREDENTIAL_ENCRYPTION_KEY` | a development key, with a warning on every boot | before you store a credential you care about. It seals them at rest, and changing it later strands every connection you had. |
 | `WEFT_ACCESS_APPS_FILE` | | you are pointing weft at a [shared-credentials file](../connections/the-apps-file.md) |
 | `WEFT_PUBLIC_TUNNEL_TOKEN` | | you want a [permanent public address](../connections/public-address.md) instead of the random one |

@@ -68,6 +68,9 @@ export function portMarkerStyle(
 		style = `background-color: white; border-color: ${color}`;
 	}
 
-	const cls = ['!w-3 !h-3', '!border !rounded-full', extraClass].filter(Boolean).join(' ');
+	// A 2px ring on every marker: at 12px a 1px dotted ring is
+	// indistinguishable from a solid hollow one, and the ring has to be
+	// the same weight everywhere or the one dotted port looks like a bug.
+	const cls = ['!w-3 !h-3', '!border-2 !rounded-full', extraClass].filter(Boolean).join(' ');
 	return { style, class: cls };
 }
