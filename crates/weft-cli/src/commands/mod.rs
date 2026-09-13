@@ -9,6 +9,7 @@ pub mod run;
 pub mod follow;
 pub mod stop;
 pub mod activate;
+pub mod bake;
 pub mod deactivate;
 pub mod cancel_activate;
 pub mod cancel_build;
@@ -29,6 +30,16 @@ pub mod token;
 pub mod connect;
 pub mod listener;
 pub mod files;
+// The version tree and its verbs.
+pub mod versions;
+pub mod checkpoint;
+pub mod branch;
+pub mod tree;
+pub mod diff;
+pub mod freeze;
+pub mod examples;
+pub mod prune;
+pub mod wake;
 
 use std::sync::Arc;
 
@@ -158,7 +169,9 @@ impl Ctx {
     /// Run a verb body with one shared Progress emitter. The body
     /// receives `&Progress` so it can fire phase events. On error,
     /// `progress.error(...)` is called automatically (so verbs
-    /// don't have to repeat the trap), then the error propagates.
+    /// don't have to repeat the trap), then the error propagates
+    /// wrapped as [`crate::progress::Reported`]: the user has seen it,
+    /// and `main` only turns it into the exit code.
     pub async fn with_progress<F, Fut>(
         &self,
         verb: crate::progress::ActionVerb,
@@ -179,7 +192,7 @@ impl Ctx {
                 if !progress.has_emitted_error() {
                     progress.error(&format!("{e}"));
                 }
-                Err(e)
+                Err(anyhow::Error::new(crate::progress::Reported(e)))
             }
         }
     }

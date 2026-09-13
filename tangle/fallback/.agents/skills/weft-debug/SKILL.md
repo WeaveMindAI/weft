@@ -1,6 +1,6 @@
 ---
 name: weft-debug
-description: "COMMAND, not reference: Inspect the last execution and chase the failure to one node. Run this when the user asks for this step by name, optionally naming an execution color. The eleven `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Inspect the last execution and chase the failure to one node. Run this when the user asks for this step by name, optionally naming an execution color. The thirteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 Debug this project's latest run, or a specific execution color if the user named one. Read the `weft-running` skill if you have not this session.

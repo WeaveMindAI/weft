@@ -20,24 +20,24 @@
 //! and the row skipped. The engine refuses to resume over any of them;
 //! the display reads render what applied.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
 use uuid::Uuid;
 
 use weft_core::exec::boundary::{
-    is_passthrough, kick_scope, settle_table, tear_down_gated_scope, BoundaryDispatch,
+    is_passthrough, kick_scope, settle_table, tear_down_scope, BoundaryDispatch,
     BoundaryOutcome,
 };
-use weft_core::exec::emission::{terminal_sweep_emission, PulseEmission};
+use weft_core::exec::emission::{boundary_emission, loop_termination_emission, terminal_sweep_emission, PulseEmission};
 use weft_core::exec::loop_runtime::{
     self, classify_loop_out, close_loop_outward, emit_loop_outward, instantiate, launch_iteration,
     LoopAdvance, LoopStreamItem,
 };
 use weft_core::exec::postprocess::{close_unmentioned_downstream, emit_port_closure, postprocess_output, OutputBag};
 use weft_core::exec::ready::{
-    build_kicked_input, firing_input, generator_inputs, owned_bag, wired_inputs, InputBag,
+    effective_input_pulses, firing_input, generator_inputs, kicked_group, owned_bag, wired_inputs,
 };
 use weft_core::exec::skip::SkipReason;
 use weft_core::exec::{
@@ -97,6 +97,21 @@ pub struct Fold {
     snap: ExecutionSnapshot,
     /// Per record, what it handed out: for the screen only.
     outputs: HashMap<Uuid, OutputBag>,
+    /// Source values before wire projection, including outputs without a
+    /// consumer in this run. Seed delivery projects these through child wires.
+    output_history: Option<Vec<OutputEmission>>,
+    output_ids: HashSet<(Uuid, String, String)>,
+}
+
+#[derive(Clone)]
+struct OutputEmission {
+    id: Uuid,
+    node: String,
+    frames: LoopFrames,
+    port: String,
+    value: Option<Arc<Value>>,
+    error: Option<String>,
+    provided: bool,
 }
 
 impl Fold {
@@ -109,6 +124,9 @@ impl Fold {
             dispatchable: None,
             snap: ExecutionSnapshot {
                 color,
+                selection: None,
+                program: None,
+                inherited_origins: Default::default(),
                 pulses: Default::default(),
                 executions: Default::default(),
                 suspensions: HashMap::new(),
@@ -119,6 +137,8 @@ impl Fold {
                 corruptions: Vec::new(),
             },
             outputs: HashMap::new(),
+            output_history: None,
+            output_ids: HashSet::new(),
         }
     }
 
@@ -132,6 +152,114 @@ impl Fold {
 
     pub fn snapshot(&self) -> &ExecutionSnapshot {
         &self.snap
+    }
+
+    /// Seed reconstruction needs every stream item. Live projection and worker
+    /// replay leave this disabled so their memory does not grow with the stream.
+    pub fn with_output_history(mut self) -> Self {
+        self.output_history = Some(Vec::new());
+        self
+    }
+
+    /// Complete review evidence, including finite stream termination and unused ports.
+    pub fn output_wires(&self) -> anyhow::Result<Vec<weft_core::run_spec::ExpectedWire>> {
+        let history = self.output_history.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("run {} was reconstructed without output history", self.color()))?;
+        let mut ordinals = HashMap::new();
+        Ok(history.iter().map(|output| {
+            let ordinal = ordinals.entry((output.node.clone(), output.frames.clone(), output.port.clone())).or_insert(0u64);
+            let wire = weft_core::run_spec::ExpectedWire {
+                node: output.node.clone(), frames: output.frames.clone(), port: output.port.clone(),
+                ordinal: *ordinal, closed: output.value.is_none(), error: output.error.clone(),
+                value: output.value.as_ref().map(|value| value.as_ref().clone()).unwrap_or(Value::Null),
+            };
+            *ordinal += 1;
+            wire
+        }).collect())
+    }
+
+    /// Import already reconstructed results. Original inputs and outputs are
+    /// history; only emissions into executable child nodes become new pulses.
+    pub fn inherit(&mut self, source: &Fold, nodes: &BTreeSet<String>) -> anyhow::Result<FoldEffects> {
+        anyhow::ensure!(source.snap.corruptions.is_empty(), "seed {} contains corrupt journal rows", source.color());
+        let history = source.output_history.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("seed {} was reconstructed without its output history", source.color()))?;
+        let reusable = weft_core::seeding::inheritable_nodes(&source.project, &source.snap);
+        for node in nodes {
+            anyhow::ensure!(!self.snap.executions.contains_key(node), "history for '{node}' was already imported");
+            anyhow::ensure!(source.project.nodes.iter().any(|definition| &definition.id == node)
+                && self.project.nodes.iter().any(|definition| &definition.id == node), "seed node '{node}' is not in both programs");
+            anyhow::ensure!(reusable.contains(node)
+                || (!source.snap.executions.contains_key(node) && history.iter().any(|output| &output.node == node && output.provided)),
+                "seed {} has no complete reusable result for '{node}'", source.color());
+            anyhow::ensure!(!source.snap.inherited_origins.contains_key(node),
+                "seed result '{node}' must name its original run, not intermediate run {}", source.color());
+            if let Some(records) = source.snap.executions.get(node) {
+                anyhow::ensure!(records.iter().all(|record| matches!(record.status, NodeExecutionStatus::Completed | NodeExecutionStatus::Skipped)),
+                    "cannot inherit unfinished or unsuccessful result '{node}' from {}", source.color());
+                anyhow::ensure!(records.iter().all(|record| record.completed_at.is_some()), "seed result '{node}' has no completion time");
+                anyhow::ensure!(records.iter().all(|record| record.inherited_from.is_none()),
+                    "seed result '{node}' must name its original run, not intermediate run {}", source.color());
+            }
+        }
+        for node in nodes {
+            if let Some(records) = source.snap.executions.get(node) {
+                let records: Vec<_> = records.iter().map(|record| {
+                    let mut inherited = record.clone();
+                    inherited.color = self.color();
+                    inherited.inherited_from = Some(record.inherited_from.unwrap_or(source.color()));
+                    inherited
+                }).collect();
+                for record in &records {
+                    if let Some(output) = source.outputs.get(&record.id) { self.outputs.insert(record.id, output.clone()); }
+                }
+                self.snap.executions.insert(node.clone(), records);
+            }
+        }
+        for (location, entries) in &source.snap.awaited_sequences {
+            if nodes.contains(&location.node_id) { self.snap.awaited_sequences.insert(location.clone(), entries.clone()); }
+        }
+        for (_, instance) in source.snap.loop_runtime.iter() {
+            if nodes.contains(&boundary_in_id(&instance.key.group_id)) {
+                self.snap.loop_runtime.inherit(instance, self.color()).map_err(anyhow::Error::msg)?;
+            }
+        }
+        let mut frontier = self.snap.selection.clone()
+            .unwrap_or_else(|| weft_core::project::selection::RunSelection::whole(&self.project));
+        frontier.edges.retain(|id| self.project.edges.iter().any(|edge| &edge.id == id
+            && nodes.contains(&edge.source) && frontier.nodes.contains(&edge.target)));
+        let edge_idx = EdgeIndex::selected(&self.project, frontier);
+        let mut effects = FoldEffects::default();
+        for output in history.iter().filter(|output| nodes.contains(&output.node)) {
+            let start = effects.emissions.len();
+            match &output.value {
+                Some(value) => {
+                    postprocess_output(&output.node, &OutputBag::from([(output.port.clone(), value.clone())]),
+                        output.id, self.color(), &output.frames, &self.project, &mut self.snap.pulses,
+                        &edge_idx, &mut effects.emissions)?;
+                }
+                None => {
+                    emit_port_closure(&output.node, &output.port, output.id, self.color(), &output.frames,
+                        &self.project, &mut self.snap.pulses, &edge_idx, &mut effects.emissions, output.error.as_deref())?;
+                }
+            }
+            for emission in &mut effects.emissions[start..] {
+                    emission.pulse.provided = output.provided;
+                    emission.pulse.inherited_from = Some(source.color());
+                    if let Some(pulse) = self.snap.pulses.get_mut(&emission.pulse.target_node)
+                        .and_then(|pulses| pulses.iter_mut().find(|pulse| pulse.id == emission.pulse.id))
+                    { pulse.provided = output.provided; pulse.inherited_from = Some(source.color()); }
+            }
+            self.remember_output(output.clone());
+        }
+        Ok(effects)
+    }
+
+    /// Settle only after all chosen ancestors have supplied their frontier.
+    pub fn settle(&mut self, at_unix: u64) -> FoldEffects {
+        let mut effects = FoldEffects::default();
+        self.boundary_pass(at_unix, &mut effects);
+        effects
     }
 
     /// The snapshot, with every awaited sequence in call order.
@@ -154,13 +282,16 @@ impl Fold {
         let mut effects = FoldEffects::default();
         let color = self.snap.color;
         match ev {
-            ExecEvent::ExecutionStarted { phase, subgraph, .. } => {
+            ExecEvent::ExecutionStarted { phase, subgraph, program, seed, .. } => {
+                self.snap.program = program.clone();
+                self.snap.inherited_origins = seed.as_ref().map(|seed| seed.origins.clone()).unwrap_or_default();
+                self.snap.selection = subgraph.clone();
                 self.phase = Some(*phase);
-                self.dispatchable = phase.dispatchable_nodes(
-                    &self.project,
-                    &self.edge_idx,
-                    subgraph.as_deref(),
-                );
+                self.edge_idx = match subgraph {
+                    Some(selection) => EdgeIndex::selected(&self.project, selection.clone()),
+                    None => EdgeIndex::build(&self.project),
+                };
+                self.dispatchable = subgraph.as_ref().map(|s| s.dispatchable_nodes());
             }
             ExecEvent::NodeKicked { node_id, firing, payload, port_snapshot, at_unix, .. } => {
                 // First kick wins; further kicks on the same node id are a
@@ -171,6 +302,13 @@ impl Fold {
                 self.snap
                     .kicked
                     .entry(FiringLocation::new(node_id.clone(), Vec::new()))
+                    .and_modify(|kick| {
+                        if *firing && !kick.firing {
+                            kick.firing = true;
+                            kick.payload = payload.clone();
+                            kick.port_snapshot = port_snapshot.clone();
+                        }
+                    })
                     .or_insert_with(|| KickedNode {
                         firing: *firing,
                         payload: payload.clone(),
@@ -180,38 +318,90 @@ impl Fold {
                     });
                 self.boundary_pass(*at_unix, &mut effects);
             }
-            ExecEvent::PortEmitted { emission_id, node_id, frames, port, value, at_unix, .. } => {
-                let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::PortEmitted, ev) else {
-                    return effects;
+            ExecEvent::PortEmitted { emission_id, node_id, frames, port, value, provided, at_unix, .. } => {
+                // A provided value is the wire's value with no firing
+                // behind it: its source never ran (it sits outside the
+                // scope), so there is no record to hold it to; it fans
+                // out and marks its pulses, nothing else. The run's own
+                // emissions belong to a firing, and a row about one the
+                // journal never opened is corruption.
+                let record_id = if *provided {
+                    None
+                } else {
+                    match self.firing_record_id(node_id, frames, CorruptionSite::PortEmitted, ev) {
+                        Some(id) => Some(id),
+                        None => return effects,
+                    }
                 };
                 let shared = value.clone();
                 let mut bag = OutputBag::new();
                 bag.insert(port.clone(), shared.clone());
+                let emitted_before = effects.emissions.len();
                 match postprocess_output(
                     node_id, &bag, *emission_id, color, frames, &self.project,
                     &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions,
                 ) {
                     Ok(mentioned) => {
-                        // What the termination sweep leaves alone is
-                        // what `postprocess_output` says it put on a
-                        // wire, as on the live side: a port with no
-                        // wire is not mentioned and sweeps to nothing.
-                        self.record_mut(node_id, record_id)
-                            .expect("`firing_record_id` found this record and nothing removes records")
-                            .mentioned_ports
-                            .extend(mentioned);
-                        // A firing's emissions merge into one output
-                        // bag, later wins per port: an ordinary port is
-                        // mentioned once per firing (the runner refuses
-                        // a second mention), a generator port once per
-                        // item, so its recorded output is the last item.
-                        self.outputs.entry(record_id).or_default().insert(port.clone(), shared);
+                        self.remember_output(OutputEmission {
+                            id: *emission_id, node: node_id.clone(), frames: frames.clone(),
+                            port: port.clone(), value: Some(shared.clone()), error: None, provided: *provided,
+                        });
+                        // A provided value rode the wire like the source's
+                        // own emission; the pulses it became say so, and
+                        // the consumer's firing view reads it off them.
+                        if *provided {
+                            for emitted in &effects.emissions[emitted_before..] {
+                                if let Some(p) = self
+                                    .snap
+                                    .pulses
+                                    .get_mut(&emitted.pulse.target_node)
+                                    .and_then(|b| b.iter_mut().find(|p| p.id == emitted.pulse.id))
+                                {
+                                    p.provided = true;
+                                }
+                            }
+                        }
+                        if let Some(record_id) = record_id {
+                            // An output is mentioned even without a wire;
+                            // a later seeded run can connect a consumer to it.
+                            self.record_mut(node_id, record_id)
+                                .expect("`firing_record_id` found this record and nothing removes records")
+                                .mentioned_ports
+                                .extend(mentioned);
+                            // A firing's emissions merge into one output
+                            // bag, later wins per port: an ordinary port is
+                            // mentioned once per firing (the runner refuses
+                            // a second mention), a generator port once per
+                            // item, so its recorded output is the last item.
+                            self.outputs.entry(record_id).or_default().insert(port.clone(), shared);
+                        }
                         self.boundary_pass(*at_unix, &mut effects);
                     }
                     Err(e) => self.report(CorruptionSite::PortEmitted, format!("{}: {e}", describe(ev))),
                 }
             }
-            ExecEvent::PortClosed { emission_id, node_id, frames, port, at_unix, .. } => {
+            ExecEvent::PortClosed { emission_id, node_id, frames, port, provided, at_unix, .. } => {
+                if *provided {
+                    let start = effects.emissions.len();
+                    match emit_port_closure(node_id, port, *emission_id, color, frames,
+                        &self.project, &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, None)
+                    {
+                        Ok(()) => {
+                            self.remember_output(OutputEmission {
+                                id: *emission_id, node: node_id.clone(), frames: frames.clone(),
+                                port: port.clone(), value: None, error: None, provided: true,
+                            });
+                            for emission in &effects.emissions[start..] {
+                                if let Some(pulse) = self.snap.pulses.get_mut(&emission.pulse.target_node)
+                                    .and_then(|pulses| pulses.iter_mut().find(|p| p.id == emission.pulse.id))
+                                { pulse.provided = true; }
+                            }
+                            self.boundary_pass(*at_unix, &mut effects);
+                        }
+                        Err(error) => self.report(CorruptionSite::PortClosed, format!("{}: {error}", describe(ev))),
+                    }
+                    return effects;
+                }
                 let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::PortClosed, ev) else {
                     return effects;
                 };
@@ -280,7 +470,7 @@ impl Fold {
                     );
                     return effects;
                 }
-                bucket.retain(|p| !ids.contains(&p.id));
+                self.snap.pulses.remove_consumed(node_id, &ids);
             }
             ExecEvent::NodeStarted { node_id, frames, at_unix, .. } => {
                 if self.node_def(node_id, ev).is_none() {
@@ -307,6 +497,7 @@ impl Fold {
                     );
                     return effects;
                 }
+                let received = self.receiving(node_id, frames);
                 let absorbed = self.absorb_pending(node_id, frames, false);
                 if let Some(k) = self.snap.kicked.get_mut(&FiringLocation::new(node_id.clone(), frames.clone())) {
                     k.dispatched = true;
@@ -315,6 +506,8 @@ impl Fold {
                 {
                     self.snap.executions.entry(node_id.clone()).or_default().push(NodeExecution {
                         id: Uuid::new_v4(),
+                        received,
+                        skip_reason: None,
                         node_id: node_id.clone(),
                         status: NodeExecutionStatus::Running,
                         pulses_absorbed: absorbed,
@@ -327,8 +520,10 @@ impl Fold {
                         logs: Vec::new(),
                         port_warnings: Vec::new(),
                         mentioned_ports: Default::default(),
+                        closed_output_ports: Default::default(),
                         color,
                         frames: frames.clone(),
+                        inherited_from: None,
                     });
                 }
             }
@@ -453,9 +648,7 @@ impl Fold {
                     Ok(launch) => {
                         if let Some(id) = taken {
                             let loop_in_id = boundary_in_id(group_id);
-                            if let Some(bucket) = self.snap.pulses.get_mut(&loop_in_id) {
-                                bucket.retain(|p| p.id != id);
-                            }
+                            self.snap.pulses.remove_consumed(&loop_in_id, &[id]);
                         }
                         effects.emissions.extend(launch.emissions);
                         kick_scope(&mut self.snap.kicked, &launch.roots, &launch.body_frames, None);
@@ -530,7 +723,13 @@ impl Fold {
                         Ok(LoopAdvance::Idle) => {}
                         Ok(LoopAdvance::EmitOutward { gather, carry, .. }) => {
                             match emit_loop_outward(&key, gather, carry, &self.project, &self.edge_idx, &mut self.snap.pulses) {
-                                Ok(emissions) => {
+                                Ok((output, emissions)) => {
+                                    for (port, value) in output {
+                                        self.remember_output(OutputEmission {
+                                            id: loop_termination_emission(group_id, parent_frames), node: boundary_out_id(group_id),
+                                            frames: parent_frames.clone(), port, value: Some(value), error: None, provided: false,
+                                        });
+                                    }
                                     effects.emissions.extend(emissions);
                                     self.boundary_pass(*at_unix, &mut effects);
                                 }
@@ -618,6 +817,7 @@ impl Fold {
             // design (a live connection dies with its worker), so they
             // never contribute to a resumed run's state.
             ExecEvent::LogLine { .. }
+            | ExecEvent::TriggerCaptured { .. }
             | ExecEvent::ExecutionTagged { .. }
             | ExecEvent::ExecutionCompleted { .. }
             | ExecEvent::ExecutionFailed { .. }
@@ -646,6 +846,9 @@ impl Fold {
         Some(FiringView {
             input: Value::Object(owned_bag(&view.input)),
             closed_ports: view.closed_ports,
+            provided_ports: view.provided_ports,
+            backup_ports: view.backup_ports,
+            inherited_ports: view.inherited_ports,
         })
     }
 
@@ -654,6 +857,10 @@ impl Fold {
     /// that emitted nothing, or none there.
     pub fn output_of(&self, node_id: &str, frames: &LoopFrames) -> Option<Value> {
         let record = self.latest_record(node_id, frames)?;
+        self.record_output(record)
+    }
+
+    pub fn record_output(&self, record: &NodeExecution) -> Option<Value> {
         let bag = self.outputs.get(&record.id)?;
         if bag.is_empty() {
             return None;
@@ -677,31 +884,43 @@ impl Fold {
 
     // ----- Internals --------------------------------------------------
 
-    fn firing_view_of(&self, node_id: &str, frames: &LoopFrames) -> Option<SharedFiringView> {
-        let def = self.project.nodes.iter().find(|n| n.id == node_id)?;
-        let record = self.latest_record(node_id, frames)?;
-        let wired = wired_inputs(&self.project, &self.edge_idx, node_id);
-        // A kicked entry node builds its bag from its written constants
-        // (and a firing trigger's port snapshot), as `kicked_group` did
-        // live. The kick is the fact; an empty absorbed list is not (a
-        // stream consumer's start absorbs nothing, its items ride the
-        // feed), and a kicked node that also received pulses dispatched
-        // over the pulses, as it did live.
-        let loc = FiringLocation::new(node_id.to_string(), frames.clone());
-        if record.pulses_absorbed.is_empty() {
-            if let Some(kick) = self.snap.kicked.get(&loc) {
-                let (input, _) = build_kicked_input(def, kick.port_snapshot.as_ref());
-                return Some(SharedFiringView { input, closed_ports: Vec::new() });
+    fn remember_output(&mut self, emission: OutputEmission) {
+        if let Some(history) = &mut self.output_history {
+            if self.output_ids.insert((emission.id, emission.node.clone(), emission.port.clone())) {
+                history.push(emission);
             }
         }
-        let absorbed: Vec<&weft_core::pulse::Pulse> = self
-            .snap
-            .pulses
-            .get(node_id)
-            .map(|b| b.iter().filter(|p| record.pulses_absorbed.contains(&p.id)).collect())
-            .unwrap_or_default();
-        let view = firing_input(def, &absorbed, &wired);
-        Some(SharedFiringView { input: view.input, closed_ports: view.closed_ports })
+    }
+
+    fn remember_scope_closures(&mut self, group: &str, frames: &LoopFrames, id: Uuid) {
+        if self.output_history.is_none() { return; }
+        let node_id = boundary_out_id(group);
+        if self.snap.selection.as_ref().is_some_and(|selection| !selection.nodes.contains(&node_id)) { return; }
+        let ports: Vec<_> = self.project.nodes.iter().find(|node| node.id == node_id).into_iter()
+            .flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, &port.name)))
+            .map(|port| port.name.clone()).collect();
+        for port in ports {
+            self.remember_output(OutputEmission { id, node: node_id.clone(), frames: frames.clone(), port,
+                value: None, error: None, provided: false });
+        }
+    }
+
+    fn firing_view_of(&self, node_id: &str, frames: &LoopFrames) -> Option<weft_core::exec::ready::FiringInput> {
+        self.latest_record(node_id, frames).map(|record| record.received.clone())
+    }
+
+    fn receiving(&self, node_id: &str, frames: &LoopFrames) -> weft_core::exec::ready::FiringInput {
+        let def = self.project.nodes.iter().find(|n| n.id == node_id).expect("validated node");
+        let pending: Vec<_> = self.snap.pulses.get(node_id).into_iter().flatten()
+            .filter(|p| p.color == self.snap.color && p.frames == *frames && p.status.is_pending()).collect();
+        if pending.is_empty() {
+            if let Some(kick) = self.snap.kicked.get(&FiringLocation::new(node_id, frames.clone())) {
+                return kicked_group(def, kick, frames, self.snap.color, &self.project, &self.edge_idx).received;
+            }
+        }
+        let wired = wired_inputs(&self.project, &self.edge_idx, node_id);
+        let effective = effective_input_pulses(def, &pending, &wired, &self.project, &self.edge_idx, self.snap.color, frames);
+        firing_input(def, &effective.iter().collect::<Vec<_>>(), &wired, &self.edge_idx)
     }
 
     /// Run the boundary pass: fire every group boundary this row made
@@ -722,11 +941,50 @@ impl Fold {
             &mut self.snap.kicked,
         );
         for dispatch in &pass.boundaries {
-            if let BoundaryOutcome::Fired { record_id, output: Some(output), .. } = &dispatch.outcome {
-                self.outputs.insert(*record_id, output.clone());
+            if let BoundaryOutcome::Fired { record_id, output, .. } = &dispatch.outcome {
+                if let Some(output) = output {
+                    self.outputs.insert(*record_id, output.clone());
+                }
+                if let Some(record) = self.snap.executions.get(&dispatch.node_id)
+                    .and_then(|records| records.iter().find(|record| record.id == *record_id))
+                {
+                    let id = boundary_emission(&dispatch.node_id, &dispatch.frames, record.ordinal);
+                    let provided_ports = record.received.provided_ports.clone();
+                    let skipped = record.status == NodeExecutionStatus::Skipped;
+                    let values = output.clone().unwrap_or_default();
+                    let ports: Vec<_> = self.project.nodes.iter().find(|node| node.id == dispatch.node_id)
+                        .into_iter().flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, &port.name)))
+                        .map(|port| port.name.clone()).collect();
+                    for port in ports {
+                        self.remember_output(OutputEmission {
+                            id, node: dispatch.node_id.clone(), frames: dispatch.frames.clone(),
+                            value: values.get(&port).cloned(), provided: provided_ports.contains(&port), port, error: None,
+                        });
+                    }
+                    if skipped {
+                        let group = self.project.nodes.iter().find(|node| node.id == dispatch.node_id)
+                            .and_then(|node| node.group_boundary.as_ref()).filter(|boundary| boundary.role == GroupBoundaryRole::In)
+                            .map(|boundary| boundary.group_id.clone());
+                        if let Some(group) = group { self.remember_scope_closures(&group, &dispatch.frames, id); }
+                    }
+                }
             }
         }
         effects.boundaries.extend(pass.boundaries);
+    }
+
+    /// Read the specific boundary firing, including its used backup origins.
+    pub fn boundary_view(&self, dispatch: &BoundaryDispatch) -> Option<FiringView> {
+        let BoundaryOutcome::Fired { record_id, .. } = &dispatch.outcome else { return None };
+        let record = self.snap.executions.get(&dispatch.node_id).into_iter().flatten()
+            .find(|record| record.id == *record_id).expect("a fired boundary has its execution record");
+        Some(FiringView {
+            input: Value::Object(owned_bag(&record.received.input)),
+            closed_ports: record.received.closed_ports.clone(),
+            provided_ports: record.received.provided_ports.clone(),
+            backup_ports: record.received.backup_ports.clone(),
+            inherited_ports: record.received.inherited_ports.clone(),
+        })
     }
 
     /// Mark every pending pulse at `(node, frames)` Absorbed and return
@@ -771,15 +1029,27 @@ impl Fold {
         ev: &ExecEvent,
         effects: &mut FoldEffects,
     ) -> bool {
+        let failure = match ev {
+            ExecEvent::PortTypeMismatch { port, expected, actual, .. } => Some(PortWarning {
+                port: port.clone(), expected: expected.clone(), actual: actual.clone(),
+            }.message()),
+            _ => None,
+        };
         match emit_port_closure(
             node_id, port, emission_id, self.snap.color, frames, &self.project,
-            &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions,
+            &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, failure.as_deref(),
         ) {
             Ok(()) => {
+                self.remember_output(OutputEmission {
+                    id: emission_id, node: node_id.into(), frames: frames.clone(),
+                    port: port.into(), value: None, error: failure, provided: false,
+                });
                 self.record_mut(node_id, record_id)
                     .expect("`firing_record_id` found this record and nothing removes records")
                     .mentioned_ports
                     .insert(port.to_string());
+                self.record_mut(node_id, record_id).expect("record exists")
+                    .closed_output_ports.insert(port.to_string());
                 self.boundary_pass(at_unix, effects);
                 true
             }
@@ -832,6 +1102,7 @@ impl Fold {
         let e = self.record_mut(node_id, record_id).expect("`firing_record_id` found this record and nothing removes records");
         let ordinal = e.ordinal;
         e.status = status.clone();
+        e.skip_reason = skip_reason.cloned();
         e.completed_at = Some(at_unix);
         if let Some(err) = error {
             e.error = Some(err.to_string());
@@ -843,14 +1114,15 @@ impl Fold {
             .as_ref()
             .filter(|gb| gb.role == GroupBoundaryRole::In)
             .map(|gb| gb.group_id.clone());
-        let emission_id = terminal_sweep_emission(color, node_id, frames, ordinal);
+        let emission_id = terminal_sweep_emission(node_id, frames, ordinal);
         match (&status, skip_reason) {
             (NodeExecutionStatus::Skipped, Some(reason)) if in_scope.is_some() => {
                 let group_id = in_scope.expect("checked");
-                effects.emissions.extend(tear_down_gated_scope(
+                effects.emissions.extend(tear_down_scope(
                     &self.project, &self.edge_idx, &mut self.snap.pulses, &mut self.snap.kicked,
-                    emission_id, color, &group_id, frames, reason,
+                    emission_id, color, &group_id, frames, Some(reason),
                 ));
+                self.remember_scope_closures(&group_id, frames, emission_id);
             }
             (NodeExecutionStatus::Skipped, Some(SkipReason::ScopeSkipped { .. })) => {}
             _ if is_loop_boundary => {
@@ -867,15 +1139,22 @@ impl Fold {
             }
             _ => {
                 let mentioned = e.mentioned_ports.clone();
+                let closed = e.closed_output_ports.clone();
                 if let Err(e) = close_unmentioned_downstream(
                     node_id, &mentioned, emission_id, color, frames, &self.project,
-                    &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, error,
+                    &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, error, &closed,
                 ) {
                     // A rejected row fires no boundary: the reader that
                     // paints the row paints nothing for it, and boundaries
                     // it made ready without their cause would show alone.
                     self.report(CorruptionSite::NodeLifecycle, format!("{}: {e}", describe(ev)));
                     return;
+                }
+                for port in def.outputs.iter().filter(|port| !closed.contains(&port.name) && (!mentioned.contains(&port.name) || port.is_generator())) {
+                    self.remember_output(OutputEmission {
+                        id: emission_id, node: node_id.into(), frames: frames.clone(), port: port.name.clone(),
+                        value: None, error: error.map(str::to_string), provided: false,
+                    });
                 }
             }
         }
@@ -991,11 +1270,10 @@ fn describe(ev: &ExecEvent) -> String {
 pub struct FiringView {
     pub input: Value,
     pub closed_ports: Vec<String>,
-}
-
-struct SharedFiringView {
-    input: InputBag,
-    closed_ports: Vec<String>,
+    /// Input ports receiving supplied outputs or starting backups.
+    pub provided_ports: Vec<String>,
+    pub backup_ports: Vec<String>,
+    pub inherited_ports: std::collections::BTreeMap<String, Color>,
 }
 
 /// Fold a whole log at once.
@@ -1093,6 +1371,7 @@ mod tests {
             frames,
             port: port.into(),
             value: Arc::new(value),
+            provided: false,
             at_unix: 0,
         }
     }
@@ -1104,8 +1383,9 @@ mod tests {
             entry_node: "src".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some("h".into()),
-            node_test: false,
+            program: None, source_version: None, node_test: false,
             subgraph: None,
+            seed: None,
             at_unix: 0,
         }
     }
@@ -1123,6 +1403,75 @@ mod tests {
 
     fn pending<'a>(snap: &'a ExecutionSnapshot, node: &str) -> Vec<&'a weft_core::pulse::Pulse> {
         snap.pulses.get(node).map(|b| b.iter().filter(|p| p.status.is_pending()).collect()).unwrap_or_default()
+    }
+
+    /// A fired trigger reads its baked port snapshot without rerunning
+    /// the source that prepared it.
+    #[test]
+    fn a_fired_triggers_wired_port_shows_the_value_that_reached_it() {
+        let project = project(
+            vec![
+                node("sched", "T", &[], &[("value", "String")], &[], Value::Null, Value::Null),
+                node("wired", "Cron", &[("cron", "String", true)], &[("scheduledTime", "String")], &[], Value::Null, Value::Null),
+            ],
+            vec![edge("sched", "value", "wired", "cron")],
+        );
+        let cron = json!("0 0 * * * *");
+        let events = vec![
+            started_execution(),
+            ExecEvent::NodeKicked {
+                color: color(),
+                node_id: "wired".into(),
+                firing: true,
+                payload: Some(json!({"scheduledTime":"event"})),
+                port_snapshot: Some(json!({"cron":cron})),
+                at_unix: 0,
+            },
+            started("wired", vec![], 1),
+        ];
+        let mut fold = Fold::new(color(), project);
+        for ev in &events {
+            fold.apply(ev);
+        }
+        assert!(fold.snapshot().corruptions.is_empty(), "{:?}", fold.snapshot().corruptions);
+        let view = fold.firing_view("wired", &vec![]).expect("the trigger fired");
+        assert_eq!(view.input, json!({ "cron": cron }), "the wired port carries what reached it");
+        assert!(view.provided_ports.is_empty(), "baked settings are not authored emissions");
+    }
+
+    /// An emitted output reaches an ordinary consumer while its source
+    /// has no firing of its own.
+    #[test]
+    fn supplied_output_reaches_its_consumers_view() {
+        let project = project(
+            vec![
+                node("sched", "T", &[], &[("value", "String")], &[], Value::Null, Value::Null),
+                node("wired", "T", &[("cron", "String", true)], &[("scheduledTime", "String")], &[], Value::Null, Value::Null),
+            ],
+            vec![edge("sched", "value", "wired", "cron")],
+        );
+        let cron = json!("0 0 * * * *");
+        let mut fold = Fold::new(color(), project);
+        // The supplied source emits before the consumer starts.
+        for ev in [
+            started_execution(),
+            ExecEvent::PortEmitted {
+                color: color(),
+                emission_id: Uuid::new_v4(),
+                node_id: "sched".into(),
+                frames: vec![],
+                port: "value".into(),
+                value: Arc::new(cron.clone()),
+                provided: true,
+                at_unix: 0,
+            },
+            started("wired", vec![], 1),
+        ] {
+            fold.apply(&ev);
+        }
+        let view = fold.firing_view("wired", &vec![]).expect("the consumer ran");
+        assert_eq!(view.input, json!({ "cron": cron }));
+        assert_eq!(view.provided_ports, vec!["cron"]);
     }
 
     /// One emission row fans out over the program: three consumers,
@@ -1459,6 +1808,29 @@ mod tests {
         assert!(pending(&snap, "inner").is_empty());
     }
 
+    #[test]
+    fn closed_group_boundaries_with_the_same_port_keep_both_outputs() {
+        let mut definition = nested_group_project().as_ref().clone();
+        let out = definition.nodes.iter_mut().find(|node| node.id == "g__out").unwrap();
+        out.inputs[0].name = "x".into();
+        out.outputs[0].name = "x".into();
+        for edge in &mut definition.edges {
+            if edge.target == "g__out" { edge.target_handle = Some("x".into()); }
+            if edge.source == "g__out" { edge.source_handle = Some("x".into()); }
+        }
+        let mut fold = Fold::new(color(), Arc::new(definition)).with_output_history();
+        for event in [
+            started_execution(), kicked("src"), started("src", vec![], 0),
+            emitted(Uuid::new_v4(), "src", vec![], "out", json!(9)),
+            emitted(Uuid::new_v4(), "src", vec![], "flow", json!(false)),
+            completed("src", vec![], 1),
+        ] { assert!(!fold.apply(&event).rejected()); }
+        let outputs = fold.output_wires().unwrap();
+        for boundary in ["g__in", "g__out"] {
+            assert_eq!(outputs.iter().filter(|wire| wire.node == boundary && wire.port == "x" && wire.closed).count(), 1, "{boundary} closure survives");
+        }
+    }
+
     /// `items` feeds loop `lp` over `items` with carry `acc`; the body
     /// `step` reads `item` and `acc` and writes `acc` and `res`.
     fn loop_project(parallel: bool) -> Arc<ProjectDefinition> {
@@ -1636,10 +2008,49 @@ mod tests {
         let by_port = |port: &str| sink.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
         assert_eq!(by_port("res"), Some(json!([100, 200, 300])));
         assert_eq!(by_port("acc"), Some(json!(33)));
+        let mut definition = loop_project(false).as_ref().clone();
+        definition.groups.push(serde_json::from_value(json!({"id":"lp","kind":"loop","loopConfig":{},"nodeIds":["step"]})).unwrap());
+        let eligible = weft_core::seeding::inheritable_nodes(&definition, &snap);
+        assert!(["lp__in", "step", "lp__out"].iter().all(|node| eligible.contains(*node)));
+        let mut missing_iteration = snap.clone();
+        missing_iteration.executions.get_mut("step").unwrap().retain(|record| record.frames != vec![frame(1)]);
+        let eligible = weft_core::seeding::inheritable_nodes(&definition, &missing_iteration);
+        assert!(["lp__in", "step", "lp__out"].iter().all(|node| !eligible.contains(*node)), "one missing iteration invalidates the whole loop");
         // Replaying the terminal row puts nothing on the wires twice.
         events.push(events.last().unwrap().clone());
         let again = fold_to_snapshot(color(), loop_project(false), &events);
         assert_eq!(pending(&again, "sink").len(), 2);
+    }
+
+    #[test]
+    fn a_zero_iteration_loop_reuses_its_empty_result_without_inventing_body_firings() {
+        let mut definition = loop_project(false).as_ref().clone();
+        definition.groups.push(serde_json::from_value(json!({"id":"lp","kind":"loop","loopConfig":{},"nodeIds":["step"]})).unwrap());
+        let project = Arc::new(definition);
+        let mut source = Fold::new(color(), project.clone()).with_output_history();
+        for row in [
+            started_execution(), started("feed", vec![], 0),
+            emitted(Uuid::new_v4(), "feed", vec![], "items", json!([])),
+            emitted(Uuid::new_v4(), "feed", vec![], "seed", json!(1)), completed("feed", vec![], 0),
+            started("lp__in", vec![], 1), loop_row_instantiated(), completed("lp__in", vec![], 1),
+            ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::OverExhausted, at_unix: 2 },
+        ] { assert!(!source.apply(&row).rejected()); }
+        let members = BTreeSet::from(["lp__in".into(), "step".into(), "lp__out".into()]);
+        let eligible = weft_core::seeding::inheritable_nodes(&project, source.snapshot());
+        assert!(members.iter().all(|node| eligible.contains(node)));
+        let mut selection = weft_core::project::selection::RunSelection::carve(&project,
+            &weft_core::project::selection::SelectionBounds { from: vec!["sink".into()], ..Default::default() }).unwrap();
+        selection.suppliers.insert("lp__out".into());
+        let mut birth = started_execution();
+        if let ExecEvent::ExecutionStarted { subgraph, .. } = &mut birth { *subgraph = Some(selection); }
+        let mut child = Fold::new(Uuid::new_v4(), project);
+        child.apply(&birth);
+        child.inherit(&source, &members).unwrap();
+        assert!(!child.snapshot().executions.contains_key("step"));
+        assert!(!child.snapshot().executions.contains_key("lp__out"));
+        let result = pending(child.snapshot(), "sink").into_iter().find(|pulse| pulse.target_port == "res").unwrap();
+        assert_eq!(result.value.as_ref(), &json!([]));
+        assert!(child.snapshot().loop_runtime.iter().all(|(_, instance)| instance.launched.is_empty()));
     }
 
     /// A failed loop closes its outward surface from the terminal row;
@@ -1829,6 +2240,24 @@ mod tests {
     /// A stream take removes the pulse from the table (no tombstone),
     /// and the stream's end is durable on the loop instance.
     #[test]
+    fn output_review_keeps_every_stream_item_and_closure_without_a_consumer() {
+        let project = project(vec![node("gen", "T", &[], &[("rows", "Generator[Number]")], &[], Value::Null, Value::Null)], vec![]);
+        let mut fold = Fold::new(color(), project).with_output_history();
+        for event in [
+            started_execution(), started("gen", vec![], 1),
+            emitted(Uuid::new_v4(), "gen", vec![], "rows", json!(10)),
+            emitted(Uuid::new_v4(), "gen", vec![], "rows", json!(20)),
+            ExecEvent::PortClosed { color: color(), emission_id: Uuid::new_v4(), node_id: "gen".into(), frames: vec![], port: "rows".into(), provided: false, at_unix: 2 },
+            completed("gen", vec![], 3),
+        ] { assert!(!fold.apply(&event).rejected()); }
+        let wires = fold.output_wires().unwrap();
+        assert_eq!(wires.len(), 3);
+        assert_eq!(wires.iter().map(|wire| wire.ordinal).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(wires.iter().map(|wire| wire.value.clone()).collect::<Vec<_>>(), vec![json!(10), json!(20), Value::Null]);
+        assert_eq!(wires.iter().map(|wire| wire.closed).collect::<Vec<_>>(), vec![false, false, true]);
+    }
+
+    #[test]
     fn pulses_consumed_removes_and_loop_stream_end_is_durable() {
         let project = project(
             vec![
@@ -1882,14 +2311,17 @@ mod tests {
     }
 
 
-    /// The run's subgraph on the birth row bounds the boundary pass
-    /// too: a boundary outside it absorbs silently and opens no record.
+    /// The birth selection removes outgoing wires at the cut, so an
+    /// excluded boundary receives no pulses and opens no record.
     #[test]
     fn a_run_subgraph_keeps_the_fold_off_the_outside() {
         let project = nested_group_project();
         let mut birth = started_execution();
         if let ExecEvent::ExecutionStarted { subgraph, .. } = &mut birth {
-            *subgraph = Some(vec!["src".into()]);
+            *subgraph = Some(weft_core::project::selection::RunSelection::carve(&project,
+                &weft_core::project::selection::SelectionBounds {
+                    target: vec!["src".into()], ..Default::default()
+                }).unwrap());
         }
         let events = vec![
             birth,
@@ -1906,11 +2338,9 @@ mod tests {
         }
         let snap = fold.into_snapshot();
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
-        // An out-of-scope boundary absorbs each pulse as it lands (it
-        // never waits for a full input set), so one pass per emission.
-        assert_eq!(outcomes, vec![("g__in".to_string(), true), ("g__in".to_string(), true)]);
+        assert!(outcomes.is_empty(), "the cut dispatches no excluded boundary");
         assert!(!snap.executions.contains_key("g__in"), "no record outside the run");
-        assert!(pending(&snap, "g__in").is_empty(), "absorbed all the same");
+        assert!(!snap.pulses.contains_key("g__in"), "no pulse crosses the cut");
         assert!(pending(&snap, "h__in").is_empty(), "nothing forwarded");
     }
 
@@ -1947,7 +2377,7 @@ mod tests {
             // A second start over a firing still open.
             started("feed", vec![], 0),
             // A close on an undeclared port, and a refused value on one.
-            ExecEvent::PortClosed { color: color(), emission_id: Uuid::new_v4(), node_id: "feed".into(), frames: vec![], port: "nope".into(), at_unix: 0 },
+            ExecEvent::PortClosed { color: color(), emission_id: Uuid::new_v4(), node_id: "feed".into(), frames: vec![], port: "nope".into(), provided: false, at_unix: 0 },
             ExecEvent::PortTypeMismatch { color: color(), emission_id: Uuid::new_v4(), node_id: "feed".into(), frames: vec![], port: "nope".into(), expected: "Number".into(), actual: "String".into(), at_unix: 0 },
             // A take naming a pulse the table does not hold.
             ExecEvent::PulsesConsumed { color: color(), node_id: "feed".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 0 },
@@ -2070,8 +2500,48 @@ mod tests {
         let a = pending(&snap, "a");
         assert_eq!(a.len(), 1);
         assert!(a[0].closed);
+        assert_eq!(a[0].close_error.as_deref(), Some("output 'out': expected Number, received String"));
         assert_eq!(a[0].id, weft_core::exec::emission::pulse_id(refused, "out", "a", "in", true), "the mismatch row is the closure");
         assert!(pending(&snap, "b")[0].closed, "the sweep closes the unmentioned port");
+    }
+
+    #[test]
+    fn inherited_input_keeps_its_original_backup_and_only_supplies_the_child_frontier() {
+        let project = project(
+            vec![
+                node("a", "T", &[("in", "Number", true)], &[("out", "Number")], &[], Value::Null, Value::Null),
+                node("b", "T", &[("in", "Number", true)], &[], &[], Value::Null, Value::Null),
+            ], vec![edge("a", "out", "b", "in")],
+        );
+        let mut original_selection = weft_core::project::selection::RunSelection::carve(&project,
+            &weft_core::project::selection::SelectionBounds { target: vec!["a".into()], ..Default::default() }).unwrap();
+        original_selection.input.insert("a".into(), [("in".into(), json!(7))].into_iter().collect());
+        let mut birth = started_execution();
+        if let ExecEvent::ExecutionStarted { subgraph, .. } = &mut birth { *subgraph = Some(original_selection); }
+        let mut original = Fold::new(color(), project.clone()).with_output_history();
+        let kick = ExecEvent::NodeKicked { color: color(), node_id: "a".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0 };
+        for row in [birth, kick, started("a", vec![], 1), emitted(Uuid::new_v4(), "a", vec![], "out", json!(9)), completed("a", vec![], 2)] {
+            assert!(!original.apply(&row).rejected());
+        }
+        let mut selection = weft_core::project::selection::RunSelection::carve(&project,
+            &weft_core::project::selection::SelectionBounds { from: vec!["b".into()], ..Default::default() }).unwrap();
+        selection.suppliers.insert("a".into());
+        selection.input.insert("b".into(), [("in".into(), json!(55))].into_iter().collect());
+        let mut birth = started_execution();
+        if let ExecEvent::ExecutionStarted { subgraph, .. } = &mut birth { *subgraph = Some(selection); }
+        let mut child = Fold::new(Uuid::new_v4(), project);
+        child.apply(&birth);
+        child.inherit(&original, &BTreeSet::from(["a".into()])).unwrap();
+        child.settle(3);
+        let history = child.firing_view("a", &vec![]).unwrap();
+        assert_eq!(history.input["in"], json!(7));
+        assert_eq!(child.snapshot().executions["a"][0].received.backup_ports, vec!["in"]);
+        assert_eq!(child.snapshot().executions["a"][0].inherited_from, Some(original.color()));
+        assert!(!child.snapshot().pulses.contains_key("a"));
+        assert!(child.snapshot().kicked.is_empty());
+        assert_eq!(*pending(child.snapshot(), "b")[0].value, json!(9));
+        child.apply(&started("b", vec![], 4));
+        assert_eq!(child.firing_view("b", &vec![]).unwrap().input["in"], json!(9));
     }
 
     /// A LoopOut row is a vote only once its writes landed: the same

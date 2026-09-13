@@ -2,18 +2,50 @@ use serde::Deserialize;
 
 use super::Ctx;
 
-/// One row of `GET /listener/inspect`: a live listener pod, how many
-/// signal rows the dispatcher has placed on it, and what the pod
-/// itself holds in RAM (or why it could not be asked).
+/// One row of `GET /listener/inspect`: a live listener pod, the signal
+/// rows the dispatcher has placed on it, what the pod itself holds in
+/// RAM (or why it could not be asked), and where the two disagree.
+/// SYNC: InspectRow <-> crates/weft-dispatcher/src/api/signal.rs listener_inspect
 #[derive(Deserialize)]
 struct InspectRow {
     pod_name: String,
     listener_url: String,
-    placed_signal_count: u64,
+    /// Rows of activating or active projects: every one is expected in
+    /// the registry.
+    placed_signals: Vec<PlacedSignal>,
+    /// Rows of hibernated or parked projects: kept so reactivate can
+    /// rehydrate them, and absent from the registry on purpose.
+    preserved_signals: Vec<PlacedSignal>,
     /// Decoded by [`registry`] rather than as an enum: an untagged
     /// enum reports a bad entry as "matched no variant" and hides which
     /// field broke.
     listener_registry: serde_json::Value,
+    /// The dispatcher's comparison of the two sides; absent exactly
+    /// when the registry could not be asked.
+    drift: Option<Drift>,
+}
+
+/// One placed `signal` row.
+#[derive(Deserialize)]
+struct PlacedSignal {
+    token: String,
+    node_id: String,
+    project_id: String,
+}
+
+/// Where the placement table and the pod disagree, each group naming
+/// the signals that make it up.
+#[derive(Deserialize)]
+struct Drift {
+    on_pod_not_placed: Vec<HeldSignal>,
+    placed_not_on_pod: Vec<PlacedSignal>,
+    preserved_on_pod: Vec<PlacedSignal>,
+}
+
+impl Drift {
+    fn is_empty(&self) -> bool {
+        self.on_pod_not_placed.is_empty() && self.placed_not_on_pod.is_empty() && self.preserved_on_pod.is_empty()
+    }
 }
 
 /// What the dispatcher got when it asked the pod for its registry:
@@ -92,19 +124,26 @@ pub async fn inspect(ctx: Ctx) -> anyhow::Result<()> {
     for (row, registry) in rows {
         println!("pod: {}", row.pod_name);
         println!("  url:               {}", row.listener_url);
-        println!("  placed signals:    {}", row.placed_signal_count);
+        println!("  placed signals:    {}", row.placed_signals.len());
+        if !row.preserved_signals.is_empty() {
+            println!(
+                "  preserved signals: {} (hibernated or parked projects; kept for reactivate, not on the pod)",
+                row.preserved_signals.len()
+            );
+        }
         match registry {
             Registry::Held(held) => {
                 println!("  listener signals:  {}", held.len());
-                if row.placed_signal_count != held.len() as u64 {
-                    println!("  ⚠ DRIFT: the placement table and the pod's registry disagree.");
-                }
-                if held.is_empty() && row.placed_signal_count == 0 {
-                    println!("  (idle: should be reaped on next cleanup tick)");
-                }
-                for sig in held {
+                for sig in &held {
                     println!("    - token={}  node={}  kind={}", sig.token, sig.node_id, sig.kind);
                 }
+                if held.is_empty() && row.placed_signals.is_empty() && row.preserved_signals.is_empty() {
+                    println!("  (idle: should be reaped on next cleanup tick)");
+                }
+                let drift = row.drift.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("/listener/inspect handed a registry for {} but no drift", row.pod_name)
+                })?;
+                print_drift(drift);
             }
             Registry::DecodeError(e) => {
                 println!("  listener signals:  (the pod answered, but not with a registry: {e})")
@@ -118,3 +157,29 @@ pub async fn inspect(ctx: Ctx) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The three ways the table and the pod disagree, each listing only
+/// the signals in it, so the reader chases a token and never a count.
+fn print_drift(drift: &Drift) {
+    if drift.is_empty() {
+        return;
+    }
+    println!("  ⚠ DRIFT: the placement table and the pod's registry disagree.");
+    if !drift.on_pod_not_placed.is_empty() {
+        println!("    on the pod with no row behind it (the table forgot it; the pod still serves it):");
+        for sig in &drift.on_pod_not_placed {
+            println!("      - token={}  node={}  kind={}", sig.token, sig.node_id, sig.kind);
+        }
+    }
+    if !drift.placed_not_on_pod.is_empty() {
+        println!("    placed for an active project but missing from the pod (its trigger cannot fire):");
+        for sig in &drift.placed_not_on_pod {
+            println!("      - token={}  node={}  project={}", sig.token, sig.node_id, sig.project_id);
+        }
+    }
+    if !drift.preserved_on_pod.is_empty() {
+        println!("    preserved for a hibernated or parked project yet still on the pod (deactivate told it to forget):");
+        for sig in &drift.preserved_on_pod {
+            println!("      - token={}  node={}  project={}", sig.token, sig.node_id, sig.project_id);
+        }
+    }
+}

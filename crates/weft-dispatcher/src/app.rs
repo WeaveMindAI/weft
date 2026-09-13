@@ -80,6 +80,9 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // anywhere surfaces in ONE error naming every stale group
     // together.
     &crate::project_store::GROUP,
+    // The version tree hangs off `project` (its foreign keys and the
+    // head columns), so it comes after.
+    &crate::versions::GROUP,
 ];
 
 /// The construction-time policies threaded into `build_state`: who a request
@@ -144,7 +147,9 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
     apply_core_schema(&pool).await?;
     let journal = PostgresJournal::from_pool(pool.clone());
     let projects: crate::ProjectStore =
-        std::sync::Arc::new(crate::PostgresProjectStore::new(pool));
+        std::sync::Arc::new(crate::PostgresProjectStore::new(pool.clone()));
+    let versions: crate::versions::VersionStore =
+        std::sync::Arc::new(crate::versions::PostgresVersionStore::new(pool));
 
     // Broker URL: every tenant pod (listener / worker / infra) talks to the
     // broker instead of touching Postgres. Required in-cluster; subprocess dev
@@ -275,6 +280,20 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
     info!("dispatcher pod identity: {}", pod_id);
 
     let pg_pool = journal.pool().clone();
+    // A pool of its own for the project transition lock. Holding an
+    // advisory lock holds a connection that does no work, so a lock taken
+    // from the work pool is a connection the locked operation then has to
+    // wait for; see `DispatcherState::lock_pool`. The acquire timeout is
+    // generous because waiting here is CONTENTION, not failure: another
+    // operation on the same project holds the lock, and the wait itself
+    // leaves a breadcrumb (`lease::PROJECT_LOCK_BREADCRUMB`).
+    let lock_pool = PostgresJournal::connect_pool_sized(
+        &database_url,
+        16,
+        std::time::Duration::from_secs(120),
+    )
+    .await
+    .with_context(|| format!("connect the lock pool at {database_url}"))?;
     let event_bus = crate::EventBus::with_notify(pg_pool.clone()).await?;
 
     // The control-plane namespace: where pooled, trusted, tenant-agnostic
@@ -338,9 +357,11 @@ pub async fn build_state(http_port: u16, defaults: Defaults) -> anyhow::Result<D
         pod_id,
         journal: Arc::new(journal),
         pg_pool,
+        lock_pool,
         workers: worker_backend,
         ensure_built,
         projects,
+        versions,
         events: event_bus,
         listener_backend,
         listeners: listener_pool,

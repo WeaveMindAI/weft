@@ -24,6 +24,7 @@ pub fn spawn_all(state: DispatcherState) {
     spawn_loop(state.clone(), Duration::from_secs(60), "supervisor_scaledown", sweep_supervisor_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(60), "worker_scaledown", sweep_worker_scaledown);
     spawn_loop(state.clone(), Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions);
+    spawn_loop(state.clone(), Duration::from_secs(3600), "retired_rows", sweep_retired_rows);
     // Re-parked fires (a route that failed) retry with a backoff stamp on
     // the element; this is what drives the retry once the stamp is due.
     spawn_loop(state.clone(), Duration::from_secs(5), "parked_fires", |s| async move {
@@ -39,6 +40,54 @@ pub fn spawn_all(state: DispatcherState) {
         "storage_sweep",
         crate::storage::process_sweep_queue,
     );
+}
+
+/// Drop what a removed project left behind that no surviving run needs.
+///
+/// The removal itself already tries this, and `weft clean` tries again
+/// when it deletes a run; both are best-effort, because neither may fail
+/// over rows nobody reads. Once the project row is gone no request can
+/// reach those rows again (`weft rm` refuses a project it cannot find,
+/// and with no runs left there is nothing to clean), so without this loop
+/// one transient failure would leave them for good, unlisted and
+/// undeletable. Hourly: nothing here is urgent, and a project whose runs
+/// all survive is a no-op.
+async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
+    let mut orphans = state.projects.projects_with_orphan_definitions().await?;
+    orphans.extend(state.versions.projects_with_orphan_versions().await?);
+    orphans.sort();
+    orphans.dedup();
+    let mut failed = 0usize;
+    for project in orphans {
+        // Per project, because recovering from a failure on ONE is the
+        // whole reason this loop exists. Propagating the first error
+        // abandoned every project after it in id order, every hour, for
+        // good.
+        match crate::api::project::retire_what_no_run_needs(&state, &project.to_string()).await {
+            Ok(0) => {}
+            Ok(dropped) => tracing::info!(
+                target: "weft_dispatcher::reaper",
+                project_id = %project, rows = dropped,
+                "retired rows of a removed project that no surviving run needs"
+            ),
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    target: "weft_dispatcher::reaper",
+                    project_id = %project, error = %e,
+                    "could not retire this removed project's rows; the next sweep tries again"
+                );
+            }
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(
+            target: "weft_dispatcher::reaper",
+            projects = failed,
+            "some removed projects' rows could not be retired this cycle"
+        );
+    }
+    Ok(())
 }
 
 /// Grace before a terminal (`done`/`dead`) worker_pod's k8s Pod
@@ -237,6 +286,7 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
             if let Err((code, msg)) =
                 crate::api::project::wipe_activating_state(
                     &state, stuck.id, &project_id,
+                    stuck.activating_ts_color.ok_or_else(|| anyhow::anyhow!("activating project {} has no reserved setup identity", stuck.id))?,
                     // The activation's driver died mid-transition and
                     // this sweep is repairing the row; nothing
                     // superseded the run and no person stopped it.

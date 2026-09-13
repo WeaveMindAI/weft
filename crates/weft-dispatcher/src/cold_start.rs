@@ -9,8 +9,8 @@
 //! and no pod that can take it gets one more worker. Capacity is bounded
 //! by MEMORY, never a task/connection count.
 //!
-//! Dedup: `spawn_pod` tasks key on `project_id`, so at most one spawn is
-//! in flight per project; concurrent dispatchers converge on one task,
+//! Dedup: `spawn_pod` tasks key on project and requested binary, so one spawn
+//! is in flight per image; concurrent dispatchers converge on one task,
 //! and a sustained-saturation project ramps one worker per tick (spawn,
 //! wait for it to come alive, and if still saturated spawn the next)
 //! rather than bursting N workers for one spike.
@@ -60,16 +60,12 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
     // they must never trigger a fresh spawn (which the unpinned task's
     // owner would then also not be).
     let saturation = weft_platform_traits::SATURATION_MEM_FRACTION;
-    // Group by project_id ONLY. A project has exactly one tenant, but `task.tenant_id`
-    // is nullable (some task kinds enqueue without resolving one), so selecting it
-    // here returns spurious duplicate rows for one project when its pending tasks
-    // carry mixed NULL/concrete stamps, and each duplicate re-runs the resolver +
-    // enqueue below for nothing (the spawn dedup then collapses them). The placement
-    // resolver below is the single authoritative source of the project's tenant, so
-    // we read it there and never from the task stamp.
+    // Each executable gets its own capacity. Tasks without an image restriction
+    // accept the current image. Tenant ownership comes from placement below.
     let rows = sqlx::query(
-        r#"SELECT DISTINCT t.project_id
+        r#"SELECT DISTINCT t.project_id, COALESCE(t.binary_hash, p.running_binary_hash) AS binary_hash
            FROM task t
+           JOIN project p ON p.id::text = t.project_id
            WHERE t.target = 'worker'
              AND t.status = 'pending'
              AND t.project_id IS NOT NULL
@@ -91,6 +87,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
 
     for row in rows {
         let project_id: String = row.try_get("project_id")?;
+        let binary_hash: String = row.try_get("binary_hash")?;
         // Worker placement via the single resolver (source-declares-
         // infra AND its own namespace exists -> project namespace, else
         // shared pool). A None here means the project was unregistered
@@ -114,7 +111,7 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
             namespace: placement.namespace,
             owner_dispatcher: state.pod_id.as_str().to_string(),
         };
-        let dedup = format!("{project_id}:spawn");
+        let dedup = format!("{project_id}:{binary_hash}:spawn");
         // Propagate enqueue failures. The outer loop catches and
         // logs+backs off; silently discarding means the project has
         // pending worker tasks but no spawn task, and the failure
@@ -130,81 +127,11 @@ async fn sweep_once(state: &DispatcherState) -> anyhow::Result<()> {
                 color: None,
                 tenant_id: Some(tenant),
                 target_pod_name: None,
-                binary_hash: None,
+                binary_hash: Some(binary_hash),
                 payload: serde_json::to_value(&payload)?,
             },
         )
         .await?;
-    }
-
-    // Superseded tasks: a pending unpinned worker task stamped with an
-    // image that is NO LONGER the project's current one, with no alive
-    // pod of that image left to claim it. Nothing will ever run it (the
-    // claim filter is exact, and every future spawn bakes the CURRENT
-    // image), so leaving it pending is an invisible forever-wait for
-    // whoever fired it. Fail the task AND cancel its color so the
-    // execution lands terminal, loudly, in the journal the user watches.
-    // The window that produces these is small (a re-register between
-    // enqueue and first claim, with the old pods gone), but real.
-    let superseded = sqlx::query(
-        r#"SELECT t.id, t.color
-           FROM task t
-           JOIN project p ON p.id = t.project_id::uuid
-           WHERE t.target = 'worker'
-             AND t.status = 'pending'
-             AND t.target_pod_name IS NULL
-             AND t.binary_hash IS NOT NULL
-             AND p.running_binary_hash IS NOT NULL
-             AND t.binary_hash <> p.running_binary_hash
-             AND NOT EXISTS (
-                 SELECT 1 FROM worker_pod wp
-                 WHERE wp.project_id = t.project_id
-                   AND wp.status IN ('spawning', 'alive')
-                   AND wp.role = 'worker'
-                   AND wp.binary_hash = t.binary_hash
-             )
-           LIMIT 100"#,
-    )
-    .fetch_all(&state.pg_pool)
-    .await?;
-    for row in superseded {
-        let task_id: uuid::Uuid = row.try_get("id")?;
-        let color: Option<String> = row.try_get("color")?;
-        let failed = weft_task_store::tasks::fail_pending(
-            &state.pg_pool,
-            task_id,
-            "superseded: the project was rebuilt before this work was claimed and no worker \
-             of the image it targeted remains; re-run against the current build",
-        )
-        .await?;
-        if !failed {
-            // Claimed in the window since the scan (a matching pod
-            // appeared): it is being handled, leave it.
-            continue;
-        }
-        tracing::warn!(
-            target: "weft_dispatcher::cold_start",
-            task_id = %task_id,
-            color = ?color,
-            "failed a superseded pending worker task (image rebuilt before claim, no \
-             old-image pod remains); its execution is cancelled"
-        );
-        if let Some(color) = color.and_then(|c| c.parse::<weft_core::Color>().ok()) {
-            let cause = weft_core::exec::CancelCause::Runtime {
-                detail: "the project was rebuilt before a worker claimed this run, and no \
-                         worker of the old build remains to run it"
-                    .into(),
-            };
-            if let Err(e) = crate::api::execution::cancel_color(state, color, &cause).await {
-                tracing::warn!(
-                    target: "weft_dispatcher::cold_start",
-                    color = %color,
-                    error = %e,
-                    "cancel_color for a superseded task failed; the reaper's stuck-execution \
-                     sweep will land the terminal"
-                );
-            }
-        }
     }
 
     Ok(())

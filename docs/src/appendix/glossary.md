@@ -38,11 +38,21 @@ journal, hosts every public URL. Never runs user code.
 **Door.** How a connection is obtained. `shared` means a credential this weft
 holds; `own` means the user brings or creates their own.
 
+**Example.** A run spec saved as `examples/<name>.json`: which part of the
+graph to run, what to hand it, and which trigger to fire. `weft run <name>`
+runs it again. See [Versions, seeded runs and frozen
+examples](../running/versions.md).
+
 **Firing.** One call to a node's body, at one color and one frame stack. A node
 can be firing several times at once inside a parallel loop.
 
 **Frames.** A stack of loop iteration indices. Two pulses only meet at a node
 if their frames match, which is what keeps iterations from mixing.
+
+**Frozen example.** Saved starting parameters plus accepted output history
+in `expected`, with optional nodes to focus on during review. Run it on
+current code, then inspect its diff. See
+[Freezing an accepted run](../running/versions.md#freezing-an-accepted-run).
 
 **Gather port.** A loop output that collects one value per iteration. Typed
 `List[T | Null]`, because an iteration can fail to write.
@@ -52,6 +62,10 @@ exactly one consumer.
 
 **Group.** A subgraph with typed boundary ports, behaving as one node from
 outside. See [Groups](../language/groups.md).
+
+**HEAD.** The version your next checkpoint or run is recorded beneath, and
+`weft branch` moves it too. It is also where `--seed` starts looking: see the
+**Seed** entry.
 
 **Infra node.** A node that needs a long-running process, declared as a typed
 spec that the supervisor compiles to Kubernetes manifests.
@@ -69,6 +83,10 @@ from the bytes. A node never states a cost.
 **Pulse.** One emission travelling to one input port, carrying a value, a
 color, and a frame stack. The only thing that moves in a running program.
 
+**Provided.** A backup input supplied at a `--from` or `--group` start,
+or an output supplied through `--emit`. Real execution input takes
+precedence over a backup. Changed supplied values invalidate affected reuse.
+
 **Recipe.** The `service` block in an access node's metadata: how a credential
 is acquired, how a request is signed, what the permissions are, how events
 arrive.
@@ -77,14 +95,49 @@ arrive.
 in the operator's trusted apps file. A recipe may use one and can never extract
 from it.
 
-**Root.** A node no wire feeds. A manual run kicks every root at the top level;
-a scope's own roots are kicked when the scope starts.
+**Root.** A node no wire feeds. A manual run kicks ordinary roots in its
+selection. Triggers require an explicit fire or supplied outputs.
+
+**Scope** (run). Which part of the graph a run executes, set by `--from`,
+`--emit`, `--target`, `--before` or `--group`, or by saved parameters. See
+[Running one group, or one node onward](../running/versions.md#running-one-group-or-one-node-onward).
 
 **Scope** (storage). Which of `Execution`, `Project`, or `Shared` a file is
 written under. It is a lifetime contract, not a folder name.
 
+**Seed.** The run a `--seed` run inherits from. By default it is head's run,
+once that run has finished or parked on a signal; if head has no run, it is
+the newest finished or parked run on head's version, or on the nearest
+ancestor version that has one. For which of its nodes are taken and which run
+again, go and read the **Stale** entry below; for how weft picks a seed when
+head has no run, go and read
+[Seeding](../running/versions.md#seeding-run-only-what-changed).
+
 **Signal.** A wake source: a timer, a form, an endpoint, a subscription, a held
 socket. Registered by a trigger, or awaited mid-flow.
+
+**Slice.** A node plus everything upstream of it, hashed together. A seeded
+run compares each node's slice against the seed's and re-runs the ones that
+differ.
+
+<span id="stale"></span>**Stale.** A node a seeded run must run itself
+rather than inherit. A node is stale when:
+
+- you edited it, or anything upstream of it;
+- it is new since the seed, or the seed's run never covered it;
+- it is a root whose kick payload changed, or one the seed never kicked;
+- its supplied starting inputs changed;
+- the seed ran it but it failed, was cancelled, is still running, or is
+  parked waiting on somebody: the question it asked belongs to the seed's
+  run, so answering it would wake the seed rather than this run, and the
+  node asks again;
+- it fired several times inside a loop and did not complete or get skipped
+  in every one of them;
+- it is beyond the permitted `--seed-before` or `--seed-until` boundary;
+- its output contains a live handle tied to the earlier run.
+
+Anything downstream of a stale node is stale, and a loop goes stale whole
+the moment any node inside it does.
 
 **Supervisor.** The tier that runs kubectl for user infrastructure. One holds a
 lease per project.
@@ -97,6 +150,15 @@ activation, then a fire per event.
 
 **Unit.** One pod template inside an infra spec. Each has its own status and
 its own stop behavior, and the infra verbs act on one at a time.
+
+**Version.** The project's program files (`.weft`, `weft.toml`, `nodes/`,
+`prompts/`, `scripts/`, `sql/`, `assets/`, `examples/`, plus the installed
+weft's own version), named by a hash of their contents, so the same code is
+always the same version however many times you run it. Your `layouts/` and
+your notes are not in it. The seeded `nodes/base_catalog/` is not listed file
+by file, but its content hash rides along with the installed weft's version,
+so upgrading the catalog changes the version like any edit. Every run and
+every checkpoint records one.
 
 **Worker.** The compiled project binary, running as a pod, multiplexing
 executions and shutting down when idle.

@@ -279,6 +279,14 @@
   let followMode = $state<'latest' | 'pinned'>('latest');
   let followColor = $state<string | undefined>(undefined);
   let followPendingCount = $state(0);
+  /// Why the followed run cannot be painted whole, when it cannot: the
+  /// code it ran is no longer recorded, so the rows are all there and
+  /// every value is missing. It goes beside the run pill, because a
+  /// canvas with nothing on it and no reason for it reads as a broken
+  /// viewer and sends people looking for a bug that is not there.
+  const runNotPainted = $derived(
+    executionState.journalCorruptions.find((c) => c.site === 'MissingProgram')?.reason,
+  );
   let sourceOpen = $state(false);
 
   // Action-bar state: single source of truth for what the bar
@@ -415,6 +423,9 @@
       if (msg.kind === 'execReset') {
         executionState = {
           isRunning: true,
+          scope: undefined,
+          seed: undefined,
+          version: undefined,
           tags: [],
           nodeOutputs: bareRecord(),
           nodeExecutions: bareRecord(),
@@ -428,6 +439,27 @@
         seenBusKeys = new Set();
         seenLoopKeys = new Set();
         seenCallerOffsets = new Set();
+        return;
+      }
+      if (msg.kind === 'execScope') {
+        // The run's birth: what it is held to, and what it inherits.
+        executionState.scope = msg.subgraph;
+        executionState.seed = msg.seed;
+        return;
+      }
+      if (msg.kind === 'execVersion') {
+        if (followColor && msg.color !== followColor) return;
+        // Both null means there is no followed run here any more (the
+        // graph moved to another project), so the banner goes rather
+        // than reading as "this run matches disk".
+        executionState.version =
+          msg.version === null && msg.diskVersion === null
+            ? undefined
+            : { version: msg.version, diskVersion: msg.diskVersion };
+        return;
+      }
+      if (msg.kind === 'specsListed') {
+        specs = msg.specs;
         return;
       }
       if (msg.kind === 'execTerminal') {
@@ -587,6 +619,10 @@
               closedPorts: e.closedPorts,
               skipReason: e.skipReason,
               output: e.output,
+              inheritedFrom: e.inheritedFrom,
+              providedPorts: e.providedPorts,
+              backupPorts: e.backupPorts,
+              inheritedPorts: e.inheritedPorts,
             },
           ];
         } else {
@@ -602,6 +638,10 @@
             if (state === 'running' && e.input !== undefined && r.input === undefined) {
               updated.input = e.input;
             }
+            if (e.inheritedFrom !== undefined) updated.inheritedFrom = e.inheritedFrom;
+            if (e.providedPorts !== undefined) updated.providedPorts = e.providedPorts;
+            if (e.backupPorts !== undefined) updated.backupPorts = e.backupPorts;
+            if (e.inheritedPorts !== undefined) updated.inheritedPorts = e.inheritedPorts;
             // A non-resumed `running` transition is a FRESH firing of
             // this (node, frames) row. Reset its per-firing port
             // warnings so the new firing starts clean and the inspector
@@ -878,6 +918,33 @@
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'runProject', targets });
   }
+
+  // The run spec dialog's round trips: resolve through the host (the
+  // parse server runs the dispatcher's own resolver), list the specs
+  // in `examples/`, run or save one, branch to a run's version.
+  let specs = $state<import('../run-spec').RunSpec[]>([]);
+  async function resolveSpec(spec: import('../run-spec').RunSpec, seeded: boolean): Promise<import('../run-spec').ResolveSpecResponse> {
+    const reply = await hostRequest('specResolved', (requestId) => ({ kind: 'resolveSpec', requestId, spec, seeded }));
+    return reply.result;
+  }
+  function onRunSpec(spec: import('../run-spec').RunSpec, seeded = false) {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'runSpec', spec, seeded });
+  }
+  function onSaveSpec(spec: import('../run-spec').RunSpec) {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'saveSpec', spec });
+  }
+  function onRunSpecFile(name: string) {
+    editorRef?.flushAllPendingSaves?.();
+    send({ kind: 'runSpecFile', name });
+  }
+  function onListSpecs() {
+    send({ kind: 'listSpecs' });
+  }
+  function onBranchTo(reference: string) {
+    send({ kind: 'branchTo', reference });
+  }
   // Stop is generic now: the host inspects the bar's current
   // state and either kills the spawned CLI process group
   // (cli_running) or POSTs /executions/{color}/cancel
@@ -940,9 +1007,10 @@
     send({ kind: 'resumeActive' });
   }
   function onResync() {
-    // Resync deactivates first; on an Active project the user picks
-    // how (same shared picker as Deactivate). Only shown when Active
-    // in practice, but guard anyway: inactive resync needs no spec.
+    // Resync deactivates first, and the user picks how (same shared
+    // picker as Deactivate). Only offered when Active; the dispatcher
+    // refuses a resync of any other project, so the guard below only
+    // keeps a stale button from opening the picker for nothing.
     if (projectIsActive) { deactivationIntent = 'resync'; return; }
     editorRef?.flushAllPendingSaves?.();
     send({ kind: 'resyncProject' });
@@ -1054,6 +1122,7 @@
             mode={followMode}
             color={followColor}
             pendingCount={followPendingCount}
+            notPainted={runNotPainted}
             onTogglePin={() => send({ kind: 'followTogglePin' })}
             onCatchUp={() => send({ kind: 'followCatchUp' })}
             onOpenSource={() => send({ kind: 'openSource' })}
@@ -1106,6 +1175,13 @@
       {fileContents}
       {autoOrganizeOnMount}
       {onRun}
+      {specs}
+      {resolveSpec}
+      {onRunSpec}
+      {onSaveSpec}
+      {onRunSpecFile}
+      {onListSpecs}
+      {onBranchTo}
       {onStop}
       {onDismissError}
       onOpenLocation={(location) => send({ kind: 'openSource', location })}

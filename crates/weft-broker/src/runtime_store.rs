@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 use sqlx::PgPool;
 
 use weft_core::storage::key::{CallerAuth, ParsedKey};
-use weft_core::storage::{KeepTtl, PresignedPart, StorageScope, StoredFile, StoredFileMeta};
+use weft_core::storage::{KeepTtl, PartAsk, PresignedPart, StorageScope, StoredFile, StoredFileMeta};
 use weft_platform_traits::{ObjectStore, PresignAudience};
 
 use crate::entitlement::{lock_tenant_storage, EntitlementSource};
@@ -158,6 +158,18 @@ pub struct UploadSpec<'a> {
 pub enum BeginUpload {
     Ready { key: String, part_size: u64 },
     AlreadyStored { key: String },
+    /// This content is already part way up, under this key: carry on with
+    /// it ([`RuntimeStore::resume_upload`]) instead of starting again.
+    ///
+    /// Answered rather than refused because it is SAFE to carry on, even
+    /// while another uploader is doing the same: the key is the content's
+    /// hash, so both hold identical bytes, and a part is reserved by
+    /// number, so naming part 3 twice reserves it once and both writers
+    /// put the same bytes in it. Refusing instead (which is what this
+    /// used to do) left the second publish of the same asset failing for
+    /// as long as the first one's leftovers sat there, up to the hour the
+    /// sweep takes to clear an abandoned upload.
+    Resume { key: String, part_size: u64 },
 }
 
 /// Internal outcome of the begin's reservation transaction.
@@ -167,9 +179,38 @@ enum Reserved {
     /// begin whose content is active (the minted key), or an identified
     /// begin whose identity the scope holds (that file's key).
     AlreadyActive(String),
+    /// A content-addressed key whose upload is part way up, with the part
+    /// size it was begun with.
+    Pending(String, u64),
 }
 
 type StoreResult<T> = Result<T, RuntimeStoreError>;
+
+fn validate_stream_layout(parts: &std::collections::BTreeMap<i32, u64>, part_size: u64) -> StoreResult<()> {
+    for (index, (number, size)) in parts.iter().enumerate() {
+        if *number != index as i32 + 1 {
+            return Err(RuntimeStoreError::Invalid("stream parts must form a contiguous sequence starting at 1".into()));
+        }
+        if index + 1 < parts.len() && *size != part_size {
+            return Err(RuntimeStoreError::Invalid(format!("stream part {number} is short; only the final part can be short")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod stream_layout_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_contiguous_prefix_with_a_short_final_part_is_valid() {
+        let parts = |items: &[(i32, u64)]| items.iter().copied().collect();
+        assert!(validate_stream_layout(&parts(&[(1, 10), (2, 3)]), 10).is_ok());
+        assert!(validate_stream_layout(&parts(&[(2, 10)]), 10).is_err());
+        assert!(validate_stream_layout(&parts(&[(1, 3), (2, 10)]), 10).is_err());
+        assert!(validate_stream_layout(&parts(&[(1, 10), (3, 10)]), 10).is_err());
+    }
+}
 
 /// One ACTIVE `runtime_file` row as `query_active_meta` selects it:
 /// (mime_type, filename, size_bytes, keep, expires_at_unix,
@@ -574,9 +615,25 @@ impl RuntimeStore {
                 .map_err(RuntimeStoreError::Other)?;
                 match existing.as_deref() {
                     Some("active") => return Ok(Reserved::AlreadyActive(key.clone())),
+                    // Part way up. The caller is handed the key and carries
+                    // on with it; see `BeginUpload::Resume`. A row a sweep
+                    // has already fenced for reaping ('reaping') is NOT
+                    // resumable: its multipart is about to be aborted.
+                    Some("pending") => {
+                        let part_size: i64 = sqlx::query_scalar(
+                            "SELECT part_size FROM runtime_file WHERE key = $1",
+                        )
+                        .bind(&key)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .context("runtime begin_upload: read the pending part size")
+                        .map_err(RuntimeStoreError::Other)?;
+                        return Ok(Reserved::Pending(key.clone(), part_size as u64));
+                    }
                     Some(status) => {
                         return Err(RuntimeStoreError::Conflict(format!(
-                            "asset '{key}' already exists ({status})"
+                            "asset '{key}' already exists ({status}); it is being cleared from \
+                             the store, so this content's key frees itself shortly"
                         )));
                     }
                     None => {}
@@ -695,6 +752,13 @@ impl RuntimeStore {
                 abort_opened_multipart().await;
                 Ok(BeginUpload::AlreadyStored { key: existing })
             }
+            // The multipart THIS begin opened is aborted: the caller is
+            // going to carry on with the one already in flight, which has
+            // its own upload id and its own part rows.
+            Ok(Reserved::Pending(existing, part_size)) => {
+                abort_opened_multipart().await;
+                Ok(BeginUpload::Resume { key: existing, part_size })
+            }
             Err(e) => {
                 abort_opened_multipart().await;
                 Err(e)
@@ -738,6 +802,19 @@ impl RuntimeStore {
                     .map_err(RuntimeStoreError::Denied)?;
                 return self.meta(&parsed).await;
             }
+            // An assembly is not resumable: it writes parts DIRECTLY (no
+            // presigned URLs) from sources it walks in order, and the
+            // in-flight upload under this key belongs to whoever opened it,
+            // with its own multipart handle. Refused loudly rather than
+            // joined; the content is addressed by its hash, so the other
+            // upload is putting the same bytes there and this call's answer
+            // arrives on the next attempt.
+            BeginUpload::Resume { key, .. } => {
+                return Err(RuntimeStoreError::Conflict(format!(
+                    "'{key}' is already part way up; wait for that upload to finish or be \
+                     cleared, then assemble again"
+                )));
+            }
         };
         let assembled = async {
             // The multipart handle, committed with the pending row by begin.
@@ -765,6 +842,8 @@ impl RuntimeStore {
             // part-sized ranges, so memory stays bounded at ~one part
             // regardless of source-object and asset size.
             let mut buf: Vec<u8> = Vec::with_capacity(part_size as usize);
+            // Parts are numbered from 1, in the order they are written.
+            let mut part_number: i32 = 1;
             for (src, expected) in sources {
                 let actual = self
                     .bucket
@@ -805,14 +884,16 @@ impl RuntimeStore {
                     buf.extend_from_slice(&bytes);
                     while buf.len() as u64 >= part_size {
                         let chunk: Vec<u8> = buf.drain(..part_size as usize).collect();
-                        self.assemble_part(caller, &key, &upload_id, chunk, entitlements)
+                        self.assemble_part(caller, &key, &upload_id, part_number, chunk, entitlements)
                             .await?;
+                        part_number += 1;
                     }
                 }
             }
             if !buf.is_empty() {
                 let chunk = std::mem::take(&mut buf);
-                self.assemble_part(caller, &key, &upload_id, chunk, entitlements).await?;
+                self.assemble_part(caller, &key, &upload_id, part_number, chunk, entitlements)
+                    .await?;
             }
             self.complete_upload(caller, &key).await
         }
@@ -840,14 +921,22 @@ impl RuntimeStore {
         caller: &CallerAuth,
         key: &str,
         upload_id: &str,
+        part_number: i32,
         chunk: Vec<u8>,
         entitlements: &dyn EntitlementSource,
     ) -> StoreResult<()> {
         let size = chunk.len() as u64;
-        let reserved = self
-            .reserve_parts(caller, key, &[size], entitlements, PresignAudience::Internal)
-            .await?;
-        let part_number = reserved[0].part_number;
+        // The assembler counts its own parts: it is the only writer of this
+        // key and it walks the sources in order, so the part it is on is the
+        // part it says it is on.
+        self.reserve_parts(
+            caller,
+            key,
+            &[PartAsk { part_number, size_bytes: size }],
+            entitlements,
+            PresignAudience::Internal,
+        )
+        .await?;
         let etag = self
             .bucket
             .upload_part(&object_key(key), upload_id, part_number, bytes::Bytes::from(chunk))
@@ -857,11 +946,20 @@ impl RuntimeStore {
         self.record_part(caller, key, part_number, &etag).await
     }
 
-    /// Reserve + presign the caller's NEXT parts, in order. Every size must be
-    /// exactly the upload's part size except the final one (any smaller size
-    /// marks the final part; nothing can be reserved after it). Each URL is
-    /// signed with its part's EXACT size, so the bucket enforces the
-    /// reservation byte-for-byte.
+    /// Reserve + presign the parts the caller NAMES. Each URL is signed with
+    /// its part's exact size, so the bucket enforces the reservation
+    /// byte-for-byte.
+    ///
+    /// The caller names the part number, and a part number IS a position:
+    /// part `n` carries the file's bytes from `(n - 1) * part_size`. So
+    /// reserving is idempotent, and that is the point. Asking for "the next
+    /// part" meant two uploaders of the same key (the key is a content hash,
+    /// so they hold identical bytes) each extended the reservation, together
+    /// reserved more parts than the file has, and both then failed on a
+    /// total that no longer added up, leaving the upload unfinishable until
+    /// the hourly sweep removed it. Naming the part makes the second asker
+    /// get the same part as the first, write the same bytes to it, and
+    /// finish.
     ///
     /// A KNOWN-size upload was charged in full at begin, so its parts must
     /// slice exactly to the declared total (no re-charge here). An unknown-
@@ -873,13 +971,28 @@ impl RuntimeStore {
         &self,
         caller: &CallerAuth,
         key: &str,
-        sizes: &[u64],
+        asks: &[PartAsk],
         entitlements: &dyn EntitlementSource,
         audience: PresignAudience,
     ) -> StoreResult<Vec<PresignedPart>> {
         Self::wall_key(caller, key)?;
-        if sizes.is_empty() {
-            return Err(RuntimeStoreError::Invalid("no part sizes requested".into()));
+        if asks.is_empty() {
+            return Err(RuntimeStoreError::Invalid("no parts requested".into()));
+        }
+        let mut seen: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+        for ask in asks {
+            if ask.part_number < 1 || ask.part_number as u64 > MAX_PARTS {
+                return Err(RuntimeStoreError::Invalid(format!(
+                    "part number {} is out of range: parts are numbered 1 to {MAX_PARTS}",
+                    ask.part_number
+                )));
+            }
+            if !seen.insert(ask.part_number) {
+                return Err(RuntimeStoreError::Invalid(format!(
+                    "part {} is named twice in one reservation",
+                    ask.part_number
+                )));
+            }
         }
         let now = self.clock.now_unix();
         let mut tx = self
@@ -907,64 +1020,75 @@ impl RuntimeStore {
         })?;
         let part_size = pending.part_size as u64;
 
-        // Where the existing reservations stand: highest part number, bytes
-        // reserved so far, and whether the FINAL (short) part is already in.
-        let (max_part, reserved_sum, has_final): (i32, i64, bool) = sqlx::query_as(
-            "SELECT COALESCE(MAX(part_number), 0)::INT, COALESCE(SUM(size_bytes), 0)::BIGINT, \
-             EXISTS(SELECT 1 FROM runtime_file_part WHERE key = $1 AND size_bytes < $2) \
-             FROM runtime_file_part WHERE key = $1",
-        )
-        .bind(key)
-        .bind(pending.part_size)
-        .fetch_one(&mut *tx)
-        .await
-        .context("runtime reserve_parts: read existing parts")
-        .map_err(RuntimeStoreError::Other)?;
-        if has_final {
-            return Err(RuntimeStoreError::Invalid(format!(
-                "upload '{key}' already reserved its final part; complete or abort it"
-            )));
-        }
-        // Size validation: every part is exactly part_size except the last
-        // (which may be smaller), and every part is non-empty. A multipart
-        // part can never be zero bytes (S3 rejects it); an empty object
-        // uploads ZERO parts and is written directly at complete.
-        for (i, &size) in sizes.iter().enumerate() {
-            let is_last = i == sizes.len() - 1;
-            if size == 0 {
+        // A part must be at least 1 byte: a multipart part can never be zero
+        // (S3 rejects it), and an empty object uploads ZERO parts and is
+        // written directly at complete.
+        for ask in asks {
+            if ask.size_bytes == 0 {
                 return Err(RuntimeStoreError::Invalid(
                     "a part must be at least 1 byte; an empty object uploads zero parts".into(),
                 ));
             }
-            if size > part_size || (!is_last && size != part_size) {
+            if ask.size_bytes > part_size {
                 return Err(RuntimeStoreError::Invalid(format!(
-                    "part size {size} invalid: every part must be exactly {part_size} bytes \
-                     except the final one (which may be smaller)"
+                    "part {} is {} bytes, more than this upload's {part_size}-byte part size",
+                    ask.part_number, ask.size_bytes
                 )));
             }
         }
-        if max_part as u64 + sizes.len() as u64 > MAX_PARTS {
-            return Err(RuntimeStoreError::Invalid(format!(
-                "upload '{key}' would exceed {MAX_PARTS} parts; declare the total size at \
-                 begin so the part size scales"
-            )));
-        }
-        let incoming: u64 = sizes.iter().sum();
-        if let Some(declared) = pending.declared_size {
-            // Known size: the parts must be the canonical slices of the
-            // declared total, in order. Anything else is a caller bug.
-            let mut offset = reserved_sum as u64;
-            for &size in sizes {
-                let expected = part_size.min((declared as u64).saturating_sub(offset));
-                if size != expected {
+        // Which of the named parts are already reserved. A re-ask is the
+        // whole point of naming parts, so it must not be charged twice: a
+        // stream is charged per part as it goes, and charging a part the
+        // caller already paid for would inch the tenant's usage up on every
+        // retry.
+        let already: Vec<(i32, i64)> = sqlx::query_as(
+            "SELECT part_number, size_bytes FROM runtime_file_part WHERE key = $1 ORDER BY part_number",
+        )
+        .bind(key)
+        .fetch_all(&mut *tx)
+        .await
+        .context("runtime reserve_parts: read the parts already reserved")
+        .map_err(RuntimeStoreError::Other)?;
+        for ask in asks {
+            if let Some((_, size)) = already.iter().find(|(number, _)| *number == ask.part_number) {
+                if *size as u64 != ask.size_bytes {
                     return Err(RuntimeStoreError::Invalid(format!(
-                        "part at offset {offset} must be {expected} bytes to slice the \
-                         declared {declared}-byte total; got {size}"
+                        "part {} was reserved as {size} bytes; its size cannot change to {}", ask.part_number, ask.size_bytes
                     )));
                 }
-                offset += size;
+            }
+        }
+        let incoming: u64 =
+            asks.iter().filter(|a| !already.iter().any(|(number, _)| *number == a.part_number)).map(|a| a.size_bytes).sum();
+        if let Some(declared) = pending.declared_size {
+            // Known size: the layout is arithmetic, so each named part has
+            // exactly one correct size and the reservation can be checked
+            // against it without reading what else is reserved. Part `n`
+            // starts at `(n - 1) * part_size`; it is a whole part unless the
+            // file ends inside it.
+            let declared = declared as u64;
+            for ask in asks {
+                let offset = (ask.part_number as u64 - 1) * part_size;
+                if offset >= declared {
+                    return Err(RuntimeStoreError::Invalid(format!(
+                        "part {} starts at byte {offset}, past the end of the declared \
+                         {declared}-byte total",
+                        ask.part_number
+                    )));
+                }
+                let expected = part_size.min(declared - offset);
+                if ask.size_bytes != expected {
+                    return Err(RuntimeStoreError::Invalid(format!(
+                        "part {} starts at byte {offset} and must be {expected} bytes to slice \
+                         the declared {declared}-byte total; got {}",
+                        ask.part_number, ask.size_bytes
+                    )));
+                }
             }
         } else {
+            let mut layout: std::collections::BTreeMap<_, _> = already.iter().map(|(number, size)| (*number, *size as u64)).collect();
+            layout.extend(asks.iter().map(|ask| (ask.part_number, ask.size_bytes)));
+            validate_stream_layout(&layout, part_size)?;
             // Stream: charge these parts now, under the lock. The account check
             // sums THIS plane's charged bytes (already including this upload's
             // reserved_bytes) plus the other plane's, both read on this tx.
@@ -1020,21 +1144,25 @@ impl RuntimeStore {
             .context("runtime reserve_parts: charge stream parts")
             .map_err(RuntimeStoreError::Other)?;
         }
-        let mut reserved = Vec::with_capacity(sizes.len());
-        for (i, &size) in sizes.iter().enumerate() {
-            let part_number = max_part + 1 + i as i32;
+        let mut reserved = Vec::with_capacity(asks.len());
+        for ask in asks {
+            // Idempotent by part number: a part already reserved keeps the
+            // size it was reserved with, and this hands back a fresh URL for
+            // it. That is what lets two uploaders of identical content, or
+            // one uploader retrying, name the same part and agree.
             sqlx::query(
                 "INSERT INTO runtime_file_part (key, part_number, size_bytes, etag) \
-                 VALUES ($1, $2, $3, NULL)",
+                 VALUES ($1, $2, $3, NULL) \
+                 ON CONFLICT (key, part_number) DO NOTHING",
             )
             .bind(key)
-            .bind(part_number)
-            .bind(size as i64)
+            .bind(ask.part_number)
+            .bind(ask.size_bytes as i64)
             .execute(&mut *tx)
             .await
             .context("runtime reserve_parts: insert part row")
             .map_err(RuntimeStoreError::Other)?;
-            reserved.push((part_number, size));
+            reserved.push((ask.part_number, ask.size_bytes));
         }
         // A reservation is progress: refresh the abandoned-pending clock. This
         // is also the LIVENESS ASSERTION for the whole transaction: it gates on
@@ -1064,8 +1192,18 @@ impl RuntimeStore {
         // Presign AFTER the commit (no bucket I/O under the tenant lock). If a
         // presign fails here the reservations stand: the caller resumes (which
         // re-presigns exactly these parts), so nothing is stranded.
+        let (offsets, _sizes, _missing) = self
+            .part_offsets(key, &pending)
+            .await
+            .map_err(RuntimeStoreError::Other)?;
         let mut parts = Vec::with_capacity(reserved.len());
         for (part_number, size) in reserved {
+            let offset_bytes = *offsets.get(&part_number).ok_or_else(|| {
+                RuntimeStoreError::Other(anyhow::anyhow!(
+                    "part {part_number} of '{key}' was just reserved and has no row to \
+                     place it in the file; abort this upload and begin again"
+                ))
+            })?;
             let url = self
                 .bucket
                 .presign_part(
@@ -1079,7 +1217,7 @@ impl RuntimeStore {
                 .await
                 .context("runtime reserve_parts: presign part (the reservation stands; resume the upload to re-presign)")
                 .map_err(RuntimeStoreError::Other)?;
-            parts.push(PresignedPart { part_number, size_bytes: size, url });
+            parts.push(PresignedPart { part_number, size_bytes: size, offset_bytes, url });
         }
         Ok(parts)
     }
@@ -1363,6 +1501,40 @@ impl RuntimeStore {
         })
     }
 
+    /// Where each of this upload's parts starts in the file.
+    ///
+    /// Known-size uploads allow reserving parts out of order. Their offsets
+    /// come from the declared layout, never from which rows arrived first.
+    /// Streams reserve a contiguous prefix and only their final part is short.
+    #[allow(clippy::type_complexity)]
+    async fn part_offsets(
+        &self,
+        key: &str,
+        pending: &PendingUpload,
+    ) -> anyhow::Result<(std::collections::BTreeMap<i32, u64>, std::collections::BTreeMap<i32, u64>, Vec<(i32, i64)>)> {
+        let rows: Vec<(i32, i64, bool)> = sqlx::query_as(
+            "SELECT part_number, size_bytes, etag IS NULL FROM runtime_file_part \
+             WHERE key = $1 ORDER BY part_number",
+        )
+        .bind(key)
+        .fetch_all(&self.pool)
+        .await
+        .context("runtime part_offsets: read part sizes")?;
+        let mut at = 0u64;
+        let mut offsets = std::collections::BTreeMap::new();
+        let mut sizes = std::collections::BTreeMap::new();
+        let mut missing = Vec::new();
+        for (number, size, unfinished) in rows {
+            offsets.insert(number, if pending.declared_size.is_some() {
+                (number as u64 - 1) * pending.part_size as u64
+            } else { at });
+            sizes.insert(number, size as u64);
+            if unfinished { missing.push((number, size)); }
+            at += size as u64;
+        }
+        Ok((offsets, sizes, missing))
+    }
+
     /// Resume an interrupted upload: re-presign exactly the reserved parts
     /// that were never reported done. Returns the upload's part size + those
     /// parts. (A part that was uploaded but whose done-report was lost is
@@ -1371,8 +1543,9 @@ impl RuntimeStore {
         &self,
         caller: &CallerAuth,
         key: &str,
+        entitlements: &dyn EntitlementSource,
         audience: PresignAudience,
-    ) -> StoreResult<(u64, Vec<PresignedPart>)> {
+    ) -> StoreResult<(u64, Vec<PresignedPart>, u64)> {
         Self::wall_key(caller, key)?;
         let mut tx = self
             .pool
@@ -1403,17 +1576,34 @@ impl RuntimeStore {
                  pending row always carries one); abort this upload and begin again"
             ))
         })?;
-        let missing: Vec<(i32, i64)> = sqlx::query_as(
-            "SELECT part_number, size_bytes FROM runtime_file_part \
-             WHERE key = $1 AND etag IS NULL ORDER BY part_number",
-        )
-        .bind(key)
-        .fetch_all(&self.pool)
-        .await
-        .context("runtime resume_upload: read missing parts")
-        .map_err(RuntimeStoreError::Other)?;
+        // Missing parts and the resume position must describe the same rows.
+        // A reservation arriving between separate reads could otherwise move
+        // the reader past bytes that neither publisher has uploaded.
+        let (offsets, sizes, missing) = self
+            .part_offsets(key, &pending)
+            .await
+            .map_err(RuntimeStoreError::Other)?;
         let mut parts = Vec::with_capacity(missing.len());
+        if let Some(declared) = pending.declared_size {
+            // Reservation order can leave holes before the highest part. Fill
+            // them through normal reservation before returning the resume
+            // prefix, so a forward-only reader never skips unreserved bytes.
+            let highest = sizes.keys().next_back().copied().unwrap_or(0);
+            let gaps: Vec<_> = (1..=highest).filter(|number| !sizes.contains_key(number)).map(|number| {
+                let offset = (number as u64 - 1) * pending.part_size as u64;
+                PartAsk { part_number: number, size_bytes: (pending.part_size as u64).min(declared as u64 - offset) }
+            }).collect();
+            if !gaps.is_empty() {
+                parts.extend(self.reserve_parts(caller, key, &gaps, entitlements, audience).await?);
+            }
+        }
         for (part_number, size) in missing {
+            let offset_bytes = *offsets.get(&part_number).ok_or_else(|| {
+                RuntimeStoreError::Other(anyhow::anyhow!(
+                    "part {part_number} of '{key}' is missing its own row, so where its bytes \
+                     belong in the file cannot be stated; abort this upload and begin again"
+                ))
+            })?;
             let url = self
                 .bucket
                 .presign_part(
@@ -1427,9 +1617,18 @@ impl RuntimeStore {
                 .await
                 .context("runtime resume_upload: presign missing part")
                 .map_err(RuntimeStoreError::Other)?;
-            parts.push(PresignedPart { part_number, size_bytes: size as u64, url });
+            parts.push(PresignedPart { part_number, size_bytes: size as u64, offset_bytes, url });
         }
-        Ok((pending.part_size as u64, parts))
+        // Everything already carved into parts, which is where new ones
+        // begin. `offsets` holds every part row, so the end of the last
+        // one plus its size is that length.
+        let reserved_bytes = offsets
+            .iter()
+            .next_back()
+            .map(|(number, at)| at + sizes.get(number).copied().unwrap_or(0))
+            .unwrap_or(0);
+        parts.sort_by_key(|part| part.part_number);
+        Ok((pending.part_size as u64, parts, reserved_bytes))
     }
 
     /// Cancel an in-flight upload: abort the bucket's multipart upload, then

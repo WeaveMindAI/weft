@@ -48,10 +48,7 @@ pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
         "asset" => FileMarker::Asset,
         _ => return None,
     };
-    let name = match marker {
-        FileMarker::File => "@file",
-        FileMarker::Asset => "@asset",
-    };
+    let name = marker.directive();
     // Each malformation gets its own actionable message (mirroring
     // @require_one_of's split); the shape comes from the one balanced
     // scan, never re-derived by string search (a `)` inside a quoted
@@ -166,8 +163,7 @@ pub(crate) fn resolve_marker_types(value: &mut serde_json::Value) {
 }
 
 fn marker_text(file_ref: &FileRef) -> String {
-    let name = match file_ref.marker { FileMarker::File => "file", FileMarker::Asset => "asset" };
-    format!("@{name}({}, {})", serde_json::to_string(&file_ref.path).expect("a path serializes"), file_ref.ty.wire_string())
+    format!("{}({}, {})", file_ref.marker.directive(), serde_json::to_string(&file_ref.path).expect("a path serializes"), file_ref.ty.wire_string())
 }
 
 /// Does this ref DEFER to the build: an `@asset` whose type is a stored
@@ -420,7 +416,7 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
     let resolved = fs
         .reader
         .resolve_and_read(base, std::path::Path::new(&file_ref.path))
-        .map_err(|e| format!("@file {e}"))?;
+        .map_err(|e| format!("{} {e}", file_ref.marker.directive()))?;
     file_ref.ty.cast_text(&resolved.content).map(Resolved::Value)
 }
 

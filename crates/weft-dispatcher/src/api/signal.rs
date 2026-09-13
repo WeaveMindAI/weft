@@ -300,40 +300,157 @@ pub async fn listener_inspect(
         // mismatches between the placement table and the pod's
         // registry. A silenced DB error or silent JSON decode failure
         // here would defeat that. Propagate / report the failure shape.
-        // Postgres counts in a signed integer; the wire promises the
-        // CLI a count, never a sign.
-        let placed_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM signal WHERE listener_pod = $1",
+        //
+        // The placement table holds two kinds of row on purpose. A
+        // signal of a project in `LISTENER_HELD_PROJECT_STATUSES` is
+        // PLACED: expected in the pod's registry. A hibernated or
+        // parked project keeps its rows (that is what reactivate
+        // rehydrates from) while the pod has been told to forget them:
+        // PRESERVED, absent from the registry by design. Every row is
+        // named, never just counted, so the drift below can say WHICH
+        // signal is the odd one out.
+        let rows: Vec<(String, String, String, bool)> = sqlx::query_as(
+            "SELECT s.token, s.node_id, s.project_id, \
+                    COALESCE(p.status = ANY($2), FALSE) \
+             FROM signal s LEFT JOIN project p ON p.id::text = s.project_id \
+             WHERE s.listener_pod = $1 \
+             ORDER BY s.project_id, s.node_id, s.token",
         )
         .bind(&pod_name)
-        .fetch_one(&state.pg_pool)
+        .bind(&weft_broker_client::protocol::LISTENER_HELD_PROJECT_STATUSES[..])
+        .fetch_all(&state.pg_pool)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("placed_count: {e}")))?;
-        let placed_count = u64::try_from(placed_count).map_err(|_| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("placed_count: negative count {placed_count}"))
-        })?;
-        let listener_registry: Value = match http
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("placed signals: {e}")))?;
+        let (placed, preserved): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .map(|(token, node_id, project_id, held)| (PlacedSignal { token, node_id, project_id }, held))
+            .partition(|(_, held)| *held);
+        let placed: Vec<PlacedSignal> = placed.into_iter().map(|(s, _)| s).collect();
+        let preserved: Vec<PlacedSignal> = preserved.into_iter().map(|(s, _)| s).collect();
+        let listener_registry: Result<Vec<RegistryEntry>, Value> = match http
             .get(format!("{}/signals", admin_url.trim_end_matches('/')))
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(v) => v,
-                Err(e) => serde_json::json!({ "decode_error": e.to_string() }),
+            Ok(r) if r.status().is_success() => match r.json::<Vec<RegistryEntry>>().await {
+                Ok(v) => Ok(v),
+                Err(e) => Err(serde_json::json!({ "decode_error": e.to_string() })),
             },
-            Ok(r) => serde_json::json!({
+            Ok(r) => Err(serde_json::json!({
                 "http_error": r.status().as_u16(),
-            }),
-            Err(e) => serde_json::json!({ "network_error": e.to_string() }),
+            })),
+            Err(e) => Err(serde_json::json!({ "network_error": e.to_string() })),
+        };
+        // Drift is only computable against a registry the pod actually
+        // handed over; a failed ask reports the failure and no drift.
+        let (registry, drift) = match listener_registry {
+            Ok(held) => {
+                let drift = listener_drift(&placed, &preserved, &held);
+                (serde_json::to_value(held).expect("registry serializes"), Some(drift))
+            }
+            Err(failure) => (failure, None),
         };
         out.push(serde_json::json!({
             "pod_name": pod_name,
             "listener_url": admin_url,
-            "placed_signal_count": placed_count,
-            "listener_registry": listener_registry,
+            "placed_signals": placed,
+            "preserved_signals": preserved,
+            "listener_registry": registry,
+            "drift": drift,
         }));
     }
     Ok(Json(out))
+}
+
+/// One `signal` row placed on a pod, as `listener_inspect` names it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlacedSignal {
+    pub token: String,
+    pub node_id: String,
+    pub project_id: String,
+}
+
+/// One entry of a pod's in-RAM registry, as its `/signals` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryEntry {
+    pub token: String,
+    pub node_id: String,
+    pub kind: Value,
+}
+
+/// Where the placement table and a pod's registry disagree. Three
+/// shapes, each with the tokens that make it up, so an operator sees
+/// exactly which signal to chase; every list empty means no drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ListenerDrift {
+    /// In the pod's registry with no placed or preserved row behind it:
+    /// the table forgot a signal the pod still serves.
+    pub on_pod_not_placed: Vec<RegistryEntry>,
+    /// A placed row (active project) the pod does not hold: the pod
+    /// forgot a signal it should serve.
+    pub placed_not_on_pod: Vec<PlacedSignal>,
+    /// A preserved row (hibernated or parked project) the pod still
+    /// holds: deactivate told it to forget, and it did not.
+    pub preserved_on_pod: Vec<PlacedSignal>,
+}
+
+impl ListenerDrift {
+    pub fn is_empty(&self) -> bool {
+        self.on_pod_not_placed.is_empty()
+            && self.placed_not_on_pod.is_empty()
+            && self.preserved_on_pod.is_empty()
+    }
+}
+
+/// Pure comparison of the two sides by token.
+pub fn listener_drift(
+    placed: &[PlacedSignal],
+    preserved: &[PlacedSignal],
+    held: &[RegistryEntry],
+) -> ListenerDrift {
+    let held_tokens: std::collections::BTreeSet<&str> = held.iter().map(|h| h.token.as_str()).collect();
+    let placed_tokens: std::collections::BTreeSet<&str> = placed.iter().map(|p| p.token.as_str()).collect();
+    let preserved_tokens: std::collections::BTreeSet<&str> =
+        preserved.iter().map(|p| p.token.as_str()).collect();
+    ListenerDrift {
+        on_pod_not_placed: held
+            .iter()
+            .filter(|h| !placed_tokens.contains(h.token.as_str()) && !preserved_tokens.contains(h.token.as_str()))
+            .cloned()
+            .collect(),
+        placed_not_on_pod: placed.iter().filter(|p| !held_tokens.contains(p.token.as_str())).cloned().collect(),
+        preserved_on_pod: preserved.iter().filter(|p| held_tokens.contains(p.token.as_str())).cloned().collect(),
+    }
+}
+
+#[cfg(test)]
+mod listener_drift_tests {
+    use super::*;
+
+    fn placed(token: &str) -> PlacedSignal {
+        PlacedSignal { token: token.into(), node_id: format!("node_{token}"), project_id: "p".into() }
+    }
+    fn held(token: &str) -> RegistryEntry {
+        RegistryEntry { token: token.into(), node_id: format!("node_{token}"), kind: Value::from("timer") }
+    }
+
+    #[test]
+    fn a_pod_holding_exactly_its_placed_signals_has_no_drift() {
+        let drift = listener_drift(&[placed("a"), placed("b")], &[placed("z")], &[held("a"), held("b")]);
+        assert!(drift.is_empty(), "{drift:?}");
+    }
+
+    #[test]
+    fn each_kind_of_disagreement_names_its_own_token() {
+        let drift = listener_drift(
+            &[placed("a"), placed("gone")],
+            &[placed("parked"), placed("quiet")],
+            &[held("a"), held("parked"), held("stranger")],
+        );
+        assert_eq!(drift.on_pod_not_placed, vec![held("stranger")]);
+        assert_eq!(drift.placed_not_on_pod, vec![placed("gone")]);
+        assert_eq!(drift.preserved_on_pod, vec![placed("parked")]);
+    }
 }
 
 /// `POST /signal/{token}`. Dispatcher entry point for every
@@ -1091,7 +1208,11 @@ pub async fn signal_file_for_token(
     // The store's own message names the storage key, and this door
     // exists so a consumer never sees one. Say what happened in the
     // consumer's terms and keep the store's text for the operator log.
-    let link = crate::storage::download_link(&state, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS))
+    // The consumer holding this token is the one who will fetch the
+    // bytes (the browser extension showing a form), so the link comes
+    // back on the address they reached us at.
+    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let link = crate::storage::download_link(&state, &base, &file.key, Some(SIGNAL_FILE_LINK_TTL_SECS))
         .await
         .map_err(|e| {
             tracing::warn!(
@@ -1671,7 +1792,7 @@ pub async fn connect_live(
     // node + project), with auth fields for the gate.
     let row = sqlx::query(
         "SELECT s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
-                s.port_snapshot, \
+                s.port_snapshot, s.program_json, s.source_version, \
                 COALESCE(p.status, 'inactive') AS status \
          FROM signal s \
          LEFT JOIN project p ON p.id::text = s.project_id \
@@ -1690,6 +1811,12 @@ pub async fn connect_live(
     let auth_kind: String = row.try_get("auth_kind").map_err(row_err)?;
     let auth_config: Option<Value> = row.try_get("auth_config").map_err(row_err)?;
     let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
+    let program_json: Option<Value> = row.try_get("program_json").map_err(row_err)?;
+    let source_version: Option<String> = row.try_get("source_version").map_err(row_err)?;
+    let source_version = source_version.ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no original source version; activate it again")))?;
+    let program: weft_core::project::hash::ProgramIdentity = serde_json::from_value(program_json
+        .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no armed code identity; activate it again")))?)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("armed program identity: {error}")))?;
 
     // The signal spec carries the kind tag + the live-caller config. The
     // protocol is the kind itself (ApiEndpoint -> Http, LiveSocket -> Ws),
@@ -1732,7 +1859,7 @@ pub async fn connect_live(
         .tenant_for_project(&project_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    ensure_live_worker(&state, &project_id, tenant.as_str()).await?;
+    ensure_live_worker(&state, &project_id, tenant.as_str(), &program.binary_hash).await?;
 
     // Prepare + ATOMICALLY admit the execution. `prepare_live_execution`
     // builds the birth (ExecutionStarted + kicks + the pinned execute task)
@@ -1752,6 +1879,8 @@ pub async fn connect_live(
         tenant.as_str(),
         color,
         port_snapshot.as_ref(),
+        &program,
+        &source_version,
     )
     .await?;
 
@@ -1819,30 +1948,22 @@ async fn prepare_live_execution(
     tenant: &str,
     color: uuid::Uuid,
     port_snapshot: Option<&Value>,
+    program: &weft_core::project::hash::ProgramIdentity,
+    source_version: &str,
 ) -> Result<weft_task_store::tasks::AdmittedPod, (StatusCode, String)> {
-    let definition_hash = state
-        .projects
-        .running_definition_hash(project_uuid)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("hash lookup: {e}")))?
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "project has no definition_hash".into()))?;
+    let definition_hash = &program.definition_hash;
     let project_json = state
         .projects
-        .definition_for_hash(project_uuid, &definition_hash)
+        .definition_for_hash(project_uuid, definition_hash)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def lookup: {e}")))?
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no definition for hash".into()))?;
     let project_def: weft_core::ProjectDefinition = serde_json::from_str(&project_json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def parse: {e}")))?;
 
-    let Some(crate::api::project::TriggerFire { kicks, subgraph }) =
+    let crate::api::project::TriggerFire { kicks, subgraph } =
         crate::api::project::compute_trigger_fire(&project_def, node_id, &Value::Null, port_snapshot)
-    else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("live trigger '{node_id}' has nothing downstream to run"),
-        ));
-    };
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
     let now = crate::lease::now_unix() as u64;
     // The fire's computed subgraph rides on ExecutionStarted: the
@@ -1853,8 +1974,11 @@ async fn prepare_live_execution(
         weft_core::context::Phase::Fire,
         node_id,
         &kicks,
-        &definition_hash,
+        definition_hash,
+        Some(program),
         Some(&subgraph),
+        None,
+        Some(source_version),
         now,
     );
     let spec_json = serde_json::to_value(spec)
@@ -1863,16 +1987,15 @@ async fn prepare_live_execution(
     // pins it. `live_connection` carries the trigger's full signal spec so the
     // worker recovers the protocol + connection knobs and expects a caller.
     let task = crate::task_kinds::execute::execution_task_spec(
-        &state.pg_pool,
         weft_task_store::TaskKind::Execute,
         project_id,
         color,
-        &definition_hash,
+        definition_hash,
+        &program.binary_hash,
         Some(tenant),
         None,
         Some(spec_json),
     )
-    .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live task spec: {e}")))?;
 
     // Atomic admit-and-birth; if every worker is memory-saturated, nothing was
@@ -1898,7 +2021,7 @@ async fn prepare_live_execution(
             LiveAdmitOutcome::Saturated => {}
         }
         // Every worker is memory-saturated: spawn another and retry.
-        spawn_worker_pod(state, project_id, tenant).await?;
+        spawn_worker_pod(state, project_id, tenant, &program.binary_hash).await?;
         if std::time::Instant::now() >= deadline {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1950,24 +2073,13 @@ async fn ensure_live_worker(
     state: &DispatcherState,
     project_id: &str,
     tenant: &str,
+    binary_hash: &str,
 ) -> Result<(), (StatusCode, String)> {
-    // "Alive" means alive ON THE CURRENT IMAGE: a stale-image survivor
-    // cannot be admitted a new live execution (the atomic admit filters
-    // on the hash), so it must not satisfy this check either, or the
-    // handshake would skip the spawn and then find no admittable pod.
-    let want_hash = state
-        .projects
-        .running_binary_hash(
-            project_id
-                .parse::<uuid::Uuid>()
-                .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?,
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running_binary_hash: {e}")))?;
+    // Admission must find the image armed with this listener's settings.
     if weft_task_store::worker_pod::has_live_for_project(
         &state.pg_pool,
         project_id,
-        want_hash.as_deref(),
+        Some(binary_hash),
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
@@ -1975,14 +2087,14 @@ async fn ensure_live_worker(
         return Ok(());
     }
     // None alive: spawn one and wait for it.
-    spawn_worker_pod(state, project_id, tenant).await?;
+    spawn_worker_pod(state, project_id, tenant, binary_hash).await?;
     let deadline = std::time::Instant::now() + LIVE_SPAWN_WAIT;
     loop {
         tokio::time::sleep(LIVE_SPAWN_POLL).await;
         if weft_task_store::worker_pod::has_live_for_project(
             &state.pg_pool,
             project_id,
-            want_hash.as_deref(),
+            Some(binary_hash),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("pod check: {e}")))?
@@ -2008,6 +2120,7 @@ async fn spawn_worker_pod(
     state: &DispatcherState,
     project_id: &str,
     tenant: &str,
+    binary_hash: &str,
 ) -> Result<(), (StatusCode, String)> {
     // Worker placement via the single resolver (source-declares-infra
     // AND its own namespace exists -> project namespace, else shared).
@@ -2025,11 +2138,11 @@ async fn spawn_worker_pod(
             kind: weft_task_store::TaskKind::SpawnPod.into(),
             target: weft_task_store::tasks::TaskTarget::Dispatcher,
             project_id: Some(project_id.to_string()),
-            dedup_key: Some(format!("{project_id}:spawn")),
+            dedup_key: Some(format!("{project_id}:{binary_hash}:spawn")),
             color: None,
             tenant_id: Some(tenant.to_string()),
             target_pod_name: None,
-            binary_hash: None,
+            binary_hash: Some(binary_hash.to_string()),
             payload: serde_json::to_value(weft_task_store::SpawnPodPayload {
                 project_id: project_id.to_string(),
                 tenant: tenant.to_string(),
@@ -2319,6 +2432,9 @@ mod public_url_tests {
 
     fn fresh(surface: &str, mount: Option<&str>) -> SignalRegistration {
         SignalRegistration {
+            source_version: None,
+            setup_color: None,
+            program: None,
             token: "tok-1".into(),
             tenant_id: "t".into(),
             project_id: "p".into(),
@@ -2489,6 +2605,9 @@ mod can_cancel_tests {
 
     fn signal(tenant: &str, project: &str) -> SignalRegistration {
         SignalRegistration {
+            source_version: None,
+            setup_color: None,
+            program: None,
             token: "s".into(),
             tenant_id: tenant.into(),
             project_id: project.into(),
@@ -2584,6 +2703,9 @@ mod signal_file_scope_tests {
 
     fn signal(color: Option<&str>) -> SignalRegistration {
         SignalRegistration {
+            source_version: None,
+            setup_color: None,
+            program: None,
             token: "tok-1".into(),
             tenant_id: "t".into(),
             project_id: "p".into(),

@@ -144,6 +144,16 @@ struct ServerRequest {
     /// meant.
     #[serde(default)]
     mode: Option<ValidationMode>,
+    /// The run spec to resolve against the parsed program (only for
+    /// `kind: "resolveSpec"`): the editor's spec dialog asks on every
+    /// change, so every missing input is a field before the run starts.
+    #[serde(default)]
+    spec: Option<weft_core::run_spec::RunSpec>,
+    #[serde(default)]
+    bakes: Vec<weft_core::run_spec::BakeSummary>,
+    /// Seed history is evaluated at execution preparation, not by the local parser.
+    #[serde(default)]
+    seeded: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +164,22 @@ enum ServerRequestKind {
     Edit,
     /// Replay a `TextEdit` (undo/redo): apply it to `source`, parse the result.
     ApplyEdit,
+    /// Resolve a run spec against the parsed program
+    /// (`weft_core::run_spec::resolve_spec`): the same resolver the
+    /// dispatcher runs at the run, so the editor refuses what the
+    /// dispatcher would refuse, with every missing input named.
+    ResolveSpec,
+}
+
+/// Response payload for a `resolveSpec` request: what the spec resolves
+/// to, or why it cannot run. One of the two is set.
+// SYNC: ResolveSpecResponse <-> packages/weft-graph/src/run-spec.ts ResolveSpecResponse
+#[derive(Debug, Serialize)]
+struct ResolveSpecResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved: Option<weft_core::run_spec::Resolved>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<weft_core::run_spec::Refusal>,
 }
 
 /// Response payload for an `edit`/`applyEdit` request: the new source, the parse
@@ -186,7 +212,7 @@ struct ServerResponse {
 /// deactivate). A malformed or failing request answers with an `error`
 /// envelope and the loop continues: one bad request must not take the server
 /// down and stop all editor feedback.
-pub async fn serve(_ctx: Ctx) -> Result<()> {
+pub async fn serve(ctx: Ctx) -> Result<()> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     // Per-project-root warm catalog. The catalog is immutable during an
@@ -200,7 +226,7 @@ pub async fn serve(_ctx: Ctx) -> Result<()> {
             continue;
         }
         let resp = match serde_json::from_str::<ServerRequest>(&line) {
-            Ok(req) => handle_request(req, &mut catalogs),
+            Ok(req) => handle_request(req, &mut catalogs, &ctx.client()).await,
             // A request we can't parse into the typed shape may still be
             // valid JSON carrying an `id` (a stale editor talking to a
             // newer server): recover it so the host matches the reply to
@@ -227,7 +253,7 @@ pub async fn serve(_ctx: Ctx) -> Result<()> {
 /// pipeline. Project discovery walks up from the file's directory (the server
 /// has no fixed cwd project, unlike the one-shot commands). Parse is lenient
 /// and works without a project (nil id, empty catalog); validate requires one.
-fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>) -> ServerResponse {
+async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>, client: &crate::client::DispatcherClient) -> ServerResponse {
     let id = req.id;
     // Three-way: no project (lenient), a project, or a BROKEN manifest. A broken
     // `weft.toml` must surface loudly on every kind, not silently degrade to the
@@ -248,6 +274,41 @@ fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>
         ServerRequestKind::Parse => {
             match parse_source(&req.source, &project, base.as_deref(), req.file.as_deref(), catalogs, req.reload_catalog) {
                 Ok(parse_resp) => envelope(id, &parse_resp),
+                Err(e) => ServerResponse { id, payload: None, error: Some(e) },
+            }
+        }
+        ServerRequestKind::ResolveSpec => {
+            let Some(spec) = req.spec else {
+                return ServerResponse { id, payload: None, error: Some("resolveSpec requires a spec".into()) };
+            };
+            match resolve_source(&req.source, project.as_ref(), req.file.as_deref(), catalogs, req.reload_catalog) {
+                Ok(mut definition) => {
+                    if spec.fire.is_some() {
+                        let root = &project.as_ref().expect("resolution requires a project").root;
+                        if let Err(error) = super::assets::resolve_project_assets(client, root, &mut definition, None, false).await {
+                            return envelope(id, &ResolveSpecResponse {
+                                resolved: None, refusal: Some(weft_core::run_spec::Refusal::error(format!("cannot verify trigger assets: {error:#}"))),
+                            });
+                        }
+                    }
+                    let resolved = weft_core::run_spec::resolve_spec(&spec, &definition)
+                        .and_then(|mut resolved| {
+                            if let Some((node, _)) = &spec.fire {
+                                let program = preview_program(&definition, project.as_ref(), catalogs)
+                                    .map_err(weft_core::run_spec::Refusal::error)?;
+                                weft_core::run_spec::validate_fire_bake(node, &program, &req.bakes)?;
+                            }
+                            if req.seeded {
+                                resolved.warnings.push("This preview has not checked the saved run. When starting, compatible saved results may supply inputs at the cut; the input warnings describe what happens without those results.".into());
+                            }
+                            Ok(resolved)
+                        });
+                    let answer = match resolved {
+                        Ok(resolved) => ResolveSpecResponse { resolved: Some(resolved), refusal: None },
+                        Err(refusal) => ResolveSpecResponse { resolved: None, refusal: Some(refusal) },
+                    };
+                    envelope(id, &answer)
+                }
                 Err(e) => ServerResponse { id, payload: None, error: Some(e) },
             }
         }
@@ -340,10 +401,64 @@ fn edit_envelope(
     }
 }
 
-/// Lenient parse of `source` with the project's id + warm catalog. No project
-/// => nil id + empty catalog (every type is an unknown placeholder), so editing
-/// outside a project still renders. The single parse path shared by the `parse`
-/// and `edit` request kinds.
+/// The runtime graph uses full includes; the canvas's interface-only graph
+/// cannot decide cuts or claim that a bake matches compiled code.
+fn resolve_source(
+    source: &str,
+    project: Option<&Project>,
+    file: Option<&std::path::Path>,
+    catalogs: &mut HashMap<PathBuf, FsCatalog>,
+    reload: bool,
+) -> std::result::Result<weft_core::ProjectDefinition, String> {
+    let project = project.ok_or_else(|| "run preview requires a project".to_string())?;
+    let file = file.ok_or_else(|| "run preview requires the open file's path".to_string())?;
+    let reader = BufferFileReader { file: file.canonicalize().map_err(|error| error.to_string())?, source };
+    let main = project.main_weft().canonicalize().map_err(|error| error.to_string())?;
+    let source = if main == reader.file { source.to_string() }
+        else { project.read_main_weft().map_err(|error| error.to_string())? };
+    let catalog = warm_catalog(catalogs, &project.root, reload)?;
+    weft_compiler::compile_enriched_with_diagnostics(&source, project.id(),
+        weft_compiler::CompileFs::with_reader(&reader, Some(&project.root)), catalog)
+        .map_err(|diagnostics| weft_compiler::render_diagnostics(&diagnostics))
+}
+
+struct BufferFileReader<'a> {
+    file: PathBuf,
+    source: &'a str,
+}
+
+impl weft_compiler::FileReader for BufferFileReader<'_> {
+    fn resolve_and_read(&self, base: &std::path::Path, relative: &std::path::Path) -> std::result::Result<weft_compiler::ResolvedFile, String> {
+        let mut file = weft_compiler::DiskFileReader.resolve_and_read(base, relative)?;
+        if file.identity == self.file { file.content = self.source.to_string(); }
+        Ok(file)
+    }
+
+    fn identity(&self, path: &std::path::Path) -> std::result::Result<PathBuf, String> {
+        weft_compiler::DiskFileReader.identity(path)
+    }
+}
+
+/// Hash the actual runtime buffer using the same build inputs as `weft run`.
+fn preview_program(
+    definition: &weft_core::ProjectDefinition,
+    project: Option<&Project>,
+    catalogs: &mut HashMap<PathBuf, FsCatalog>,
+) -> std::result::Result<weft_core::project::hash::ProgramIdentity, String> {
+    let project = project.ok_or_else(|| "trigger preview requires a project".to_string())?;
+    let catalog = warm_catalog(catalogs, &project.root, false)?;
+    let facts = || -> anyhow::Result<weft_core::project::hash::ProgramIdentity> {
+        let root = weft_compiler::build::resolve_weft_root()?;
+        Ok(weft_core::project::hash::ProgramIdentity {
+            definition_hash: weft_compiler::hash::compute_definition_hash(definition)?,
+            binary_hash: weft_compiler::hash::compute_binary_hash(definition, project, &root, catalog, weft_compiler::codegen::NodeSet::Full)?,
+            implementations: weft_compiler::hash::implementation_hashes(definition, project, &root, catalog, weft_compiler::codegen::NodeSet::Full)?,
+        })
+    };
+    facts().map_err(|error| format!("cannot verify the buffer's trigger bake: {error:#}"))
+}
+
+/// Lenient canvas parsing keeps includes as navigable interfaces.
 fn parse_source(
     source: &str,
     project: &Option<Project>,
@@ -488,7 +603,37 @@ mod tests {
     use std::path::Path;
 
     #[test]
-    fn server_request_carries_the_validation_mode() {
+    fn runtime_preview_expands_includes_using_the_unsaved_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weft.toml"), "[package]\nname='preview'\nid='00000000-0000-0000-0000-000000000099'\nversion='0.1.0'\n").unwrap();
+        std::fs::create_dir(dir.path().join("nodes")).unwrap();
+        std::fs::write(dir.path().join("main.weft"), "batch = @include(\"batch.weft\")\n").unwrap();
+        let include = dir.path().join("batch.weft");
+        let saved = "Group(text: String) -> (out: String) {\n self.out = self.text\n}\n";
+        std::fs::write(&include, saved).unwrap();
+        let project = weft_compiler::project::Project::load(dir.path()).unwrap();
+        let mut catalogs = Default::default();
+        let original = super::resolve_source(saved, Some(&project), Some(&include), &mut catalogs, false).unwrap();
+        let edited = "Group(number: Number) -> (out: Number) {\n self.out = self.number\n}\n";
+        let current = super::resolve_source(edited, Some(&project), Some(&include), &mut catalogs, false).unwrap();
+        assert!(current.nodes.iter().any(|node| node.id == "batch__in" && node.inputs.iter().any(|port| port.name == "number")));
+        assert_ne!(weft_compiler::hash::compute_definition_hash(&original).unwrap(), weft_compiler::hash::compute_definition_hash(&current).unwrap());
+        assert_eq!(std::fs::read_to_string(&include).unwrap(), saved);
+    }
+
+    #[test]
+    fn a_resolve_spec_request_carries_its_spec() {
+        let req: ServerRequest = serde_json::from_str(
+            r#"{"id":3,"kind":"resolveSpec","source":"","spec":{"name":"x","from":{"a":{}}},"seeded":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(req.kind, ServerRequestKind::ResolveSpec));
+        assert_eq!(req.spec.unwrap().from.keys().collect::<Vec<_>>(), vec!["a"]);
+        assert!(req.seeded);
+    }
+
+    #[tokio::test]
+    async fn server_request_carries_the_validation_mode() {
         // The extension sends `mode` on validate requests; absent stays
         // None (and the validate handler then refuses the request).
         let req: ServerRequest = serde_json::from_str(
@@ -501,7 +646,7 @@ mod tests {
             serde_json::from_str(r#"{"id":2,"kind":"validate","source":""}"#).unwrap();
         assert_eq!(req.mode, None);
         // And the handler refuses it before touching any project state.
-        let resp = handle_request(req, &mut Default::default());
+        let resp = handle_request(req, &mut Default::default(), &crate::client::DispatcherClient::new("http://unused")).await;
         assert_eq!(
             resp.error.as_deref(),
             Some("validate requires a mode (\"structural\" or \"runtime\")")

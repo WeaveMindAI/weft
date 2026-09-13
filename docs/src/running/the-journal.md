@@ -83,18 +83,44 @@ you never have to scan the flat graph.
 
 ## What the journal costs
 
-One row per event. A ten-node execution is a few dozen rows.
+A ten-node execution is a few dozen rows.
 
-Two places where that adds up, and how each is handled:
+Two things make that number grow.
 
-**Buses** write one row per channel per window, one second by default, rather
-than one row per message. A journaled bus's window row carries every message in
-it, so nothing is lost and there are simply fewer rows. An ephemeral bus writes
-a rollup instead: counts and bytes per sender.
+**Buses** write one row per bus per window, one second by default, instead of
+one row per message. A journaled bus's window row carries every message in
+it. Joining, leaving and closing still cost a row each. An ephemeral bus
+journals no payloads: it keeps them in memory for the consumers reading it,
+and its window row carries only a count and a byte total per sender per
+message kind, plus the window's offset range.
 
-**Streams** write one emitted and one consumed row per item. Windowing stream
-pulses the way buses do is designed and tracked in the repository's `TODO.md`;
-until it lands, a stream of ten million items is ten million pairs of rows.
+**Streams** write one emitted and one consumed row per item, so a stream of
+ten million items writes twenty million rows. We are building the same
+windowing for streams; for where that stands, go and read [the
+roadmap](../appendix/roadmap.md#execution).
+
+## Seeded runs
+
+If you ran with `--seed`, the new run reuses part of an earlier one without
+copying a single row. The new run's first row names its parent run and
+which earlier execution supplied each reused node. The inherited facts
+stay under their original run's color.
+
+Readers interpret inherited history against its original program, then
+combine the selected facts with the child's own events. Inherited firings
+retain their input and output evidence, questions, answers, node logs and
+costs, marked with the original run. Historical costs are not new charges.
+Execution-wide state such as the parent's terminal status and live caller
+connection is not transferred to the child.
+
+If you are looking at a seeded run in the editor, a firing taken from the
+seed is outlined in blue, because the fold marks it with the run it came
+from. An input you handed in yourself is marked `provided`, and the editor
+labels it `provided by hand`.
+
+Reused history depends on its original journal. If required history has
+been cleaned, replay reports the missing source run. Start a new run
+without seeding, or select an available seed with `weft branch <run>`.
 
 ## Cleaning up
 
@@ -115,7 +141,42 @@ any more; with `--all`, every project's, the kind node's copies, stale
 --build-cache`. For what each one removes, go and read the `weft clean`
 row in [the CLI page](cli.md).
 
+Cleaning is per subject, and naming a subject takes all of it. A color
+takes that one run. `--project <id>` takes a whole project's history,
+which is how you erase a project you have already removed (removing a
+project deliberately leaves its runs behind). With no subject you get
+the age sweep: everything older than `--keep-days`, 30 by default.
+
 During a run the journal is append-only, and the dispatcher never edits a row.
+Deleting a run also removes it from the version tree ([Versions](versions.md)),
+and a version the deletion left bare (no runs, no versions under it, no
+checkpoint name, not where head is) goes with it. A checkpoint you named is
+never swept.
+
+`weft rm` is the other half of this and works the other way round: with no
+flags it unregisters the project and KEEPS its runs, along with everything
+needed to read them back (the code each one ran, and its row in the version
+tree). `weft rm --journal` is what throws those away.
+
+## A past run that shows nothing
+
+A run's rows say what happened, not what it meant. Every input and
+output you see in the editor is worked out afterwards by replaying those
+rows against the code the run ran, so a run whose code the dispatcher no
+longer holds paints as a graph with all its nodes and none of its
+values. The editor says so on the run itself rather than leaving you to
+guess: the code is not recorded any more, here is what to do.
+
+The code is kept for as long as any run points at it, removing a project
+included, so this is rare. What gets you there is deleting the last run
+that needed a version, or a journal older than the release that started
+keeping them.
+
+If you still have those files, `weft build` in the project folder puts the
+code back: registering records the compiled program under its own hash,
+and that hash is what the run names, so unchanged files restore exactly
+what it was folded against and it reads as it did. If you do not have
+them, `weft clean <color>` removes the run.
 
 ## Holes
 

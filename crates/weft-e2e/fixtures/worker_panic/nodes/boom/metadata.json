@@ -1,0 +1,21 @@
+{
+  "type": "Boom",
+  "label": "Boom",
+  "description": "Panics on demand, inside node code. Used by the e2e rig to prove a panicking node fails its execution loudly, leaves the worker healthy for the next run, and releases everything that execution registered on the pod.",
+  "tags": ["e2e", "failure"],
+  "icon": "Bomb",
+  "color": "#b45454",
+  "inputs": [
+    {
+      "name": "explode",
+      "type": "Boolean",
+      "widget": { "kind": "checkbox" },
+      "default": true,
+      "label": "Panic"
+    }
+  ],
+  "outputs": [
+    { "name": "done", "type": "String" }
+  ],
+  "requires_infra": false
+}

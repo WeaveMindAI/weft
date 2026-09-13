@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { Play, Square, Zap, Database, Loader2 } from '@lucide/svelte';
+	import { Play, Square, Zap, Database, Loader2, ChevronDown } from '@lucide/svelte';
+	import { specSummary, specForAction, type RunSpec } from '../../../../run-spec';
 	import type {
 		ActionBarState,
 		ActionAvailability,
@@ -12,11 +13,18 @@
 	import ErrorDetailsModal from './ErrorDetailsModal.svelte';
 	import { runLabel } from '../../run-targets';
 
+	let specMenuOpen = $state(false);
+
 	let {
 		state: barState,
 		drift,
 		onRun,
 		runTargetCount,
+		specs = [],
+		focusedGroup = null,
+		onRunSpec,
+		onOpenSpecDialog,
+		onOpenSpecMenu,
 		onActivate,
 		onCancelActivate,
 		onCancelBuild,
@@ -59,6 +67,18 @@
 		/// How many output nodes the run is aimed at. Zero is the ordinary
 		/// run, and the button says so plainly.
 		runTargetCount?: number;
+		/// The project's specs (`examples/*.json`), already ordered with
+		/// the ones scoped to `focusedGroup` first, for the Run menu.
+		specs?: RunSpec[];
+		/// The group the user stands in (inside an include), if any: the
+		/// menu offers "Run this group" for it first.
+		focusedGroup?: string | null;
+		/// Run a saved spec by name (`weft run <name>`).
+		onRunSpec?: (name: string) => void;
+		/// Open the spec dialog, with a spec filled in or blank.
+		onOpenSpecDialog?: (initial?: RunSpec) => void;
+		/// The menu is opening: refresh the spec list.
+		onOpenSpecMenu?: () => void;
 		onActivate?: () => void;
 		// Mid-activate: cancel TriggerSetup, wipe partial signals,
 		// flip back to Inactive.
@@ -244,6 +264,7 @@
 			case 'activate':
 			case 'reactivate':
 			case 'resume_active': return 'Activating triggers...';
+			case 'bake': return 'Preparing trigger settings...';
 			case 'cancel_activate': return 'Cancelling activate...';
 			case 'cancel_build': return 'Cancelling build...';
 			case 'deactivate': return 'Deactivating triggers...';
@@ -720,14 +741,48 @@
 			<span class={labelCss}>Stop Execution</span>
 		</button>
 	{:else if slot.kind === 'run' && onRun}
-		<button
-			class="{btn} {btnDisabled} px-6 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800"
-			onclick={onRun}
-			disabled={!slot.enabled}
-		>
-			<Play class="w-3.5 h-3.5" />
-			<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
-		</button>
+		<div class="relative flex items-stretch">
+			<button
+				class="{btn} {btnDisabled} px-6 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-r-none"
+				onclick={onRun}
+				disabled={!slot.enabled}
+			>
+				<Play class="w-3.5 h-3.5" />
+				<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
+			</button>
+			<!-- The Run menu: the project's specs, "Run this group" when the
+			     user stands inside one, and the dialog for a one-off. -->
+			<button
+				class="{btn} {btnDisabled} px-1.5 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-l-none border-l border-l-zinc-700"
+				onclick={() => { specMenuOpen = !specMenuOpen; if (specMenuOpen) onOpenSpecMenu?.(); }}
+				disabled={!slot.enabled}
+				title="Run a spec"
+			>
+				<ChevronDown class="w-3.5 h-3.5" />
+			</button>
+			{#if specMenuOpen}
+				<div class="absolute right-0 top-full mt-1 z-50 min-w-64 bg-white border rounded-lg shadow-lg p-1 text-xs">
+					{#if focusedGroup}
+						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted font-medium" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(specForAction('group', focusedGroup)); }}>
+							Run this group ({focusedGroup})…
+						</button>
+					{/if}
+					{#each specs as spec (spec.name)}
+						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted flex justify-between gap-3" onclick={() => { specMenuOpen = false; onRunSpec?.(spec.name); }}>
+							<span class="font-mono">{spec.name}</span>
+							<span class="text-zinc-400">{specSummary(spec)}</span>
+						</button>
+					{/each}
+					{#if specs.length === 0}
+						<div class="px-2 py-1.5 text-zinc-400">no specs in examples/</div>
+					{/if}
+					<div class="my-1 border-t"></div>
+					<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(); }}>
+						Run from a spec…
+					</button>
+				</div>
+			{/if}
+		</div>
 	{/if}
 {/snippet}
 
@@ -821,4 +876,3 @@
 		<span class={labelCss}>Resync</span>
 	</button>
 {/snippet}
-

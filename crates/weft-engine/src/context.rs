@@ -97,6 +97,9 @@ pub struct EngineClients {
     /// refuse to die while this is non-zero, so money is never dropped by
     /// a shutdown racing a resolve.
     pub pending_costs: Arc<crate::metering::PendingCostRecords>,
+    /// Charges opened by a call whose amount only a later response
+    /// states, held pod-wide until that response lands.
+    pub open_charges: Arc<crate::metering::OpenCharges>,
 }
 
 impl EngineClients {
@@ -144,6 +147,7 @@ impl EngineClients {
                 token,
             ),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            open_charges: crate::metering::OpenCharges::new(),
         }
     }
 }
@@ -1873,6 +1877,7 @@ pub async fn ship_port_emissions(
                 frames: frames.clone(),
                 port: port.clone(),
                 value: value.clone(),
+                provided: false,
                 at_unix: now_unix(),
             },
             pod_name,
@@ -1913,6 +1918,7 @@ pub async fn ship_port_closed(
             node_id: node_id.to_string(),
             frames: frames.clone(),
             port: port.to_string(),
+            provided: false,
             at_unix: now_unix(),
         },
     };
@@ -2039,15 +2045,18 @@ impl ContextHandle for RunnerHandle {
         )
         .await
         .map_err(|e| WeftError::Suspension(format!("request token: {e}")))?;
+        let weft_core::primitive::RegisterSignalResult::Registered { token } = reply else {
+            return Err(WeftError::Suspension("await_signal was captured instead of registered".into()));
+        };
         tracing::info!(
             target: "weft_engine::suspend",
             node = %self.node_id,
             color = %self.color,
             call_index = call_index,
-            token = %reply.token,
+            token = %token,
             "await_signal: registered; returning Suspended",
         );
-        Err(WeftError::Suspended { token: reply.token })
+        Err(WeftError::Suspended { token })
     }
 
     /// Replay-side of `ctx.run`. Pops the next entry in the
@@ -2425,12 +2434,14 @@ impl ContextHandle for RunnerHandle {
         )
         .await
         .map_err(|e| WeftError::Suspension(format!("register_signal: {e}")))?;
+        if !matches!(reply, weft_core::primitive::RegisterSignalResult::Captured) {
+            return Err(WeftError::Suspension("trigger setup armed a listener instead of capturing its parameters".into()));
+        }
         tracing::info!(
             target: "weft_engine::register",
             node = %self.node_id,
             color = %self.color,
-            token = %reply.token,
-            "register_signal: dispatcher ack"
+            "register_signal: captured"
         );
         Ok(())
     }
@@ -2519,6 +2530,7 @@ impl ContextHandle for RunnerHandle {
         let sink = Arc::new(crate::metering::CostSink {
             tasks: self.clients.tasks.clone(),
             pending: self.clients.pending_costs.clone(),
+            open_charges: self.clients.open_charges.clone(),
             project_id: self.project_id.clone(),
             tenant_id: self.tenant_id.clone(),
             color: self.color,
@@ -2793,15 +2805,6 @@ impl ContextHandle for RunnerHandle {
     }
 }
 
-/// Reply shape from a `register_signal` task. Mirrors
-/// `weft-dispatcher::task_kinds::register_signal::RegisterSignalResult`
-/// but lives here because the engine can't depend on the
-/// dispatcher.
-#[derive(Debug, serde::Deserialize)]
-struct RegisterSignalReply {
-    token: String,
-}
-
 async fn enqueue_register_signal_task(
     tasks: &dyn TaskStoreClient,
     color: Color,
@@ -2812,7 +2815,7 @@ async fn enqueue_register_signal_task(
     tenant_id: &str,
     call_index: u32,
     port_snapshot: Option<Value>,
-) -> anyhow::Result<RegisterSignalReply> {
+) -> anyhow::Result<weft_core::primitive::RegisterSignalResult> {
     // Task-level dedup so retries (network blip, supervisor
     // reconnect) converge on the same token. `is_resume` is in the
     // key because the same (color, node, frames, call_index) tuple can
@@ -3091,6 +3094,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            open_charges: crate::metering::OpenCharges::new(),
             steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
@@ -3158,6 +3162,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker,
             pending_costs: crate::metering::PendingCostRecords::new(),
+            open_charges: crate::metering::OpenCharges::new(),
             steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
@@ -3420,6 +3425,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: worker_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            open_charges: crate::metering::OpenCharges::new(),
             steering: Arc::new(NoopSteering),
         };
         let color = uuid::Uuid::from_u128(0xC0);
@@ -3456,6 +3462,7 @@ mod replay_tests {
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: test_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
+            open_charges: crate::metering::OpenCharges::new(),
             steering: Arc::new(NoopSteering),
         };
         let runner = crate::test_rig::LiveTestRunner::new(

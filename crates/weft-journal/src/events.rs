@@ -22,12 +22,25 @@
 //! older shape does not decode, the read that hits it fails naming
 //! the color, and `weft clean` removes the execution.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use weft_core::frames::LoopFrames;
 use weft_core::primitive::{LoopTerminationReason, SignalSpec};
 use weft_core::Color;
+
+/// The chosen origin of each reused result, independent of which nodes
+/// execute in the child. Readers reconstruct each origin under its own
+/// birth context and import history without replaying its scheduling.
+// SYNC: Seed <-> packages/weft-graph/src/protocol.ts Seed
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seed {
+    pub parent: Color,
+    pub origins: BTreeMap<String, Color>,
+}
 
 /// One event in the execution log. Append-only; events are never
 /// edited or deleted by the dispatcher. User-initiated cleanup
@@ -53,6 +66,10 @@ pub enum ExecEvent {
         /// color fails loudly as NotFound instead of resuming
         /// against a sentinel hash.
         definition_hash: Option<String>,
+        /// Graph and production implementation identity for reuse and bake.
+        program: Option<weft_core::project::hash::ProgramIdentity>,
+        /// Immutable source version used to start this execution.
+        source_version: Option<String>,
         /// True for a node self-test's execution identity: the color
         /// is real (cost attribution, broker scoping, a terminal
         /// event) but its lifecycle is owned by the test task, so
@@ -72,7 +89,13 @@ pub enum ExecEvent {
         /// `NodeDefinition.scope` is a node's group-nesting path, a
         /// different thing entirely.)
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        subgraph: Option<Vec<String>>,
+        subgraph: Option<weft_core::project::selection::RunSelection>,
+        /// The run this one was seeded from and what it may not take
+        /// from it (`weft run --seed`). `None` for a run that starts
+        /// from nothing. Rows this run inherited never exist under its
+        /// color: they are read off the seed's journal at fold time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<Seed>,
         at_unix: u64,
     },
 
@@ -203,6 +226,11 @@ pub enum ExecEvent {
         /// writing the row copies nothing (serde reads through the
         /// `Arc`).
         value: std::sync::Arc<Value>,
+        /// Authored `--emit` output, supplied without executing its source.
+        /// The fold fans it out through selected wires and marks receiving
+        /// ports as provided. Starting input backups live on RunSelection.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        provided: bool,
         at_unix: u64,
     },
 
@@ -217,6 +245,8 @@ pub enum ExecEvent {
         node_id: String,
         frames: LoopFrames,
         port: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        provided: bool,
         at_unix: u64,
     },
 
@@ -332,6 +362,15 @@ pub enum ExecEvent {
         group_id: String,
         parent_frames: LoopFrames,
         reason: LoopTerminationReason,
+        at_unix: u64,
+    },
+
+    /// Setup evaluated this trigger without arming a listener.
+    TriggerCaptured {
+        color: Color,
+        node_id: String,
+        spec: SignalSpec,
+        port_snapshot: Value,
         at_unix: u64,
     },
 
@@ -601,6 +640,7 @@ impl ExecEvent {
             | Self::LoopStreamEnded { color, .. }
             | Self::LoopTerminated { color, .. }
             | Self::SuspensionRegistered { color, .. }
+            | Self::TriggerCaptured { color, .. }
             | Self::SuspensionResolved { color, .. }
             | Self::RunOutput { color, .. }
             | Self::CostReported { color, .. }
@@ -643,6 +683,7 @@ impl ExecEvent {
             | Self::LoopStreamEnded { at_unix, .. }
             | Self::LoopTerminated { at_unix, .. }
             | Self::SuspensionRegistered { at_unix, .. }
+            | Self::TriggerCaptured { at_unix, .. }
             | Self::SuspensionResolved { at_unix, .. }
             | Self::RunOutput { at_unix, .. }
             | Self::CostReported { at_unix, .. }
@@ -684,6 +725,7 @@ impl ExecEvent {
             Self::LoopStreamEnded { .. } => "loop_stream_ended",
             Self::LoopTerminated { .. } => "loop_terminated",
             Self::SuspensionRegistered { .. } => "suspension_registered",
+            Self::TriggerCaptured { .. } => "trigger_captured",
             Self::SuspensionResolved { .. } => "suspension_resolved",
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
@@ -750,9 +792,10 @@ mod wire_tests {
                 frames: frames.clone(),
                 port: "out".into(),
                 value: std::sync::Arc::new(json!({ "nested": { "deep": [1, 2, { "k": null }] } })),
+                provided: false,
                 at_unix: 1,
             },
-            ExecEvent::PortClosed { color: color(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), at_unix: 1 },
+            ExecEvent::PortClosed { color: color(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), provided: false, at_unix: 1 },
             ExecEvent::PortTypeMismatch {
                 color: color(),
                 emission_id: emission,
@@ -850,8 +893,12 @@ mod wire_tests {
                 entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("h".into()),
-                node_test: false,
-                subgraph: Some(vec!["out".into(), "src".into()]),
+                program: None, source_version: Some("version".into()), node_test: false,
+                subgraph: Some(weft_core::project::selection::RunSelection {
+                    nodes: ["out".into(), "src".into()].into_iter().collect(),
+                    ..Default::default()
+                }),
+                seed: Some(Seed { parent: color(), origins: BTreeMap::from([("source".into(), color())]) }),
                 at_unix: 7,
             },
             ExecEvent::ExecutionStarted {
@@ -860,8 +907,9 @@ mod wire_tests {
                 entry_node: "node-test:MyNode::my_test".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: None,
-                node_test: true,
+                program: None, source_version: None, node_test: true,
                 subgraph: None,
+                seed: None,
                 at_unix: 7,
             },
             ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
@@ -873,8 +921,8 @@ mod wire_tests {
             ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
             ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
             ExecEvent::NodeCancelled { color: color(), node_id: "n".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
-            ExecEvent::PortEmitted { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), at_unix: 1 },
-            ExecEvent::PortClosed { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), at_unix: 1 },
+            ExecEvent::PortEmitted { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), provided: true, at_unix: 1 },
+            ExecEvent::PortClosed { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), provided: false, at_unix: 1 },
             ExecEvent::PortTypeMismatch { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), expected: "String".into(), actual: "Number".into(), at_unix: 1 },
             ExecEvent::PulsesConsumed { color: color(), node_id: "n".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
             ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: vec![], at_unix: 1 },
@@ -963,4 +1011,3 @@ mod wire_tests {
         assert!(serde_json::from_value::<ExecEvent>(old_skip).is_err(), "a skip without its reason is refused");
     }
 }
-

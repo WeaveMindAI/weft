@@ -276,7 +276,34 @@ async fn process_one_row(
     // first pod observing the terminal row removes the signal
     // entries; sibling pods see an empty result and skip.
     match &event {
+        ExecEvent::ExecutionStarted { phase: weft_core::context::Phase::Fire, node_test: false, .. } => {
+            crate::api::versions::record_trigger_run(state, color).await?;
+        }
         e if e.is_execution_terminal() => {
+            // Publication precedes the completion notification. The durable
+            // cursor retries this after a dispatcher dies, even if the request
+            // that started the bake no longer exists.
+            if state.journal.is_trigger_setup_pending(color).await? {
+                // Storage failures retry. A permanently unreadable capture must
+                // release its ownership without replacing the last good bake.
+                let (rows, bad) = state.journal.events_log_lossy(color).await?;
+                let capture = match bad.into_iter().next() {
+                    Some(reason) => Err(anyhow::Error::msg(reason)),
+                    None => crate::journal::TriggerBake::from_events(
+                        &rows.into_iter().map(|row| row.event).collect::<Vec<_>>(),
+                    ),
+                };
+                match capture {
+                    Ok(bake) => state.journal.finish_trigger_setup(color, bake.as_ref()).await?,
+                    Err(error) => {
+                        state.journal.finish_trigger_setup(color, None).await?;
+                        publish_unreadable(state, color, &project_id,
+                            weft_core::primitive::CorruptionSite::UndecodableRow,
+                            format!("cannot save trigger bake: {error:#}; the last good bake is preserved. Run `weft bake` again to refresh it."),
+                        ).await;
+                    }
+                }
+            }
             terminal_cleanup(state, color).await?;
             // Storage terminate sweep: queue the un-kept exec-file
             // sweep DURABLY (workers stall-then-die, so worker-side
@@ -357,19 +384,27 @@ async fn open_projection<'c>(
     row_id: i64,
     event: &ExecEvent,
 ) -> anyhow::Result<&'c mut LiveProjection> {
-    let program = match execution_program(state, color).await? {
-        ProgramLookup::Unreadable(reason) => {
-            publish_unreadable(state, color, &project_id, reason).await;
-            ProgramLookup::Unreadable(String::new())
+    // Whatever stops this run from painting whole, say it once, here,
+    // as the projection opens. The projector then carries a reason-less
+    // copy of the same state: the corruption is published, and the
+    // projection must not republish it on every later row.
+    let found = execution_program(state, color).await?;
+    let program = match found.unpaintable() {
+        Some((site, reason)) => {
+            let reason = reason.to_string();
+            publish_unreadable(state, color, &project_id, site, reason).await;
+            found.without_reason()
         }
-        found => found,
+        None => found,
     };
     let projector = if matches!(event, ExecEvent::ExecutionStarted { .. }) {
-        ExecutionProjector::new(color, program, project_id)
+        let inheritance = inheritance_or_unreadable(state, color, &project_id, std::slice::from_ref(event), &program).await;
+        ExecutionProjector::new(color, program, project_id).with_inheritance(inheritance)
     } else {
         match rows_before(&state.pg_pool, color, row_id).await? {
             CatchUp::Rows(earlier) => {
-                let mut projector = ExecutionProjector::new(color, program, project_id);
+                let inheritance = inheritance_or_unreadable(state, color, &project_id, &earlier, &program).await;
+                let mut projector = ExecutionProjector::new(color, program, project_id).with_inheritance(inheritance);
                 for row in &earlier {
                     projector.project(row);
                 }
@@ -380,6 +415,7 @@ async fn open_projection<'c>(
                     state,
                     color,
                     &project_id,
+                    weft_core::primitive::CorruptionSite::UndecodableRow,
                     format!("row {row_id} of this execution no longer decodes: {reason}"),
                 )
                 .await;
@@ -394,6 +430,32 @@ async fn open_projection<'c>(
     Ok(cursor.projectors.get_mut(&color).expect("inserted just above"))
 }
 
+/// The seed chain a run inherits, or an empty one with the reason
+/// published as the run's corruption (a cleaned seed leaves the run's
+/// own rows paintable and its inherited nodes empty on the screen).
+async fn inheritance_or_unreadable(
+    state: &DispatcherState,
+    color: weft_core::Color,
+    project_id: &str,
+    rows: &[ExecEvent],
+    program: &ProgramLookup,
+) -> weft_journal::SeedChain {
+    match crate::projection::execution_inheritance(state, rows, program).await {
+        Ok(chain) => chain,
+        Err(reason) => {
+            publish_unreadable(
+                state,
+                color,
+                project_id,
+                weft_core::primitive::CorruptionSite::UndecodableRow,
+                reason,
+            )
+            .await;
+            weft_journal::SeedChain::default()
+        }
+    }
+}
+
 /// A color whose journal cannot be read back: logged, and published
 /// as the same corruption event the replay read publishes, so the
 /// screen shows the run as unreadable and names `weft clean`.
@@ -401,6 +463,7 @@ async fn publish_unreadable(
     state: &DispatcherState,
     color: weft_core::Color,
     project_id: &str,
+    site: weft_core::primitive::CorruptionSite,
     reason: String,
 ) {
     tracing::error!(
@@ -413,7 +476,7 @@ async fn publish_unreadable(
         crate::events::DispatcherEvent::JournalCorruption {
             color,
             project_id: project_id.to_string(),
-            site: weft_core::primitive::CorruptionSite::UndecodableRow,
+            site,
             reason,
         },
     );

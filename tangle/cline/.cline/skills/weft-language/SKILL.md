@@ -303,21 +303,20 @@ emits `true` on the winning case's port, closing the rest; wire a case port
 into the branch's `_should_flow`. `FirstInOrder` emits the first of its inputs
 that carried a value, in written order, merging alternative paths.
 
-What runs: a manual run kicks every root (a top-level node no wire feeds).
-A trigger is a root, and with no event behind it its outputs close and prune
-its branch, so a hand run exercises the paths that need no trigger.
-`--target <node>` (repeatable, any node) runs those nodes and what they
-need: the union when you name several, nothing past a target, no sibling
-branch even one sharing a root, and a target inside a group brings the
-whole group and whatever feeds the group's inputs. A trigger fire runs the
-fired trigger's own program:
-everything downstream of it, plus what that needs upstream, stopping at
-other triggers (a trigger's outputs are the event, not a function of its
-inputs, which were read once at activation). Every node the fire reaches
-runs. One file can hold several programs, one per trigger, and they may
-share upstream nodes (one database, one provider): on a fire the shared
-node runs for the fired program and the other programs are left without a
-trace.
+What runs: a manual run starts ordinary roots within its selection.
+A trigger requires one explicit fire or supplied emitted outputs.
+`--target <node>` runs through that endpoint; `--before <node>` excludes
+it. Repeated endpoints select the union of their required work.
+Ordinary groups are cut precisely, with their flow gates still applied;
+loops stay whole and refuse interior cuts. A shared root does not dispatch
+work outside the selection.
+
+A trigger fire starts from exactly that trigger and follows its program,
+including the dependencies needed downstream. Its input settings come from
+matching preparation; its wake payload belongs to this event. Other triggers
+are not fired. Preparation and infra extraction also stop precisely inside
+ordinary groups and refuse interior loop cuts. One file can hold several
+trigger programs sharing dependencies without executing unrelated branches.
 
 Ends: completed (no pulse in flight), suspended (every live firing parked on
 an external wait: a person, a timer; costs nothing), stuck (provably

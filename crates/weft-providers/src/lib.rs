@@ -44,6 +44,21 @@ pub enum RouteClass {
     /// node re-querying its own cost harmless (it gets its answer and is
     /// billed nothing) and the meter's own follow-up query safe to make.
     Free,
+    /// A route that costs nothing itself, but whose response REPORTS on a
+    /// billable call made earlier.
+    ///
+    /// A queue-style provider commits the money when a job is submitted
+    /// and only states the amount once that job has finished, on a later
+    /// read (fal submits at `POST <model>` and reports at
+    /// `GET <app>/requests/<id>`). Watched like a billable route, booked
+    /// like a free one: its observation never opens a charge of its own,
+    /// it closes the one the submit opened. Pairing a report to its charge
+    /// and booking the figure are the worker's job, so a meter for such a
+    /// provider stays declarative and never polls anything itself
+    /// ([`ProviderMeter::opens_charge`] names the charge,
+    /// [`ProviderMeter::charge_reported_on`] names which charge a report
+    /// speaks for, [`ProviderMeter::fold_report`] reads the figure).
+    Reports,
     /// A long-lived two-way channel (a WebSocket) whose cost accrues from
     /// the frames that travel it, with no total knowable up front. Measured
     /// by a [`SessionObservation`] fed every frame both directions; admitted
@@ -107,6 +122,16 @@ pub struct FollowUp<'a> {
 /// `amount_usd: None` means the cost is genuinely unknown (e.g. the stream
 /// was cut before the usage arrived and the provider has no ledger to ask).
 /// An unknown is recorded AS unknown; it is never booked as $0.
+///
+/// Before writing a `None` branch, go and find what the provider itself
+/// reports for the call: a field in the response, a header
+/// ([`CallObservation::on_headers`]), or a ledger the meter can ask through
+/// [`FollowUp`]. `None` is for a figure the provider will not give, never for
+/// one nobody went looking for. A meter that re-derives the quantity from the
+/// REQUEST instead prices the easy models and goes quiet on the ones whose
+/// charge the request does not decide (a token-priced model whose quality
+/// setting moves the token count, a model that falls back to per-second GPU
+/// billing), which is unmetered spend wearing the shape of a measurement.
 #[derive(Debug, Clone)]
 pub struct MeasuredCost {
     pub amount_usd: Option<f64>,
@@ -124,6 +149,19 @@ pub struct MeasuredCost {
 pub trait CallObservation: Send {
     /// The response status line arrived. Called once, before any chunk.
     fn on_status(&mut self, status: u16);
+
+    /// The response headers arrived. Called once, after
+    /// [`Self::on_status`] and before any chunk.
+    ///
+    /// This is where a provider that states the charge out of band puts
+    /// it (fal's `X-Fal-Billable-Units` is the billed quantity itself,
+    /// already denominated in the unit its rate card prices). A meter
+    /// that reads it gets the provider's OWN number instead of
+    /// re-deriving one from the request, which is the difference
+    /// between measuring a call and guessing at it.
+    ///
+    /// Default: ignore them, for a provider that says nothing useful here.
+    fn on_headers(&mut self, _headers: &http::HeaderMap) {}
     /// One chunk of response body bytes, in order.
     fn on_chunk(&mut self, bytes: &[u8]);
     /// The response ended. `interrupted` = it was cut before the provider
@@ -177,7 +215,14 @@ pub trait ProviderMeter: Send + Sync {
     /// `Ok(None)` = send as-is. An unparseable body on a route that needs
     /// rewriting is a loud error: an unpreparable call would produce an
     /// unmeasurable spend.
-    fn prepare(&self, path: &str, body: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
+    ///
+    /// Most providers report what a call cost without being asked, so
+    /// the default sends the body untouched and only a meter that has
+    /// something to opt into writes this. It used to be required, which
+    /// made every author write the same no-op.
+    fn prepare(&self, _path: &str, _body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
 
     /// The worst-case price this provider could charge for the Billable call
     /// described by `body`: computed BEFORE the call goes out, from the
@@ -290,6 +335,93 @@ pub trait ProviderMeter: Send + Sync {
         observed: ObservedCall,
         follow_up: FollowUp<'_>,
     ) -> MeasuredCost;
+
+    /// Whether a call on this route can be priced at all once it comes
+    /// back, asked BEFORE it is sent.
+    ///
+    /// Separate from [`Self::ceiling_usd`], which asks a different
+    /// question: what the worst case costs. A call can be perfectly
+    /// priceable afterwards and still have no bound before (a model
+    /// billed by GPU time), and the two must not gate each other.
+    ///
+    /// This is the gate for the case nothing downstream can recover
+    /// from: a call the meter could never put a figure on, no matter
+    /// what the provider answers. fal's is a model its pricing catalog
+    /// lists no price for, since the unit price is the only place a
+    /// price exists. Refusing here costs the caller nothing; letting the
+    /// call go means spending money that can only ever be recorded as
+    /// unknown.
+    ///
+    /// `Ok(())` admits the call. The error is shown to the caller, so
+    /// name the model or route and say what would make it priceable.
+    /// The default admits, for a provider that can always price what it
+    /// answers.
+    async fn priceable(&self, _path: &str, _follow_up: FollowUp<'_>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether this billable call's amount is only stated by a LATER
+    /// response, and under what id the two are tied together.
+    ///
+    /// A provider that answers the charge inline says `None` (the
+    /// default) and is priced by [`Self::resolve`] there and then. A
+    /// queue-style provider answers `Some(id)`: the call spent money
+    /// whose figure does not exist yet, so the harness opens a charge
+    /// under `id` and holds it until a [`RouteClass::Reports`] response
+    /// answers for it. [`Self::resolve`] is NOT called for such a call;
+    /// the observation's `data` becomes the open charge's scratch, so
+    /// whatever the submit knew (the model, for one) is already there
+    /// when the report lands.
+    ///
+    /// `path` arrives as a FACT (relative, as [`Self::classify`]
+    /// received it) so a meter never infers which call this was from the
+    /// response's shape, the same rule [`Self::resolve`] follows.
+    ///
+    /// Answered from the observation alone, with no I/O, because the
+    /// charge has to be open before the caller's next request can report
+    /// on it.
+    ///
+    /// The id must be one the PROVIDER assigned, read out of the
+    /// response: a job id, a request id, a task id. Never one the meter
+    /// invented, and never one taken from the request. The harness keeps
+    /// the charge under `(service, id)`, and a report arrives carrying
+    /// nothing but its own response, so two runs whose ids the meter
+    /// chose rather than read will collide, and the figure one of them
+    /// reports is then booked against the other run's spend.
+    fn opens_charge(&self, _path: &str, _observed: &ObservedCall) -> Option<String> {
+        None
+    }
+
+    /// Which open charge a [`RouteClass::Reports`] response speaks for,
+    /// as the id [`Self::opens_charge`] named it by. `None` means this
+    /// response reports on nothing the harness is holding, and it is
+    /// dropped.
+    fn charge_reported_on(&self, _path: &str, _observed: &ObservedCall) -> Option<String> {
+        None
+    }
+
+    /// Fold one report into the charge it speaks for, and price the
+    /// charge if this report finished it.
+    ///
+    /// `scratch` is the open charge's meter-owned state, seeded with the
+    /// billable call's own observation data and carried across every
+    /// report. A provider that states its figure across more than one
+    /// response accumulates here (fal's status route measures the run
+    /// time, its result route states the billed count) and returns
+    /// `None` until the picture is complete.
+    ///
+    /// `Some(cost)` closes the charge and books it. Never errors: a
+    /// charge that finished with no honest figure is `amount_usd: None`,
+    /// recorded as unknown.
+    async fn fold_report(
+        &self,
+        _path: &str,
+        _observed: ObservedCall,
+        _scratch: &mut Value,
+        _follow_up: FollowUp<'_>,
+    ) -> Option<MeasuredCost> {
+        None
+    }
 }
 
 /// One provider meter's self-registration. Each provider file submits one

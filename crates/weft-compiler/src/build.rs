@@ -39,6 +39,61 @@ pub struct StagedImageBuild {
     pub content_hash: String,
 }
 
+/// The cargo crate name of every generated worker. One constant for every
+/// project, so the top crate (and its binary, `sanitize_crate_name` of
+/// this) is the same unit in the shared compile cache whichever project
+/// asks: the builder base precompiles the stock project's worker under
+/// this name and a project's build finds every package crate it did not
+/// touch already fresh.
+pub const WORKER_CRATE_NAME: &str = "weft-worker";
+
+/// A stock project (`weft new` output, untouched) held in a temp dir, with
+/// its compiled definition and catalog: the input every standard-worker
+/// question is answered from. The full-library image every untouched
+/// project runs on is its build, and the builder base precompiles its
+/// worker crate. Its `nodes/base_catalog` is a symlink to the
+/// installation's catalog instead of the copy `weft new` makes: every
+/// reader of a node tree follows symlinks, the hashes label package roots
+/// relative to the project root, and a copy of the whole catalog per
+/// question asked would be paid on every `weft build`. The project's name
+/// and id never reach the worker image, so any stock project names the
+/// same one.
+pub struct StockProject {
+    _dir: tempfile::TempDir,
+    pub project: Project,
+    pub definition: weft_core::project::ProjectDefinition,
+    pub catalog: FsCatalog,
+}
+
+impl StockProject {
+    /// Every catalog node type: the set the stock worker compiles.
+    pub fn node_types(&self) -> BTreeSet<String> {
+        codegen::node_types_for(&self.definition, &self.catalog, codegen::NodeSet::Full)
+    }
+
+    /// What the builder base installs and exports to compile this
+    /// worker: the stdlib packages' build-stage system packages and
+    /// `[build.env]`.
+    pub fn builder_stage(&self) -> CompileResult<worker_image::BuilderStage> {
+        worker_image::BuilderStage::for_nodes(&self.catalog, &self.node_types(), self.project.root.as_path())
+    }
+
+    pub fn materialize() -> CompileResult<Self> {
+        let dir = tempfile::tempdir().map_err(CompileError::Io)?;
+        for (rel, bytes) in crate::project::scaffold_files("standard-worker", uuid::Uuid::nil())? {
+            std::fs::write(dir.path().join(rel), bytes).map_err(CompileError::Io)?;
+        }
+        std::fs::create_dir_all(dir.path().join("nodes")).map_err(CompileError::Io)?;
+        let stdlib = weft_catalog::stdlib_root().map_err(CompileError::Build)?;
+        std::os::unix::fs::symlink(&stdlib, crate::project::base_catalog_dir(dir.path()))
+            .map_err(CompileError::Io)?;
+        let project = Project::load(dir.path())?;
+        let (definition, catalog) = crate::hash::load_enriched_project(&project)
+            .map_err(|e| CompileError::Build(format!("compile the stock project: {e}")))?;
+        Ok(Self { _dir: dir, project, definition, catalog })
+    }
+}
+
 /// Validate + codegen + stage from an ALREADY-COMPILED definition. Pipeline:
 ///
 /// 1. Validate the (resolved) definition, abort on any error.
@@ -69,6 +124,7 @@ pub fn build_project(
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
     builder_base_ref: &str,
+    node_set: codegen::NodeSet,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     crate::bail_on_errors(crate::validate::validate_with_mode(
@@ -76,15 +132,13 @@ pub fn build_project(
         catalog,
         ValidationMode::Structural,
     ))?;
-    // The crate/binary name is a project-identity property owned by the
-    // manifest (`weft.toml` `[package] name`), not a parse-time property of the
-    // graph. The parsed `ProjectDefinition` carries no name.
-    let crate_name = project.manifest.package.name.clone();
+    // Project identity arrives with each execution, never in the worker image.
+    let crate_name = WORKER_CRATE_NAME;
 
     let crate_root = project_root.join(".weft").join("target").join("build");
-    let referenced_nodes = codegen::collect_node_types(definition);
-    codegen::emit(definition, project_root, &crate_root, catalog, &crate_name)?;
-    let binary_name = sanitize_crate_name(&crate_name);
+    let referenced_nodes = codegen::node_types_for(definition, catalog, node_set);
+    codegen::emit(definition, project_root, &crate_root, catalog, crate_name, node_set)?;
+    let binary_name = sanitize_crate_name(crate_name);
 
     let dockerfile_summary = worker_image::emit(
         &project.manifest.build.worker,
@@ -93,6 +147,7 @@ pub fn build_project(
         &referenced_nodes,
         &binary_name,
         builder_base_ref,
+        &StockProject::materialize()?.builder_stage()?,
     )?;
     let dockerfile_path = project_root.join(".weft/target/Dockerfile.worker");
     if let Some(parent) = dockerfile_path.parent() {
@@ -119,7 +174,7 @@ pub fn build_project(
     )?;
 
     let content_hash =
-        crate::hash::compute_binary_hash(definition, project, &weft_root, catalog)
+        crate::hash::compute_binary_hash(definition, project, &weft_root, catalog, node_set)
             .map_err(|e| CompileError::Build(format!("compute binary hash: {e}")))?;
 
     Ok(StagedImageBuild { build_context, content_hash })
@@ -185,10 +240,25 @@ fn stage_build_context(
         stage_worker_workspace(weft_root, &ctx.join("weft"))?;
     }
 
-    // `project-nodes/` = each referenced package root, placed at its
-    // path relative to `nodes/` so the `#[path]` includes resolve.
+    stage_project_nodes(project_root, catalog, referenced_nodes, &ctx.join("project-nodes"))?;
+
+    Ok(ctx)
+}
+
+/// `project-nodes/` = each referenced package root, placed under `dest`
+/// at its path relative to the project's `nodes/`, so the emitted
+/// `#[path]` includes resolve once the directory is COPYed to
+/// [`worker_image::NODES_MOUNT`]. The worker build context and the
+/// builder base (which precompiles the stock project's worker) stage
+/// the same way, so a package crate the base compiled is the same unit
+/// a project's build asks for.
+fn stage_project_nodes(
+    project_root: &Path,
+    catalog: &FsCatalog,
+    referenced_nodes: &BTreeSet<String>,
+    dest: &Path,
+) -> CompileResult<()> {
     let nodes_root = project_root.join("nodes");
-    let project_nodes = ctx.join("project-nodes");
     for root in catalog.package_roots_for(referenced_nodes) {
         let rel = root.strip_prefix(&nodes_root).map_err(|_| {
             CompileError::Build(format!(
@@ -201,10 +271,9 @@ fn stage_build_context(
         // over), so staging and hashing agree on a node's byte-content:
         // a file the build copies but the hash skips (or vice versa)
         // is how a stale worker image gets served.
-        copy_dir_filtered(&root, &project_nodes.join(rel), weft_catalog::NODE_TREE_EXCLUDE)?;
+        copy_dir_filtered(&root, &dest.join(rel), weft_catalog::NODE_TREE_EXCLUDE)?;
     }
-
-    Ok(ctx)
+    Ok(())
 }
 
 /// The bare content-addressed node-test image tag,
@@ -258,6 +327,7 @@ pub fn build_test_artifact(
         &referenced,
         &test_crate.binary_name,
         builder_base_ref,
+        &StockProject::materialize()?.builder_stage()?,
     )?;
     let dockerfile_path = project_root
         .join(".weft")
@@ -463,11 +533,22 @@ fn write_scoped_workspace_manifest(
 /// time), but an invisible failure would look like the cache mysteriously
 /// stopped working, so it must be loud.
 fn mirror_mtime(src: &Path, dst: &Path) {
-    let result = std::fs::metadata(src)
-        .and_then(|meta| meta.modified())
-        .and_then(|modified| {
-            filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(modified))
-        });
+    match std::fs::metadata(src).and_then(|meta| meta.modified()) {
+        Ok(modified) => stamp_mtime(dst, modified),
+        Err(e) => tracing::warn!(
+            target: "weft_compiler::build",
+            src = %src.display(),
+            error = %e,
+            "could not read the source mtime; the copy keeps a wall-clock mtime and cargo will rebuild it"
+        ),
+    }
+}
+
+/// Set `dst`'s mtime to `modified`. The safe failure direction is the
+/// wall-clock mtime `dst` already has (newer than anything cached, so
+/// cargo recompiles), hence warn-only, and loud for the reason above.
+pub(crate) fn stamp_mtime(dst: &Path, modified: std::time::SystemTime) {
+    let result = filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(modified));
     if let Err(e) = result {
         tracing::warn!(
             target: "weft_compiler::build",
@@ -479,61 +560,102 @@ fn mirror_mtime(src: &Path, dst: &Path) {
     }
 }
 
-/// Stage the builder-base docker build context at
-/// `<weft_root>/.weft-base-context/` and return its path. Layout matches what
+/// Stage the builder-base docker build CONTEXT into
+/// `<weft_root>/.weft-base-context/` (see [`stage_builder_base_context_at`]).
+pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
+    stage_builder_base_context_at(weft_root, &weft_root.join(worker_image::BASE_CONTEXT_DIR))
+}
+
+/// Stage the builder-base docker build CONTEXT at `ctx`, holding exactly what
 /// the rendered Dockerfile COPYs:
 ///
 /// ```text
-/// .weft-base-context/
-///   Dockerfile           (worker-builder-base.Dockerfile with the target
-///                         cache key substituted; build with -f THIS file)
+/// <ctx>/
+///   Dockerfile           (worker-builder-base.Dockerfile with its tokens
+///                         substituted; build with -f THIS file)
 ///   rust-toolchain.toml
 ///   Cargo.toml           (workspace manifest scoped to the worker closure)
 ///   Cargo.lock
 ///   crates/<closure>/    (only the worker-linked crates)
-///   .weft-warmup/        (generated warm-up crate, see codegen::emit_warmup_crate)
+///   .weft-warmup/        (the stock project's full-library worker crate,
+///                         emitted by `codegen::emit` exactly as a project
+///                         build emits its own)
+///   project-nodes/       (the whole stdlib catalog, staged as a project
+///                         build stages its referenced packages)
 /// ```
 ///
-/// The Dockerfile is RENDERED, not copied: its `{{target_cache_key}}` token
-/// becomes a hash of Cargo.lock + rust-toolchain.toml, so a dependency or
-/// toolchain change starts a fresh compile cache instead of inheriting (and
-/// baking into the image) every artifact ever built. The base hash keeps
-/// covering the SOURCE template; the key is a pure function of two files the
-/// hash already covers.
+/// The base precompiles the STOCK PROJECT'S WORKER, not a deps-only stand-in:
+/// the package crates pull in dependencies of their own (`sqlx`, `pyo3`,
+/// `tungstenite`, ...) and change how cargo unifies the features of the
+/// shared ones, so a base that had compiled only the engine's dependencies
+/// left every first build on a host recompiling the engine, most of the
+/// dependency tree and every package crate (measured at 1m07 on a warm
+/// machine). Compiling the same crate the standard worker image is built
+/// from, at the same paths (`/work`, `/weft/project-nodes`), makes every
+/// package crate an untouched project links fingerprint-fresh in the seeded
+/// compile cache; a project compiles only the packages it edited or added
+/// and its thin top crate.
+///
+/// The Dockerfile is RENDERED, not copied: `{{target_cache_key}}` becomes a
+/// hash of Cargo.lock + rust-toolchain.toml, so a dependency or toolchain
+/// change starts a fresh compile cache instead of inheriting (and baking into
+/// the image) every artifact ever built; `{{worker_binary}}` names the binary
+/// the cache sweep keeps; `{{install_build_system_packages}}` and
+/// `{{build_env_lines}}` are what the stdlib packages need to compile
+/// (`StockProject::builder_stage`), the same lines a project's builder stage
+/// would carry, which is why a project FROMing the base installs only what
+/// lies beyond them. The base hash keeps covering the SOURCE template and the
+/// packages' `deps.toml`; the rendered values are pure functions of files it
+/// already covers.
 ///
 /// Regenerated wholesale on every call (it is a derived artifact): a stale
 /// leftover crate from a previous closure would otherwise linger in the
 /// context and the baked image. Callers only invoke this when the
 /// content-addressed base tag is absent, so the staging cost is paid exactly
 /// once per base rebuild.
-pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
-    let ctx = weft_root.join(worker_image::BASE_CONTEXT_DIR);
+pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileResult<PathBuf> {
     if ctx.exists() {
-        std::fs::remove_dir_all(&ctx).map_err(CompileError::Io)?;
+        std::fs::remove_dir_all(ctx).map_err(CompileError::Io)?;
     }
-    stage_worker_workspace(weft_root, &ctx)?;
+    stage_worker_workspace(weft_root, ctx)?;
     let toolchain_src = weft_root.join("rust-toolchain.toml");
     let toolchain_dst = ctx.join("rust-toolchain.toml");
     std::fs::copy(&toolchain_src, &toolchain_dst).map_err(CompileError::Io)?;
     mirror_mtime(&toolchain_src, &toolchain_dst);
-    codegen::emit_warmup_crate(&ctx.join(worker_image::WARMUP_CRATE_DIR), weft_root)?;
 
+    let stock = StockProject::materialize()?;
+    let referenced = stock.node_types();
+    codegen::emit(
+        &stock.definition,
+        stock.project.root.as_path(),
+        &ctx.join(worker_image::WARMUP_CRATE_DIR),
+        &stock.catalog,
+        WORKER_CRATE_NAME,
+        codegen::NodeSet::Full,
+    )?;
+    stage_project_nodes(stock.project.root.as_path(), &stock.catalog, &referenced, &ctx.join("project-nodes"))?;
+
+    let (install_packages, env_lines) = stock.builder_stage()?.render();
     let template_path = weft_root.join(crate::hash::BUILDER_BASE_DOCKERFILE);
-    let template = std::fs::read_to_string(&template_path).map_err(CompileError::Io)?;
-    let key = target_cache_key(weft_root)?;
-    if !template.contains("{{target_cache_key}}") {
-        return Err(CompileError::Build(format!(
-            "{} lost its {{{{target_cache_key}}}} token; the base compile cache \
-             would stop keying on the lock + toolchain",
-            template_path.display()
-        )));
+    let mut rendered = std::fs::read_to_string(&template_path).map_err(CompileError::Io)?;
+    for (token, value) in [
+        ("{{target_cache_key}}", target_cache_key(weft_root)?),
+        ("{{worker_binary}}", sanitize_crate_name(WORKER_CRATE_NAME)),
+        ("{{install_build_system_packages}}", install_packages),
+        ("{{build_env_lines}}", env_lines),
+    ] {
+        if !rendered.contains(token) {
+            return Err(CompileError::Build(format!(
+                "{} lost its {token} token; the base would stop keying its compile cache \
+                 on the lock + toolchain, stop sweeping it, or stop installing what the \
+                 stock worker compiles with",
+                template_path.display()
+            )));
+        }
+        rendered = rendered.replace(token, &value);
     }
-    std::fs::write(
-        ctx.join("Dockerfile"),
-        template.replace("{{target_cache_key}}", &key),
-    )
-    .map_err(CompileError::Io)?;
-    Ok(ctx)
+    std::fs::write(ctx.join("Dockerfile"), rendered).map_err(CompileError::Io)?;
+    Ok(ctx.to_path_buf())
 }
 
 /// The builder-base compile-cache key: a short hash of `Cargo.lock` +
@@ -770,6 +892,32 @@ pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
 #[cfg(test)]
 mod tests {
     use super::sanitize_crate_name;
+
+    /// The builder base compiles the STOCK WORKER: the staged context
+    /// carries a package crate per stdlib package (so their rlibs, and the
+    /// dependencies they pull in, are baked with the feature unification a
+    /// real worker triggers) and the stdlib sources those crates include,
+    /// and the Dockerfile has both tokens rendered. A base that only warmed
+    /// the engine's dependencies is the regression this pins against: it
+    /// left every first build on a host recompiling most of the tree.
+    #[test]
+    fn the_builder_base_context_carries_the_stock_worker_and_the_stdlib() {
+        let weft_root = super::resolve_weft_root().expect("resolve weft root");
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = super::stage_builder_base_context_at(&weft_root, &dir.path().join("ctx")).expect("stage");
+        let crate_root = ctx.join(crate::worker_image::WARMUP_CRATE_DIR);
+        let manifest = std::fs::read_to_string(crate_root.join("Cargo.toml")).unwrap();
+        assert!(manifest.contains("pkg_format = { path = \"./pkg_format-"), "{manifest}");
+        assert!(crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME).is_file());
+        assert!(ctx.join("project-nodes/base_catalog/basic/format/mod.rs").is_file());
+        let dockerfile = std::fs::read_to_string(ctx.join("Dockerfile")).unwrap();
+        assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");
+        assert!(dockerfile.contains(&format!("/work {}", sanitize_crate_name(super::WORKER_CRATE_NAME))));
+        assert!(dockerfile.contains("COPY project-nodes /weft/project-nodes"));
+        // The stdlib's own build packages are installed in the base (the
+        // Python node needs the interpreter's headers to compile pyo3).
+        assert!(dockerfile.contains("libpython3-dev"), "{dockerfile}");
+    }
 
     /// The names cargo/docker/staging key on must never collide: every
     /// pair that differs only by case, punctuation, or the lossy `_`

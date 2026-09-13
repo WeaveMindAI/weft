@@ -10,9 +10,12 @@ CLI.
 | Command | What it does |
 |---|---|
 | `weft new <name>` | scaffold a project: `weft.toml`, `main.weft`, `nodes/` with the standard library seeded in |
-| `weft build` | build the project's worker image; does not register or run it |
-| `weft run [--detach]` | compile, register, fire one execution, stream its events until completion, including across waits. `--detach` returns after starting it. |
-| `weft run --target <node>` | the same, but run only these nodes and what they need, nothing past them and no sibling branch. Repeatable (the union of what each needs), any node. See [what actually runs](../language/mental-model.md#what-actually-runs). |
+| `weft build` | build the project's worker image and register the project, starting nothing. Registering is also how you put back code the dispatcher no longer holds: it records the compiled program under its own hash, which is what a past run's values are worked out from, so the run reads again. It does not add a version to the tree; `weft checkpoint` does that |
+| `weft run [--detach] [--referenced]` | compile, register, fire one execution, stream its events until completion, including across waits. `--detach` returns after starting it. The whole catalog is compiled by default; `--referenced` opts into compiling only the graph's node types. Every run records the code it ran as a version: [Versions](versions.md). |
+| `weft run --target <node>` | the same, but it runs only these nodes and whatever they need. Repeatable, and several targets run the union of what each needs; any node can be a target. See [what actually runs](../language/mental-model.md#what-actually-runs). |
+| `weft run --seed [--seed-before <node>] [--seed-until <node>]` | reuse compatible completed work from head's run. Before excludes the named node from reuse; until permits it too. Changed code, inputs and dependencies still invalidate reuse. See [Seeding](versions.md#seeding-run-only-what-changed). |
+| `weft run --before <node>` | run what that node needs and NOT the node. The mirror of `--target`, and how you run a program up to the act you do not want performed: `weft run --before post` does everything the posting step needs and stops there. Repeatable. |
+| `weft run [<example>] [--referenced] [--seed] [--root] [--from <node>=<ports-json>]... [--emit <node>=<ports-json>]... [--target <id>]... [--before <id>]... [--group <id>=<ports-json>] [--fire <trigger>=<wake-json>] [--save <name>]` | build and start one execution; `--detach` returns its color. `--from` supplies backup inputs at a start, `--emit` supplies outputs without executing that node. Real producers take precedence over backups. `--target` includes the endpoint; `--before` excludes it. `--group` selects a whole group or included file, with its input payload. `--fire` runs exactly one trigger using a matching bake. Ordinary groups can be cut precisely; loops stay whole. `--seed-before` / `--seed-until` bound compatible reuse. Named examples supply saved starting parameters; current code runs. Clear and replacement rules are in [Versions](versions.md) |
 | `weft follow <project>` | live event stream for a project |
 | `weft stop <color>` | cancel a running execution. Every command that takes a color also takes the first characters of one (`weft stop 3f2a`), as long as they name a single run |
 | `weft ps` | list registered projects |
@@ -25,7 +28,24 @@ CLI.
 | `weft executions [--limit N] [--project <id>] [--phase fire\|trigger_setup\|infra_setup]` | recent executions, newest first, with each run's status, phase, local start time, entry node and the tags it put on itself ([stopping other runs](../nodes/steering-executions.md)). "Has my trigger fired since the change" is `--phase fire`: it hides the setup runs an activate or resync makes. |
 | `weft events <color> [--node <id>] [--kind <kind>] [--full]` | one execution's events in order, one line each: local time, kind, node, and a short summary of the value or error. Values are cut short so a long run stays readable; `--node` keeps one node's events, `--kind` one kind (`node_failed`; a substring works, so `failed` catches both failure kinds), `--full` prints the values whole, and `--json` prints the replay rows the graph view reads. |
 | `weft logs [color]` | the run's log: the lines its nodes wrote, and every failure the journal recorded about it (a node failing, a port refusing a value, the run failing or being cancelled) as `error` and `warn` lines naming the node they are about. The last 1000 lines; `--limit` raises that (up to 20000), and a full page says the run may have written more. |
-| `weft clean [color]` | purge journal data. Asks before deleting runs; pass `--yes` when scripting. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images` (reclaim worker images nothing runs any more, scoped to the current project's images; a global sweep of dangling untagged build leftovers rides along. With `--all`: every project's, the kind node's copies, stale `weft-infra-*` tags, and old builder-base images; whatever the dispatcher's referenced set covers survives) and `--build-cache`. `setup.sh` runs `--images --all` after every daemon refresh. |
+| `weft clean [color]` | purge journal data. Asks before deleting runs; pass `--yes` when scripting. Naming a subject takes all of it: a color deletes that run, `--project <id>` deletes that project's whole history (runs outlive the project, so this is how a removed project's history is erased). With no subject it deletes runs older than `--keep-days` (30), or everything with `--all`. Also `--images` (reclaim worker images nothing runs any more, scoped to the current project's images; a global sweep of dangling untagged build leftovers rides along. With `--all`: every project's, the kind node's copies, stale `weft-infra-*` tags, and old builder-base images; whatever the dispatcher's referenced set covers survives) and prints the size of the compile cache every worker build shares. That cache bounds itself: each build drops the compiled node packages and worker crates no build has linked for 30 days, and `--all` also drops a whole cache no build has touched for 30 days (one is left behind whenever the toolchain or the builder changes). `--build-cache` throws away the whole BuildKit cache, that compile cache included, so the next build seeds a fresh one from the builder base, which already holds every stock node compiled. `setup.sh` runs `--images --all` after every daemon refresh. |
+
+## Versions and examples
+
+| Command | What it does |
+|---|---|
+| `weft checkpoint [<label>] [--root]` | record the files as a version under head, no run, no build. Works as the first thing you do in a project: it tells the dispatcher the project exists, without building anything. `already at <id>` when nothing changed. `--root` (on `run` too) records a version with no parent and refuses if that same version already has a parent. On `run` it also means nothing is seeded. |
+| `weft tree` | the version tree: every version, what changed in it against its parent, and its runs beneath it. It marks HEAD's version, the activated version, and HEAD's run, which is the one your next `--seed` inherits from. `--json` adds `disk_version`: the version your files on disk match right now, or null when they match none. |
+| `weft branch <version\|label\|color> [--discard]` | restore that version's files and move head there. Restoring a version clears head's run, so the next `--seed` falls back to the newest finished or parked run on that version, or on the nearest ancestor version that has one. If you want a particular run as your seed, name its color instead of a version. Refuses on unkept edits, naming the files. |
+| `weft diff <ref> <ref> [--full]` | compare observed outputs for human or AI review, including frozen focus nodes. A ref is a color, its unambiguous prefix or `example:<name>`. Differences are evidence and do not fail the command |
+| `weft freeze <name> [<run>] [--expect <node>]...` | save that run's starting parameters and observed outputs in `examples/<name>.json`; default is head's run. `--expect` marks nodes to focus on during review. Run and diff leave the accepted file intact; freeze again after accepting its replacement |
+| `weft examples` | list saved parameters and frozen examples; inspect them, rerun with `weft run <name>`, then compare with `weft diff` |
+| `weft bake [--referenced]` | prepare trigger inputs without arming listeners. A manual `--fire` requires a matching bake; use `--referenced` here when the run uses `--referenced`. Activation also prepares and records a bake before arming |
+| `weft wake <color> <node>` | resolve a pure time wait now. A wait that expects a value is refused, naming its kind. |
+| `weft prune <version> [--yes]` | delete a version, everything under it, and their runs. Asks first. Refuses on head's version, the activated version, any version a frozen example was frozen from or any ancestor of one, and while a run in the subtree is running. It names each reason. |
+
+For what each verb does and what every refusal means, go and read
+[Versions, seeded runs and frozen examples](versions.md).
 
 ## Triggers
 
@@ -36,7 +56,7 @@ CLI.
 | `weft cancel-activate` | abort an activation in progress |
 | `weft cancel-build` | abort a build in progress |
 | `weft cancel-running` | cancel executions currently in flight |
-| `weft resync` | reconcile registrations against the current source |
+| `weft resync` | re-register an active project's triggers against the current source (a parked or hibernated project refuses; `weft activate` brings it back) |
 
 "Turn this project off" means different things depending on what is in flight,
 so `deactivate` takes a `--mode` to say which you meant:
@@ -90,7 +110,7 @@ actually do to a unit.
 | `weft daemon status` | is it up, and its public address if it has one |
 | `weft daemon restart` | the same reconcile as `weft daemon start` (an alias): apply what changed, roll what needs it |
 | `weft daemon logs [--tail N] [-f]` | tail the runtime log |
-| `weft build-images [--push \| --push-suffix <s> \| --print]` | make every shared image (the four system images plus the worker builder base) exist locally under its content-addressed ref. `--push` publishes them to the registry (the release workflow's verb); `--print` only prints the refs this tree resolves to, touching nothing |
+| `weft build-images [--push \| --push-suffix <s> \| --print]` | make every shared image (the four system images, worker builder base and full-library worker) exist locally under its content-addressed ref. `--push` publishes them to the registry (the release workflow's verb); `--print` only prints the refs this tree resolves to, without building images |
 | `weft build-base` | make just the worker builder-base image exist locally |
 
 Aliased to `weft d`.

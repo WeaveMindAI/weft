@@ -74,20 +74,27 @@ to agree on.
 It also makes each of those tasks a better task, because whoever builds it sees
 two types and one job instead of a repository.
 
-## What you can do today
+## The verbs a pass uses
 
-The language, the compiler, typed wiring, folding groups, the journal, the live
-graph view, the node test rig, and human steps in the loop. The loop above is
-how weft itself gets built.
+`weft run --seed` reuses compatible completed work while you iterate.
+Changed code and inputs invalidate the affected work and its consumers.
 
-Landing next:
+To exercise one piece, `--from node='{"port":value}'` starts at that node
+with backup inputs. `--target` includes an endpoint; `--before` excludes
+it. `--group group='{"port":value}'` runs a whole group alone.
+For a trigger, `weft bake` prepares its settings without listening,
+then `weft run --fire trigger='<wake-json>'` fires that one trigger.
 
-- **Growing a program from a running execution.** Today a pass re-executes from
-  the start, seconds at the size of program this suits. Resuming from where the
-  previous pass got to, so you extend a live execution instead of replaying it,
-  is being built now.
-- **Cementing a passing example as a test with one gesture**, so the tool tells
-  you the moment an earlier example stops working.
-- The zoom-and-refine flow as its own product surface.
-- Several agents building branches in parallel under one plan, each against its
-  own typed contract.
+When a run comes out right, `weft freeze <name>` preserves its starting
+parameters and accepted outputs. After a change, `weft run <name>` runs
+the current code with those parameters. Inspect the result with
+`weft diff <color> example:<name>`: you or Tangle judge whether the
+change is acceptable. Freezing the new run replaces the accepted example.
+For the commands and their boundaries, read [Versions,
+seeded runs and frozen examples](../running/versions.md).
+
+## What is landing next
+
+- The editor will let you descend into a group, fix one stage there and come
+  back out.
+- Several agents will be able to build branches in parallel under one plan.

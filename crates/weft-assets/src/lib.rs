@@ -22,9 +22,15 @@
 //! I/O is behind two traits so the sync's orchestration is contract-testable
 //! with fakes: [`AssetSource`] (where the project's files live) and
 //! [`AssetStore`] (the project's asset plane in runtime storage).
+//!
+//! The hash-diff-upload core is [`publish_hashed`], and it is not only
+//! the asset sync's: a version snapshot (`weft checkpoint`, every `weft
+//! run`) publishes the project's files through [`publish_files`] into
+//! the same content-addressed plane, so a file identical to one any
+//! earlier version held costs nothing to record again.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Seek};
 
 use anyhow::{bail, Context, Result};
 use sha2::Digest;
@@ -33,33 +39,38 @@ use weft_core::storage::{FileHandle, StoredFile};
 use weft_core::storage::key::{parse_key, KeyScope};
 use weft_core::storage::media::{classify_media_slot, media_slots, MediaSlotContent};
 
-/// Where the project's files live. `open` returns a streaming reader so a
-/// multi-gigabyte asset is hashed and uploaded in bounded memory.
+pub trait AssetReader: Read + Seek + Send {}
+impl<T: Read + Seek + Send> AssetReader for T {}
+
+/// Where the project's files live. Paths are as written in an `@asset`
+/// ref: project-relative, or absolute/outside where the source allows
+/// it. Errors name the path ("asset not found" is the loud build error).
 pub trait AssetSource: Send + Sync {
-    /// A reader over the file at `path` (as written in the `@asset` ref:
-    /// project-relative, or absolute/outside where the source allows it).
-    /// Errors name the path ("asset not found" is the loud build error).
+    /// A streaming reader over the file: one forward pass, bounded
+    /// memory, no promise about what a second open sees. Hashing reads
+    /// this way.
     fn open(&self, path: &str) -> Result<Box<dyn Read + Send>>;
+    /// A reader over bytes that cannot change under the caller, which
+    /// [`publish_hashed`] verifies against the recorded hash and then
+    /// rewinds and uploads. Only the files that are about to be stored
+    /// are opened this way, because a disk source pays for it with a
+    /// private copy of the file: a new asset is read once to hash it, once
+    /// to copy it, once to verify the copy and once to upload it. An asset
+    /// the store already holds is only ever read once.
+    fn snapshot(&self, path: &str) -> Result<Box<dyn AssetReader>>;
 }
 
 /// The project's asset plane in runtime storage.
 #[async_trait::async_trait]
 pub trait AssetStore: Send + Sync {
-    /// Remove one stored asset by key. The sync's own undo: an upload whose
-    /// bytes turned out not to match the hash they were stored under (the
-    /// file changed between the hashing read and the upload read) must not
-    /// stay in the store, where a later diff would take the hash for the
-    /// real content.
-    async fn delete(&self, key: &str) -> Result<()>;
     /// Every existing asset of the project: `content hash -> full storage key`.
     async fn list(&self) -> Result<BTreeMap<String, String>>;
     /// Upload one asset's bytes under its content hash. MUST be idempotent
     /// for an already-ACTIVE identical hash (same content = same asset),
     /// and MUST error for anything else.
     ///
-    /// The answer says which of the two happened, because they are not the
-    /// same thing to the caller: only [`Uploaded::Stored`] read `bytes`, so
-    /// only there does the sync have a streamed hash to hold the upload to.
+    /// The bytes are a verified snapshot. Return their stored key whether
+    /// this call uploads them or another publisher already completed them.
     async fn upload(
         &self,
         hash: &str,
@@ -67,26 +78,7 @@ pub trait AssetStore: Send + Sync {
         filename: &str,
         size_bytes: u64,
         bytes: &mut (dyn Read + Send),
-    ) -> Result<Uploaded>;
-}
-
-/// What an upload did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Uploaded {
-    /// The bytes were read and stored under this key.
-    Stored(String),
-    /// The store already held this exact content under this key, so
-    /// nothing was read and nothing was written.
-    AlreadyStored(String),
-}
-
-impl Uploaded {
-    /// The stored key, whichever way the upload went.
-    pub fn key(&self) -> &str {
-        match self {
-            Uploaded::Stored(k) | Uploaded::AlreadyStored(k) => k,
-        }
-    }
+    ) -> Result<String>;
 }
 
 /// This project's uploaded files used by the resolved definition, including
@@ -149,19 +141,114 @@ pub fn hash_reader_peeking(mut r: impl Read) -> Result<(String, u64, Vec<u8>)> {
     Ok((format!("{:x}", hasher.finalize()), total, head))
 }
 
-/// A reader that hashes what passes through it, so the upload read can be
-/// held to the hash the first read produced.
-struct HashingReader<R> {
-    inner: R,
-    hasher: sha2::Sha256,
+/// One file hashed and ready to publish: what [`publish_hashed`] needs
+/// to know about it. Built by [`hash_files`] or, for an `@asset` ref, by
+/// [`sync_assets`] after its kind check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashedFile {
+    /// The path as the source opens it.
+    pub path: String,
+    /// The content hash: the file's identity everywhere.
+    pub hash: String,
+    pub size: u64,
+    /// The media type the store records for it.
+    pub mime: String,
 }
 
-impl<R: Read> Read for HashingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
+/// Where a published file lives in the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    pub hash: String,
+    pub key: String,
+}
+
+/// Hash every file in `paths` through `source`, naming each one's media
+/// type from its first bytes (the filename when the bytes carry no
+/// signature). Every path that cannot be read is collected and reported
+/// in ONE loud error, so a snapshot with three missing files names all
+/// three.
+pub fn hash_files(paths: &[String], source: &dyn AssetSource) -> Result<Vec<HashedFile>> {
+    let mut hashed = Vec::with_capacity(paths.len());
+    let mut broken: Vec<String> = Vec::new();
+    for path in paths {
+        match source.open(path).and_then(hash_reader_peeking) {
+            Ok((hash, size, head)) => {
+                let mime = weft_core::storage::sniff_mime(&head)
+                    .unwrap_or_else(|| weft_core::storage::mime_from_filename(path));
+                hashed.push(HashedFile { path: path.clone(), hash, size, mime: mime.to_string() });
+            }
+            Err(e) => broken.push(format!("  {path}: {e:#}")),
+        }
     }
+    if !broken.is_empty() {
+        bail!("{} file(s) could not be read:\n{}", broken.len(), broken.join("\n"));
+    }
+    Ok(hashed)
+}
+
+/// Make sure the store holds every hashed file, and answer each one's
+/// key: `content hash -> full storage key`. The content-addressed core
+/// every publisher shares (an `@asset` sync, a version snapshot): diff
+/// against what the store already holds, upload only the missing
+/// content, never delete an existing file (a paused execution may still
+/// need an earlier version). Each missing file is uploaded from a
+/// snapshot verified against its recorded hash first: parts are stored
+/// by number under a key that is the content's hash, so bytes that do
+/// not match must never reach a part another publisher of the same
+/// content may be writing too.
+pub async fn publish_hashed(
+    hashed: &[HashedFile],
+    source: &dyn AssetSource,
+    store: &dyn AssetStore,
+) -> Result<BTreeMap<String, String>> {
+    // 1. Diff against what the store already holds.
+    let existing = store.list().await.context("list existing assets")?;
+
+    // 2. Verify each missing file's snapshot against the earlier hash,
+    //    then rewind and upload those exact bytes. Record every key.
+    let mut keys: BTreeMap<String, String> = BTreeMap::new();
+    for HashedFile { path, hash, size, mime } in hashed {
+        if let Some(key) = existing.get(hash.as_str()) {
+            keys.insert(hash.clone(), key.clone());
+            continue;
+        }
+        if keys.contains_key(hash.as_str()) {
+            continue; // two paths, identical bytes: already uploaded this pass
+        }
+        let mut reader = source
+            .snapshot(path)
+            .with_context(|| format!("snapshot {path} for upload"))?;
+        let (actual_hash, actual_size) = hash_reader(&mut reader)?;
+        anyhow::ensure!(actual_hash == *hash && actual_size == *size,
+            "{path} changed while it was being published; rerun the command");
+        reader.rewind().with_context(|| format!("rewind verified snapshot of {path}"))?;
+        let uploaded = store
+            .upload(hash, mime, path, *size, reader.as_mut())
+            .await
+            .with_context(|| format!("upload {path}"))?;
+        keys.insert(hash.clone(), uploaded);
+    }
+    Ok(keys)
+}
+
+/// Publish every file in `paths` and answer where each one landed:
+/// `path -> Published { hash, key }`. [`hash_files`] then
+/// [`publish_hashed`]; a version snapshot is exactly this over the
+/// files a version covers.
+pub async fn publish_files(
+    paths: &[String],
+    source: &dyn AssetSource,
+    store: &dyn AssetStore,
+) -> Result<BTreeMap<String, Published>> {
+    let hashed = hash_files(paths, source)?;
+    let keys = publish_hashed(&hashed, source, store).await?;
+    Ok(hashed
+        .into_iter()
+        .map(|h| {
+            let key = keys.get(&h.hash).expect("every hashed file got a key").clone();
+            (h.path, Published { hash: h.hash, key })
+        })
+        .collect())
 }
 
 /// Ensure `refs` are uploaded and return the compiler's resolution map
@@ -183,7 +270,7 @@ pub async fn sync_assets(
     //    refs by path AND declared type, so one path under two types is
     //    checked once per type; identical bytes share one stored asset
     //    whatever they are declared.
-    let mut hashed: Vec<(&FileRef, String, u64, &'static str)> = Vec::with_capacity(refs.len());
+    let mut hashed: Vec<(&FileRef, HashedFile)> = Vec::with_capacity(refs.len());
     let mut broken: Vec<String> = Vec::new();
     for r in refs {
         match source.open(&r.path).and_then(hash_reader_peeking) {
@@ -192,7 +279,10 @@ pub async fn sync_assets(
                     Ok(()) => {
                         let mime = weft_core::storage::sniff_mime(&head)
                             .unwrap_or_else(|| weft_core::storage::mime_from_filename(&r.path));
-                        hashed.push((r, hash, size, mime));
+                        hashed.push((
+                            r,
+                            HashedFile { path: r.path.clone(), hash, size, mime: mime.to_string() },
+                        ));
                     }
                     Err(e) => broken.push(format!("  {e}")),
                 }
@@ -208,62 +298,20 @@ pub async fn sync_assets(
         );
     }
 
-    // 2. Diff against what the store already holds.
-    let existing = store.list().await.context("list existing assets")?;
+    // 2. The shared content-addressed core verifies and uploads missing content.
+    let files: Vec<HashedFile> = hashed.iter().map(|(_, h)| h.clone()).collect();
+    let keys = publish_hashed(&files, source, store).await?;
 
-    // 3. Upload the missing content (a second reader pass streams the bytes;
-    //    hashing buffered them nowhere). The second pass is hashed too and
-    //    held to the first: a file edited between the two reads would
-    //    otherwise be stored under another content's hash, and every later
-    //    build would take it for that content. Record every asset's key.
-    let mut keys: BTreeMap<&str, String> = BTreeMap::new();
-    for (r, hash, size, mime) in &hashed {
-        if let Some(key) = existing.get(hash.as_str()) {
-            keys.insert(hash, key.clone());
-            continue;
-        }
-        if keys.contains_key(hash.as_str()) {
-            continue; // two paths, identical bytes: already uploaded this pass
-        }
-        let reader = source
-            .open(&r.path)
-            .with_context(|| format!("re-open asset {} for upload", r.path))?;
-        let mut reader = HashingReader { inner: reader, hasher: sha2::Sha256::new() };
-        let uploaded = store
-            .upload(hash, mime, &r.path, *size, &mut reader)
-            .await
-            .with_context(|| format!("upload asset {}", r.path))?;
-        // Only a real transfer has a streamed hash to check. An
-        // `AlreadyStored` answer read nothing (the store already held this
-        // content), so hashing what came off the reader would compare the
-        // file against the empty digest and throw away a healthy asset.
-        if let Uploaded::Stored(key) = &uploaded {
-            let streamed = format!("{:x}", reader.hasher.finalize());
-            if streamed != *hash {
-                store
-                    .delete(key)
-                    .await
-                    .with_context(|| format!("discard the changed asset {} (stored as {key})", r.path))?;
-                bail!(
-                    "asset {} changed while it was being synced (it hashed {hash} when the build \
-                     read it and {streamed} when it was uploaded); rerun the build",
-                    r.path
-                );
-            }
-        }
-        keys.insert(hash, uploaded.key().to_string());
-    }
-
-    // 4. The compiler's map: path -> stored-file value, marker kind picked by
+    // 3. The compiler's map: path -> stored-file value, marker kind picked by
     //    the DECLARED type (an `Image` ref is `__weft_image__` whatever the
     //    extension guesses).
     let mut map = BTreeMap::new();
-    for (r, hash, size, mime) in &hashed {
-        let key = keys.get(hash.as_str()).expect("every hashed ref got a key");
+    for (r, h) in &hashed {
+        let key = keys.get(h.hash.as_str()).expect("every hashed ref got a key");
         let file = StoredFile {
             key: key.clone(),
-            mime_type: mime.to_string(),
-            size_bytes: *size,
+            mime_type: h.mime.clone(),
+            size_bytes: h.size,
             filename: r.path.clone(),
         };
         map.insert(r.resolution_key(), weft_core::storage::typed_file_value(&file, &r.ty));

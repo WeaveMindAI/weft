@@ -17,7 +17,6 @@ use uuid::Uuid;
 
 use crate::frames::LoopFrames;
 use crate::pulse::Pulse;
-use crate::Color;
 
 /// One pulse placed on a downstream edge, plus the provenance (which
 /// node + port emitted it). The `pulse` is the EXACT pulse pushed onto
@@ -60,32 +59,33 @@ pub fn pulse_id(
 /// among the records at the same (node, frames): a node fired twice at
 /// one location closes its ports twice, and the two sweeps must not
 /// collide.
-pub fn terminal_sweep_emission(color: Color, node_id: &str, frames: &LoopFrames, ordinal: usize) -> Uuid {
-    derived(&TERMINAL_SWEEP, &[&color.to_string(), node_id, &frames_key(frames), &ordinal.to_string()])
+///
+/// None of the derived emissions below folds the run's color in: a
+/// pulse table is one run's, so the location and the ordinal already
+/// name the act, and a seeded run folds rows it inherited from another
+/// run into ITS table (`weft_journal::seed`), where an id that changed
+/// with the color would no longer match the pulse ids those rows name.
+pub fn terminal_sweep_emission(node_id: &str, frames: &LoopFrames, ordinal: usize) -> Uuid {
+    derived(&TERMINAL_SWEEP, &[node_id, &frames_key(frames), &ordinal.to_string()])
 }
 
 /// The emission of a group boundary firing (a `Passthrough` forwarding
 /// its inputs, or the closures a gated scope owes the outside).
-pub fn boundary_emission(color: Color, node_id: &str, frames: &LoopFrames, ordinal: usize) -> Uuid {
-    derived(&BOUNDARY, &[&color.to_string(), node_id, &frames_key(frames), &ordinal.to_string()])
+pub fn boundary_emission(node_id: &str, frames: &LoopFrames, ordinal: usize) -> Uuid {
+    derived(&BOUNDARY, &[node_id, &frames_key(frames), &ordinal.to_string()])
 }
 
 /// The emission of a loop launching iteration `index` (the body's
 /// per-iteration pulses).
-pub fn iteration_launch_emission(
-    color: Color,
-    group_id: &str,
-    parent_frames: &LoopFrames,
-    index: u32,
-) -> Uuid {
-    derived(&ITERATION_LAUNCH, &[&color.to_string(), group_id, &frames_key(parent_frames), &index.to_string()])
+pub fn iteration_launch_emission(group_id: &str, parent_frames: &LoopFrames, index: u32) -> Uuid {
+    derived(&ITERATION_LAUNCH, &[group_id, &frames_key(parent_frames), &index.to_string()])
 }
 
 /// The emission of a loop instance ending (its outward values, or the
 /// closures of an abnormal end). One per instance: an instance
 /// terminates once.
-pub fn loop_termination_emission(color: Color, group_id: &str, parent_frames: &LoopFrames) -> Uuid {
-    derived(&LOOP_TERMINATION, &[&color.to_string(), group_id, &frames_key(parent_frames)])
+pub fn loop_termination_emission(group_id: &str, parent_frames: &LoopFrames) -> Uuid {
+    derived(&LOOP_TERMINATION, &[group_id, &frames_key(parent_frames)])
 }
 
 /// Frames as a stable text key (`"3.0"` for `[3, 0]`, empty at root).
@@ -133,21 +133,20 @@ mod tests {
 
     #[test]
     fn derived_emissions_separate_by_every_part_and_by_kind() {
-        let color = Uuid::nil();
         let root: LoopFrames = Vec::new();
         let inner: LoopFrames = vec![LoopIteration { index: 2 }];
-        let sweep = terminal_sweep_emission(color, "n", &root, 0);
-        assert_eq!(sweep, terminal_sweep_emission(color, "n", &root, 0));
-        assert_ne!(sweep, terminal_sweep_emission(color, "n", &root, 1), "a second firing sweeps apart");
-        assert_ne!(sweep, terminal_sweep_emission(color, "n", &inner, 0));
-        assert_ne!(sweep, boundary_emission(color, "n", &root, 0), "same parts, different act");
+        let sweep = terminal_sweep_emission("n", &root, 0);
+        assert_eq!(sweep, terminal_sweep_emission("n", &root, 0));
+        assert_ne!(sweep, terminal_sweep_emission("n", &root, 1), "a second firing sweeps apart");
+        assert_ne!(sweep, terminal_sweep_emission("n", &inner, 0));
+        assert_ne!(sweep, boundary_emission("n", &root, 0), "same parts, different act");
         assert_ne!(
-            iteration_launch_emission(color, "g", &root, 0),
-            iteration_launch_emission(color, "g", &root, 1)
+            iteration_launch_emission("g", &root, 0),
+            iteration_launch_emission("g", &root, 1)
         );
         assert_ne!(
-            loop_termination_emission(color, "g", &root),
-            loop_termination_emission(color, "g", &inner)
+            loop_termination_emission("g", &root),
+            loop_termination_emission("g", &inner)
         );
     }
 }

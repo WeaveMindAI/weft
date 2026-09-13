@@ -345,6 +345,15 @@ struct ConnInner {
 }
 
 impl LiveCallerConnection {
+    /// The socket owns this connection even after execution cleanup removes
+    /// its registry entry. Record the disconnect exactly once on that owner.
+    fn mark_disconnected(&self, reason: &str) {
+        if self.connected.swap(false, Ordering::SeqCst) {
+            let offset = self.next_offset();
+            self.journal.disconnected(self.color, offset, reason);
+        }
+    }
+
     fn next_offset(&self) -> u64 {
         self.next_offset.fetch_add(1, Ordering::SeqCst)
     }
@@ -426,11 +435,9 @@ impl CallerConnection for LiveCallerConnection {
             try_terminate(g.terminated)?;
             g.terminated = true;
         }
-        let offset = self.next_offset();
         if let Some(c) = &final_chunk {
+            let offset = self.next_offset();
             self.journal.outbound(self.color, offset, c, true);
-        } else {
-            self.journal.disconnected(self.color, offset, "response complete");
         }
         // The terminal always lands (subject to no capacity policy); if the
         // socket task already ended (caller gone), it is silently dropped
@@ -626,20 +633,26 @@ impl CallerRegistry {
         self.inner.lock().expect("registry poisoned").get(&color).cloned()
     }
 
+    /// Drop a color's entry.
+    ///
+    /// Never panics: this runs from `ExecutionResidue`'s destructor,
+    /// which can itself run during an unwind, and a panic there aborts
+    /// the process. A poisoned registry is reported and the entry stays
+    /// (the pod is already in trouble; taking it down is worse).
     pub fn detach(&self, color: Color) {
-        self.inner.lock().expect("registry poisoned").remove(&color);
-    }
-
-    /// Mark a connection's caller as gone (socket task ended) and emit the
-    /// disconnect journal event. Idempotent.
-    pub fn mark_disconnected(&self, color: Color, reason: &str) {
-        if let Some(conn) = self.get(color) {
-            if conn.connected.swap(false, Ordering::SeqCst) {
-                let offset = conn.next_offset();
-                conn.journal.disconnected(color, offset, reason);
+        match self.inner.lock() {
+            Ok(mut inner) => {
+                inner.remove(&color);
             }
+            Err(_) => tracing::error!(
+                target: "weft_engine::caller_conn",
+                %color,
+                "the caller registry is poisoned, so this execution's connection entry was not \
+                 dropped; it goes with the pod"
+            ),
         }
     }
+
 }
 
 /// Build a connection + the socket-facing channels. Returns the shared
@@ -991,7 +1004,7 @@ async fn drive_http(
         // The exchange ended: stop producers (a blocked send now errors) and
         // mark the caller gone for this run.
         outbound.close();
-        registry.mark_disconnected(color, reason);
+        conn.mark_disconnected(reason);
         registry.detach(color);
         if matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution) {
             canceller.cancel(color);
@@ -1115,7 +1128,7 @@ async fn drive_ws(
     // on a full outbound queue (its send now errors).
     inbound.close();
     outbound.close();
-    state.registry.mark_disconnected(color, reason);
+    conn.mark_disconnected(reason);
     state.registry.detach(color);
     if matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution) {
         state.canceller.cancel(color);
@@ -1173,6 +1186,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socket_disconnect_is_recorded_after_registry_cleanup() {
+        let journal = Arc::new(RecordingSink::default());
+        let (conn, _, _) = new_connection(ws_cfg(), Color::nil(), None, journal.clone());
+        let registry = CallerRegistry::new();
+        registry.attach(Color::nil(), conn.clone());
+        conn.terminate(None).await.unwrap();
+        registry.detach(Color::nil());
+        conn.mark_disconnected("socket closed");
+        conn.mark_disconnected("socket closed again");
+        assert_eq!(journal.events.lock().unwrap().iter().filter(|event| event.starts_with("disconnected@")).count(), 1);
+    }
+
+    #[tokio::test]
     async fn outbound_chunks_reach_the_socket_channel_and_journal() {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out_rx, _inb) =
@@ -1186,11 +1212,14 @@ mod tests {
         assert!(matches!(first, Outbound::Chunk(_)));
         let term = out_rx.recv().await.expect("terminate");
         assert!(matches!(term, Outbound::Terminate(None)));
-        // Journal saw connect, the outbound chunk, and the disconnect on close.
+        // Journal saw connect and the outbound chunk. The disconnect is the
+        // socket task's to record when the exchange ends (`mark_disconnected`
+        // on the connection it owns), never the close itself: a close with
+        // no socket task behind it is not a caller going away.
         let ev = sink.events();
         assert!(ev[0].starts_with("connected@0"), "got {ev:?}");
         assert!(ev.iter().any(|e| e.starts_with("outbound@")), "got {ev:?}");
-        assert!(ev.iter().any(|e| e.starts_with("disconnected@")), "got {ev:?}");
+        assert!(!ev.iter().any(|e| e.starts_with("disconnected@")), "got {ev:?}");
     }
 
     #[tokio::test]

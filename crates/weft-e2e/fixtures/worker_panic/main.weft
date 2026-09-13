@@ -1,0 +1,16 @@
+# A node that panics, and one that does not.
+#
+# A panic inside node code is not a graceful failure: it unwinds through
+# the worker's own machinery, past the point where an ordinary error
+# would have been caught. The question this fixture exists to answer is
+# what the worker has left afterwards: the execution must end failed
+# rather than hang, the pod must survive, and everything that execution
+# registered on the pod must be released even though the unwind skipped
+# the ordinary path.
+
+boom = Boom -> (done: String) {
+  explode: true
+}
+
+after = Debug
+after.data = boom.done

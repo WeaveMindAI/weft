@@ -9,37 +9,6 @@ use anyhow::Result;
 use weft_task_store::tasks::{enqueue_dedup, NewTask, TaskTarget};
 use weft_task_store::{CancelExecutionPayload, ExecutionPayload, TaskKind};
 
-/// Enqueue an `execute` task scoped to (project_id, color). Dedup on
-/// color so racing `/run` calls converge.
-///
-/// `definition_hash` is the project row's `running_definition_hash`
-/// at enqueue time; the worker uses it as the broker's
-/// `expected_hash` so the execution runs on the project shape the
-/// user clicked Run against, even when a later edit changes the
-/// hash before the worker claims.
-pub async fn enqueue_execute(
-    pool: &sqlx::PgPool,
-    project_id: &str,
-    color: weft_core::Color,
-    definition_hash: &str,
-    tenant_id: Option<&str>,
-) -> Result<()> {
-    // New executions are unpinned: a fresh color has no owner yet, and
-    // the atomic task claim guarantees exactly one worker picks it up
-    // (that worker becomes the owner). Pinning is only needed for resume
-    // (see `enqueue_resume`), where a live owner may already exist.
-    enqueue_execution(
-        pool,
-        TaskKind::Execute,
-        project_id,
-        color,
-        definition_hash,
-        tenant_id,
-        None,
-    )
-    .await
-}
-
 /// Enqueue a `resume` task for `color`. Dedup key is `{color}:resume`
 /// so multiple fires arriving while a worker is already running
 /// coalesce: the in-flight worker is expected to observe the fresh
@@ -122,12 +91,12 @@ async fn alive_color_owner<'e>(
 ///
 /// `live_connection`: `Some(spec)` for a live-caller execution (the worker
 /// expects a caller to attach), `None` otherwise.
-pub async fn execution_task_spec(
-    pool: &sqlx::PgPool,
+pub fn execution_task_spec(
     kind: TaskKind,
     project_id: &str,
     color: weft_core::Color,
     definition_hash: &str,
+    binary_hash: &str,
     tenant_id: Option<&str>,
     // The pod to pin the task to, or None to let any alive worker for
     // the project claim it. New executions pass None (a fresh color has
@@ -144,19 +113,6 @@ pub async fn execution_task_spec(
         definition_hash: definition_hash.to_string(),
         live_connection,
     };
-    // Stamp the CURRENT image so an UNPINNED task is only claimable by a
-    // pod baked from it (a stale-image worker's binary lacks the current
-    // graph's node impls; the claim filter + cold-start sweep then route
-    // the task to a fresh, correct pod instead). Read from the project
-    // row here, the one producer, so every execute/resume enqueue path
-    // carries it without each call site re-fetching. Pinned tasks bypass
-    // the claim filter, so the stamp is inert on them.
-    let binary_hash: Option<String> =
-        sqlx::query_scalar("SELECT running_binary_hash FROM project WHERE id = $1::uuid")
-            .bind(project_id)
-            .fetch_optional(pool)
-            .await?
-            .flatten();
     let dedup = format!("{color_str}:{}", kind.as_str());
     Ok(NewTask {
         kind: kind.into(),
@@ -166,7 +122,7 @@ pub async fn execution_task_spec(
         color: Some(color_str),
         tenant_id: tenant_id.map(str::to_string),
         target_pod_name,
-        binary_hash,
+        binary_hash: Some(binary_hash.to_string()),
         payload: serde_json::to_value(&payload)?,
     })
 }
@@ -180,17 +136,25 @@ async fn enqueue_execution(
     tenant_id: Option<&str>,
     target_pod_name: Option<String>,
 ) -> Result<()> {
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM exec_event WHERE color = $1 AND kind = 'execution_started' ORDER BY id LIMIT 1"
+    ).bind(color.to_string()).fetch_one(pool).await?;
+    let birth: weft_journal::ExecEvent = serde_json::from_str(&payload)?;
+    let weft_journal::ExecEvent::ExecutionStarted { program: Some(program), project_id: recorded_project, .. } = birth else {
+        anyhow::bail!("execution {color} has no recorded production code identity");
+    };
+    anyhow::ensure!(recorded_project == project_id && program.definition_hash == definition_hash,
+        "execution {color} does not match the requested project and graph");
     let task = execution_task_spec(
-        pool,
         kind,
         project_id,
         color,
         definition_hash,
+        &program.binary_hash,
         tenant_id,
         target_pod_name,
         None,
-    )
-    .await?;
+    )?;
     enqueue_dedup(pool, task).await?;
     Ok(())
 }

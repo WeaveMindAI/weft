@@ -1,0 +1,18 @@
+# An included file: one anonymous group, proved on its own with
+# `weft run --group 'triage={"text":"hello"}'`.
+Group(text: String) -> (loud: String) {
+  first = ExecPython(text: String) -> (out: String) {
+    code: "return {'out': text}"
+  }
+  first.text = self.text
+  up = ExecPython(text: String) -> (out: String) {
+    code: "return {'out': text.upper()}"
+  }
+  up.text = first.out
+  last = ExecPython(text: String) -> (out: String) {
+    code: "return {'out': text}"
+  }
+  last.text = up.out
+  unrelated = Text { value: "unrelated group branch" }
+  self.loud = last.out
+}

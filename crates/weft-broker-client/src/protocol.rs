@@ -59,7 +59,7 @@ macro_rules! wire_enum {
         }
 
         impl $name {
-            pub fn as_str(self) -> &'static str {
+            pub const fn as_str(self) -> &'static str {
                 match self {
                     $( Self::$variant => $str, )+
                 }
@@ -1604,10 +1604,24 @@ pub struct SupervisorInfraCommandInFlightResponse {
 
 // ---------- Signals ----------
 
+/// The `project.status` values whose signal rows belong in a listener
+/// pod's in-RAM registry: a project being activated (the rehydrate at
+/// the end of activate runs before the flip to active) or live. A
+/// hibernated or parked project keeps its rows in the table so
+/// reactivate can restore them, but the pod was told to forget them at
+/// deactivate, and a pod restarting must not bring them back. Both
+/// readers of the table use this one list: the broker's
+/// `signal/list_for_pod` (what a booting pod rehydrates) and the
+/// dispatcher's `listener_inspect` (what it counts as placed).
+pub const LISTENER_HELD_PROJECT_STATUSES: [&str; 2] =
+    [ProjectStatus::Activating.as_str(), ProjectStatus::Active.as_str()];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalListForPodRequest {
     /// The pooled listener pod asking for the signals placed on it.
-    /// The broker returns rows where `signal.listener_pod = pod_name`.
+    /// The broker returns rows where `signal.listener_pod = pod_name`
+    /// and the owning project's status is one of
+    /// [`LISTENER_HELD_PROJECT_STATUSES`].
     pub pod_name: String,
 }
 

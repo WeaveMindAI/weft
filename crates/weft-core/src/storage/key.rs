@@ -93,6 +93,27 @@ pub fn is_scope_tag(s: &str) -> bool {
     SCOPE_TAGS.contains(&s)
 }
 
+/// Render a TENANT-LESS scope key (`<scope>/<owner>/<id>`), the exact
+/// inverse of `is_scope_key`.
+///
+/// The counterpart of `ParsedKey::to_key` for the short form, and the
+/// only sanctioned way to build one. Both segments pass the wall's
+/// grammar, so a key can never carry a `/` or a `..` out of a value
+/// that came off the wire: the version tree builds asset keys from a
+/// client-supplied manifest, and one bad entry there used to produce a
+/// key the storage surface refuses, which poisoned that project's whole
+/// asset-reference publish from then on.
+pub fn scope_key(scope: &KeyScope, id: &str) -> Result<String, String> {
+    let owner = scope.owner();
+    if !valid_segment(owner) {
+        return Err(format!("'{owner}' is not a valid key segment"));
+    }
+    if !valid_segment(id) {
+        return Err(format!("'{id}' is not a valid key segment"));
+    }
+    Ok(format!("{}/{}/{}", scope.tag(), owner, id))
+}
+
 impl KeyScope {
     /// Build the scope for a `(tag, owner)` pair, or None if `tag` is not
     /// a known scope tag. The canonical tag -> variant mapping; `parse_key`

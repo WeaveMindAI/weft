@@ -102,6 +102,28 @@ pub async fn assert_verb_rejected(disp: &Dispatcher, path: &str, why: &str) -> a
     Ok(())
 }
 
+/// Assert a RUN is rejected by the LIFECYCLE gate (a REJ cell).
+///
+/// The status code alone does not prove it: a definition hash that does
+/// not match the project's answers 409 too, three lines further down
+/// the same handler, so a test that only checked the code would pass
+/// with the gate deleted. The message is what tells the two apart.
+pub async fn assert_run_rejected(disp: &Dispatcher, pid: &Uuid, why: &str) -> anyhow::Result<()> {
+    let path = format!("/projects/{pid}/versions/runs");
+    let body = json!({ "manifest": {}, "definitionHash": "e2e-never-registered", "binaryHash": "e2e-never-registered" });
+    let (code, text) = disp.post_raw(&path, &body).await?;
+    anyhow::ensure!(
+        code == reqwest::StatusCode::CONFLICT,
+        "POST {path} must be rejected by the gate ({why}) with 409, but got HTTP {code}: {text}"
+    );
+    anyhow::ensure!(
+        text.contains("is not available right now"),
+        "POST {path} must be rejected by the LIFECYCLE gate ({why}), but it answered 409 for \
+         another reason: {text}"
+    );
+    Ok(())
+}
+
 /// The current status string of one execution (`running` /
 /// `waiting_for_input` / `completed` / `cancelled` / `failed`), read live
 /// (no settle wait).
@@ -141,4 +163,64 @@ pub async fn fire_until_execution(
         }
     }
     Err(last_err.unwrap().context("no execution started after repeated trigger pushes"))
+}
+
+// ----- reading a `--json` command's NDJSON --------------------------------
+//
+// One definition of each, used by every version-tree suite. They were a
+// verbatim copy in two test files, which is how two readers of one
+// output format stop agreeing.
+
+/// The execution color returned by run or bake.
+pub fn color_of(stdout: &str) -> anyhow::Result<Uuid> {
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        let color = if v.get("verb").and_then(Value::as_str) == Some("bake") {
+            v.pointer("/detail/result/color")
+        } else {
+            v.pointer("/detail/color")
+        };
+        if let Some(c) = color.and_then(Value::as_str) {
+            return Ok(c.parse()?);
+        }
+    }
+    anyhow::bail!("no execution color in command output:\n{stdout}")
+}
+
+/// The one-line summary on the terminal event.
+pub fn summary_of(stdout: &str) -> String {
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if v.get("phase").and_then(Value::as_str) == Some("complete") {
+            return v.pointer("/detail/summary").and_then(Value::as_str).unwrap_or("").to_string();
+        }
+    }
+    String::new()
+}
+
+/// The warnings a verb reported, in the order it reported them.
+///
+/// One shape for every verb: a `warning` phase carrying a `message`.
+pub fn warnings_of(stdout: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if v.get("phase").and_then(Value::as_str) != Some("warning") {
+            continue;
+        }
+        if let Some(m) = v.pointer("/detail/message").and_then(Value::as_str) {
+            out.push(m.to_string());
+        }
+    }
+    out
+}
+
+/// The version tree, as `weft tree --json` answers it.
+pub async fn tree_of(project: &weft_e2e::project::Project) -> anyhow::Result<Value> {
+    Ok(serde_json::from_str(project.weft(&["tree", "--json"]).await?.trim())?)
+}
+
+/// Whether a node's rows in a replay came from the seed.
+pub fn inherited(replay: &weft_e2e::Replay, node: &str) -> bool {
+    replay.for_node(node).any(|e| e.field("inherited_from").is_some())
 }

@@ -180,7 +180,7 @@ async fn infra_sync(
     action: InfraAction,
     opts: InfraOpts,
 ) -> Result<()> {
-    let handle = super::ensure::ensure_registered(ctx, progress).await?;
+    let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
     let image_tags =
         build_infra_images(progress, &handle.plan, &handle.id, &handle.client).await?;
     let verb_label = action_verb_label(&action);

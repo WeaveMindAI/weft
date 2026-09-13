@@ -123,6 +123,14 @@ impl SocketDial for ConnectionSocketDial {
         let parsed: url::Url =
             url.parse().map_err(|e| dial_err(service, format!("bad URL '{url}': {e}")))?;
         let meter = self.meter;
+        // Apply the credential's route policy before either direct or relay
+        // routing, just as the HTTP client does.
+        let https = https_form(&parsed);
+        if self.sink.origin == weft_core::CredentialOwner::Ours {
+            let meter = meter.ok_or_else(|| dial_err(service, "the runtime credential requires a meter; none was attached"))?;
+            weft_providers::ours_route_on(meter, service, "GET", https.as_str())
+                .map_err(|error| dial_err(service, error))?;
+        }
 
         // Route the session, mirroring the HTTP lanes exactly.
         let (target, observation) = match &self.relay_url {
@@ -162,7 +170,6 @@ impl SocketDial for ConnectionSocketDial {
                     .map_err(|_| dial_err(service, "URL scheme rewrite refused"))?;
                 let observation = match meter {
                     Some(meter) => {
-                        let https = https_form(&parsed);
                         match weft_providers::route_under(meter.base_url(), &https)
                             .map(|route| (route.to_string(), meter))
                         {
@@ -587,6 +594,7 @@ mod tests {
         Arc::new(CostSink {
             tasks,
             pending,
+            open_charges: crate::metering::OpenCharges::new(),
             project_id: "p1".into(),
             tenant_id: "t1".into(),
             color: uuid::Uuid::nil(),
@@ -595,6 +603,37 @@ mod tests {
             service: "bytesvc".into(),
             origin: weft_core::CredentialOwner::TheirOwn,
         })
+    }
+
+    /// The runtime's own credential never travels off the service's
+    /// declared routes, on this lane exactly as on the HTTP one. Without
+    /// the gate a node holding an `Ours` connection could name any host
+    /// and the shared key would be stamped onto that handshake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runtime_credential_only_dials_declared_routes() {
+        let (base, _seen) = spawn_echo_ws().await;
+        let base: &'static str = Box::leak(base.into_boxed_str());
+        let meter: &'static ByteMeter = Box::leak(Box::new(ByteMeter { base, inbound: false }));
+        let tasks = Arc::new(RecordingTaskStore::default());
+        let pending = crate::metering::PendingCostRecords::new();
+        let mut sink_ours = sink(tasks.clone(), pending.clone());
+        Arc::get_mut(&mut sink_ours).expect("sole owner").origin = weft_core::CredentialOwner::Ours;
+        let dial = ConnectionSocketDial {
+            steps: vec![],
+            relay_url: None,
+            meter: Some(meter),
+            sink: sink_ours,
+        };
+
+        let refused = dial.dial("wss://attacker.example/live").await;
+        let err = match refused {
+            Ok(_) => panic!("a host outside the service's API must be refused"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("not under service"), "{err}");
+
+        // The service's own session route still dials.
+        dial.dial(&format!("{base}/live?mode=fast")).await.expect("the declared route dials");
     }
 
     /// L3, the whole worker lane: the dialer signs the handshake with the

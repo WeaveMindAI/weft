@@ -45,6 +45,13 @@
 		onApplyTextEdit,
 		onResyncSource,
 		onRun,
+		specs = [],
+		resolveSpec,
+		onRunSpec,
+		onSaveSpec,
+		onRunSpecFile,
+		onListSpecs,
+		onBranchTo,
 		onStop,
 		onDismissError,
 		onOpenLocation,
@@ -86,6 +93,13 @@
 		execPrefix?: string;
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
 		onRun?: (targets: string[]) => void;
+		specs?: import('../../../../run-spec').RunSpec[];
+		resolveSpec?: (spec: import('../../../../run-spec').RunSpec, seeded: boolean) => Promise<import('../../../../run-spec').ResolveSpecResponse>;
+		onRunSpec?: (spec: import('../../../../run-spec').RunSpec, seeded?: boolean) => void;
+		onSaveSpec?: (spec: import('../../../../run-spec').RunSpec) => void;
+		onRunSpecFile?: (name: string) => void;
+		onListSpecs?: () => void;
+		onBranchTo?: (reference: string) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onOpenLocation: (location: SourceLocation) => void;
@@ -133,6 +147,13 @@
 		{onApplyTextEdit}
 		{onResyncSource}
 		{onRun}
+		{specs}
+		{resolveSpec}
+		{onRunSpec}
+		{onSaveSpec}
+		{onRunSpecFile}
+		{onListSpecs}
+		{onBranchTo}
 		{onStop}
 		{onDismissError}
 		{onOpenLocation}

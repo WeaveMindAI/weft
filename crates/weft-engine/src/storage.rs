@@ -222,6 +222,10 @@ impl WorkerStorage {
         use futures::StreamExt;
         let part_size = part_size as usize;
         let mut buf: Vec<u8> = Vec::new();
+        // Parts are NAMED by their position, from 1, and this loop is the
+        // only writer of this key's stream, so the part it is on is the part
+        // it says it is on.
+        let mut part_number: i32 = 1;
         while let Some(chunk) = data.next().await {
             let chunk = chunk.map_err(|e| {
                 WeftError::NodeExecution(format!("storage: reading upload stream: {e}"))
@@ -230,7 +234,8 @@ impl WorkerStorage {
             while buf.len() >= part_size {
                 let rest = buf.split_off(part_size);
                 let part = bytes::Bytes::from(std::mem::replace(&mut buf, rest));
-                self.upload_one_part(color, key, part).await?;
+                self.upload_one_part(color, key, part_number, part).await?;
+                part_number += 1;
             }
         }
         // The final short part, only if there are leftover bytes. A stream that
@@ -239,7 +244,7 @@ impl WorkerStorage {
         // multipart part, which S3 cannot represent; `complete` writes it as a
         // plain empty object).
         if !buf.is_empty() {
-            self.upload_one_part(color, key, bytes::Bytes::from(buf)).await?;
+            self.upload_one_part(color, key, part_number, bytes::Bytes::from(buf)).await?;
         }
         let value: Value = self
             .post_json(
@@ -256,14 +261,23 @@ impl WorkerStorage {
 
     /// Reserve one part (its URL comes back signed to exactly this size),
     /// PUT it, and record its etag.
-    async fn upload_one_part(&self, color: Color, key: &str, bytes: bytes::Bytes) -> WeftResult<()> {
+    async fn upload_one_part(
+        &self,
+        color: Color,
+        key: &str,
+        part_number: i32,
+        bytes: bytes::Bytes,
+    ) -> WeftResult<()> {
         let UploadPartsResponse { parts } = self
             .post_json(
                 "/v1/storage/upload/parts",
                 color,
                 &weft_core::storage::UploadPartsRequest {
                     key: key.to_string(),
-                    sizes: vec![bytes.len() as u64],
+                    parts: vec![weft_core::storage::PartAsk {
+                        part_number,
+                        size_bytes: bytes.len() as u64,
+                    }],
                 },
                 "reserve upload part",
             )
@@ -376,7 +390,11 @@ impl WorkerStorageOps for WorkerStorage {
         // Begin: the broker mints the key, charges a declared size against the
         // quota up front, and opens the multipart upload. The broker never
         // sees the bytes.
-        let UploadBeginResponse { key, part_size, already_stored } = self
+        // `resume` is not read here: it can only come back for a
+        // CONTENT-ADDRESSED key (an asset, where two callers can hold the
+        // same bytes), and a node's upload is execution-scoped under a
+        // freshly minted id, so nothing can already be part way up under it.
+        let UploadBeginResponse { key, part_size, already_stored, resume: _ } = self
             .post_json(
                 "/v1/storage/upload/begin",
                 color,

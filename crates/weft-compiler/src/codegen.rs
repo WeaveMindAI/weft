@@ -57,6 +57,7 @@ pub fn emit(
     target_root: &Path,
     catalog: &FsCatalog,
     crate_name: &str,
+    node_set: NodeSet,
 ) -> CompileResult<PathBuf> {
     let crate_root = target_root.to_path_buf();
     // A pure function of its inputs: wipe any previous emission so a
@@ -74,11 +75,12 @@ pub fn emit(
     // toolchain from the baked workspace. One resolver for every weft-root read.
     let weft_root = crate::build::resolve_weft_root()?;
 
-    // Every CATALOG-resolved node type referenced by the project.
-    // Runtime-internal built-ins (Passthrough, LoopIn, LoopOut, ...)
-    // are excluded: the engine dispatches them inline, so they don't
-    // need a catalog shim and the catalog doesn't carry them.
-    let referenced = collect_node_types(project);
+    // The CATALOG node types this binary compiles in: what the project
+    // references, or the whole catalog under `NodeSet::Full`. Runtime-
+    // internal built-ins (Passthrough, LoopIn, LoopOut, ...) are never
+    // among them: the engine dispatches them inline, so they don't need
+    // a catalog shim and the catalog doesn't carry them.
+    let referenced = node_types_for(project, catalog, node_set);
 
     // Group referenced nodes by their owning package. `package_key`
     // is the package root dir; codegen emits one `pkg_<name>/` cargo
@@ -87,19 +89,26 @@ pub fn emit(
     // every package).
     let packages = group_by_package(catalog, &referenced)?;
 
-    write_worker_cargo_toml(&crate_root, catalog, &packages, crate_name)?;
-    write_rust_toolchain(&crate_root, &weft_root)?;
     // The `ProjectDefinition` is NOT baked into the binary anymore;
     // workers fetch it from the broker at execution claim time keyed
     // by `definition_hash`. A pure-config or pure-topology edit
     // therefore no longer re-bakes any source file into the worker
     // crate, and the docker image hash stays cache-hit.
-    write_package_crates(
+    let crate_dirs = write_package_crates(
         &crate_root,
         catalog,
         &packages,
         &EmitPaths::Container { nodes_root: project_root.join("nodes") },
     )?;
+    write_worker_cargo_toml(&crate_root, catalog, &packages, &crate_dirs, crate_name)?;
+    write_rust_toolchain(&crate_root, &weft_root)?;
+    // The cache sweep the Dockerfile runs after `cargo build`; it rides
+    // in the crate so the `COPY build/ /work/` carries it.
+    std::fs::write(
+        crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME),
+        crate::worker_image::CACHE_GC_SCRIPT,
+    )
+    .map_err(CompileError::Io)?;
     write_registry_rs(&src_dir, &packages)?;
     write_main_rs(&src_dir, catalog)?;
 
@@ -218,6 +227,48 @@ fn sanitize_pkg_ident(raw: &str) -> String {
     format!("pkg_{}", crate::build::sanitize_crate_name(raw))
 }
 
+/// Which catalog node types a worker binary compiles in.
+///
+/// `Referenced` is the ordinary build: the types the program names, so
+/// the binary is as small as the program. `Full` compiles every node
+/// in the catalog, so a program edit that starts using a node the
+/// previous program did not never rebuilds the image: the build is
+/// content-addressed either way (`compute_binary_hash` folds the same
+/// set plus this choice), so a full image rebuilds only when a node
+/// source was added, removed, or edited. CLI builds default to `Full`;
+/// `--referenced` selects only the graph's types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeSet {
+    Referenced,
+    Full,
+}
+
+impl NodeSet {
+    /// The line the binary hash folds so a full image and a referenced
+    /// image of one program never share a tag.
+    pub fn hash_marker(self) -> &'static str {
+        match self {
+            NodeSet::Referenced => "referenced",
+            NodeSet::Full => "full",
+        }
+    }
+}
+
+/// The catalog node types a build under `node_set` compiles in, sorted:
+/// [`collect_node_types`] for `Referenced`, every catalog entry for
+/// `Full`. The ONE resolution of the choice; codegen, the Dockerfile
+/// staging and the binary hash all read it.
+pub fn node_types_for(
+    project: &ProjectDefinition,
+    catalog: &FsCatalog,
+    node_set: NodeSet,
+) -> BTreeSet<String> {
+    match node_set {
+        NodeSet::Referenced => collect_node_types(project),
+        NodeSet::Full => catalog.iter().map(|e| e.node_type.clone()).collect(),
+    }
+}
+
 /// The set of CATALOG node types this project references, sorted.
 /// Runtime-internal built-in node types (Passthrough, LoopIn,
 /// LoopOut, ...) are excluded: they live in the engine, not the
@@ -320,6 +371,7 @@ fn write_worker_cargo_toml(
     crate_root: &Path,
     catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
+    crate_dirs: &BTreeMap<String, String>,
     crate_name: &str,
 ) -> CompileResult<()> {
     let package_name = crate::build::sanitize_crate_name(crate_name);
@@ -329,13 +381,15 @@ fn write_worker_cargo_toml(
     let mut deps = fixed_worker_deps();
     // One path dep per referenced package crate. These are the ONLY
     // per-project deps; everything else (`fixed_worker_deps`) is identical for
-    // every worker, which is what lets the builder base precompile them once
-    // (via the warm-up crate) and every worker reuse the rlibs.
+    // every worker. The builder base compiles the stock project's worker
+    // from this same emission, so a project reuses every rlib it shares
+    // with it: the engine, the dependencies, and each stock package crate
+    // it did not edit.
     for pkg in packages {
         insert_dep(
             &mut deps,
             &pkg.module_ident,
-            toml::Value::Table(path_table(&format!("./{}", pkg.module_ident))),
+            toml::Value::Table(path_table(&format!("./{}", crate_dirs[&pkg.module_ident]))),
         );
     }
 
@@ -373,13 +427,27 @@ path = "src/main.rs"
     Ok(())
 }
 
-/// Emit one cargo crate per referenced node package. Each lives at
-/// `<crate_root>/pkg_<name>/`. The package crate's `lib.rs` reuses
-/// the original `pkg_<name>.rs` shim shape (`#[path]`-includes of
-/// shared `.rs` files and each referenced node's `mod.rs`); the
-/// difference is that it now compiles to a standalone `.rlib`, so
-/// editing one node's source rebuilds ONLY this crate plus the
-/// worker's link step, leaving sibling package crates cache-hit.
+/// Emit one cargo crate per referenced node package and answer where
+/// each landed: `module_ident -> directory name under crate_root`. The
+/// package crate's `lib.rs` reuses the original `pkg_<name>.rs` shim
+/// shape (`#[path]`-includes of shared `.rs` files and each referenced
+/// node's `mod.rs`); the difference is that it now compiles to a
+/// standalone `.rlib`, so editing one node's source rebuilds ONLY this
+/// crate plus the worker's link step, leaving sibling package crates
+/// cache-hit.
+///
+/// The directory is `pkg_<name>-<slot>`, where the slot is a digest of
+/// the package's sources AND the two generated files. Cargo tells path
+/// crates apart by their path, never by their content, and every
+/// project's build shares one compile cache on the host: with a fixed
+/// `pkg_<name>` path, a project whose copy of a stock node is edited
+/// would leave its rlib where the next untouched project (whose files
+/// carry older mtimes) picks it up as fresh, and that project's worker
+/// would run the edit. Same content, same slot, shared rlib; a
+/// difference in the package's files or in either generated file, a
+/// slot of its own. The slot covers exactly those inputs: anything the
+/// generator later adds to the emitted root manifest that reaches every
+/// package crate (a `[profile]`, a `[patch]`) has to join the digest.
 ///
 /// Per-package and per-node cargo deps land here, not on the worker.
 fn write_package_crates(
@@ -387,23 +455,78 @@ fn write_package_crates(
     catalog: &FsCatalog,
     packages: &[PackageEmit<'_>],
     paths: &EmitPaths,
-) -> CompileResult<()> {
+) -> CompileResult<BTreeMap<String, String>> {
+    let mut dirs = BTreeMap::new();
     for pkg in packages {
-        let pkg_dir = crate_root.join(&pkg.module_ident);
+        let cargo_toml = render_package_cargo_toml(catalog, pkg, paths)?;
+        let lib_rs = render_package_lib_rs(catalog, pkg, paths)?;
+        let dir_name = format!(
+            "{}-{}",
+            pkg.module_ident,
+            package_crate_slot(pkg, &cargo_toml, &lib_rs)?
+        );
+        let pkg_dir = crate_root.join(&dir_name);
         let pkg_src = pkg_dir.join("src");
         std::fs::create_dir_all(&pkg_src).map_err(CompileError::Io)?;
-        write_package_cargo_toml(&pkg_dir, catalog, pkg, paths)?;
-        write_package_lib_rs(&pkg_src, catalog, pkg, paths)?;
+        std::fs::write(pkg_dir.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
+        std::fs::write(pkg_src.join("lib.rs"), lib_rs).map_err(CompileError::Io)?;
+        // Within one slot, cargo decides whether a cached rlib is still
+        // good by comparing every source mtime, this shim included,
+        // against the rlib's. Written at wall-clock time the shim would
+        // be newer than any rlib another project (or an earlier build)
+        // left in the shared compile cache, and every package would
+        // recompile on every build. Its content is a function of the
+        // package's files, so it takes the newest of their mtimes.
+        let newest = newest_source_mtime(&pkg.package.root)?;
+        for generated in [pkg_dir.join("Cargo.toml"), pkg_src.join("lib.rs")] {
+            crate::build::stamp_mtime(&generated, newest);
+        }
+        dirs.insert(pkg.module_ident.clone(), dir_name);
     }
-    Ok(())
+    Ok(dirs)
 }
 
-fn write_package_cargo_toml(
-    pkg_dir: &Path,
+/// The slot a package crate compiles in: sixteen hex characters over
+/// the package's files (the node-tree walk the binary hash uses, so
+/// the same files count) and the generated manifest and shim.
+fn package_crate_slot(
+    pkg: &PackageEmit<'_>,
+    cargo_toml: &str,
+    lib_rs: &str,
+) -> CompileResult<String> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"weft-package-crate-v1\n");
+    crate::hash::hash_path(&mut hasher, &pkg.module_ident, &pkg.package.root)
+        .map_err(|e| CompileError::Build(format!("hash package {}: {e}", pkg.package.name)))?;
+    hasher.update(b"Cargo.toml:\n");
+    hasher.update(cargo_toml.as_bytes());
+    hasher.update(b"\nlib.rs:\n");
+    hasher.update(lib_rs.as_bytes());
+    Ok(crate::hash::hex(&hasher.finalize()).chars().take(16).collect())
+}
+
+/// The newest mtime among a package root's files (the same walk the
+/// binary hash and the staging copy use, so the stamp tracks exactly the
+/// files the compiled crate reads).
+fn newest_source_mtime(package_root: &Path) -> CompileResult<std::time::SystemTime> {
+    let files = crate::hash::walk_dir(package_root)
+        .map_err(|e| CompileError::Build(format!("walk package {}: {e}", package_root.display())))?;
+    let mut newest = std::time::SystemTime::UNIX_EPOCH;
+    for file in files {
+        let modified = std::fs::metadata(&file)
+            .and_then(|meta| meta.modified())
+            .map_err(CompileError::Io)?;
+        newest = newest.max(modified);
+    }
+    Ok(newest)
+}
+
+fn render_package_cargo_toml(
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
     paths: &EmitPaths,
-) -> CompileResult<()> {
+) -> CompileResult<String> {
     // Runtime essentials shared with the worker, plus the workspace
     // surface every node body uses. `paths` places the weft crates
     // (`../../weft/...` inside a build container, the real checkout
@@ -482,8 +605,7 @@ node-tests = []
         ident = pkg.module_ident,
         deps = deps_fragment,
     );
-    std::fs::write(pkg_dir.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
-    Ok(())
+    Ok(contents)
 }
 
 /// Per-package `lib.rs`: re-exports each referenced node's module
@@ -491,12 +613,11 @@ node-tests = []
 /// shared-package `.rs` files. Same shape as the old `pkg_*.rs`
 /// shim that lived in the worker crate; the only difference is it
 /// compiles to a standalone `.rlib`.
-fn write_package_lib_rs(
-    pkg_src: &Path,
+fn render_package_lib_rs(
     catalog: &FsCatalog,
     pkg: &PackageEmit<'_>,
     paths: &EmitPaths,
-) -> CompileResult<()> {
+) -> CompileResult<String> {
     let mut body = String::new();
     body.push_str(&format!(
         "//! Package crate for `{}`. Emitted by codegen; do not edit.\n\n",
@@ -539,8 +660,7 @@ fn write_package_lib_rs(
             "#[path = \"{include}\"]\npub mod {mod_name};\n\n"
         ));
     }
-    std::fs::write(pkg_src.join("lib.rs"), body).map_err(CompileError::Io)?;
-    Ok(())
+    Ok(body)
 }
 
 /// Propagate the workspace's pinned toolchain into the generated
@@ -644,12 +764,9 @@ fn base_runtime_deps() -> BTreeMap<String, toml::Value> {
 /// the runtime baseline (`base_runtime_deps`) plus the engine path deps and the
 /// fixed crates.io deps. The ONLY thing a real worker adds on top is one path dep
 /// per referenced node package (`pkg_<node>`), and any crates THOSE nodes pull in
-/// live inside the `pkg_<node>` crate, not here. This is THE shared definition:
-/// `write_worker_cargo_toml` builds the real worker from it, and
-/// `emit_warmup_crate` builds the builder-base warm-up crate from the SAME set, so
-/// the base precompiles exactly the rlibs (with the exact feature unification) a
-/// real worker reuses. A test asserts the two stay in lockstep; if they drift, the
-/// warm-up stops matching and workers silently recompile the engine again.
+/// live inside the `pkg_<node>` crate, not here. Its path deps also seed the
+/// worker crate closure (`worker_workspace_crates`): the workspace crates the
+/// builder base bakes and every worker hash covers.
 pub fn fixed_worker_deps() -> BTreeMap<String, toml::Value> {
     let mut deps = base_runtime_deps();
     insert_dep(
@@ -806,60 +923,6 @@ fn dependency_tables(manifest: &toml::Value) -> Vec<&toml::value::Table> {
         }
     }
     out
-}
-
-/// Emit the builder-base WARM-UP crate at `crate_root`: a minimal binary crate
-/// whose dependencies are EXACTLY `fixed_worker_deps()` (no per-project
-/// `pkg_<node>`), plus a `main.rs` that references the engine so cargo actually
-/// links it. The builder base compiles this once into the shared `/weft/target`,
-/// pre-cooking every engine + dependency rlib with the SAME crate identity and
-/// feature unification a real worker triggers. A real worker (same fixed deps,
-/// same seeded lock, same target dir) then finds those rlibs fingerprint-fresh and
-/// compiles only its `pkg_<node>` crates + the thin top crate.
-///
-/// The warm-up's `main.rs` only needs to force the engine + its deps to LINK
-/// (so they are compiled), not to do anything: a bare `use` of the engine root
-/// plus an empty `main` is enough for cargo to build the full dependency tree.
-pub fn emit_warmup_crate(crate_root: &Path, weft_root: &Path) -> CompileResult<()> {
-    let src = crate_root.join("src");
-    std::fs::create_dir_all(&src).map_err(CompileError::Io)?;
-
-    // Pin the SAME toolchain a real worker crate uses (codegen writes this into
-    // every worker via `write_rust_toolchain`). Without it, `cargo` in the
-    // warm-up's own directory has no `rust-toolchain.toml` and rustup refuses to
-    // pick a version, and a mismatched toolchain would re-fingerprint every rlib.
-    write_rust_toolchain(crate_root, weft_root)?;
-
-    let mut deps_fragment = String::new();
-    for (name, value) in fixed_worker_deps() {
-        deps_fragment.push_str(&format!("{name} = {}\n", toml_inline(&value)));
-    }
-    let cargo_toml = format!(
-        r#"# Emitted by weft codegen for the builder base. Do NOT edit by hand.
-# Its dependencies are exactly the project-independent set every worker shares
-# (`codegen::fixed_worker_deps`), so building it precompiles the rlibs a real
-# worker reuses. Per-project node packages are NOT here.
-
-[package]
-name = "weft-worker-warmup"
-version = "0.1.0"
-edition = "2021"
-
-[[bin]]
-name = "weft-worker-warmup"
-path = "src/main.rs"
-
-[dependencies]
-{deps}"#,
-        deps = deps_fragment,
-    );
-    std::fs::write(crate_root.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
-
-    // Reference the engine crate so cargo links it (and thus its whole
-    // dependency tree). An empty `main` is all the warm-up needs to run.
-    let main_rs = "#[allow(unused_imports)]\nuse weft_engine as _;\n\nfn main() {}\n";
-    std::fs::write(src.join("main.rs"), main_rs).map_err(CompileError::Io)?;
-    Ok(())
 }
 
 /// Insert a package- or node-declared cargo dep, MERGING with any
@@ -1047,7 +1110,7 @@ fn ident_for_node_type(node_type: &str) -> String {
     out
 }
 
-// Each package crate is an EXTERNAL cargo dep (path = "./pkg_<name>"
+// Each package crate is an EXTERNAL cargo dep (path = "./pkg_<name>-<slot>"
 // in Cargo.toml), so the worker binary just uses them as crates and
 // main.rs needs no package knowledge (no `mod pkg_<name>;`), but it
 // bakes the project's TYPE declarations: node metadata embedded by
@@ -1311,6 +1374,7 @@ pub fn emit_test_crate(
     let binary_name = format!("{}_tests", crate::build::sanitize_crate_name(&package.name));
     let (build_line, build_deps_fragment) =
         write_binary_build_script(target_root, catalog, std::slice::from_ref(&pkg))?;
+    let crate_dirs = write_package_crates(target_root, catalog, std::slice::from_ref(&pkg), paths)?;
 
     // Root Cargo.toml: only what the generated main names directly
     // (weft-core for the registry, weft-engine for the runner) plus
@@ -1327,7 +1391,7 @@ pub fn emit_test_crate(
         toml::Value::Table(t)
     });
     insert_dep(&mut deps, &pkg.module_ident, {
-        let mut t = path_table(&format!("./{}", pkg.module_ident));
+        let mut t = path_table(&format!("./{}", crate_dirs[&pkg.module_ident]));
         t.insert(
             "features".into(),
             toml::Value::Array(vec![toml::Value::String("node-tests".into())]),
@@ -1365,7 +1429,6 @@ path = "src/main.rs"
     );
     std::fs::write(target_root.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
 
-    write_package_crates(target_root, catalog, std::slice::from_ref(&pkg), paths)?;
     write_registry_rs(&src_dir, std::slice::from_ref(&pkg))?;
 
     let type_decls = baked_type_decls(catalog);
@@ -1403,7 +1466,7 @@ fn main() -> std::process::ExitCode {{
 #[cfg(test)]
 mod tests {
     use super::collect_node_types;
-    use super::{emit_warmup_crate, fixed_worker_deps, worker_workspace_crates};
+    use super::{fixed_worker_deps, worker_workspace_crates};
 
     /// The worker crate closure on THIS repo. Not a tautology check: the
     /// closure is computed from the real manifests, so this pins the expected
@@ -1430,42 +1493,6 @@ mod tests {
             "worker crate closure changed; confirm the new set is really \
              worker-linked, then update this pin"
         );
-    }
-
-    /// The warm-up crate's dependencies MUST be exactly the project-independent
-    /// `fixed_worker_deps`: if they drift, the builder base precompiles a
-    /// different rlib set than real workers need and every worker silently
-    /// recompiles the engine again (the regression this whole mechanism fixes).
-    /// Also asserts the warm-up carries NO per-project `pkg_<node>` dep, so a
-    /// node's crates can never get baked into the shared base.
-    #[test]
-    fn warmup_crate_deps_match_fixed_worker_deps_exactly() {
-        let dir = std::env::temp_dir().join(format!("weft-warmup-test-{}", uuid::Uuid::new_v4()));
-        let weft_root = crate::build::resolve_weft_root().expect("resolve weft root");
-        emit_warmup_crate(&dir, &weft_root).expect("emit warm-up crate");
-        let cargo_toml =
-            std::fs::read_to_string(dir.join("Cargo.toml")).expect("read warm-up Cargo.toml");
-        let parsed: toml::Value = toml::from_str(&cargo_toml).expect("parse warm-up Cargo.toml");
-        let dep_table = parsed
-            .get("dependencies")
-            .and_then(|d| d.as_table())
-            .expect("warm-up has [dependencies]");
-
-        let expected = fixed_worker_deps();
-        // Same dependency NAMES, exactly (no missing, no extra like a pkg_*).
-        let got_names: std::collections::BTreeSet<&str> =
-            dep_table.keys().map(String::as_str).collect();
-        let want_names: std::collections::BTreeSet<&str> =
-            expected.keys().map(String::as_str).collect();
-        assert_eq!(
-            got_names, want_names,
-            "warm-up crate deps drifted from fixed_worker_deps"
-        );
-        assert!(
-            !got_names.iter().any(|n| n.starts_with("pkg_")),
-            "warm-up must carry NO per-project node package dep"
-        );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A real worker's dependency set is `fixed_worker_deps` PLUS one path dep per

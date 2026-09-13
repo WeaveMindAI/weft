@@ -137,6 +137,42 @@
         "title": "Refresh Executions",
         "category": "Weft",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "weft.toggleExecutionsMode",
+        "title": "Flat list / by version",
+        "category": "Weft",
+        "icon": "$(list-tree)"
+      },
+      {
+        "command": "weft.branchHere",
+        "title": "Branch here",
+        "category": "Weft",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "weft.checkpointLabel",
+        "title": "Checkpoint…",
+        "category": "Weft",
+        "icon": "$(bookmark)"
+      },
+      {
+        "command": "weft.pruneVersion",
+        "title": "Prune",
+        "category": "Weft",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "weft.diffWithHead",
+        "title": "Diff with head",
+        "category": "Weft",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "weft.freezeRun",
+        "title": "Freeze as example…",
+        "category": "Weft",
+        "icon": "$(lock)"
       }
     ],
     "views": {
@@ -182,6 +218,16 @@
           "command": "weft.clearExecutions",
           "when": "view == weft.executions",
           "group": "navigation@2"
+        },
+        {
+          "command": "weft.toggleExecutionsMode",
+          "when": "view == weft.executions",
+          "group": "navigation@3"
+        },
+        {
+          "command": "weft.checkpointLabel",
+          "when": "view == weft.executions",
+          "group": "navigation@4"
         }
       ],
       "view/item/context": [
@@ -203,6 +249,41 @@
         {
           "command": "weft.deleteExecution",
           "when": "view == weft.executions && viewItem =~ /^weftExecution-/",
+          "group": "inline@2"
+        },
+        {
+          "command": "weft.branchHere",
+          "when": "view == weft.executions && viewItem == weftVersion",
+          "group": "inline@1"
+        },
+        {
+          "command": "weft.pruneVersion",
+          "when": "view == weft.executions && viewItem == weftVersion",
+          "group": "inline@2"
+        },
+        {
+          "command": "weft.viewExecution",
+          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "group": "inline@1"
+        },
+        {
+          "command": "weft.diffWithHead",
+          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "group": "1_run@1"
+        },
+        {
+          "command": "weft.freezeRun",
+          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "group": "1_run@2"
+        },
+        {
+          "command": "weft.branchHere",
+          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
+          "group": "1_run@3"
+        },
+        {
+          "command": "weft.deleteExecution",
+          "when": "view == weft.executions && viewItem =~ /^weftRun-/",
           "group": "inline@2"
         }
       ]

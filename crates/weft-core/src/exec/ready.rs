@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use crate::exec::skip::{check_flow_permission, check_should_skip, SkipReason};
 use crate::frames::LoopFrames;
 use crate::project::{Edge, EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
-use crate::context::Phase;
+use crate::primitive::Phase;
 use crate::pulse::{Pulse, PulseStatus, PulseTable};
 use crate::weft_type::WeftType;
 use crate::Color;
@@ -36,14 +36,7 @@ pub fn owned_bag(bag: &InputBag) -> Map<String, Value> {
 pub struct ReadyGroup {
     pub frames: LoopFrames,
     pub color: Color,
-    pub input: InputBag,
-    /// Wired ports whose resolved pulse for this firing was a CLOSURE
-    /// (the upstream terminated without firing the port). Disjoint
-    /// from the keys of `input`: closures carry no data, so they
-    /// never appear there. The inspector reads the same list back off
-    /// the journal fold to render closed ports distinctly from
-    /// user-emitted nulls.
-    pub closed_ports: Vec<String>,
+    pub received: FiringInput,
     /// Set when this firing must NOT run its body, and why. `None`
     /// means run it.
     pub skip: Option<SkipReason>,
@@ -84,6 +77,42 @@ pub fn resolve_port_value<'a>(group_pulses: &[&'a Pulse], port: &str) -> Option<
         });
     }
     winner
+}
+
+/// Resolve authored backups only after the ordinary supplier has ended or
+/// is absent. These derived input facts are never journaled as wire emissions.
+pub fn effective_input_pulses(
+    node: &NodeDefinition,
+    actual: &[&Pulse],
+    wired: &HashSet<&str>,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
+    color: Color,
+    frames: &LoopFrames,
+) -> Vec<Pulse> {
+    let mut effective: Vec<_> = actual.iter().map(|pulse| (*pulse).clone()).collect();
+    let Some(selection) = edge_idx.selection() else { return effective };
+    for port in &node.inputs {
+        if !selection.includes_port(node, &port.name) { continue; }
+        let winner = resolve_port_value(actual, &port.name);
+        if winner.is_some_and(|pulse| !pulse.closed || pulse.close_error.is_some()) { continue; }
+        if winner.is_none() && selection.has_supplier(project, &node.id, &port.name) { continue; }
+        if winner.is_none() && !wired.contains(port.name.as_str())
+            && node.port_literals.get(&port.name).is_some_and(|v| literal_is_data(node, &port.name, v))
+        { continue; }
+        if matches!(port.port_type, WeftType::Generator(_)) { continue; }
+        let backup = selection.input.get(&node.id).and_then(|ports| ports.get(&port.name));
+        if let Some(value) = backup {
+            let mut pulse = Pulse::new(uuid::Uuid::nil(), color, frames.clone(), &node.id, &port.name, Arc::new(value.clone()));
+            pulse.provided = true;
+            pulse.backup = true;
+            pulse.inherited_from = selection.input_origins.get(&node.id).and_then(|ports| ports.get(&port.name)).copied();
+            effective.push(pulse);
+        } else if winner.is_none() && wired.contains(port.name.as_str()) {
+            effective.push(Pulse::closure(uuid::Uuid::nil(), color, frames.clone(), &node.id, &port.name));
+        }
+    }
+    effective
 }
 
 /// Higher rank wins. Data (1) > closure (0).
@@ -231,19 +260,20 @@ pub fn find_ready_among<'a>(
         let required: HashSet<&str> = node
             .inputs
             .iter()
-            .filter(|p| p.required)
+            .filter(|p| p.required && edge_idx.includes_port(node, &p.name))
             .map(|p| p.name.as_str())
             .collect();
 
         let mut literal_filled: HashSet<&str> = HashSet::new();
         for (name, value) in &node.port_literals {
-            if !wired.contains(name.as_str()) && literal_is_data(node, name, value) {
+            if edge_idx.includes_port(node, name) && !wired.contains(name.as_str()) && literal_is_data(node, name, value) {
                 literal_filled.insert(name.as_str());
             }
         }
 
         let groups = find_groups_for_node(
             node, node_pulses, &required, &wired, &literal_filled, has_incoming, out_of_scope,
+            project, edge_idx,
         );
         for group in groups {
             result.push((node, group));
@@ -265,6 +295,8 @@ fn find_groups_for_node(
     literal_filled: &HashSet<&str>,
     has_incoming: bool,
     out_of_scope: bool,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
 ) -> Vec<ReadyGroup> {
     let pending: Vec<&Pulse> = node_pulses
         .iter()
@@ -284,8 +316,10 @@ fn find_groups_for_node(
     let mut ready = Vec::new();
 
     for ((color, frames), group_pulses) in &groups {
+        let effective = effective_input_pulses(node, group_pulses, wired, project, edge_idx, *color, frames);
+        let effective_refs: Vec<_> = effective.iter().collect();
         let all_satisfied = wired.iter().all(|port_name| {
-            group_pulses.iter().any(|p| p.target_port == *port_name)
+            effective_refs.iter().any(|p| p.target_port == *port_name)
         });
 
         // An out-of-scope node never waits for its full input set: it
@@ -295,8 +329,7 @@ fn find_groups_for_node(
             continue;
         }
 
-        let FiringInput { input, closed_ports, type_errors } =
-            firing_input(node, group_pulses, wired);
+        let received = firing_input(node, &effective_refs, wired, edge_idx);
 
         // Group/Loop boundary skip rules: only In-boundary skips; Out
         // forwards whatever came through.
@@ -317,7 +350,9 @@ fn find_groups_for_node(
             // (`kicked_group` runs `check_flow_permission`).
             None
         } else {
-            check_should_skip(node, group_pulses, required, wired, literal_filled)
+            let mut filled = literal_filled.clone();
+            filled.extend(effective.iter().filter(|p| p.backup && !p.closed).map(|p| p.target_port.as_str()));
+            check_should_skip(node, &effective_refs, required, wired, &filled)
         };
 
         let pulse_ids: Vec<uuid::Uuid> = group_pulses.iter().map(|p| p.id).collect();
@@ -325,11 +360,10 @@ fn find_groups_for_node(
         ready.push(ReadyGroup {
             frames: frames.clone(),
             color: *color,
-            input,
-            closed_ports,
+            error: received.error(),
+            received,
             skip,
             pulse_ids,
-            error: if type_errors.is_empty() { None } else { Some(type_errors.join("; ")) },
             out_of_scope,
         });
     }
@@ -351,24 +385,44 @@ pub fn kicked_group(
     kick: &crate::primitive::KickedNode,
     frames: &LoopFrames,
     color: Color,
+    project: &ProjectDefinition,
+    edge_idx: &EdgeIndex,
 ) -> ReadyGroup {
-    let (input, input_errors) = build_kicked_input(node, kick.port_snapshot.as_ref());
+    let wired = wired_inputs(project, edge_idx, &node.id);
+    let effective = effective_input_pulses(node, &[], &wired, project, edge_idx, color, frames);
+    let effective_refs: Vec<_> = effective.iter().collect();
+    let received = if kick.firing {
+        let (input, errors) = build_kicked_input(node, kick.port_snapshot.as_ref());
+        FiringInput { input, type_errors: errors, ..Default::default() }
+    } else {
+        firing_input(node, &effective_refs, &wired, edge_idx)
+    };
     let skip = match &kick.scope_skipped {
         Some(scope) => Some(SkipReason::ScopeSkipped { scope: scope.clone() }),
-        // No pulses exist on a kick, so only the literal branch of the
-        // flow permission can fire.
-        None => check_flow_permission(node, &[]),
+        // Trigger preparation already evaluated its wired gate. A fire
+        // requires that capture and reads its baked settings. Live pulses
+        // into triggers are dropped by settle_out_of_run; enclosing group
+        // gates still decide scope_permission before this kick dispatches.
+        None if kick.firing => check_flow_permission(node, &[]),
+        None => check_should_skip(node, &effective_refs,
+            &node.inputs.iter().filter(|p| p.required && edge_idx.includes_port(node, &p.name)).map(|p| p.name.as_str()).collect(),
+            &wired, &received.input.keys().map(String::as_str).collect()),
     };
     ReadyGroup {
         frames: frames.clone(),
         color,
-        input,
-        closed_ports: Vec::new(),
+        error: received.error(),
+        received,
         skip,
+        // A kick absorbs nothing, so it must fold nothing in: a pulse
+        // read into the bag here would stay pending for ever (absorption
+        // is driven by this list) and the execution could never reach
+        // Completed. Whatever is waiting on a wire is read by the
+        // ordinary pulse-driven dispatch instead, or, for a trigger in
+        // the firing phase, dropped by `settle_out_of_run`.
         pulse_ids: Vec::new(),
         // A kicked node whose own ports refuse their values fails the
         // same way a pulsed one does.
-        error: if input_errors.is_empty() { None } else { Some(input_errors.join("; ")) },
         out_of_scope: false,
     }
 }
@@ -379,6 +433,7 @@ pub fn kicked_group(
 
 /// What a firing sees on its ports: the bag its body reads, the wired
 /// ports whose pulse was a closure, and every value a port refused.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FiringInput {
     pub input: InputBag,
     /// Wired ports whose resolved pulse for this firing was a CLOSURE
@@ -391,6 +446,15 @@ pub struct FiringInput {
     /// doc).
     pub closed_ports: Vec<String>,
     pub type_errors: Vec<String>,
+    pub provided_ports: Vec<String>,
+    pub backup_ports: Vec<String>,
+    pub inherited_ports: BTreeMap<String, Color>,
+}
+
+impl FiringInput {
+    pub fn error(&self) -> Option<String> {
+        (!self.type_errors.is_empty()).then(|| self.type_errors.join("; "))
+    }
 }
 
 /// Build a firing's view of its ports from the pulses it sees. THE
@@ -402,6 +466,7 @@ pub fn firing_input(
     node: &NodeDefinition,
     group_pulses: &[&Pulse],
     wired: &HashSet<&str>,
+    edge_idx: &EdgeIndex,
 ) -> FiringInput {
     let mut obj = InputBag::new();
 
@@ -421,6 +486,7 @@ pub fn firing_input(
     }
 
     fill_input_from_literals(node, wired, &mut obj);
+    obj.retain(|port, _| edge_idx.includes_port(node, port));
 
     // Runtime type enforcement on input ports: the single check point
     // (see `check_input`). A mismatch on a required port aggregates
@@ -440,7 +506,17 @@ pub fn firing_input(
         .collect();
     closed_ports.sort();
 
-    FiringInput { input: obj, closed_ports, type_errors }
+    let mut provided_ports = Vec::new();
+    let mut backup_ports = Vec::new();
+    let mut inherited_ports = BTreeMap::new();
+    for port in group_pulses.iter().map(|p| p.target_port.as_str()).collect::<std::collections::BTreeSet<_>>() {
+        if let Some(winner) = resolve_port_value(group_pulses, port) {
+            if winner.provided { provided_ports.push(port.to_string()); }
+            if winner.backup { backup_ports.push(port.to_string()); }
+            if let Some(origin) = winner.inherited_from { inherited_ports.insert(port.to_string(), origin); }
+        }
+    }
+    FiringInput { input: obj, closed_ports, type_errors, provided_ports, backup_ports, inherited_ports }
 }
 
 /// Runtime type enforcement on input ports: the single check point
@@ -546,11 +622,11 @@ pub fn build_kicked_input(
     node: &NodeDefinition,
     port_snapshot: Option<&Value>,
 ) -> (InputBag, Vec<String>) {
+    let mut obj = InputBag::new();
     // A firing trigger's ports replay the setup-time snapshot: seed the
-    // bag from it first (only keys naming declared input ports; the
+    // bag from it (only keys naming declared input ports; the
     // snapshot is runtime-written so extras would be a writer bug, and
     // dropping them keeps the port contract the single source of shape).
-    let mut obj = InputBag::new();
     if let Some(snapshot) = port_snapshot.and_then(Value::as_object) {
         for (k, v) in snapshot {
             if node.inputs.iter().any(|p| p.name == *k) {
@@ -558,9 +634,10 @@ pub fn build_kicked_input(
             }
         }
     }
-    // Kicked nodes are entry points: no wired pending inputs by
-    // definition, so the wired set is empty. Literals skip keys the
-    // snapshot already filled.
+    // Literals fill whatever the snapshot left unset. The wired set
+    // stays empty on purpose: a wired port falls back to its literal
+    // here, which is what a trigger fired with nothing upstream running
+    // has always done.
     fill_input_from_literals(node, &HashSet::new(), &mut obj);
     // The same gate the pulse path runs (`check_input`). A trigger's
     // ports are exactly where a widget's domain rule earns its keep (a
@@ -633,7 +710,9 @@ mod tests {
     use super::{build_kicked_input, check_input, resolve_port_value, InputCheck};
     use serde_json::Value;
     use crate::frames::LoopIteration;
-    use crate::project::{InputDefinition, NodeDefinition, Position};
+    use crate::project::{EdgeIndex, InputDefinition, NodeDefinition, Position, ProjectDefinition};
+    use super::{effective_input_pulses, firing_input};
+    use std::collections::HashSet;
     use crate::pulse::Pulse;
     use crate::NodeFeatures;
     use serde_json::json;
@@ -652,7 +731,7 @@ mod tests {
     /// absorbs nothing.
     #[test]
     fn the_settle_pass_absorbs_outside_the_run_and_drops_trigger_pulses_at_fire() {
-        use crate::context::Phase;
+        use crate::primitive::Phase;
         use crate::pulse::PulseStatus;
         let project: crate::project::ProjectDefinition = serde_json::from_value(json!({
             "id": "00000000-0000-0000-0000-000000000000",
@@ -716,13 +795,18 @@ mod tests {
             data(color, firing_frames.clone(), "k", "p", json!("exact")),
         ];
         let wired: std::collections::HashSet<&str> = ["p"].into_iter().collect();
+        let project = ProjectDefinition {
+            id: color, nodes: vec![node.clone()], edges: vec![], groups: vec![],
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+        };
         let groups = super::find_groups_for_node(
             &node, &pulses, &std::collections::HashSet::new(), &wired,
             &std::collections::HashSet::new(), true, false,
+            &project, &EdgeIndex::build(&project),
         );
         assert_eq!(groups.len(), 3, "one group per frame stack");
         let exact = groups.iter().find(|g| g.frames == firing_frames).expect("the exact group");
-        assert_eq!(Value::Object(super::owned_bag(&exact.input)), json!({"p": "exact"}));
+        assert_eq!(Value::Object(super::owned_bag(&exact.received.input)), json!({"p": "exact"}));
         assert_eq!(exact.pulse_ids, vec![pulses[2].id]);
     }
 
@@ -947,6 +1031,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_selected_boundary_cannot_receive_or_validate_excluded_literals_and_backups() {
+        let mut node = kicked_node("Passthrough", vec![port("String", true)], json!({"p": 99}));
+        let mut included = port("String", true);
+        included.name = "selected".into();
+        node.inputs.push(included);
+        node.port_literals.insert("selected".into(), json!("kept"));
+        let project = ProjectDefinition {
+            id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
+            created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+        };
+        let mut selection = crate::project::selection::RunSelection::default();
+        selection.nodes.insert(node.id.clone());
+        selection.boundary_ports.insert(node.id.clone(), ["selected".into()].into());
+        selection.input.insert(node.id.clone(), [("p".into(), json!("unused"))].into());
+        let index = EdgeIndex::selected(&project, selection);
+        let effective = effective_input_pulses(&node, &[], &HashSet::new(), &project, &index, project.id, &vec![]);
+        assert!(effective.is_empty());
+        let received = firing_input(&node, &[], &HashSet::new(), &index);
+        assert_eq!(super::owned_bag(&received.input), json!({"selected":"kept"}).as_object().unwrap().clone());
+        assert!(received.type_errors.is_empty(), "the excluded invalid literal cannot fail this boundary");
+    }
+
+    #[test]
+    fn backups_wait_for_real_input_and_only_replace_absence() {
+        let node = kicked_node("X", vec![port("String", true)], json!({}));
+        let mut source = node.clone();
+        source.id = "source".into();
+        let project = ProjectDefinition {
+            id: uuid::Uuid::nil(), nodes: vec![source, node.clone()],
+            edges: vec![serde_json::from_value(json!({"id":"wire", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"p"})).unwrap()],
+            groups: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+        };
+        let mut selection = crate::project::selection::RunSelection::whole(&project);
+        selection.input.entry("k".into()).or_default().insert("p".into(), json!("backup"));
+        let index = EdgeIndex::selected(&project, selection.clone());
+        let wired = HashSet::from(["p"]);
+        let color = project.id;
+        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, color, &vec![]);
+        assert!(effective.is_empty(), "a selected supplier is still pending");
+        let real = data(color, vec![], "k", "p", json!("real"));
+        let closure = Pulse::closure(uuid::Uuid::new_v4(), color, vec![], "k", "p");
+        for actual in [vec![&real], vec![&closure, &real]] {
+            let effective = effective_input_pulses(&node, &actual, &wired, &project, &index, color, &vec![]);
+            let view = firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &index);
+            assert_eq!(*view.input["p"], json!("real"));
+            assert!(!effective.iter().any(|p| p.provided));
+        }
+        let effective = effective_input_pulses(&node, &[&closure], &wired, &project, &index, color, &vec![]);
+        assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &index).input["p"], json!("backup"));
+        selection.nodes.remove("source");
+        let index = EdgeIndex::selected(&project, selection);
+        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, color, &vec![]);
+        assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &index).input["p"], json!("backup"));
+        let null = data(color, vec![], "k", "p", Value::Null);
+        let effective = effective_input_pulses(&node, &[&null], &wired, &project, &index, color, &vec![]);
+        assert!(!firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &index).type_errors.is_empty());
+        assert!(!effective.iter().any(|p| p.provided), "invalid real data does not choose a backup");
+        let failed = Pulse::closure_with_error(uuid::Uuid::new_v4(), color, vec![], "k", "p", Some("producer failed".into()));
+        let effective = effective_input_pulses(&node, &[&failed], &wired, &project, &index, color, &vec![]);
+        assert!(effective.iter().all(|p| !p.backup));
+        assert_eq!(effective[0].close_error.as_deref(), Some("producer failed"));
+    }
+
     /// Regression: a kicked orphan node (entry node with no incoming
     /// edges) used to receive an empty input bag, so a body-settable
     /// port like `Range.to` set via source config (`Range { to: 10 }`)
@@ -993,6 +1141,27 @@ mod tests {
         let snapshot = json!({ "endpointUrl": "http://bridge", "ghost": 1 });
         let (input, _) = build_kicked_input(&node, Some(&snapshot));
         assert_eq!(Value::Object(super::owned_bag(&input)), json!({ "endpointUrl": "http://bridge", "mode": "media" }));
+    }
+
+    /// An ACTIVATED trigger replays the ports it registered with, and
+    /// they beat the node's own literal: the snapshot is the shape the
+    /// trigger is already running on.
+    #[test]
+    fn the_setup_snapshot_beats_the_literal_on_the_same_port() {
+        let inputs = vec![
+            serde_json::from_value(json!({
+                "name": "endpointUrl", "portType": "String", "required": true,
+            }))
+            .unwrap(),
+        ];
+        let node = kicked_node("Recv", inputs, json!({ "endpointUrl": "http://from-the-body" }));
+        let snapshot = json!({ "endpointUrl": "http://registered" });
+        let (input, errors) = build_kicked_input(&node, Some(&snapshot));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            Value::Object(super::owned_bag(&input)),
+            json!({ "endpointUrl": "http://registered" })
+        );
     }
 
     /// Wires are authoritative: a WIRED port whose pulse resolved to a

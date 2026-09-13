@@ -12,6 +12,14 @@ import type * as vscode from 'vscode';
 
 /** Thrown when `weft <args>` exits non-zero. Carries the captured
  *  stderr so the caller surfaces the CLI's actual reason. */
+/** The message of a CLI `phase: "error"` event, when `value` is one. */
+function jsonErrorMessage(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const ev = value as { phase?: unknown; detail?: { message?: unknown } };
+  if (ev.phase !== 'error') return undefined;
+  return typeof ev.detail?.message === 'string' ? ev.detail.message : undefined;
+}
+
 export class WeftCliError extends Error {
   constructor(
     public readonly args: string[],
@@ -48,7 +56,10 @@ export function projectDirOf(doc: vscode.TextDocument): string {
 export function runWeftJson<T>(
   args: string[],
   cwd: string,
-  opts: { stdin?: string; onStderr?: (chunk: string) => void } = {},
+  opts: {
+    stdin?: string;
+    onStderr?: (chunk: string) => void;
+  } = {},
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     const child = spawn('weft', args, { cwd, env: process.env });
@@ -79,15 +90,24 @@ export function runWeftJson<T>(
       }
     });
     child.on('close', (code) => {
-      if (code !== 0) {
-        reject(new WeftCliError(args, code, stderr));
+      let parsed: T | undefined;
+      try {
+        parsed = JSON.parse(stdout) as T;
+      } catch {
+        parsed = undefined;
+      }
+      if (parsed !== undefined && code === 0) {
+        resolve(parsed);
         return;
       }
-      try {
-        resolve(JSON.parse(stdout) as T);
-      } catch (err) {
-        reject(new Error(`weft ${args.join(' ')}: invalid JSON output: ${String(err)}`));
+      if (code !== 0) {
+        // Under `--json` a failing verb prints one `phase: "error"`
+        // event on stdout and nothing on stderr; the message lives in
+        // its detail. Anything else on a failure is stderr's to tell.
+        reject(new WeftCliError(args, code, jsonErrorMessage(parsed) ?? stderr));
+        return;
       }
+      reject(new Error(`weft ${args.join(' ')}: invalid JSON output`));
     });
     // Absorb stdin stream errors: if the child exits and closes the
     // pipe before our write lands (e.g. a fast non-zero exit), the

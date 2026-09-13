@@ -52,7 +52,7 @@ html, body, #app {
 }
 
 /* xyflow canvas: dotted grid on off-white background, matching v1. */
-:global(.svelte-flow) {
+.svelte-flow {
   background: #fafafa;
   --xy-background-pattern-dots-color-default: #d4d4d8;
   --xy-background-color-default: #fafafa;
@@ -64,59 +64,88 @@ html, body, #app {
 
 /* Controls (bottom-left zoom/fit/lock). Match v1: white/90 bg, zinc
  * border, zinc icons. */
-:global(.svelte-flow__controls) {
+.svelte-flow__controls {
   background: rgba(255, 255, 255, 0.9) !important;
   border: 1px solid #e4e4e7 !important;
   border-radius: 6px !important;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06) !important;
   overflow: hidden;
 }
-:global(.svelte-flow__controls-button) {
+.svelte-flow__controls-button {
   background: #ffffff !important;
   border: none !important;
   border-bottom: 1px solid #e4e4e7 !important;
   color: #71717a !important;
   fill: #71717a !important;
 }
-:global(.svelte-flow__controls-button:last-child) {
+.svelte-flow__controls-button:last-child {
   border-bottom: none !important;
 }
-:global(.svelte-flow__controls-button:hover) {
+.svelte-flow__controls-button:hover {
   background: #f4f4f5 !important;
   color: #18181b !important;
   fill: #18181b !important;
 }
 
-/* Node status glow rings. Applied on top of the base node shadow.
- * Ported from v1's ProjectNode :global() block. */
-:global(.node-running-glow) {
+/* Node status glow rings, one per node. Applied on top of the base node
+ * shadow.
+ *
+ * THE one home for these. They used to be stated here and again inside
+ * `ProjectNode.svelte`, and because component styles are injected into
+ * the head at runtime (after this linked sheet) with the same specificity
+ * and the same `!important`, which copy won depended on which was written
+ * last. That decided which ring a node showed whenever two classes landed
+ * on it at once, which is why the nodes now pick exactly one
+ * (`glowClass`). */
+.node-running-glow {
   box-shadow:
     0 1px 3px rgba(0, 0, 0, 0.08),
     0 4px 12px rgba(0, 0, 0, 0.05),
     0 0 0 2px rgba(245, 158, 11, 0.4) !important;
 }
-:global(.node-completed-glow) {
+.node-waiting-glow {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.05),
+    0 0 0 2px rgba(6, 182, 212, 0.45) !important;
+}
+.node-completed-glow {
   box-shadow:
     0 1px 3px rgba(0, 0, 0, 0.08),
     0 4px 12px rgba(0, 0, 0, 0.05),
     0 0 0 2px rgba(16, 185, 129, 0.3) !important;
 }
-:global(.node-failed-glow) {
+.node-failed-glow {
   box-shadow:
     0 1px 3px rgba(0, 0, 0, 0.08),
     0 4px 12px rgba(0, 0, 0, 0.05),
     0 0 0 2px rgba(239, 68, 68, 0.4) !important;
 }
+/* A firing a seeded run took from its seed instead of running again.
+ * Purple, and deliberately not the cyan a waiting node wears: the two
+ * used to be a shade apart, and "this came from an earlier run" read as
+ * "this is suspended". */
+.node-inherited-glow {
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    0 4px 12px rgba(0, 0, 0, 0.05),
+    0 0 0 2px rgba(168, 85, 247, 0.45) !important;
+}
+/* A node the followed run never covered (outside its scope): dimmed,
+ * with no status ring, so a scoped run never reads as a broken full run. */
+.run-dimmed {
+  opacity: 0.35;
+}
 
 /* Wider hit area for resize handles. v1 uses 12px so the grab zone
  * isn't razor-thin. */
-:global(.svelte-flow__resize-control.line.left),
-:global(.svelte-flow__resize-control.line.right) {
+.svelte-flow__resize-control.line.left,
+.svelte-flow__resize-control.line.right {
   width: 12px !important;
   background: transparent !important;
 }
-:global(.svelte-flow__resize-control.line.top),
-:global(.svelte-flow__resize-control.line.bottom) {
+.svelte-flow__resize-control.line.top,
+.svelte-flow__resize-control.line.bottom {
   height: 12px !important;
   background: transparent !important;
 }
@@ -125,17 +154,17 @@ html, body, #app {
  * we override to a 12px circle with a proper border so our
  * port-marker.ts `!w-3 !h-3 !border !rounded-full` classes take
  * effect cleanly. */
-:global(.svelte-flow__handle) {
+.svelte-flow__handle {
   width: 12px;
   height: 12px;
   background: #ffffff;
   border: 1px solid #52525b;
   border-radius: 9999px;
 }
-:global(.svelte-flow__handle-left) {
+.svelte-flow__handle-left {
   left: -6px;
 }
-:global(.svelte-flow__handle-right) {
+.svelte-flow__handle-right {
   right: -6px;
 }
 
@@ -143,17 +172,17 @@ html, body, #app {
  * flash of everything-stacked-at-origin before the first layout
  * pass lands. (v1 does the same via node-pending-layout opacity 0
  * in ProjectEditorInner.) */
-:global(.node-pending-layout) {
+.node-pending-layout {
   opacity: 0 !important;
   pointer-events: none !important;
 }
 
 /* Edges */
-:global(.svelte-flow__edge-path) {
+.svelte-flow__edge-path {
   stroke: #52525b;
   stroke-width: 1.5;
 }
-:global(.svelte-flow__edge.selected .svelte-flow__edge-path) {
+.svelte-flow__edge.selected .svelte-flow__edge-path {
   stroke: #3b82f6;
   stroke-width: 2;
 }

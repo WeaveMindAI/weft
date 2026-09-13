@@ -36,6 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum ActionVerb {
     Run,
     Activate,
+    Bake,
     /// Cancel an in-flight `activate` (status=Activating). Wipes
     /// partial trigger registrations and flips the project back to
     /// Inactive.
@@ -81,6 +82,10 @@ pub enum Phase {
     /// Loading image into kind cluster (or pushing it to a registry).
     ImagePushStart,
     ImagePushDone,
+    /// The stale-image sweep after an ensure dropped something. Detail
+    /// carries `{ "images": [<ref>, ...] }`, the host refs untagged.
+    /// Never emitted when the sweep dropped nothing.
+    ImagesReclaimed,
     /// HTTP request to the dispatcher started.
     DispatcherCallStart,
     /// HTTP request to the dispatcher finished. Body in `detail`
@@ -99,6 +104,10 @@ pub enum Phase {
     /// executions and so is unbounded. Detail:
     /// `{ "verb": "...", "elapsedSeconds": S }`.
     InfraWait,
+    /// Something the person should know that is not a failure: the verb
+    /// carries on and still ends `Complete`. Detail carries
+    /// `{ "message": "..." }`.
+    Warning,
     /// CLI verb finished cleanly.
     Complete,
     /// CLI verb failed. Detail carries `{ "message": "..." }`.
@@ -110,10 +119,32 @@ pub enum Phase {
 #[derive(Debug, Serialize)]
 struct Event<'a> {
     ts_unix: u64,
-    verb: ActionVerb,
+    /// Absent on the one event a verb with no progress channel (a
+    /// reader such as `events` or `logs`) emits: its failure, through
+    /// [`report_plain_error`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verb: Option<ActionVerb>,
     phase: Phase,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<&'a Value>,
+}
+
+/// The one report for a failure that reached `main` unreported: a verb
+/// with no progress channel, or a failure before a channel existed.
+/// Same shape as a channel's own error, so every verb fails the same
+/// way: under `--json` one `phase: "error"` event on stdout, otherwise
+/// one lowercase `error:` line on stderr. The cause chain rides along
+/// in the message (`{e:#}`), since readers build their errors from
+/// context and the chain is where the "why" lives.
+pub fn report_plain_error(json: bool, e: &anyhow::Error) {
+    let message = format!("{e:#}");
+    if json {
+        let detail = serde_json::json!({ "message": message });
+        let ev = Event { ts_unix: now_unix(), verb: None, phase: Phase::Error, detail: Some(&detail) };
+        println!("{}", serde_json::to_string(&ev).expect("Event serializes"));
+    } else {
+        eprintln!("error: {message}");
+    }
 }
 
 /// One emitter per CLI invocation. Cheap to clone; commands thread
@@ -128,6 +159,26 @@ pub struct Progress {
     /// error (so the editor sees the structured one, not a flattened
     /// duplicate that would overwrite it).
     error_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// An error a verb's progress channel has already shown the user. It
+/// wraps the original so `{:?}` and `source()` still reach the cause,
+/// and `main` recognises it to exit non-zero without printing the same
+/// message a second time (once as the `error:` phase, once as anyhow's
+/// `Error:` report).
+#[derive(Debug)]
+pub struct Reported(pub anyhow::Error);
+
+impl std::fmt::Display for Reported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Reported {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 impl Progress {
@@ -151,7 +202,7 @@ impl Progress {
     pub fn emit(&self, phase: Phase, detail: Option<Value>) {
         let ev = Event {
             ts_unix: now_unix(),
-            verb: self.verb,
+            verb: Some(self.verb),
             phase,
             detail: detail.as_ref(),
         };
@@ -166,9 +217,15 @@ impl Progress {
         } else {
             // Human-readable single-line status. Skips noisy phases
             // (start/done pairs collapse, complete is silent) so
-            // the terminal doesn't fill with chatter.
+            // the terminal doesn't fill with chatter. Warnings and
+            // errors go where a shell expects them, on stderr, so a
+            // script capturing stdout gets the result and nothing
+            // else; every other line is progress and stays on stdout.
             if let Some(line) = human_line(&ev) {
-                println!("{line}");
+                match ev.phase {
+                    Phase::Warning | Phase::Error => eprintln!("{line}"),
+                    _ => println!("{line}"),
+                }
             }
         }
     }
@@ -205,6 +262,18 @@ impl Progress {
         self.emit(
             Phase::ImagePushDone,
             Some(serde_json::json!({ "image": image })),
+        );
+    }
+
+    /// Report the stale images an ensure's sweep untagged; silent when
+    /// there were none, so a no-change build prints nothing about it.
+    pub fn images_reclaimed(&self, images: &[String]) {
+        if images.is_empty() {
+            return;
+        }
+        self.emit(
+            Phase::ImagesReclaimed,
+            Some(serde_json::json!({ "images": images })),
         );
     }
 
@@ -248,10 +317,32 @@ impl Progress {
         self.emit(Phase::TriggerRegisterDone, None);
     }
 
+    /// Something the person should see that is not a failure.
+    ///
+    /// On the progress channel, so a verb that rides it never has to
+    /// print beside its own NDJSON (one stdout cannot be both).
+    pub fn warn(&self, message: &str) {
+        self.emit(Phase::Warning, Some(serde_json::json!({ "message": message })));
+    }
+
     pub fn complete(&self, summary: &str) {
         self.emit(
             Phase::Complete,
             Some(serde_json::json!({ "summary": summary })),
+        );
+    }
+
+    /// `complete` carrying the verb's own answer.
+    ///
+    /// A verb on the progress channel must not also print a bare JSON
+    /// document to stdout: the two share one stream, and a reader
+    /// parsing NDJSON gets a line with no phase while a reader parsing
+    /// one document gets neither. The result rides the completion
+    /// instead.
+    pub fn complete_with(&self, summary: &str, result: serde_json::Value) {
+        self.emit(
+            Phase::Complete,
+            Some(serde_json::json!({ "summary": summary, "result": result })),
         );
     }
 
@@ -307,6 +398,14 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
                 .unwrap_or("?")
         ),
         Phase::ImagePushStart => "loading image".to_string(),
+        Phase::ImagesReclaimed => {
+            let n = ev
+                .detail
+                .and_then(|d| d.get("images"))
+                .and_then(|v| v.as_array())
+                .map_or(0, |a| a.len());
+            format!("dropped {n} stale image tag{}", if n == 1 { "" } else { "s" })
+        }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::TriggerRegisterStart => "registering triggers".to_string(),
         Phase::InfraWait => {
@@ -322,6 +421,13 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
                 .unwrap_or(0);
             format!("still waiting on infra {verb} (elapsed {elapsed}s; Ctrl+C to back out)")
         }
+        Phase::Warning => format!(
+            "warning: {}",
+            ev.detail
+                .and_then(|d| d.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+        ),
         Phase::Complete => return ev
             .detail
             .and_then(|d| d.get("summary"))

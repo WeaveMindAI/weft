@@ -6,6 +6,7 @@
     mode,
     color,
     pendingCount,
+    notPainted = undefined,
     onTogglePin,
     onCatchUp,
     onOpenSource,
@@ -19,6 +20,11 @@
     mode: 'latest' | 'pinned';
     color: string | undefined;
     pendingCount: number;
+    /// Set when the run on screen cannot be painted from its journal,
+    /// with the reason. Shown as its own pill: the canvas is empty or
+    /// half-empty and the person deserves to be told why rather than
+    /// left to guess at the viewer.
+    notPainted?: string;
     onTogglePin: () => void;
     onCatchUp: () => void;
     onOpenSource?: () => void;
@@ -58,6 +64,16 @@
       <ArrowLeft class="w-3 h-3" />
       Return{navFileName ? ` · ${navFileName}` : ''}
     </button>
+  {/if}
+
+  {#if notPainted}
+    <div
+      class="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-amber-50 text-amber-800 border border-amber-300 shadow-sm text-xs font-medium max-w-lg"
+      title={notPainted}
+    >
+      <span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+      <span class="truncate">{notPainted}</span>
+    </div>
   {/if}
 
   {#if mode === 'pinned' && pendingCount > 0}

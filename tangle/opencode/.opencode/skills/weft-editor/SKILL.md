@@ -150,8 +150,9 @@ select, Ctrl+D duplicate, Del delete, Esc closes the palette and drops a wire yo
 
 ## Running and watching
 
-The Run button runs the pinned project: every root fires, or only the aimed
-targets when some are set. Each node glows as it fires, values travel the
+The Run button runs the pinned project's ordinary roots, or the selected
+work when a cut is set. Triggers need an explicit fire or supplied outputs.
+Each node glows as it fires, values travel the
 wires, and the Executions list gains the run. Click any node to open the
 **inspector**: status, duration, cost ("$0.0123 (own key)"), the exact
 inputs and outputs of that firing as JSON trees, closed ports shown as

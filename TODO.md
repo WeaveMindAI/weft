@@ -814,3 +814,25 @@ questions to answer before writing any of it:
   and no `self.x` is the same mistake one level down.
 
 Until that is answered there is no warning, and a leaf is just a leaf.
+
+## Show the version tree in the sidebar the way git tools draw history
+
+`weft tree` already knows everything: every version, what changed
+against its parent, the runs beneath each one, head marked, and
+`weft branch` restores any of them. The sidebar shows none of that
+shape. It fetches `tree --json` and uses it to decorate a flat list of
+executions, so a person cannot see that two runs sit on different
+branches, that head moved back, or that a checkpoint exists at all.
+
+**What it should look like.** A graph the way a git client draws one:
+one row per version, a lane per branch with the connecting lines, the
+runs of a version nested under it, head and the seed run marked. A
+right-click or inline action on a version runs `weft branch` (with the
+dirty-tree refusal surfaced as the prompt it already is), and on a run
+sets it as the seed. Hovering a version shows the file diff summary the
+CLI already prints.
+
+**Open questions.** Whether the tree replaces the executions list or
+sits beside it (a run is reachable through both today); how much of a
+long history to load before the view goes lazy; and whether a version's
+diff should open the file diff in the editor rather than a tooltip.

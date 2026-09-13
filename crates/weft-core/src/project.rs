@@ -11,6 +11,10 @@ use uuid::Uuid;
 use crate::node::Accepts;
 use crate::weft_type::WeftType;
 
+/// The canonical form of a program and the digests over it.
+pub mod hash;
+pub mod selection;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
     pub id: Uuid,
@@ -617,6 +621,7 @@ pub struct Edge {
 pub struct EdgeIndex {
     outgoing: std::collections::HashMap<String, Vec<usize>>,
     incoming: std::collections::HashMap<String, Vec<usize>>,
+    selection: Option<selection::RunSelection>,
 }
 
 impl EdgeIndex {
@@ -627,7 +632,24 @@ impl EdgeIndex {
             outgoing.entry(edge.source.clone()).or_default().push(i);
             incoming.entry(edge.target.clone()).or_default().push(i);
         }
-        Self { outgoing, incoming }
+        Self { outgoing, incoming, selection: None }
+    }
+
+    pub fn selected(project: &ProjectDefinition, selection: selection::RunSelection) -> Self {
+        let mut index = Self::build(project);
+        for edges in index.outgoing.values_mut().chain(index.incoming.values_mut()) {
+            edges.retain(|i| selection.edges.contains(&project.edges[*i].id));
+        }
+        index.selection = Some(selection);
+        index
+    }
+
+    pub fn selection(&self) -> Option<&selection::RunSelection> {
+        self.selection.as_ref()
+    }
+
+    pub fn includes_port(&self, node: &NodeDefinition, port: &str) -> bool {
+        self.selection.as_ref().is_none_or(|selection| selection.includes_port(node, port))
     }
 
     pub fn get_outgoing<'a>(&self, project: &'a ProjectDefinition, node_id: &str) -> Vec<&'a Edge> {
@@ -747,45 +769,14 @@ pub fn scope_body_roots(
         .nodes
         .iter()
         .filter(|n| direct_scope_of(n) == Some(group_id))
+        .filter(|n| edge_idx.selection().is_none_or(|s| s.nodes.contains(&n.id)))
         .filter(|n| !n.features.is_trigger)
-        .filter(|n| edge_idx.get_incoming(project, &n.id).is_empty())
+        .filter(|n| edge_idx.get_incoming(project, &n.id).iter().all(|edge|
+            edge_idx.selection().is_some_and(|s| !s.nodes.contains(&edge.source) && !s.suppliers.contains(&edge.source))))
         .map(|n| n.id.clone())
         .collect()
 }
 
-/// Close `set` over scope membership: a node inside a scope brings the
-/// whole scope with it (everything inside runs when the scope starts),
-/// and a scope's In boundary brings the scope. Without this closure a
-/// body's unwired root would fall outside the set and never start.
-///
-/// Only the In boundary brings its scope, and that asymmetry is
-/// deliberate: In is where a scope STARTS, so wanting it means wanting
-/// the body. An Out boundary is reached from inside, by which point the
-/// body is already in the set through its own nodes, and treating Out as
-/// an entrance would drag a whole group in behind any wire that merely
-/// reads its result.
-fn scope_closure(project: &ProjectDefinition, set: &mut std::collections::HashSet<String>) {
-    loop {
-        let mut scopes: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for node in project.nodes.iter().filter(|n| set.contains(&n.id)) {
-            scopes.extend(node.scope.iter().map(String::as_str));
-            if let Some(b) = node.group_boundary.as_ref().filter(|b| b.role == GroupBoundaryRole::In) {
-                scopes.insert(b.group_id.as_str());
-            }
-        }
-        let before = set.len();
-        for node in &project.nodes {
-            let inside = node.scope.iter().any(|g| scopes.contains(g.as_str()))
-                || node.group_boundary.as_ref().is_some_and(|b| scopes.contains(b.group_id.as_str()));
-            if inside {
-                set.insert(node.id.clone());
-            }
-        }
-        if set.len() == before {
-            return;
-        }
-    }
-}
 
 /// The ids of the project's trigger nodes (`features.is_trigger`).
 pub fn trigger_ids(project: &ProjectDefinition) -> Vec<String> {
@@ -797,72 +788,6 @@ pub fn infra_ids(project: &ProjectDefinition) -> Vec<String> {
     project.nodes.iter().filter(|n| n.requires_infra).map(|n| n.id.clone()).collect()
 }
 
-/// The nodes a run aimed at `seeds` dispatches: everything the seeds
-/// depend on by wire (a node in `stop_at` is included and not walked
-/// through, see [`upstream_closure_stop_at`]), every scope one of those
-/// sits in, and then whatever THOSE need, until nothing new arrives. A
-/// scope's In boundary is fed by wires like any node, so bringing a
-/// scope in brings the sources of its inputs too; leaving them out
-/// would kick the boundary as a root with inputs that never come.
-///
-/// The ONE definition of "what runs", shared by a targeted manual run,
-/// a trigger fire, and both setup phases (the dispatcher kicks its
-/// roots, the engine absorbs pulses outside it).
-pub fn run_subgraph(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    seeds: &[String],
-    stop_at: &std::collections::HashSet<String>,
-) -> std::collections::HashSet<String> {
-    let mut set = upstream_closure_stop_at(project, edge_idx, seeds, stop_at);
-    loop {
-        let before = set.len();
-        scope_closure(project, &mut set);
-        if set.len() == before {
-            return set;
-        }
-        let seeds: Vec<String> = set.iter().cloned().collect();
-        set = upstream_closure_stop_at(project, edge_idx, &seeds, stop_at);
-    }
-}
-
-/// The nodes of `in_subgraph` a fresh run kicks: those with no
-/// in-subgraph parent that sit outside every scope (a node inside a
-/// group or loop is the scope launcher's to start, at the scope's
-/// frames, when the scope starts), plus every node in `force_roots`
-/// whatever its parents or scope. A fire forces its triggers: at fire
-/// time a trigger's outputs are the event, not a function of its
-/// inputs, and a trigger inside a group is still kicked by its fire.
-pub fn subgraph_roots(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    in_subgraph: &std::collections::HashSet<String>,
-    force_roots: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    let mut roots = Vec::new();
-    for node_id in in_subgraph {
-        if force_roots.contains(node_id) {
-            roots.push(node_id.clone());
-            continue;
-        }
-        let inside_a_scope = project
-            .nodes
-            .iter()
-            .find(|n| &n.id == node_id)
-            .is_some_and(|n| !n.scope.is_empty());
-        if inside_a_scope {
-            continue;
-        }
-        let has_in_subgraph_parent = edge_idx
-            .get_incoming(project, node_id)
-            .iter()
-            .any(|e| in_subgraph.contains(&e.source));
-        if !has_in_subgraph_parent {
-            roots.push(node_id.clone());
-        }
-    }
-    roots
-}
 
 /// Every node `seeds` depend on by following wires backward, seeds
 /// included. The scope of a setup phase (everything the triggers, or
@@ -1112,9 +1037,9 @@ mod project_wire_tests {
 }
 
 #[cfg(test)]
-mod run_subgraph_tests {
+mod selection_setup_tests {
     use super::*;
-    use std::collections::HashSet;
+    use super::selection::{RunSelection, SelectionBounds};
 
     /// (id, is_trigger, requires_infra, scope chain) plus the wires. A
     /// `{g}__in` / `{g}__out` id is a boundary of scope `g`, the way
@@ -1128,7 +1053,7 @@ mod run_subgraph_tests {
                 });
                 serde_json::json!({
                     "id": id,
-                    "nodeType": "T",
+                    "nodeType": if boundary.is_some() { "Passthrough" } else { "T" },
                     "label": null,
                     "config": {},
                     "position": { "x": 0, "y": 0 },
@@ -1145,8 +1070,10 @@ mod run_subgraph_tests {
                 "id": format!("e_{s}_{t}"), "source": s, "sourcePort": "out", "target": t, "targetPort": "in",
             }))
             .collect();
+        let groups: Vec<_> = nodes.iter().filter_map(|(id, _, _, _)| id.strip_suffix("__in"))
+            .map(|id| serde_json::json!({"id": id, "kind":"group"})).collect();
         serde_json::from_value(serde_json::json!({
-            "id": Uuid::nil(), "nodes": n_json, "edges": e_json, "groups": []
+            "id": Uuid::nil(), "nodes": n_json, "edges": e_json, "groups": groups
         }))
         .expect("valid test project")
     }
@@ -1162,7 +1089,7 @@ mod run_subgraph_tests {
     }
 
     #[test]
-    fn a_scope_brought_in_by_a_member_brings_the_sources_of_its_inputs() {
+    fn an_unwired_group_member_needs_its_gate_but_not_other_input_branches() {
         // cfg ──► g__in ──► g.a ──► g__out
         //         g.seed (unwired body root)
         // Aiming at the unwired seed brings the scope, and the scope's
@@ -1178,11 +1105,9 @@ mod run_subgraph_tests {
             ],
             &[("cfg", "g__in"), ("g__in", "g.a"), ("g.a", "g__out")],
         );
-        let edge_idx = EdgeIndex::build(&p);
-        let set = run_subgraph(&p, &edge_idx, &strs(&["g.seed"]), &HashSet::new());
-        assert_eq!(sorted(set.clone()), strs(&["cfg", "g.a", "g.seed", "g__in", "g__out"]));
-        // The run kicks `cfg`, never the boundary the wire feeds, and never a body node.
-        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &HashSet::new())), strs(&["cfg"]));
+        let selection = RunSelection::setup(&p, &strs(&["g.seed"])).unwrap();
+        assert_eq!(sorted(selection.nodes.clone()), strs(&["g.seed", "g__in"]));
+        assert_eq!(sorted(selection.roots(&p)), strs(&["g.seed", "g__in"]));
     }
 
     #[test]
@@ -1201,10 +1126,9 @@ mod run_subgraph_tests {
             ],
             &[("root", "h__in"), ("h__in", "h.x"), ("h.x", "h__out"), ("h__out", "g__in"), ("g__in", "g.a"), ("g.a", "g__out")],
         );
-        let edge_idx = EdgeIndex::build(&p);
-        let set = run_subgraph(&p, &edge_idx, &strs(&["g.a"]), &HashSet::new());
-        assert_eq!(sorted(set.clone()), strs(&["g.a", "g__in", "g__out", "h.x", "h__in", "h__out", "root"]));
-        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &HashSet::new())), strs(&["root"]));
+        let selection = RunSelection::setup(&p, &strs(&["g.a"])).unwrap();
+        assert_eq!(sorted(selection.nodes.clone()), strs(&["g.a", "g__in", "h.x", "h__in", "h__out", "root"]));
+        assert_eq!(sorted(selection.roots(&p)), strs(&["root"]));
     }
 
     #[test]
@@ -1213,11 +1137,9 @@ mod run_subgraph_tests {
             &[("setup", false, false, &[]), ("trig", true, false, &[]), ("out", false, false, &[])],
             &[("setup", "trig"), ("trig", "out")],
         );
-        let edge_idx = EdgeIndex::build(&p);
-        let stop: HashSet<String> = trigger_ids(&p).into_iter().collect();
-        let set = run_subgraph(&p, &edge_idx, &strs(&["out"]), &stop);
-        assert_eq!(sorted(set.clone()), strs(&["out", "trig"]));
-        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &stop)), strs(&["trig"]));
+        let selection = RunSelection::carve(&p, &SelectionBounds { fire: Some("trig".into()), ..Default::default() }).unwrap();
+        assert_eq!(sorted(selection.nodes.clone()), strs(&["out", "trig"]));
+        assert_eq!(sorted(selection.roots(&p)), strs(&["trig"]));
     }
 
     #[test]
@@ -1233,10 +1155,9 @@ mod run_subgraph_tests {
             ],
             &[],
         );
-        let edge_idx = EdgeIndex::build(&p);
-        let set = run_subgraph(&p, &edge_idx, &infra_ids(&p), &HashSet::new());
-        assert_eq!(sorted(set.clone()), strs(&["g.db", "g__in", "g__out"]));
-        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &HashSet::new())), strs(&["g__in", "g__out"]));
+        let selection = RunSelection::setup(&p, &infra_ids(&p)).unwrap();
+        assert_eq!(sorted(selection.nodes.clone()), strs(&["g.db", "g__in"]));
+        assert_eq!(sorted(selection.roots(&p)), strs(&["g.db", "g__in"]));
     }
 
     #[test]
@@ -1255,13 +1176,12 @@ mod run_subgraph_tests {
             ],
             &[("text", "compute"), ("compute", "infra"), ("infra", "trigger"), ("trigger", "reply"), ("cfg", "infra_b")],
         );
-        let edge_idx = EdgeIndex::build(&p);
-        let infra = run_subgraph(&p, &edge_idx, &infra_ids(&p), &HashSet::new());
-        assert_eq!(sorted(infra), strs(&["cfg", "compute", "infra", "infra_b", "text"]));
-        let triggers = run_subgraph(&p, &edge_idx, &trigger_ids(&p), &HashSet::new());
-        assert_eq!(sorted(triggers), strs(&["compute", "infra", "text", "trigger"]));
+        let infra = RunSelection::setup(&p, &infra_ids(&p)).unwrap();
+        assert_eq!(sorted(infra.nodes), strs(&["cfg", "compute", "infra", "infra_b", "text"]));
+        let triggers = RunSelection::setup(&p, &trigger_ids(&p)).unwrap();
+        assert_eq!(sorted(triggers.nodes), strs(&["compute", "infra", "text", "trigger"]));
         let none = project(&[("a", false, false, &[]), ("b", false, false, &[])], &[("a", "b")]);
-        assert!(run_subgraph(&none, &EdgeIndex::build(&none), &infra_ids(&none), &HashSet::new()).is_empty());
+        assert!(RunSelection::setup(&none, &infra_ids(&none)).unwrap().nodes.is_empty());
     }
 
     #[test]
@@ -1270,9 +1190,7 @@ mod run_subgraph_tests {
             &[("g__in", false, false, &[]), ("g.trig", true, false, &["g"]), ("g__out", false, false, &[])],
             &[],
         );
-        let edge_idx = EdgeIndex::build(&p);
-        let force: HashSet<String> = trigger_ids(&p).into_iter().collect();
-        let set = run_subgraph(&p, &edge_idx, &strs(&["g.trig"]), &force);
-        assert_eq!(sorted(subgraph_roots(&p, &edge_idx, &set, &force)), strs(&["g.trig", "g__in", "g__out"]));
+        let selection = RunSelection::carve(&p, &SelectionBounds { fire: Some("g.trig".into()), ..Default::default() }).unwrap();
+        assert_eq!(sorted(selection.roots(&p)), strs(&["g.trig", "g__in"]));
     }
 }

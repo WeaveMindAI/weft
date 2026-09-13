@@ -45,6 +45,86 @@ const WORKER_IDLE_EXIT: std::time::Duration = std::time::Duration::from_secs(30)
 /// execution. cancel_execution looks up by color and fires the flag.
 type CancelRegistry = Arc<Mutex<HashMap<Color, Arc<CancellationFlag>>>>;
 
+/// Everything one execution registered on the pod, released when the
+/// execution ends however it ends.
+///
+/// These used to be plain statements after the run returned, which an
+/// unwind skips, and an unwind is a DESIGNED path here: the bus
+/// shutdown panics when the pump has not drained inside its deadline,
+/// after the `catch_unwind` around the drive. The pod then kept a
+/// cancel flag and a live config for a dead color for the rest of its
+/// life, so a later cancel of that execution reported success while
+/// firing a flag nobody reads, and the connection server still handed
+/// out a config and accepted a socket for a run that no longer exists.
+/// A guard cannot be skipped.
+struct ExecutionResidue {
+    color: Color,
+    cancel_registry: CancelRegistry,
+    /// THIS execution's flag, so the deferred removal can tell it from
+    /// a later claim's. The registry is keyed by color, and a resume of
+    /// the same color can be waiting on the color gate and register its
+    /// own flag the instant this one's gate is released. Removing by
+    /// key alone deleted the NEW execution's flag, so its cancel found
+    /// nothing and reported a no-op, and pod shutdown never cancelled
+    /// it: the exact failure this guard exists to prevent, moved into
+    /// the gap between the guard and the task.
+    flag: Arc<CancellationFlag>,
+    caller_registry: crate::caller_conn::CallerRegistry,
+    live_configs: LiveConfigMap,
+    open_charges: Arc<crate::metering::OpenCharges>,
+}
+
+impl Drop for ExecutionResidue {
+    fn drop(&mut self) {
+        let color = self.color;
+        // Money first: a charge belongs to this execution, so a job it
+        // submitted and never read back is written down as spend with
+        // no figure, here, rather than waiting for the pod to die.
+        //
+        // Nothing in this destructor may panic: a panic in a Drop that
+        // is itself running during an unwind aborts the process, and
+        // the unwind path is a designed one here (the bus shutdown
+        // panics on a pump that will not drain). So every lock is
+        // taken defensively and a poisoned one is reported, never
+        // unwrapped.
+        self.open_charges.flush_color(color, "the execution ended before the job was read back");
+        match self.live_configs.lock() {
+            Ok(mut configs) => {
+                configs.remove(&color);
+            }
+            Err(_) => tracing::error!(
+                target: "weft_engine::run_pod",
+                %color,
+                "the live-config map is poisoned, so this execution's config was not dropped; \
+                 the connection server may still hand out a config for it until the pod exits"
+            ),
+        }
+        self.caller_registry.detach(color);
+        // The cancel registry is an async lock, so its removal is a
+        // task; `Handle::try_current` because a destructor can run
+        // while the runtime is shutting down, where `tokio::spawn`
+        // panics. Removing only if the flag is still OURS.
+        let registry = self.cancel_registry.clone();
+        let mine = self.flag.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let mut reg = registry.lock().await;
+                    if reg.get(&color).is_some_and(|f| Arc::ptr_eq(f, &mine)) {
+                        reg.remove(&color);
+                    }
+                });
+            }
+            Err(_) => tracing::error!(
+                target: "weft_engine::run_pod",
+                %color,
+                "no runtime to drop this execution's cancel flag on (the pod is tearing down); \
+                 the entry goes with the process"
+            ),
+        }
+    }
+}
+
 /// `IdleExit` impl backed by the broker's guarded CAS. The picker
 /// calls `try_idle_exit` after the idle window; the broker flips
 /// `alive -> done` only if no pending/claimed work exists for the
@@ -56,12 +136,16 @@ struct WorkerIdleExit {
     worker_pods: Arc<dyn WorkerPodClient>,
     pod_name: String,
     pending_costs: Arc<crate::metering::PendingCostRecords>,
+    /// A charge whose amount a later response will state keeps the pod
+    /// alive too: the job is still running, and the read that prices it
+    /// has not happened yet.
+    open_charges: Arc<crate::metering::OpenCharges>,
 }
 
 #[async_trait::async_trait]
 impl weft_task_store::executor::IdleExit for WorkerIdleExit {
     async fn try_idle_exit(&self) -> anyhow::Result<bool> {
-        if self.pending_costs.count() > 0 {
+        if self.pending_costs.count() > 0 || self.open_charges.count() > 0 {
             return Ok(false);
         }
         self.worker_pods.mark_done_if_idle(&self.pod_name).await
@@ -92,6 +176,8 @@ struct WorkerCtx {
     /// so a provision body never sees the shared namespace.)
     namespace: String,
     cancel_registry: CancelRegistry,
+    /// One drive per color at a time on this pod (see [`ColorGate`]).
+    driving: ColorGate,
     /// Cache of fetched definitions keyed by `definition_hash`.
     /// Workers fetch each hash they encounter once; consecutive
     /// claims on the same hash reuse the cached `ProjectDefinition`.
@@ -114,6 +200,73 @@ struct WorkerCtx {
 }
 
 type ProjectCache = Arc<Mutex<BoundedProjectCache>>;
+
+/// Serializes the drives of one color on this pod. A resume is pinned
+/// to the color's owner, and it can land while the owner is still
+/// driving the color: a person answers a form between the node's
+/// `SuspensionRegistered` and the drive's `NodeSuspended` (the node
+/// body has registered its wait but has not returned yet), so the
+/// resume task is claimed by this same pod while the first drive is
+/// mid-flight. Two drives of one color fold the journal twice and run
+/// the parked node twice (the second one as a crashed-Running re-run,
+/// since the first has not written `NodeSuspended` yet): every side
+/// effect below it happens twice. Held for the whole drive, the gate
+/// makes the resume wait for the live drive, which resumes the answer
+/// in place; the queued drive then folds a journal that already holds
+/// the terminal and settles as `AlreadySettled`.
+#[derive(Clone, Default)]
+struct ColorGate {
+    gates: Arc<std::sync::Mutex<HashMap<Color, Arc<Mutex<()>>>>>,
+}
+
+/// The gate held for one color; drop it when the drive is over.
+struct HeldColor {
+    color: Color,
+    gates: ColorGate,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ColorGate {
+    /// The gate map, whether or not a previous holder panicked while
+    /// holding it.
+    ///
+    /// The map holds nothing but `Color -> Arc<Mutex<()>>`: an insert or
+    /// a remove either happened or did not, so a panic mid-way leaves no
+    /// half-built state for a later caller to trip over, and poisoning
+    /// carries no information worth acting on. Taking the poison as fatal
+    /// is what would hurt: `hold` runs on every drive, so one poisoned
+    /// map would panic every later drive on the pod, and the release side
+    /// runs inside a destructor during the bus-shutdown unwind, where a
+    /// panic aborts the process. Both sides go through here so they
+    /// cannot disagree about that.
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<Color, Arc<Mutex<()>>>> {
+        self.gates.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Wait for any drive of `color` on this pod to end, then hold it.
+    async fn hold(&self, color: Color) -> HeldColor {
+        let gate = self.map().entry(color).or_default().clone();
+        let guard = gate.lock_owned().await;
+        HeldColor { color, gates: self.clone(), guard: Some(guard) }
+    }
+}
+
+impl Drop for HeldColor {
+    fn drop(&mut self) {
+        // Release first, then forget the gate if nobody is waiting on
+        // it (the map's own reference is the only one left).
+        self.guard.take();
+        // NEVER panics: this runs during the bus-shutdown unwind (it is
+        // declared beside `ExecutionResidue`, whose own destructor says
+        // the same thing), and a panic in a destructor that is itself
+        // unwinding aborts the process. `ColorGate::map` is what keeps
+        // that promise.
+        let mut gates = self.gates.map();
+        if gates.get(&self.color).is_some_and(|g| Arc::strong_count(g) == 1) {
+            gates.remove(&self.color);
+        }
+    }
+}
 
 /// Per-color live-connection runtime config + heartbeat interval, set by
 /// the execute path and read by the connection server's resolver. Uses a
@@ -227,6 +380,7 @@ pub async fn run_pod(
         tenant_id,
         namespace,
         cancel_registry: cancel_registry.clone(),
+        driving: ColorGate::default(),
         project_cache: Arc::new(Mutex::new(BoundedProjectCache::new())),
         caller_registry,
         live_configs,
@@ -242,10 +396,12 @@ pub async fn run_pod(
     // work, the picker attempts the guarded `alive -> done` CAS via
     // the broker. The CAS (not the timer) is the correctness gate.
     let pending_costs = ctx.clients.pending_costs.clone();
+    let open_charges = ctx.clients.open_charges.clone();
     let idle_exit: Arc<dyn weft_task_store::executor::IdleExit> = Arc::new(WorkerIdleExit {
         worker_pods: worker_pods.clone(),
         pod_name: pod_name.clone(),
         pending_costs: pending_costs.clone(),
+        open_charges: open_charges.clone(),
     });
     run_worker_picker(
         picker_tasks,
@@ -277,6 +433,12 @@ pub async fn run_pod(
     // cost resolution to land its record before the row is marked done.
     // Each resolve is internally bounded (request timeout + fixed ledger
     // budget), so this wait always ends.
+    //
+    // A charge still open here is a call that spent and whose amount no
+    // response ever stated (a job submitted and never read back). The pod
+    // is going away, so nothing can arrive to price it: book it as the
+    // unknown it is, before the wait, so the row still lands.
+    open_charges.flush("the worker pod shut down before the job was read back");
     pending_costs.wait_zero().await;
     let _ = worker_pods.mark_done(&pod_name).await;
     Ok(())
@@ -575,12 +737,23 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
         // (the set_running_definition_hash precondition refuses that),
         // so a miss here is a real upstream bug.
         let project = fetch_or_cached_project(ctx, &payload.definition_hash).await?;
+        let _driving = ctx.driving.hold(color).await;
 
         let flag = CancellationFlag::new_arc();
         ctx.cancel_registry
             .lock()
             .await
             .insert(color, flag.clone());
+        // From here on every exit path, including a panic, releases what
+        // this execution registered on the pod.
+        let _residue = ExecutionResidue {
+            color,
+            flag: flag.clone(),
+            cancel_registry: ctx.cancel_registry.clone(),
+            caller_registry: ctx.caller_registry.clone(),
+            live_configs: ctx.live_configs.clone(),
+            open_charges: ctx.clients.open_charges.clone(),
+        };
 
         // Live-connection executions carry their trigger's `live_connection`
         // config. Register the runtime config so the connection server can
@@ -634,12 +807,9 @@ impl WorkerTaskKind<WorkerCtx> for ExecuteKind {
             }
         }
 
-        ctx.cancel_registry.lock().await.remove(&color);
-        // Drop the live config + any attached connection for this color
-        // (the socket task already detaches on disconnect, but a run that
-        // finished before the caller attached must not leak the config).
-        ctx.live_configs.lock().expect("live_configs poisoned").remove(&color);
-        ctx.caller_registry.detach(color);
+        // The cancel flag, the live config and any attached connection
+        // are released by `ExecutionResidue` when this returns or
+        // unwinds; nothing to do here.
         // No explicit slot release: a live execution's capacity slot IS its
         // execute task row, and the executor flips that task terminal
         // (complete/failed) when this handler returns. Once the task leaves
@@ -789,5 +959,31 @@ impl WorkerTaskKind<WorkerCtx> for CancelExecutionKind {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two drives of one color take turns; another color is not held up.
+    #[tokio::test]
+    async fn a_color_is_driven_once_at_a_time_on_a_pod() {
+        let gate = ColorGate::default();
+        let (a, b) = (Color::new_v4(), Color::new_v4());
+        let first = gate.hold(a).await;
+        let other = gate.hold(b).await;
+        drop(other);
+        let queued = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                gate.hold(a).await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!queued.is_finished(), "the second drive waits for the first");
+        drop(first);
+        queued.await.unwrap();
+        assert!(gate.gates.lock().unwrap().is_empty(), "a released color is forgotten");
     }
 }

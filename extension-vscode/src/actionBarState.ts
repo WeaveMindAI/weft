@@ -239,7 +239,7 @@ export class ActionBarStore {
       return;
     }
     if (ev.phase === 'error') {
-      slot.error = errorFromCliEvent(ev);
+      slot.error = errorFromCliEvent(slot.cli.verb, ev);
       slot.cli = undefined;
       this.notifyIfPinned(projectId);
       return;
@@ -407,7 +407,9 @@ function truncateForModal(s: string, maxLen: number): string {
 /// (message / what / stage) are missing, fall back to placeholders
 /// AND console.error so wire drift surfaces, and stamp the raw event
 /// into details.raw so the modal shows what actually arrived.
-function errorFromCliEvent(ev: CliEvent): ActionBarError {
+/// `verb` is the slot's, not the event's: the guard in `cliEvent`
+/// already matched them, and an event's verb is optional on the wire.
+function errorFromCliEvent(verb: ActionVerb, ev: CliEvent): ActionBarError {
   const d = ev.detail ?? {};
   const messageRaw = d.message as string | undefined;
   const whatRaw = d.what as string | undefined;
@@ -443,7 +445,7 @@ function errorFromCliEvent(ev: CliEvent): ActionBarError {
     ...(exitCode !== undefined ? { exitCode } : {}),
     ...(command ? { command } : {}),
   };
-  return { verb: ev.verb, message, details };
+  return { verb, message, details };
 }
 
 function parseDiagnostics(value: unknown): ActionErrorDiagnostic[] {

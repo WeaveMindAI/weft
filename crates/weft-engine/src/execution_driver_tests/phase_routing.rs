@@ -145,6 +145,20 @@
     }
 
     async fn seed(journal: &MemJournal, project: &ProjectDefinition, color: Color, phase: weft_core::context::Phase, kicks: &[&str]) {
+        // Mirror the dispatcher's birth row: a setup phase carries the
+        // selection that bounds it (its triggers' or infra nodes'
+        // dependencies), and the engine refuses a setup row without one.
+        let subgraph = match phase {
+            weft_core::context::Phase::TriggerSetup => Some(
+                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::trigger_ids(project))
+                    .expect("setup selection"),
+            ),
+            weft_core::context::Phase::InfraSetup => Some(
+                weft_core::project::selection::RunSelection::setup(project, &weft_core::project::infra_ids(project))
+                    .expect("setup selection"),
+            ),
+            weft_core::context::Phase::Fire => None,
+        };
         journal
             .record_event(
                 &ExecEvent::ExecutionStarted {
@@ -153,8 +167,9 @@
                     entry_node: kicks[0].to_string(),
                     phase,
                     definition_hash: Some("test-hash".into()),
-                    node_test: false,
-                    subgraph: None,
+                    program: None, source_version: None, node_test: false,
+                    subgraph,
+                    seed: None,
                     at_unix: 0,
                 },
                 None,
@@ -423,8 +438,9 @@
                     entry_node: "trig".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    node_test: false,
+                    program: None, source_version: None, node_test: false,
                     subgraph: None,
+                    seed: None,
                     at_unix: 0,
                 },
                 None,

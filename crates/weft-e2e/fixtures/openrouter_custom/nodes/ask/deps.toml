@@ -1,7 +1,8 @@
 [dependencies]
 minillmlib = "0.5.10"
-# The project defines its OWN provider meter in this node's mod.rs; the
-# ProviderMeter trait's method signatures name these two crates (a follow-up
-# HTTP client, and anyhow errors), so a node that ships a meter pulls them in.
-# anyhow is already in the codegen base, but a bare node still declares reqwest.
+# `minillmlib`'s `with_http_client` takes a `reqwest` client, so this node
+# declares reqwest itself. The meter in this node's mod.rs needs nothing
+# extra: weft-providers, async-trait and anyhow are already on every node's
+# path, and the trait's follow-up client is a `reqwest_middleware` type that
+# rides in through weft-providers.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

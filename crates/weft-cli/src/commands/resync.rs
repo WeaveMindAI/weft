@@ -21,30 +21,34 @@ async fn run_inner(
     progress: &crate::progress::Progress,
     opts: InfraOpts,
 ) -> anyhow::Result<()> {
-    let handle = super::ensure::ensure_registered(ctx, progress).await?;
-    // The dispatcher requires the trigger-deactivation choice when the
-    // project is Active (412 otherwise): resync deactivates with the
-    // user's spec, never a hardcoded one. Same shared prompt as
-    // `weft deactivate` / the infra verbs.
-    let active = super::deactivate::project_is_active(&handle.client, &handle.id).await?;
-    let trigger_deactivation = if active {
-        Some(super::deactivate::prompt_trigger_deactivation(
-            ctx.json(),
-            "resync",
-            opts.mode.as_deref(),
-            opts.grace,
-            opts.running_policy.as_deref(),
-            opts.drain_timeout,
-        )?)
-    } else {
-        None
-    };
+    // Resync only re-registers an ACTIVE project (the dispatcher
+    // refuses anything else with a 409: a parked project is brought
+    // back with `weft activate`, by choice, never as a side effect),
+    // and it needs the trigger-deactivation choice the shared prompt
+    // asks for (`weft deactivate` / the infra verbs use the same one).
+    // Both are settled BEFORE the build: registering loads the new
+    // image and drops the one the project is active on, so a refusal
+    // has to come before anything is touched.
+    let project_id = ctx.project()?.id().to_string();
+    if !super::deactivate::project_is_active(&ctx.client(), &project_id).await? {
+        anyhow::bail!(
+            "resync: this project is not active, and resync only re-registers an active \
+             project; `weft activate` brings it up on the current source"
+        );
+    }
+    let trigger_deactivation = super::deactivate::prompt_trigger_deactivation(
+        ctx.json(),
+        "resync",
+        opts.mode.as_deref(),
+        opts.grace,
+        opts.running_policy.as_deref(),
+        opts.drain_timeout,
+    )?;
+    let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
     let path = format!("/projects/{}/resync", handle.id);
     let mut body_map = serde_json::Map::new();
     handle.inject_hash_fields(&mut body_map);
-    if let Some(td) = trigger_deactivation {
-        body_map.insert("triggerDeactivation".into(), td);
-    }
+    body_map.insert("triggerDeactivation".into(), trigger_deactivation);
     let body = serde_json::Value::Object(body_map);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);

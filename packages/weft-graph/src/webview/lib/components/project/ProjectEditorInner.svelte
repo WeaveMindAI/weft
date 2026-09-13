@@ -20,6 +20,8 @@
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import type { LoopIteration } from "../../../../protocol";
 	import { isContainerNodeType, isLoopNodeType, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
+	import RunSpecDialog from './RunSpecDialog.svelte';
+	import { groupOfPrefix, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
 	import type { EditOp, SourceLocation, TextEdit } from "../../../../protocol";
 	import { SHOULD_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
@@ -49,6 +51,13 @@
 		onApplyTextEdit,
 		onResyncSource,
 		onRun,
+		specs = [],
+		resolveSpec,
+		onRunSpec,
+		onSaveSpec,
+		onRunSpecFile,
+		onListSpecs,
+		onBranchTo,
 		onStop,
 		onDismissError,
 		onOpenLocation,
@@ -111,6 +120,13 @@
 		/// Targets are the nodes the user aimed the run at, empty for the
 		/// ordinary run.
 		onRun?: (targets: string[]) => void;
+		specs?: RunSpec[];
+		resolveSpec?: (spec: RunSpec, seeded: boolean) => Promise<ResolveSpecResponse>;
+		onRunSpec?: (spec: RunSpec, seeded?: boolean) => void;
+		onSaveSpec?: (spec: RunSpec) => void;
+		onRunSpecFile?: (name: string) => void;
+		onListSpecs?: () => void;
+		onBranchTo?: (reference: string) => void;
 		onStop?: () => void;
 		onDismissError?: () => void;
 		onOpenLocation: (location: SourceLocation) => void;
@@ -1627,6 +1643,9 @@
 		/// runs untracked, so a source it reads on its own never registers as
 		/// a dependency of the overlay effect.
 		runTargets: ReadonlySet<string>;
+		/// The followed run's node set (`null` = whole graph, `undefined`
+		/// = no run or its birth has not arrived).
+		runScope: ReadonlySet<string> | null | undefined;
 		execPrefix: string;
 		projectNodes: import('../../types').NodeInstance[];
 	};
@@ -1667,6 +1686,9 @@
 			showInfraSubgraph,
 			showTriggerSubgraph,
 			runTargets,
+			runScope: executionState?.scope === undefined ? undefined
+				: executionState.scope === null ? null
+				: new Set(executionState.scope),
 			// Touch execPrefix in the tracked region so a navigation that only
 			// changes the exec-id prefix re-decorates (decorate reads it via
 			// execKey). Untrack the projection: the STRUCTURAL effect already
@@ -1809,7 +1831,15 @@
 								// blank Input panel where the per-node inspector
 								// shows `port: (closed)` rows.
 								closedPorts: inExec.closedPorts,
+								// A reused input boundary alone does not mean its body was reused.
+								inheritedFrom: allRelated.every((e) => e.inheritedFrom === inExec.inheritedFrom)
+									? inExec.inheritedFrom : undefined,
+								providedPorts: inExec.providedPorts,
+								backupPorts: inExec.backupPorts,
+								inheritedPorts: inExec.inheritedPorts,
 								costUsd: allRelated.reduce((sum, e) => sum + (e.costUsd || 0), 0),
+								inheritedCostUsd: allRelated.reduce((sum, e) => sum + (e.inheritedFrom ? e.costUsd : 0), 0),
+								inheritedCostUnknown: allRelated.some((e) => e.inheritedFrom && e.costUnknown),
 								// An unknown member cost keeps the group honest too: the
 								// summed figure alone would read as the full price.
 								costUnknown: allRelated.some((e) => e.costUnknown),
@@ -1827,7 +1857,20 @@
 					// Derive SvelteFlow wrapper class from the latest execution status
 					const latestExec = executions[executions.length - 1];
 					const execStatus = latestExec?.status;
-					const nodeClass = execStatus === 'running' || execStatus === 'waiting_for_input' ? 'node-running'
+					// A node outside the followed run's scope is "not in this run":
+					// dimmed, no status class, never skipped or empty. One more
+					// case of the dimming the subgraph highlight already paints.
+					const notInRun = ctx.runScope !== undefined && ctx.runScope !== null
+						&& !ctx.runScope.has(execKey(n.id)) && executions.length === 0;
+					// Inheritance is NOT one of these: it is orthogonal to
+					// status, and the node components paint it themselves
+					// (`node-inherited-glow`, from `latestExecution.inheritedFrom`).
+					// Branching on it here cost an inherited node its status
+					// class, so an inherited group lost `node-completed`, which
+					// is what `GroupNode`'s own styling keys off, and the class
+					// it gained instead (`node-inherited`) is defined nowhere.
+					const nodeClass = notInRun ? 'run-dimmed'
+						: execStatus === 'running' || execStatus === 'waiting_for_input' ? 'node-running'
 						: execStatus === 'failed' ? 'node-failed'
 						: execStatus === 'completed' || execStatus === 'skipped' ? 'node-completed'
 						: '';
@@ -2069,6 +2112,27 @@
 	function runWithTargets(): void {
 		onRun?.(liveRunTargets);
 	}
+
+	/// The run spec dialog: `null` closed, else the spec it opened with.
+	let specDialogInitial = $state<RunSpec | null>(null);
+	let specDialogOpen = $state(false);
+	/// The group the user stands in (an include's alias chain), so the
+	/// dialog and the Run menu put it first.
+	const focusedGroup = $derived(groupOfPrefix(execPrefix));
+	const menuSpecs = $derived(orderSpecsForMenu(specs, focusedGroup));
+	function openSpecDialog(initial: RunSpec): void {
+		specDialogInitial = initial;
+		specDialogOpen = true;
+	}
+	$effect(() => {
+		if (!specDialogOpen) specDialogInitial = null;
+	});
+	/// The followed run's version differs from the files on disk.
+	const versionMismatch = $derived.by(() => {
+		const v = executionState?.version;
+		if (!v || !v.version) return null;
+		return v.version !== v.diskVersion ? v.version : null;
+	});
 	// An OPEN node menu closes itself when its target can no longer fill it:
 	// the node vanished from the graph (deleted from the text tab in another
 	// column while the menu was open), or, in simplified view, its only menu
@@ -3860,11 +3924,24 @@
 		     `state.backend` for at-rest facts and `state.overlay`
 		     for the in-flight user-action; `drift` lights
 		     Resync/Upgrade indicators. -->
+		{#if versionMismatch && executionState?.seed !== undefined}
+			<div class="flex items-center gap-3 px-3 py-1.5 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg mb-1">
+				<span>This run is from version {versionMismatch.slice(0, 8)}; your code differs.</span>
+				{#if onBranchTo}
+					<button class="px-2 py-0.5 rounded border border-amber-300 hover:bg-amber-100" onclick={() => onBranchTo?.(versionMismatch)}>Branch here</button>
+				{/if}
+			</div>
+		{/if}
 		<ActionBar
 			state={actionBarState}
 			{drift}
 			onRun={runWithTargets}
 			runTargetCount={liveRunTargets.length}
+			specs={menuSpecs}
+			{focusedGroup}
+			onRunSpec={onRunSpecFile}
+			onOpenSpecDialog={(initial) => openSpecDialog(initial ?? { name: 'one-off' })}
+			onOpenSpecMenu={onListSpecs}
 			{onStop}
 			{onDismissError}
 			{onOpenLocation}
@@ -3892,6 +3969,15 @@
 			nodeCount={nodes.length}
 		/>
 	</div>
+	{#if specDialogInitial && resolveSpec && onRunSpec}
+		<RunSpecDialog
+			bind:open={specDialogOpen}
+			initial={specDialogInitial}
+			{resolveSpec}
+			onRun={(spec, seeded) => onRunSpec?.(spec, seeded)}
+			onSave={(spec) => onSaveSpec?.(spec)}
+		/>
+	{/if}
 
 	<!-- Wire menu: read a key off the value a wire carries -->
 	{#if edgeMenu}
@@ -3999,6 +4085,22 @@
 							<span class="text-muted-foreground text-xs">◎</span>
 							<span>{runTargets.has(targetNodeId) ? 'Unset target' : 'Set as target'}</span>
 						</button>
+						<button
+							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', execKey(targetNodeId))); }}
+						>
+							<span class="text-muted-foreground text-xs">▶</span>
+							<span>Run from here…</span>
+						</button>
+						{#if isContainerNodeType(nodeToEdit.data.nodeType) || nodeToEdit.data.includePath}
+							<button
+								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
+								onclick={() => { contextMenu = null; openSpecDialog(specForAction('group', execKey(targetNodeId))); }}
+							>
+								<span class="text-muted-foreground text-xs">▶</span>
+								<span>Run this group…</span>
+							</button>
+						{/if}
 						{#if hasInfraActions}
 							{#if !simplified}<div class="my-1 mx-2 border-t"></div>{/if}
 							<div class="px-3 py-1 text-xs text-muted-foreground uppercase tracking-wide">

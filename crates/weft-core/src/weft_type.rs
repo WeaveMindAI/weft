@@ -1158,6 +1158,16 @@ impl WeftType {
         Self::detect_bus_type(value.as_object()?)?.get("id")?.as_str()
     }
 
+    /// A handle nested in a record or list still belongs to its original run.
+    pub fn contains_bus_handle(value: &serde_json::Value) -> bool {
+        if Self::bus_marker_id(value).is_some() { return true; }
+        match value {
+            serde_json::Value::Array(items) => items.iter().any(Self::contains_bus_handle),
+            serde_json::Value::Object(fields) => fields.values().any(Self::contains_bus_handle),
+            _ => false,
+        }
+    }
+
     /// Public helper: extract the mode from a Bus marker. Returns
     /// `Some(BusMode)` on success, `None` if the value is not a Bus
     /// marker OR the mode field is missing OR the field carries an

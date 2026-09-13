@@ -310,14 +310,23 @@ pub async fn lookup(
 pub async fn picker_begin(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
+    headers: axum::http::HeaderMap,
     Json(req): Json<weft_access_store::BeginPicker>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let picker_state = weft_access_store::begin_picker(&state.pg_pool, &caller.0 .0, req)
         .await
         .map_err(access_err)?;
+    // Built from THIS request's own host, like every other link a
+    // caller is about to fetch. The editor asks for this address and
+    // then opens it in the person's browser, so it has to be the
+    // address the editor itself reached: one install answers on several
+    // at once (a loopback port-forward, a tunnel name, an ingress host),
+    // and a configured constant is wrong for every caller arriving at
+    // one of the others, invisibly until the page will not load.
     let url = format!(
         "{}/access/picker/{picker_state}",
-        state.external_base_url().trim_end_matches('/')
+        base.as_str()
     );
     Ok(Json(serde_json::json!({ "state": picker_state, "url": url })))
 }
@@ -331,6 +340,7 @@ pub async fn picker_begin(
 /// inside the editor.
 pub async fn picker_page(
     State(state): State<DispatcherState>,
+    headers: axum::http::HeaderMap,
     Path(picker_state): Path<String>,
 ) -> Result<Html<String>, ApiError> {
     let session = weft_access_store::load_picker(&state.pg_pool, &picker_state)
@@ -360,9 +370,12 @@ pub async fn picker_page(
         },
     )
     .await?;
+    // The page this address is written into is the page being served
+    // right now, and it posts its answer back itself, so the caller and
+    // the fetcher are the same client: the request's own host again.
     let result_url = format!(
         "{}/access/picker/{picker_state}/result",
-        state.external_base_url().trim_end_matches('/')
+        crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?.as_str()
     );
     // The page runs NODE-declared script on purpose, un-sandboxed:
     // provider choosers (Google's included) need their own cookies for

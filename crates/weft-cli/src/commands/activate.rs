@@ -34,7 +34,7 @@ async fn run_inner(
         // Activate-by-id skips the build/discover step entirely.
         Some(id) => (ctx.client(), id.clone(), id, None, None, None),
         None => {
-            let handle = super::ensure::ensure_registered(ctx, progress).await?;
+            let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
             (
                 handle.client,
                 handle.id,

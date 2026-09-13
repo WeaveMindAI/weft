@@ -17,6 +17,8 @@
 #                                           # (a filter matches TEST NAMES,
 #                                           # not file names; matching none
 #                                           # fails loudly)
+#   scripts/run-db-tests.sh weft-dispatcher test_name db_lifecycle
+#                                           # compile and run only this test file
 #
 # Set DATABASE_URL yourself and the script uses that server instead of
 # starting a container, which is what CI does.
@@ -33,6 +35,11 @@ CRATES=(weft-dispatcher weft-broker weft-access-store weft-task-store)
 
 only_crate="${1:-}"
 filter="${2:-}"
+test_target="${3:-}"
+if [ "$#" -gt 3 ] || { [ -n "$test_target" ] && { [ -z "$only_crate" ] || [ -z "$filter" ]; }; }; then
+  echo "usage: scripts/run-db-tests.sh [crate [test-name-filter [test-file]]]" >&2
+  exit 1
+fi
 if [ -n "$only_crate" ]; then
   found=0
   for c in "${CRATES[@]}"; do [ "$c" = "$only_crate" ] && found=1; done
@@ -64,7 +71,11 @@ for crate in "${CRATES[@]}"; do
   echo "=== $crate"
   if [ -n "$filter" ]; then
     crate_failed=0
-    out="$(cargo test -p "$crate" --features db-tests -- "$filter" 2>&1 | tee /dev/stderr)" \
+    cargo_args=(-p "$crate" --features db-tests)
+    if [ -n "$test_target" ]; then
+      cargo_args+=(--test "$test_target")
+    fi
+    out="$(cargo test "${cargo_args[@]}" -- "$filter" 2>&1 | tee /dev/stderr)" \
       || crate_failed=1
     # A filter that matches nothing "passes" with zero tests run, which
     # would report green on a suite where nothing executed. Filters

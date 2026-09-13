@@ -214,7 +214,7 @@ async function showNotification(task: PendingTask, enabled: boolean): Promise<bo
     await browser.notifications.create(`${NOTIFICATION_ID_PREFIX}${task.token}`, {
       type: 'basic',
       iconUrl: browser.runtime.getURL('/icon/128.png'),
-      title: 'WeaveMind Task',
+      title: 'Weft Task',
       message: `New task: ${task.title}`,
     });
     return true;

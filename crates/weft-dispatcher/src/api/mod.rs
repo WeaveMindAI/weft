@@ -43,6 +43,7 @@ pub mod signal;
 pub mod access;
 pub mod node_tests;
 pub mod storage;
+pub mod versions;
 
 /// The dispatcher routes, not yet bound to state. Additional routes can be
 /// `.merge`d onto this `Router<DispatcherState>` before binding state (so the
@@ -61,10 +62,21 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/health", get(|| async { "ok" }))
         .route("/projects", get(project::list))
         .route("/projects/{id}", get(project::get).delete(project::remove))
-        .route("/projects/{id}/run", post(project::run))
+        // The version tree: checkpoint, the run that records itself
+        // (THE start path for the CLI and the editor), the tree, head,
+        // the activation version, per-run bookkeeping, and prune.
+        .route("/projects/{id}/versions", post(versions::checkpoint))
+        .route("/projects/{id}/versions/runs", post(versions::run))
+        .route("/projects/{id}/versions/runs/{color}", axum::routing::put(versions::update_run))
+        .route("/projects/{id}/versions/tree", get(versions::tree))
+        .route("/projects/{id}/versions/sweep", post(versions::sweep))
+        .route("/projects/{id}/versions/head", axum::routing::put(versions::set_head))
+        .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
+        .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
         .route("/projects/{id}/status", get(project::status))
         .route("/projects/{id}/executions/latest", get(execution::latest_for_project))
         .route("/projects/{id}/activate", post(project::activate))
+        .route("/projects/{id}/bake", post(project::bake))
         // Cancel an in-flight activate (status=Activating). Wipes
         // every signal row registered so far, cancels the
         // TriggerSetup color, CASes status to Inactive.
@@ -101,8 +113,11 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/projects/{id}/infra/nodes/{node_id}/action", post(infra::action))
         .route("/executions/resolve/{prefix}", get(execution::resolve_color))
         .route("/executions/{color}/cancel", post(execution::cancel))
+        // Resolve a pure time wait now (`weft wake`).
+        .route("/executions/{color}/wake/{node}", post(execution::wake))
         .route("/executions/{color}/logs", get(execution::list_logs))
         .route("/executions/{color}/replay", get(execution::replay))
+        .route("/executions/{color}/outputs", get(execution::outputs))
         .route(
             "/executions/{color}",
             get(execution::get).delete(execution::delete_execution),
@@ -124,8 +139,8 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         // proxies each verb to the broker (which owns the bucket + metadata);
         // bulk bytes never flow through the dispatcher.
         .route("/storage/files", get(storage::list_files).delete(storage::remove))
+        .route("/storage/files/meta/{*key}", get(storage::file_meta))
         .route("/storage/files/download", post(storage::download))
-        .route("/storage/public-base", get(storage::public_base))
         .route("/storage/usage", get(storage::usage))
         // Asset publication (the pre-build sync): the same multipart contract
         // the worker uses, proxied to the broker's admin upload surface; part

@@ -365,6 +365,52 @@ impl SettledRun {
             .collect()
     }
 
+    /// Assert the execution recorded `count` spends for `service` that
+    /// carry NO figure.
+    ///
+    /// The counterpart of [`Self::assert_measured`]: money went out and
+    /// nothing ever stated what it came to. That is an honest answer and
+    /// it has to reach the trail, because the alternative is a zero
+    /// (which claims the call was free) or no row at all (which claims
+    /// the call never happened). A job submitted and never read back is
+    /// the shape that produces it.
+    ///
+    /// Like a resolved record, an unresolved one lands after the
+    /// terminal event, so this waits for it rather than judging the
+    /// at-terminal snapshot.
+    pub async fn assert_spend_without_figure(
+        &mut self,
+        service: &str,
+        count: usize,
+    ) -> Result<&Self> {
+        const COST_TRAIL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+        let unpriced = |replay: &Replay| {
+            replay
+                .by_kind("cost_reported")
+                .filter(|e| e.str_field("service") == Some(service))
+                .filter(|e| e.0.get("amount_usd").is_none_or(Value::is_null))
+                .count()
+        };
+        self.refresh_replay_until(
+            &format!("{count} unpriced '{service}' spend(s) to land on the journal"),
+            COST_TRAIL_DEADLINE,
+            move |replay| unpriced(replay) >= count,
+        )
+        .await?;
+        let got = unpriced(&self.replay);
+        if got != count {
+            bail!(
+                "expected {count} '{service}' spend(s) with no figure, got {got}; \
+                 every cost record: {:?}",
+                self.replay
+                    .by_kind("cost_reported")
+                    .map(|e| (e.str_field("service").unwrap_or("?").to_string(), e.0.get("amount_usd").cloned()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(self)
+    }
+
     /// Assert the execution recorded exactly one cost for `service`, resolved
     /// to a real positive amount AND spent on the expected key (`origin` is
     /// `"their-own"` or `"ours"`): the call was made, it rode the

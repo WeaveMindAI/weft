@@ -333,6 +333,20 @@ impl LoopRuntime {
         self.instances.get_mut(key)
     }
 
+    /// Retain a finished loop as history without launching any body work.
+    pub fn inherit(&mut self, instance: &LoopInstance, color: Color) -> Result<(), String> {
+        if instance.terminated.is_none() {
+            return Err(format!("cannot inherit unfinished loop '{}'", instance.key.group_id));
+        }
+        let mut inherited = instance.clone();
+        inherited.key.color = color;
+        if self.instances.contains_key(&inherited.key) {
+            return Err(format!("loop '{}' already has an instance at these frames", inherited.key.group_id));
+        }
+        self.instances.insert(inherited.key.clone(), inherited);
+        Ok(())
+    }
+
     /// Lookup or instantiate. Returns true on first-time instantiation.
     /// `gather_ports` is the LoopOut node's declared outward gather
     /// port names (non-carry outputs), captured here so the outward
@@ -1190,7 +1204,7 @@ pub fn launch_iteration(
     output.insert("index".to_string(), Arc::new(serde_json::json!(index)));
 
     let loop_in_id = crate::project::boundary_in_id(group_id);
-    let emission_id = iteration_launch_emission(key.color, group_id, &key.parent_frames, index);
+    let emission_id = iteration_launch_emission(group_id, &key.parent_frames, index);
     let mut emissions = Vec::new();
     let mentioned = postprocess_output(
         &loop_in_id, &output, emission_id, key.color, &body_frames, project, pulses, edge_idx,
@@ -1208,7 +1222,7 @@ pub fn launch_iteration(
     // loops must not break the skip cascade.
     close_unmentioned_downstream(
         &loop_in_id, &mentioned, emission_id, key.color, &body_frames, project, pulses, edge_idx,
-        &mut emissions, None,
+        &mut emissions, None, &std::collections::HashSet::new(),
     )
     .map_err(|e| e.to_string())?;
     // The body's own roots (members no wire feeds) start with the
@@ -1325,7 +1339,7 @@ pub fn emit_loop_outward(
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
-) -> Result<Vec<PulseEmission>, String> {
+) -> Result<(OutputBag, Vec<PulseEmission>), String> {
     let loop_out_id = crate::project::boundary_out_id(&key.group_id);
     let mut output = OutputBag::new();
     for (port, slots) in gather {
@@ -1344,7 +1358,7 @@ pub fn emit_loop_outward(
     postprocess_output(
         &loop_out_id,
         &output,
-        loop_termination_emission(key.color, &key.group_id, &key.parent_frames),
+        loop_termination_emission(&key.group_id, &key.parent_frames),
         key.color,
         &key.parent_frames,
         project,
@@ -1353,7 +1367,7 @@ pub fn emit_loop_outward(
         &mut emissions,
     )
     .map_err(|e| format!("loop '{}' outward emit failed: {e}", key.group_id))?;
-    Ok(emissions)
+    Ok((output, emissions))
 }
 
 /// The closures a loop that ends abnormally (failed, cancelled) owes
@@ -1369,7 +1383,7 @@ pub fn close_loop_outward(
         project,
         edge_idx,
         pulses,
-        loop_termination_emission(key.color, &key.group_id, &key.parent_frames),
+        loop_termination_emission(&key.group_id, &key.parent_frames),
         key.color,
         &key.group_id,
         &key.parent_frames,

@@ -166,7 +166,7 @@ pub async fn sync(
     sync_inner(state, id, body).await
 }
 
-async fn sync_inner(
+pub(super) async fn sync_inner(
     state: DispatcherState,
     id: uuid::Uuid,
     body: SyncRequest,
@@ -435,7 +435,7 @@ async fn sync_inner(
     crate::api::project::reconcile_worker(&state, &project_id, running_policy, drain_timeout_secs)
         .await?;
     let started: Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)> =
-        crate::lease::with_project_transition_lock(&state.pg_pool, &project_id, || async {
+        crate::lease::with_project_transition_lock(&state.lock_pool, &project_id, || async {
             if crate::api::project::infra_setup_in_flight(&state, &project_id).await? {
                 return Ok(Err((
                     StatusCode::CONFLICT,
@@ -447,9 +447,7 @@ async fn sync_inner(
             Ok(crate::api::project::start_infra_setup(&state, id).await)
         })
         .await
-        .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("project transition lock: {e}"))
-        })?;
+        .map_err(|e| crate::lease::lock_answer("project transition lock", e))?;
     if let Some(run) = started? {
         crate::api::project::await_infra_setup(&state, run).await?;
     }
@@ -460,13 +458,11 @@ async fn sync_inner(
     crate::api::project::reconcile_worker(&state, &project_id, running_policy, drain_timeout_secs)
         .await?;
     let landing: Result<(), (StatusCode, String)> =
-        crate::lease::with_project_transition_lock(&state.pg_pool, &project_id, || async {
+        crate::lease::with_project_transition_lock(&state.lock_pool, &project_id, || async {
             Ok(teardown_project_namespace_if_no_infra(&state, id).await)
         })
         .await
-        .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("project transition lock: {e}"))
-        })?;
+        .map_err(|e| crate::lease::lock_answer("project transition lock", e))?;
     landing?;
 
     // No auto-reactivate. Upgrade is CLI-orchestrated stop-then-start:

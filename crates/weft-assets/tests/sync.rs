@@ -6,7 +6,7 @@ use std::io::Read;
 use std::sync::Mutex;
 
 use serde_json::json;
-use weft_assets::{hash_reader, referenced_asset_keys, sync_assets, AssetSource, AssetStore};
+use weft_assets::{hash_reader, publish_files, referenced_asset_keys, sync_assets, AssetSource, AssetStore};
 use weft_core::project::{FileRef, ProjectDefinition};
 use weft_core::storage::StoredFile;
 use weft_core::weft_type::{WeftPrimitive, WeftType};
@@ -21,21 +21,39 @@ struct ChangingSource {
     versions: Mutex<Vec<Vec<u8>>>,
 }
 
-impl AssetSource for ChangingSource {
-    fn open(&self, path: &str) -> anyhow::Result<Box<dyn Read + Send>> {
+impl ChangingSource {
+    fn next(&self, path: &str) -> anyhow::Result<std::io::Cursor<Vec<u8>>> {
         anyhow::ensure!(path == self.path, "asset not found: {path}");
         let mut versions = self.versions.lock().unwrap();
         anyhow::ensure!(!versions.is_empty(), "opened more times than versions");
-        Ok(Box::new(std::io::Cursor::new(versions.remove(0))))
+        Ok(std::io::Cursor::new(versions.remove(0)))
+    }
+}
+
+impl AssetSource for ChangingSource {
+    fn open(&self, path: &str) -> anyhow::Result<Box<dyn Read + Send>> {
+        Ok(Box::new(self.next(path)?))
+    }
+    fn snapshot(&self, path: &str) -> anyhow::Result<Box<dyn weft_assets::AssetReader>> {
+        Ok(Box::new(self.next(path)?))
+    }
+}
+
+impl FakeSource {
+    fn bytes(&self, path: &str) -> anyhow::Result<std::io::Cursor<Vec<u8>>> {
+        match self.0.get(path) {
+            Some(bytes) => Ok(std::io::Cursor::new(bytes.clone())),
+            None => anyhow::bail!("asset not found: {path}"),
+        }
     }
 }
 
 impl AssetSource for FakeSource {
     fn open(&self, path: &str) -> anyhow::Result<Box<dyn Read + Send>> {
-        match self.0.get(path) {
-            Some(bytes) => Ok(Box::new(std::io::Cursor::new(bytes.clone()))),
-            None => anyhow::bail!("asset not found: {path}"),
-        }
+        Ok(Box::new(self.bytes(path)?))
+    }
+    fn snapshot(&self, path: &str) -> anyhow::Result<Box<dyn weft_assets::AssetReader>> {
+        Ok(Box::new(self.bytes(path)?))
     }
 }
 
@@ -45,7 +63,6 @@ impl AssetSource for FakeSource {
 struct FakeStore {
     existing: Mutex<BTreeMap<String, String>>,
     uploads: Mutex<Vec<String>>,
-    deletes: Mutex<Vec<String>>,
     /// (hash, mime) of every upload, for the media-type contract.
     mimes: Mutex<Vec<(String, String)>>,
     fail_upload_of: Option<String>,
@@ -62,11 +79,6 @@ fn key_for(hash: &str) -> String {
 
 #[async_trait::async_trait]
 impl AssetStore for FakeStore {
-    async fn delete(&self, key: &str) -> anyhow::Result<()> {
-        self.existing.lock().unwrap().retain(|_, k| k != key);
-        self.deletes.lock().unwrap().push(key.to_string());
-        Ok(())
-    }
     async fn list(&self) -> anyhow::Result<BTreeMap<String, String>> {
         Ok(self.existing.lock().unwrap().clone())
     }
@@ -77,25 +89,25 @@ impl AssetStore for FakeStore {
         _filename: &str,
         size_bytes: u64,
         bytes: &mut (dyn Read + Send),
-    ) -> anyhow::Result<weft_assets::Uploaded> {
+    ) -> anyhow::Result<String> {
         if self.already_stored_of.as_deref() == Some(hash) {
             // The store already held this content: it reads nothing and
             // answers the key it has, exactly as the begin verb does.
-            return Ok(weft_assets::Uploaded::AlreadyStored(key_for(hash)));
+            return Ok(key_for(hash));
         }
         if self.fail_upload_of.as_deref() == Some(hash) {
             anyhow::bail!("store rejected upload of {hash}");
         }
         // The fake verifies what the broker enforces: the streamed bytes
-        // really are `size_bytes` long. (The broker checks only the size;
-        // the hash is the sync's own promise, tested through `delete`.)
+        // really are `size_bytes` long. Hash verification belongs to the
+        // publisher and happens before this call.
         let (_, streamed_size) = hash_reader(bytes)?;
         assert_eq!(streamed_size, size_bytes, "uploaded bytes match the declared size");
         self.mimes.lock().unwrap().push((hash.to_string(), mime.to_string()));
         let key = key_for(hash);
         self.existing.lock().unwrap().insert(hash.to_string(), key.clone());
         self.uploads.lock().unwrap().push(hash.to_string());
-        Ok(weft_assets::Uploaded::Stored(key))
+        Ok(key)
     }
 }
 
@@ -362,16 +374,15 @@ async fn one_path_under_two_types_is_checked_under_each() {
 }
 
 #[tokio::test]
-async fn a_file_edited_between_the_two_reads_is_refused_and_its_upload_discarded() {
+async fn a_file_edited_between_the_two_reads_is_refused_before_upload() {
     let source = ChangingSource {
         path: "a.png".into(),
         versions: Mutex::new(vec![png(b"one"), png(b"two")]),
     };
     let store = FakeStore::default();
     let err = sync_assets(&[image_ref("a.png")], &source, &store).await.unwrap_err();
-    assert!(err.to_string().contains("a.png changed while it was being synced"), "{err:#}");
-    let first = sha(&png(b"one"));
-    assert_eq!(*store.deletes.lock().unwrap(), vec![key_for(&first)], "the mis-hashed upload is removed");
+    assert!(err.to_string().contains("a.png changed while it was being published"), "{err:#}");
+    assert!(store.uploads.lock().unwrap().is_empty(), "changed bytes never reach storage");
     assert!(store.existing.lock().unwrap().is_empty(), "nothing is left under the first hash");
 }
 
@@ -395,10 +406,8 @@ async fn the_stored_media_type_comes_from_the_bytes_before_the_filename() {
 }
 
 /// A concurrent build finished uploading this exact content between our
-/// list and our begin. The store reads nothing and answers its key, so
-/// there is no streamed hash to hold the upload to: checking one anyway
-/// compared the file against the empty digest and deleted a healthy
-/// asset out from under the build that made it.
+/// list and our begin. The store reads nothing and answers its key;
+/// the already verified snapshot needs no transfer.
 #[tokio::test]
 async fn content_the_store_already_holds_is_kept_not_deleted() {
     let bytes = png(b"shared");
@@ -407,11 +416,55 @@ async fn content_the_store_already_holds_is_kept_not_deleted() {
     let store = FakeStore { already_stored_of: Some(hash.clone()), ..FakeStore::default() };
     let refs = vec![image_ref("logo.png")];
     let map = sync_assets(&refs, &source, &store).await.expect("an already-stored asset syncs");
-    assert!(store.deletes.lock().unwrap().is_empty(), "nothing is deleted");
     assert!(store.uploads.lock().unwrap().is_empty(), "nothing is transferred");
     assert_eq!(
         map[&image_key("logo.png")]["__weft_image__"]["key"],
         serde_json::json!(key_for(&hash)),
         "the ref resolves to the key the store already had"
     );
+}
+
+// ---- publish_files: the content-addressed core on its own, as a version
+// snapshot uses it (no `@asset` kind check, any file) ----
+
+#[tokio::test]
+async fn publish_files_uploads_only_what_the_store_is_missing() {
+    let source = FakeSource(BTreeMap::from([
+        ("main.weft".to_string(), b"graph {}".to_vec()),
+        ("prompts/p.txt".to_string(), b"hello".to_vec()),
+    ]));
+    let store = FakeStore::default();
+    store.existing.lock().unwrap().insert(sha(b"hello"), key_for(&sha(b"hello")));
+    let published = publish_files(&["main.weft".into(), "prompts/p.txt".into()], &source, &store)
+        .await
+        .unwrap();
+    assert_eq!(published["main.weft"].hash, sha(b"graph {}"));
+    assert_eq!(published["main.weft"].key, key_for(&sha(b"graph {}")));
+    assert_eq!(published["prompts/p.txt"].key, key_for(&sha(b"hello")));
+    assert_eq!(*store.uploads.lock().unwrap(), vec![sha(b"graph {}")], "the held file is not re-uploaded");
+    let mimes = store.mimes.lock().unwrap();
+    assert!(mimes.iter().any(|(h, m)| *h == sha(b"graph {}") && m == "text/plain"), "{mimes:?}");
+}
+
+#[tokio::test]
+async fn publish_files_names_every_unreadable_file_in_one_error() {
+    let source = FakeSource(BTreeMap::new());
+    let store = FakeStore::default();
+    let err = publish_files(&["a.weft".into(), "b.weft".into()], &source, &store).await.unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("a.weft") && text.contains("b.weft"), "{text}");
+    assert!(store.uploads.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn publish_files_refuses_changed_bytes_before_upload() {
+    let source = ChangingSource {
+        path: "main.weft".into(),
+        versions: Mutex::new(vec![b"one".to_vec(), b"two".to_vec()]),
+    };
+    let store = FakeStore::default();
+    let err = publish_files(&["main.weft".into()], &source, &store).await.unwrap_err();
+    assert!(err.to_string().contains("main.weft changed while it was being published"), "{err:#}");
+    assert!(store.uploads.lock().unwrap().is_empty());
+    assert!(store.existing.lock().unwrap().is_empty());
 }

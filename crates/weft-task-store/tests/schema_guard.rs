@@ -438,6 +438,47 @@ async fn the_plan_writes_sql_for_a_drop_a_type_change_and_a_new_column(pool: PgP
     assert!(!sql.contains("yourself"), "nothing is left for a human to write: {sql}");
 }
 
+// Postgres names a constraint for every NOT NULL column. When the column
+// goes, the plan must not also drop that constraint by name: the DROP
+// COLUMN already took it, and the file would fail on a constraint that no
+// longer exists. Proven by running the plan against the old table, which
+// is exactly what a release does.
+#[sqlx::test]
+async fn dropping_a_not_null_column_does_not_also_drop_its_constraint(pool: PgPool) {
+    use weft_task_store::schema_guard::{plan_migration, read_schema};
+
+    let old = "CREATE TABLE probe (owner TEXT NOT NULL, big_key TEXT NOT NULL, payload TEXT NOT NULL, \
+               PRIMARY KEY (owner, big_key))";
+    sqlx::raw_sql(old).execute(&pool).await.unwrap();
+    let before = read_schema(&pool).await.unwrap();
+
+    sqlx::raw_sql(
+        "DROP TABLE probe; \
+         CREATE TABLE probe (owner TEXT NOT NULL, key_hash TEXT NOT NULL, payload TEXT NOT NULL, \
+         PRIMARY KEY (owner, key_hash))",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let after = read_schema(&pool).await.unwrap();
+    let stmts: Vec<String> =
+        plan_migration(&before, &after).into_iter().map(|p| p.stmt).collect();
+    let sql = stmts.join("\n");
+    assert!(sql.contains("DROP COLUMN big_key;"), "{sql}");
+    assert!(!sql.contains("big_key_not_null"), "the column takes its NOT NULL constraint with it: {sql}");
+
+    // The proof: the plan runs on the OLD table and lands on the new shape.
+    sqlx::raw_sql(&format!("DROP TABLE probe; {old}")).execute(&pool).await.unwrap();
+    for stmt in &stmts {
+        sqlx::raw_sql(stmt).execute(&pool).await.unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    let landed = read_schema(&pool).await.unwrap();
+    assert_eq!(
+        landed.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        after.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+}
+
 // Array and enum columns are the shapes information_schema renders as
 // the words ARRAY / USER-DEFINED; the planner must emit their REAL type
 // names, proven by executing what it wrote.
@@ -587,4 +628,18 @@ mod release {
         assert!(err.contains("guard_probe") && err.contains("extra"), "{err}");
         assert_eq!(recorded_ids(&pool).await, vec![DRAFT_EXTRA[0].id.to_string()], "rolled back");
     }
+}
+
+/// A release only settles groups the live database has built; one the
+/// code added since the last boot has no stamp and is left for the boot.
+#[sqlx::test]
+async fn a_group_the_database_never_built_is_unborn_to_a_release(pool: PgPool) {
+    let mut conn = pool.acquire().await.unwrap();
+    let all = weft_task_store::schema_guard::unborn_groups(&mut conn, &[&GUARDED, &OTHER]).await.unwrap();
+    assert_eq!(all, vec!["guard_probe", "guard_other"], "no stamp table yet: every group is unborn");
+    drop(conn);
+    apply(&pool, &[&GUARDED], NONE).await.expect("build one group");
+    let mut conn = pool.acquire().await.unwrap();
+    let rest = weft_task_store::schema_guard::unborn_groups(&mut conn, &[&GUARDED, &OTHER]).await.unwrap();
+    assert_eq!(rest, vec!["guard_other"]);
 }

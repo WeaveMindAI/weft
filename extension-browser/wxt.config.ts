@@ -25,8 +25,8 @@ export default defineConfig({
     openDevtools: false,
   },
   manifest: ({ browser, manifestVersion }) => ({
-    name: 'WeaveMind',
-    description: 'Human-in-the-loop task manager for WeaveMind projects',
+    name: 'Weft tasks',
+    description: 'Human-in-the-loop task manager for weft projects',
     permissions: ['storage', 'notifications', 'alarms'],
     // No fixed host access. Each runtime's host is requested from the
     // user at the moment they add its token (popup, `permissions.request`)

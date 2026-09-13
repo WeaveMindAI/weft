@@ -297,17 +297,17 @@ impl ProviderMeter for OpenRouterMeter {
             };
         }
 
-        // 3. No generation was created. A refused call (non-2xx before any
-        // generation id) bills nothing; that is a known zero, not an unknown.
-        if status != 0 && !(200..300).contains(&(status as u16)) {
-            return MeasuredCost {
-                amount_usd: Some(0.0),
-                model,
-                metadata: json!({
-                    "resolution": "provider refused the call; nothing billed",
-                    "status": status,
-                }),
-            };
+        // 3. No generation id to look up. What the status says on its own
+        // then decides, through the one shared rule
+        // (`providers::cost_from_status`): a refusal bills nothing, but a
+        // 5xx is NOT a refusal. A gateway answering 502 over a generation
+        // OpenRouter had already created and billed used to book zero
+        // here, which claimed a real spend was free.
+        if status != 0 {
+            if let Some(mut cost) = crate::providers::cost_from_status(status as u16, "the call") {
+                cost.model = model;
+                return cost;
+            }
         }
 
         // 4. Nothing to anchor a lookup on: unknown, said honestly.

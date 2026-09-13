@@ -14,9 +14,9 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::authenticator::CallerTenant;
 use crate::state::DispatcherState;
@@ -51,6 +51,20 @@ pub(crate) fn storage_err(e: anyhow::Error) -> ApiError {
     internal(e)
 }
 
+/// GET /storage/files/meta/{key}: one active file owned by the caller.
+pub async fn file_meta(
+    State(state): State<DispatcherState>, caller: CallerTenant, Path(key): Path<String>,
+) -> Result<Response, ApiError> {
+    let key = ensure_tenant_key(&caller.0, &key)?;
+    match crate::storage::file_meta(&state, &key).await {
+        Ok(meta) => Ok(Json(meta).into_response()),
+        Err(error) if error.downcast_ref::<crate::storage::StorageNotFound>().is_some() => {
+            Ok((StatusCode::NOT_FOUND, [("x-weft-not-found", "file")], "file is not stored").into_response())
+        }
+        Err(error) => Err(storage_err(error)),
+    }
+}
+
 /// GET /storage/files: every runtime file in the caller's tenant.
 pub async fn list_files(
     State(state): State<DispatcherState>,
@@ -83,20 +97,23 @@ pub struct DownloadRequest {
 
 /// POST /storage/files/download: resolve the acting tenant, prefix the key, and
 /// mint a relay download link (with the file's name + size for the client).
-/// The answer is a `/public/files/{token}` URL on this dispatcher's public
-/// base, NOT a presigned bucket URL: the download handshake serves browsers
+/// The answer is a `/public/files/{token}` URL, NOT a presigned bucket URL:
+/// the download handshake serves browsers
 /// and CLIs on the user's side of any port forward, tunnel, or proxy, and a
 /// presigned URL's signature covers the exact host the client must send, so
 /// one rewritten hop turns it into a bucket signature error. The token URL
-/// rides the same base every other editor call already reaches.
+/// comes back on the address THIS caller used, so it rides the same base
+/// every other call they make already reaches.
 pub async fn download(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
+    headers: axum::http::HeaderMap,
     Json(req): Json<DownloadRequest>,
 ) -> Result<Json<weft_core::storage::PresignResult>, ApiError> {
     let tenant = caller.0;
     let key = ensure_tenant_key(&tenant, &req.key)?;
-    let p = crate::storage::download_link(&state, &key, req.ttl_secs).await.map_err(storage_err)?;
+    let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    let p = crate::storage::download_link(&state, &base, &key, req.ttl_secs).await.map_err(storage_err)?;
     Ok(Json(p))
 }
 
@@ -166,23 +183,6 @@ pub async fn public_file(
     builder
         .body(axum::body::Body::from_stream(upstream.bytes_stream()))
         .map_err(internal)
-}
-
-#[derive(Serialize)]
-pub struct PublicBaseResponse {
-    pub public_base_url: String,
-}
-
-/// GET /storage/public-base: the object store's browser-facing origin, which the
-/// webview adds to its CSP `img-src`/`media-src` so an `<img>`/`<video>` can
-/// stream presigned bytes directly from the bucket. `WEFT_OBJECT_STORE_PUBLIC_ENDPOINT`
-/// overrides the in-cluster slot endpoint with the browser-reachable one (e.g. a
-/// public object-store or ingress host); it falls back to the slot endpoint.
-pub async fn public_base() -> Json<PublicBaseResponse> {
-    let public_base_url = std::env::var("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT")
-        .or_else(|_| std::env::var("WEFT_OBJECT_STORE_ENDPOINT"))
-        .unwrap_or_default();
-    Json(PublicBaseResponse { public_base_url })
 }
 
 // ---------- editor upload (the file-drop config field) ----------
@@ -272,8 +272,18 @@ pub async fn asset_references(
     caller: CallerTenant,
     Json(mut req): Json<weft_core::storage::AssetReferencesRequest>,
 ) -> Result<StatusCode, ApiError> {
-    req.project.parse::<uuid::Uuid>()
+    let project = req.project.parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "project is not a valid id".to_string()))?;
+    // The build's own assets plus every blob a surviving version of the
+    // project names: the version tree shares the asset plane, and a
+    // version's files must outlive the builds that stopped referencing
+    // them. What no version and no build names expires as before, which
+    // is how a prune reclaims its blobs.
+    req.keys.extend(
+        crate::api::versions::version_blob_keys(&state, project)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}")))?,
+    );
     for key in &mut req.keys {
         *key = ensure_tenant_key(&caller.0, key)?;
     }
@@ -282,7 +292,9 @@ pub async fn asset_references(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /storage/upload/parts: reserve + presign the next parts.
+/// POST /storage/upload/parts: reserve + presign the parts the caller
+/// names. Naming them is what makes a reservation idempotent; see
+/// `weft_core::storage::UploadPartsRequest`.
 pub async fn upload_parts(
     State(state): State<DispatcherState>,
     caller: CallerTenant,

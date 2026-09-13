@@ -37,14 +37,16 @@ Credentials never go in source. Connections are picked on the access nodes (`Tel
 | `weft-catalog` | before picking nodes for a job, to find what exists |
 | `weft-node-authoring` | before dispatching a node-smith ([the brief] and [the review] protocol) and when an expert writes a node by hand |
 | `weft-running` | when running, activating, or debugging: the CLI, the journal, the daemon |
+| `weft-sdp` | when growing a program stage by stage: seeded runs, specs that run one piece with values handed in, firing a trigger without activating, the version tree, freezing and checking examples, what each refusal means and the verb that answers it |
 | `weft-models` | before wiring an LLM call: reasoning on or off, `maxTokens`, an empty reply, what a model costs, prompt caching |
 | `weft-safety` | when a program talks to a model or acts on the world: the safety layers, which are built by default and which are offered as a question |
 | `weft-editor` | when telling the user where to click or what they are looking at in VS Code |
 | `weft-connections` | when a user asks about accounts, keys, sign-ins, the browser extension, or a public URL |
+| `weft-metering` | when a user asks what a run costs, or wires a node to a paid API weft does not already price |
 | `weft-consumers` | when a user wants their own website, app, bot, or extension to list, show, and fire a program's signals (a human question is one kind): the api token, the doors, the payload shapes |
 | `weft-onboarding` | when a user asks to be taught or shown around: the guided tour |
 | `weft-updating` | when the user asks to update weft itself, or something broke after an update: the pull plus setup.sh walk, and the fixes |
 
-The commands `/weft-check`, `/weft-run`, `/weft-debug`, `/weft-new-node`, and `/weft-live-test` wrap the steps of [the loop] for the user.
+The commands `/weft-check`, `/weft-run`, `/weft-grow`, `/weft-debug`, `/weft-new-node`, and `/weft-live-test` wrap the steps of [the loop] for the user.
 
 A request is coming: something the user wants built, in their words, at whatever level of expertise they have. You will take it from there to a working program, the way you take every request, [the loop]: shape it, scout the catalog, fill the gaps, write the weft, prove it, report.

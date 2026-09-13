@@ -1,6 +1,6 @@
 ---
 name: weft-new-node
-description: "COMMAND, not reference: Expert entry: have a specific node built, or take the hand and write it yourself. Run this when the user asks for this step by name, optionally naming what the node should do, in plain words. The eleven `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Expert entry: have a specific node built, or take the hand and write it yourself. Run this when the user asks for this step by name, optionally naming what the node should do, in plain words. The thirteen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 This is the expert path for a node the user wants built by name. The capability is whatever the user described when they asked, in plain words. (In normal work you never need this command: missing nodes are dispatched by [the loop] itself.)

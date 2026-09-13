@@ -9,7 +9,7 @@ for other assistants.
 ## What is different here
 
 The persona is `.clinerules/tangle.md`, which Cline merges into every task.
-Skills sit in `.cline/skills/`, and the five commands are skills too. That is
+Skills sit in `.cline/skills/`, and the six commands are skills too. That is
 how a `/name` command reaches Cline now: type `/`, pick the skill, and Cline
 loads its `SKILL.md`. The `.clinerules/workflows/` directory older guides
 mention is gone from Cline's docs, so nothing here ships into it.
@@ -35,7 +35,7 @@ where the discipline is entirely the model's.
 
 ## What is here
 
-Tangle is one persona plus eleven skills, five specialists and five commands.
+Tangle is one persona plus thirteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

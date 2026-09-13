@@ -82,6 +82,7 @@ pub fn postprocess_output(
                 declared = node.outputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
             )));
         };
+        mentioned.insert(port_name.clone());
         for edge in outgoing.iter().filter(|e| e.source_handle.as_deref() == Some(port_name.as_str())) {
             let delivered = if edge.path.is_empty() {
                 Some(value.clone())
@@ -145,7 +146,6 @@ pub fn postprocess_output(
 
     // Every port is declared (validated above); emit.
     for d in deliveries {
-        mentioned.insert(d.port.to_string());
         match d.value {
             Some(value) => emit_value_on_edge(
                 project, node_id, d.edge, d.port, value, emission_id, color, frames, pulses, emissions,
@@ -252,9 +252,8 @@ fn emit_value_on_edge(
 /// error when this sweep runs on a failure path: it rides the
 /// generator ports' closures as a FAILED end, so the consumer's pull
 /// surfaces the producer's error through `?` instead of reading a
-/// clean finish over a truncated stream. Ordinary ports never carry
-/// it: their consumers act on the closure itself (skip / missing
-/// input).
+/// clean finish over a truncated stream. Scalar closures retain it too,
+/// so input backups cannot hide a producer failure.
 #[allow(clippy::too_many_arguments)]
 pub fn close_unmentioned_downstream(
     node_id: &str,
@@ -267,6 +266,7 @@ pub fn close_unmentioned_downstream(
     edge_idx: &EdgeIndex,
     emissions: &mut Vec<PulseEmission>,
     failure: Option<&str>,
+    closed: &HashSet<String>,
 ) -> WeftResult<()> {
     let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
         // Same impossible state as `postprocess_output`'s node lookup;
@@ -280,12 +280,11 @@ pub fn close_unmentioned_downstream(
     let outgoing = edge_idx.get_outgoing(project, node_id);
     for port in &node.outputs {
         let is_generator = port.is_generator();
-        if mentioned.contains(&port.name) && !is_generator {
+        if closed.contains(&port.name) || (mentioned.contains(&port.name) && !is_generator) {
             continue;
         }
-        let close_error = if is_generator { failure } else { None };
         emit_closure_on_outgoing(
-            project, node_id, &port.name, emission_id, color, frames, close_error, &outgoing,
+            project, node_id, &port.name, emission_id, color, frames, failure, &outgoing,
             pulses, emissions,
         );
     }
@@ -307,6 +306,7 @@ pub fn emit_port_closure(
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
     emissions: &mut Vec<PulseEmission>,
+    failure: Option<&str>,
 ) -> WeftResult<()> {
     let declared = project
         .nodes
@@ -331,7 +331,7 @@ pub fn emit_port_closure(
     }
     let outgoing = edge_idx.get_outgoing(project, node_id);
     emit_closure_on_outgoing(
-        project, node_id, port_name, emission_id, color, frames, None, &outgoing, pulses, emissions,
+        project, node_id, port_name, emission_id, color, frames, failure, &outgoing, pulses, emissions,
     );
     Ok(())
 }
@@ -406,7 +406,7 @@ fn emit_closure_on_edge(
         frames.clone(),
         edge.target.clone(),
         target_handle.to_string(),
-        close_error.filter(|_| generator_target).map(str::to_string),
+        close_error.map(str::to_string),
     );
     emissions.push(PulseEmission {
         pulse: pulse.clone(),
@@ -453,6 +453,56 @@ mod fan_in_tests {
 
     fn emission() -> Uuid {
         Uuid::new_v4()
+    }
+
+    #[test]
+    fn unused_output_is_still_mentioned_for_future_seed_consumers() {
+        let project = direct_project();
+        let mut pulses = PulseTable::default();
+        let mut emissions = Vec::new();
+        let mentioned = postprocess_output("src", &OutputBag::from([("out".into(), Arc::new(json!(42)))]),
+            emission(), Uuid::nil(), &vec![], &project, &mut pulses, &EdgeIndex::build(&project), &mut emissions).unwrap();
+        assert_eq!(mentioned, HashSet::from(["out".into()]));
+        assert!(pulses.is_empty());
+        assert!(emissions.is_empty());
+    }
+
+    #[test]
+    fn failed_scalar_closure_keeps_its_reason_to_prevent_backup_substitution() {
+        let mut project = direct_project();
+        project.edges.push(edge("out", "consumer", "in"));
+        let index = EdgeIndex::build(&project);
+        for explicit in [true, false] {
+            let mut pulses = PulseTable::default();
+            let mut emissions = Vec::new();
+            if explicit {
+                emit_port_closure("src", "out", emission(), Uuid::nil(), &vec![], &project,
+                    &mut pulses, &index, &mut emissions, Some("refused output")).unwrap();
+            } else {
+                close_unmentioned_downstream("src", &HashSet::new(), emission(), Uuid::nil(), &vec![], &project,
+                    &mut pulses, &index, &mut emissions, Some("refused output"), &HashSet::new()).unwrap();
+            }
+            assert_eq!(pulses["consumer"][0].close_error.as_deref(), Some("refused output"));
+        }
+    }
+
+    #[test]
+    fn completion_does_not_close_a_consumed_generator_end_again() {
+        let mut project = direct_project();
+        project.nodes[0].outputs[0].port_type = serde_json::from_value(json!("Generator[Number]")).unwrap();
+        project.nodes[1].inputs[0].port_type = serde_json::from_value(json!("Generator[Number]")).unwrap();
+        project.edges.push(edge("out", "consumer", "in"));
+        let index = EdgeIndex::build(&project);
+        let mut pulses = PulseTable::default();
+        let mut emissions = Vec::new();
+        emit_port_closure("src", "out", emission(), Uuid::nil(), &vec![], &project, &mut pulses, &index, &mut emissions, None).unwrap();
+        assert_eq!(emissions.len(), 1);
+        pulses.clear();
+        emissions.clear();
+        close_unmentioned_downstream("src", &HashSet::from(["out".into()]), emission(), Uuid::nil(), &vec![], &project,
+            &mut pulses, &index, &mut emissions, None, &HashSet::from(["out".into()])).unwrap();
+        assert!(emissions.is_empty());
+        assert!(pulses.is_empty());
     }
 
     #[test]

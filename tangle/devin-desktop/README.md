@@ -14,7 +14,7 @@ workflows and hooks are still read from `.windsurf/`.
 
 The persona is split across `.devin/rules/tangle-1.md` through `tangle-4.md`,
 each `trigger: always_on`. **That split is not cosmetic:** Devin caps a
-workspace rule file at 12,000 characters, and Tangle is about 29,000, so a
+workspace rule file at 12,000 characters, and Tangle is about 30,000, so a
 single file would be silently truncated. The split falls on section
 boundaries, so each file is whole ideas rather than a cut sentence.
 
@@ -32,13 +32,13 @@ would send Tangle chasing an error that no longer exists. The persona tells
 Tangle to read that file after a batch of edits, which is what closes the loop
 by hand.
 
-The five commands are workflows in `.windsurf/workflows/`, invoked as
+The six commands are workflows in `.windsurf/workflows/`, invoked as
 `/weft-check` and so on, and they are manual-only: Cascade never runs a
 workflow on its own.
 
 ## What is here
 
-Tangle is one persona plus eleven skills, five specialists and five commands.
+Tangle is one persona plus thirteen skills, five specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

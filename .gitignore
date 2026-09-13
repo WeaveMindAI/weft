@@ -24,8 +24,9 @@ __pycache__
 node_modules/
 .DS_Store
 
-# Codegen-emitted builder-base warm-up crate (emitted by
-# `codegen::emit_warmup_crate` at build time; regenerated, never hand-edited).
+# The staged builder-base build context (`build::stage_builder_base_context`:
+# the worker crate closure, the stock worker crate and the stdlib sources;
+# regenerated on every base build, never hand-edited).
 .weft-base-context/
 
 # VS Code extension build output

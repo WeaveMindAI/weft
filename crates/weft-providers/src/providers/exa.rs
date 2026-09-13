@@ -64,11 +64,6 @@ impl ProviderMeter for ExaMeter {
         }
     }
 
-    fn prepare(&self, _path: &str, _body: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        // `costDollars` always rides the response; nothing to opt into.
-        Ok(None)
-    }
-
     async fn ceiling_usd(
         &self,
         path: &str,

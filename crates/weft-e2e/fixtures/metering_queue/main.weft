@@ -1,0 +1,18 @@
+# A paid call with a QUEUE shape: the money is committed when the job is
+# submitted, and the amount is only stated on a later read.
+#
+# The provider is the rig's own fake and the meter ships in this project
+# (nodes/queue_job/mod.rs), so the test owns both ends: it decides whether
+# the answer is ever read back, which is the difference between a spend
+# with a figure on it and a spend the trail must record as unknown.
+#
+# `readBack` is what the rig flips. Left false, the job is submitted and
+# never read: real money out, no figure anywhere, and the execution's end
+# is the only thing that can write that down.
+
+job = QueueJob -> (requestId: String) {
+  readBack: false
+}
+
+out = Debug
+out.data = job.requestId

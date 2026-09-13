@@ -32,6 +32,10 @@ fn names() -> WeftResult<()> {
 }
 
 fn renders() -> WeftResult<()> {
+    let number = parse_template("{{n}}")?;
+    for (value, expected) in [(json!(41), "41"), (json!(41.0), "41"), (json!(-0.0), "0"), (json!(1.25), "1.25")] {
+        assert_eq!(render(&number, &ports(&[("n", value)])), expected);
+    }
     let pieces = parse_template("Hi {{user}}: {{n}} items, {{items}}, flag {{ok}}, {{user}}!")?;
     let text = render(
         &pieces,

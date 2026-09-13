@@ -189,7 +189,9 @@ pub fn check_should_skip(
                 return false;
             }
             if !wired.contains(port.name.as_str()) {
-                return true;
+                // An unwired setting can still supply its declared default.
+                // A closed wire below remains closed even when a default exists.
+                return port.default.is_none();
             }
             // A wired generator port in a formed group has an arrival
             // by construction, and even a closure-arrival is a live
@@ -384,6 +386,21 @@ mod tests {
             data_pulse(SHOULD_FLOW_PORT, json!(true)),
         ];
         let wired: HashSet<&str> = ["a", "b", SHOULD_FLOW_PORT].into_iter().collect();
+        assert_eq!(
+            check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
+            Some(SkipReason::EveryInputClosed),
+        );
+    }
+
+    #[test]
+    fn unwired_defaults_keep_a_node_alive_but_closed_wires_do_not() {
+        let mut node = node_all_optional();
+        for port in &mut node.inputs {
+            port.default = Some(json!("setting"));
+        }
+        assert_eq!(check_should_skip(&node, &[], &HashSet::new(), &HashSet::new(), &HashSet::new()), None);
+        let pulses = vec![closure_pulse("a"), closure_pulse("b")];
+        let wired = ["a", "b"].into_iter().collect();
         assert_eq!(
             check_should_skip(&node, &view(&pulses), &HashSet::new(), &wired, &HashSet::new()),
             Some(SkipReason::EveryInputClosed),

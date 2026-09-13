@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::cancellation::CancellationFlag;
@@ -13,78 +12,8 @@ use crate::tag::StopSelf;
 use crate::weft_type::WeftType;
 use crate::Color;
 
-/// Which lifecycle phase this invocation belongs to. Three-runtime
-/// model: infra setup provisions long-lived resources (infra pods),
-/// trigger setup wires up listeners (opens subscriptions, registers
-/// URLs), and fire runs the regular execution subgraph.
-///
-/// Engine/journal vocabulary only: nodes never see it. The engine
-/// routes each phase to the right `Node` method from the manifest
-/// (`setup_trigger` for a trigger at TriggerSetup, `run` otherwise;
-/// a trigger is skipped at InfraSetup).
-///
-/// - `InfraSetup`: an infra node is being provisioned.
-/// - `TriggerSetup`: a trigger node (or its upstream) is being set
-///   up. The trigger registers the wake signal the listener
-///   should watch.
-/// - `Fire`: the normal fire-time execution. The firing trigger
-///   receives the wake payload, its outputs flow downstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    InfraSetup,
-    TriggerSetup,
-    Fire,
-}
+pub use crate::primitive::Phase;
 
-impl Phase {
-    /// Stable wire/storage tag. Matches the serde rename so the
-    /// JSON form and the DB form agree.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::InfraSetup => "infra_setup",
-            Self::TriggerSetup => "trigger_setup",
-            Self::Fire => "fire",
-        }
-    }
-
-    /// The set of nodes an execution in this phase may dispatch, or
-    /// `None` for the whole graph. In `TriggerSetup` only the run
-    /// subgraph of the triggers runs; in `InfraSetup` only that of the
-    /// infra nodes; at `Fire` the subgraph the dispatcher journaled on
-    /// `ExecutionStarted` (a trigger fire's program, a targeted manual
-    /// run's selection), or everything for an untargeted run. A pulse
-    /// into any node outside the set is absorbed silently. The ONE
-    /// derivation, read by the live scheduler and the journal fold.
-    pub fn dispatchable_nodes(
-        self,
-        project: &crate::project::ProjectDefinition,
-        edge_idx: &crate::project::EdgeIndex,
-        subgraph: Option<&[String]>,
-    ) -> Option<std::collections::HashSet<String>> {
-        use crate::project::{infra_ids, run_subgraph, trigger_ids};
-        match self {
-            Self::TriggerSetup => {
-                Some(run_subgraph(project, edge_idx, &trigger_ids(project), &Default::default()))
-            }
-            Self::InfraSetup => {
-                Some(run_subgraph(project, edge_idx, &infra_ids(project), &Default::default()))
-            }
-            Self::Fire => subgraph.map(|s| s.iter().cloned().collect()),
-        }
-    }
-
-    /// The inverse of `as_str`: a stored or typed tag back to the
-    /// phase, `None` for anything else. Every reader of a phase
-    /// written as text (the DB column, a CLI flag) comes through here,
-    /// so the set of names has one definition.
-    pub fn from_tag(tag: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == tag)
-    }
-
-    /// Every phase, for a caller that has to offer the choice.
-    pub const ALL: [Phase; 3] = [Self::InfraSetup, Self::TriggerSetup, Self::Fire];
-}
 
 /// How long a node's provider work may take, unless it says otherwise
 /// ([`ExecutionContext::open_within`]). Generous for a normal API

@@ -31,7 +31,10 @@ pub mod node_test;
 pub mod primitive;
 pub mod project;
 pub mod pulse;
+pub mod run_spec;
 pub mod running_policy;
+#[cfg(feature = "runtime")]
+pub mod seeding;
 // The predicate submodule is wire-pure and always available (the
 // `SignalSpec` wire type in `primitive` carries `Vec<Predicate>`); the
 // rest of the module (kind registry, typed kinds) is runtime-only and

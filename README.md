@@ -194,6 +194,13 @@ We call it
 [Sequential Diffusion Programming](https://weavemindai.github.io/weft/thinking/sdp.html):
 the program sharpens pass after pass, the way an image sharpens out of noise.
 
+`weft run --seed` reuses compatible completed work while you develop.
+When a run comes out right, `weft freeze <name>` preserves its starting
+parameters and the outputs you accepted. After editing, `weft run <name>`
+uses those parameters with the current code. `weft diff` presents the
+changed outputs for you or Tangle to judge. For the verbs, read [Versions, seeded runs and
+frozen examples](https://weavemindai.github.io/weft/running/versions.html).
+
 When something breaks in production six months later, you run the same loop
 again with the failing case as your example. Every execution was recorded step
 by step, with the value on every wire. Weft calls that the journal, and for how

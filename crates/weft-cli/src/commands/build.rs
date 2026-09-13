@@ -1,8 +1,9 @@
-//! `weft build`: compile the current project into a worker
-//! container image. Tagged `weft-worker:<binary-hash>`; the project id
-//! rides the `weft.dev/project` label, so identical sources across
-//! projects share one image. The build itself runs in a multi-stage
-//! `docker build` so the host needs only docker + kind + kubectl.
+//! `weft build`: compile the current project into a worker container
+//! image and register it, without starting anything. The image is
+//! tagged `weft-worker:<binary-hash>`; the project id rides the
+//! `weft.dev/project` label, so identical sources across projects share
+//! one image. The build itself runs in a multi-stage `docker build` so
+//! the host needs only docker + kind + kubectl.
 
 use anyhow::Result;
 use tokio::process::Command;
@@ -12,48 +13,30 @@ use crate::commands::daemon::{cluster_config, ClusterBackend};
 use crate::images;
 use crate::progress::{ActionVerb, Progress};
 
-pub async fn run(ctx: Ctx) -> Result<()> {
-    let client = ctx.client();
-    // Ctx's cached discovery: one walk per invocation, one wording for
-    // every verb's "no project here". Cloned so the async closure can
-    // own it.
-    let project = ctx.project()?.clone();
+pub async fn run(ctx: Ctx, node_set: weft_compiler::codegen::NodeSet) -> Result<()> {
+    let inner = ctx.clone();
     ctx.with_progress(ActionVerb::Build, |progress| async move {
-        // Compile first, then resolve `@asset` refs into the definition BEFORE
-        // the plan validates + hashes it (`plan_build_from`): the hashes must
-        // cover the resolved values, so a changed asset re-hashes and
-        // re-stages exactly like a config change.
-        let (mut definition, catalog) = weft_compiler::hash::load_enriched_project(&project)
-            .map_err(|e| anyhow::anyhow!("compile project: {e}"))?;
-        crate::commands::assets::resolve_project_assets(&client, &project.root, &mut definition)
-            .await?;
-        // The shared build brain: stage the worker context from the resolved
-        // definition. The base is ensured inside the image build; pass its ref
-        // through here so the staged Dockerfile FROMs it.
-        let builder_base_ref = crate::images::ensure_worker_builder_base().await?;
-        let plan = weft_compiler::build_plan::plan_build_from(
-            &project,
-            &definition,
-            &catalog,
-            &builder_base_ref,
-            &CliTagPolicy,
-        )
-        .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
-        let worker = worker_planned_image(&plan)?;
-        // What must survive the post-ensure GC beyond the fresh tag
-        // (idle projects' current images, draining pods): the keep-set
-        // via `referenced_set_for_gc` (None + a warning when the answer
-        // is unlearnable -> the GC is skipped, never guessed).
-        let referenced = crate::images::referenced_set_for_gc(&client).await;
-        ensure_worker_image_with_progress(
-            &progress,
-            &project.id().to_string(),
-            &worker.image_ref,
-            &worker.context_dir,
-            referenced.as_ref(),
-        )
-        .await?;
-        progress.complete(&format!("worker image {}", short_hash(&plan.binary_hash)));
+        // Build IS "make the dispatcher's picture of this project match
+        // my disk": the image, and the compiled program registered under
+        // its own hash, with nothing started. Same path every other verb
+        // takes to get there, so a `weft run` straight after is a no-op
+        // rather than a second opinion on what the project is.
+        //
+        // It is also how a person puts back code the dispatcher lost. A
+        // run names the hash of the program it ran, and its inputs and
+        // outputs are worked out by folding the journal against that
+        // program, so registering unchanged files restores exactly what
+        // the run needs and it reads again. It records nothing in the
+        // VERSION TREE: that is `weft checkpoint`, and a version is a
+        // point in a folder's history rather than something a build has
+        // an opinion about.
+        let handle = super::ensure::ensure_registered(&inner, &progress, node_set).await?;
+        progress.complete(&format!(
+            "{} ({}) on worker image {}",
+            handle.name,
+            handle.id,
+            short_hash(&handle.plan.binary_hash)
+        ));
         Ok(())
     })
     .await
@@ -109,6 +92,7 @@ pub async fn run_build_images(push: bool, push_suffix: Option<String>, print: bo
         let shared = crate::images::SharedImages {
             system: crate::images::SystemImages::resolve()?,
             builder_base: Some(crate::images::builder_base_ref()?),
+            worker: Some(crate::images::standard_worker_ref()?),
         };
         for image_ref in shared.bare_refs() {
             println!("{image_ref}");
@@ -151,11 +135,26 @@ pub async fn ensure_worker_image_with_progress(
     worker_context_dir: &std::path::Path,
     referenced: Option<&crate::images::ReferencedImages>,
 ) -> Result<()> {
+    // The registry can only ever hold the full-library worker CI built;
+    // a project's own hash is never there, so only that one ref is
+    // worth a pull before deciding to compile.
+    if !crate::images::image_present(image_tag).await? && image_tag == crate::images::standard_worker_ref()? {
+        let cfg = cluster_config();
+        let cluster = if cfg.backend == ClusterBackend::Kind && kind_available(&cfg.cluster_name).await {
+            Some(cfg.cluster_name.as_str())
+        } else { None };
+        crate::images::import_published_worker(image_tag, cluster).await?;
+    }
     if crate::images::image_present(image_tag).await? {
         progress.build_skip(image_tag, "hash_match");
         let cfg = cluster_config();
         match cfg.backend {
-            ClusterBackend::Kind if kind_available(&cfg.cluster_name).await => {
+            // A "loading image" line only when there is a load: the
+            // usual no-change build finds the tag already on the node.
+            ClusterBackend::Kind
+                if kind_available(&cfg.cluster_name).await
+                    && !crate::images::kind_node_has_tag(&cfg.cluster_name, image_tag).await =>
+            {
                 progress.image_push_start(image_tag);
                 crate::images::kind_load(&cfg.cluster_name, image_tag, false).await?;
                 progress.image_push_done(image_tag);
@@ -163,12 +162,13 @@ pub async fn ensure_worker_image_with_progress(
             ClusterBackend::Kind => {}
             ClusterBackend::K8s => return Err(bail_k8s_push_needed(image_tag)),
         }
-        gc_stale_images(
+        let dropped = gc_stale_images(
             &[image_tag.to_string()],
             &[format!("weft.dev/project={project_id}")],
             referenced,
         )
         .await;
+        progress.images_reclaimed(&dropped);
         return Ok(());
     }
 
@@ -262,12 +262,13 @@ async fn docker_build_and_kind_load(
     // projects, so the project id rides on the LABEL, not the tag.
     // Cargo build cache (the heavy part) lives in the baked base +
     // BuildKit and survives this.
-    gc_stale_images(
+    let dropped = gc_stale_images(
         &[tag.to_string()],
         &[format!("weft.dev/project={project_id}")],
         referenced,
     )
     .await;
+    progress.images_reclaimed(&dropped);
     Ok(())
 }
 
@@ -311,15 +312,17 @@ async fn build_worker_image(
 /// use refuses its node-side remove.
 ///
 /// Best effort throughout (a transient docker error never fails a
-/// build), and the shared BuildKit layer cache is untouched, so
-/// rebuilding a dropped tag stays warm.
+/// build), silent on stdout (docker's own chatter is captured), and
+/// the shared BuildKit layer cache is untouched, so rebuilding a
+/// dropped tag stays warm. Returns the host refs docker untagged, for
+/// the caller to report.
 pub async fn gc_stale_images(
     fresh: &[String],
     labels: &[String],
     referenced: Option<&crate::images::ReferencedImages>,
-) {
-    let Some(referenced) = referenced else { return };
-    let Some((repo, keep)) = fresh_repo_and_tags(fresh) else { return };
+) -> Vec<String> {
+    let Some(referenced) = referenced else { return Vec::new() };
+    let Some((repo, keep)) = fresh_repo_and_tags(fresh) else { return Vec::new() };
     let filters: Vec<String> = labels.iter().map(|l| format!("label={l}")).collect();
     let mut list = images::docker();
     list.arg("images");
@@ -327,20 +330,32 @@ pub async fn gc_stale_images(
         list.args(["--filter", f]);
     }
     list.args(["--format", "{{.Repository}}:{{.Tag}}"]);
-    let Ok(out) = list.output().await else { return };
+    let Ok(out) = list.output().await else { return Vec::new() };
     if !out.status.success() {
-        return;
+        return Vec::new();
     }
     let stale = images::host_images_matching(&String::from_utf8_lossy(&out.stdout), |r, t| {
         r == repo && !keep.contains(t) && !referenced.is_referenced(r, t)
     });
     if stale.is_empty() {
-        return;
+        return Vec::new();
     }
     // No `-f`: a tag docker refuses to drop (an image a host container
     // still runs) is information, and force would untag it anyway and
-    // strand the container's restart.
-    let _ = images::docker().args(["rmi"]).args(&stale).status().await;
+    // strand the container's restart. Output is captured, never
+    // inherited: docker's `Untagged:` / `Deleted:` chatter would land
+    // in the middle of a `--json` event stream, and the caller reports
+    // the outcome in its own voice. Docker keeps going past a refused
+    // tag, so the untagged refs are read back from its output instead
+    // of assumed from the request.
+    let dropped: Vec<String> = match images::docker().args(["rmi"]).args(&stale).output().await {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix("Untagged: "))
+            .map(|r| r.trim().to_string())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
     // The kind node's containerd holds its own copy of every loaded
     // tag (with no labels); condemn exactly the host-stale hash set
     // there, through the one matcher every node cleanup uses (bare,
@@ -366,7 +381,7 @@ pub async fn gc_stale_images(
                 let _ = images::docker()
                     .args(["exec", &node, "crictl", "rmi"])
                     .args(&node_stale)
-                    .status()
+                    .output()
                     .await;
             }
         }
@@ -376,7 +391,8 @@ pub async fn gc_stale_images(
     for f in &filters {
         prune.args(["--filter", f]);
     }
-    let _ = prune.status().await;
+    let _ = prune.output().await;
+    dropped
 }
 
 /// The one repo `fresh` names plus its bare tags, or `None` (with a

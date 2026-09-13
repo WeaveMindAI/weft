@@ -148,6 +148,13 @@ async fn post_admin_unit(
     Ok(())
 }
 
+/// Read one active file without changing its lifetime or minting a link.
+pub async fn file_meta(state: &DispatcherState, key: &str) -> Result<StoredFileMeta> {
+    let response = state.http.get(admin_url(state, &format!("/v1/storage/admin/meta/{key}")))
+        .bearer_auth(read_token(state).await?).send().await.context("read stored file metadata")?;
+    check(response, "file metadata").await?.json().await.context("parse stored file metadata")
+}
+
 /// List one tenant's runtime files (the `weft files ls` surface).
 pub async fn tenant_list(state: &DispatcherState, tenant: &str) -> Result<Vec<StoredFileMeta>> {
     let out: ListFilesResponse = post_admin(
@@ -198,25 +205,25 @@ pub async fn delete_key(state: &DispatcherState, key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Presign a download URL for one file (the `weft files download` handshake),
-/// with the file's name + size for the CLI.
-pub async fn presign(state: &DispatcherState, key: &str, ttl_secs: Option<u64>) -> Result<PresignResult> {
-    post_admin(
-        state,
-        "/v1/storage/admin/presign",
-        "presign",
-        &PresignRequest { key: key.to_string(), ttl_secs },
-    )
-    .await
-}
-
 /// Mint a relay download link for one file: the broker's token joined
-/// onto THIS dispatcher's public base, resolved by the public
+/// onto the base `base` names, resolved by the public
 /// `/public/files/{token}` route. What a browser download rides (a
 /// presigned bucket URL breaks the moment a forward/proxy rewrites the
 /// host, because its signature covers it; a token URL does not care).
+///
+/// `base` is the address the client that will FETCH this link reaches
+/// this dispatcher at. Callers serving a request pass
+/// [`LinkBase::for_request`], built from that request's own host, so
+/// the link comes back on whichever of this install's addresses the
+/// caller is already using. There is deliberately no default: one
+/// install answers on several addresses at once (a loopback
+/// port-forward, a tunnel's public name, an ingress host), so a link
+/// built from a configured constant is wrong for every client that
+/// arrived at one of the others, and that failure is invisible until
+/// someone clicks the link.
 pub async fn download_link(
     state: &DispatcherState,
+    base: &LinkBase,
     key: &str,
     ttl_secs: Option<u64>,
 ) -> Result<PresignResult> {
@@ -228,14 +235,37 @@ pub async fn download_link(
     )
     .await?;
     Ok(PresignResult {
-        url: format!(
-            "{}/public/files/{}",
-            state.public_base_url.trim_end_matches('/'),
-            minted.token
-        ),
+        url: format!("{}/public/files/{}", base.as_str(), minted.token),
         filename: minted.filename,
         size_bytes: minted.size_bytes,
     })
+}
+
+/// The address a minted link is built on: where the client that will
+/// fetch it reaches this dispatcher. Always trailing-slash-free.
+///
+/// It is a type rather than a bare `&str` so a call site cannot pass
+/// "some URL that was lying around" by accident: it comes from the
+/// request made by the client that will fetch the link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkBase(String);
+
+impl LinkBase {
+    /// The address THIS request came in on: the right base whenever
+    /// the client that asked is the client that will fetch.
+    pub fn for_request(headers: &axum::http::HeaderMap) -> Result<Self, String> {
+        Self::from_request_host(weft_core::net::request_base_url(headers))
+    }
+
+    /// The choice `for_request` makes, over plain values.
+    fn from_request_host(requested: Option<String>) -> Result<Self, String> {
+        let base = requested.ok_or_else(|| "cannot construct a link: request has no valid Host header".to_string())?;
+        Ok(Self(base.trim_end_matches('/').to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Wipe a whole scope/tenant prefix (`weft files rm <prefix>` / project-delete).
@@ -503,4 +533,29 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod link_base_tests {
+    use super::LinkBase;
+
+    /// The caller's own address wins, whichever of the install's
+    /// addresses they arrived on, and a trailing slash never doubles
+    /// up in the link.
+    #[test]
+    fn a_link_is_built_on_the_address_the_caller_used() {
+        for host in ["http://127.0.0.1:9998", "https://weft-dev-copper-lantern.weavemind.ai"] {
+            let base = LinkBase::from_request_host(Some(host.to_string())).unwrap();
+            assert_eq!(base.as_str(), host);
+        }
+        assert_eq!(
+            LinkBase::from_request_host(Some("https://a.example.com/".into())).unwrap().as_str(),
+            "https://a.example.com"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_host_cannot_mint_a_link() {
+        assert!(LinkBase::from_request_host(None).unwrap_err().contains("Host"));
+    }
 }

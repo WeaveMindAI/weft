@@ -249,6 +249,7 @@ impl LiveTestRunner {
         for handle in handles {
             failures.extend(handle.close_opened_accesses().await);
         }
+        self.clients.open_charges.flush_color(self.color, "the node test ended before the job was read back");
         self.clients.pending_costs.wait_zero().await;
         failures
     }

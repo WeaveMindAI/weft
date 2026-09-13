@@ -1,0 +1,4 @@
+[package]
+name = "e2e_metering_queue"
+id = "00000000-0000-0000-0000-000000000079"
+version = "0.1.0"

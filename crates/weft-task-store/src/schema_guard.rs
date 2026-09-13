@@ -898,9 +898,21 @@ pub fn plan_migration(old: &[Thing], new: &[Thing]) -> Vec<Planned> {
             }
             continue;
         }
-        if !new_by.contains_key(&key(thing)) {
-            plan.push(Planned { owner: owner_of(thing), stmt: removed(thing) });
+        if new_by.contains_key(&key(thing)) {
+            continue;
         }
+        // A column's NOT NULL constraint (Postgres names one per NOT NULL
+        // column) leaves with the column: dropping it separately fails
+        // once the DROP COLUMN has run, or is a no-op step before it.
+        if thing.kind == "constraint" {
+            if let Some(column) = thing.body.strip_prefix("NOT NULL ") {
+                let column_key = ("column".to_string(), thing.table.clone(), column.trim().to_string());
+                if !new_by.contains_key(&column_key) {
+                    continue;
+                }
+            }
+        }
+        plan.push(Planned { owner: owner_of(thing), stmt: removed(thing) });
     }
     plan
 }
@@ -1214,6 +1226,27 @@ async fn shape_diff(
     let live: Vec<Thing> = live_all.iter().filter(|t| ours(t)).cloned().collect();
     let expected: Vec<Thing> = expected.iter().filter(|t| ours(t)).cloned().collect();
     Ok(diff_things(&expected, "the release", &live, "your live database"))
+}
+
+/// The groups the live database has never built: no row in
+/// `weft_schema_stamp`, which the boot writes the first time it builds
+/// a group from its canonical DDL. A database from before the stamp
+/// table existed has built nothing this way, so every group is unborn
+/// to it and the boot builds them all.
+#[cfg(feature = "db-tests")]
+pub async fn unborn_groups(
+    conn: &mut sqlx::PgConnection,
+    groups: &[&SchemaGroup],
+) -> anyhow::Result<Vec<&'static str>> {
+    let stamped: Vec<(String,)> =
+        sqlx::query_as("SELECT group_name FROM weft_schema_stamp").fetch_all(&mut *conn).await.or_else(|e| {
+            if e.as_database_error().is_some_and(|d| d.code().as_deref() == Some("42P01")) {
+                Ok(Vec::new())
+            } else {
+                Err(e)
+            }
+        })?;
+    Ok(groups.iter().map(|g| g.name).filter(|name| !stamped.iter().any(|(s,)| s == name)).collect())
 }
 
 /// One released migration as it settles on the live database: its
@@ -1553,6 +1586,18 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
                 stray.iter().map(|id| format!("'{id}'")).collect::<Vec<_>>().join(", ")
             );
         }
+        // A group the live database has never built (no stamp: it was
+        // added to the code after this database last booted) has no
+        // history to bring along; the next boot builds it from its
+        // canonical DDL and records its origin, so the release neither
+        // checks nor settles it.
+        let unborn = unborn_groups(&mut conn, groups).await?;
+        for name in &unborn {
+            println!("group '{name}' is new to the live database; the next boot builds it");
+        }
+        let born: Vec<&SchemaGroup> =
+            groups.iter().copied().filter(|g| !unborn.contains(&g.name)).collect();
+        let groups = born.as_slice();
         let mut settling: Vec<Settling> = Vec::new();
         for group in groups {
             if released.iter().any(|(g, ..)| g == group.name) {
@@ -1571,6 +1616,9 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
             }
         }
         for (group_name, id, sql) in &released {
+            if unborn.contains(&group_name.as_str()) {
+                continue;
+            }
             let group = *groups
                 .iter()
                 .find(|g| g.name == group_name)
