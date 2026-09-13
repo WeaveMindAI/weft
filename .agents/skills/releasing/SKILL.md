@@ -13,6 +13,13 @@ concept and nothing merges there. Work lands on a feature branch, goes
 into `mvp` through a PR, and the merge is what publishes.
 
 1. Commit on the feature branch (only when the [user] says so).
+   If the change touches `extension-vscode/`, `extension-browser/` or
+   `packages/weft-graph/` (both editors bundle it), bump that package's
+   version IN THE SAME PR (`pnpm version patch --no-git-tag-version`
+   in the package directory): a merge without a bump publishes nothing
+   to the stores. The `extension versions bumped` CI check refuses a
+   PR that forgot; `scripts/check-extension-bump.sh origin/mvp` is the
+   same check locally.
 2. `gh pr create --base mvp --head <branch>`.
 3. `gh pr merge <n> --auto --merge`, which lands it the moment CI
    passes. Earlier PRs into `mvp` are merge commits, so match that.
@@ -20,7 +27,8 @@ into `mvp` through a PR, and the merge is what publishes.
    CLI binaries, the `.vsix` and the browser zips, updates the rolling
    `mvp-latest` release, and then publishes to each store.
 
-CI runs on `pull_request` into `mvp` only. Four checks: `build`,
+CI runs on `pull_request` into `mvp` only. Five checks: `extension
+versions bumped` (PRs only), `build`,
 `cargo test + clippy`, `cargo test --features db-tests`, and
 `graph + editor`.
 
@@ -142,6 +150,16 @@ curl -s -X POST 'https://marketplace.visualstudio.com/_apis/public/gallery/exten
   -H 'Accept: application/json;api-version=7.2-preview.1' \
   -d '{"filters":[{"criteria":[{"filterType":7,"value":"weavemind.weft-vscode"}],"pageSize":5,"pageNumber":1}],"flags":914}'
 ```
+
+## A publish job that fails with an empty log
+
+`.github/actions/publish-and-record` captures the store's output so it
+can read the refusal. `shell: bash` runs the step under `-e`, and a
+`set -uo pipefail` does not lift that, so until the capture was
+wrapped in `set +e` a failing publish exited on the capture line and
+the log ended at the `PUBLISH:` echo with nothing from the store. If
+that shape ever comes back, the store's answer is missing because the
+script died before printing it, not because the store said nothing.
 
 ## What ships even when a store fails
 

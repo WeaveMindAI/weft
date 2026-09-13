@@ -31,6 +31,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The stores publish a version once (the record tags in release.yml),
+  # so an extension change merged under a version the stores already
+  # carry never reaches them. PRs only: a called run on an mvp push has
+  # no base to compare against, and by then the merge has happened.
+  bump:
+    name: extension versions bumped
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: scripts/check-extension-bump.sh "origin/${{ github.base_ref }}"
+
   rust:
     name: cargo test + clippy
     runs-on: ubuntu-latest
