@@ -56,8 +56,9 @@ say so on the page.
 **Start where the reader is**, including the wrong belief they arrived with.
 Taking that apart is usually the first job, before any syntax.
 
-**No em dashes.** Comma, colon, parentheses, or two sentences. Why we hunt them
-is [its own page](src/thinking/em-dashes.md).
+**No em dashes.** Comma, colon, parentheses, or two sentences. Models reach for
+them far more than people do, so an em dash reads as a tell that nobody reviewed the
+line again.
 
 If you add a page, add it to `SUMMARY.md`. `create-missing` is off, so a link
 to a file that does not exist fails the build rather than shipping a dead link.

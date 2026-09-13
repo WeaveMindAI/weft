@@ -75,4 +75,3 @@
 
 - [Glossary](appendix/glossary.md)
 - [Where this is going](appendix/roadmap.md)
-- [Why we hunt em dashes](thinking/em-dashes.md)

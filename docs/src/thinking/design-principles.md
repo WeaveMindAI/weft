@@ -1,33 +1,23 @@
 # Design principles
 
-These are the rules we use when deciding whether something belongs in weft. They're here so you can hold us to them, and so you can argue with them.
+The rules we use when deciding whether something belongs in weft.
 
 ## Put the coordination where you can read it
 
-A model call and a database query are both just steps with named inputs and outputs. The graph says how their work fits together, what happens inside each one is that step's own business. So you can change who approves an answer without reading the model code, and swap a step for another one that does the same job.
+Whatever decides what connects to what, or what runs next, should be something you can read. In most systems that logic is buried in code you never open: a retry loop, a queue, an `if` three calls deep. In weft it is written down in the graph and checked before the run, so you can find where a decision is made and change it without touching the steps around it. You read it from the outside in: a group's interface says what goes in and what comes out, and its boundary is real to the compiler, so nothing can reach inside without going through it. A group does not survive into the running program, so folding and nesting cost nothing.
 
-The point isn't that models are special. A step can finish in a millisecond or stay alive for a week swapping messages with other steps, and plenty of weft programs have no model in them at all. What they have in common is that the thing deciding what happens next is the graph, which was written down and checked before anything ran.
+## The plumbing belongs to weft, not to your node
 
-## Make the shape readable before the details
+A node's code should be its own job and nothing else. Handling a credential, keeping a subscription alive, saving state, writing down what happened: those belong to the runtime, where they are written once and hardened for every node. When two nodes would otherwise write the same thing, that thing gets built once for both. For where the line sits today, read [the commandments of plumbing](plumbing.md).
 
-You should be able to read what a program does before reading how any of it works. Groups do that in the source as much as in the picture: read the interface, open the body only when you have to work inside it.
+## The language knows nothing about your nodes
 
-The test we apply to a feature is whether a decision stays visible in the program. If whether a message needs approval ends up settled somewhere inside a step, we got it wrong.
-
-## Add the mechanism, not the special case
-
-A new service should need its own declaration and its own code. What we try hard to avoid is a special branch for it inside weft's runtime. A service says how to get hold of a credential and how to sign a request, using mechanisms weft already has, and when a protocol needs something genuinely new, the job is to build that mechanism once so every other service gets it too.
-
-So the question to ask isn't how many catalog entries there are. It's whether you can add the thing your program needs without rebuilding the machinery underneath it. For where that line sits today, read [the commandments of plumbing](plumbing.md).
+The compiler, the dispatcher and the runtime never mention a node by name or hardcode its fields. A Postgres step and a model step look the same to the language; everything a node needs, it asks for through the ctx. So adding a node that needs something new means building a general mechanism in weft, never a branch that already knows that node.
 
 ## Refuse a mistake as soon as anything can see it
 
-The compiler sees a badly typed connection before anything runs. A service can refuse a missing credential the moment you connect it. Each check belongs wherever there's finally enough information to make it, and not once you reach the place where the issue will break something worse.
+A badly typed wire should fail at compile time, and a missing credential when you connect the account, not when the request goes out. Put each check at the earliest place with enough information to make it, and have it say what went wrong and what to do about it.
 
-When something does fail it should say what went wrong and what you can do next to fix it.
+## Fail loudly, never silently
 
-## One implementation of anything shared
-
-If every step has to repeat the same dance to open a connection, that dance belongs in weft. A step should ask for the connection and get on with the request it wanted to make. This is opinionated on purpose: there is one way a file is stored and one way a credential is held, so each piece gets hardened once instead of half-written again in every node.
-
-For people contributing to weft's development, the same goes for weft's own insides.
+When something does go wrong, it says so. A fallback that quietly returns a second-best value turns a broken program into one that looks like it works, and the user never finds out. The failure is part of the design too: name what broke and what the person can do next.

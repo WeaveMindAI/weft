@@ -148,12 +148,24 @@ much smaller the workaround looks.
 **Same-language duplicates get merged.** One fact, one place: if you find
 it written twice in the same language, merge the copies.
 
-For why the code is shaped this way, including the no-fallbacks rule, naming by
-contract, and the prose header every file opens with, go read the
+**No fallbacks.** When something fails, fail loudly with an error the user can
+see, or a log that names it. A fallback that quietly returns a second-best value
+hides the bug and becomes debt. Design the aftermath too: say what broke and
+what the person can do next.
+
+**Name by contract, not mechanism.** A name says what the caller asks for and
+gets back, not how it is computed. `connect_db_and_login_and_hand_connection` is
+`db_connection`; a function that hands back shared `GeneratorInfo` is not
+`pricing_generator`, however much it happens to cache. Read the call site alone:
+does the name say what the caller receives?
+
+For the general principles behind weft's design, read
 [Design principles](https://weavemindai.github.io/weft/thinking/design-principles.html).
 
-**No em dashes**, in commited code and comments as much as in prose. You can go check
-[why we hunt em dashes](https://weavemindai.github.io/weft/thinking/em-dashes.html).
+**No em dashes**, in committed code and comments as much as in prose. Models
+reach for them far more than people do, so an em dash reads as a tell that
+nobody read the line again. Our review pass strips every one, so finding an em
+dash means the line skipped review.
 
 ## Working on the database
 
