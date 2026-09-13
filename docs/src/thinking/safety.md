@@ -2,7 +2,7 @@
 
 There's something fundamental about LLMs that most people get wrong: the thing you talk to isn't the model. The model predicts probabilities for the next token, a sampling algorithm picks which one actually happens, that token goes back into the context, and the model predicts again. Nobody wrote the assistant down anywhere. The model offers the possible continuations, the sampler picks one, and after enough picks you're talking to a character.
 
-So if you want a different assistant, you edit some text and start again, and what emerges is different. The character lives mostly in the context, and you can open the context and read it.
+So if you want a different assistant, you edit some text, start again, and what emerges is different. The character lives mostly in the context, and you can open the context and read it.
 
 That still works, but it's getting harder, because more and more of the assumptions about what's being predicted get pulled out of the context and into the weights. Getting a model to actually be the character you handed it takes real effort now, and more of it every year. Those models are still fundamentally simulators though, even if their internal dynamics have changed. For what I think about training, go read [Three properties for alignment](https://weavemind.ai/blog/three-properties-for-alignment).
 
@@ -30,7 +30,7 @@ weft is powerful enough to build that level of coordination. But:
    hoping it maintains. In weft the graph decides, and the graph was written
    down and checked before anything ran. The model fills in values at the
    steps you gave it.
-2. **A part reaches exactly what you wired to it.** Not just what it can see,
+2. **A node gets exactly what you wired to it.** Not just what it can see,
    what it can do. The agent that investigates a case cannot also decide
    whether its own answer needs approving, and that's not a convention someone
    followed, it's a fact about the program. Scoping what information
