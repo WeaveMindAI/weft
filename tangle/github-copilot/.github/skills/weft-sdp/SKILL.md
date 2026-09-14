@@ -34,7 +34,9 @@ weft run --from triage='{"text":"the invoice is wrong"}' --before publish --deta
   A group or loop name includes the whole container with `--target`, or
   excludes the whole container with `--before`.
 - `--group group='{"port":value}'` runs the whole group or loop alone.
-  An included file uses its group alias. `--from group='{"port":value}'`
+  An included file uses its group alias, and a node inside one is named
+  through that alias (`--from triage.up`, `--target triage.up`), which is
+  also how `weft events` prints it. `--from group='{"port":value}'`
   runs the whole group or loop and continues downstream. Choose one form;
   `--group` cannot combine with from, emit, target or before.
 - `--emit node='{"port":value}'` supplies that node's outputs without running

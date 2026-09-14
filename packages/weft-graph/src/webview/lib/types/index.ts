@@ -10,7 +10,7 @@ import type {
 	CallerInspectorEvent,
 	CorruptionSite,
 	LoopInspectorEvent,
-	LoopIteration,
+	Frame,
 	NodeExecutionStatus,
 	NodeFeaturesWire as NodeFeatures,
 } from '../../../protocol';
@@ -450,7 +450,7 @@ export interface NodeExecution {
 	costIds?: string[];
 	logs: unknown[];
 	color: string;
-	frames: LoopIteration[];
+	frames: Frame[];
 	/// Frame stack serialized as JSON, used to correlate completion
 	/// events to the right running row when several firings run
 	/// in parallel. `[]` at root (outside any loop).
@@ -502,9 +502,10 @@ export interface ExecutionTerminal {
  */
 export interface ExecutionState {
 	isRunning: boolean;
-	/** The node set the followed run is held to; `null` for the whole
-	 *  graph, `undefined` before the run's birth arrived. A node outside
-	 *  it is "not in this run": dimmed, no status badge. */
+	/** The places the followed run is held to (`locatedKey`s); `null`
+	 *  for the whole graph, `undefined` before the run's birth arrived. A
+	 *  node outside it, at the call on screen, is "not in this run":
+	 *  dimmed, no status badge. */
 	scope?: string[] | null;
 	/** The run this one was seeded from and what it re-ran, or `null`
 	 *  for a run from nothing. */

@@ -92,13 +92,13 @@ async fn my_scenario() -> anyhow::Result<()> {
 ```
 
 A **fixture** is `fixtures/<name>/` with a `weft.toml` (any id; the rig rewrites
-it) + a `main.weft`; a custom node goes under `fixtures/<name>/nodes/<node>/`. For
-a runtime value baked into the graph, put a `__E2E_TOKEN__` placeholder in
-`main.weft` and call `project.substitute_in_main(...)` before building.
+it) + a `src/main.weft`; a custom node goes under `fixtures/<name>/nodes/<node>/`.
+For a runtime value baked into the graph, put a `__E2E_TOKEN__` placeholder in
+`src/main.weft` and call `project.substitute_in_main(...)` before building.
 
 To write the `.weft` graph itself, see the language reference under
 `../../docs/src/language/` (and `../../docs/src/nodes/` for custom nodes). Get the project
-right there; a malformed `main.weft` fails at build, not as a test assertion.
+right there; a malformed `src/main.weft` fails at build, not as a test assertion.
 
 **If a test needs something the toolkit doesn't have, extend the toolkit
 (`src/`), not the test.** Keep test bodies about WHAT they assert; the HOW (HTTP,

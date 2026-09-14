@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ArrowLeft, Code, Pin, PinOff } from '@lucide/svelte';
+  import { ArrowLeft, Code, EyeOff, Pin, PinOff } from '@lucide/svelte';
   import type { Snippet } from 'svelte';
 
   let {
@@ -9,6 +9,7 @@
     notPainted = undefined,
     onTogglePin,
     onCatchUp,
+    onClearFollow,
     onOpenSource,
     sourceOpen = false,
     navDepth = 0,
@@ -27,6 +28,10 @@
     notPainted?: string;
     onTogglePin: () => void;
     onCatchUp: () => void;
+    /// Take the run off the canvas without leaving live mode: the eye
+    /// button. Before it, the only way out of a replayed run's
+    /// highlight was closing the graph.
+    onClearFollow: () => void;
     onOpenSource?: () => void;
     /// True when the .weft source is currently visible in some
     /// editor tab. Drives the Source button's active styling so
@@ -108,6 +113,18 @@
       Live{shortColor ? ` · ${shortColor}` : ''}
     {/if}
   </button>
+
+  {#if color}
+    <button
+      type="button"
+      onclick={onClearFollow}
+      class="flex items-center justify-center w-7 h-7 rounded-md border border-zinc-200 bg-white text-zinc-600 shadow-sm hover:bg-zinc-50 hover:text-zinc-900 transition"
+      title="Stop showing this run. The graph goes blank and follows the next run that starts."
+      aria-label="Stop showing this run"
+    >
+      <EyeOff class="w-3.5 h-3.5" />
+    </button>
+  {/if}
 
   {#if onOpenSource}
     <button

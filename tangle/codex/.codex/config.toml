@@ -7,8 +7,8 @@
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 
-# The five specialists run side by side: Tangle dispatches one node-smith per
+# The six specialists run side by side: Tangle dispatches one node-smith per
 # missing node and waits for all of them before wiring anything.
 [agents]
 enabled = true
-max_concurrent_threads_per_session = 5
+max_concurrent_threads_per_session = 6

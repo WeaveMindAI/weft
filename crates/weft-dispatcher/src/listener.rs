@@ -401,7 +401,12 @@ pub async fn register_signal(
     Ok((body.routing, body.kind_state))
 }
 
-pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Value> {
+/// The signal's display as its holder serves it, or `None` when the
+/// pod answers that it does not hold this token (its registry lost
+/// the entry; the durable row still names the pod). To the person
+/// looking at the trigger that is the same as no holder at all:
+/// nothing is listening until the project is activated again.
+pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Option<Value>> {
     let client = reqwest::Client::new();
     let url = format!("{}/display", handle.admin_url.trim_end_matches('/'));
     let resp = client
@@ -409,9 +414,12 @@ pub async fn display_signal(handle: &ListenerHandle, token: &str) -> Result<Valu
         .json(&serde_json::json!({ "token": token }))
         .send()
         .await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     let resp = bail_unless_ok(resp, "/display").await?;
     let body: weft_listener::protocol::DisplayResponse = resp.json().await?;
-    Ok(body.display)
+    Ok(Some(body.display))
 }
 
 pub async fn action_signal(
@@ -1329,20 +1337,6 @@ impl ListenerPool {
         // duplicated.
         self.reap_idle(backend, pg_pool, pod_id).await
     }
-}
-
-/// Clear the placement holder on a set of signal tokens (set
-/// `signal.listener_pod = NULL`). Used after a bulk unregister so a
-/// later fire re-places the signal instead of routing to a stale pod.
-pub async fn clear_placement(pg_pool: &PgPool, tokens: &[String]) -> Result<()> {
-    if tokens.is_empty() {
-        return Ok(());
-    }
-    sqlx::query("UPDATE signal SET listener_pod = NULL WHERE token = ANY($1)")
-        .bind(tokens)
-        .execute(pg_pool)
-        .await?;
-    Ok(())
 }
 
 /// Generation for the first-ever placement of a token that has no

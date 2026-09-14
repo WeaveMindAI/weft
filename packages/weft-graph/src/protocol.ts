@@ -594,10 +594,13 @@ export interface GroupDefinition {
   /// On the Rust side `kind` + `loopConfig` are ONE flattened tagged
   /// enum (GroupKind), so a loop always carries its config and a
   /// payload missing `kind` fails Rust deserialization.
-  kind: 'group' | 'loop';
+  kind: 'group' | 'loop' | 'call' | 'body';
   /// Loop config fields (parallel/over/carry/max_iters/trim_on_mismatch).
-  /// Always present when `kind === 'loop'`, never for `group`.
+  /// Always present when `kind === 'loop'`, never for the others.
   loopConfig?: Record<string, unknown> | null;
+  /// For a `call`: the id of the shared `body` group (the included
+  /// file, compiled once) this site calls. Never for the others.
+  body?: string;
   /// Always null today: no group-like decl carries a user label in the
   /// language; the editor derives the display name from the id's local
   /// segment. The slot exists so a future label syntax needs no wire
@@ -1107,18 +1110,41 @@ export type NodeExecutionStatus =
 // it falls back to "(none)" for every node, even when the
 // execution actually moved data.
 
-/// Frame stack identifying which iteration of which (nested) loop this
-/// firing belongs to. Empty for firings outside any loop.
-// SYNC: LoopIteration <-> crates/weft-core/src/frames.rs LoopIteration
-export interface LoopIteration {
-  index: number;
+/// One level of the dynamic structure a firing is inside: an iteration
+/// of a loop (`{index}`), or a call of an included file through the site
+/// named (`{site}`, the site's own id: `auth`, or `Auth.billing.inner`
+/// for a site inside a body). A firing's frame stack is a list of these,
+/// outermost first; empty at the root. A loop body and an included file
+/// are each compiled once, and the stack is what tells two runs through
+/// the same nodes apart.
+// SYNC: Frame <-> crates/weft-core/src/frames.rs Frame
+export type Frame = { index: number } | { site: string };
+
+/// The call sites on a frame stack, outermost first: which use of which
+/// included file the firing belongs to, loop frames left out.
+export function callPathOf(frames: readonly Frame[]): string[] {
+  return frames.flatMap((f) => ('site' in f ? [f.site] : []));
+}
+
+/// One frame as text: `#3` for an iteration, `@auth` for a call.
+export function frameText(frame: Frame): string {
+  return 'index' in frame ? `#${frame.index}` : `@${frame.site}`;
+}
+
+/// The key of one place of a run: a node under the call sites that
+/// reach it, `one/Clean.strip`, or the bare id at the top. What a run's
+/// scope, a seed's origins and a run selection are keyed by.
+// SYNC: locatedKey <-> crates/weft-core/src/frames.rs Located
+export function locatedKey(id: string, callPath: readonly string[]): string {
+  return callPath.length === 0 ? id : `${callPath.join('/')}/${id}`;
 }
 
 /// Whose credential a measured call spent.
 // SYNC: CredentialOwner <-> crates/weft-core/src/access/mod.rs CredentialOwner
 export type CredentialOwner = 'their-own' | 'ours';
 
-/// The parent run and the original run supplying each reused result.
+/// The parent run and the original run supplying each reused result,
+/// per place (a `locatedKey`).
 // SYNC: Seed <-> crates/weft-journal/src/events.rs Seed
 export interface Seed {
   parent: string;
@@ -1145,7 +1171,7 @@ export interface NodeExecEvent {
   /// `[{index:2}]` when inside iteration 2 of a single loop; nested
   /// loops extend the array. Used as part of the execution-card key so
   /// parallel iterations don't cross-correlate.
-  frames: LoopIteration[];
+  frames: Frame[];
   error?: string;
   input?: unknown;
   /// Wired input ports that arrived as CLOSURE markers for this firing
@@ -1195,7 +1221,7 @@ export type LoopInspectorEvent =
   | {
       kind: 'instantiated';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       /// Effective iteration cap; null for an uncapped loop (done- or
       /// stream-driven with no max_iters), whose count is unknowable
       /// up front.
@@ -1205,20 +1231,20 @@ export type LoopInspectorEvent =
   | {
       kind: 'iteration_launched';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       index: number;
     }
   | {
       kind: 'out_fired';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       index: number;
       doneVote?: boolean | null;
     }
   | {
       kind: 'terminated';
       groupId: string;
-      parentFrames: LoopIteration[];
+      parentFrames: Frame[];
       reason: LoopTerminationReason;
     };
 
@@ -1752,10 +1778,13 @@ export type HostMessage =
   /// Navigation depth in the include back-stack. `depth > 0` means the user
   /// navigated into an included file; the webview shows a Return button.
   /// `fileName` is the current file's display name for the navigation bar.
-  /// `execPrefix` is the dotted alias chain descended through (e.g. `c.` or
-  /// `c.inner.`), prepended to node ids when looking up execution values so
-  /// the journal's qualified keys match the sub-graph's bare node ids.
-  | { kind: 'navState'; depth: number; fileName: string; execPrefix: string }
+  /// `callPath` is the chain of call sites descended through, outermost
+  /// first (`['c']`, or `['c', 'C.inner']`), each the site's own id. An
+  /// included file's nodes carry the file's id (`C.strip`) in the journal
+  /// whatever site called them; which call a row belongs to is the call
+  /// frames it carries, so the view keeps the rows whose call frames are
+  /// this path.
+  | { kind: 'navState'; depth: number; fileName: string; callPath: string[] }
   /// The run reached a terminal. A cancel carries WHY (`reason` is the
   /// text, `cause` the structured value), so a run stopped by a sibling
   /// through `ctx.stop_tagged` reads as that, never as a bare failure.
@@ -1763,15 +1792,21 @@ export type HostMessage =
   /// The run tagged itself (`ctx.tag_execution`). `tags` is one call's
   /// list; the webview accumulates the run's set.
   | { kind: 'execTags'; color: string; tags: string[] }
-  /// The run's scope, off its birth row: the node set it is held to
-  /// (`null` = the whole graph), so every other node paints as not in
-  /// this run, and the run it was seeded from with what it re-ran.
+  /// The run's scope, off its birth row: the places it is held to
+  /// (`locatedKey`s; `null` = the whole graph), so every other node
+  /// paints as not in this run, and the run it was seeded from with
+  /// what it re-ran.
   // SYNC: execScope <-> crates/weft-dispatcher/src/events.rs DispatcherEvent::ExecutionStarted (subgraph, seed)
   | { kind: 'execScope'; color: string; subgraph: string[] | null; seed: Seed | null }
   /// Which version the followed run ran, and which version the files on
   /// disk are (`null` when the disk matches no recorded version), so the
   /// graph can say "this run is from version X, your code differs".
   | { kind: 'execVersion'; color: string; version: string | null; diskVersion: string | null }
+  /// No run is on screen any more: the person stopped looking at one,
+  /// or the one they were looking at was deleted. Everything a run
+  /// painted (statuses, values, scope dimming, the version banner)
+  /// goes, and the canvas waits for the next run to start.
+  | { kind: 'execCleared' }
   /// The answer to a `resolveSpec` request.
   | { kind: 'specResolved'; requestId: number; result: ResolveSpecResponse }
   /// The project's `examples/*.json`, for the Run menu.
@@ -1793,14 +1828,14 @@ export type HostMessage =
   /// the value. Attaches a warning to the matching execution row WITHOUT
   /// changing its state (the node did not fail). Kept separate from
   /// `execEvent`, which is purely a state transition.
-  | { kind: 'execPortWarning'; nodeId: string; frames: LoopIteration[]; port: string; expected: string; actual: string }
+  | { kind: 'execPortWarning'; nodeId: string; frames: Frame[]; port: string; expected: string; actual: string }
   /// One metered call's cost record for a firing (a provider meter's
   /// figure). `costId` is the record's stable identity: the same record can
   /// arrive via both the replay and the live stream, so the reducer dedups
   /// on it. `amountUsd` null = the meter could not resolve the figure (an
   /// honest unknown; nothing is added to the row's total). `origin` says
   /// whose key the call spent.
-  | { kind: 'execCost'; nodeId: string; frames: LoopIteration[]; costId: string; amountUsd: number | null; origin: CredentialOwner }
+  | { kind: 'execCost'; nodeId: string; frames: Frame[]; costId: string; amountUsd: number | null; origin: CredentialOwner }
   /// One bus event (live or replay). Carries only what the bus layer
   /// recorded: join / left / message / closed keyed by `busId`.
   /// Routing to node inspector panels is a SEPARATE signal,
@@ -2028,6 +2063,9 @@ export type WebviewMessage =
   | { kind: 'refreshStatus' }
   | { kind: 'followTogglePin' }
   | { kind: 'followCatchUp' }
+  /// Stop showing the followed run and go back to an empty, live
+  /// canvas: the next run to start is followed as usual.
+  | { kind: 'followClear' }
   /// Replay a PAST execution onto the canvas: the host loads that execution's
   /// recorded events and feeds them as the editor's execution state (so the
   /// graph shows that run's final node statuses + outputs). `color` is the

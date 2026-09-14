@@ -79,16 +79,18 @@ export class AutoFollowController {
     return this.color;
   }
 
-  /** The followed execution ceased to exist (deleted from the
-   *  sidebar): stop streaming it and clear the follow. Mode reverts
-   *  to 'latest': a pin on a deleted execution points at nothing, and
-   *  'latest' auto-jumps to the next run, which is what the user is
-   *  left wanting. */
+  /** Stop showing the followed execution: the person clicked the eye
+   *  button on the graph, or the run was deleted from the sidebar.
+   *  Streaming stops and the canvas is wiped (`execCleared`). Mode
+   *  reverts to 'latest': there is nothing left to be pinned to, and
+   *  the next run to start is followed as usual, which is what the
+   *  person is left wanting in both cases. */
   clearFollow(): void {
     this.mode = 'latest';
     this.color = undefined;
     this.pendingQueue = [];
     this.follower.stop();
+    this.post({ kind: 'execCleared' });
     this.emitStatus();
   }
 

@@ -44,7 +44,7 @@ use weft_core::exec::{
     latest_firing, latest_firing_mut, next_firing_ordinal, NodeExecution, NodeExecutionStatus,
     PortWarning,
 };
-use weft_core::frames::{FiringLocation, LoopFrames};
+use weft_core::frames::{FiringLocation, Located, LoopFrames};
 use weft_core::primitive::{
     AwaitedEntry, AwaitedEntryKind, CorruptionSite, ExecutionSnapshot, JournalCorruption, KickedNode,
     LoopInstanceKey, LoopTerminationReason, SuspensionInfo,
@@ -93,7 +93,7 @@ pub struct Fold {
     phase: Option<weft_core::context::Phase>,
     /// The run's node set, from `ExecutionStarted`; `None` before that
     /// row and for an untargeted run.
-    dispatchable: Option<HashSet<String>>,
+    dispatchable: Option<HashSet<Located>>,
     snap: ExecutionSnapshot,
     /// Per record, what it handed out: for the screen only.
     outputs: HashMap<Uuid, OutputBag>,
@@ -180,57 +180,62 @@ impl Fold {
 
     /// Import already reconstructed results. Original inputs and outputs are
     /// history; only emissions into executable child nodes become new pulses.
-    pub fn inherit(&mut self, source: &Fold, nodes: &BTreeSet<String>) -> anyhow::Result<FoldEffects> {
+    pub fn inherit(&mut self, source: &Fold, places: &BTreeSet<Located>) -> anyhow::Result<FoldEffects> {
         anyhow::ensure!(source.snap.corruptions.is_empty(), "seed {} contains corrupt journal rows", source.color());
         let history = source.output_history.as_ref()
             .ok_or_else(|| anyhow::anyhow!("seed {} was reconstructed without its output history", source.color()))?;
         let reusable = weft_core::seeding::inheritable_nodes(&source.project, &source.snap);
-        for node in nodes {
-            anyhow::ensure!(!self.snap.executions.contains_key(node), "history for '{node}' was already imported");
-            anyhow::ensure!(source.project.nodes.iter().any(|definition| &definition.id == node)
-                && self.project.nodes.iter().any(|definition| &definition.id == node), "seed node '{node}' is not in both programs");
-            anyhow::ensure!(reusable.contains(node)
-                || (!source.snap.executions.contains_key(node) && history.iter().any(|output| &output.node == node && output.provided)),
-                "seed {} has no complete reusable result for '{node}'", source.color());
-            anyhow::ensure!(!source.snap.inherited_origins.contains_key(node),
-                "seed result '{node}' must name its original run, not intermediate run {}", source.color());
-            if let Some(records) = source.snap.executions.get(node) {
-                anyhow::ensure!(records.iter().all(|record| matches!(record.status, NodeExecutionStatus::Completed | NodeExecutionStatus::Skipped)),
-                    "cannot inherit unfinished or unsuccessful result '{node}' from {}", source.color());
-                anyhow::ensure!(records.iter().all(|record| record.completed_at.is_some()), "seed result '{node}' has no completion time");
-                anyhow::ensure!(records.iter().all(|record| record.inherited_from.is_none()),
-                    "seed result '{node}' must name its original run, not intermediate run {}", source.color());
-            }
+        // The records at one place: the node's firings under that
+        // place's calls, at every loop iteration.
+        let records_at = |snap: &ExecutionSnapshot, place: &Located| -> Vec<weft_core::exec::NodeExecution> {
+            snap.executions.get(&place.id).into_iter().flatten()
+                .filter(|record| Located::at(&place.id, &record.frames) == *place).cloned().collect()
+        };
+        for place in places {
+            anyhow::ensure!(records_at(&self.snap, place).is_empty(), "history for '{place}' was already imported");
+            anyhow::ensure!(source.project.nodes.iter().any(|definition| definition.id == place.id)
+                && self.project.nodes.iter().any(|definition| definition.id == place.id), "seed node '{place}' is not in both programs");
+            let records = records_at(&source.snap, place);
+            anyhow::ensure!(reusable.contains(place)
+                || (records.is_empty() && history.iter().any(|output| Located::at(&output.node, &output.frames) == *place && output.provided)),
+                "seed {} has no complete reusable result for '{place}'", source.color());
+            anyhow::ensure!(!source.snap.inherited_origins.contains_key(place),
+                "seed result '{place}' must name its original run, not intermediate run {}", source.color());
+            anyhow::ensure!(records.iter().all(|record| matches!(record.status, NodeExecutionStatus::Completed | NodeExecutionStatus::Skipped)),
+                "cannot inherit unfinished or unsuccessful result '{place}' from {}", source.color());
+            anyhow::ensure!(records.iter().all(|record| record.completed_at.is_some()), "seed result '{place}' has no completion time");
+            anyhow::ensure!(records.iter().all(|record| record.inherited_from.is_none()),
+                "seed result '{place}' must name its original run, not intermediate run {}", source.color());
         }
-        for node in nodes {
-            if let Some(records) = source.snap.executions.get(node) {
-                let records: Vec<_> = records.iter().map(|record| {
-                    let mut inherited = record.clone();
-                    inherited.color = self.color();
-                    inherited.inherited_from = Some(record.inherited_from.unwrap_or(source.color()));
-                    inherited
-                }).collect();
-                for record in &records {
-                    if let Some(output) = source.outputs.get(&record.id) { self.outputs.insert(record.id, output.clone()); }
-                }
-                self.snap.executions.insert(node.clone(), records);
+        for place in places {
+            let records: Vec<_> = records_at(&source.snap, place).into_iter().map(|record| {
+                let mut inherited = record;
+                inherited.color = self.color();
+                inherited.inherited_from = Some(inherited.inherited_from.unwrap_or(source.color()));
+                inherited
+            }).collect();
+            if records.is_empty() { continue; }
+            for record in &records {
+                if let Some(output) = source.outputs.get(&record.id) { self.outputs.insert(record.id, output.clone()); }
             }
+            self.snap.executions.entry(place.id.clone()).or_default().extend(records);
         }
         for (location, entries) in &source.snap.awaited_sequences {
-            if nodes.contains(&location.node_id) { self.snap.awaited_sequences.insert(location.clone(), entries.clone()); }
+            if places.contains(&Located::at(&location.node_id, &location.frames)) { self.snap.awaited_sequences.insert(location.clone(), entries.clone()); }
         }
         for (_, instance) in source.snap.loop_runtime.iter() {
-            if nodes.contains(&boundary_in_id(&instance.key.group_id)) {
+            if places.contains(&Located::at(boundary_in_id(&instance.key.group_id), &instance.key.parent_frames)) {
                 self.snap.loop_runtime.inherit(instance, self.color()).map_err(anyhow::Error::msg)?;
             }
         }
         let mut frontier = self.snap.selection.clone()
             .unwrap_or_else(|| weft_core::project::selection::RunSelection::whole(&self.project));
-        frontier.edges.retain(|id| self.project.edges.iter().any(|edge| &edge.id == id
-            && nodes.contains(&edge.source) && frontier.nodes.contains(&edge.target)));
+        let nodes = frontier.nodes.clone();
+        frontier.edges.retain(|wire| weft_core::project::selection::wire_ends(&self.project, wire)
+            .is_some_and(|(source, target)| places.contains(&source) && nodes.contains(&target)));
         let edge_idx = EdgeIndex::selected(&self.project, frontier);
         let mut effects = FoldEffects::default();
-        for output in history.iter().filter(|output| nodes.contains(&output.node)) {
+        for output in history.iter().filter(|output| places.contains(&Located::at(&output.node, &output.frames))) {
             let start = effects.emissions.len();
             match &output.value {
                 Some(value) => {
@@ -293,15 +298,15 @@ impl Fold {
                 };
                 self.dispatchable = subgraph.as_ref().map(|s| s.dispatchable_nodes());
             }
-            ExecEvent::NodeKicked { node_id, firing, payload, port_snapshot, at_unix, .. } => {
-                // First kick wins; further kicks on the same node id are a
-                // true no-op (the documented contract). The first kick's
+            ExecEvent::NodeKicked { node_id, frames, firing, payload, port_snapshot, at_unix, .. } => {
+                // First kick wins; further kicks on the same location are
+                // a true no-op (the documented contract). The first kick's
                 // payload and `dispatched` flag are authoritative; a later
                 // kick carrying a different payload is a writer-level bug
                 // the fold must not paper over by silently merging.
                 self.snap
                     .kicked
-                    .entry(FiringLocation::new(node_id.clone(), Vec::new()))
+                    .entry(FiringLocation::new(node_id.clone(), frames.clone()))
                     .and_modify(|kick| {
                         if *firing && !kick.firing {
                             kick.firing = true;
@@ -895,9 +900,9 @@ impl Fold {
     fn remember_scope_closures(&mut self, group: &str, frames: &LoopFrames, id: Uuid) {
         if self.output_history.is_none() { return; }
         let node_id = boundary_out_id(group);
-        if self.snap.selection.as_ref().is_some_and(|selection| !selection.nodes.contains(&node_id)) { return; }
+        if !self.edge_idx.admits(&node_id, frames) { return; }
         let ports: Vec<_> = self.project.nodes.iter().find(|node| node.id == node_id).into_iter()
-            .flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, &port.name)))
+            .flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, frames, &port.name)))
             .map(|port| port.name.clone()).collect();
         for port in ports {
             self.remember_output(OutputEmission { id, node: node_id.clone(), frames: frames.clone(), port,
@@ -918,9 +923,9 @@ impl Fold {
                 return kicked_group(def, kick, frames, self.snap.color, &self.project, &self.edge_idx).received;
             }
         }
-        let wired = wired_inputs(&self.project, &self.edge_idx, node_id);
+        let wired = wired_inputs(&self.project, &self.edge_idx, node_id, frames);
         let effective = effective_input_pulses(def, &pending, &wired, &self.project, &self.edge_idx, self.snap.color, frames);
-        firing_input(def, &effective.iter().collect::<Vec<_>>(), &wired, &self.edge_idx)
+        firing_input(def, &effective.iter().collect::<Vec<_>>(), &wired, frames, &self.edge_idx)
     }
 
     /// Run the boundary pass: fire every group boundary this row made
@@ -953,7 +958,7 @@ impl Fold {
                     let skipped = record.status == NodeExecutionStatus::Skipped;
                     let values = output.clone().unwrap_or_default();
                     let ports: Vec<_> = self.project.nodes.iter().find(|node| node.id == dispatch.node_id)
-                        .into_iter().flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, &port.name)))
+                        .into_iter().flat_map(|node| node.outputs.iter().filter(|port| self.edge_idx.includes_port(node, &dispatch.frames, &port.name)))
                         .map(|port| port.name.clone()).collect();
                     for port in ports {
                         self.remember_output(OutputEmission {
@@ -1293,15 +1298,15 @@ pub fn fold_to_snapshot<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
-    use weft_core::frames::LoopIteration;
+    use weft_core::frames::Frame;
     use weft_core::pulse::PulseStatus;
 
     fn color() -> Color {
         Uuid::nil()
     }
 
-    fn frame(index: u32) -> LoopIteration {
-        LoopIteration { index }
+    fn frame(index: u32) -> Frame {
+        Frame::Loop { index }
     }
 
     /// A node in a test program: `(id, type, inputs, outputs, scope,
@@ -1393,7 +1398,7 @@ mod tests {
     fn kicked(node: &str) -> ExecEvent {
         ExecEvent::NodeKicked {
             color: color(),
-            node_id: node.into(),
+            node_id: node.into(), frames: vec![],
             firing: true,
             payload: None,
             port_snapshot: None,
@@ -1403,6 +1408,77 @@ mod tests {
 
     fn pending<'a>(snap: &'a ExecutionSnapshot, node: &str) -> Vec<&'a weft_core::pulse::Pulse> {
         snap.pulses.get(node).map(|b| b.iter().filter(|p| p.status.is_pending()).collect()).unwrap_or_default()
+    }
+
+    /// A replay crosses a call the way the live engine did: the site's
+    /// In pushes its frame, the shared body's rows carry it, and the
+    /// body's Out hands the result back to that site alone.
+    #[test]
+    fn a_call_replays_under_its_site_frame_and_answers_its_own_site() {
+        use weft_core::project::boundary_types as bt;
+        let mut project = project(
+            vec![
+                node("src", "T", &[], &[("a", "Number"), ("b", "Number")], &[], Value::Null, Value::Null),
+                node("a__in", bt::CALL_IN, &[("x", "Number", true)], &[("x", "Number")], &[], json!({"groupId": "a", "role": "In"}), Value::Null),
+                node("a__out", bt::CALL_OUT, &[("y", "Number", true)], &[("y", "Number")], &[], json!({"groupId": "a", "role": "Out"}), Value::Null),
+                node("b__in", bt::CALL_IN, &[("x", "Number", true)], &[("x", "Number")], &[], json!({"groupId": "b", "role": "In"}), Value::Null),
+                node("b__out", bt::CALL_OUT, &[("y", "Number", true)], &[("y", "Number")], &[], json!({"groupId": "b", "role": "Out"}), Value::Null),
+                node("B__in", bt::INCLUDE_IN, &[("x", "Number", true)], &[("x", "Number")], &[], json!({"groupId": "B", "role": "In"}), Value::Null),
+                node("B.n", "T", &[("in", "Number", true)], &[("out", "Number")], &["B"], Value::Null, Value::Null),
+                node("B__out", bt::INCLUDE_OUT, &[("y", "Number", true)], &[("y", "Number")], &[], json!({"groupId": "B", "role": "Out"}), Value::Null),
+                node("sa", "T", &[("in", "Number", true)], &[], &[], Value::Null, Value::Null),
+                node("sb", "T", &[("in", "Number", true)], &[], &[], Value::Null, Value::Null),
+            ],
+            vec![
+                edge("src", "a", "a__in", "x"), edge("src", "b", "b__in", "x"),
+                edge("a__in", "x", "B__in", "x"), edge("b__in", "x", "B__in", "x"),
+                edge("B__in", "x", "B.n", "in"), edge("B.n", "out", "B__out", "y"),
+                edge("B__out", "y", "a__out", "y"), edge("B__out", "y", "b__out", "y"),
+                edge("a__out", "y", "sa", "in"), edge("b__out", "y", "sb", "in"),
+            ],
+        );
+        Arc::get_mut(&mut project).unwrap().groups = serde_json::from_value(json!([
+            { "id": "a", "kind": "call", "body": "B", "nodeIds": [] },
+            { "id": "b", "kind": "call", "body": "B", "nodeIds": [] },
+            { "id": "B", "kind": "body", "nodeIds": ["B.n"] }
+        ])).unwrap();
+        let call = |site: &str| vec![Frame::Call { site: site.into() }];
+        let emission = Uuid::new_v4();
+        let events = vec![
+            started_execution(),
+            kicked("src"),
+            started("src", vec![], 1),
+            emitted(emission, "src", vec![], "a", json!(1)),
+            emitted(emission, "src", vec![], "b", json!(2)),
+            completed("src", vec![], 2),
+            // The body's member ran for call `a` and answered.
+            started("B.n", call("a"), 3),
+            emitted(Uuid::new_v4(), "B.n", call("a"), "out", json!(10)),
+            completed("B.n", call("a"), 4),
+        ];
+        let mut fold = Fold::new(color(), project);
+        for ev in &events {
+            fold.apply(ev);
+        }
+        let snap = fold.snapshot();
+        assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
+        // The body's In fired once per site, under that site's frame.
+        let mut body_in: Vec<LoopFrames> = snap.executions["B__in"].iter().map(|r| r.frames.clone()).collect();
+        body_in.sort();
+        assert_eq!(body_in, vec![call("a"), call("b")]);
+        // `B.n` for call `b` is still waiting with its own value.
+        let waiting = pending(snap, "B.n");
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].frames, call("b"));
+        assert_eq!(*waiting[0].value, json!(2));
+        // The answer came back to `a`'s sink at the root, and only there.
+        let sa = pending(snap, "sa");
+        assert_eq!(sa.len(), 1);
+        assert_eq!(*sa[0].value, json!(10));
+        assert!(sa[0].frames.is_empty());
+        assert!(pending(snap, "sb").is_empty());
+        assert_eq!(snap.executions["a__out"].len(), 1);
+        assert!(!snap.executions.contains_key("b__out"));
     }
 
     /// A fired trigger reads its baked port snapshot without rerunning
@@ -1421,7 +1497,7 @@ mod tests {
             started_execution(),
             ExecEvent::NodeKicked {
                 color: color(),
-                node_id: "wired".into(),
+                node_id: "wired".into(), frames: vec![],
                 firing: true,
                 payload: Some(json!({"scheduledTime":"event"})),
                 port_snapshot: Some(json!({"cron":cron})),
@@ -2011,11 +2087,11 @@ mod tests {
         let mut definition = loop_project(false).as_ref().clone();
         definition.groups.push(serde_json::from_value(json!({"id":"lp","kind":"loop","loopConfig":{},"nodeIds":["step"]})).unwrap());
         let eligible = weft_core::seeding::inheritable_nodes(&definition, &snap);
-        assert!(["lp__in", "step", "lp__out"].iter().all(|node| eligible.contains(*node)));
+        assert!(["lp__in", "step", "lp__out"].iter().all(|node| eligible.contains(&Located::top(*node))));
         let mut missing_iteration = snap.clone();
         missing_iteration.executions.get_mut("step").unwrap().retain(|record| record.frames != vec![frame(1)]);
         let eligible = weft_core::seeding::inheritable_nodes(&definition, &missing_iteration);
-        assert!(["lp__in", "step", "lp__out"].iter().all(|node| !eligible.contains(*node)), "one missing iteration invalidates the whole loop");
+        assert!(["lp__in", "step", "lp__out"].iter().all(|node| !eligible.contains(&Located::top(*node))), "one missing iteration invalidates the whole loop");
         // Replaying the terminal row puts nothing on the wires twice.
         events.push(events.last().unwrap().clone());
         let again = fold_to_snapshot(color(), loop_project(false), &events);
@@ -2035,12 +2111,12 @@ mod tests {
             started("lp__in", vec![], 1), loop_row_instantiated(), completed("lp__in", vec![], 1),
             ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::OverExhausted, at_unix: 2 },
         ] { assert!(!source.apply(&row).rejected()); }
-        let members = BTreeSet::from(["lp__in".into(), "step".into(), "lp__out".into()]);
+        let members = BTreeSet::from([Located::top("lp__in"), Located::top("step"), Located::top("lp__out")]);
         let eligible = weft_core::seeding::inheritable_nodes(&project, source.snapshot());
         assert!(members.iter().all(|node| eligible.contains(node)));
         let mut selection = weft_core::project::selection::RunSelection::carve(&project,
             &weft_core::project::selection::SelectionBounds { from: vec!["sink".into()], ..Default::default() }).unwrap();
-        selection.suppliers.insert("lp__out".into());
+        selection.suppliers.insert(Located::top("lp__out"));
         let mut birth = started_execution();
         if let ExecEvent::ExecutionStarted { subgraph, .. } = &mut birth { *subgraph = Some(selection); }
         let mut child = Fold::new(Uuid::new_v4(), project);
@@ -2119,7 +2195,7 @@ mod tests {
         let inst = snap.loop_runtime.get(&lp_key()).expect("instance");
         assert_eq!(inst.launched, vec![0, 1, 2]);
         assert_eq!(inst.out_fired, vec![2]);
-        let lanes: HashSet<u32> = pending(&snap, "step").iter().map(|p| p.frames[0].index).collect();
+        let lanes: HashSet<u32> = pending(&snap, "step").iter().map(|p| p.frames[0].loop_index().expect("a loop frame")).collect();
         assert_eq!(lanes, [0, 1].into_iter().collect(), "lanes 0 and 1 still wait; lane 2 absorbed");
         // A closed write records as Closed, a null slot in the list.
         assert_eq!(inst.gather_lists["res"][&2], weft_core::exec::loop_runtime::LoopWrite::Value(Arc::new(json!(300))));
@@ -2132,7 +2208,7 @@ mod tests {
             started_execution(),
             ExecEvent::NodeKicked {
                 color: color(),
-                node_id: "src".into(),
+                node_id: "src".into(), frames: vec![],
                 firing: true,
                 payload: Some(payload.clone()),
                 port_snapshot: None,
@@ -2515,23 +2591,23 @@ mod tests {
         );
         let mut original_selection = weft_core::project::selection::RunSelection::carve(&project,
             &weft_core::project::selection::SelectionBounds { target: vec!["a".into()], ..Default::default() }).unwrap();
-        original_selection.input.insert("a".into(), [("in".into(), json!(7))].into_iter().collect());
+        original_selection.input.insert(Located::top("a"), [("in".into(), json!(7))].into_iter().collect());
         let mut birth = started_execution();
         if let ExecEvent::ExecutionStarted { subgraph, .. } = &mut birth { *subgraph = Some(original_selection); }
         let mut original = Fold::new(color(), project.clone()).with_output_history();
-        let kick = ExecEvent::NodeKicked { color: color(), node_id: "a".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0 };
+        let kick = ExecEvent::NodeKicked { color: color(), node_id: "a".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 };
         for row in [birth, kick, started("a", vec![], 1), emitted(Uuid::new_v4(), "a", vec![], "out", json!(9)), completed("a", vec![], 2)] {
             assert!(!original.apply(&row).rejected());
         }
         let mut selection = weft_core::project::selection::RunSelection::carve(&project,
             &weft_core::project::selection::SelectionBounds { from: vec!["b".into()], ..Default::default() }).unwrap();
-        selection.suppliers.insert("a".into());
-        selection.input.insert("b".into(), [("in".into(), json!(55))].into_iter().collect());
+        selection.suppliers.insert(Located::top("a"));
+        selection.input.insert(Located::top("b"), [("in".into(), json!(55))].into_iter().collect());
         let mut birth = started_execution();
         if let ExecEvent::ExecutionStarted { subgraph, .. } = &mut birth { *subgraph = Some(selection); }
         let mut child = Fold::new(Uuid::new_v4(), project);
         child.apply(&birth);
-        child.inherit(&original, &BTreeSet::from(["a".into()])).unwrap();
+        child.inherit(&original, &BTreeSet::from([Located::top("a")])).unwrap();
         child.settle(3);
         let history = child.firing_view("a", &vec![]).unwrap();
         assert_eq!(history.input["in"], json!(7));

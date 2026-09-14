@@ -11,25 +11,31 @@ Your job is the whole program. You hold the graph in your head, design the typed
 
 ## What this project is
 
-A weft program is a graph of nodes connected by typed wires, written in `main.weft`. The compiler proves the wiring before anything runs. The runtime executes it durably: every run is journaled node by node, a program can suspend for a person or a timer and resume later at no compute cost. Weft programs are written by you and read by the user as a graph (the VS Code extension renders it live), so a program is kept short and legible, and the graph does the explaining.
+A weft program is a graph of nodes connected by typed wires, written in `src/main.weft`. The compiler proves the wiring before anything runs. The runtime executes it durably: every run is journaled node by node, a program can suspend for a person or a timer and resume later at no compute cost. Weft programs are written by you and read by the user as a graph (the VS Code extension renders it live), so a program is kept short and legible, and the graph does the explaining.
 
 Every node a run reaches runs. A manual run kicks every root (a top-level node no wire feeds); a trigger fire runs the fired trigger's own program (everything downstream of it and what that needs); `weft run --target <node>` runs that node and what it needs, nothing else (repeat `--target` to run several; any node is a valid target, and a target never drags a sibling branch in, even when they share a root).
 
 ## The project on disk
 
 ```
-main.weft           the program (yours to write)
 weft.toml           name, id, version (the id is minted once, never regenerate it)
+src/
+  main.weft         the entry point (yours to write)
+  <name>.weft       a module: one group per file, pulled in by @include
+  <domain>/         a package of modules, grouped by what the code is about
+  <domain>/<node>/  a node only that package uses, found by its metadata.json
 nodes/
   base_catalog/     the standard library, copied in at `weft new`. READ-ONLY:
                     `weft catalog update` wipes and recopies it
-  <anything else>/  this project's own nodes, including what the specialists build
-prompts/ scripts/ sql/   content pulled in by @file("...") markers
+  <anything else>/  this project's own nodes that several modules share
+assets/             everything pulled in by @file("...") / @asset("..."): prompts, scripts, images
+examples/           frozen runs (`weft freeze`)
 layouts/            editor graph positions (generated, never edit by hand)
+front/              a frontend, if the project has one: its own toolchain, weft ignores it
 .weft/              build state (generated, never edit)
 ```
 
-Long prompts live in `prompts/*.md`, Python in `scripts/*.py`, SQL in `sql/*.sql`. The `@file` marker is bidirectional: the editor can write back into those files, so they are the right home for anything a person might want to reread and edit.
+A program starts as `src/main.weft` alone and stays one file as long as it fits [the level rule]. A group earns its own file the way a module does in any language: by size, or because two places use it. It becomes `src/<name>.weft` (exactly one anonymous group per file) and `main.weft` keeps `<name> = @include("<name>.weft")` in its place; a folder under `src/` groups modules by domain, named like any package, never by graph depth. Content pulled in by a marker lives under `assets/` (`assets/prompts/*.md`, `assets/scripts/*.py`, and so on), and a marker's path is relative to the project root wherever it is written: `@file("assets/prompts/triage.md")` from any file. An `@include` path is relative to the file that writes it, like an import. The `@file` marker is bidirectional: the editor can write back into those files, so they are the right home for anything a person might want to reread and edit.
 
 ## Ground truth
 

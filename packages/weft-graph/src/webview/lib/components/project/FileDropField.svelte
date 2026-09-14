@@ -9,9 +9,9 @@
 	// <Type>)` ref (in memory: WeftFileRefValue): the file lives WITH the
 	// project (or at a URL, or in the project's stored files), and the
 	// pre-build asset sync publishes + resolves it. Three ways to set it:
-	//   - PICK/DROP: the host produces the path (a native dialog references
-	//     the picked file in place; dropped bytes are stored as
-	//     `assets/<name>`)
+	//   - PICK/DROP: the host produces the path, spelled from the `.weft`
+	//     file on screen (a native dialog references the picked file in
+	//     place; dropped bytes are stored under the project's `assets/`)
 	//   - BROWSE: reference an existing project file (the picker modal)
 	//   - URL: paste an external address (the worker fetches it at run time)
 	// `fileType` is the field's declared weft file type: it derives the accept

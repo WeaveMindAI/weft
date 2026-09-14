@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::exec::emission::{iteration_launch_emission, loop_termination_emission, PulseEmission};
 use crate::exec::postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag};
 use crate::exec::ready::InputBag;
-use crate::frames::{LoopFrames, LoopIteration};
+use crate::frames::{Frame, LoopFrames};
 use crate::generator::{StreamBuffer, StreamEnd};
 use crate::primitive::{LoopInstanceKey, LoopTerminationReason};
 use crate::project::{EdgeIndex, NodeDefinition, ProjectDefinition};
@@ -886,7 +886,7 @@ fn is_prefix(short: &LoopFrames, long: &LoopFrames) -> bool {
 /// parent frame stack is `parent_frames`.
 pub fn iteration_frames(parent_frames: &LoopFrames, index: u32) -> LoopFrames {
     let mut frames = parent_frames.clone();
-    frames.push(LoopIteration { index });
+    frames.push(Frame::Loop { index });
     frames
 }
 
@@ -1228,7 +1228,7 @@ pub fn launch_iteration(
     // The body's own roots (members no wire feeds) start with the
     // iteration, at its frames: everything inside a loop runs once per
     // iteration, wired to the loop's edges or not.
-    let roots = crate::project::scope_body_roots(project, edge_idx, group_id);
+    let roots = crate::project::scope_body_roots(project, edge_idx, group_id, &body_frames);
     loop_runtime.record_launched(key, index);
     Ok(IterationLaunch { emissions, roots, body_frames })
 }
@@ -1573,9 +1573,9 @@ mod tests {
     fn cancel_inside_marks_terminated() {
         let mut rt = LoopRuntime::new();
         let mut k = key();
-        k.parent_frames = vec![LoopIteration { index: 0 }];
+        k.parent_frames = vec![Frame::Loop { index: 0 }];
         rt.ensure(k.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(5),vec![]);
-        let outer_frames = vec![LoopIteration { index: 0 }];
+        let outer_frames = vec![Frame::Loop { index: 0 }];
         rt.cancel_inside(&outer_frames, Uuid::nil());
         let inst = rt.get(&k).expect("instance");
         assert_eq!(inst.terminated, Some(LoopTerminationReason::Cancelled));
@@ -1591,17 +1591,17 @@ mod tests {
         let mut rt = LoopRuntime::new();
         let inst_0 = LoopInstanceKey {
             group_id: "inner".into(),
-            parent_frames: vec![LoopIteration { index: 0 }],
+            parent_frames: vec![Frame::Loop { index: 0 }],
             color: Uuid::nil(),
         };
         let inst_1 = LoopInstanceKey {
             group_id: "inner".into(),
-            parent_frames: vec![LoopIteration { index: 1 }],
+            parent_frames: vec![Frame::Loop { index: 1 }],
             color: Uuid::nil(),
         };
         rt.ensure(inst_0.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
         rt.ensure(inst_1.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
-        rt.cancel_inside(&vec![LoopIteration { index: 0 }], Uuid::nil());
+        rt.cancel_inside(&vec![Frame::Loop { index: 0 }], Uuid::nil());
         assert_eq!(
             rt.get(&inst_0).unwrap().terminated,
             Some(LoopTerminationReason::Cancelled),
@@ -1627,7 +1627,7 @@ mod tests {
         };
         let inner_key = LoopInstanceKey {
             group_id: "inner".into(),
-            parent_frames: vec![LoopIteration { index: 0 }],
+            parent_frames: vec![Frame::Loop { index: 0 }],
             color: Uuid::nil(),
         };
         rt.ensure(outer_key.clone(), cfg(false, &["x"], &[], None), LoopItemSource::Lists, Some(3),vec![]);
@@ -2018,7 +2018,7 @@ mod tests {
         let input = bag(&[("items", serde_json::json!([10, 20])), ("acc", serde_json::json!(5))]);
         let firing = instantiate(&mut rt, def(&project, "lp__in"), &project, &input, &Vec::new(), Uuid::nil()).unwrap();
         let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &edge_idx, &mut pulses).unwrap();
-        assert_eq!(launch.body_frames, vec![LoopIteration { index: 1 }]);
+        assert_eq!(launch.body_frames, vec![Frame::Loop { index: 1 }]);
         assert_eq!(launch.roots, vec!["lonely".to_string()]);
         let step = pending_at(&pulses, "step");
         let value = |port: &str| step.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());

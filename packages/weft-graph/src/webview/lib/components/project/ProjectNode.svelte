@@ -18,6 +18,7 @@
 	import { emptyToUnset, isFileRefValue, type WeftFileRefValue } from '../../value-format';
 	import { openPortMenu, buildPortMenuItems } from "../../utils/port-context-menu";
 	import { portMarkerStyle } from "../../utils/port-marker";
+	import { nodeIsTrigger } from "../../utils/node-roles";
 	import { portDeleteAction } from "../../projection/header-ports";
 	import { fieldForInput, fieldForSpecField, inputRendersField, inputsOf, nextPortLiterals, outputsOf, shouldFlowField } from "../../utils/input-field";
 	import ExecutionInspector from './ExecutionInspector.svelte';
@@ -484,7 +485,7 @@
 	);
 	const canAddPorts = $derived(canAddInputPorts || canAddOutputPorts);
 	// `_should_flow` decides whether the node runs at all, so it docks in
-	// the top-left corner as a square instead of sitting in the port rail
+	// the top-left corner as an arrow instead of sitting in the port rail
 	// among the node's own inputs. Filled means something answers it: a
 	// wire, or a literal written straight into the braces.
 	const flowConnected = $derived(
@@ -1390,8 +1391,16 @@
 				<span class="break-all">{data.bodyFeed.error}</span>
 			</div>
 		{:else if data.bodyFeed.state === 'absent'}
+			<!-- The feed's source is not there: no listener holds this
+			     trigger, or the infra is not provisioned. One quiet line
+			     naming the button that brings it back, never the red
+			     error box (nothing is broken, nothing is running). -->
 			<div class="text-[10px] text-muted-foreground bg-zinc-50 border border-zinc-200 rounded px-2 py-1.5">
-				Not running. Start it from the action bar.
+				{#if nodeIsTrigger({ nodeType: data.nodeType, features: data.features })}
+					Nothing is listening for this trigger. Activate the project from the action bar.
+				{:else}
+					Not running. Start it from the action bar.
+				{/if}
 			</div>
 		{:else if data.bodyFeed.items.length > 0}
 			<div class="space-y-2">
@@ -1475,7 +1484,7 @@
 {/snippet}
 
 <!-- Flow dock: `_should_flow` decides whether this node runs at all, so it
-     sits apart from the node's own inputs, as a square in the top-left
+     sits apart from the node's own inputs, as an arrow in the top-left
      corner. Filled means something answers it. -->
 {#snippet flowDock()}
 	<FlowDock top={18} subject="node" connected={flowConnected} />
@@ -1711,7 +1720,10 @@
 		{/if}
 		
 		<!-- Ports Section -->
-		<div class="mt-2 flex justify-between text-[10px] text-zinc-500 w-full">
+		<!-- Two half-width columns with a gap between them: a long port name
+		     truncates inside its half instead of running into the other
+		     side's names. -->
+		<div class="mt-2 flex justify-between gap-2 text-[10px] text-zinc-500 w-full">
 			<!-- Input Ports (wireable inputs only; config-exposure inputs
 			     live in the body as fields, never on the edge rail) -->
 			<div class="space-y-1 min-w-0 flex-1">
@@ -1739,7 +1751,7 @@
 						<span class="truncate">{input.name}</span>
 						{#if inputDeleteAction}
 							<button
-								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 ml-auto text-xs leading-none"
+								class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 shrink-0 text-sm leading-none"
 								onclick={(e) => { e.stopPropagation(); removeInputPort(input.name); }}
 								title={inputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 							>×</button>
@@ -1795,7 +1807,7 @@
 					/>
 					{#if outputDeleteAction}
 						<button
-							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 mr-auto text-xs leading-none"
+							class="opacity-0 group-hover:opacity-100 text-destructive hover:text-destructive/80 shrink-0 text-sm leading-none"
 							onclick={(e) => { e.stopPropagation(); removeOutputPort(output.name); }}
 							title={outputDeleteAction === 'revert' ? 'Reset to default' : 'Remove port'}
 						>×</button>
@@ -1817,8 +1829,8 @@
 							/>
 						</div>
 					{:else}
-						<button 
-							class="flex items-center gap-0.5 text-muted-foreground/60 hover:text-muted-foreground transition-colors justify-end"
+						<button
+							class="flex items-center gap-0.5 text-muted-foreground/60 hover:text-muted-foreground transition-colors"
 							onclick={(e) => { e.stopPropagation(); addingOutputPort = true; }}
 						>
 							<span>output</span>
@@ -2208,6 +2220,10 @@
 		border-radius: 0.375rem;
 		background-color: rgba(96, 165, 250, 0.08);
 	}
+	/* The status glow rings (`.node-running-glow` and friends) are defined
+	   once in `app.css`; this component only picks which class goes on
+	   (`glowClass`). */
+
 	/* Debug node data display - single resizable box */
 	.debug-data-container {
 		margin: 0;
@@ -2303,17 +2319,7 @@
 		to { transform: rotate(360deg); }
 	}
 
-	/* Widen resize line hit area: make the element itself thicker (transparent)
-	   while keeping the visible border thin. The element IS the drag target. */
-	:global(.node-resize-line.svelte-flow__resize-control.line.left),
-	:global(.node-resize-line.svelte-flow__resize-control.line.right) {
-		width: 12px !important;
-		background: transparent;
-	}
-	:global(.node-resize-line.svelte-flow__resize-control.line.top),
-	:global(.node-resize-line.svelte-flow__resize-control.line.bottom) {
-		height: 12px !important;
-		background: transparent;
-	}
+	/* The resize lines get their wider grab zone from `app.css`, which
+	   already widens every `.svelte-flow__resize-control.line`. */
 
 </style>

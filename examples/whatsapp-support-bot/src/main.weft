@@ -12,7 +12,7 @@ draft = LlmInference -> (answer: String, sensitivity: String) {
   parseJson: true
   prompt: ask.content
   provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider
-  params: LlmParams { systemPrompt: @file("prompts/support.md"), temperature: 0.75 }.params
+  params: LlmParams { systemPrompt: @file("assets/prompts/support.md"), temperature: 0.75 }.params
 }
 
 # Exactly one of these two says yes, the other stays quiet

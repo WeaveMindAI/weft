@@ -46,7 +46,8 @@ already gitignored for you.
 ```
 hello/
   weft.toml      the project's name and its permanent id
-  main.weft      the program
+  src/
+    main.weft    the program
   nodes/         every node this project can use
   .weft/         build output and caches (already gitignored for you)
 ```
@@ -58,13 +59,14 @@ into the weft installation and upgrading weft cannot change what your program
 does. If you want the newer standard library later, `weft catalog update` re-syncs
 that mirror.
 
-Your own nodes go anywhere else under `nodes/`, never inside `base_catalog/`,
+Your own nodes go anywhere else under `nodes/`, or beside the code under
+`src/`, never inside `base_catalog/`,
 because `weft catalog update` wipes and recopies that folder and anything you
 edited in there goes with it.
 
 ## The program
 
-`main.weft` is three lines:
+`src/main.weft` is three lines:
 
 ```weft
 greeting = Text { value: "hello world" }
@@ -106,7 +108,7 @@ so whenever anything in weft says "per color", it means per execution.
 
 ## Change something
 
-Edit `main.weft`:
+Edit `src/main.weft`:
 
 ```weft
 greeting = Text { value: "hello world" }

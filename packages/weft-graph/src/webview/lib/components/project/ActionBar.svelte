@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Play, Square, Zap, Database, Loader2, ChevronDown } from '@lucide/svelte';
+	import { Play, Square, Zap, Database, Loader2, ChevronUp } from '@lucide/svelte';
 	import { specSummary, specForAction, type RunSpec } from '../../../../run-spec';
 	import type {
 		ActionBarState,
@@ -313,7 +313,12 @@
 		| { kind: 'building'; cancelling: boolean }
 		| { kind: 'pending'; message: string }
 		| { kind: 'stop_execution' }
-		| { kind: 'run'; enabled: boolean };
+		// `plainRun`: the one-click Run that fires every root. Off in a
+		// project whose triggers are the entry point (the trigger
+		// lifecycle is the button there); the spec menu beside it stays,
+		// since a spec supplies its own starting values and runs as an
+		// ordinary one-shot whatever the project's entry point is.
+		| { kind: 'run'; enabled: boolean; plainRun: boolean };
 
 	type TriggerSlotState =
 		| { kind: 'absent' }
@@ -398,17 +403,17 @@
 		if (isExecRunning) {
 			return { kind: 'stop_execution' };
 		}
-		// No execution in flight: only show Run when the trigger
-		// slot is hidden. Whenever the trigger slot is visible
+		// No execution in flight: the one-click Run only when the
+		// trigger slot is hidden. Whenever the trigger slot is visible
 		// (source has triggers, or backend still has them active /
 		// deactivating / preserved), the trigger lifecycle is the
-		// right entry point and Run would conflict. The exception is
-		// an aimed run that walks through no trigger (a hand-fired
-		// maintenance branch): that run is an ordinary one-shot, so
-		// the button comes back beside the trigger lifecycle.
-		if (triggerSlotVisible && !runTargetsAvoidTriggers) {
-			return { kind: 'absent' };
-		}
+		// right entry point and a bare Run would conflict. The
+		// exception is an aimed run that walks through no trigger (a
+		// hand-fired maintenance branch): that run is an ordinary
+		// one-shot, so the button comes back beside the trigger
+		// lifecycle. The spec menu is there either way: a saved
+		// example runs the project from its own starting values.
+		const plainRun = !triggerSlotVisible || runTargetsAvoidTriggers;
 		// Source-derived gate: Run is only legal once the infra it
 		// would touch is Running. An aimed run consults only ITS
 		// subgraph's infra nodes (per-node status); the ordinary run
@@ -427,6 +432,7 @@
 				&& nodeCount > 0
 				&& infraReady
 				&& isVerbAvailable('run'),
+			plainRun,
 		};
 	});
 
@@ -742,26 +748,32 @@
 		</button>
 	{:else if slot.kind === 'run' && onRun}
 		<div class="relative flex items-stretch">
-			<button
-				class="{btn} {btnDisabled} px-6 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-r-none"
-				onclick={onRun}
-				disabled={!slot.enabled}
-			>
-				<Play class="w-3.5 h-3.5" />
-				<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
-			</button>
+			{#if slot.plainRun}
+				<button
+					class="{btn} {btnDisabled} px-6 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-r-none"
+					onclick={onRun}
+					disabled={!slot.enabled}
+				>
+					<Play class="w-3.5 h-3.5" />
+					<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
+				</button>
+			{/if}
 			<!-- The Run menu: the project's specs, "Run this group" when the
-			     user stands inside one, and the dialog for a one-off. -->
+			     user stands inside one, and the dialog for a one-off. The bar
+			     sits at the bottom of the screen, so the menu opens UPWARD
+			     and the chevron points up while closed, down while open (it
+			     is then the thing to click to close it). Without a Run
+			     button beside it the chevron is a rounded button of its own. -->
 			<button
-				class="{btn} {btnDisabled} px-1.5 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-l-none border-l border-l-zinc-700"
+				class="{btn} {btnDisabled} px-1.5 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 {slot.plainRun ? 'rounded-l-none border-l border-l-zinc-700' : ''}"
 				onclick={() => { specMenuOpen = !specMenuOpen; if (specMenuOpen) onOpenSpecMenu?.(); }}
 				disabled={!slot.enabled}
-				title="Run a spec"
+				title={specMenuOpen ? 'Close' : 'Run a saved example, this group, or a one-off'}
 			>
-				<ChevronDown class="w-3.5 h-3.5" />
+				<ChevronUp class="w-3.5 h-3.5 transition-transform {specMenuOpen ? 'rotate-180' : ''}" />
 			</button>
 			{#if specMenuOpen}
-				<div class="absolute right-0 top-full mt-1 z-50 min-w-64 bg-white border rounded-lg shadow-lg p-1 text-xs">
+				<div class="absolute right-0 bottom-full mb-1 z-50 min-w-64 bg-white border rounded-lg shadow-lg p-1 text-xs">
 					{#if focusedGroup}
 						<button class="w-full text-left px-2 py-1.5 rounded hover:bg-muted font-medium" onclick={() => { specMenuOpen = false; onOpenSpecDialog?.(specForAction('group', focusedGroup)); }}>
 							Run this group ({focusedGroup})…

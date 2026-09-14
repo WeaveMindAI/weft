@@ -97,7 +97,7 @@ its own type, `null` is an error. `key?:` makes the created port optional.
 
 ````weft
 step = ExecPython -> (out: String) {
-  code: @file("scripts/step.py")
+  code: @file("assets/scripts/step.py")
   text: draft.answer      # a String port, from the wire
   limit: 3                # a Number port, from the literal
   notes?: review.notes    # optional: a closure here does not skip the node
@@ -434,6 +434,17 @@ may hold its own source.
 
 Reuse across files: `triage = @include("triage.weft")`, where the included
 file is exactly one anonymous top-level group; its ports become `triage`'s.
+The file is compiled ONCE and every `@include` of it is a call: a run reaching
+`triage` sends its port values into the file's one body under a frame naming
+the call site, and the results come back to that site alone, the way a loop's
+one body runs once per iteration. The two nest freely. An included file has
+no name you write or read: a node inside is always addressed through the site
+the way the source reads. `weft events <run> --node triage.classify` shows
+that one use of it and every row prints its node that way, `weft run --group
+triage` runs the call, and a cut inside the file is spelled the same
+(`--from triage.classify`, `--target triage.classify`): it runs inside that
+one call. The same file included twice reads apart (`triage.classify`,
+`again.classify`).
 
 ## Loops
 
@@ -491,8 +502,8 @@ emit back.
 | `@asset("x.txt", String)` | a text file's contents inline | no |
 
 `@file` is bidirectional (the editor writes edits back into the file) so
-binary types are refused; it is the marker for `prompts/`, `scripts/`,
-`sql/`; its type defaults to `String`. `@asset` ALWAYS names its type, and
+binary types are refused; it is the marker for `assets/prompts/`,
+`assets/scripts/` and the like; its type defaults to `String`. `@asset` ALWAYS names its type, and
 a file type names one kind: `Image`, `Video`, `Audio`, or `Blob` (never
 `File` or `Media`; the compiler never guesses a kind from a name or bytes).
 A file-typed `@asset` resolves through the build's asset sync

@@ -115,7 +115,7 @@ const plugin = async ({ directory }: { directory: string }) => ({
       const edited = absolutePath(directory, path)
       const root = await projectRoot(edited)
       if (!root) continue
-      const target = isWeftSource(path) ? edited : join(root, "main.weft")
+      const target = isWeftSource(path) ? edited : join(root, "src", "main.weft")
       if (await Bun.file(target).exists()) targets.add(target)
     }
 

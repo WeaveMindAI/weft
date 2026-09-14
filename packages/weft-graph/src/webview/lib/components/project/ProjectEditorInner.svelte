@@ -18,10 +18,10 @@
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
-	import type { LoopIteration } from "../../../../protocol";
+	import { callPathOf, locatedKey, type Frame } from "../../../../protocol";
 	import { isContainerNodeType, isLoopNodeType, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible } from "../../types";
 	import RunSpecDialog from './RunSpecDialog.svelte';
-	import { groupOfPrefix, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
+	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
 	import type { EditOp, SourceLocation, TextEdit } from "../../../../protocol";
 	import { SHOULD_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
@@ -86,7 +86,7 @@
 		infraFeedByNode,
 		signalFeedByNode,
 		onOpenInclude = () => {},
-		execPrefix = '',
+		callPath = [],
 		fileContents = {},
 	}: {
 		project: ProjectDefinition;
@@ -107,10 +107,13 @@
 		onResyncSource: () => Promise<{ project: ProjectDefinition; weftCode: string } | null>;
 		// Navigate into an @include'd file; host opens it + pushes a back-stack.
 		onOpenInclude?: (path: string, alias: string) => void;
-		// Dotted alias chain (e.g. `c.`) prepended to node ids for execution
-		// value lookup when navigated into an included file. The Return
-		// button itself lives in the GraphToolbar (App level), not here.
-		execPrefix?: string;
+		// The call sites descended through to reach this file, outermost
+		// first. An included file's nodes carry the file's own id in the
+		// journal whatever site called them, so the ids match this view as
+		// they are; which call a row belongs to is its call frames, and only
+		// the rows under this path are shown. The Return button itself lives
+		// in the GraphToolbar (App level), not here.
+		callPath?: string[];
 		// Resolved content of @file targets, keyed by the marker's relative
 		// path. The display value for file-backed fields (config holds only
 		// the `@file(...)` marker, never the resolved content).
@@ -179,8 +182,8 @@
 
 	// VS Code embedding: dashboard chrome (right sidebar, code
 	// panel, mobile notice, export dialog) is removed. The text
-	// editor is the .weft tab in column 2; the activity-bar
-	// Inspector handles node inspection.
+	// editor is the .weft tab in column 2; node inspection is the
+	// magnifier on each node card, which opens ExecutionInspector.
 
 	// ── The projection engine ──────────────────────────────────────────────
 	// The visible graph is a pure function of (truth, pendingOps, layoutCode),
@@ -561,12 +564,30 @@
 		onOpenInclude(path, alias);
 	}
 
-	/** Map a local node id to its execution-journal key. When navigated into
-	 *  an included file, journal events are keyed by the fully-qualified id
-	 *  (e.g. `c.strip`) while this view's nodes are bare (`strip`), so prepend
-	 *  the accumulated alias prefix. No-op at the top level (empty prefix). */
+	/** A node's execution-journal key: its id, in every view. An included
+	 *  file's nodes are journaled under the file's own id (`C.strip`), which
+	 *  is the id this view gives them, so no prefix is added; which CALL a
+	 *  row belongs to is its call frames, filtered in `readOverlayCtx`. */
 	function execKey(localId: string): string {
-		return execPrefix + localId;
+		return localId;
+	}
+
+	/** The rows of a run that belong to the calls this view descended
+	 *  through: a row's call frames, in order, equal `callPath`. At the top
+	 *  level that is every row with no call frame; inside an included file
+	 *  it is the rows of the one call on screen, and the same file reached
+	 *  through another site keeps its own. */
+	function rowsUnderCallPath(
+		rows: Record<string, import('../../types').NodeExecution[]>,
+		path: readonly string[],
+	): Record<string, import('../../types').NodeExecution[]> {
+		const same = (a: readonly string[]) => a.length === path.length && a.every((s, i) => s === path[i]);
+		const out: Record<string, import('../../types').NodeExecution[]> = Object.create(null);
+		for (const [id, list] of Object.entries(rows)) {
+			const kept = list.filter((r) => same(callPathOf(r.frames)));
+			if (kept.length > 0) out[id] = kept;
+		}
+		return out;
 	}
 
 	/** Whose key a group's members spent, folded for the group's synthetic
@@ -885,8 +906,8 @@
 						// even when two containers share a local label in different scopes.
 						// A container's signature IS its whole surface, so the full
 						// list is written.
-						const inputs = toPortSigs(nextInputs);
-						const outputs = toPortSigs(nextOutputs);
+						const inputs = toPortSigs(nextInputs, 'input');
+						const outputs = toPortSigs(nextOutputs, 'output');
 						if (kind === 'Loop') {
 							ops.push({ op: 'updateLoopPorts', loopId: nodeId, inputs, outputs });
 						} else {
@@ -1646,7 +1667,7 @@
 		/// The followed run's node set (`null` = whole graph, `undefined`
 		/// = no run or its birth has not arrived).
 		runScope: ReadonlySet<string> | null | undefined;
-		execPrefix: string;
+		callPath: string[];
 		projectNodes: import('../../types').NodeInstance[];
 	};
 
@@ -1671,7 +1692,7 @@
 		}
 		return {
 			nodeOutputs: state?.nodeOutputs || {},
-			nodeExecutions: state?.nodeExecutions || {},
+			nodeExecutions: rowsUnderCallPath(state?.nodeExecutions || {}, callPath),
 			busLogByBus: state?.busLogByBus || {},
 			busesByNode,
 			busMetaByBus: state?.busMetaByBus ?? {},
@@ -1689,13 +1710,13 @@
 			runScope: executionState?.scope === undefined ? undefined
 				: executionState.scope === null ? null
 				: new Set(executionState.scope),
-			// Touch execPrefix in the tracked region so a navigation that only
-			// changes the exec-id prefix re-decorates (decorate reads it via
-			// execKey). Untrack the projection: the STRUCTURAL effect already
-			// owns repaint-on-projection-change, so reading fold here too would
+			// Read in the tracked region so a navigation that only changes the
+			// call path re-decorates (the rows above are filtered by it).
+			// Untrack the projection: the STRUCTURAL effect already owns
+			// repaint-on-projection-change, so reading fold here too would
 			// make every keystroke run BOTH effects (a redundant second full
 			// decorate pass on the hottest path).
-			execPrefix,
+			callPath,
 			projectNodes: untrack(() => fold.project.nodes),
 		};
 	}
@@ -1707,9 +1728,9 @@
 	 *  paths cannot drift. */
 	/// Is a row at `frames` inside the iteration at `iteration`: the same
 	/// frame stack, or one that extends it (a nested loop's own frames).
-	function withinFrames(frames: LoopIteration[], iteration: LoopIteration[]): boolean {
+	function withinFrames(frames: Frame[], iteration: Frame[]): boolean {
 		return frames.length >= iteration.length
-			&& iteration.every((f, i) => frames[i].index === f.index);
+			&& iteration.every((f, i) => JSON.stringify(frames[i]) === JSON.stringify(f));
 	}
 
 	function decorate(ns: Node[], es: Edge[], ctx: OverlayCtx): { nodes: Node[]; edges: Edge[] } {
@@ -1861,7 +1882,7 @@
 					// dimmed, no status class, never skipped or empty. One more
 					// case of the dimming the subgraph highlight already paints.
 					const notInRun = ctx.runScope !== undefined && ctx.runScope !== null
-						&& !ctx.runScope.has(execKey(n.id)) && executions.length === 0;
+						&& !ctx.runScope.has(locatedKey(n.id, ctx.callPath)) && executions.length === 0;
 					// Inheritance is NOT one of these: it is orthogonal to
 					// status, and the node components paint it themselves
 					// (`node-inherited-glow`, from `latestExecution.inheritedFrom`).
@@ -1870,7 +1891,8 @@
 					// is what `GroupNode`'s own styling keys off, and the class
 					// it gained instead (`node-inherited`) is defined nowhere.
 					const nodeClass = notInRun ? 'run-dimmed'
-						: execStatus === 'running' || execStatus === 'waiting_for_input' ? 'node-running'
+						: execStatus === 'running' ? 'node-running'
+						: execStatus === 'waiting_for_input' ? 'node-waiting'
 						: execStatus === 'failed' ? 'node-failed'
 						: execStatus === 'completed' || execStatus === 'skipped' ? 'node-completed'
 						: '';
@@ -2118,7 +2140,7 @@
 	let specDialogOpen = $state(false);
 	/// The group the user stands in (an include's alias chain), so the
 	/// dialog and the Run menu put it first.
-	const focusedGroup = $derived(groupOfPrefix(execPrefix));
+	const focusedGroup = $derived(groupOfCallPath(callPath));
 	const menuSpecs = $derived(orderSpecsForMenu(specs, focusedGroup));
 	function openSpecDialog(initial: RunSpec): void {
 		specDialogInitial = initial;
@@ -3639,8 +3661,8 @@
 					// GHOST inputs (they re-derive from the copied carry list on
 					// apply). Then copy the source config AFTER the ports exist.
 					// (Children are NOT deep-copied: the shell duplicates.)
-					const sigInputs = toPortSigs(inputsOf(orig.data.inputs).filter(headerWorthy));
-					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs));
+					const sigInputs = toPortSigs(inputsOf(orig.data.inputs).filter(headerWorthy), 'input');
+					const sigOutputs = toPortSigs(outputsOf(orig.data.outputs), 'output');
 					if (sigInputs.length > 0 || sigOutputs.length > 0) {
 						ops.push(isLoop
 							? { op: 'updateLoopPorts', loopId: scopedId, inputs: sigInputs, outputs: sigOutputs }
@@ -3725,11 +3747,18 @@
 	// narrower local type once dropped it silently). toPortSigs writes a
 	// CONTAINER signature, which is its whole surface: the rendered type
 	// IS the spelling there, and declaredType deliberately plays no part.
-	function toPortSigs(ports: HeaderPortLike[]): import('../../../../protocol').EditPortSig[] {
+	function toPortSigs(ports: HeaderPortLike[], side: 'input' | 'output'): import('../../../../protocol').EditPortSig[] {
 		// portRequired: the ONE missing-value polarity (Rust's serde
 		// default: not required); rendered ports always carry the flag,
-		// so this only matters for a hand-built port object.
-		return (ports ?? []).map(p => ({ name: p.name, required: portRequired(p), portType: p.portType }));
+		// so this only matters for a hand-built port object. An OUTPUT
+		// has no optionality at all (the language has no `?` on one, and
+		// the edit server refuses a sig asking for it), so its flag is
+		// never read: whatever a port object says, the sig says `true`.
+		return (ports ?? []).map(p => ({
+			name: p.name,
+			required: side === 'output' || portRequired(p),
+			portType: p.portType,
+		}));
 	}
 
 	/// Flush every pending debounced edit. Called before the host kicks off
@@ -4087,7 +4116,7 @@
 						</button>
 						<button
 							class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', execKey(targetNodeId))); }}
+							onclick={() => { contextMenu = null; openSpecDialog(specForAction('from', addressOf(callPath, targetNodeId))); }}
 						>
 							<span class="text-muted-foreground text-xs">▶</span>
 							<span>Run from here…</span>
@@ -4095,7 +4124,7 @@
 						{#if isContainerNodeType(nodeToEdit.data.nodeType) || nodeToEdit.data.includePath}
 							<button
 								class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
-								onclick={() => { contextMenu = null; openSpecDialog(specForAction('group', execKey(targetNodeId))); }}
+								onclick={() => { contextMenu = null; openSpecDialog(specForAction('group', addressOf(callPath, targetNodeId))); }}
 							>
 								<span class="text-muted-foreground text-xs">▶</span>
 								<span>Run this group…</span>

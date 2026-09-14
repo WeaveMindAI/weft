@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 
 use super::ProjectDefinition;
+use crate::frames::Located;
 
 /// A hex-encoded SHA-256 digest. 64 chars.
 pub type SourceHash = String;
@@ -68,24 +69,35 @@ impl ProgramIdentity {
 
     /// Each result depends on its actual data paths and enclosing controls.
     /// Whole loops share one dependency identity and cannot reuse a partial body.
-    pub fn slice_hashes(&self, project: &ProjectDefinition) -> anyhow::Result<BTreeMap<String, SourceHash>> {
+    /// One digest per PLACE: a node of an included file has one per call
+    /// that reaches it, since what feeds it there is that call's chain.
+    pub fn slice_hashes(&self, project: &ProjectDefinition) -> anyhow::Result<BTreeMap<Located, SourceHash>> {
         anyhow::ensure!(self.definition_hash == compute_definition_hash(project)?, "program identity does not match its graph");
-        project.nodes.iter().map(|node| {
-            let selection = super::selection::RunSelection::dependencies(project, std::slice::from_ref(&node.id));
+        super::selection::every_place(project).into_iter().map(|place| {
+            let selection = super::selection::RunSelection::dependencies(project, std::slice::from_ref(&place));
+            let ids: HashSet<String> = selection.nodes.iter().map(|p| p.id.clone()).collect();
             let mut slice = project.clone();
-            slice.nodes.retain(|node| selection.nodes.contains(&node.id));
+            slice.nodes.retain(|node| ids.contains(&node.id));
             slice.nodes.sort_by(|a, b| a.id.cmp(&b.id));
-            slice.edges.retain(|edge| selection.edges.contains(&edge.id));
-            for boundary in slice.nodes.iter_mut().filter(|node| node.node_type == "Passthrough") {
-                let ports = selection.boundary_ports.get(&boundary.id);
-                let relevant = |port: &str| ports.is_some_and(|ports| ports.contains(port));
+            slice.edges.retain(|edge| selection.edges.iter().any(|wire| wire.id == edge.id));
+            for boundary in slice.nodes.iter_mut().filter(|node| super::boundary_types::is_port_selected(&node.node_type)) {
+                // The ports read at any place the boundary is at in this slice.
+                let ports: std::collections::BTreeSet<&String> = selection.boundary_ports.iter()
+                    .filter(|(at, _)| at.id == boundary.id).flat_map(|(_, ports)| ports).collect();
+                let relevant = |port: &str| ports.iter().any(|p| p.as_str() == port);
                 boundary.inputs.retain(|port| relevant(&port.name));
                 boundary.outputs.retain(|port| relevant(&port.name));
                 boundary.port_literals.retain(|port, _| relevant(port));
             }
             let mut hasher = Sha256::new();
-            hasher.update(b"weft-production-slice-v1\n");
-            hash_definition_slice(&mut hasher, &slice, &selection.dispatchable_nodes())?;
+            hasher.update(b"weft-production-slice-v2\n");
+            hash_definition_slice(&mut hasher, &slice, &ids)?;
+            // The places themselves: two slices of one id under different
+            // calls hold the same nodes and differ in the chain of sites.
+            for place in &selection.nodes {
+                hasher.update(place.to_string().as_bytes());
+                hasher.update(b"\n");
+            }
             for member in &slice.nodes {
                 let implementation = self.implementations.get(&member.node_type)
                     .ok_or_else(|| anyhow::anyhow!("program identity is missing implementation '{}'", member.node_type))?;
@@ -94,7 +106,7 @@ impl ProgramIdentity {
                 hasher.update(implementation.as_bytes());
                 hasher.update(b"\n");
             }
-            Ok((node.id.clone(), hex(&hasher.finalize())))
+            Ok((place, hex(&hasher.finalize())))
         }).collect()
     }
 }
@@ -391,11 +403,11 @@ mod slice_tests {
         let mut changed = identity.clone();
         changed.implementations.insert("b".into(), "b2".into());
         let hashes = changed.slice_hashes(&graph).unwrap();
-        assert_eq!(hashes["a"], original["a"]);
-        assert_eq!(hashes["x"], original["x"]);
-        assert_ne!(hashes["b"], original["b"]);
+        assert_eq!(hashes[&Located::top("a")], original[&Located::top("a")]);
+        assert_eq!(hashes[&Located::top("x")], original[&Located::top("x")]);
+        assert_ne!(hashes[&Located::top("b")], original[&Located::top("b")]);
         changed.implementations.insert("a".into(), "a2".into());
-        assert_ne!(changed.slice_hashes(&graph).unwrap()["b"], hashes["b"]);
+        assert_ne!(changed.slice_hashes(&graph).unwrap()[&Located::top("b")], hashes[&Located::top("b")]);
         graph.nodes.reverse();
         changed.definition_hash = compute_definition_hash(&graph).unwrap();
         let reversed = changed.slice_hashes(&graph).unwrap();
@@ -457,7 +469,7 @@ mod slice_tests {
         ProgramIdentity {
             definition_hash: compute_definition_hash(p).unwrap(), binary_hash: "worker".into(),
             implementations: p.nodes.iter().map(|node| (node.node_type.clone(), "code".into())).collect(),
-        }.slice_hashes(p).unwrap()[node].clone()
+        }.slice_hashes(p).unwrap()[&Located::top(node)].clone()
     }
 
     #[test]

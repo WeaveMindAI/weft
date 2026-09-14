@@ -264,7 +264,11 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       }
       rebuilt = [];
       const seen = new Set<string>();
-      for (let offset = 0; offset < this.loaded; offset += ExecutionsProvider.PAGE_SIZE) {
+      // The list is the open project's runs and nothing else. With no
+      // project open there is nothing to list, so nothing is fetched:
+      // an unscoped read returned every project's history, and that is
+      // what the view showed until the graph opened and pinned one.
+      for (let offset = 0; projectId && offset < this.loaded; offset += ExecutionsProvider.PAGE_SIZE) {
         const page = await this.fetchPage(offset, projectId);
         total = page.total;
         for (const e of page.executions) {
@@ -389,10 +393,12 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     // A failed fetch is on screen, not just in the console: the rows
     // below it are the last successful list, not the current truth.
     if (this.lastError) nodes.push(new ListErrorNode(this.lastError));
-    // The server already ordered newest-first; no client sort.
-    for (const s of this.cache) {
-      nodes.push(new ExecutionNode(s, this.pinnedProject?.id === s.project_id));
+    if (!this.pinnedProject) {
+      nodes.push(new HintNode('Open a project to see its runs'));
+      return nodes;
     }
+    // The server already ordered newest-first; no client sort.
+    for (const s of this.cache) nodes.push(new ExecutionNode(s));
     if (this.cache.length < this.total) nodes.push(new LoadMoreNode(this.total - this.cache.length));
     return nodes;
   }
@@ -507,7 +513,7 @@ interface ExecutionPage {
 }
 
 export class ExecutionNode extends vscode.TreeItem {
-  constructor(public readonly summary: ExecutionSummary, pinned: boolean) {
+  constructor(public readonly summary: ExecutionSummary) {
     const statusIcon = {
       running: '$(sync~spin)',
       completed: '$(check)',
@@ -523,7 +529,7 @@ export class ExecutionNode extends vscode.TreeItem {
     this.id = summary.color;
     const tags = summary.tags;
     const tagged = tags.length > 0 ? `  ·  ${tags.join(', ')}` : '';
-    this.description = `${summary.status}${tagged}${pinned ? '' : '  ·  other project'}`;
+    this.description = `${summary.status}${tagged}`;
     this.tooltip = new vscode.MarkdownString(
       [
         `**exec** ${summary.color}`,

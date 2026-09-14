@@ -16,7 +16,7 @@ mention is gone from Cline's docs, so nothing here ships into it.
 
 **Cline has no way to define a specialist.** Its subagents are read-only
 research helpers it spawns on its own judgement, with no file where you could
-give one a prompt of its own, so the five specialists are skills that Tangle
+give one a prompt of its own, so the six specialists are skills that Tangle
 loads and becomes, one at a time, in the same conversation. For the two that
 only ever read, Tangle is told it can also ask for parallel research in a
 sentence and let Cline spread the search across its own subagents. Each one opens with a note saying exactly that: the scope
@@ -35,7 +35,7 @@ where the discipline is entirely the model's.
 
 ## What is here
 
-Tangle is one persona plus thirteen skills, five specialists and six commands.
+Tangle is one persona plus fifteen skills, six specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

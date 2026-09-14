@@ -301,7 +301,7 @@
         vec![
             ExecEvent::NodeKicked {
                 color: color(),
-                node_id: "n".into(),
+                node_id: "n".into(), frames: vec![],
                 firing: true,
                 payload: Some(json!({"body": 1})),
                 port_snapshot: None,

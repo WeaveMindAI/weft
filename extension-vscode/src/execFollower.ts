@@ -23,7 +23,7 @@ import type {
   CancelCause,
   CorruptionSite,
   HostMessage,
-  LoopIteration,
+  Frame,
   LoopTerminationReason,
   NodeExecEvent,
   Seed,
@@ -42,14 +42,14 @@ export type DispatcherEvent = { event_id: string } & (
   // one was seeded from (`weft run --seed`); `provided_ports` names the
   // input ports supplied at a run's `--from` or `--group` start.
   // SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
-  | { kind: 'node_started'; color: string; node: string; frames: LoopIteration[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_suspended'; color: string; node: string; frames: LoopIteration[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_resumed'; color: string; node: string; frames: LoopIteration[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_cancelled'; color: string; node: string; frames: LoopIteration[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_completed'; color: string; node: string; frames: LoopIteration[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_failed'; color: string; node: string; frames: LoopIteration[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_skipped'; color: string; node: string; frames: LoopIteration[]; closed_ports: string[]; reason: SkipReason; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'port_type_mismatch'; color: string; node: string; frames: LoopIteration[]; port: string; expected: string; actual: string; project_id: string; at_unix: number }
+  | { kind: 'node_started'; color: string; node: string; frames: Frame[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_suspended'; color: string; node: string; frames: Frame[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_resumed'; color: string; node: string; frames: Frame[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_cancelled'; color: string; node: string; frames: Frame[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_completed'; color: string; node: string; frames: Frame[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_failed'; color: string; node: string; frames: Frame[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_skipped'; color: string; node: string; frames: Frame[]; closed_ports: string[]; reason: SkipReason; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'port_type_mismatch'; color: string; node: string; frames: Frame[]; port: string; expected: string; actual: string; project_id: string; at_unix: number }
   | { kind: 'execution_completed'; color: string; project_id: string; outputs: unknown; at_unix: number }
   | { kind: 'execution_failed'; color: string; project_id: string; error: string; at_unix: number }
   | { kind: 'execution_cancelled'; color: string; project_id: string; reason: string; cause?: CancelCause; at_unix: number }
@@ -82,7 +82,7 @@ export type DispatcherEvent = { event_id: string } & (
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
   // SYNC: inherited cost <-> crates/weft-dispatcher/src/events.rs CostReported
-  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: LoopIteration[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
+  | { kind: 'cost_reported'; color: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; cost_id: string; service: string; amount_usd: number | null; origin: 'their-own' | 'ours'; at_unix: number }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -114,10 +114,10 @@ export type DispatcherEvent = { event_id: string } & (
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
   // SYNC: loop_instantiated <-> crates/weft-dispatcher/src/events.rs LoopInstantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
-  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; iter_cap: number | null; parallel: boolean; at_unix: number }
-  | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; at_unix: number }
-  | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; index: number; done_vote?: boolean | null; at_unix: number }
-  | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: LoopIteration[]; reason: LoopTerminationReason; at_unix: number }
+  | { kind: 'loop_instantiated'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; iter_cap: number | null; parallel: boolean; at_unix: number }
+  | { kind: 'loop_iteration_launched'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; at_unix: number }
+  | { kind: 'loop_out_fired'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; done_vote?: boolean | null; at_unix: number }
+  | { kind: 'loop_terminated'; color: string; project_id: string; group_id: string; parent_frames: Frame[]; reason: LoopTerminationReason; at_unix: number }
   // Graph-level participation: a node is wired to a bus. Derived
   // dispatcher-side from emitted pulses carrying a bus marker,
   // so source AND target nodes get one BusParticipant edge each.

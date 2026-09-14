@@ -71,8 +71,8 @@ pub async fn parse(file: Option<std::path::PathBuf>) -> Result<()> {
         }
         None => (uuid::Uuid::nil(), FsCatalog::empty()),
     };
-    let base = base_dir_for(file.as_deref(), project.as_ref().map(|p| p.root.as_path()));
-    let resp = do_parse(&source, id, base.as_deref(), &catalog, file.as_deref());
+    let anchor = anchor_for(file.as_deref(), project.as_ref().map(|p| p.root.as_path()));
+    let resp = do_parse(&source, id, &anchor, &catalog, file.as_deref());
     println!("{}", serde_json::to_string(&resp).context("serialize parse response")?);
     Ok(())
 }
@@ -85,21 +85,15 @@ pub async fn parse(file: Option<std::path::PathBuf>) -> Result<()> {
 fn do_parse(
     source: &str,
     id: uuid::Uuid,
-    base: Option<&std::path::Path>,
+    anchor: &Anchor,
     catalog: &FsCatalog,
     file: Option<&std::path::Path>,
 ) -> ParseResponse {
-    // An anonymous top-level group takes its id from the filename (PascalCase),
-    // so the file's root carries the same id at parse, edit, and render. The
-    // compiler derives it; a normal project (named main group) ignores it.
-    let source_id = weft_compiler::source_name::derive_id(file);
-    // The CLI always reads `@file`/`@include` content from disk; a `base` is the
-    // project root to resolve against, its absence means "outside a project."
-    let fs = match base {
-        Some(b) => weft_compiler::CompileFs::disk(b),
-        None => weft_compiler::CompileFs::none(),
-    };
-    let (project, diagnostics) = weft_compiler::parse_only(source, id, fs, catalog, Some(&source_id));
+    // An anonymous top-level group takes the file's body id (its path from
+    // the project root), so the file's root carries the same id at parse,
+    // edit, render and in the journal. A flat program ignores it.
+    let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), file);
+    let (project, diagnostics) = weft_compiler::parse_only(source, id, anchor.fs(), catalog, Some(&source_id));
     let catalog_map = collect_catalog(&project, catalog);
     ParseResponse { project, catalog: catalog_map, diagnostics }
 }
@@ -265,14 +259,14 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
         },
         None => None,
     };
-    // `@file`/`@include` base: the file's own dir, else the project root (so a
-    // bare `--file foo.weft` inside a project resolves relative paths against the
-    // root). SAME shared rule as the one-shot commands.
-    let base = base_dir_for(req.file.as_deref(), project.as_ref().map(|p| p.root.as_path()));
+    // `@file`/`@include` anchor: the file's own dir, else the program's `src/`
+    // (so a bare `--file foo.weft` inside a project resolves relative paths as
+    // the program would). SAME shared rule as the one-shot commands.
+    let anchor = anchor_for(req.file.as_deref(), project.as_ref().map(|p| p.root.as_path()));
 
     match req.kind {
         ServerRequestKind::Parse => {
-            match parse_source(&req.source, &project, base.as_deref(), req.file.as_deref(), catalogs, req.reload_catalog) {
+            match parse_source(&req.source, &project, &anchor, req.file.as_deref(), catalogs, req.reload_catalog) {
                 Ok(parse_resp) => envelope(id, &parse_resp),
                 Err(e) => ServerResponse { id, payload: None, error: Some(e) },
             }
@@ -329,7 +323,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
             };
             match warm_catalog(catalogs, &project.root, req.reload_catalog) {
                 Ok(cat) => {
-                    let v = do_validate(&req.source, project.id(), base.as_deref(), cat, req.file.as_deref(), mode);
+                    let v = do_validate(&req.source, project.id(), &anchor, cat, req.file.as_deref(), mode);
                     envelope(id, &v)
                 }
                 Err(e) => ServerResponse { id, payload: None, error: Some(e) },
@@ -339,7 +333,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
             // Apply the edit batch -> new source + the inverse text edit (undo).
             // Parse the result so the UI re-renders in one round-trip. Edit
             // failure is loud (the frontend keeps the pre-edit source).
-            let source_id = weft_compiler::source_name::derive_id(req.file.as_deref());
+            let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), req.file.as_deref());
             // Edit ops validate written TYPE strings, so the project's
             // registry must be active (a declared name in a port
             // override is valid exactly when the catalog knows it).
@@ -352,7 +346,6 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
             };
             let (new_source, inverse) = match weft_compiler::edit::apply_edits(
                 &req.source,
-                base.as_deref(),
                 &source_id,
                 &req.ops,
                 registry,
@@ -363,7 +356,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
                 // (it would end up in a user-facing toast).
                 Err(e) => return ServerResponse { id, payload: None, error: Some(e.to_string()) },
             };
-            edit_envelope(id, new_source, inverse, &project, &base, &req, catalogs)
+            edit_envelope(id, new_source, inverse, &project, &anchor, &req, catalogs)
         }
         ServerRequestKind::ApplyEdit => {
             // Undo/redo: replay a raw text edit, parse the result. The returned
@@ -378,7 +371,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
                 Err(e) => return ServerResponse { id, payload: None, error: Some(e.to_string()) },
             };
             let inverse = weft_compiler::edit::invert_text_edit(&req.source, &new_source);
-            edit_envelope(id, new_source, inverse, &project, &base, &req, catalogs)
+            edit_envelope(id, new_source, inverse, &project, &anchor, &req, catalogs)
         }
     }
 }
@@ -391,11 +384,11 @@ fn edit_envelope(
     new_source: String,
     inverse: weft_compiler::edit::TextEdit,
     project: &Option<Project>,
-    base: &Option<PathBuf>,
+    anchor: &Anchor,
     req: &ServerRequest,
     catalogs: &mut HashMap<PathBuf, FsCatalog>,
 ) -> ServerResponse {
-    match parse_source(&new_source, project, base.as_deref(), req.file.as_deref(), catalogs, req.reload_catalog) {
+    match parse_source(&new_source, project, anchor, req.file.as_deref(), catalogs, req.reload_catalog) {
         Ok(parse) => envelope(id, &EditResponse { source: new_source, parse, inverse }),
         Err(e) => ServerResponse { id, payload: None, error: Some(e) },
     }
@@ -417,8 +410,9 @@ fn resolve_source(
     let source = if main == reader.file { source.to_string() }
         else { project.read_main_weft().map_err(|error| error.to_string())? };
     let catalog = warm_catalog(catalogs, &project.root, reload)?;
+    let src_dir = project.src_dir();
     weft_compiler::compile_enriched_with_diagnostics(&source, project.id(),
-        weft_compiler::CompileFs::with_reader(&reader, Some(&project.root)), catalog)
+        weft_compiler::CompileFs::with_reader(&reader, Some(&project.root)).anchored_at(Some(&src_dir)), catalog)
         .map_err(|diagnostics| weft_compiler::render_diagnostics(&diagnostics))
 }
 
@@ -428,8 +422,8 @@ struct BufferFileReader<'a> {
 }
 
 impl weft_compiler::FileReader for BufferFileReader<'_> {
-    fn resolve_and_read(&self, base: &std::path::Path, relative: &std::path::Path) -> std::result::Result<weft_compiler::ResolvedFile, String> {
-        let mut file = weft_compiler::DiskFileReader.resolve_and_read(base, relative)?;
+    fn resolve_and_read(&self, root: &std::path::Path, base: &std::path::Path, relative: &std::path::Path) -> std::result::Result<weft_compiler::ResolvedFile, String> {
+        let mut file = weft_compiler::DiskFileReader.resolve_and_read(root, base, relative)?;
         if file.identity == self.file { file.content = self.source.to_string(); }
         Ok(file)
     }
@@ -462,7 +456,7 @@ fn preview_program(
 fn parse_source(
     source: &str,
     project: &Option<Project>,
-    base: Option<&std::path::Path>,
+    anchor: &Anchor,
     file: Option<&std::path::Path>,
     catalogs: &mut HashMap<PathBuf, FsCatalog>,
     reload_catalog: bool,
@@ -470,9 +464,9 @@ fn parse_source(
     match project {
         Some(p) => {
             let cat = warm_catalog(catalogs, &p.root, reload_catalog)?;
-            Ok(do_parse(source, p.id(), base, cat, file))
+            Ok(do_parse(source, p.id(), anchor, cat, file))
         }
-        None => Ok(do_parse(source, uuid::Uuid::nil(), base, &FsCatalog::empty(), file)),
+        None => Ok(do_parse(source, uuid::Uuid::nil(), anchor, &FsCatalog::empty(), file)),
     }
 }
 
@@ -506,15 +500,42 @@ fn envelope<T: Serialize>(id: u64, payload: &T) -> ServerResponse {
 /// one-shot commands (`parse`, `validate`) and the parse-server, all of which
 /// discover the project ONCE and pass its root here, so they can't drift on
 /// where a bare-filename's relative paths resolve.
-fn base_dir_for(file: Option<&std::path::Path>, project_root: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
-    file_dir(file).or_else(|| project_root.map(|r| r.to_path_buf()))
+/// Where a source's markers resolve. `root` is the project (the wall a
+/// path may not leave, and what every path is spelled from); `base` is
+/// what a relative path is joined onto: the file's own directory, else the
+/// program's `src/`. Outside a project the file's directory is both, and a
+/// bare snippet has neither (a marker is then a compile error).
+struct Anchor {
+    root: Option<PathBuf>,
+    base: Option<PathBuf>,
+}
+
+impl Anchor {
+    /// The CLI always reads `@file`/`@include` content from disk.
+    fn fs(&self) -> weft_compiler::CompileFs<'_> {
+        match (&self.root, &self.base) {
+            (Some(root), Some(base)) => weft_compiler::CompileFs::disk(root).anchored_at(Some(base)),
+            _ => weft_compiler::CompileFs::none(),
+        }
+    }
+}
+
+fn anchor_for(file: Option<&std::path::Path>, project_root: Option<&std::path::Path>) -> Anchor {
+    let dir = file_dir(file);
+    match project_root {
+        Some(root) => Anchor {
+            root: Some(root.to_path_buf()),
+            base: Some(dir.unwrap_or_else(|| root.join(weft_compiler::project::SRC_DIR))),
+        },
+        None => Anchor { root: dir.clone(), base: dir },
+    }
 }
 
 /// The source file's own directory, or `None` for no `--file` OR a bare
 /// filename. `Path::parent()` of `"foo.weft"` is `Some("")` (the empty path),
 /// not `None`; an empty base would silently resolve `@file`/`@include` against
 /// the process CWD, so an empty parent is treated as absent (caller falls back
-/// to the project root). Pure, so the bare-filename branch is unit-tested.
+/// to the program's `src/`). Pure, so the bare-filename branch is unit-tested.
 fn file_dir(file: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
     file.and_then(|f| f.parent())
         .filter(|p| !p.as_os_str().is_empty())
@@ -532,11 +553,11 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
     // Same single-discovery shape as `parse`: derive the `@file`/`@include` base
     // from the project we already resolved, not a second `ctx.project()` call.
-    let base = base_dir_for(file.as_deref(), Some(project.root.as_path()));
+    let anchor = anchor_for(file.as_deref(), Some(project.root.as_path()));
     // Runtime: the terminal command is the complete pre-flight check (graph
     // shape plus runtime rules like missing credentials); callers that want
     // the structural tier go through the parse-server's mode field.
-    let resp = do_validate(&source, project.id(), base.as_deref(), &catalog, file.as_deref(), ValidationMode::Runtime);
+    let resp = do_validate(&source, project.id(), &anchor, &catalog, file.as_deref(), ValidationMode::Runtime);
     println!("{}", serde_json::to_string(&resp).context("serialize validate response")?);
     Ok(())
 }
@@ -549,22 +570,18 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
 fn do_validate(
     source: &str,
     id: uuid::Uuid,
-    base: Option<&std::path::Path>,
+    anchor: &Anchor,
     catalog: &FsCatalog,
     file: Option<&std::path::Path>,
     mode: ValidationMode,
 ) -> ValidateResponse {
     // Same anonymous-group id derivation as parse, so a standalone file's
-    // diagnostics reference the same filename-derived id the editor renders.
-    let source_id = weft_compiler::source_name::derive_id(file);
-    let fs = match base {
-        Some(b) => weft_compiler::CompileFs::disk(b),
-        None => weft_compiler::CompileFs::none(),
-    };
+    // diagnostics reference the same id the editor renders.
+    let source_id = weft_compiler::source_name::file_id(anchor.root.as_deref(), file);
     let (_, diagnostics) = weft_compiler::compile_strict(
         source,
         id,
-        fs,
+        anchor.fs(),
         catalog,
         mode,
         Some(&source_id),
@@ -607,8 +624,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("weft.toml"), "[package]\nname='preview'\nid='00000000-0000-0000-0000-000000000099'\nversion='0.1.0'\n").unwrap();
         std::fs::create_dir(dir.path().join("nodes")).unwrap();
-        std::fs::write(dir.path().join("main.weft"), "batch = @include(\"batch.weft\")\n").unwrap();
-        let include = dir.path().join("batch.weft");
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.weft"), "batch = @include(\"batch.weft\")\n").unwrap();
+        let include = dir.path().join("src/batch.weft");
         let saved = "Group(text: String) -> (out: String) {\n self.out = self.text\n}\n";
         std::fs::write(&include, saved).unwrap();
         let project = weft_compiler::project::Project::load(dir.path()).unwrap();
@@ -656,7 +674,7 @@ mod tests {
     #[test]
     fn file_dir_treats_bare_filename_as_absent() {
         // A bare filename has an empty parent; file_dir must return None (so
-        // base_dir_for falls back to the project root) rather than Some("")
+        // anchor_for falls back to the program's `src/`) rather than Some("")
         // which would resolve @file against the CWD.
         assert_eq!(file_dir(None), None);
         assert_eq!(file_dir(Some(Path::new("foo.weft"))), None);

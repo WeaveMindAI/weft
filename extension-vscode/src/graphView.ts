@@ -17,7 +17,7 @@ import { runWeftJson, projectDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc, textTabsForPath } from './tabs';
 import type { ActionErrorDetails, CatalogEntry, DeactivationSpec, EditOp, ErrorVerb, HostMessage, LiveDataItem, ParseResponse, ProjectDefinition, ResolveSpecResponse, RunSpec, SourceLocation, TextEdit, WebviewMessage } from '../../packages/weft-graph/src/protocol';
-import { exampleNameProblem, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
+import { exampleNameProblem, groupOfCallPath, parseRunSpec, parseSuppliedJson, specToRunArgs } from '../../packages/weft-graph/src/run-spec';
 import type { BakeSummary } from '../../packages/weft-graph/src/run-spec';
 import * as nodeFs from 'node:fs';
 import { typeReferencesFile } from '../../packages/weft-graph/src/protocol';
@@ -40,7 +40,7 @@ export class GraphViewController {
   /// Include-navigation back-stack. Each frame records the doc the user came
   /// from and the include alias they clicked to descend (used to build the
   /// execution-id prefix so sub-graph journal values render). `openInclude`
-  /// pushes; Return pops. The bottom is the project's main.weft.
+  /// pushes; Return pops. The bottom is the project's `src/main.weft`.
   private navStack: { doc: vscode.TextDocument; alias: string }[] = [];
   /// Set when the next parse is for a freshly-swapped file (navigation),
   /// so the webview treats its parseResult as a fresh mount (rebuild +
@@ -76,6 +76,7 @@ export class GraphViewController {
   private navHandler: ((focusedGroup: string | null) => void) | undefined;
   private followTogglePinHandler: (() => void) | undefined;
   private followCatchUpHandler: (() => void) | undefined;
+  private followClearHandler: (() => void) | undefined;
   private openSourceHandler: ((location?: SourceLocation) => void) | undefined;
   /// Stop / Cancel button on the action bar. Extension inspects
   /// the current ActionBarState to decide whether to kill the CLI
@@ -181,7 +182,7 @@ export class GraphViewController {
    *  still showing the old project's banner and nothing else would ever
    *  clear it. A version of `null` is how the webview is told there is no
    *  followed run here. */
-  private forgetExecVersion(): void {
+  forgetExecVersion(): void {
     if (!this.lastExecVersion) return;
     const color = this.lastExecVersion.color;
     this.lastExecVersion = undefined;
@@ -198,6 +199,7 @@ export class GraphViewController {
   private execVersionFor: string | undefined;
   setFollowTogglePinHandler(fn: () => void): void { this.followTogglePinHandler = fn; }
   setFollowCatchUpHandler(fn: () => void): void { this.followCatchUpHandler = fn; }
+  setFollowClearHandler(fn: () => void): void { this.followClearHandler = fn; }
   setOpenSourceHandler(fn: (location?: SourceLocation) => void): void { this.openSourceHandler = fn; }
   /// Stop / Cancel pressed on the action bar. Extension dispatches
   /// based on whether the bar is in cli_running (kill CLI) or
@@ -385,7 +387,7 @@ export class GraphViewController {
           // graph), not an include navigation (navigateInto sets watchedDoc to
           // its target before this fires, so that case sees no change here).
           const isDifferentDoc = ed.document !== this.watchedDoc;
-          // Drop any include back-stack so the Return button / execPrefix don't
+          // Drop any include back-stack so the Return button / call path don't
           // dangle against an unrelated graph.
           if (isDifferentDoc && this.navStack.length > 0) {
             this.navStack = [];
@@ -442,7 +444,7 @@ export class GraphViewController {
   /// only reports edits to a TextDocument VS Code still holds; once the
   /// source tab is closed, VS Code detaches that document at a moment
   /// nothing here controls, and a detached document's text is frozen. An
-  /// agent writing `main.weft` while only the graph is open then changes
+  /// agent writing `src/main.weft` while only the graph is open then changes
   /// nothing the change event can see, and the graph shows the old program
   /// until the source tab is opened by hand. This watcher is the other ear:
   /// a write on disk re-latches a live document (liveDoc re-opens the file
@@ -898,12 +900,14 @@ export class GraphViewController {
         const items = signalDisplayToLiveItems(body);
         this.post({ kind: 'signalDisplay', nodeId, state: 'ok', items });
       } catch (err) {
-        // 404 = the signal is not registered (the project is not
-        // activated, or its trigger setup failed and never registered).
-        // A distinct RESTING state, never collapsed into a healthy
-        // empty list; stale items from a previous activation clear.
-        // Anything else (listener down, BAD_GATEWAY) is a real
-        // failure; surface it.
+        // 404 = nothing is listening for this trigger: the project is
+        // not activated, its trigger setup never registered, or the
+        // listener that held it is gone or has forgotten it (the
+        // dispatcher folds all of those into one 404). A distinct
+        // RESTING state, never collapsed into a healthy empty list;
+        // stale items from a previous activation clear. Anything else
+        // (the dispatcher unreachable, BAD_GATEWAY) is a real failure;
+        // surface it.
         if (err instanceof HttpError && err.status === 404) {
           this.post({ kind: 'signalDisplay', nodeId, state: 'absent' });
           return;
@@ -1253,6 +1257,9 @@ export class GraphViewController {
       case 'followCatchUp':
         this.followCatchUpHandler?.();
         break;
+      case 'followClear':
+        this.followClearHandler?.();
+        break;
       case 'openSource':
         this.openSourceHandler?.(msg.location);
         break;
@@ -1404,11 +1411,14 @@ export class GraphViewController {
 
   /// The file-drop field's asset pick. Locally a PICKED file is referenced IN
   /// PLACE: the native dialog returns the real path, written into the
-  /// `@file(...)` ref as project-relative when under the root, absolute
-  /// otherwise (out-of-project refs are legal locally; the build's asset sync
-  /// reads them from wherever they are). A DRAG-DROPPED file arrives as bytes
-  /// (the browser hides its OS path), so it is stored as a project file under
-  /// `assets/` instead, never overwriting an existing different file.
+  /// `@file(...)` ref relative to the PROJECT ROOT when the pick is inside
+  /// the project (a marker's path is root-relative wherever it is written,
+  /// so the spelling is the same from `src/main.weft` and from any module),
+  /// absolute otherwise (out-of-project refs are legal locally; the build's
+  /// asset sync reads them from wherever they are). A DRAG-DROPPED file
+  /// arrives as bytes (the browser hides its OS path), so it is stored as a
+  /// project file under the root `assets/` instead, never overwriting an
+  /// existing different file, and referenced the same way.
   private async runPickAsset(
     requestId: number,
     accept: string | undefined,
@@ -1422,10 +1432,18 @@ export class GraphViewController {
         this.post({ kind: 'assetPicked', requestId, error: 'no project root (save the project first)' });
         return;
       }
+      // Inside the project a ref is spelled from the root, so it travels
+      // with the project; outside, the absolute path is the only honest
+      // spelling.
+      const refFor = (absolute: string): string => {
+        const fromRoot = nodePath.relative(root, absolute);
+        const inProject = !fromRoot.startsWith('..') && !nodePath.isAbsolute(fromRoot);
+        return inProject ? fromRoot.split(nodePath.sep).join('/') : absolute;
+      };
       if (dropped) {
         const paths: string[] = [];
         for (const file of dropped) {
-          paths.push(await this.storeDroppedFile(root, file));
+          paths.push(refFor(await this.storeDroppedFile(root, file)));
         }
         this.post({ kind: 'assetPicked', requestId, paths });
         return;
@@ -1434,14 +1452,7 @@ export class GraphViewController {
         canSelectMany: multiple,
         filters: dialogFiltersForAccept(accept),
       });
-      // A pick outside the project is referenced by its absolute path; one
-      // inside is referenced relative to the project, so the ref travels
-      // with the project.
-      const paths = (picked ?? []).map((uri) => {
-        const rel = nodePath.relative(root, uri.fsPath);
-        const inProject = !rel.startsWith('..') && !nodePath.isAbsolute(rel);
-        return inProject ? rel.split(nodePath.sep).join('/') : uri.fsPath;
-      });
+      const paths = (picked ?? []).map((uri) => refFor(uri.fsPath));
       this.post({ kind: 'assetPicked', requestId, paths });
     } catch (e) {
       this.post({
@@ -1452,8 +1463,8 @@ export class GraphViewController {
     }
   }
 
-  /// Store one dropped file under the project's `assets/`, and hand back
-  /// the path a ref writes. The browser hides a dropped file's OS path, so
+  /// Store one dropped file under the project's root `assets/`, and hand
+  /// back its absolute path. The browser hides a dropped file's OS path, so
   /// its bytes are what travels; a name collision takes a numeric suffix
   /// rather than clobbering a different file that happens to share a name.
   private async storeDroppedFile(
@@ -1471,7 +1482,7 @@ export class GraphViewController {
         await vscode.workspace.fs.stat(vscode.Uri.file(full));
       } catch {
         await vscode.workspace.fs.writeFile(vscode.Uri.file(full), bytes);
-        return `assets/${candidate}`;
+        return full;
       }
       const dot = leaf.lastIndexOf('.');
       candidate = dot > 0 ? `${leaf.slice(0, dot)}-${n}${leaf.slice(dot)}` : `${leaf}-${n}`;
@@ -1939,7 +1950,7 @@ export class GraphViewController {
     this.freshMount = true;
     // Send navState BEFORE the parse it depends on: open() posts parseResult
     // (freshMount), which remounts the editor and looks up execution values via
-    // execPrefix. navState (computed from the now-updated navStack) must arrive
+    // the call path. navState (computed from the now-updated navStack) must arrive
     // first so that lookup uses the correct prefix on the first render.
     this.sendNavState();
     await this.open(target, undefined, true);
@@ -2113,26 +2124,27 @@ export class GraphViewController {
     await this.open(previous.doc, undefined, true);
   }
 
-  /// Push the current navigation depth, file name, and execution-id prefix to
-  /// the webview. The prefix is the dotted alias chain descended through
-  /// (e.g. `c.` or `c.inner.`), so sub-graph journal values (keyed by the
-  /// fully-qualified id) line up with this file's bare node ids.
+  /// Push the current navigation depth, file name, and call path to the
+  /// webview. The call path is the chain of call sites descended through
+  /// (each the site's own id, `c` then `C.inner`), so the webview shows
+  /// the rows of the one call on screen. The executions view is told the
+  /// same place as a group address (`c.inner`).
   private sendNavState(): void {
     const fileName = this.watchedDoc?.uri.fsPath.split(/[\\/]/).pop() ?? '';
-    const execPrefix = this.navStack.map((f) => `${f.alias}.`).join('');
+    const callPath = this.navStack.map((f) => f.alias);
     void this.panel?.webview.postMessage({
       kind: 'navState',
       depth: this.navStack.length,
       fileName,
-      execPrefix,
+      callPath,
     });
-    this.navHandler?.(this.navStack.length === 0 ? null : this.navStack.map((f) => f.alias).join('.'));
+    this.navHandler?.(groupOfCallPath(callPath));
   }
 
   /** Fetch every node type available in the current project scope
    *  (stdlib + project-local `nodes/`) and ship the catalog to the
    *  webview so the command palette can list them all, even types
-   *  the current `main.weft` doesn't reference yet. */
+   *  the current `src/main.weft` doesn't reference yet. */
 
   private async sendGlobalCatalog(): Promise<void> {
     if (!this.watchedDoc) return;

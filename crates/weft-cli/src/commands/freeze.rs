@@ -38,8 +38,13 @@ pub async fn run(ctx: Ctx, name: String, color: Option<String>, expect: Vec<Stri
     }
     let rows = super::versions::replay_rows(&client, &run.color).await?;
     let mut expected = super::versions::output_wires(&client, &project_id, &run.color).await?;
+    // `--expect` is spelled from the top (`triage.last`); the run's
+    // nodes are the compiled ids. The project's definition maps one to
+    // the other; outside a project the spelling is the id.
+    let definition = ctx.project().ok().and_then(|p| weft_compiler::hash::load_enriched_project(p).ok().map(|(d, _)| d));
     for node in &expect {
-        if !expected.nodes.contains(node) { bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.color)); }
+        let id = definition.as_ref().map(|d| weft_core::project::resolve_address(d, node).0).unwrap_or_else(|| node.clone());
+        if !expected.nodes.contains(&id) { bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.color)); }
     }
     expected.focus = expect.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let facts = outside_facts(&rows);

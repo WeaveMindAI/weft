@@ -9,7 +9,7 @@
 //! |             | terminates its infra pods (PVCs included), reclaims its |
 //! |             | stored data, and drops the row                          |
 //! | `--journal` | also drop this project's execution + log rows           |
-//! | `--local`   | also wipe `.weft/target/` under the cwd project         |
+//! | `--local`   | also wipe this project's build artifacts on the host    |
 //! | `--all`     | implies the two levels above                            |
 //!
 //! Flags are additive. `--all` is pure sugar. The dispatcher-side
@@ -224,20 +224,29 @@ fn wipe_local_artifacts(ctx: &Ctx, progress: &Progress) -> Result<()> {
     // surface that loudly: --local was requested but there's nothing
     // local to wipe.
     let project = ctx.project().context("--local requested, but no project in cwd")?;
-    let target = project.state_dir().join("target");
-    if target.exists() {
-        std::fs::remove_dir_all(&target)
-            .with_context(|| format!("remove {}", target.display()))?;
-        progress.dispatcher_call_done(serde_json::json!({
-            "step": "local_wipe",
-            "path": target.display().to_string(),
-        }));
-    } else {
-        progress.dispatcher_call_done(serde_json::json!({
-            "step": "local_wipe",
-            "path": target.display().to_string(),
-            "skipped": "missing",
-        }));
+    // Two places hold this project's build artifacts: its own
+    // `.weft/target/`, and its slice of the machine-wide node-test
+    // cache. The shared cache's TARGET dir is deliberately left alone,
+    // because it belongs to every project on the machine; only this
+    // project's emitted crates and listings go.
+    for target in [
+        project.state_dir().join("target"),
+        super::test_node::project_cache_slice(&project.root),
+    ] {
+        if target.exists() {
+            std::fs::remove_dir_all(&target)
+                .with_context(|| format!("remove {}", target.display()))?;
+            progress.dispatcher_call_done(serde_json::json!({
+                "step": "local_wipe",
+                "path": target.display().to_string(),
+            }));
+        } else {
+            progress.dispatcher_call_done(serde_json::json!({
+                "step": "local_wipe",
+                "path": target.display().to_string(),
+                "skipped": "missing",
+            }));
+        }
     }
     Ok(())
 }

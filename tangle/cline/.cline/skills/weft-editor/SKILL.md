@@ -33,7 +33,7 @@ extension talks to the dispatcher at `http://localhost:9999` (setting
   dot colored by its type (String gray, Number blue, Boolean rose, files
   gold/purple/green/brown, List teal, Dict purple, Access teal, Bus amber,
   MustOverride red); a required input carries a `*`.
-- **The small square top-left of every box** is `_should_flow`, the port
+- **The small amber arrow top-left of every box** is `_should_flow`, the port
   that decides whether it runs: filled when something answers it, hollow
   when nothing does.
 - **Wires** are arrows colored by the source port's type.
@@ -155,8 +155,9 @@ work when a cut is set. Triggers need an explicit fire or supplied outputs.
 Each node glows as it fires, values travel the
 wires, and the Executions list gains the run. Click any node to open the
 **inspector**: status, duration, cost ("$0.0123 (own key)"), the exact
-inputs and outputs of that firing as JSON trees, closed ports shown as
-"(closed)", skip reasons in plain words ("its `_should_flow` said no", "the
+inputs and outputs of that firing as one card per port (a long value
+expands, copies, and selects whole on a double-click), closed ports greyed
+out, skip reasons in plain words ("its `_should_flow` said no", "the
 required input 'x' closed", "the scope 'x' it lives in did not run"),
 error boxes, bus and loop activity panels, and a firing navigator
 ("‹ 2/5 iter 5/2 ›") for nodes that fired several times. The Copy button

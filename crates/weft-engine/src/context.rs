@@ -4622,11 +4622,11 @@ mod bus_pump_tests {
     /// fail, so this catches a frames-ignoring regression.
     #[test]
     fn parallel_loop_lanes_are_independent_participants() {
-        use weft_core::frames::LoopIteration;
+        use weft_core::frames::Frame;
         let (waits, coord) = coord_with_tracker();
         // Both lanes share a node id "worker" but differ in frame index.
-        let lane0 = FiringLocation::new("worker", vec![LoopIteration { index: 0 }]);
-        let lane1 = FiringLocation::new("worker", vec![LoopIteration { index: 1 }]);
+        let lane0 = FiringLocation::new("worker", vec![Frame::Loop { index: 0 }]);
+        let lane1 = FiringLocation::new("worker", vec![Frame::Loop { index: 1 }]);
         let bus0 = wait_src(&coord.new_bus(BusOptions::default(), lane0.clone()).unwrap());
         let bus1 = wait_src(&coord.new_bus(BusOptions::default(), lane1.clone()).unwrap());
         // Lane 0 parks (deadlocked). Lane 1 is an in-flight task still

@@ -19,11 +19,9 @@ fn stdlib() -> FsCatalog {
         .expect("stdlib discovers")
 }
 
-fn run_package(catalog: &FsCatalog, build_root: &Path, package: &str) {
-    let binary = weft_compiler::build::build_node_test_binary(catalog, package, build_root)
-        .unwrap_or_else(|e| panic!("build test binary for '{package}': {e}"));
+fn run_package(binary: &Path, package: &str) {
 
-    let out = Command::new(&binary)
+    let out = Command::new(binary)
         .arg("run-all")
         .output()
         .unwrap_or_else(|e| panic!("run {}: {e}", binary.display()));
@@ -71,7 +69,21 @@ fn every_stdlib_node_test_passes() {
     // persistent across runs, so the engine compiles once and every
     // later sweep reuses the cache.
     let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node-test-sweep");
+    let dirs = weft_compiler::build::TestBuildDirs::under(&work);
+    // Every package emitted before any builds, so cargo unifies
+    // features across them: the same shape `weft test-node` uses.
+    let workspace = weft_compiler::build::prepare_test_workspace(&catalog, &packages, &dirs)
+        .unwrap_or_else(|e| panic!("prepare the test workspace: {e}"));
+    let binaries = weft_compiler::build::build_node_test_binaries(&workspace)
+        .unwrap_or_else(|e| panic!("build the node-test binaries: {e}"));
     for package in &packages {
-        run_package(&catalog, &work, package);
+        let binary = binaries
+            .get(package)
+            .unwrap_or_else(|| panic!("no binary built for '{package}'"));
+        run_package(binary, package);
+        // Same as `weft test-node`: the binary is an output, not a
+        // cache, and keeping 29 of them left 3.2GB in every dev's
+        // target/tmp for nothing. Relinking costs no measurable time.
+        weft_compiler::build::drop_built_binary(binary);
     }
 }

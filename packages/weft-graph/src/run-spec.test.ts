@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   exampleNameProblem,
-  groupOfPrefix,
+  addressOf,
+  groupOfCallPath,
   isFrozen,
   orderSpecsForMenu,
   parseRunSpec,
@@ -65,9 +66,13 @@ describe('run spec', () => {
   });
 
   it('reads the group the user stands in off the include prefix', () => {
-    expect(groupOfPrefix('')).toBeNull();
-    expect(groupOfPrefix('c.')).toBe('c');
-    expect(groupOfPrefix('c.inner.')).toBe('c.inner');
+    expect(groupOfCallPath([])).toBeNull();
+    expect(groupOfCallPath(['c'])).toBe('c');
+    expect(groupOfCallPath(['c', 'C.inner'])).toBe('c.inner');
+    expect(groupOfCallPath(['c', 'C.billing.inner'])).toBe('c.billing.inner');
+    expect(addressOf([], 'plain')).toBe('plain');
+    expect(addressOf(['c'], 'C.strip')).toBe('c.strip');
+    expect(addressOf(['c', 'C.inner'], 'Inner.deep')).toBe('c.inner.deep');
   });
 
   it('puts the specs scoped to the focused group first', () => {

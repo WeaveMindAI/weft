@@ -11,7 +11,12 @@ describe('containerStatus', () => {
 
 	it('a member still running keeps the container running', () => {
 		expect(containerStatus('completed', rows('completed', 'running'))).toBe('running');
-		expect(containerStatus('completed', rows('waiting_for_input'))).toBe('running');
+	});
+
+	it('a member parked on a human holds the container: waiting, not running', () => {
+		expect(containerStatus('completed', rows('completed', 'waiting_for_input'))).toBe('waiting_for_input');
+		// Unless something else inside is still actually running.
+		expect(containerStatus('completed', rows('waiting_for_input', 'running'))).toBe('running');
 	});
 
 	it('a failed member fails the container', () => {

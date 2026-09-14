@@ -783,6 +783,12 @@ hint "installing from ${C_BOLD}${here}${C_RESET}"
 #       vsix `mv` target, the release job's manifest generation)
 release_assets_url="https://github.com/WeaveMindAI/weft/releases/download/mvp-latest"
 prebuilt_dir="${HOME}/.local/share/weft/prebuilt"
+# THE home of the `weft` binary on PATH, whichever path produced it:
+# downloaded prebuilt, or copied here out of target/ after a local
+# build. One home means `weft_bin` is always a link to one stable
+# place, so no build cache is ever load-bearing.
+installed_bin_dir="${HOME}/.local/share/weft/bin"
+installed_bin="${installed_bin_dir}/weft"
 prebuilt_commit=""
 prebuilt_vscode_version=""
 use_prebuilt_cli=0
@@ -1176,12 +1182,18 @@ if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
       hint "VS Code: 'code' not on PATH; skipping extension removal"
     fi
 
-    # 3. Drop the CLI symlink.
+    # 3. Drop the CLI symlink AND the binary it points at. The binary
+    #    is an installed piece, not work, so an uninstall that left it
+    #    behind would leave ~25MB the user has no reason to look for.
     if [[ -L "${weft_bin}" || -f "${weft_bin}" ]]; then
       rm -f "${weft_bin}"
       ok "removed ${C_DIM}${weft_bin}${C_RESET}"
     else
       hint "CLI symlink at ${weft_bin} already absent"
+    fi
+    if [[ -f "${installed_bin}" ]]; then
+      rm -f "${installed_bin}"
+      ok "removed ${C_DIM}${installed_bin}${C_RESET}"
     fi
 
     # 4. Hints for the manual cleanup we deliberately don't do.
@@ -1485,16 +1497,21 @@ if [[ $build_cli -eq 1 ]]; then
   #     build adds entries; nothing prunes them).
   # (The anonymous-volume reap is NOT here: it runs on every install
   # regardless of flags, in its own section above.)
-  # The target/ bound is a cap, not a wipe: under the cap the
-  # incremental cache is untouched and rebuilds stay fast; over it we
-  # clean and pay one cold build now instead of filling the disk later.
+  # The target/ bound is a cap, not a wipe: under the cap nothing is
+  # touched and rebuilds stay fast. Over it, the incremental dirs go
+  # FIRST and the cap is re-measured, because they are the cheapest
+  # thing in there to lose (they only speed up rebuilding a crate you
+  # just edited, and they were the single biggest line item at 9.6G in
+  # a 22G tree) while deps/ is what makes a rebuild fast at all. Only
+  # if that is not enough does the whole tree go and the build runs
+  # cold.
   # The cap measures the WHOLE of target/ (debug + release + tmp); a
   # full debug build of this workspace with line-tables-only debuginfo
-  # plus the db-test and e2e binaries sits well under 40G, so the
-  # default only trips on real accumulation, never on a routine tree
-  # (a cap under the working size would wipe on every install).
+  # plus the db-test and e2e binaries sits well under the default, so
+  # it only trips on real accumulation, never on a routine tree (a cap
+  # under the working size would wipe on every install).
   # Override with WEFT_TARGET_CAP_GB.
-  target_cap_gb="${WEFT_TARGET_CAP_GB:-40}"
+  target_cap_gb="${WEFT_TARGET_CAP_GB:-15}"
   if [[ ! "${target_cap_gb}" =~ ^[0-9]+$ ]]; then
     fail "WEFT_TARGET_CAP_GB must be a whole number of gigabytes, got '${target_cap_gb}'"
     exit 1
@@ -1512,10 +1529,21 @@ if [[ $build_cli -eq 1 ]]; then
     if [[ ! "${target_gb}" =~ ^[0-9]+$ ]]; then
       warn "could not measure target/; skipping the size cap"
     elif [[ "${target_gb}" -gt "${target_cap_gb}" ]]; then
-      warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); cleaning before the build"
-      remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
-        " ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}" \
-        "; the cap stays exceeded"
+      warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); trimming before the build"
+      for inc in "${here}"/target/*/incremental; do
+        [[ -d "${inc}" ]] || continue
+        remove_dir_reporting "${inc}" "${C_DIM}${inc#"${here}"/}${C_RESET}" \
+          "" "; the cap may stay exceeded"
+      done
+      target_kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1)"
+      target_gb=""
+      [[ "${target_kb}" =~ ^[0-9]+$ ]] && target_gb="$((target_kb / 1024 / 1024))"
+      if [[ "${target_gb}" =~ ^[0-9]+$ && "${target_gb}" -gt "${target_cap_gb}" ]]; then
+        warn "still ${target_gb}G after dropping the incremental caches; clearing target/"
+        remove_dir_reporting "${here}/target" "${C_DIM}target/${C_RESET}" \
+          " ${C_DIM}(this build runs cold; the cap is WEFT_TARGET_CAP_GB)${C_RESET}" \
+          "; the cap stays exceeded"
+      fi
     fi
   fi
   # Gate on daemon REACHABILITY, not binary presence: a --cli install
@@ -1539,7 +1567,7 @@ if [[ $build_cli -eq 1 ]]; then
     # recorded repo location must refresh even when the bytes are
     # already right, since this checkout may be a different clone than
     # the one that downloaded them).
-    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${prebuilt_dir}/weft" 0755; then
+    if ! acquire_prebuilt "${cli_asset}" "${cli_sha256}" "${installed_bin}" 0755; then
       use_prebuilt_cli=0
       if command -v cargo >/dev/null 2>&1; then
         warn "prebuilt CLI download failed; building locally instead"
@@ -1566,9 +1594,9 @@ if [[ $build_cli -eq 1 ]]; then
       hint "fix the ownership (docker can leave root-owned entries there): ${C_BOLD}sudo chown -R \"\$(id -u):\$(id -g)\" ~/.local/share/weft${C_RESET}${C_DIM}, then re-run${C_RESET}"
       exit 1
     fi
-    chmod 0755 "${prebuilt_dir}/weft"
-    ln -sfn "${prebuilt_dir}/weft" "${weft_bin}"
-    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${prebuilt_dir}/weft${C_RESET}"
+    chmod 0755 "${installed_bin}"
+    ln -sfn "${installed_bin}" "${weft_bin}"
+    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
   fi
 
   if [[ $use_prebuilt_cli -eq 0 ]]; then
@@ -1626,8 +1654,30 @@ if [[ $build_cli -eq 1 ]]; then
       fi
       hint "source changed during the build; building again"
     done
-    ln -sfn "${src}" "${weft_bin}"
-    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${src}${C_RESET}"
+    # Copy the binary OUT of target/, then link PATH at the copy, the
+    # same shape the prebuilt path above uses. Linking straight into
+    # target/ made the build cache load-bearing: `rm -rf target` (or
+    # the size cap above firing) left `weft` as a dangling symlink
+    # with nothing saying why. The copy costs ~25MB and makes target/
+    # pure cache, safe to delete at any moment.
+    # The copy's own error is kept: a `weft` that is still running (the
+    # extension in another VS Code window, a `weft run` in a terminal)
+    # holds the file open and Linux refuses to overwrite it, which cp
+    # reports as "Text file busy". Left as-is that read as a broken
+    # install; it is the running program, and closing it is the fix.
+    mkdir -p "${installed_bin_dir}"
+    cp_err="$(cp "${src}" "${installed_bin}" 2>&1 >/dev/null)" || {
+      if grep -q 'Text file busy' <<<"${cp_err}"; then
+        fail "weft is still running, so its binary cannot be replaced: close every VS Code window that has a weft project open (the extension runs weft) and any terminal running a weft command, then re-run ./setup.sh"
+      else
+        fail "could not install the built binary to ${installed_bin}"
+        printf '%s\n' "${cp_err}" >&2
+      fi
+      exit 1
+    }
+    chmod 0755 "${installed_bin}"
+    ln -sfn "${installed_bin}" "${weft_bin}"
+    ok "linked ${C_DIM}${weft_bin}${C_RESET} ${SYM_ARROW} ${C_DIM}${installed_bin}${C_RESET}"
   fi
 
   # Engine-change sweep, on either path: the builder base and the

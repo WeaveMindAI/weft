@@ -260,14 +260,14 @@
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
             program: None, source_version: None, node_test: false,
             subgraph: subgraph.map(|s| weft_core::project::selection::RunSelection::restricted(
-                &project, s.iter().map(|n| n.to_string()).collect()).expect("valid test selection")),
+                &project, s.iter().map(|n| weft_core::frames::Located::top(*n)).collect()).expect("valid test selection")),
             seed: None,
             at_unix: 0,
         }];
         for kick in kicks {
             rows.push(ExecEvent::NodeKicked {
                 color,
-                node_id: kick.to_string(),
+                node_id: kick.to_string(), frames: vec![],
                 firing: firing == Some(*kick),
                 payload: None,
                 port_snapshot: None,
@@ -367,7 +367,7 @@
                             format!("{:?}", p.status),
                             p.closed,
                             p.close_error.clone(),
-                            p.frames.iter().map(|f| f.index).collect::<Vec<_>>(),
+                            p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
                             p.target_port.clone(),
                             p.value.to_string(),
                             p.provided,
@@ -403,7 +403,7 @@
                         closed_outputs.sort();
                         (
                             node.clone(),
-                            r.frames.iter().map(|f| f.index).collect::<Vec<_>>(),
+                            r.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
                             r.ordinal,
                             r.status.clone(),
                             r.error.clone(),
@@ -438,7 +438,7 @@
                     out_fired.sort_unstable();
                     (
                         key.group_id.clone(),
-                        key.parent_frames.iter().map(|f| f.index).collect(),
+                        key.parent_frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
                         format!("{:?}", inst.config),
                         format!("{:?}", inst.source),
                         inst.iter_cap,
@@ -462,7 +462,7 @@
                 .map(|(loc, k)| {
                     (
                         loc.node_id.clone(),
-                        loc.frames.iter().map(|f| f.index).collect(),
+                        loc.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect(),
                         k.dispatched,
                         k.firing,
                         k.payload.as_ref().map(|v| v.to_string()),

@@ -364,7 +364,7 @@ enum Cmd {
     /// cwd project is unregistered: the dispatcher deactivates it,
     /// terminates its infra pods, and reclaims its stored data.
     /// Add flags to escalate: `--journal` drops execution history,
-    /// `--local` wipes `.weft/target/` on the host, `--all`
+    /// `--local` wipes this project's build artifacts, `--all`
     /// implies every flag. An explicit project id overrides the
     /// cwd discovery.
     Rm {
@@ -509,7 +509,9 @@ enum Cmd {
     /// prints the replay rows the graph view reads.
     Events {
         color: String,
-        /// Only events of this node (its id in the source).
+        /// Only events of this node, spelled the way the source reads:
+        /// `auth.check` is the node `check` of the file the site `auth`
+        /// includes, and only that use of it.
         #[arg(long)]
         node: Option<String>,
         /// Only events of this kind (`node_failed`, `node_completed`,
@@ -547,7 +549,7 @@ enum Cmd {
     ///   <UUID>            one execution
     ///   --images          unreferenced worker images for the cwd project
     ///                     (use --all to span every project)
-    ///   --build-cache     docker buildkit cache prune
+    ///   --build-cache     drop the docker buildkit cache and the node-test cache
     ///   --all             with the journal subject: nuke every execution
     ///                     with --images: every project's images
     ///   --project <id>    that project's runs, all of them. They
@@ -579,7 +581,9 @@ enum Cmd {
         /// images (~1.4GB each; the next build re-makes the base).
         #[arg(long, default_value_t = false)]
         images: bool,
-        /// Prune docker BuildKit cache (heavy: invalidates cargo dep cache).
+        /// Drop every build cache: the docker BuildKit cache and the
+        /// host's node-test cache (heavy: the next build and the next
+        /// `weft test-node` compile the engine and every dependency again).
         #[arg(long, default_value_t = false)]
         build_cache: bool,
         /// Answer the confirmation a journal deletion asks for.
@@ -1108,7 +1112,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             commands::executions::events(
                 ctx,
                 color,
-                commands::executions::EventsFilter { node, kind, full },
+                commands::executions::EventsFilter { node, call_path: Vec::new(), kind, full },
             )
             .await
         }

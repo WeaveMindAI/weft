@@ -195,8 +195,8 @@
                     ("Taker", Box::new(Taker { take_only: None, log: log.clone() })),
                 ]);
                 let mut selection = weft_core::project::selection::RunSelection::whole(&project);
-                if !selected { selection.nodes.remove("producer"); }
-                selection.input.entry("consumer".into()).or_default().insert("in".into(), json!([8, 9]));
+                if !selected { selection.nodes.remove(&weft_core::frames::Located::top("producer")); }
+                selection.input.entry(weft_core::frames::Located::top("consumer")).or_default().insert("in".into(), json!([8, 9]));
                 let root = if selected { "producer" } else { "consumer" };
                 let rows = vec![
                     ExecEvent::ExecutionStarted {
@@ -204,7 +204,7 @@
                         phase: Phase::Fire, definition_hash: Some("test-hash".into()), program: None, source_version: None, node_test: false,
                         subgraph: Some(selection), seed: None, at_unix: 0,
                     },
-                    ExecEvent::NodeKicked { color, node_id: root.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+                    ExecEvent::NodeKicked { color, node_id: root.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
                 ];
                 let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, color, rows, CancellationFlag::new_arc()).await;
                 let drove = drove.expect("stream run drives");

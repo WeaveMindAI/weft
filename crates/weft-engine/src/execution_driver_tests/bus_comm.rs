@@ -172,7 +172,7 @@
             .record_event(
                 &ExecEvent::NodeKicked {
                     color,
-                    node_id: "producer".into(),
+                    node_id: "producer".into(), frames: vec![],
                     firing: false,
                     payload: None,
                     port_snapshot: None,
@@ -306,7 +306,7 @@
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
-            color, node_id: "waiter".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+            color, node_id: "waiter".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
 
         let clients = clients(journal.clone());
@@ -558,7 +558,7 @@
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
-            color, node_id: creator.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+            color, node_id: creator.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
         let clients = clients(journal.clone());
         tokio::time::timeout(
@@ -1046,7 +1046,7 @@
             program: None, source_version: None, node_test: false, subgraph: None, seed: None, at_unix: 0,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
-                color, node_id: "payer".into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+                color, node_id: "payer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
             }, None).await.unwrap();
             let fake_access_broker = crate::context::FakeAccessBroker::new();
             // Runtime-owned on purpose: only an `Ours` credential is
@@ -1302,7 +1302,7 @@
                 j.record_event(
                     &ExecEvent::NodeKicked {
                         color,
-                        node_id,
+                        node_id, frames: vec![],
                         firing: false,
                         payload: None,
                         port_snapshot: None,
@@ -2056,7 +2056,7 @@
             .unwrap();
         journal
             .record_event(
-                &ExecEvent::NodeKicked { color, node_id: entry.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+                &ExecEvent::NodeKicked { color, node_id: entry.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
                 None,
             )
             .await
@@ -2379,7 +2379,7 @@
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {
-                color, node_id: n.into(), firing: false, payload: None, port_snapshot: None, at_unix: 0,
+                color, node_id: n.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
             }, None).await.unwrap();
         }
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));

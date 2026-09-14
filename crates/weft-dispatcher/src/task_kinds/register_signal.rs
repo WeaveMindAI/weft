@@ -152,7 +152,8 @@ impl RegisterSignalExecutor {
             hasher.update(payload.node_id.as_bytes());
             hasher.update(b":");
             for frame in &payload.frames {
-                hasher.update(frame.index.to_le_bytes());
+                hasher.update(frame.text().as_bytes());
+                hasher.update(b"/");
             }
             hasher.update(b":");
             hasher.update(payload.call_index.to_le_bytes());
@@ -443,7 +444,7 @@ impl RegisterSignalExecutor {
             let frames_key = payload
                 .frames
                 .iter()
-                .map(|f| format!("{}", f.index))
+                .map(weft_core::frames::Frame::text)
                 .collect::<Vec<_>>()
                 .join("/");
             state

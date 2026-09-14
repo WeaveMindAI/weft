@@ -1,7 +1,7 @@
 //! Fixture -> isolated, live project lifecycle.
 //!
 //! A fixture is a real weft project committed under `crates/weft-e2e/fixtures/
-//! <name>/` (a `weft.toml`, a `main.weft`, and any custom nodes under
+//! <name>/` (a `weft.toml`, a `src/main.weft`, and any custom nodes under
 //! `nodes/`). It deliberately does NOT commit `nodes/base_catalog/`: that
 //! built-in-node mirror is regenerated from current code by `weft catalog
 //! update` during [`Project::prepare`], which is the whole point (built-in
@@ -106,6 +106,24 @@ impl Project {
         self.id
     }
 
+    /// The program as it compiles right now, from the working copy: what
+    /// an assertion spelled the way the source reads (`triage.up`)
+    /// resolves against. Read fresh each time, so a test that edits the
+    /// source sees the edit.
+    pub fn definition(&self) -> Result<weft_core::ProjectDefinition> {
+        let project = weft_compiler::project::Project::load(&self.dir)
+            .map_err(|e| anyhow::anyhow!("load {}: {e}", self.dir.display()))?;
+        let (definition, _) = weft_compiler::hash::load_enriched_project(&project)
+            .map_err(|e| anyhow::anyhow!("compile {}: {e}", self.dir.display()))?;
+        Ok(definition)
+    }
+
+    /// Observe a run to its end and read it through this program, so
+    /// every node in an assertion is spelled the way the source reads.
+    pub async fn settled(&self, color: Uuid) -> Result<crate::run::SettledRun> {
+        Ok(crate::run::SettledRun::observe(&self.disp, color).await?.reading(self.definition()?))
+    }
+
     /// The temp working directory (where `weft` runs).
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -208,7 +226,7 @@ impl Project {
     /// real URL. Errors if the placeholder is absent (a fixture/test mismatch we
     /// want loud, never a silent no-op that ships a placeholder to the compiler).
     pub fn substitute_in_main(&self, placeholder: &str, value: &str) -> Result<()> {
-        let path = self.dir.join("main.weft");
+        let path = self.dir.join("src").join("main.weft");
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("read {}", path.display()))?;
         if !raw.contains(placeholder) {
@@ -229,7 +247,7 @@ impl Project {
     /// save), so no placeholder checking here; the caller writes complete,
     /// final source.
     pub fn set_main(&self, contents: &str) -> Result<()> {
-        let path = self.dir.join("main.weft");
+        let path = self.dir.join("src").join("main.weft");
         std::fs::write(&path, contents).with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
@@ -242,7 +260,7 @@ impl Project {
     /// the compiled graph carries it. No string-surgery on source: the edit is
     /// the same operation a click in the editor performs.
     pub fn set_node_config(&self, node: &str, key: &str, value: &str) -> Result<()> {
-        let path = self.dir.join("main.weft");
+        let path = self.dir.join("src").join("main.weft");
         let source = std::fs::read_to_string(&path)
             .with_context(|| format!("read {}", path.display()))?;
         // The fixture's own catalog registry: an edit touching a declared
@@ -252,7 +270,6 @@ impl Project {
             .type_registry();
         let (edited, _inverse) = weft_compiler::edit::apply_edits(
             &source,
-            None,
             // `main.weft`'s anonymous root takes the "Main" id; SetConfig
             // resolves the node against that, matching the lowering.
             "Main",

@@ -1251,7 +1251,7 @@
             .iter()
             .filter_map(|e| match e {
                 ExecEvent::NodeStarted { node_id, frames, .. } if node_id == "seed" => {
-                    Some(frames.iter().map(|f| f.index).collect())
+                    Some(weft_core::frames::loop_indices(frames))
                 }
                 _ => None,
             })

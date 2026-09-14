@@ -203,7 +203,7 @@ pub fn cancel_terminal_events(
                         continue;
                     }
                     let frames_key: String =
-                        e.frames.iter().map(|f| f.index.to_string()).collect::<Vec<_>>().join(".");
+                        weft_core::frames::frames_text(&e.frames);
                     writes.push((
                         ExecEvent::NodeCancelled {
                             color,
@@ -882,7 +882,7 @@ mod cancel_tests {
 
     fn open_firing(color: Color) -> Vec<ExecEvent> {
         vec![
-            ExecEvent::NodeKicked { color, node_id: "wait".into(), firing: true, payload: None, port_snapshot: None, at_unix: 0 },
+            ExecEvent::NodeKicked { color, node_id: "wait".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
             ExecEvent::NodeStarted { color, node_id: "wait".into(), frames: vec![], at_unix: 1 },
         ]
     }

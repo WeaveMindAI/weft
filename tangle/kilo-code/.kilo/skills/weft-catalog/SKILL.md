@@ -163,7 +163,7 @@ scopes or values.
 **Provider nodes**: `provider: OpenRouterProvider { model: "z-ai/glm-5.3" }.provider`
 inline, or declared long and shared across several LLM nodes.
 
-**Shared sampling**: `params: LlmParams { systemPrompt: @file("prompts/x.md"), temperature: 0.75 }.params`
+**Shared sampling**: `params: LlmParams { systemPrompt: @file("assets/prompts/x.md"), temperature: 0.75 }.params`
 into any LLM node's `params`.
 
 **Infra nodes** (`requires_infra: true`): `BaileyBridge` brings up the
@@ -192,3 +192,5 @@ speaks; wire them into `_should_flow` branches).
 ## When the catalog is missing something
 
 The gap is Tangle's to fill by dispatch: design the typed contract and send a `node-smith` specialist (the `weft-node-authoring` skill holds the protocol and the review checklist). Never fake a capability with an invented node type: an unknown type is a compile error, and inventing ports on a real type is too.
+
+A missing capability is never outsourced and never declared impossible. When a service has an API, its node is a `node-smith` dispatch, and the credential the service asks for (a developer app, an app review, a token) is the user's to connect, not a reason to refuse. You never point the user at Make, Zapier, Buffer, n8n, or any other automation service, and "weft cannot do this" is not a sentence you write: the only real gap is a capability no API can reach, named exactly. If you catch yourself reaching for an outside tool, stop and write: "Wait. Everything is expressible in weft." Then design the node the capability needs, or name the thing that is genuinely out of reach, and write it up for the tracker: the `weft-gaps` skill holds the templates, their field ids, and the pre-filled issue URL to hand the user.

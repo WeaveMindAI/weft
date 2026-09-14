@@ -1036,6 +1036,29 @@ my = Loop(items: List[String]) -> (results: List[String | Null]) {
     assert!(codes(&d).contains(&"trigger-in-loop"), "{d:?}");
 }
 
+/// A trigger inside an included file is inside a loop when the site
+/// that includes the file is: the body runs once per iteration there.
+#[test]
+fn a_trigger_in_an_included_file_called_from_a_loop_is_a_compile_error() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("timer.weft"), "Group() -> (out: String) {\n  t = Cron { cron: \"0 * * * * *\" }\n  self.out = t.scheduledTime\n}\n").unwrap();
+    let source = r#"
+my = Loop(items: List[String]) -> (results: List[String | Null]) {
+    over: ["items"]
+    c = @include("timer.weft")
+    self.results = c.out
+}
+"#;
+    let mut project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    let d = validate(&project, &catalog());
+    let found = d.iter().find(|d| d.code.as_deref() == Some("trigger-in-loop")).unwrap_or_else(|| panic!("{d:?}"));
+    assert!(found.message.contains("'t' is in an included file that 'my.c' includes from inside the Loop 'my'"), "{}", found.message);
+    let mut project = compile("c = @include(\"timer.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    assert!(!codes(&validate(&project, &catalog())).contains(&"trigger-in-loop"));
+}
+
 #[test]
 fn an_infra_node_inside_a_loop_is_a_compile_error() {
     // No stdlib infra node fits a loop body's ports, so mark the member

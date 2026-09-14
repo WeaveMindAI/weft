@@ -224,7 +224,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
             // `over` declaration (a stream `over` port is legal), so
             // it stays under this rule: an optional stream `over`
             // would otherwise compile as an unwirable loop.
-            if node.node_type != "Passthrough"
+            if !weft_core::project::boundary_types::is_forwarding(&node.node_type)
                 && port.port_type.as_generator().is_some()
                 && (!port.required || port.default.is_some())
             {
@@ -281,7 +281,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
         component_root(project).into_iter().collect();
     for node in &project.nodes {
         let Some(gb) = node.group_boundary.as_ref() else { continue };
-        if node.node_type != "Passthrough" {
+        if !weft_core::project::boundary_types::is_forwarding(&node.node_type) {
             continue;
         }
         let span = node.header_span_or_default();
@@ -457,10 +457,34 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
 fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     use std::collections::{HashMap, HashSet};
 
-    // Node-level outgoing adjacency.
+    // Node-level outgoing adjacency, over the graph as it RUNS: a call
+    // is one step from the site's In to its Out (the body runs in
+    // between, under its own frame), and a body is checked on its own.
+    // The static wires from every site into one shared body and back
+    // would otherwise join every caller of a file into one loop
+    // (`two.raw = one.cleaned` with `one` and `two` including the same
+    // file is a chain of two calls, not a cycle).
+    let site_steps: Vec<(String, String)> = project
+        .groups
+        .iter()
+        .filter(|g| matches!(g.kind, weft_core::project::GroupKind::Call { .. }))
+        .map(|g| (
+            weft_core::project::boundary_in_id(&g.id),
+            weft_core::project::boundary_out_id(&g.id),
+        ))
+        .collect();
+    let node_type = |id: &str| project.nodes.iter().find(|n| n.id == id).map(|n| n.node_type.as_str());
     let mut outgoing: HashMap<&str, Vec<&str>> = HashMap::new();
     for e in &project.edges {
+        let into_body = node_type(&e.target) == Some(weft_core::project::boundary_types::INCLUDE_IN);
+        let out_of_body = node_type(&e.source) == Some(weft_core::project::boundary_types::INCLUDE_OUT);
+        if into_body || out_of_body {
+            continue;
+        }
         outgoing.entry(e.source.as_str()).or_default().push(e.target.as_str());
+    }
+    for (site_in, site_out) in &site_steps {
+        outgoing.entry(site_in.as_str()).or_default().push(site_out.as_str());
     }
 
     // graph-cycle: iterative DFS with a three-color marking; report each
@@ -516,28 +540,46 @@ fn check_graph_shape(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     // setup phase that reached one inside a loop would run the loop and
     // set the node up once per item. A GROUP is fine for both: a trigger
     // in the middle of a group fires there and its run starts from it.
+    // An included file's body sits at the top level; it is inside a loop
+    // when a site that reaches it (through however many files) is. Each
+    // such body remembers the site and the loop, for the message: the
+    // node's own file shows no loop.
+    let mut bodies_under_a_loop: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    loop {
+        let before = bodies_under_a_loop.len();
+        for group in &project.groups {
+            let weft_core::project::GroupKind::Call { body } = &group.kind else { continue };
+            if bodies_under_a_loop.contains_key(body) { continue; }
+            let Some(entry) = project.nodes.iter().find(|n| n.id == weft_core::project::boundary_in_id(&group.id)) else { continue };
+            let through = entry.scope.iter().find_map(|s| if loop_groups.contains(s.as_str()) {
+                Some((group.id.clone(), s.clone()))
+            } else {
+                bodies_under_a_loop.get(s).cloned()
+            });
+            if let Some(through) = through {
+                bodies_under_a_loop.insert(body.clone(), through);
+            }
+        }
+        if bodies_under_a_loop.len() == before { break; }
+    }
     for node in project.nodes.iter().filter(|n| n.features.is_trigger || n.requires_infra) {
-        if !node.scope.iter().any(|s| loop_groups.contains(s.as_str())) {
+        let through_a_site = node.scope.iter().find_map(|s| bodies_under_a_loop.get(s));
+        if through_a_site.is_none() && !node.scope.iter().any(|s| loop_groups.contains(s.as_str())) {
             continue;
         }
-        let (code, message) = if node.features.is_trigger {
-            (
-                "trigger-in-loop",
-                format!(
-                    "trigger '{}' is inside a Loop; a trigger registers once and fires \
-                     outside any iteration, so it cannot live in a loop body",
-                    author_name(node)
-                ),
-            )
+        let what = if node.features.is_trigger { "trigger" } else { "infra node" };
+        let why = if node.features.is_trigger {
+            "a trigger registers once and fires outside any iteration, so it cannot live in a loop body"
         } else {
-            (
-                "infra-in-loop",
-                format!(
-                    "infra node '{}' is inside a Loop; infra is provisioned once for the \
-                     project, not once per item, so it cannot live in a loop body",
-                    author_name(node)
-                ),
-            )
+            "infra is provisioned once for the project, not once per item, so it cannot live in a loop body"
+        };
+        let code = if node.features.is_trigger { "trigger-in-loop" } else { "infra-in-loop" };
+        let message = match through_a_site {
+            Some((site, in_loop)) => format!(
+                "{what} '{}' is in an included file that '{site}' includes from inside the Loop '{in_loop}'; {why}",
+                author_name(node).rsplit('.').next().unwrap_or_default()
+            ),
+            None => format!("{what} '{}' is inside a Loop; {why}", author_name(node)),
         };
         push(d, node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, code, message);
     }
@@ -1176,6 +1218,14 @@ fn check_port_resolution(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     let mut seen: std::collections::HashMap<(String, String), usize> = Default::default();
     for edge in &project.edges {
         let Some(handle) = edge.target_handle.as_deref() else { continue };
+        // A shared body's In is wired from every site that calls it, one
+        // wire per site: at run time each call reaches it under its own
+        // frame, so those are not two drivers of one port.
+        if project.nodes.iter().any(|n| n.id == edge.target
+            && n.node_type == weft_core::project::boundary_types::INCLUDE_IN)
+        {
+            continue;
+        }
         let key = (edge.target.clone(), handle.to_string());
         let span = edge.span.unwrap_or_default();
         let file = edge.source_file.as_deref();
@@ -1496,7 +1546,7 @@ fn check_port_coverage(
         .collect();
 
     for node in &project.nodes {
-        if node.node_type == "Passthrough" {
+        if weft_core::project::boundary_types::is_forwarding(&node.node_type) {
             continue;
         }
         let span = node.header_span_or_default();
@@ -2680,13 +2730,22 @@ fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     let mut top_item_of: HashMap<&str, &str> = HashMap::new();
     let mut infra: HashSet<&str> = HashSet::new();
 
+    // An included file's body is its own level (the file's page), not an
+    // item on the page of the program that includes it: there the item
+    // is the call site.
+    let bodies: HashSet<&str> = project
+        .groups
+        .iter()
+        .filter(|g| matches!(g.kind, weft_core::project::GroupKind::Body))
+        .map(|g| g.id.as_str())
+        .collect();
     for node in &project.nodes {
         let item = match &node.group_boundary {
             Some(b) => {
                 // A component file's root boundaries are the file's own
                 // interface, not an item at any level, and a wire from
                 // them joins nothing (as a literal joins nothing).
-                if Some(b.group_id.as_str()) == root {
+                if Some(b.group_id.as_str()) == root || bodies.contains(b.group_id.as_str()) {
                     continue;
                 }
                 b.group_id.as_str()

@@ -43,7 +43,14 @@ pub struct ResolvedFile {
 /// failure ("escapes the root", "not found", "is not valid UTF-8") is just a
 /// message pointed at a source line.
 pub trait FileReader {
-    fn resolve_and_read(&self, base: &Path, relative: &Path) -> Result<ResolvedFile, String>;
+    /// Read the file `relative` names from `base`, refusing anything
+    /// outside `root` (the project). The two differ for an `@include`,
+    /// whose path is relative to the file that writes it: the program
+    /// lives in `src/`, so `@include("../lib/x.weft")` in
+    /// `src/billing/charge.weft` climbs one level and lands inside the
+    /// project. A `@file` / `@asset` path is relative to the project root
+    /// wherever it is written, so for those the two are the same.
+    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String>;
 
     /// The identity `resolve_and_read` would give `path` (the disk backing
     /// canonicalizes, the map backing normalizes lexically), so a caller can
@@ -54,24 +61,24 @@ pub trait FileReader {
 
 /// The on-disk backing: today's behavior. Joins `relative` onto `base`,
 /// canonicalizes (resolving `..` and symlinks), rejects anything that escapes
-/// `base`, then reads the bytes.
+/// `root`, then reads the bytes.
 ///
 /// The project tree is TRUSTED: this runs at build time on the user's own
 /// project, and referenced files are part of that project. The containment
 /// check guards against an accidental `../` typo pulling a file from outside
-/// `base` into the build. It is robust for that: `canonicalize` resolves `..`
-/// and follows symlinks before the prefix check, so any path that lands outside
-/// `base` (including via a symlink) is rejected.
+/// the project into the build. It is robust for that: `canonicalize` resolves
+/// `..` and follows symlinks before the prefix check, so any path that lands
+/// outside `root` (including via a symlink) is rejected.
 pub struct DiskFileReader;
 
 impl FileReader for DiskFileReader {
-    fn resolve_and_read(&self, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
-        let canonical_base = self.identity(base)?;
+    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
+        let canonical_root = self.identity(root)?;
         let identity = base
             .join(relative)
             .canonicalize()
             .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
-        if !identity.starts_with(&canonical_base) {
+        if !identity.starts_with(&canonical_root) {
             return Err(format!("path {relative:?} escapes the project root"));
         }
         let content = std::fs::read_to_string(&identity)
@@ -92,11 +99,11 @@ impl FileReader for DiskFileReader {
 /// Resolution is LEXICAL (no filesystem): `relative` is joined onto `base` and
 /// normalized (`.` and `..` collapsed), and that normalized path is both the
 /// identity and the map key. Containment is enforced the same way the disk
-/// reader enforces it: a normalized path that climbs above `base` (a leading
+/// reader enforces it: a normalized path that climbs above `root` (a leading
 /// `..` survives normalization) escapes and is rejected, so a `@file("../x")`
-/// fails identically on both backings. Keys in the map must be the normalized
-/// form the compiler resolves to (callers build the map from the same paths the
-/// source references).
+/// at the root fails identically on both backings. Keys in the map must be the
+/// normalized form the compiler resolves to (callers build the map from the
+/// same paths the source references).
 pub struct MapFileReader {
     files: std::collections::BTreeMap<PathBuf, String>,
 }
@@ -108,17 +115,17 @@ impl MapFileReader {
 }
 
 impl FileReader for MapFileReader {
-    fn resolve_and_read(&self, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
+    fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
         let escapes = || format!("path {relative:?} escapes the project root");
-        // Normalize the base and the joined path, then enforce the SAME
-        // containment the disk reader enforces (`starts_with(base)`). A `..` that
+        // Normalize the root and the joined path, then enforce the SAME
+        // containment the disk reader enforces (`starts_with(root)`). A `..` that
         // merely balances out a base component (e.g. `proj/../secret.txt`)
-        // survives the per-path climb check yet leaves the base, so checking
+        // survives the per-path climb check yet leaves the root, so checking
         // "climbs above its own root" is not enough: the normalized join must
-        // still sit under the normalized base.
-        let canonical_base = self.identity(base)?;
+        // still sit under the normalized root.
+        let canonical_root = self.identity(root)?;
         let identity = normalize_lexical(&base.join(relative)).ok_or_else(escapes)?;
-        if !identity.starts_with(&canonical_base) {
+        if !identity.starts_with(&canonical_root) {
             return Err(escapes());
         }
         match self.files.get(&identity) {
@@ -158,19 +165,26 @@ pub(crate) fn normalize_lexical(path: &Path) -> Option<PathBuf> {
     Some(out.iter().collect())
 }
 
-/// The filesystem view threaded through the compile pipeline: a reader plus the
-/// current resolution anchor. Replaces the bare `base_dir: Option<&Path>` the
-/// pipeline used to thread, unifying "where do I resolve relative paths" and
-/// "how do I read them" into one value (they are never independent).
+/// The filesystem view threaded through the compile pipeline: a reader, the
+/// project root, and the current resolution anchor. Replaces the bare
+/// `base_dir: Option<&Path>` the pipeline used to thread, unifying "where do
+/// I resolve relative paths" and "how do I read them" into one value (they
+/// are never independent).
 ///
-/// `base` is `None` when compiling outside any project (an unsaved buffer, a
-/// bare snippet): a `@file`/`@include` then has no anchor and is a compile error,
-/// exactly as before. Descending into an included file produces a fresh
-/// `CompileFs` (`descend`) carrying the SAME reader and the included file's own
-/// directory as the new anchor.
+/// `root` is the project (the folder holding `weft.toml`): every path a
+/// marker names must land inside it, `@file` / `@asset` paths are relative
+/// to it wherever they are written, and every path that leaves the
+/// compiler is spelled from it. `base` is the directory of the file being
+/// compiled, what an `@include` path is joined onto: `src/` for the
+/// program, an included file's own directory inside it. Both are `None`
+/// when compiling outside any project (an unsaved buffer, a bare snippet):
+/// a `@file`/`@include` then has no anchor and is a compile error. Entering
+/// an included file produces a fresh `CompileFs` (`anchored_at`) carrying
+/// the SAME reader and root and the included file's directory as the anchor.
 #[derive(Clone, Copy)]
 pub struct CompileFs<'a> {
     pub reader: &'a dyn FileReader,
+    pub root: Option<&'a Path>,
     pub base: Option<&'a Path>,
 }
 
@@ -180,11 +194,14 @@ pub struct CompileFs<'a> {
 static DISK_READER: DiskFileReader = DiskFileReader;
 
 impl<'a> CompileFs<'a> {
-    /// Disk-backed view anchored at `base` (the project root / file directory).
-    pub fn disk(base: &'a Path) -> Self {
+    /// Disk-backed view of the project at `root`, anchored there too: for a
+    /// file that sits at the root (a test fixture, a standalone file). A
+    /// program under `src/` follows with `anchored_at`.
+    pub fn disk(root: &'a Path) -> Self {
         Self {
             reader: &DISK_READER,
-            base: Some(base),
+            root: Some(root),
+            base: Some(root),
         }
     }
 
@@ -193,21 +210,24 @@ impl<'a> CompileFs<'a> {
     pub fn none() -> Self {
         Self {
             reader: &DISK_READER,
+            root: None,
             base: None,
         }
     }
 
     /// View with an explicit reader (the in-memory map the browser parse path
-    /// uses) anchored at `base`.
-    pub fn with_reader(reader: &'a dyn FileReader, base: Option<&'a Path>) -> Self {
-        Self { reader, base }
+    /// uses) of the project at `root`, anchored there.
+    pub fn with_reader(reader: &'a dyn FileReader, root: Option<&'a Path>) -> Self {
+        Self { reader, root, base: root }
     }
 
-    /// The view for content referenced INSIDE a resolved file: same reader, the
-    /// included file's own directory as the new anchor.
-    pub fn descend(&self, base: Option<&'a Path>) -> Self {
+    /// The same project seen from `base`: the directory of the file whose
+    /// markers are being resolved (`src/` for the program, an included
+    /// file's own directory once the compiler has entered it).
+    pub fn anchored_at(&self, base: Option<&'a Path>) -> Self {
         Self {
             reader: self.reader,
+            root: self.root,
             base,
         }
     }

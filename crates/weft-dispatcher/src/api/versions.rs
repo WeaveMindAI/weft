@@ -18,6 +18,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use weft_core::run_spec::{resolve_spec, Refusal, Resolved, RunSpec};
+use weft_core::frames::Located;
 use weft_core::seeding::{inheritable_nodes, seed_plan, SeedOutcome};
 use weft_core::Color;
 
@@ -466,7 +467,7 @@ async fn settled_colors(
 /// The seed run folded, with its program: what the stale set reads.
 struct SeededFrom {
     color: Color,
-    outcomes: BTreeMap<String, SeedOutcome>,
+    outcomes: BTreeMap<Located, SeedOutcome>,
     outputs: Vec<weft_core::run_spec::ExpectedWire>,
 }
 
@@ -476,12 +477,12 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
     let definition = sources[&run.color].project().as_ref();
     let snapshot = sources[&run.color].snapshot();
     let outputs = sources[&run.color].output_wires().map_err(|e| internal("seed outputs", e))?;
-    let live_nodes: BTreeSet<_> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
-        .map(|wire| wire.node.as_str()).collect();
+    let live_nodes: BTreeSet<Located> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
+        .map(|wire| Located::at(&wire.node, &wire.frames)).collect();
     let mut identities = BTreeMap::new();
     let mut outcomes = BTreeMap::new();
-    for node in inheritable_nodes(definition, snapshot) {
-        let origin = snapshot.inherited_origins.get(&node).copied().unwrap_or(run.color);
+    for place in inheritable_nodes(definition, snapshot) {
+        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run.color);
         let (original, graph) = if origin == run.color { (snapshot, definition) } else {
             let source = sources.get(&origin).ok_or_else(|| internal("seed origin", format!("missing run {origin}")))?;
             (source.snapshot(), source.project().as_ref())
@@ -493,20 +494,23 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
         let mut used_backups = BTreeMap::new();
         let mut backup_origins = BTreeMap::new();
         let mut absent_ports = BTreeSet::new();
-        let declaration = graph.nodes.iter().find(|n| n.id == node).ok_or_else(|| internal("seed node", &node))?;
-        for record in original.executions.get(&node).into_iter().flatten() {
+        let declaration = graph.nodes.iter().find(|n| n.id == place.id).ok_or_else(|| internal("seed node", &place.id))?;
+        for record in original.executions.get(&place.id).into_iter().flatten()
+            .filter(|record| Located::at(&place.id, &record.frames) == place)
+        {
             for port in &record.received.backup_ports {
-                let value = original.selection.as_ref().and_then(|selection| selection.input.get(&node))
-                    .and_then(|ports| ports.get(port)).ok_or_else(|| internal("seed backup", format!("{origin}: {node}.{port} has no recorded backup")))?;
+                let value = original.selection.as_ref().and_then(|selection| selection.input.get(&place))
+                    .and_then(|ports| ports.get(port)).ok_or_else(|| internal("seed backup", format!("{origin}: {place}.{port} has no recorded backup")))?;
                 used_backups.insert(port.clone(), value.clone());
                 backup_origins.insert(port.clone(), record.received.inherited_ports.get(port).copied().unwrap_or(origin));
             }
             absent_ports.extend(declaration.inputs.iter().filter(|port| !record.received.input.contains_key(&port.name)).map(|port| port.name.clone()));
         }
-        let boundary_ports = original.selection.as_ref().and_then(|selection| selection.boundary_ports.get(&node)).cloned().unwrap_or_default();
-        outcomes.insert(node.clone(), SeedOutcome { origin, slice_hash: identities[&origin][&node].clone(), used_backups, backup_origins, absent_ports, boundary_ports,
-            emitted_live_handle: live_nodes.contains(node.as_str()),
-            fire: original.kicked.iter().find(|(location, kick)| location.node_id == node && kick.firing)
+        let boundary_ports = original.selection.as_ref().and_then(|selection| selection.boundary_ports.get(&place)).cloned().unwrap_or_default();
+        let slice_hash = identities[&origin].get(&place).ok_or_else(|| internal("seed identity", format!("run {origin} has no slice for {place}")))?.clone();
+        outcomes.insert(place.clone(), SeedOutcome { origin, slice_hash, used_backups, backup_origins, absent_ports, boundary_ports,
+            emitted_live_handle: live_nodes.contains(&place),
+            fire: original.kicked.iter().find(|(location, kick)| Located::at(&location.node_id, &location.frames) == place && kick.firing)
                 .map(|(_, kick)| kick.payload.clone().unwrap_or(Value::Null)),
         });
     }
@@ -603,7 +607,7 @@ pub async fn run(
     }
 
     // Infra pre-flight, scoped to what THIS run executes.
-    let bound: Option<HashSet<String>> = Some(resolved.selection.nodes.iter().cloned().collect());
+    let bound: Option<HashSet<String>> = Some(resolved.selection.nodes.iter().map(|place| place.id.clone()).collect());
     let missing = crate::api::project::missing_infra_nodes(&state, &project_id, &project, bound.as_ref()).await?;
     if !missing.is_empty() {
         return Err((
@@ -648,11 +652,14 @@ pub async fn run(
     // re-runs, chosen because it is stable, not because it is first in
     // any graph order. A seeded run that inherited every node it
     // selected kicks nothing and re-runs nothing; it says so.
+    // Named the way the program reads them (`one.strip` for a node of
+    // an included file under the site `one`).
+    let spell = |place: &Located| weft_core::project::address_of(&project, &place.id, &place.path);
     let entry_node = kicks
         .first()
-        .map(|k| k.node.clone())
+        .map(|k| spell(&Located::at(&k.node, &k.frames)))
         .or_else(|| resolved.provided.iter().find_map(|p| p.consumers.first().map(|(n, _)| n.clone())))
-        .or_else(|| stale.iter().next().cloned())
+        .or_else(|| stale.iter().next().map(spell))
         .unwrap_or_else(|| "everything inherited".into());
     // Recording the run and starting it happen under the project's
     // transition lock, together.
@@ -675,7 +682,7 @@ pub async fn run(
     // so holds a pooled connection while it runs. Everything expensive
     // this handler does, the seed fold above and the response below,
     // stays outside it.
-    let stale_vec: Vec<String> = stale.iter().cloned().collect();
+    let stale_vec: Vec<String> = stale.iter().map(spell).collect();
     let (version, moved) = with_tree_lock(&state, &project_id, || async {
         // Head is read again in here. The one read outside chose the
         // seed, which is this run's own business; the version's PARENT
@@ -756,11 +763,8 @@ pub async fn run(
         ));
     }
 
-    let in_run = &resolved.selection.nodes;
-    let (inherited, ran): (Vec<String>, Vec<String>) = match &seed {
-        Some(seed) => (seed.origins.keys().cloned().collect(), in_run.iter().cloned().collect()),
-        None => (Vec::new(), in_run.iter().cloned().collect()),
-    };
+    let ran: Vec<String> = resolved.selection.nodes.iter().map(spell).collect();
+    let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect()).unwrap_or_default();
     Ok(Json(VersionRunResponse {
         color,
         version: version.version,
@@ -776,10 +780,26 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
     // Seed suppliers carry their original events. Only authored emits create
     // new supplied facts, including closures for an explicit empty port map,
     // and only the emits the cut kept (`--before` can drop one).
-    for (source, ports) in spec.emit.iter().filter(|(source, _)| resolved.selection.suppliers.contains(*source)) {
-        let node = project.nodes.iter().find(|node| &node.id == source).expect("resolved source exists");
+    // The resolver already turned each emit into the source's id and
+    // the frames it emits under; one row set per source.
+    let mut by_source: std::collections::BTreeMap<&str, (weft_core::frames::LoopFrames, std::collections::BTreeMap<&str, &Value>)> = Default::default();
+    for emission in resolved.provided.iter().filter(|e| resolved.selection.suppliers.contains(&Located::at(&e.source_node, &e.frames))) {
+        let entry = by_source.entry(emission.source_node.as_str()).or_insert_with(|| (emission.frames.clone(), Default::default()));
+        entry.1.insert(emission.source_port.as_str(), &emission.value);
+    }
+    // An emit with an empty port map still closes every output.
+    for spelled in spec.emit.keys() {
+        let (source, path) = weft_core::project::resolve_address(project, spelled);
+        let place = Located::new(source, path);
+        if resolved.selection.suppliers.contains(&place) {
+            by_source.entry(project.nodes.iter().find(|n| n.id == place.id).map(|n| n.id.as_str()).expect("resolved source exists"))
+                .or_insert_with(|| (place.frames(), Default::default()));
+        }
+    }
+    for (source, (frames, ports)) in by_source {
+        let node = project.nodes.iter().find(|node| node.id == source).expect("resolved source exists");
         for port in &node.outputs {
-            let supplied = ports.get(&port.name);
+            let supplied = ports.get(port.name.as_str()).copied();
             let generator = matches!(port.port_type, weft_core::weft_type::WeftType::Generator(_));
             let values: Vec<&Value> = match supplied {
                 Some(value) if generator => value.as_array().expect("resolved stream is a list").iter().collect(),
@@ -789,14 +809,14 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
             for (index, value) in values.into_iter().enumerate() {
                 events.push(weft_journal::ExecEvent::PortEmitted {
                     color, emission_id: uuid::Uuid::new_v5(&color, format!("supplied\0{source}\0{}\0{index}", port.name).as_bytes()),
-                    node_id: source.clone(), frames: vec![], port: port.name.clone(), value: Arc::new(value.clone()),
+                    node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), value: Arc::new(value.clone()),
                     provided: true, at_unix,
                 });
             }
             if generator || supplied.is_none() {
                 events.push(weft_journal::ExecEvent::PortClosed {
                     color, emission_id: uuid::Uuid::new_v5(&color, format!("supplied-end\0{source}\0{}", port.name).as_bytes()),
-                    node_id: source.clone(), frames: vec![], port: port.name.clone(), provided: true, at_unix,
+                    node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), provided: true, at_unix,
                 });
             }
         }
@@ -819,12 +839,12 @@ pub async fn trigger_bakes(
 /// A seeded run kicks its stale roots and every explicitly fired trigger.
 fn seeded_kicks(
     resolved: &Resolved,
-    stale: &BTreeSet<String>,
+    stale: &BTreeSet<Located>,
 ) -> Vec<Kick> {
     resolved
         .kicks
         .iter()
-        .filter(|k| k.firing || stale.contains(&k.node))
+        .filter(|k| k.firing || stale.contains(&Located::at(&k.node, &k.frames)))
         .cloned()
         .collect()
 }
@@ -1357,7 +1377,7 @@ mod fire_snapshot_tests {
         let wake = serde_json::json!({"message": "original"});
         let (birth, mut kicks) = crate::api::project::execution_birth_events(
             color, &project.to_string(), weft_core::context::Phase::Fire, "trigger",
-            &[Kick { node: "trigger".into(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
+            &[Kick { node: "trigger".into(), frames: Vec::new(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
             "original-graph", None, None, None, Some("original-source"), 42,
         );
         let mut rows = vec![birth];
@@ -1368,14 +1388,14 @@ mod fire_snapshot_tests {
         assert_eq!(run.created_at, 42);
         assert_eq!(run.spec.unwrap().fire, Some(("trigger".into(), wake)));
         rows.push(weft_journal::ExecEvent::NodeKicked {
-            color, node_id: "other-trigger".into(), firing: true,
+            color, node_id: "other-trigger".into(), frames: vec![], firing: true,
             payload: None, port_snapshot: None, at_unix: 42,
         });
         assert!(trigger_run_from_birth(color, &rows).unwrap_err().to_string().contains("more than one trigger"));
     }
 
     fn plan(node: &str, firing: bool) -> Kick {
-        Kick { node: node.to_string(), firing, payload: None, port_snapshot: None }
+        Kick { node: node.to_string(), frames: Vec::new(), firing, payload: None, port_snapshot: None }
     }
 
     /// A fired trigger replays the ports it registered at activation,
@@ -1407,7 +1427,7 @@ mod fire_snapshot_tests {
         fired.port_snapshot = Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" }));
         let resolved = Resolved {
             selection: weft_core::project::selection::RunSelection {
-                nodes: ["ask".to_string()].into_iter().collect(),
+                nodes: [Located::top("ask")].into_iter().collect(),
                 ..Default::default()
             },
             kicks: vec![fired],
@@ -1415,7 +1435,7 @@ mod fire_snapshot_tests {
             crossings: vec![],
             warnings: vec![],
         };
-        let stale: BTreeSet<String> = ["ask".to_string()].into_iter().collect();
+        let stale: BTreeSet<Located> = [Located::top("ask")].into_iter().collect();
         let kicks = seeded_kicks(&resolved, &stale);
         assert_eq!(kicks[0].port_snapshot, Some(serde_json::json!({ "endpointUrl": "http://bridge:8090" })));
     }

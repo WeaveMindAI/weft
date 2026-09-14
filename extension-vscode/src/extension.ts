@@ -3,9 +3,9 @@
 // Wires together:
 //   - the dispatcher HTTP client (one per extension instance)
 //   - the graph webview that opens when a .weft file is viewed
-//   - the Weft activity-bar sidebar (Projects, Executions, Inspector)
+//   - the Weft activity-bar sidebar (Projects, Executions)
 //   - the execution follower that bridges dispatcher SSE events
-//     into graph + inspector updates
+//     into graph updates
 //   - the VS Code commands that the sidebar, context menus, and
 //     keybindings trigger
 //
@@ -185,7 +185,7 @@ export function activate(context: vscode.ExtensionContext) {
   /// the worker / infra the user activated could now be stale. `weft
   /// status` hashes what is ON DISK, so the honest trigger is any
   /// WRITE inside the pinned project, whoever made it: an editor
-  /// save, the graph view rewriting `main.weft` through
+  /// save, the graph view rewriting `src/main.weft` through
   /// `workspace.fs.writeFile`, a layout write. A save listener missed
   /// every non-editor write (VS Code drops an editor-less document
   /// after a while, and the graph then writes via fs), so a
@@ -228,6 +228,17 @@ export function activate(context: vscode.ExtensionContext) {
   graphView.setNavHandler((group) => executionsProvider.setFocusedGroup(group));
   graphView.setFollowTogglePinHandler(() => autoFollow.togglePin());
   graphView.setFollowCatchUpHandler(() => autoFollow.catchUpToLatest());
+  graphView.setFollowClearHandler(() => stopShowingRun());
+
+  /// Take the followed run off the canvas: the eye button on the graph,
+  /// and deleting the run that is on screen, both end here. The
+  /// controller clears its follow and the webview's paint; the version
+  /// banner is remembered by the view itself, so it is forgotten here
+  /// too, or a remount would bring it back over an empty canvas.
+  function stopShowingRun(): void {
+    autoFollow.clearFollow();
+    graphView.forgetExecVersion();
+  }
   graphView.setCliVerbHandler((verb, args) => runCliVerb(verb, args));
   graphView.setCliStatusHandler(() => refreshActionBarFromStatus());
   graphView.setStopActionHandler(() => stopAction());
@@ -1124,7 +1135,7 @@ export function activate(context: vscode.ExtensionContext) {
     // follow through the controller (which owns the followed color)
     // so its state and the webview's pill stay consistent.
     if (autoFollow.currentColor() === summary.color) {
-      autoFollow.clearFollow();
+      stopShowingRun();
     }
     let deleted = true;
     try {

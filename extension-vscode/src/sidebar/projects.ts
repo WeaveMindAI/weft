@@ -1,4 +1,5 @@
-// Projects sidebar: discovers `.weft` files in the open workspace
+// Projects sidebar: discovers weft projects (a folder holding a
+// `weft.toml`, its program at `src/main.weft`) in the open workspace
 // folders and exposes them as a TreeView. Refresh is cheap (a single
 // findFiles glob), so we re-run it whenever the user asks or a
 // file-system event suggests new/removed .weft files.
@@ -75,13 +76,14 @@ function extractPackageId(toml: string): string | undefined {
 }
 
 export interface WeftProject {
-  /** Deterministic UUID keyed by the main.weft absolute path. */
+  /** The project's id from its `weft.toml`, or a deterministic UUID
+   *  keyed by the entry file's absolute path when the manifest has none. */
   id: string;
-  /** Display name: the containing folder. */
+  /** Display name: the project folder. */
   label: string;
-  /** Absolute path to the .weft entry file. */
+  /** Absolute path to `src/main.weft`, the .weft entry file. */
   entryPath: string;
-  /** Absolute path to the folder containing the .weft file. */
+  /** Absolute path to the project root (the folder holding `weft.toml`). */
   rootPath: string;
 }
 
@@ -138,35 +140,26 @@ export class ProjectNode extends vscode.TreeItem {
   }
 }
 
+/// A project is a folder with a `weft.toml`, and its program is
+/// `src/main.weft` (the one entry the CLI reads, `Project::main_weft`
+/// in weft-compiler). One row per manifest: the modules under `src/`
+/// are parts of that project, not projects of their own, which is what
+/// listing every `.weft` file used to make them. A manifest whose
+/// entry file is missing is skipped rather than shown as a project the
+/// graph cannot open.
 async function discoverProjects(): Promise<WeftProject[]> {
-  const uris = await vscode.workspace.findFiles('**/*.weft', '**/node_modules/**');
-  // Group by parent folder; show one entry per folder (take the
-  // lexicographically first .weft file as the entry). Multiple
-  // .weft files in one folder = multiple entries for now; revisit
-  // if that becomes common.
-  const byFolder = new Map<string, string[]>();
-  for (const uri of uris) {
-    const p = uri.fsPath;
-    const dir = path.dirname(p);
-    const list = byFolder.get(dir) ?? [];
-    list.push(p);
-    byFolder.set(dir, list);
-  }
+  const manifests = await vscode.workspace.findFiles('**/weft.toml', '**/node_modules/**');
   const projects: WeftProject[] = [];
-  for (const [dir, files] of byFolder) {
-    files.sort();
-    for (const f of files) {
-      projects.push({
-        // weft.toml is the source of truth when present (matches
-        // CLI + dispatcher). Fall back to the path-derived id only
-        // for orphan .weft files with no weft.toml anywhere up the
-        // tree.
-        id: readProjectIdFromToml(f) ?? deriveProjectId(f),
-        label: path.basename(dir),
-        entryPath: f,
-        rootPath: dir,
-      });
-    }
+  for (const uri of manifests) {
+    const dir = path.dirname(uri.fsPath);
+    const entry = path.join(dir, 'src', 'main.weft');
+    if (!fs.existsSync(entry)) continue;
+    projects.push({
+      id: readProjectIdFromToml(entry) ?? deriveProjectId(entry),
+      label: path.basename(dir),
+      entryPath: entry,
+      rootPath: dir,
+    });
   }
   projects.sort((a, b) => a.label.localeCompare(b.label));
   return projects;

@@ -14,14 +14,14 @@ credit = Group(db: Access, telegramUser: String) -> (paid: Boolean, refusal?: St
   # Take one credit off this telegram account, or say why we cannot.
   # The query reads the sender's id as `$telegram_id`.
   debit = PostgresExecuteQuery(telegram_id: String) {
-    query: @file("sql/spend_credit.sql")
+    query: @file("assets/sql/spend_credit.sql")
     account: self.db
     telegram_id: self.telegramUser
   }
 
   # `refusal` says nothing when the credit was taken
   read = ExecPython(rows: List[JsonDict]) -> (paid: Boolean, refusal?: String) {
-    code: @file("scripts/outcome.py")
+    code: @file("assets/scripts/outcome.py")
     rows: debit.rows
   }
 
@@ -42,7 +42,7 @@ brief = Group(request: String) -> (prompt: String) {
   write = LlmInference -> (response: String) {
     prompt: self.request
     provider: OpenRouterProvider { model: "anthropic/claude-sonnet-4.5" }.provider
-    params: LlmParams { systemPrompt: @file("prompts/image_brief.md") }.params
+    params: LlmParams { systemPrompt: @file("assets/prompts/image_brief.md") }.params
   }
   self.prompt = write.response
 }
@@ -74,9 +74,9 @@ Three files sit beside it, none of them weft:
 
 | File | What it holds |
 |---|---|
-| `sql/spend_credit.sql` | one statement that takes a credit and reports what happened |
-| `scripts/outcome.py` | turns the query's row into `paid` and, when it failed, a sentence |
-| `prompts/image_brief.md` | the system prompt that turns a message into an image brief |
+| `assets/sql/spend_credit.sql` | one statement that takes a credit and reports what happened |
+| `assets/scripts/outcome.py` | turns the query's row into `paid` and, when it failed, a sentence |
+| `assets/prompts/image_brief.md` | the system prompt that turns a message into an image brief |
 
 `@file` pulls each one in as that field's value, so the SQL lives in a real
 `.sql` file your editor can highlight while still being the node's config.

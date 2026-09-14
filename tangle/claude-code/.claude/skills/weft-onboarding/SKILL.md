@@ -36,7 +36,7 @@ never a lecture about what is not.
 | a box | a node: one step that does one thing (ask a model, send a message, wait for a person) |
 | an arrow | a wire: where a step's result goes next; the color says what kind of value it carries |
 | the dots on a box's edges | ports: the named places values come in and go out |
-| the small square top-left of a box | the on/off switch: filled means something said "run this", hollow means nothing did |
+| the small amber arrow top-left of a box | the on/off switch: filled means something said "run this", hollow means nothing did |
 | a big box holding smaller boxes | a group: steps bundled into one named step, collapsible like a folder |
 | a violet box with a rotate icon | a loop: the same steps run once per item of a list |
 | a trigger | what starts the program on its own (a message arriving, a schedule, a form); the action bar grows an Activate button when one is in the program |
@@ -47,13 +47,13 @@ never a lecture about what is not.
 
 ## The tour, in order
 
-1. **Two views of one thing.** Open `main.weft`: the graph appears. The
+1. **Two views of one thing.** Open `src/main.weft`: the graph appears. The
    "Source" button puts the text beside it. Type in one, or drag a box in
    the other: they never drift, because every edit goes through the
    compiler. This is the whole idea of weft: the program is the picture.
 2. **Reading the picture.** Left dots are inputs, right dots are outputs,
-   arrows carry results, colors carry types, the small top-left square is
-   the on/off switch. The label on a box is its name; the small text is
+   arrows carry results, colors carry types, the small amber arrow top-left
+   is the on/off switch. The label on a box is its name; the small text is
    its type.
 3. **Run it once.** The "Run Project" button (or Ctrl+Enter). Boxes glow
    amber as they work, green as they land. Click one: the inspector shows

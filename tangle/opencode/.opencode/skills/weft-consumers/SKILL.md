@@ -11,7 +11,10 @@ an **api token** lets an outside client list the signals it may see and
 fire them. The weft browser extension is one such client, for the kind
 people answer by hand (a form); anything that can send HTTP can be
 another, for that kind or any kind that renders a consumer payload. This
-is the whole surface, in the order a client uses it.
+is the whole surface, in the order a client uses it. A frontend the project
+builds for itself under `front/` (the `weft-frontend` skill) is one more
+client of exactly these doors, for the human steps the program parks, while
+the program's own `ApiEndpoint` routes serve the page's ordinary data calls.
 
 ## The token
 

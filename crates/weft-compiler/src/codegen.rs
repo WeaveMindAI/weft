@@ -98,17 +98,11 @@ pub fn emit(
         &crate_root,
         catalog,
         &packages,
-        &EmitPaths::Container { nodes_root: project_root.join("nodes") },
+        &EmitPaths::Container { project_root: project_root.to_path_buf() },
     )?;
     write_worker_cargo_toml(&crate_root, catalog, &packages, &crate_dirs, crate_name)?;
     write_rust_toolchain(&crate_root, &weft_root)?;
-    // The cache sweep the Dockerfile runs after `cargo build`; it rides
-    // in the crate so the `COPY build/ /work/` carries it.
-    std::fs::write(
-        crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME),
-        crate::worker_image::CACHE_GC_SCRIPT,
-    )
-    .map_err(CompileError::Io)?;
+    write_cache_gc_script(&crate_root)?;
     write_registry_rs(&src_dir, &packages)?;
     write_main_rs(&src_dir, catalog)?;
 
@@ -121,27 +115,29 @@ pub fn emit(
 ///     context mounts the weft workspace at `WEFT_MOUNT` and the
 ///     project's nodes at `NODES_MOUNT` (the worker image, and a
 ///     staged test image). `#[path]` includes and path deps use the
-///     mount layout; `nodes_root` is the on-disk `nodes/` dir the
-///     includes are rebased against.
+///     mount layout; `project_root` is the on-disk project the
+///     includes are rebased against (a node lives under its `nodes/`
+///     or beside the code under its `src/`, and both trees are staged
+///     at their project-relative path).
 ///   - `Local`: the crate compiles on the host with plain cargo (the
 ///     local node-test binary). `#[path]` includes are the real
 ///     absolute node paths; path deps point at the real weft checkout.
 pub enum EmitPaths {
-    Container { nodes_root: PathBuf },
+    Container { project_root: PathBuf },
     Local { weft_root: PathBuf },
 }
 
 impl EmitPaths {
-    /// The `#[path = "..."]` string for a real source file under the
-    /// project's `nodes/` root.
+    /// The `#[path = "..."]` string for a real source file under one of
+    /// the project's node roots.
     fn include_path(&self, abs: &Path) -> CompileResult<String> {
         match self {
-            EmitPaths::Container { nodes_root } => {
-                let rel = abs.strip_prefix(nodes_root).map_err(|_| {
+            EmitPaths::Container { project_root } => {
+                let rel = abs.strip_prefix(project_root).map_err(|_| {
                     CompileError::Build(format!(
-                        "source file {} is not under project nodes root {}",
+                        "source file {} is not under the project root {}",
                         abs.display(),
-                        nodes_root.display()
+                        project_root.display()
                     ))
                 })?;
                 Ok(format!(
@@ -402,13 +398,7 @@ fn write_worker_cargo_toml(
         r#"# Emitted by weft codegen. Do not edit by hand; regenerated on
 # every `weft build`.
 
-# Self-contained: without this, an emission living under some other
-# cargo workspace (a project inside a workspace dir) would be claimed
-# by it and refuse to build. Path-dep subcrates auto-join this
-# workspace.
-[workspace]
-
-[package]
+{workspace}[package]
 name = "{name}"
 version = "0.1.0"
 edition = "2021"
@@ -419,6 +409,7 @@ path = "src/main.rs"
 
 [dependencies]
 {deps}{build_deps}"#,
+        workspace = STANDALONE_WORKSPACE_HEADER,
         name = package_name,
         deps = deps_fragment,
         build_deps = build_deps_fragment,
@@ -661,6 +652,21 @@ fn render_package_lib_rs(
         ));
     }
     Ok(body)
+}
+
+/// Put the compile-cache sweep (`worker_image::CACHE_GC_SCRIPT`) at the
+/// root of a crate that builds inside an image. The Dockerfile's
+/// `cargo build` RUN calls it out of `/work` after the binary is copied
+/// out, and the crate root is what the `COPY build/ /work/` carries, so
+/// this is how the script reaches the build. Every crate the built-in
+/// templates build gets one: the worker crate and the container path's
+/// node-test crate.
+fn write_cache_gc_script(crate_root: &Path) -> Result<(), CompileError> {
+    std::fs::write(
+        crate_root.join(crate::worker_image::CACHE_GC_SCRIPT_NAME),
+        crate::worker_image::CACHE_GC_SCRIPT,
+    )
+    .map_err(CompileError::Io)
 }
 
 /// Propagate the workspace's pinned toolchain into the generated
@@ -1306,6 +1312,91 @@ pub struct TestCrate {
     pub node_types: Vec<String>,
 }
 
+/// The dev profile every HOST node-test build uses. (The container
+/// path builds `--release` inside its image, so it never reads a dev
+/// profile and does not carry one.)
+///
+/// Cargo's own dev defaults are wrong for an emission and were what
+/// let these builds grow into tens of gigabytes:
+///   - full debuginfo put 286MB of debug sections in a 333MB test
+///     binary, once per package. `line-tables-only` keeps the
+///     file:line a failing test's backtrace is read by and drops the
+///     rest, which is most of it.
+///   - incremental state only pays off when somebody edits a crate and
+///     rebuilds it. Nobody edits an emission (it is regenerated from
+///     scratch every run), so every byte of it was dead weight.
+///
+/// SYNC: test-build dev profile <-> the weft workspace root's
+/// [profile.dev] in Cargo.toml, which an emission cannot inherit
+/// because it is not a member of that workspace.
+const DEV_PROFILE_BLOCK: &str = r#"[profile.dev]
+debug = "line-tables-only"
+incremental = false
+"#;
+
+/// What a STANDALONE emission (the worker crate, and the container
+/// path's test crate: one crate per image) puts above its `[package]`:
+/// its own workspace, so an emission living under some other cargo
+/// workspace (a project inside a workspace dir) is not claimed by it
+/// and refused a build.
+const STANDALONE_WORKSPACE_HEADER: &str = "\
+# Self-contained: without this, an emission living under some other
+# cargo workspace (a project inside a workspace dir) would be claimed
+# by it and refuse to build. Path-dep subcrates auto-join this
+# workspace.
+[workspace]
+
+";
+
+/// Write the workspace root the host's node-test crates are members
+/// of: one `Cargo.toml` listing `members`, the toolchain pin, and a
+/// seeded `Cargo.lock`.
+///
+/// ONE workspace rather than one per package, because cargo resolves
+/// features per workspace: 28 separate workspaces sharing a target dir
+/// meant the same dependency was compiled once per distinct feature
+/// union (ten copies of `sqlx-postgres`, all from one run). Members
+/// unify, so each dependency is built once.
+///
+/// `members` is what THIS run emitted, not every package in the
+/// project, which is what keeps a broken sibling harmless: a package
+/// nobody targeted is not a member, so it cannot fail the resolve.
+pub fn emit_test_workspace(root: &Path, members: &[String]) -> CompileResult<()> {
+    std::fs::create_dir_all(root).map_err(CompileError::Io)?;
+    let weft_root = crate::build::resolve_weft_root()?;
+    write_rust_toolchain(root, &weft_root)?;
+    // Seed the Cargo.lock so the build resolves the versions the weft
+    // workspace already pins for every dep the lock covers (a node dep
+    // OUTSIDE the lock still resolves fresh; only the shared engine
+    // graph is pinned). Overwritten on EVERY run, so the cache follows
+    // the installed weft: a lock left over from an older install would
+    // keep building the engine's old dependency versions beside the
+    // new ones, which is exactly the growth this cache exists to stop.
+    // The container path gets the same seed from the Dockerfile's
+    // `cp /weft/Cargo.lock`.
+    let lock_src = weft_root.join("Cargo.lock");
+    std::fs::copy(&lock_src, root.join("Cargo.lock")).map_err(|e| {
+        CompileError::Build(format!("seed Cargo.lock from {}: {e}", lock_src.display()))
+    })?;
+    let member_list = members
+        .iter()
+        .map(|m| format!("    \"{}\",\n", escape_quoted_str(m)))
+        .collect::<String>();
+    let contents = format!(
+        "# Emitted by weft codegen: the workspace this run's node-test\n\
+         # crates are members of. Do not edit by hand; rewritten on every\n\
+         # test build.\n\
+         \n\
+         [workspace]\n\
+         resolver = \"2\"\n\
+         members = [\n{member_list}]\n\
+         \n\
+         {DEV_PROFILE_BLOCK}"
+    );
+    std::fs::write(root.join("Cargo.toml"), contents).map_err(CompileError::Io)?;
+    Ok(())
+}
+
 /// Emit the per-PACKAGE node-test crate at `target_root`:
 ///
 /// ```text
@@ -1356,19 +1447,20 @@ pub fn emit_test_crate(
     }
     let src_dir = target_root.join("src");
     std::fs::create_dir_all(&src_dir).map_err(CompileError::Io)?;
-    let weft_root = crate::build::resolve_weft_root()?;
-    write_rust_toolchain(target_root, &weft_root)?;
-
-    // Seed the workspace's Cargo.lock so the host build resolves the
-    // versions the workspace already pins for every dep the lock
-    // covers (a node dep OUTSIDE the lock still resolves fresh; only
-    // the shared engine graph is pinned). The container path gets the
-    // same seed from the Dockerfile's `cp /weft/Cargo.lock`.
-    if matches!(paths, EmitPaths::Local { .. }) {
-        let lock_src = weft_root.join("Cargo.lock");
-        std::fs::copy(&lock_src, target_root.join("Cargo.lock")).map_err(|e| {
-            CompileError::Build(format!("seed Cargo.lock from {}: {e}", lock_src.display()))
-        })?;
+    // The container path builds ONE crate inside its own image, so it
+    // carries its own workspace and toolchain pin. The local path is a
+    // MEMBER of the shared workspace `emit_test_workspace` writes (see
+    // there for why), which owns those and the dev profile instead.
+    let standalone = matches!(paths, EmitPaths::Container { .. });
+    if standalone {
+        let weft_root = crate::build::resolve_weft_root()?;
+        write_rust_toolchain(target_root, &weft_root)?;
+        // The test image builds with the same Dockerfile fragment a
+        // worker does, and that fragment runs the cache sweep out of
+        // `/work` after `cargo build`: without the script here, every
+        // test image build reported a failed sweep and the test crates'
+        // per-package artifacts never expired from the shared cache.
+        write_cache_gc_script(target_root)?;
     }
 
     let binary_name = format!("{}_tests", crate::build::sanitize_crate_name(&package.name));
@@ -1406,13 +1498,7 @@ pub fn emit_test_crate(
         r#"# Emitted by weft codegen: the `{pkg_name}` package's node-test
 # crate. Do not edit by hand; regenerated on every test build.
 
-# Self-contained: without this, an emission living under some other
-# cargo workspace (a project inside a workspace dir) would be claimed
-# by it and refuse to build. Path-dep subcrates auto-join this
-# workspace.
-[workspace]
-
-[package]
+{workspace_block}[package]
 name = "{binary_name}"
 version = "0.1.0"
 edition = "2021"
@@ -1426,6 +1512,7 @@ path = "src/main.rs"
         pkg_name = package.name,
         deps = deps_fragment,
         build_deps = build_deps_fragment,
+        workspace_block = if standalone { STANDALONE_WORKSPACE_HEADER } else { "" },
     );
     std::fs::write(target_root.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
 

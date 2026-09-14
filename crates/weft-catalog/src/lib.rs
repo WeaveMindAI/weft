@@ -201,17 +201,31 @@ impl FsCatalog {
         root: &Path,
         policy: DiscoverPolicy,
     ) -> Result<Self, CatalogError> {
+        Self::discover_roots_with_policy(&[root], policy)
+    }
+
+    /// One catalog over several trees. A project's nodes live in two
+    /// places: `nodes/` (the standard library and anything shared) and
+    /// beside the code that uses them under `src/`, so both are walked
+    /// into one catalog with one namespace: a type name declared in both
+    /// is the same collision it would be inside one tree. A root that
+    /// does not exist contributes nothing.
+    pub fn discover_roots_with_policy(
+        roots: &[&Path],
+        policy: DiscoverPolicy,
+    ) -> Result<Self, CatalogError> {
         let mut cat = Self {
             entries: HashMap::new(),
             packages: HashMap::new(),
             warnings: Vec::new(),
             type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
         };
-        if root.exists() {
+        let roots: Vec<&Path> = roots.iter().copied().filter(|r| r.exists()).collect();
+        if !roots.is_empty() {
             // Type declarations first: port type strings in any
             // metadata.json may use the declared names, so the registry
             // must exist before a single NodeMetadata is deserialized.
-            match build_type_registry(root, policy, &mut cat.warnings)? {
+            match build_type_registry(&roots, policy, &mut cat.warnings)? {
                 Some(registry) => cat.type_registry = std::sync::Arc::new(registry),
                 None => { /* Lenient fallback: builtin only, warned. */ }
             }
@@ -222,7 +236,7 @@ impl FsCatalog {
                 chain: Default::default(),
                 done: Default::default(),
             };
-            registry.scoped(|| visit_dir(root, &mut ctx))?;
+            registry.scoped(|| roots.iter().try_for_each(|root| visit_dir(root, &mut ctx)))?;
         }
         Ok(cat)
     }
@@ -398,8 +412,10 @@ pub struct NodeDeps {
 /// FOO_CONFIG = "{{catalog_path}}/foo-config.txt"
 /// ```
 ///
-/// resolves to `/weft/project-nodes/base_catalog/basic/exec_python/foo-config.txt`
-/// if the node lives at `nodes/base_catalog/basic/exec_python/`.
+/// resolves to `/weft/project-nodes/nodes/base_catalog/basic/exec_python/foo-config.txt`
+/// if the node lives at `nodes/base_catalog/basic/exec_python/` (the
+/// mount holds every node at its project-relative path, so one beside
+/// the code lands under `/weft/project-nodes/src/...`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BuildEnv {
     #[serde(default)]
@@ -781,12 +797,14 @@ impl DiscoverCtx<'_> {
 /// registry build failure becomes a warning and `None` (builtin-only),
 /// so the editor keeps rendering while the author fixes the clash.
 fn build_type_registry(
-    root: &Path,
+    roots: &[&Path],
     policy: DiscoverPolicy,
     warnings: &mut Vec<String>,
 ) -> Result<Option<weft_core::weft_type::TypeRegistry>, CatalogError> {
     let mut declarations: Vec<(String, String, String)> = Vec::new();
-    harvest_type_declarations(root, &mut declarations)?;
+    for root in roots {
+        harvest_type_declarations(root, &mut declarations)?;
+    }
     // Lexical order by origin path: `fs::read_dir` order is
     // filesystem-dependent, and a clash error names the SECOND origin,
     // so an unsorted harvest would blame a different file per machine.
@@ -795,7 +813,9 @@ fn build_type_registry(
         Ok(registry) => Ok(Some(registry)),
         Err(error) => match policy {
             DiscoverPolicy::Strict => Err(CatalogError::Parse {
-                path: root.to_path_buf(),
+                // The clash names both origins itself; the first root is
+                // the tree the reader will look in first.
+                path: roots.first().map(|r| r.to_path_buf()).unwrap_or_default(),
                 error: format!("type declarations: {error}"),
             }),
             DiscoverPolicy::Lenient => {
@@ -1472,6 +1492,30 @@ mod package_tests {
             "the drop is warned, not silent: {:?}",
             cat.warnings()
         );
+    }
+
+    /// A project's nodes live in two trees, `nodes/` and beside the code
+    /// under `src/`, walked into ONE catalog: a node in either is found,
+    /// and one name in both is the same collision it is inside one tree.
+    #[test]
+    fn nodes_are_found_across_both_roots_and_a_name_is_unique_across_them() {
+        let root = tempfile::tempdir().expect("temp root");
+        let stdlib = stdlib_root().expect("stdlib root");
+        copy_dir(&stdlib.join("slack"), &root.path().join("nodes/slack"));
+        copy_dir(&stdlib.join("logic"), &root.path().join("src/billing/logic"));
+        let roots = [root.path().join("nodes"), root.path().join("src")];
+        let roots: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
+        let cat = FsCatalog::discover_roots_with_policy(&roots, DiscoverPolicy::Strict).expect("both trees");
+        assert!(cat.packages().any(|p| p.name == "slack"), "the shared tree");
+        assert!(cat.packages().any(|p| p.name == "logic"), "beside the code");
+        // A root that is not there contributes nothing and is no error.
+        let missing = root.path().join("nowhere");
+        FsCatalog::discover_roots_with_policy(&[roots[0], &missing], DiscoverPolicy::Strict).expect("a missing root is empty");
+
+        copy_dir(&stdlib.join("slack"), &root.path().join("src/slack_again"));
+        let err = FsCatalog::discover_roots_with_policy(&roots, DiscoverPolicy::Strict)
+            .expect_err("one name in both trees is a collision");
+        assert!(matches!(&err, CatalogError::PackageNameCollision { name, .. } if name == "slack"), "{err}");
     }
 
     /// Every shipped stdlib `metadata.json` parses under the strict schema

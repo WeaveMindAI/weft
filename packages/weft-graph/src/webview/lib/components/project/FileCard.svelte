@@ -3,7 +3,14 @@
 	import type { FileValueWire } from '../../../../protocol';
 	import { send } from '../../../host';
 
-	let { label, file }: { label: string; file: FileValueWire } = $props();
+	let { label, file, note = undefined }: {
+		label: string;
+		file: FileValueWire;
+		/// Where the value came from when it did not travel a wire in
+		/// this run (a backup, a supplied output, the seed run). Shown
+		/// beside the file's metadata.
+		note?: string;
+	} = $props();
 
 	function fmtSize(bytes: number): string {
 		const units = ['B', 'KiB', 'MiB', 'GiB'];
@@ -42,7 +49,7 @@
 				{file.filename || file.key || file.url}
 			</div>
 			<div class="text-[10px] text-zinc-400">
-				{file.mimeType}{#if file.sizeBytes > 0}&nbsp;· {fmtSize(file.sizeBytes)}{/if}
+				{file.mimeType}{#if file.sizeBytes > 0}&nbsp;· {fmtSize(file.sizeBytes)}{/if}{#if note}&nbsp;· <span class="text-sky-700">{note}</span>{/if}
 			</div>
 		</div>
 		{#if file.key}

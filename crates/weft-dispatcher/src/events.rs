@@ -81,7 +81,7 @@ pub enum DispatcherEvent {
         color: Color,
         entry_node: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        subgraph: Option<Vec<String>>,
+        subgraph: Option<Vec<weft_core::frames::Located>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<weft_journal::Seed>,
         project_id: String,

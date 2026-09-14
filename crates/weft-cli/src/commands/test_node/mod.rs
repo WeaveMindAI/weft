@@ -1,10 +1,12 @@
 //! `weft test-node`: run node self-tests.
 //!
-//! Basic/fake tiers run RIGHT HERE: the per-package test crate is
-//! emitted against the real weft checkout (`EmitPaths::Local`), built
-//! with plain cargo (no docker, no cluster, no broker), and executed.
-//! A broken `main.weft` or a broken sibling package never blocks this:
-//! only the target package has to compile.
+//! Basic/fake tiers run RIGHT HERE: every targeted package's test
+//! crate is emitted against the real weft checkout
+//! (`EmitPaths::Local`) as a member of one cargo workspace, built with
+//! plain cargo (no docker, no cluster, no broker), and executed.
+//! A broken `main.weft` never blocks this, and neither does a broken
+//! package nobody targeted: only what you asked to test joins the
+//! build. Target a package and it is the only one that has to compile.
 //!
 //! The live tier runs the PRODUCTION credential path (connection
 //! resolution, relaying, metering, billing), which only exists next to
@@ -119,43 +121,49 @@ pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
         bail!("--key and --connection only apply to the live tier; add --tier live");
     }
 
-    // All packages share one build root under `.weft/target/test/`,
-    // so the engine compiles once and stays cached across packages
-    // and runs. The local tiers RUN the per-package binary, so they
-    // build it; the live tier only needs each package's test LISTING,
-    // which `cached_listing` answers without a build when the
-    // package's content hash has not moved.
-    let test_build_root = project.root.join(".weft").join("target").join("test");
+    // The cargo cache is machine-wide and lives outside the project,
+    // so the engine compiles once per MACHINE rather than once per
+    // project, and a project folder never grows a build cache. The
+    // local tiers RUN the per-package binary, so they build it; the
+    // live tier only needs each package's test LISTING, which
+    // `cached_listing` answers without a build when the package's
+    // content hash has not moved.
+    let cache_root = node_test_cache_root();
+    bound_build_cache(&cache_root, cache_cap_bytes()?)?;
+    let build_dirs =
+        weft_compiler::build::TestBuildDirs::shared(&project.root, &cache_root);
+    // Every package this run will test is emitted BEFORE any of them
+    // builds, so cargo unifies features across them and compiles each
+    // shared dependency once instead of once per feature union.
+    let package_names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
+    let workspace =
+        weft_compiler::build::prepare_test_workspace(&catalog, &package_names, &build_dirs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut reports: Vec<TestReport> = Vec::new();
-    // A package that fails to BUILD stops the sweep (its tests cannot
-    // run), but never silently: the packages that already ran render
-    // their reports first, then the build error fails the command.
-    let mut build_error: Option<anyhow::Error> = None;
     if !local.is_empty() {
+        // Every package compiles before any test runs: nothing to run
+        // until the code builds, and cargo's own diagnostics have
+        // already named whatever broke.
+        let binaries = weft_compiler::build::build_node_test_binaries(&workspace)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         for target in &targets {
-            match weft_compiler::build::build_node_test_binary(
-                &catalog,
-                &target.name,
-                &test_build_root,
-            ) {
-                Ok(binary) => reports.extend(
-                    run_local(&binary, target, args.test.as_deref(), &local, args.parallel)?,
-                ),
-                Err(e) => {
-                    build_error = Some(anyhow::anyhow!("{e}"));
-                    break;
-                }
-            }
+            let binary = binaries.get(&target.name).with_context(|| {
+                format!("no test binary was built for package '{}'", target.name)
+            })?;
+            let run = run_local(binary, target, args.test.as_deref(), &local, args.parallel);
+            // The binary has served its purpose. It is ~110MB (mostly
+            // the line tables), it relinks in seconds from the
+            // dependency cache that stays, and keeping one per package
+            // held 3.2GB of the cache between runs for nothing.
+            weft_compiler::build::drop_built_binary(binary);
+            reports.extend(run?);
         }
     }
-    if live && build_error.is_none() {
-        run_live(&ctx, &catalog, &targets, &test_build_root, &args, &mut reports).await?;
+    if live {
+        run_live(&ctx, &catalog, &targets, &workspace, &build_dirs, &args, &mut reports).await?;
     }
 
     render(&ctx, &reports)?;
-    if let Some(e) = build_error {
-        return Err(e);
-    }
     let failed = reports.iter().filter(|r| !r.passed).count();
     if failed > 0 {
         bail!("{failed} of {} node tests failed", reports.len());
@@ -213,6 +221,109 @@ pub fn hash(ctx: Ctx, target: Option<String>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The machine-wide node-test cache: one compiled engine for every
+/// project on this machine, beside the rest of weft's own state rather
+/// than inside anybody's project.
+fn node_test_cache_root() -> PathBuf {
+    super::daemon::data_dir().join("node-test-cache")
+}
+
+/// This project's own slice of the shared node-test cache (its emitted
+/// crates and listings), the part `weft rm --local` reclaims.
+pub fn project_cache_slice(project_root: &std::path::Path) -> PathBuf {
+    weft_compiler::build::TestBuildDirs::shared(project_root, &node_test_cache_root()).crates_root
+}
+
+/// What the node-test cache takes on disk, for `weft clean --images`'s
+/// size report: `None` when nothing has been built on this machine.
+pub fn cache_size_bytes() -> Result<Option<u64>> {
+    let root = node_test_cache_root();
+    if !root.exists() {
+        return Ok(None);
+    }
+    dir_size_bytes(&root)
+        .map(Some)
+        .with_context(|| format!("measure the node-test cache at {}", root.display()))
+}
+
+/// Throw the whole node-test cache away (`weft clean --build-cache`):
+/// every project's emitted crates and the shared compiled engine. The
+/// next `weft test-node` builds cold and re-makes all of it.
+pub fn wipe_cache() -> Result<()> {
+    let root = node_test_cache_root();
+    if !root.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&root).with_context(|| format!("remove {}", root.display()))
+}
+
+/// The cap on the node-test cache, in bytes. Override with
+/// `WEFT_TEST_CACHE_CAP_GB`; 0 disables the bound.
+fn cache_cap_bytes() -> Result<u64> {
+    // A full sweep of the 28-package stdlib settles at 1.7GB, so the
+    // cap has to sit above that or it would wipe on every ordinary
+    // run. 6GB leaves room for a project's own packages on top and
+    // still trips long before accumulated junk is the user's problem.
+    const DEFAULT_CAP_GB: u64 = 6;
+    let Ok(raw) = std::env::var("WEFT_TEST_CACHE_CAP_GB") else {
+        return Ok(DEFAULT_CAP_GB * 1024 * 1024 * 1024);
+    };
+    let gb: u64 = raw.trim().parse().with_context(|| {
+        format!("WEFT_TEST_CACHE_CAP_GB must be a whole number of gigabytes, got '{raw}'")
+    })?;
+    Ok(gb * 1024 * 1024 * 1024)
+}
+
+/// Keep the node-test build cache under `cap_bytes`, wiping it whole
+/// when it is over.
+///
+/// Cargo's target dir is append-only: an artifact's filename carries a
+/// hash of its features, flags and dependency graph, so a build with
+/// any of those changed writes a NEW file beside the old one and
+/// nothing ever deletes the old one. Left alone it grows until the
+/// disk is full (one project's cache reached 16GB before the cache
+/// was shared and bounded). Under the cap the cache is untouched and
+/// reruns stay fast; over it, one cold rebuild buys the space back.
+/// `cap_bytes` of 0 disables the bound.
+fn bound_build_cache(root: &std::path::Path, cap_bytes: u64) -> Result<()> {
+    if cap_bytes == 0 || !root.exists() {
+        return Ok(());
+    }
+    let size = dir_size_bytes(root)
+        .with_context(|| format!("measure the node-test build cache at {}", root.display()))?;
+    if size <= cap_bytes {
+        return Ok(());
+    }
+    println!(
+        "node-test build cache is {:.1}GB (cap {:.0}GB); clearing it, so this run builds cold. \
+         The cap is WEFT_TEST_CACHE_CAP_GB.",
+        size as f64 / 1024.0 / 1024.0 / 1024.0,
+        cap_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
+    );
+    std::fs::remove_dir_all(root).with_context(|| format!("remove {}", root.display()))?;
+    Ok(())
+}
+
+/// Total bytes of every file under `root`, following no symlinks (a
+/// target dir symlinked onto another disk is still that disk's
+/// problem, and following one could wander out of the tree).
+fn dir_size_bytes(root: &std::path::Path) -> std::io::Result<u64> {
+    let mut total = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let meta = entry.metadata()?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Resolve the positional target to packages. A package name wins over
@@ -315,50 +426,75 @@ fn list_tests(binary: &PathBuf) -> Result<Vec<NodeTestsListing>> {
     Ok(parsed.nodes)
 }
 
-/// A package's test listing without an unconditional build: a
-/// live-only sweep must not pay a cargo build per package just to
-/// learn "no live tests here". The listing is a pure function of the
-/// package's code, so it is cached under the build root keyed by
-/// `node_test_cache_hash` (the package's sources plus the type
-/// registry; an engine edit changes the binary but never the
-/// listing); a hash hit reads the stored answer,
-/// a miss builds the binary, asks it, and stores.
-fn cached_listing(
+/// Every targeted package's test listing, built at most ONCE for the
+/// whole set: a live-only sweep must not pay a cargo build per
+/// package just to learn "no live tests here". The listing is a pure
+/// function of the package's code, so it is cached under the
+/// project's cache slice keyed by `node_test_cache_hash` (the
+/// package's sources plus the type registry; an engine edit changes
+/// the binary but never the listing). A hash hit reads the stored
+/// answer; every miss is collected first, then one workspace build
+/// produces all the missing binaries, each is asked, and its answer
+/// stored.
+fn cached_listings(
     project: &weft_compiler::project::Project,
     catalog: &FsCatalog,
-    package: &str,
-    test_build_root: &std::path::Path,
-) -> Result<Vec<NodeTestsListing>> {
+    targets: &[TargetPackage],
+    build_dirs: &weft_compiler::build::TestBuildDirs,
+    workspace: &weft_compiler::build::TestWorkspace,
+) -> Result<BTreeMap<String, Vec<NodeTestsListing>>> {
     #[derive(serde::Serialize, serde::Deserialize)]
     struct StoredListing {
         hash: String,
         nodes: Vec<NodeTestsListing>,
     }
-    let hash = weft_compiler::build::node_test_cache_hash(project, catalog, package)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let path = test_build_root
-        .join("listings")
-        .join(format!("{}.json", weft_compiler::build::sanitize_crate_name(package)));
-    // A stale, unreadable, or old-format entry is simply rebuilt
-    // below; the file is a pure cache, never a source of truth.
-    if let Ok(bytes) = std::fs::read(&path) {
-        if let Ok(stored) = serde_json::from_slice::<StoredListing>(&bytes) {
-            if stored.hash == hash {
-                return Ok(stored.nodes);
+    let mut listings = BTreeMap::new();
+    // (package, its hash, where its listing is stored) for every
+    // package whose stored listing is missing or stale.
+    let mut stale: Vec<(String, String, PathBuf)> = Vec::new();
+    for target in targets {
+        if listings.contains_key(&target.name) {
+            continue;
+        }
+        let hash = weft_compiler::build::node_test_cache_hash(project, catalog, &target.name)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = build_dirs.crates_root.join("listings").join(format!(
+            "{}.json",
+            weft_compiler::build::sanitize_crate_name(&target.name)
+        ));
+        // A stale, unreadable, or old-format entry is simply rebuilt
+        // below; the file is a pure cache, never a source of truth.
+        let stored = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StoredListing>(&bytes).ok())
+            .filter(|stored| stored.hash == hash);
+        match stored {
+            Some(stored) => {
+                listings.insert(target.name.clone(), stored.nodes);
             }
+            None => stale.push((target.name.clone(), hash, path)),
         }
     }
-    let binary =
-        weft_compiler::build::build_node_test_binary(catalog, package, test_build_root)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let nodes = list_tests(&binary)?;
-    std::fs::create_dir_all(path.parent().expect("the listings path has a parent"))?;
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&StoredListing { hash, nodes: nodes.clone() })
-            .expect("a listing serializes"),
-    )?;
-    Ok(nodes)
+    if stale.is_empty() {
+        return Ok(listings);
+    }
+    let binaries = weft_compiler::build::build_node_test_binaries(workspace)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for (package, hash, path) in stale {
+        let binary = binaries
+            .get(&package)
+            .with_context(|| format!("no test binary was built for package '{package}'"))?;
+        let nodes = list_tests(binary)?;
+        weft_compiler::build::drop_built_binary(binary);
+        std::fs::create_dir_all(path.parent().expect("the listings path has a parent"))?;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&StoredListing { hash, nodes: nodes.clone() })
+                .expect("a listing serializes"),
+        )?;
+        listings.insert(package, nodes);
+    }
+    Ok(listings)
 }
 
 struct BinaryOutput {
@@ -444,7 +580,8 @@ async fn run_live(
     ctx: &Ctx,
     catalog: &FsCatalog,
     targets: &[TargetPackage],
-    test_build_root: &std::path::Path,
+    workspace: &weft_compiler::build::TestWorkspace,
+    build_dirs: &weft_compiler::build::TestBuildDirs,
     args: &TestNodeArgs,
     reports: &mut Vec<TestReport>,
 ) -> Result<()> {
@@ -458,12 +595,13 @@ async fn run_live(
     // once, BEFORE any consent prompt, grant, or pod. (The pod-side
     // `rig.fixture` read stays the runtime backstop.)
     let mut missing_fixtures: Vec<String> = Vec::new();
+    let listings = cached_listings(project, catalog, targets, build_dirs, workspace)?;
     for target in targets {
-        for node in cached_listing(project, catalog, &target.name, test_build_root)? {
+        for node in &listings[&target.name] {
             if target.node_filter.as_deref().is_some_and(|f| f != node.node_type) {
                 continue;
             }
-            for t in node.tests {
+            for t in &node.tests {
                 if t.tier != TestTier::Live {
                     continue;
                 }
@@ -490,7 +628,7 @@ async fn run_live(
                 runs.push(LiveRun {
                     package: target.name.clone(),
                     node: node.node_type.clone(),
-                    test: t.name,
+                    test: t.name.clone(),
                     service,
                 });
             }
@@ -1174,4 +1312,57 @@ async fn ensure_test_image(
     )
     .await;
     Ok(tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write `bytes` bytes at `path`, creating parents.
+    fn file_of(path: &std::path::Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; bytes]).unwrap();
+    }
+
+    #[test]
+    fn dir_size_counts_every_file_at_every_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        file_of(&dir.path().join("a"), 100);
+        file_of(&dir.path().join("deps/b"), 250);
+        file_of(&dir.path().join("incremental/x/c"), 650);
+        assert_eq!(dir_size_bytes(dir.path()).unwrap(), 1000);
+    }
+
+    #[test]
+    fn a_cache_under_the_cap_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("test");
+        file_of(&root.join("deps/a"), 100);
+        bound_build_cache(&root, 1000).unwrap();
+        assert!(root.join("deps/a").exists());
+    }
+
+    #[test]
+    fn a_cache_over_the_cap_is_wiped_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("test");
+        file_of(&root.join("deps/a"), 2000);
+        bound_build_cache(&root, 1000).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_zero_cap_disables_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("test");
+        file_of(&root.join("deps/a"), 2000);
+        bound_build_cache(&root, 0).unwrap();
+        assert!(root.join("deps/a").exists());
+    }
+
+    #[test]
+    fn a_missing_cache_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        bound_build_cache(&dir.path().join("absent"), 1).unwrap();
+    }
 }

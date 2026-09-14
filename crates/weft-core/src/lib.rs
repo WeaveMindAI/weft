@@ -150,7 +150,7 @@ pub use infra::{
     ProvisionContextError, Resources, ScalingPolicy, StopBehavior, TerminateBehavior, Toleration,
     Unit, UnitHealth, UnitKind, UpgradeBehavior, Volume, VolumeKind,
 };
-pub use frames::{LoopFrames, LoopIteration};
+pub use frames::{Frame, LoopFrames};
 pub use node::{
     Condition, InputSpec, MetadataCatalog, PortSpec, PortsFromConfig, PortTemplate,
     NodeFeatures, NodeManifest, NodeMetadata, NodeOutput, OutputSpec, RuleDiagnostic, RuleSeverity,

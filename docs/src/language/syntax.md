@@ -88,7 +88,7 @@ because it says nothing about the type.
 
 ```weft
 step = ExecPython -> (out: String) {
-  code: @file("scripts/step.py")
+  code: @file("assets/scripts/step.py")
   text: draft.answer      # a String port, from the wire
   limit: 3                # a Number port, from the literal
   notes?: review.notes    # optional: a closure here does not skip the node

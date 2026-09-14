@@ -58,6 +58,21 @@ impl Event {
     pub fn is_node(&self, node: &str) -> bool {
         self.node() == Some(node)
     }
+
+    /// The call sites this event's frames carry, outermost first: which
+    /// use of an included file the firing belongs to.
+    pub fn call_path(&self) -> Vec<String> {
+        self.frames().as_array().map(|frames| frames.iter()
+            .filter_map(|f| f.get("site").and_then(Value::as_str).map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+
+    /// True when this event names `node` under exactly the call `path`
+    /// (an event without a frames field, such as a cost row, is taken at
+    /// the top).
+    pub fn is_node_at(&self, node: &str, path: &[String]) -> bool {
+        self.is_node(node) && self.call_path() == path
+    }
 }
 
 /// The full ordered replay for one execution. The rig's single read-back

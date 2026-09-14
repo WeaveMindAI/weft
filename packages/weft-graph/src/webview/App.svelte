@@ -185,7 +185,7 @@
   // Include-navigation back-stack state, driven by the host's `navState`.
   let navDepth = $state(0);
   let navFileName = $state('');
-  let execPrefix = $state('');
+  let callPath = $state<string[]>([]);
   // The raw source text of the CURRENTLY ACTIVE file (the entry file at depth 0,
   // or the included sub-file after navigation). Set from every `parseResult`'s
   // `source`, so it tracks include navigation. Exposed on `EditorContext` for
@@ -216,18 +216,27 @@
   // `busMetaByBus` carries per-bus header metadata (mode) seeded
   // from the first BusParticipant edge the dispatcher derives from
   // the bus marker JSON.
-  let executionState = $state<ExecutionState>({
-    isRunning: false,
-    tags: [],
-    nodeOutputs: bareRecord(),
-    nodeExecutions: bareRecord(),
-    busLogByBus: bareRecord(),
-    busMetaByBus: bareRecord(),
-    busParticipantsByBus: bareRecord(),
-    journalCorruptions: [],
-    loopEventsByGroup: {},
-    callerLog: [],
-  });
+  /// A canvas with no run painted on it. `isRunning` is true while a
+  /// run is about to be replayed onto it (`execReset`), false when
+  /// there is simply nothing to show (startup, `execCleared`).
+  function emptyExecutionState(isRunning: boolean): ExecutionState {
+    return {
+      isRunning,
+      scope: undefined,
+      seed: undefined,
+      version: undefined,
+      tags: [],
+      nodeOutputs: bareRecord(),
+      nodeExecutions: bareRecord(),
+      busLogByBus: bareRecord(),
+      busMetaByBus: bareRecord(),
+      busParticipantsByBus: bareRecord(),
+      journalCorruptions: [],
+      loopEventsByGroup: {},
+      callerLog: [],
+    };
+  }
+  let executionState = $state<ExecutionState>(emptyExecutionState(false));
 
   // Dedup keys for append-only inspector logs. The execution follower
   // subscribes to the live SSE stream BEFORE replaying the journal
@@ -352,7 +361,7 @@
       if (msg.kind === 'navState') {
         navDepth = msg.depth;
         navFileName = msg.fileName;
-        execPrefix = msg.execPrefix;
+        callPath = msg.callPath;
         return;
       }
       if (msg.kind === 'fileContents') {
@@ -420,22 +429,8 @@
         catalogWarnings = msg.warnings ?? [];
         return;
       }
-      if (msg.kind === 'execReset') {
-        executionState = {
-          isRunning: true,
-          scope: undefined,
-          seed: undefined,
-          version: undefined,
-          tags: [],
-          nodeOutputs: bareRecord(),
-          nodeExecutions: bareRecord(),
-          busLogByBus: bareRecord(),
-          busMetaByBus: bareRecord(),
-          busParticipantsByBus: bareRecord(),
-          journalCorruptions: [],
-          loopEventsByGroup: {},
-          callerLog: [],
-        };
+      if (msg.kind === 'execReset' || msg.kind === 'execCleared') {
+        executionState = emptyExecutionState(msg.kind === 'execReset');
         seenBusKeys = new Set();
         seenLoopKeys = new Set();
         seenCallerOffsets = new Set();
@@ -1049,7 +1044,7 @@
     get activeSource() { return activeSource; },
     get activeFileName() { return navFileName; },
     get navDepth() { return navDepth; },
-    get execPrefix() { return execPrefix; },
+    get callPath() { return callPath; },
     get executionState() { return executionState; },
     get error() { return error; },
     get diagnostics() { return diagnostics; },
@@ -1125,6 +1120,7 @@
             notPainted={runNotPainted}
             onTogglePin={() => send({ kind: 'followTogglePin' })}
             onCatchUp={() => send({ kind: 'followCatchUp' })}
+            onClearFollow={() => send({ kind: 'followClear' })}
             onOpenSource={() => send({ kind: 'openSource' })}
             sourceOpen={sourceOpen}
             {navDepth}
@@ -1171,7 +1167,7 @@
       {onApplyTextEdit}
       {onResyncSource}
       {onOpenInclude}
-      {execPrefix}
+      {callPath}
       {fileContents}
       {autoOrganizeOnMount}
       {onRun}

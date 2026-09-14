@@ -2243,9 +2243,12 @@ async fn wait_for_pod_dns(pod_name: &str, namespace: &str) -> Result<(), (Status
 
 /// Inspector proxy: read the listener's per-signal display info.
 /// Resolves (project_id, node_id) → signal row → token →
-/// listener `/display` call. Returns 503 if the listener happens
-/// to be reaped (caller is the inspector UI; we don't spin the
-/// listener up just to render its display).
+/// listener `/display` call. Every way of having nothing to show
+/// (no signal row, no live holder, a holder that does not know the
+/// token) is one 404: the caller is the graph's trigger panel, which
+/// draws 404 as "not running, activate it", the way an infra node
+/// draws its unprovisioned state. The rest is a failure it shows
+/// verbatim. Nothing is spun up just to render a display.
 pub async fn display_signal(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -2256,18 +2259,22 @@ pub async fn display_signal(
         .map_err(|_| (StatusCode::BAD_REQUEST, "bad project id".to_string()))?;
     authorize_project(&state, &caller.0, id).await?;
     let token = lookup_signal_token_for_node(&state, &project_id, &node_id).await?;
-    // Resolve the pod holding this signal; if none is live (reaped while
-    // idle), 503 rather than spinning a listener up just to render the
-    // inspector display.
+    let not_listening = || {
+        (
+            StatusCode::NOT_FOUND,
+            format!("no listener holds the trigger {node_id}; activate the project to register it"),
+        )
+    };
     let handle = state
         .listeners
         .resolve_signal(&token, &state.pg_pool)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener resolve: {e}")))?
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "listener not running for this signal".into()))?;
+        .ok_or_else(not_listening)?;
     let display = crate::listener::display_signal(&handle, &token)
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /display: {e}")))?;
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("listener /display: {e}")))?
+        .ok_or_else(not_listening)?;
     Ok(Json(display))
 }
 

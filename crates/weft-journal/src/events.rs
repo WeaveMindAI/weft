@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::frames::LoopFrames;
+use weft_core::frames::{Located, LoopFrames};
 use weft_core::primitive::{LoopTerminationReason, SignalSpec};
 use weft_core::Color;
 
@@ -39,7 +39,9 @@ use weft_core::Color;
 #[serde(deny_unknown_fields)]
 pub struct Seed {
     pub parent: Color,
-    pub origins: BTreeMap<String, Color>,
+    /// Per place (a node under the calls that reach it): the run whose
+    /// result it keeps.
+    pub origins: BTreeMap<Located, Color>,
 }
 
 /// One event in the execution log. Append-only; events are never
@@ -102,6 +104,11 @@ pub enum ExecEvent {
     NodeKicked {
         color: Color,
         node_id: String,
+        /// The frames the kick fires under: empty for a root at the top;
+        /// the call frames of the site chain for a root inside an
+        /// included file that a cut named through its site.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frames: LoopFrames,
         /// This kick is the FIRING trigger of the execution. Explicit,
         /// never inferred from `payload` presence: a fire with an empty
         /// body journals `"payload": null`, indistinguishable from an
@@ -770,7 +777,7 @@ mod wire_tests {
     /// SQL readers filter on.
     #[test]
     fn reshaped_rows_round_trip() {
-        let frames = vec![weft_core::frames::LoopIteration { index: 2 }];
+        let frames = vec![weft_core::frames::Frame::Loop { index: 2 }];
         let emission = Uuid::new_v4();
         let rows = vec![
             ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
@@ -895,10 +902,10 @@ mod wire_tests {
                 definition_hash: Some("h".into()),
                 program: None, source_version: Some("version".into()), node_test: false,
                 subgraph: Some(weft_core::project::selection::RunSelection {
-                    nodes: ["out".into(), "src".into()].into_iter().collect(),
+                    nodes: [Located::top("out"), Located::top("src")].into_iter().collect(),
                     ..Default::default()
                 }),
-                seed: Some(Seed { parent: color(), origins: BTreeMap::from([("source".into(), color())]) }),
+                seed: Some(Seed { parent: color(), origins: BTreeMap::from([(Located::top("source"), color())]) }),
                 at_unix: 7,
             },
             ExecEvent::ExecutionStarted {
@@ -912,8 +919,8 @@ mod wire_tests {
                 seed: None,
                 at_unix: 7,
             },
-            ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
-            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::LoopIteration { index: 2 }], at_unix: 1 },
+            ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), frames: vec![], firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
+            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
             ExecEvent::NodeCompleted { color: color(), node_id: "n".into(), frames: vec![], at_unix: 1 },
             ExecEvent::NodeFailed { color: color(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
             ExecEvent::NodeSkipped { color: color(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into() }, at_unix: 1 },
@@ -928,7 +935,7 @@ mod wire_tests {
             ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: vec![], at_unix: 1 },
             ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
             ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: None, at_unix: 1 },
-            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: vec![weft_core::frames::LoopIteration { index: 0 }], index: 3, at_unix: 1 },
+            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: vec![weft_core::frames::Frame::Loop { index: 0 }], index: 3, at_unix: 1 },
             ExecEvent::LoopStreamEnded { color: color(), group_id: "lp".into(), parent_frames: vec![], end: weft_core::primitive::StreamEnd::Failed { error: "upstream".into() }, at_unix: 1 },
             ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
             ExecEvent::ExecutionCompleted { color: color(), at_unix: 1 },

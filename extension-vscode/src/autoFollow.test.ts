@@ -17,6 +17,8 @@ type Call = { verb: 'replay' | 'stop'; color?: string };
 function rig() {
   const calls: Call[] = [];
   const posted: FollowStatus[] = [];
+  // Every other message the controller posts to the webview, by kind.
+  const otherPosts: string[] = [];
 
   // Typed as the surface the controller actually uses, so a signature
   // change on the real follower fails this file at compile time; the
@@ -28,6 +30,7 @@ function rig() {
 
   const post = (msg: HostMessage) => {
     if (msg.kind === 'followStatus') posted.push(msg.status as FollowStatus);
+    else otherPosts.push(msg.kind);
   };
 
   const actionable: DispatcherEvent[] = [];
@@ -36,7 +39,7 @@ function rig() {
     post,
     (ev) => actionable.push(ev),
   );
-  return { c, calls, posted, actionable, latest: () => posted[posted.length - 1] };
+  return { c, calls, posted, otherPosts, actionable, latest: () => posted[posted.length - 1] };
 }
 
 function started(color: string): DispatcherEvent {
@@ -164,12 +167,22 @@ describe('reconnect', () => {
 });
 
 describe('clearing and switching', () => {
-  it('clearing a deleted execution stops the stream and reverts to latest', () => {
-    const { c, calls, latest } = rig();
+  it('clearing stops the stream, wipes the canvas and reverts to latest', () => {
+    const { c, calls, otherPosts, latest } = rig();
     c.pinToExecution('old');
     c.clearFollow();
     expect(calls.at(-1)).toEqual({ verb: 'stop' });
+    expect(otherPosts).toEqual(['execCleared']);
     expect(latest()).toEqual({ mode: 'latest', color: undefined, pendingCount: 0 });
+  });
+
+  it('after clearing, the next execution to start is followed', () => {
+    const { c, calls, latest } = rig();
+    c.pinToExecution('old');
+    c.clearFollow();
+    c.handleEvent(started('fresh'));
+    expect(calls.at(-1)).toEqual({ verb: 'replay', color: 'fresh' });
+    expect(latest()).toEqual({ mode: 'latest', color: 'fresh', pendingCount: 0 });
   });
 
   it('switching project drops everything', () => {

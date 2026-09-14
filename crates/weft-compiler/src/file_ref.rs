@@ -407,7 +407,9 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
             file_ref.path, file_ref.ty
         ));
     }
-    let Some(base) = fs.base else {
+    // The ref reaches here already spelled from the project root (see
+    // `anchor_on_root`), so the root is both the wall and the anchor.
+    let Some(root) = fs.root else {
         return Err(format!(
             "@file({:?}) cannot be resolved outside a project",
             file_ref.path
@@ -415,53 +417,55 @@ fn resolve(file_ref: &FileRef, fs: &CompileFs) -> Result<Resolved, String> {
     };
     let resolved = fs
         .reader
-        .resolve_and_read(base, std::path::Path::new(&file_ref.path))
+        .resolve_and_read(root, root, std::path::Path::new(&file_ref.path))
         .map_err(|e| format!("{} {e}", file_ref.marker.directive()))?;
     file_ref.ty.cast_text(&resolved.content).map(Resolved::Value)
 }
 
-/// Re-anchor a disk ref written in an included file onto the compiled
-/// file's directory (the project root on a build, where the compiled
-/// file is the project's `main.weft`): `@file("x")` inside
-/// `components/box.weft` names `components/x`. Every consumer of a
-/// ref's path (the editor's file watcher and save, the asset sync, the
-/// build's resolution map) resolves against that one anchor, so a ref
-/// only ever leaves the compiler in one spelling whichever file the
-/// text was typed in. A URL or a stored-file key names nothing on disk
-/// and is left alone; so is a ref from the compiled file itself.
+/// Put a disk ref into its one spelling. A relative path is relative to
+/// the PROJECT ROOT wherever it was typed: `@file("assets/prompts/x.md")`
+/// means the same file in `src/main.weft`, in `src/billing/charge.weft`
+/// and in a file included from either, so every consumer of a ref's path
+/// (the editor's file watcher and save, the asset sync, the build's
+/// resolution map) resolves against that one anchor and a ref only ever
+/// leaves the compiler in one spelling. It is normalized (`.` and a
+/// balancing `..` collapse); one that climbs above the root is refused,
+/// there being nothing above the root it could mean.
 ///
-/// A path that lands OUTSIDE the anchor keeps its absolute spelling
-/// rather than being refused: naming a file where it already sits is
-/// allowed (`weft-cli`'s asset source opens an absolute path as given),
-/// and it is allowed identically from the compiled file, where this
-/// function does not run at all. Refusing it here only made the same
-/// text legal or illegal depending on which file it was typed in.
-fn anchor_on_root(
-    mut file_ref: FileRef,
-    source_file: Option<&str>,
-    root: &Result<std::path::PathBuf, String>,
-) -> Result<FileRef, String> {
-    let Some(source_file) = source_file else { return Ok(file_ref) };
+/// A file outside the project is named where it sits, by an absolute
+/// path or one under `~` (expanded to the home directory here, so the
+/// wire and the hash carry the real path): allowed for local runs, and
+/// the compiler-READ refs are still walled by the reader. A URL or a
+/// stored-file key names nothing on disk and is left alone.
+fn spell_from_root(mut file_ref: FileRef, home: Option<&std::path::Path>) -> Result<FileRef, String> {
     if is_url_ref(&file_ref) || is_runtime_key_ref(&file_ref) {
         return Ok(file_ref);
     }
-    let root = root.as_ref().map_err(|e| e.clone())?;
-    let dir = std::path::Path::new(source_file).parent().unwrap_or(std::path::Path::new(""));
-    let joined = crate::file_reader::normalize_lexical(&dir.join(&file_ref.path)).ok_or_else(|| {
-        format!(
-            "{}({:?}) climbs above the filesystem root",
-            file_ref.marker.directive(),
-            file_ref.path
-        )
-    })?;
+    let written = std::path::Path::new(&file_ref.path);
+    let spelled = if let Ok(under_home) = written.strip_prefix("~") {
+        let home = home.ok_or_else(|| {
+            format!(
+                "{}({:?}) names a file under `~`, and no home directory is known here",
+                file_ref.marker.directive(),
+                file_ref.path
+            )
+        })?;
+        home.join(under_home)
+    } else if written.is_absolute() {
+        written.to_path_buf()
+    } else {
+        crate::file_reader::normalize_lexical(written).ok_or_else(|| {
+            format!(
+                "{}({:?}) climbs above the project root: a path is relative to the project, wherever it is written",
+                file_ref.marker.directive(),
+                file_ref.path
+            )
+        })?
+    };
     // A path is text on the wire, and a definition hash is computed over
     // it, so a lossy conversion would make the same project hash
     // differently on two machines. Refuse rather than replace bytes.
-    let anchored = match joined.strip_prefix(root) {
-        Ok(relative) => relative,
-        Err(_) => joined.as_path(),
-    };
-    file_ref.path = anchored
+    file_ref.path = spelled
         .to_str()
         .ok_or_else(|| {
             format!(
@@ -475,22 +479,15 @@ fn anchor_on_root(
 }
 
 /// Resolve all file-backed values through one pass after includes and groups
-/// have been flattened. A ref written in an included file is first spelled
-/// relative to the project root (see [`anchor_on_root`]), so everything
-/// resolves against one anchor and the ref's path means the same thing to
-/// every consumer.
+/// have been flattened. Every ref is first put into its one spelling (see
+/// [`spell_from_root`]), so everything resolves against the project root
+/// and the ref's path means the same thing to every consumer.
 pub(crate) fn resolve_project_file_refs(
     project: &mut weft_core::project::ProjectDefinition,
     root_fs: &CompileFs,
     errors: &mut Vec<CompileError>,
 ) {
-    // Computed once: an include-sourced ref needs the root's identity to be
-    // spelled under it. Compiling outside a project (no anchor) only fails
-    // when such a ref actually turns up.
-    let root = match root_fs.base {
-        Some(base) => root_fs.reader.identity(base),
-        None => Err("a file reference cannot be resolved outside a project".into()),
-    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     for node in &mut project.nodes {
       let config_spans = &node.config_spans;
       let literal_spans = &node.port_literal_spans;
@@ -530,7 +527,7 @@ pub(crate) fn resolve_project_file_refs(
                     return;
                 }
             };
-            let file_ref = match anchor_on_root(file_ref, source_file, &root) {
+            let file_ref = match spell_from_root(file_ref, home.as_deref()) {
                 Ok(fr) => fr,
                 Err(msg) => {
                     errors.push(CompileError::at(span, msg).in_file(source_file));

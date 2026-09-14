@@ -10,7 +10,7 @@ for other assistants.
 
 The persona is a project rule with `alwaysApply: true`
 (`.cursor/rules/tangle.mdc`), so it loads every session. Skills sit in
-`.cursor/skills/`, the five specialists are subagents in `.cursor/agents/`,
+`.cursor/skills/`, the six specialists are subagents in `.cursor/agents/`,
 and permissions live in `.cursor/cli.json`. The six commands are skills too:
 Cursor has no separate command file type, and any skill is invocable as
 `/skill-name`.
@@ -25,7 +25,7 @@ it must never run; here it structurally cannot.
 
 **A worktree per specialist.** Cursor gives each dispatched subagent its own
 git worktree and branch. The `node-smith` is told to write exactly one folder
-and never touch `main.weft`; on Cursor that isolation is real, so a specialist
+and never touch `src/main.weft`; on Cursor that isolation is real, so a specialist
 that misbehaves cannot reach the user's program at all.
 
 **The compiler answers every edit.** A `postToolUse` hook
@@ -42,7 +42,7 @@ user runs those themselves. Deny beats allow, which is what keeps the broad
 
 ## What is here
 
-Tangle is one persona plus thirteen skills, five specialists and six commands.
+Tangle is one persona plus fifteen skills, six specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

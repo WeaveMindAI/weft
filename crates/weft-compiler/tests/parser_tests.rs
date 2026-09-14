@@ -1825,6 +1825,35 @@ grp = Group(data: String) -> (result: String) {
     assert!(worker.group_boundary.is_none());
 }
 
+/// An output has no optionality, so every output the wire carries says
+/// `required: true`, on a group and on the boundary nodes it compiles
+/// into. The editor writes a container's whole signature back from what
+/// the wire gave it, and a `false` here came back as an optional
+/// output, which the edit server refuses: adding any port to a group
+/// that already had one output failed on that first output's name.
+#[test]
+fn group_outputs_are_never_optional_on_the_wire() {
+    let source = r#"
+g = Group(data: String, extra?: String) -> (text: String, body: String) {
+    worker = Template { template: "{{data}}" }
+    worker.value = self.data
+    self.text = worker.output
+    self.body = worker.output
+}
+"#;
+    let result = compile(source, uuid::Uuid::new_v4(), CompileFs::none()).expect("should compile");
+    let group = result.groups.iter().find(|g| g.id == "g").expect("the group");
+    assert!(group.out_ports.iter().all(|p| p.required), "{:?}", group.out_ports);
+    // The declared optionality of the INPUTS is preserved, so the
+    // signature round-trips as written.
+    let required: Vec<(&str, bool)> = group.in_ports.iter().map(|p| (p.name.as_str(), p.required)).collect();
+    assert_eq!(required, vec![("data", true), ("extra", false)]);
+    for boundary in ["g__in", "g__out"] {
+        let node = result.nodes.iter().find(|n| n.id == boundary).expect(boundary);
+        assert!(node.outputs.iter().all(|p| p.required), "{boundary}: {:?}", node.outputs);
+    }
+}
+
 #[test]
 fn test_scope_nested_groups() {
     let source = r#"
@@ -2071,12 +2100,101 @@ fn include_full_inlines_group() {
     let source = r#"
 c = @include("cleaner.weft")
 "#;
-    // Full mode (build): the group inlines, flattening to c__in / c__out
-    // boundary Passthroughs plus the internal node, all scoped under `c`.
+    // Full mode (build): the file compiles ONCE as the body `Cleaner`
+    // (its id is the file's name), with IncludeIn / IncludeOut boundaries
+    // and its own nodes under it; the alias is a call site, a CallIn /
+    // CallOut pair wired to the body's boundaries port for port.
     let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
-    assert!(project.nodes.iter().any(|n| n.id == "c__in"), "missing c__in: {:?}", project.nodes.iter().map(|n| &n.id).collect::<Vec<_>>());
-    assert!(project.nodes.iter().any(|n| n.id == "c__out"));
-    assert!(project.nodes.iter().any(|n| n.id == "c.strip"));
+    let ty = |id: &str| project.nodes.iter().find(|n| n.id == id).map(|n| n.node_type.as_str()).unwrap_or_else(|| panic!("no node {id}: {:?}", project.nodes.iter().map(|n| &n.id).collect::<Vec<_>>()));
+    assert_eq!(ty("c__in"), "CallIn");
+    assert_eq!(ty("c__out"), "CallOut");
+    assert_eq!(ty("@cleaner__in"), "IncludeIn");
+    assert_eq!(ty("@cleaner__out"), "IncludeOut");
+    assert_eq!(ty("@cleaner.strip"), "Text");
+    let has_edge = |s: &str, sp: &str, t: &str, tp: &str| project.edges.iter().any(|e| e.source == s && e.source_handle.as_deref() == Some(sp) && e.target == t && e.target_handle.as_deref() == Some(tp));
+    assert!(has_edge("c__in", "raw", "@cleaner__in", "raw"), "the site hands its input to the body");
+    assert!(has_edge("@cleaner__out", "cleaned", "c__out", "cleaned"), "the body's result comes back to the site");
+    let group = |id: &str| project.groups.iter().find(|g| g.id == id).unwrap_or_else(|| panic!("no group {id}"));
+    assert!(matches!(&group("c").kind, weft_core::GroupKind::Call { body } if body == "@cleaner"));
+    assert!(matches!(group("@cleaner").kind, weft_core::GroupKind::Body));
+    // The body's node sits in the body's scope, not the site's.
+    assert_eq!(project.nodes.iter().find(|n| n.id == "@cleaner.strip").unwrap().scope, vec!["@cleaner".to_string()]);
+}
+
+/// Two sites of one file share one body: one copy of its nodes, two call
+/// sites, both wired to the same boundaries. What tells the two calls
+/// apart at run time is the call frame each site's In pushes.
+#[test]
+fn a_file_included_twice_compiles_once() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cleaner.weft"), CLEANER_WEFT).unwrap();
+    let source = "a = @include(\"cleaner.weft\")\nb = @include(\"cleaner.weft\")\n";
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
+    assert_eq!(project.nodes.iter().filter(|n| n.id == "@cleaner.strip").count(), 1);
+    assert_eq!(project.groups.iter().filter(|g| matches!(g.kind, weft_core::GroupKind::Body)).count(), 1);
+    for site in ["a", "b"] {
+        assert!(project.nodes.iter().any(|n| n.id == format!("{site}__in") && n.node_type == "CallIn"), "{site}");
+        assert!(project.edges.iter().any(|e| e.source == format!("{site}__in") && e.target == "@cleaner__in"), "{site} feeds the body");
+        assert!(project.edges.iter().any(|e| e.source == "@cleaner__out" && e.target == format!("{site}__out")), "the body answers {site}");
+    }
+}
+
+/// Two calls of one file in a chain (`two.raw = one.cleaned`) are two
+/// steps, not a cycle, and the body's In taking one wire per site is not
+/// two drivers of one port: the strict pipeline accepts the program.
+#[test]
+fn chained_calls_of_one_file_validate() {
+    use weft_compiler::{compile_strict, validate::ValidationMode, Severity};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("nodes")).unwrap();
+    std::fs::write(dir.path().join("cleaner.weft"), CLEANER_WEFT).unwrap();
+    let source = "a = Text { value: \"hello\" }\none = @include(\"cleaner.weft\")\ntwo = @include(\"cleaner.weft\")\none.raw = a.value\ntwo.raw = one.cleaned\nout = Debug { data: two.cleaned }\n";
+    let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
+    let (_, diagnostics) = compile_strict(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), &catalog, ValidationMode::Structural, None);
+    let errors: Vec<_> = diagnostics.iter().filter(|d| d.severity == Severity::Error).collect();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// A file's identity is its path from the project root, so two files
+/// with one name in two folders are two bodies, each with its own id
+/// that no program could spell.
+#[test]
+fn two_included_files_with_one_name_are_two_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("b")).unwrap();
+    std::fs::write(dir.path().join("a/cleaner.weft"), CLEANER_WEFT).unwrap();
+    std::fs::write(dir.path().join("b/cleaner.weft"), CLEANER_WEFT).unwrap();
+    let source = "x = @include(\"a/cleaner.weft\")\ny = @include(\"b/cleaner.weft\")\n";
+    let project = compile(source, uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
+    for body in ["@a:cleaner", "@b:cleaner"] {
+        assert!(project.groups.iter().any(|g| g.id == body && matches!(g.kind, weft_core::GroupKind::Body)), "{body}");
+        assert!(project.nodes.iter().any(|n| n.id == format!("{body}.strip")), "{body}.strip");
+    }
+    assert!(matches!(&project.groups.iter().find(|g| g.id == "x").unwrap().kind, weft_core::GroupKind::Call { body } if body == "@a:cleaner"));
+}
+
+/// Two files that land on one body id are refused, even when the
+/// second is reached from inside the first: the id is taken before a
+/// file's own includes resolve.
+#[test]
+fn two_files_landing_on_one_body_id_are_refused_however_they_are_reached() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a-b.weft"), "Group() {\n  x = @include(\"a_b.weft\")\n}\n").unwrap();
+    std::fs::write(dir.path().join("a_b.weft"), CLEANER_WEFT).unwrap();
+    let errs = compile("c = @include(\"a-b.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
+    assert!(errs.iter().any(|e| e.message.contains("takes the id `@a_b`") && e.message.contains("rename one of them")), "{errs:?}");
+}
+
+/// A file whose own include is broken is not registered as a body: a
+/// second site of it reports the errors again rather than finding an
+/// id with nothing behind it.
+#[test]
+fn a_file_that_fails_to_compile_is_not_registered_for_its_next_site() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("broken.weft"), "Group() {\n  x = @include(\"missing.weft\")\n}\n").unwrap();
+    let errs = compile("a = @include(\"broken.weft\")\nb = @include(\"broken.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).unwrap_err();
+    assert!(errs.iter().filter(|e| e.message.contains("missing.weft")).count() >= 2, "{errs:?}");
 }
 
 /// Every spliced node, edge, and per-field span names the FILE it was
@@ -2101,18 +2219,18 @@ fn include_stamps_the_owning_file_on_nodes_edges_and_spans() {
         .expect("compile");
     let node = |id: &str| project.nodes.iter().find(|n| n.id == id).unwrap_or_else(|| panic!("{id}"));
     let file_of = |id: &str| node(id).source_file.clone().unwrap_or_default();
-    assert!(file_of("c.i.deep").ends_with("inner.weft"), "{}", file_of("c.i.deep"));
-    assert!(file_of("c.m").ends_with("mid.weft"), "{}", file_of("c.m"));
-    // The inner group's IN boundary belongs to inner.weft, and the fill
-    // `i.raw = "from-mid"` written in mid.weft carries mid.weft on ITS
-    // span entry, on that same node.
-    let boundary = node("c.i__in");
-    assert!(
-        boundary.source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
-        "{:?}",
-        boundary.source_file
-    );
-    let fill = boundary.port_literal_spans.get("raw").expect("fill span");
+    // Each body's nodes carry the body's own file: the inner file's under
+    // `Inner`, the middle file's under `Mid`.
+    assert!(file_of("@inner.deep").ends_with("inner.weft"), "{}", file_of("@inner.deep"));
+    assert!(file_of("@mid.m").ends_with("mid.weft"), "{}", file_of("@mid.m"));
+    // The inner body's IN boundary belongs to inner.weft. The site `i`
+    // that calls it is written in mid.weft, and so is the fill
+    // `i.raw = "from-mid"`, which lands on that site's In.
+    assert!(file_of("@inner__in").ends_with("inner.weft"), "{}", file_of("@inner__in"));
+    let site = node("@mid.i__in");
+    assert_eq!(site.node_type, "CallIn");
+    assert!(site.source_file.as_deref().unwrap_or_default().ends_with("mid.weft"), "{:?}", site.source_file);
+    let fill = site.port_literal_spans.get("raw").expect("fill span");
     assert!(
         fill.source_file.as_deref().unwrap_or_default().ends_with("mid.weft"),
         "{:?}",
@@ -2122,7 +2240,7 @@ fn include_stamps_the_owning_file_on_nodes_edges_and_spans() {
     let edge = project
         .edges
         .iter()
-        .find(|e| e.source == "c.i.deep")
+        .find(|e| e.source == "@inner.deep")
         .expect("inner edge");
     assert!(
         edge.source_file.as_deref().unwrap_or_default().ends_with("inner.weft"),
@@ -2131,12 +2249,12 @@ fn include_stamps_the_owning_file_on_nodes_edges_and_spans() {
     );
 }
 
-/// An included file with INTERNAL nesting (a nested group + an inline-expr) must
-/// scope every id under the call-site alias in ONE pass (no `rescope_group`
-/// string surgery). Pins the include-reshape: the included file is parsed with
-/// the alias as its anon-root id, so internals are `{alias}.*` directly.
+/// An included file with INTERNAL nesting (a nested group + an inline-expr)
+/// scopes every id under the BODY's id (the file's name) in ONE pass: the
+/// file is parsed with that id as its anon-root id, so internals are
+/// `Comp.*` directly, whatever alias calls it.
 #[test]
-fn include_with_nested_group_scopes_under_alias() {
+fn include_with_nested_group_scopes_under_the_body() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("comp.weft"),
@@ -2144,15 +2262,17 @@ fn include_with_nested_group_scopes_under_alias() {
     ).unwrap();
     let project = compile("c = @include(\"comp.weft\")\n", uuid::Uuid::new_v4(), CompileFs::disk(dir.path())).expect("compile");
     let ids: std::collections::HashSet<&str> = project.nodes.iter().map(|n| n.id.as_str()).collect();
-    // Boundary passthroughs of the included root and the nested sub-group, all
-    // scoped under the alias `c` in one pass.
-    assert!(ids.contains("c__in") && ids.contains("c__out"), "root boundaries: {ids:?}");
-    assert!(ids.contains("c.sub__in") && ids.contains("c.sub__out"), "nested-group boundaries: {ids:?}");
-    assert!(ids.contains("c.sub.inner"), "deep child: {ids:?}");
-    // The inline-expr anon node is scoped under the alias too (`c.pick__value`).
-    assert!(ids.contains("c.pick__value"), "inline anon under alias: {ids:?}");
-    // No id leaked the included file's own derived id (`Comp`) or stayed unscoped.
-    assert!(!ids.iter().any(|i| i.starts_with("Comp")), "no leaked source id: {ids:?}");
+    // The site's pair in the caller, the body's boundaries and the nested
+    // sub-group's, all under the body's id in one pass.
+    assert!(ids.contains("c__in") && ids.contains("c__out"), "site boundaries: {ids:?}");
+    assert!(ids.contains("@comp__in") && ids.contains("@comp__out"), "body boundaries: {ids:?}");
+    assert!(ids.contains("@comp.sub__in") && ids.contains("@comp.sub__out"), "nested-group boundaries: {ids:?}");
+    assert!(ids.contains("@comp.sub.inner"), "deep child: {ids:?}");
+    // The inline-expr anon node is scoped under the body too.
+    assert!(ids.contains("@comp.pick__value"), "inline anon under the body: {ids:?}");
+    // Nothing of the body is scoped under the alias: the alias holds the
+    // site's two boundaries and nothing else.
+    assert!(!ids.iter().any(|i| i.starts_with("c.")), "nothing under the alias: {ids:?}");
 }
 
 #[test]
@@ -2492,7 +2612,7 @@ clean = @include("cleaner.weft")
     let cfg = project.nodes.iter().find(|n| n.id == "cfg").expect("cfg");
     assert_eq!(cfg.config.get("systemPrompt").and_then(|v| v.as_str()), Some("be concise"));
     assert!(project.nodes.iter().any(|n| n.id == "clean__in"));
-    assert!(project.nodes.iter().any(|n| n.id == "clean.strip"));
+    assert!(project.nodes.iter().any(|n| n.id == "@cleaner.strip"));
 }
 
 #[test]
@@ -2917,9 +3037,9 @@ fn separate_line_post_body_output_syntax_is_no_longer_accepted() {
 #[test]
 fn include_with_internal_loop_lowers() {
     // Full-mode @include with a Loop inside the included file: the
-    // loop's LoopIn/LoopOut boundary nodes must land scoped under the
-    // call-site alias, same as Group's boundary Passthroughs. A regression
-    // in the include resolution would either drop the Loop or scope it
+    // loop's LoopIn/LoopOut boundary nodes land scoped under the body's
+    // id, one level below its own IncludeIn/IncludeOut. A regression in
+    // the include resolution would either drop the Loop or scope it
     // wrong.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -2942,12 +3062,14 @@ fn include_with_internal_loop_lowers() {
         .iter()
         .map(|n| (n.id.clone(), n.node_type.clone()))
         .collect();
-    // Outer Group boundary Passthroughs scoped under the alias `c`.
-    assert!(ids.contains(&("c__in".into(), "Passthrough".into())), "outer group in: {ids:?}");
-    assert!(ids.contains(&("c__out".into(), "Passthrough".into())), "outer group out: {ids:?}");
-    // Inner Loop boundary nodes scoped one level deeper.
-    assert!(ids.contains(&("c.doit__in".into(), "LoopIn".into())), "loop in: {ids:?}");
-    assert!(ids.contains(&("c.doit__out".into(), "LoopOut".into())), "loop out: {ids:?}");
+    // The site's pair in the caller, then the body's own boundaries.
+    assert!(ids.contains(&("c__in".into(), "CallIn".into())), "site in: {ids:?}");
+    assert!(ids.contains(&("c__out".into(), "CallOut".into())), "site out: {ids:?}");
+    assert!(ids.contains(&("@inner__in".into(), "IncludeIn".into())), "body in: {ids:?}");
+    assert!(ids.contains(&("@inner__out".into(), "IncludeOut".into())), "body out: {ids:?}");
+    // The loop's boundary nodes one level inside the body.
+    assert!(ids.contains(&("@inner.doit__in".into(), "LoopIn".into())), "loop in: {ids:?}");
+    assert!(ids.contains(&("@inner.doit__out".into(), "LoopOut".into())), "loop out: {ids:?}");
 }
 
 /// `_should_flow` written inside a group's braces belongs to the group's IN

@@ -165,5 +165,6 @@ triage = @include("triage.weft")
 ```
 
 The included file must be exactly one anonymous top-level group. Its ports
-become `triage`'s ports and you wire it like any node. See
-[Files and reuse](files-and-reuse.md).
+become `triage`'s ports and you wire it like any node. The file is compiled
+once and every `@include` of it is a call, like a loop body is compiled once
+and every iteration runs it. See [Files and reuse](files-and-reuse.md).

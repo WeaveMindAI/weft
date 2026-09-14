@@ -226,7 +226,7 @@ pub struct ExecutionSnapshot {
     pub program: Option<crate::project::hash::ProgramIdentity>,
     /// Chosen history includes bodies of zero-iteration loops, which have no
     /// firing record on which to store an origin.
-    pub inherited_origins: std::collections::BTreeMap<String, Color>,
+    pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, Color>,
     pub pulses: crate::pulse::PulseTable,
     pub executions: crate::exec::NodeExecutionTable,
     pub suspensions: HashMap<String, SuspensionInfo>,

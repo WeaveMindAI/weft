@@ -1,6 +1,6 @@
 # Reading the graph
 
-Open the project folder in VS Code. Open `main.weft`. The graph appears beside
+Open the project folder in VS Code. Open `src/main.weft`. The graph appears beside
 the code.
 
 ![The Weft graph view beside main.weft in VS Code](../img/graph-split-view.png)
@@ -39,11 +39,11 @@ one key off the value it carries, the graph form of
 `speed.wpm = reader.profile.stats.wpm`. Right-click a wire to pick a key, one
 level at a time, or to go back to reading the whole value.
 
-## The square in the top-left corner
+## The arrow in the top-left corner
 
-Every box, node or group, has a small square on its top-left edge, apart from
-its own inputs. That is `_should_flow`, the port that decides whether the box
-runs at all. It is filled in when something answers it and hollow when nothing
+Every box, node or group, has a small amber arrow on its top-left edge, apart
+from its own inputs. That is `_should_flow`, the port that decides whether the
+box runs at all. It is filled in when something answers it and hollow when nothing
 does. For what counts as a no, go and read
 [How a weft program runs](../language/mental-model.md).
 
@@ -161,7 +161,10 @@ node can be the target:
 An aimed run also answers only to what it would execute. If the targets'
 joined subgraph reaches no trigger, the Run button shows up even in a project
 whose triggers are the usual entry point, which is how a hand-fired
-maintenance branch runs without activating anything. And it is gated by
+maintenance branch runs without activating anything. The little arrow next to
+Run stays in every project, triggers or not: it opens the saved examples, so
+you can replay one whenever you like, and a run started that way is saved like
+any other. And it is gated by
 exactly the infra it would touch: an infra node inside that subgraph has to be
 running first (the button stays grey, and `weft run --target` refuses, until
 it is), while infra elsewhere in the project does not hold it up.

@@ -175,7 +175,7 @@ def main() -> int:
         target = path
     elif ("{}nodes{}".format(os.sep, os.sep)) in path:
         # A catalog change: check the program that consumes it.
-        target = os.path.join(root, "main.weft")
+        target = os.path.join(root, "src", "main.weft")
         if not os.path.isfile(target):
             return 0
     else:

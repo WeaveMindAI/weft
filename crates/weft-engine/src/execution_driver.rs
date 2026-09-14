@@ -477,7 +477,7 @@ async fn drive_color(
     // carries its allowed nodes); an untargeted manual run carries
     // none and dispatches every pulse. Derived once here: the drive
     // and the cancel walk settle under the same set.
-    let dispatchable: Option<std::collections::HashSet<String>> =
+    let dispatchable: Option<std::collections::HashSet<weft_core::frames::Located>> =
         run_subgraph.as_ref().map(|s| s.dispatchable_nodes());
     let edge_idx = match &run_subgraph {
         Some(selection) => EdgeIndex::selected(&project_arc, selection.clone()),
@@ -1114,7 +1114,7 @@ async fn drive(
     phase: weft_core::context::Phase,
     // The nodes this run may dispatch (see `run_one_execution_observed`
     // where it is derived); None = the whole graph.
-    dispatchable: Option<&std::collections::HashSet<String>>,
+    dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
     // Number of journal events the caller already folded into the
     // snapshot it handed us. The bus-held resume poll compares against
     // this to detect newly-landed rows without a redundant re-fetch.
@@ -1431,7 +1431,7 @@ async fn drive(
             if info.dispatched {
                 continue;
             }
-            if dispatchable.is_some_and(|s| !s.contains(&loc.node_id)) {
+            if dispatchable.is_some_and(|s| !s.contains(&weft_core::frames::Located::at(&loc.node_id, &loc.frames))) {
                 info.dispatched = true;
                 continue;
             }
@@ -1786,7 +1786,7 @@ async fn drive(
             // the port resolves the marker to the feed).
             if !generator_ports.is_empty() {
                 let loc = FiringLocation::new(node_id.clone(), group.frames.clone());
-                let wired = weft_core::exec::ready::wired_inputs(project, edge_idx, &node_id);
+                let wired = weft_core::exec::ready::wired_inputs(project, edge_idx, &node_id, &group.frames);
                 let mut feed_error: Option<String> = None;
                 // In declared port order: the feeds are created one per
                 // port, in the order the node declares them.
@@ -2706,8 +2706,8 @@ pub(crate) async fn handle_loop_boundary_firing(
         let index = group
             .frames
             .last()
-            .map(|f| f.index)
-            .ok_or_else(|| format!("LoopOut '{}' fired with empty frame stack", node_def.id))?;
+            .and_then(weft_core::frames::Frame::loop_index)
+            .ok_or_else(|| format!("LoopOut '{}' fired with no iteration frame on top of its stack", node_def.id))?;
         let inst_config = loop_runtime
             .get(&key)
             .map(|inst| inst.config.clone())
@@ -3196,7 +3196,7 @@ async fn cancel_cleanup(
     // error (the same text the `NodeCancelled` rows will carry).
     reason: &str,
     phase: weft_core::context::Phase,
-    dispatchable: Option<&std::collections::HashSet<String>>,
+    dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
 ) {
     // An in-flight node's future is aborted immediately; it needs no window
     // to wrap up first. A paid call's cost is measured by the metering tap
@@ -3245,7 +3245,7 @@ async fn cancel_open_firings(
     pod_name: &str,
     reason: &str,
     phase: weft_core::context::Phase,
-    dispatchable: Option<&std::collections::HashSet<String>>,
+    dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
 ) {
     let open: Vec<FiringLocation> = executions
         .iter()
@@ -4055,7 +4055,7 @@ fn check_generator_buffer_cap(
     frames: &weft_core::frames::LoopFrames,
     pulses: &PulseTable,
 ) -> Result<(), String> {
-    let outgoing = edge_idx.get_outgoing(project, node_id);
+    let outgoing = edge_idx.get_outgoing(project, node_id, frames);
     for port in output.outputs.keys() {
         for edge in outgoing.iter().filter(|e| e.source_handle.as_deref() == Some(port.as_str())) {
             if !weft_core::exec::ready::edge_targets_generator(project, edge) {

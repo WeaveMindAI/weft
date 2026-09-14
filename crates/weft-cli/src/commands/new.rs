@@ -1,5 +1,5 @@
 //! `weft new <name>`: scaffold a new project directory with
-//! weft.toml, main.weft, nodes/, .weft/, and an initialized git
+//! weft.toml, src/main.weft, nodes/, .weft/, and an initialized git
 //! repo. With `--assistant <name>`, also install the Tangle
 //! assistant persona for that AI coding assistant, via symlinks
 //! into the weft checkout (see `AssistantSpec`). The choice is

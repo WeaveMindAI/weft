@@ -30,7 +30,7 @@ shell command inside a prompt with `!{...}` and pull in a file with `@{...}`.
 
 ## What is here
 
-Tangle is one persona plus thirteen skills, five specialists and six commands.
+Tangle is one persona plus fifteen skills, six specialists and six commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

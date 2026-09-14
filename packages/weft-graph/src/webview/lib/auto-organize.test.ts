@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { autoOrganize } from './auto-organize';
+import { expandedContainerMinPx } from './constants/container-layout';
 
 const node = (id: string, extra: Record<string, unknown> = {}) => ({
   id,
@@ -134,5 +135,30 @@ describe('simplified view', () => {
 		const s = simplified.groupSizes.get('g')!;
 		expect(s.width).toBeLessThan(b.width);
 		expect(s.height).toBeLessThan(b.height);
+	});
+});
+
+describe('a container is never smaller than the box it draws', () => {
+	it('a one-square simplified loop comes out at the renderer floor exactly', async () => {
+		// The engine's floor and the renderer's floor are one value
+		// (expandedContainerMinPx). They used to differ: the engine wrapped
+		// one square in its slim padding while the container's CSS floored
+		// at the builder's 250x200, so the drawn loop spilled past the
+		// parent box the engine had sized around the smaller number.
+		const loop = { ...node('l'), nodeType: 'Loop', config: { expanded: true } };
+		const child = { ...node('l.row'), parentId: 'l' };
+		const sizes = new Map([['l.row', { width: 96, height: 96 }]]);
+		const { groupSizes } = await autoOrganize([loop, child] as any, [], sizes, undefined, true);
+		const drawn = expandedContainerMinPx(true);
+		const got = groupSizes.get('l')!;
+		expect(got.width).toBeGreaterThanOrEqual(drawn.w);
+		expect(got.height).toBeGreaterThanOrEqual(drawn.h);
+		// And not padded beyond the square plus the slim chrome either: the
+		// floor is exactly the padding around one square.
+		expect(got.height).toBe(drawn.h);
+	});
+
+	it('the builder floor is the container CSS floor', () => {
+		expect(expandedContainerMinPx(false)).toEqual({ w: 250, h: 200 });
 	});
 });

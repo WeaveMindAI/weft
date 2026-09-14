@@ -9,7 +9,7 @@ use weft_e2e::{ensure, infra, project::Project, run, SettledRun};
 async fn infra_node_provisions_runs_and_terminates() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("infra_min", disp).await?;
-    project.write_file("main.weft", r#"
+    project.write_file("src/main.weft", r#"
 scope = Group() -> (status: String) {
   enabled = Text { value: "true" }
   ready = Cast -> (value: Boolean) { value: enabled.value }
@@ -43,7 +43,7 @@ out.data = scope.status
 
     // Terminate and assert the node is actually gone (cleanup happened).
     infra::terminate_and_wait_gone(&project, "scope.svc").await?;
-    project.write_file("main.weft", r#"
+    project.write_file("src/main.weft", r#"
 scope = Loop(values: List[Number]) -> (statuses: List[String | Null]) {
   over: ["values"]
   svc = MiniService

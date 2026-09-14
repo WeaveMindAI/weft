@@ -581,10 +581,13 @@ g.input = @file("a.txt", TextAlias)
 }
 
 #[test]
-fn include_arguments_and_body_files_resolve_from_their_own_source() {
+fn include_arguments_and_body_files_resolve_from_the_project_root() {
+    // A `@file` path is relative to the project root wherever it is
+    // typed: the same text in the caller and in the included file names
+    // the same file.
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
         (std::path::PathBuf::from("/project/input.txt"), "caller".into()),
-        (std::path::PathBuf::from("/project/components/input.txt"), "callee".into()),
+        (std::path::PathBuf::from("/project/components/input.txt"), "not this one".into()),
         (std::path::PathBuf::from("/project/components/box.weft"), "Group(input: String) {\n n = Text { value: @file(\"input.txt\") }\n}".into()),
     ]));
     for mode in [crate::weft_compiler::IncludeMode::Full, crate::weft_compiler::IncludeMode::Interface] {
@@ -598,11 +601,9 @@ fn include_arguments_and_body_files_resolve_from_their_own_source() {
                 let boundary = project.nodes.iter().find(|n| n.id == "box__in").unwrap();
                 assert_eq!(boundary.port_literals["input"], serde_json::json!("caller"));
                 assert_eq!(boundary.file_refs["input"].path, "input.txt");
-                let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
-                assert_eq!(body.config["value"], serde_json::json!("callee"));
-                // The body's ref leaves the compiler spelled under the project
-                // root, the anchor every consumer resolves against.
-                assert_eq!(body.file_refs["value"].path, "components/input.txt");
+                let body = project.nodes.iter().find(|n| n.id == "@components:box.n").unwrap();
+                assert_eq!(body.config["value"], serde_json::json!("caller"));
+                assert_eq!(body.file_refs["value"].path, "input.txt");
             }
             crate::weft_compiler::IncludeMode::Interface => {
                 let node = project.nodes.iter().find(|n| n.id == "box").unwrap();
@@ -614,7 +615,7 @@ fn include_arguments_and_body_files_resolve_from_their_own_source() {
 }
 
 #[test]
-fn a_deferred_asset_in_an_included_file_is_respelled_under_the_project_root() {
+fn a_deferred_asset_in_an_included_file_keeps_its_root_spelling() {
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
         (std::path::PathBuf::from("/project/components/box.weft"), "Group {\n n = Text { value: @asset(\"pics/a.png\", Image) }\n}".into()),
     ]));
@@ -623,50 +624,46 @@ fn a_deferred_asset_in_an_included_file_is_respelled_under_the_project_root() {
         uuid::Uuid::nil(), crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
         crate::weft_compiler::IncludeMode::Full, None,
     ).unwrap();
-    let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
-    assert_eq!(body.config["value"], serde_json::json!("@asset(\"components/pics/a.png\", Image)"));
-    assert_eq!(body.file_refs["value"].path, "components/pics/a.png");
+    let body = project.nodes.iter().find(|n| n.id == "@components:box.n").unwrap();
+    assert_eq!(body.config["value"], serde_json::json!("@asset(\"pics/a.png\", Image)"));
+    assert_eq!(body.file_refs["value"].path, "pics/a.png");
     let refs = crate::file_ref::collect_asset_refs(&project);
-    assert_eq!(refs.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), vec!["components/pics/a.png"]);
+    assert_eq!(refs.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(), vec!["pics/a.png"]);
 }
 
 #[test]
-fn an_included_ref_climbs_to_the_root_and_a_read_outside_it_is_still_refused() {
+fn an_included_ref_reads_from_the_root_and_a_climb_above_it_is_refused() {
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
         (std::path::PathBuf::from("/project/shared.txt"), "shared".into()),
-        (std::path::PathBuf::from("/project/components/box.weft"), "Group {\n n = Text { value: @file(\"../shared.txt\") }\n}".into()),
-        (std::path::PathBuf::from("/project/components/bad.weft"), "Group {\n n = Text { value: @file(\"../../etc/passwd\") }\n}".into()),
+        (std::path::PathBuf::from("/project/components/box.weft"), "Group {\n n = Text { value: @file(\"sub/../shared.txt\") }\n}".into()),
+        (std::path::PathBuf::from("/project/components/bad.weft"), "Group {\n n = Text { value: @file(\"../etc/passwd\") }\n}".into()),
     ]));
     let fs = crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project")));
     let project = crate::weft_compiler::compile_with_mode(
         "box = @include(\"components/box.weft\")\n", uuid::Uuid::nil(), fs,
         crate::weft_compiler::IncludeMode::Full, None,
     ).unwrap();
-    let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
+    let body = project.nodes.iter().find(|n| n.id == "@components:box.n").unwrap();
     assert_eq!(body.config["value"], serde_json::json!("shared"));
     assert_eq!(body.file_refs["value"].path, "shared.txt");
     let errs = crate::weft_compiler::compile_with_mode(
         "box = @include(\"components/bad.weft\")\n", uuid::Uuid::nil(), fs,
         crate::weft_compiler::IncludeMode::Full, None,
     ).unwrap_err();
-    // The wall on COMPILER-READ files is the reader's, and it still
-    // holds for a ref written in an included file: the anchored path
-    // lands outside the root and the read is refused there.
-    assert!(errs.iter().any(|e| e.message.contains("escapes the project root")), "{errs:?}");
+    // There is nothing above the project root a relative path could
+    // mean, so a climb is refused before any read.
+    assert!(errs.iter().any(|e| e.message.contains("climbs above the project root")), "{errs:?}");
 }
 
 /// A DEFERRED asset is never read by the compiler, so nothing refuses a
-/// path outside the project: naming a file where it already sits is
-/// allowed, exactly as it is from the compiled file itself. What the
-/// anchoring must guarantee is that the path means the same thing
-/// wherever it was typed, so it comes out absolute rather than as a
-/// climb out of somebody's directory.
+/// file outside the project: naming a file where it already sits, by an
+/// absolute path, is allowed from any file, and the spelling is kept.
 #[test]
-fn a_deferred_asset_outside_the_root_keeps_one_absolute_spelling() {
+fn a_deferred_asset_outside_the_root_keeps_its_absolute_spelling() {
     let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::from([
         (
             std::path::PathBuf::from("/project/components/box.weft"),
-            "Group {\n n = Text { value: @asset(\"../../shared/logo.png\", Image) }\n}".into(),
+            "Group {\n n = Text { value: @asset(\"/shared/logo.png\", Image) }\n}".into(),
         ),
     ]));
     let project = crate::weft_compiler::compile_with_mode(
@@ -677,10 +674,28 @@ fn a_deferred_asset_outside_the_root_keeps_one_absolute_spelling() {
         None,
     )
     .unwrap();
-    let body = project.nodes.iter().find(|n| n.id == "box.n").unwrap();
+    let body = project.nodes.iter().find(|n| n.id == "@components:box.n").unwrap();
     assert_eq!(body.file_refs["value"].path, "/shared/logo.png");
     assert_eq!(
         body.config["value"],
         serde_json::json!("@asset(\"/shared/logo.png\", Image)")
     );
+}
+
+/// `~` names the home directory, so a file kept there is written the way a
+/// person writes it, and the wire carries the real path.
+#[test]
+fn a_tilde_path_expands_to_the_home_directory() {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from).expect("HOME is set in the test environment");
+    let reader = crate::file_reader::MapFileReader::new(std::collections::BTreeMap::new());
+    let project = crate::weft_compiler::compile_with_mode(
+        "n = Text { value: @asset(\"~/pics/logo.png\", Image) }\n",
+        uuid::Uuid::nil(),
+        crate::file_reader::CompileFs::with_reader(&reader, Some(std::path::Path::new("/project"))),
+        crate::weft_compiler::IncludeMode::Full,
+        None,
+    )
+    .unwrap();
+    let node = project.nodes.iter().find(|n| n.id == "n").unwrap();
+    assert_eq!(node.file_refs["value"].path, home.join("pics/logo.png").to_str().unwrap());
 }

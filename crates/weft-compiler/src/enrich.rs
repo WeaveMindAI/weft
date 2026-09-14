@@ -199,7 +199,7 @@ pub enum EnrichPolicy {
 /// entry by design: enrich fills their ports itself, and diagnostics must
 /// not flag them as unknown types.
 pub fn is_lowering_builtin(node_type: &str) -> bool {
-    matches!(node_type, "Passthrough" | "LoopIn" | "LoopOut")
+    weft_core::project::boundary_types::is_boundary(node_type)
 }
 
 pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) -> CompileResult<()> {

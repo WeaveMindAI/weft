@@ -27,7 +27,7 @@ You never trust a report you can re-verify for the cost of one command, and ever
 - Re-run the tests yourself: `weft test-node <Type>` (local tiers, fast, free). The quoted output in the report is a claim; your run is the verdict. A report that claimed green and runs red is redispatched with the dishonesty named as the finding.
 - Diff the delivered `metadata.json` against the report's port list yourself. Metadata drift (a port renamed or dropped between report and file) is redispatched.
 - Read every test and ask one question: how would this test fail? A test with no answer (runs the node, ignores the result, asserts nothing about the outputs) is not a test, whatever its name says.
-- `weft validate --file main.weft < main.weft` still passes with the node in the catalog, and `weft describe-nodes --node <Type> --compact` succeeds. The folder is under `nodes/`, never inside `nodes/base_catalog/`.
+- `weft validate --file src/main.weft < src/main.weft` still passes with the node in the catalog, and `weft describe-nodes --node <Type> --compact` succeeds. The folder sits beside the module that uses it under `src/`, or under `nodes/` when shared; never inside `nodes/base_catalog/`.
 
 **Then check the contract and the body:**
 
@@ -45,6 +45,7 @@ You never trust a report you can re-verify for the cost of one command, and ever
 - **swallowed in the test**: patterns like `if let Err(_) = ... {}` that pass on failure.
 - **coverage gap against the contract**: a port behavior in the contract with no test that would fail if it broke. Count the tests against the ports: every port in the contract needs a test that fails if its behavior breaks, and a port with none is the finding.
 - **live tests missing or hollow**: the contract names a service but there is no `NodeTest::live` entry for it, or the entry declares no service and no fixtures.
+- **stale versions**: an API or dependency version taken from memory or an old example instead of the service's current docs, or a version the service no longer serves. The node is built against what the service runs today (the latest stable or LTS), and the report names each version and where it came from.
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and the report did not say so.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) is a patch on the symptom and fails the review on both counts.
 - **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node.
@@ -299,6 +300,12 @@ Sections: `[dependencies]` (cargo), `[build-dependencies]`, `[system.build]`
 keyed by distro like `debian_12`, `ubuntu_24_04`, `alpine_3_19`, or
 `default`), `[build.env]`.
 
+Declare the version you actually built and tested against, current and
+maintained: the latest stable or LTS, never a bleeding-edge major when a
+stable one works, and never a deprecated one. A dependency copied from an old
+example without checking its version, or an unpinned `*`, is a review finding:
+the report names each dependency's version and where it came from.
+
 ## Tests
 
 `tests.rs` exports `pub fn tests() -> Vec<NodeTest>`. Each fake test is an
@@ -318,5 +325,5 @@ asks first. Write a node's tests in the same change that writes the node.
 The catalog walk picks the folder up automatically; no registration exists.
 Check it landed: `weft describe-nodes --node MyThing --compact` must
 succeed, or re-run `weft validate`, which compiles against `nodes/` fresh. Then use the
-type in `main.weft` like any catalog node. Custom type names must not collide
+type in `src/main.weft` like any catalog node. Custom type names must not collide
 with existing ones (loud error, no shadowing).

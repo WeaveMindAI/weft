@@ -48,13 +48,16 @@ pub async fn run(
     // either way: the editor's palette must survive a node mid-edit. Same
     // traversal as the build, only the error reaction differs (warn vs abort),
     // so the palette and the build never disagree about what a node is.
-    let nodes_dir = if stdlib {
-        stdlib_root().map_err(|e| anyhow::anyhow!(e))?
+    let roots: Vec<std::path::PathBuf> = if stdlib {
+        vec![stdlib_root().map_err(|e| anyhow::anyhow!(e))?]
     } else {
-        ctx.project()?.root.join("nodes")
+        weft_compiler::project::node_roots(&ctx.project()?.root).to_vec()
     };
-    let cat = FsCatalog::discover_with_policy(&nodes_dir, DiscoverPolicy::Lenient)
-        .map_err(|e| anyhow::anyhow!("describe: {e}"))?;
+    let cat = FsCatalog::discover_roots_with_policy(
+        &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
+        DiscoverPolicy::Lenient,
+    )
+    .map_err(|e| anyhow::anyhow!("describe: {e}"))?;
 
     let mut catalog = BTreeMap::new();
     for entry in cat.iter() {

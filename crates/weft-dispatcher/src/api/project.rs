@@ -13,7 +13,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::project::{infra_ids, trigger_ids};
+use weft_core::frames::Located;
+use weft_core::project::{infra_places, trigger_ids, trigger_places};
 use weft_core::ProjectDefinition;
 
 use crate::authenticator::{authorize_project, CallerTenant};
@@ -556,7 +557,7 @@ pub use weft_core::project::compute_trigger_deps;
 /// Returns an empty vec if the project has no infra nodes (the
 /// caller short-circuits : no InfraSetup execution needed).
 pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Result<Vec<Kick>, String> {
-    setup_kicks(project, infra_ids(project))
+    setup_kicks(project, infra_places(project))
 }
 
 /// Kicks for a TriggerSetup-phase sub-execution: the roots of the run
@@ -567,21 +568,22 @@ pub fn compute_infra_setup_kicks(project: &ProjectDefinition) -> Result<Vec<Kick
 /// Returns an empty vec if the project has no triggers (activate is
 /// a no-op in that case).
 pub fn compute_trigger_setup_kicks(project: &ProjectDefinition) -> Result<Vec<Kick>, String> {
-    setup_kicks(project, trigger_ids(project))
+    setup_kicks(project, trigger_places(project))
 }
 
 /// A setup phase kicks the roots of `seeds`' run subgraph, payload-less
 /// and with no terminators (a trigger's setup needs its inputs). The
 /// engine bounds the same phase with the same subgraph.
-fn setup_kicks(project: &ProjectDefinition, seeds: Vec<String>) -> Result<Vec<Kick>, String> {
+fn setup_kicks(project: &ProjectDefinition, seeds: Vec<Located>) -> Result<Vec<Kick>, String> {
     if seeds.is_empty() {
         return Ok(Vec::new());
     }
     let selection = weft_core::project::selection::RunSelection::setup(project, &seeds)?;
     Ok(selection.roots(project)
         .into_iter()
-        .map(|id| Kick {
-            node: id,
+        .map(|place| Kick {
+            frames: place.frames(),
+            node: place.id,
             firing: false,
             payload: None,
             port_snapshot: None,
@@ -766,6 +768,7 @@ pub(crate) fn execution_birth_events(
         .map(|kick| weft_journal::ExecEvent::NodeKicked {
             color,
             node_id: kick.node.clone(),
+            frames: kick.frames.clone(),
             firing: kick.firing,
             payload: kick.payload.clone(),
             port_snapshot: kick.port_snapshot.clone(),
@@ -826,7 +829,7 @@ pub async fn start_infra_setup(
     // journaled/enqueued hash must come from the SAME definition (see
     // `coherent_definition`).
     let (program, project) = coherent_definition(state, project_id_uuid).await?;
-    let selection = weft_core::project::selection::RunSelection::setup(&project, &infra_ids(&project))
+    let selection = weft_core::project::selection::RunSelection::setup(&project, &infra_places(&project))
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let kicks = compute_infra_setup_kicks(&project).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     if kicks.is_empty() {
@@ -1019,7 +1022,8 @@ pub fn compute_trigger_fire(
         &weft_core::project::selection::SelectionBounds {
             fire: Some(firing_node_id.into()), ..Default::default()
         })?;
-    let kicks = Kick::for_selection(project, &selection, Some((firing_node_id, payload)), port_snapshot);
+    let (fired, path) = weft_core::project::resolve_address(project, firing_node_id);
+    let kicks = Kick::for_selection(project, &selection, Some((&Located::new(fired, path), payload)), port_snapshot);
     Ok(TriggerFire { kicks, subgraph: selection })
 }
 
@@ -1981,9 +1985,9 @@ async fn prepare_trigger_setup(
     project: &ProjectDefinition,
 ) -> Result<(), (StatusCode, String)> {
     let project_id = id.to_string();
-    let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_ids(project))
+    let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_places(project))
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    let nodes = selection.nodes.iter().cloned().collect();
+    let nodes = selection.nodes.iter().map(|place| place.id.clone()).collect();
     if !missing_infra_nodes(state, &project_id, project, Some(&nodes)).await?.is_empty() {
         let _ = super::infra::sync_inner(state.clone(), id, super::infra::SyncRequest::default()).await?;
     }
@@ -3926,7 +3930,7 @@ async fn run_trigger_setup(
 ) -> Result<crate::journal::TriggerBake, (StatusCode, String)> {
     let project_id = project_id_uuid.to_string();
     let color = activation.unwrap_or_else(uuid::Uuid::new_v4);
-    let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_ids(project))
+    let selection = weft_core::project::selection::RunSelection::setup(project, &trigger_places(project))
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
 
     // Subscribe BEFORE journaling+enqueueing so the worker can't beat us to
@@ -4147,7 +4151,7 @@ mod trigger_kick_tests {
     }
 
     fn sorted(set: &weft_core::project::selection::RunSelection) -> Vec<String> {
-        set.nodes.iter().cloned().collect()
+        set.nodes.iter().map(|place| place.to_string()).collect()
     }
 
     fn fire(p: &ProjectDefinition, node: &str, payload: Value) -> TriggerFire {
@@ -4655,7 +4659,7 @@ mod run_subgraph_tests {
             &[("src", "a"), ("a", "out1"), ("src", "b"), ("b", "out2")],
         );
         let sub = aimed_at(&p, &["out1"]);
-        let mut nodes: Vec<&str> = sub.nodes.iter().map(|s| s.as_str()).collect();
+        let mut nodes: Vec<&str> = sub.nodes.iter().map(|s| s.id.as_str()).collect();
         nodes.sort();
         assert_eq!(nodes, vec!["a", "out1", "src"]);
     }
@@ -4674,8 +4678,8 @@ mod run_subgraph_tests {
             &[("setup", "trig"), ("trig", "mid"), ("mid", "out")],
         );
         let sub = aimed_at(&p, &["out"]);
-        assert!(sub.nodes.contains("trig"));
-        assert!(!sub.nodes.contains("setup"), "the trigger's own upstream stays out");
+        assert!(sub.nodes.contains(&Located::top("trig")));
+        assert!(!sub.nodes.contains(&Located::top("setup")), "the trigger's own upstream stays out");
 
         let resolved = weft_core::run_spec::resolve_spec(&weft_core::run_spec::RunSpec {
             target: vec!["out".into()], ..weft_core::run_spec::RunSpec::whole("x")

@@ -119,6 +119,8 @@ impl ConnectOpts {
 /// each file visited ONCE: a subgraph included in two places is still
 /// one source file, so one pick serves every inclusion.
 struct AccessTarget {
+    /// The project root the file sits under.
+    root: std::path::PathBuf,
     /// The file the node is written in; the pick is written HERE (the
     /// same per-file edit the editor makes when navigated into it).
     file: std::path::PathBuf,
@@ -577,7 +579,7 @@ fn collect_targets(
     }
     let source = std::fs::read_to_string(&canonical)
         .with_context(|| format!("read {}", canonical.display()))?;
-    let source_id = weft_compiler::source_name::derive_id(Some(&canonical));
+    let source_id = weft_compiler::source_name::body_id(root, &canonical);
     let base = canonical
         .parent()
         .map(std::path::Path::to_path_buf)
@@ -585,7 +587,7 @@ fn collect_targets(
     let (definition, diagnostics) = weft_compiler::parse_only(
         &source,
         project_id,
-        weft_compiler::CompileFs::disk(&base),
+        weft_compiler::CompileFs::disk(root).anchored_at(Some(&base)),
         catalog,
         Some(&source_id),
     );
@@ -642,6 +644,7 @@ fn collect_targets(
         };
         indices.push(out.len());
         out.push(AccessTarget {
+            root: root.to_path_buf(),
             file: canonical.clone(),
             rel_file: canonical
                 .strip_prefix(root)
@@ -927,12 +930,11 @@ impl Connecting<'_> {
                 form: None,
             },
         };
-        // The file's own filename-derived anon-root id, the same identity
-        // the editor edits it under when navigated into it.
-        let source_id = weft_compiler::source_name::derive_id(Some(file));
+        // The file's own anon-root id, the same identity the editor edits
+        // it under when navigated into it.
+        let source_id = weft_compiler::source_name::body_id(&self.target.root, file);
         let (edited, _inverse) = weft_compiler::edit::apply_edits(
             &source,
-            None,
             &source_id,
             &[op],
             self.registry.clone(),

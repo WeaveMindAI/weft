@@ -3,7 +3,7 @@
     use std::sync::Mutex as StdMutex;
     use weft_core::exec::loop_runtime::{compute_loop_iter_cap, LoopConfig, LoopItemSource};
     use weft_core::exec::ready::InputBag;
-    use weft_core::frames::LoopIteration;
+    use weft_core::frames::Frame;
     use weft_core::exec::ready::ReadyGroup;
     use weft_core::primitive::LoopInstanceKey;
     use weft_core::project::{
@@ -423,7 +423,7 @@
         journal: &CapturingJournal,
     ) {
         let color = uuid::Uuid::nil();
-        let frames = vec![LoopIteration { index: iter }];
+        let frames = vec![Frame::Loop { index: iter }];
         let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
         let loop_out = lp.project.nodes.iter().find(|n| n.id == lp.loop_out_id).unwrap();
         // The body firings that produced these writes: `writes` is
@@ -489,7 +489,7 @@
         .await
         .expect("LoopOut firing");
         journal
-            .record_event(&ExecEvent::NodeCompleted { color, node_id: lp.loop_out_id.clone(), frames: vec![LoopIteration { index: iter }], at_unix: 0 }, None)
+            .record_event(&ExecEvent::NodeCompleted { color, node_id: lp.loop_out_id.clone(), frames: vec![Frame::Loop { index: iter }], at_unix: 0 }, None)
             .await
             .unwrap();
     }
@@ -517,7 +517,7 @@
             .filter(|p| p.target_port == "in" && !p.closed)
             .collect();
         assert_eq!(on_in.len(), 3, "three body pulses, one per iteration");
-        let frames: Vec<u32> = on_in.iter().map(|p| p.frames[0].index).collect();
+        let frames: Vec<u32> = on_in.iter().map(|p| p.frames[0].loop_index().expect("loop frame")).collect();
         let mut sorted = frames.clone();
         sorted.sort();
         assert_eq!(sorted, vec![0, 1, 2], "iterations 0..3 fired: {:?}", frames);
@@ -624,7 +624,7 @@
         let mut frames: Vec<u32> = body
             .iter()
             .filter(|p| p.target_port == "in" && !p.closed)
-            .map(|p| p.frames[0].index)
+            .map(|p| p.frames[0].loop_index().expect("loop frame"))
             .collect();
         frames.sort();
         assert_eq!(frames, vec![1, 2], "only the missing iterations relaunch");
@@ -999,12 +999,12 @@
         };
         let key_inner_iter0 = LoopInstanceKey {
             group_id: "inner".into(),
-            parent_frames: vec![LoopIteration { index: 0 }],
+            parent_frames: vec![Frame::Loop { index: 0 }],
             color: uuid::Uuid::nil(),
         };
         let key_inner_iter1 = LoopInstanceKey {
             group_id: "inner".into(),
-            parent_frames: vec![LoopIteration { index: 1 }],
+            parent_frames: vec![Frame::Loop { index: 1 }],
             color: uuid::Uuid::nil(),
         };
         rt.ensure(key_inner_iter0.clone(), LoopConfig {
@@ -1017,7 +1017,7 @@
         assert!(rt.get(&key_inner_iter0).is_some(), "inner instance at outer iter 0 lives");
         assert!(rt.get(&key_inner_iter1).is_some(), "inner instance at outer iter 1 lives");
         // Distinct: cancelling one does not affect the other.
-        rt.cancel_inside(&vec![LoopIteration { index: 0 }], uuid::Uuid::nil());
+        rt.cancel_inside(&vec![Frame::Loop { index: 0 }], uuid::Uuid::nil());
         use weft_core::primitive::LoopTerminationReason;
         assert_eq!(rt.get(&key_inner_iter0).unwrap().terminated, Some(LoopTerminationReason::Cancelled),
             "iter 0's inner instance cancelled");
@@ -1228,7 +1228,7 @@
         ) -> std::collections::HashMap<String, serde_json::Value> {
             pulses.get(body_id)
                 .map(|b| b.iter()
-                    .filter(|p| p.frames.len() == 1 && p.frames[0].index == idx && !p.closed)
+                    .filter(|p| p.frames.len() == 1 && p.frames[0].loop_index().expect("loop frame") == idx && !p.closed)
                     .map(|p| (p.target_port.clone(), (*p.value).clone()))
                     .collect())
                 .unwrap_or_default()
@@ -1305,7 +1305,7 @@
         let by_port = |pulses: &PulseTable, idx: u32| -> std::collections::HashMap<String, serde_json::Value> {
             pulses.get(&lp.body_id)
                 .map(|b| b.iter()
-                    .filter(|p| p.frames.len() == 1 && p.frames[0].index == idx && !p.closed)
+                    .filter(|p| p.frames.len() == 1 && p.frames[0].loop_index().expect("loop frame") == idx && !p.closed)
                     .map(|p| (p.target_port.clone(), (*p.value).clone()))
                     .collect())
                 .unwrap_or_default()

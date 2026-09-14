@@ -660,7 +660,7 @@ fn frames_of(row: &Value) -> weft_core::frames::LoopFrames {
 }
 
 pub fn frames_key(frames: &weft_core::frames::LoopFrames) -> String {
-    frames.iter().map(|f| f.index.to_string()).collect::<Vec<_>>().join(".")
+    weft_core::frames::frames_text(frames)
 }
 
 /// The outside facts a replay shows: every kick payload, every answer

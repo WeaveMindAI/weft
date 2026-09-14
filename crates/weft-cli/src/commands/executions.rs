@@ -98,22 +98,56 @@ pub async fn list(
 #[derive(Debug, Default, Clone)]
 pub struct EventsFilter {
     pub node: Option<String>,
+    /// The call sites the named node's rows must run under, outermost
+    /// first: what `--node auth.check` resolves to beside the node's
+    /// id (`Auth.check` under `["auth"]`). Empty = any, or none.
+    pub call_path: Vec<String>,
     pub kind: Option<String>,
     pub full: bool,
 }
 
 impl EventsFilter {
+    /// Read `--node` the way the program is written: through the call
+    /// sites (`auth.check`), which the compiled definition turns into
+    /// the node's own id and the call path its rows carry. Without a
+    /// definition the spelling is taken as the id itself. A node of an
+    /// included file has no spelling of its own: it is always named
+    /// through a site.
+    pub fn resolve_node(&mut self, project: &weft_core::ProjectDefinition) -> anyhow::Result<()> {
+        if let Some(spelled) = &self.node {
+            let (id, call_path) = weft_core::project::resolve_address(project, spelled);
+            if call_path.is_empty() {
+                if let Some(node) = project.nodes.iter().find(|n| n.id == id) {
+                    if weft_core::project::selection::enclosing_body(project, node).is_some() {
+                        anyhow::bail!("'{spelled}' is inside an included file; name it through the site that includes the file, like `site.{}`", id.rsplit('.').next().unwrap_or(&id));
+                    }
+                }
+            }
+            self.node = Some(id);
+            self.call_path = call_path;
+        }
+        Ok(())
+    }
+
     /// Whether one replay row survives the filters. A node filter is
     /// exact (a node's id), so a run-level row (a start, a completion,
-    /// the run failing) never passes one: it names no node. A kind
-    /// filter matches the kind exactly or as a substring, so `failed`
-    /// finds both `node_failed` and `execution_failed`, and `loop`
-    /// finds the loop lifecycle.
+    /// the run failing) never passes one: it names no node; and when
+    /// the node was named through call sites, only the rows under
+    /// that call path pass. A kind filter matches the kind exactly or
+    /// as a substring, so `failed` finds both `node_failed` and
+    /// `execution_failed`, and `loop` finds the loop lifecycle.
     pub fn keeps(&self, row: &serde_json::Value) -> bool {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
         let node_ok = self.node.as_deref().is_none_or(|n| row_node(row) == Some(n));
-        kind_ok && node_ok
+        let call_ok = self.call_path.is_empty() || {
+            let frames: weft_core::frames::LoopFrames = row
+                .get("frames")
+                .and_then(|f| serde_json::from_value(f.clone()).ok())
+                .unwrap_or_default();
+            weft_core::frames::call_path(&frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
+        };
+        kind_ok && node_ok && call_ok
     }
 }
 
@@ -206,8 +240,18 @@ fn field_text(value: &serde_json::Value, full: bool) -> String {
     format!("{cut}...")
 }
 
-pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Result<()> {
+pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow::Result<()> {
     let color = super::resolve_color(&ctx, &color).await?;
+    // `--node` is spelled through the call sites, the way the program
+    // reads; the project's compiled definition says which id and which
+    // call path that is, and the rows print their node the same way.
+    // Outside a project the spelling is the id and the rows show ids.
+    let definition = ctx.project().ok()
+        .and_then(|project| weft_compiler::hash::load_enriched_project(project).ok())
+        .map(|(definition, _)| definition);
+    if let Some(definition) = &definition {
+        filter.resolve_node(definition)?;
+    }
     let client = ctx.client();
     let resp: serde_json::Value = client
         .get_json(&format!("/executions/{color}/replay"))
@@ -215,7 +259,9 @@ pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Re
     let arr = resp
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {resp}"))?;
-    let kept: Vec<&serde_json::Value> = arr.iter().filter(|row| filter.keeps(row)).collect();
+    let kept: Vec<serde_json::Value> = arr.iter().filter(|row| filter.keeps(row))
+        .map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => row.clone() })
+        .collect();
     if ctx.json_out(&kept)? {
         return Ok(());
     }
@@ -226,10 +272,26 @@ pub async fn events(ctx: Ctx, color: String, filter: EventsFilter) -> anyhow::Re
         );
         return Ok(());
     }
-    for row in kept {
+    for row in &kept {
         println!("{}", event_line(row, filter.full));
     }
     Ok(())
+}
+
+/// The row with its node named the way the program reads: a node of an
+/// included file through the site its call frames say (`one.strip`),
+/// so two calls of one file read apart. The frames stay, for the loop
+/// iteration.
+pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefinition) -> serde_json::Value {
+    let key = ["node", "node_id"].into_iter().find(|key| row.get(key).and_then(|v| v.as_str()).is_some());
+    if let Some(key) = key {
+        let frames: weft_core::frames::LoopFrames = row.get("frames")
+            .and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
+        let path: Vec<String> = weft_core::frames::call_path(&frames).into_iter().map(str::to_string).collect();
+        let id = row[key].as_str().unwrap_or_default().to_string();
+        row[key] = serde_json::Value::String(weft_core::project::address_of(project, &id, &path));
+    }
+    row
 }
 
 pub async fn clean(
@@ -778,9 +840,18 @@ async fn reclaim_host_images(images: &[String]) -> anyhow::Result<Reclaimed> {
     Ok(done)
 }
 
-/// What the shared worker compile cache takes on disk, per cache key,
-/// and how to drop it.
+/// What the two compile caches on this host take on disk and how to
+/// drop each: the node-test cache `weft test-node` builds into, and the
+/// worker compile cache every image build shares, per cache key.
 async fn report_compile_cache_size() -> anyhow::Result<()> {
+    match super::test_node::cache_size_bytes()? {
+        None => println!("node-test cache: nothing built on this host"),
+        Some(bytes) => println!(
+            "node-test cache: {:.1}GB; it wipes itself past WEFT_TEST_CACHE_CAP_GB (6 by default), \
+             `weft rm --local` drops one project's slice, `weft clean --build-cache` drops it whole",
+            bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        ),
+    }
     let caches = crate::images::worker_compile_caches().await?;
     if caches.is_empty() {
         println!("worker compile cache: no BuildKit record (nothing built on this host, or already pruned)");
@@ -826,8 +897,13 @@ async fn retired_compile_cache_sweep() -> anyhow::Result<()> {
 
 /// `docker buildx prune` reclaims BuildKit's intermediate layers.
 /// This is the heavy reclaim: cargo deps, intermediate Rust compile
-/// state, etc. The next build will re-download deps and re-link.
+/// state, etc. The next build will re-download deps and re-link. The
+/// host's node-test cache goes with it: it is the same kind of thing
+/// (compiled engine plus dependencies, re-made by the next build), and
+/// "drop every build cache" should mean every one.
 async fn clean_build_cache() -> anyhow::Result<()> {
+    println!("dropping the node-test cache (the next `weft test-node` builds cold)…");
+    super::test_node::wipe_cache()?;
     println!("pruning docker BuildKit cache (next build will be slower)…");
     let status = crate::images::docker()
         .args(["buildx", "prune", "--force"])
@@ -859,6 +935,13 @@ mod tests {
         assert!(exact.keeps(&done) && !exact.keeps(&failed));
         let by_node = EventsFilter { node: Some("llm".into()), ..Default::default() };
         assert!(by_node.keeps(&failed) && !by_node.keeps(&done) && !by_node.keeps(&run_failed));
+        // Named through a call site, only the rows under that call pass.
+        let in_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"site": "auth"}]});
+        let other_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"index": 1}, {"site": "again"}]});
+        let by_call = EventsFilter { node: Some("Auth.check".into()), call_path: vec!["auth".into()], ..Default::default() };
+        assert!(by_call.keeps(&in_call) && !by_call.keeps(&other_call));
+        let any_call = EventsFilter { node: Some("Auth.check".into()), ..Default::default() };
+        assert!(any_call.keeps(&in_call) && any_call.keeps(&other_call));
     }
 
     /// The compact line cuts a long value at the summary width on a

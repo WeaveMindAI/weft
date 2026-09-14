@@ -200,9 +200,8 @@ pub struct TextEdit {
 /// inverse edit (apply it to the new source to get the original back). The whole
 /// batch runs against ONE mutable CST clone: parse once, mutate op-by-op,
 /// serialize once. On any op failure the whole batch fails and the caller keeps
-/// the original source. `base_dir` is accepted for signature stability with the
-/// parse-server; CST editing is purely structural and does not read included
-/// files (an `@include` is an opaque marker token), so it is currently unused.
+/// the original source. CST editing is purely structural and reads no file:
+/// an `@include` is an opaque marker token, so no filesystem view is taken.
 ///
 /// `source_id` is the file's identity (e.g. `MyCleaner` from `my-cleaner.weft`,
 /// `Untitled` for an unsaved buffer). It's the id an anonymous top-level group
@@ -215,17 +214,15 @@ pub struct TextEdit {
 /// on each caller, so no entry point can forget it.
 pub fn apply_edits(
     source: &str,
-    base_dir: Option<&std::path::Path>,
     source_id: &str,
     ops: &[EditOp],
     registry: std::sync::Arc<weft_core::weft_type::TypeRegistry>,
 ) -> Result<(String, TextEdit), EditError> {
-    registry.scoped(|| apply_edits_inner(source, base_dir, source_id, ops))
+    registry.scoped(|| apply_edits_inner(source, source_id, ops))
 }
 
 fn apply_edits_inner(
     source: &str,
-    _base_dir: Option<&std::path::Path>,
     source_id: &str,
     ops: &[EditOp],
 ) -> Result<(String, TextEdit), EditError> {
