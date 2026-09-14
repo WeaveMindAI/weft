@@ -333,7 +333,7 @@ open source project, please reach out!
 
 ## License
 
-Weft uses the [O'Saasy License](LICENSE).
+Copyright © 2026, WeaveMind, Inc. Weft uses the [O'Saasy License](LICENSE).
 
 For hosted-use partnerships, write to contact@weavemind.ai.
 
