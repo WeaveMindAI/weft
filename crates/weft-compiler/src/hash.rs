@@ -518,8 +518,8 @@ mod fs_hashes {
     /// matching what the stage copy materializes.
     /// This is the hash side of the one node-tree walk policy: it must
     /// see exactly the bytes the build stages, or a missed/extra file
-    /// silently de/over-syncs the worker-image hash. Order is not stable;
-    /// callers that need deterministic order sort the returned vec.
+    /// silently de/over-syncs the worker-image hash. The paths come back
+    /// sorted, so a hash over them is the same on every machine.
     pub fn walk_dir(root: &Path) -> Result<Vec<PathBuf>> {
         walk_dir_skipping(root, &[])
     }
@@ -532,6 +532,12 @@ mod fs_hashes {
         let mut out = Vec::new();
         let mut chain = Vec::new();
         walk_into(root, skip_top_level, &mut out, &mut chain)?;
+        // `read_dir` order is the filesystem's, and it differs between
+        // machines: two release runners walked the stdlib in different
+        // orders and minted two builder-base hashes for one commit.
+        // Every caller feeds these paths to a hasher, so the walk owns
+        // the ordering.
+        out.sort();
         Ok(out)
     }
 
@@ -631,9 +637,7 @@ mod fs_hashes {
         hasher.update(b"dir:");
         hasher.update(label.as_bytes());
         hasher.update(b"\n");
-        let mut entries = walk_dir_skipping(dir, skip)?;
-        entries.sort();
-        for entry in entries {
+        for entry in walk_dir_skipping(dir, skip)? {
             let rel = entry
                 .strip_prefix(dir)
                 .unwrap_or(&entry)
@@ -858,6 +862,26 @@ mod tests {
             "updatedAt": ts,
         }))
         .expect("test ProjectDefinition")
+    }
+
+    /// Regression: the two release runners walked the stdlib in their
+    /// filesystems' own orders and hashed two different builder bases
+    /// for one commit. The walk owns the order, so every hash fed from
+    /// it is the same on every machine.
+    #[test]
+    fn walk_dir_returns_paths_in_one_order_whatever_the_filesystem_gives() {
+        let dir = tempfile::tempdir().unwrap();
+        // Created out of order, and in a subdirectory too.
+        for rel in ["z/deps.toml", "m.rs", "a/deps.toml", "z/a.rs"] {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let walked = walk_dir(dir.path()).unwrap();
+        let mut sorted = walked.clone();
+        sorted.sort();
+        assert_eq!(walked, sorted);
+        assert_eq!(walked.len(), 4);
     }
 
     /// Regression: `created_at` / `updated_at` are stamped at
