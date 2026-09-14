@@ -37,30 +37,42 @@ impl Node for HttpNode {
     }
 
     async fn execute(&self, ctx: ExecutionContext) -> NodeResult {
-        let client = reqwest::Client::new();
-        
         let url = ctx.config.get("url")
             .or_else(|| ctx.input.get("url"))
             .and_then(|v| v.as_str())
             .unwrap_or("https://httpbin.org/get");
-        
+
         let method = ctx.config.get("method")
             .and_then(|v| v.as_str())
             .unwrap_or("GET");
 
         tracing::info!("HTTP request: {} {}", method, url);
 
+        let mut header_map = reqwest::header::HeaderMap::new();
+        if let Some(headers_obj) = ctx.input.get("headers").and_then(|v| v.as_object()) {
+            for (key, value) in headers_obj {
+                if let (Ok(name), Some(val)) = (
+                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                    value.as_str().and_then(|v| reqwest::header::HeaderValue::from_str(v).ok()),
+                ) {
+                    header_map.insert(name, val);
+                }
+            }
+        }
+
+        let client = &ctx.http_client;
+
         let result = match method.to_uppercase().as_str() {
             "POST" => {
                 let body = ctx.input.get("body").cloned().unwrap_or(serde_json::json!({}));
-                client.post(url).json(&body).send().await
+                client.post(url).headers(header_map).json(&body).send().await
             }
             "PUT" => {
                 let body = ctx.input.get("body").cloned().unwrap_or(serde_json::json!({}));
-                client.put(url).json(&body).send().await
+                client.put(url).headers(header_map).json(&body).send().await
             }
-            "DELETE" => client.delete(url).send().await,
-            _ => client.get(url).send().await,
+            "DELETE" => client.delete(url).headers(header_map).send().await,
+            _ => client.get(url).headers(header_map).send().await,
         };
 
         match result {
