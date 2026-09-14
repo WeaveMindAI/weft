@@ -33,9 +33,24 @@ impl Node for DateNode {
 
     async fn execute(&self, ctx: ExecutionContext) -> NodeResult {
         let default_date = chrono::Utc::now().to_rfc3339();
-        let value = ctx.config.get("value")
+        let raw = ctx.config.get("value")
             .and_then(|v| v.as_str())
             .unwrap_or(&default_date);
+
+        let format = ctx.config.get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ISO");
+
+        let value = match format {
+            "Unix" => {
+                let ts = chrono::DateTime::parse_from_rfc3339(raw)
+                    .map(|d| d.timestamp())
+                    .unwrap_or_else(|_| chrono::Utc::now().timestamp());
+                ts.to_string()
+            }
+            _ => raw.to_string(),
+        };
+
         NodeResult::completed(serde_json::json!({ "value": value }))
     }
 }
