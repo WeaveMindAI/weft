@@ -232,7 +232,11 @@ export class ActionBarStore {
 
   cliEvent(projectId: string, ev: CliEvent): void {
     const slot = this.slots.get(projectId);
-    if (!slot || !slot.cli || slot.cli.verb !== ev.verb) return;
+    if (!slot || !slot.cli) return;
+    // A failure that reached the CLI's main unreported (a refused
+    // spec, a bad flag) is emitted with no verb: it belongs to the
+    // verb running in this slot.
+    if (slot.cli.verb !== ev.verb && !(ev.phase === 'error' && ev.verb === undefined)) return;
     if (ev.phase === 'complete') {
       slot.cli = undefined;
       this.notifyIfPinned(projectId);
@@ -244,7 +248,7 @@ export class ActionBarStore {
       this.notifyIfPinned(projectId);
       return;
     }
-    slot.cli = { verb: ev.verb, phase: ev.phase, detail: ev.detail };
+    slot.cli = { verb: slot.cli.verb, phase: ev.phase, detail: ev.detail };
     this.notifyIfPinned(projectId);
   }
 
@@ -255,6 +259,17 @@ export class ActionBarStore {
     details?: ActionErrorDetails,
   ): void {
     const slot = this.ensureSlot(projectId);
+    // The process exiting non-zero after its own `error` event is the
+    // same failure twice; the event said what went wrong (`unknown
+    // node 'one.trim'`), the exit only says "exited 1". Keep the
+    // event's unless the crash brought a headline of its own.
+    const said = slot.error?.verb === verb;
+    const crashSays = details?.diagnostics.length;
+    if (said && !crashSays) {
+      slot.cli = undefined;
+      this.notifyIfPinned(projectId);
+      return;
+    }
     slot.error = { verb, message, ...(details ? { details } : {}) };
     slot.cli = undefined;
     this.notifyIfPinned(projectId);
@@ -436,7 +451,11 @@ function errorFromCliEvent(verb: ActionVerb, ev: CliEvent): ActionBarError {
     : rawField;
   const exitCode = typeof d.exit_code === 'number' ? d.exit_code : undefined;
   const command = (d.command as string | undefined);
-  const diagnostics = parseDiagnostics(d.diagnostics);
+  // The message is what the modal has to show when the verb packed no
+  // per-item diagnostics: "unknown node 'one.trim'" is the whole story,
+  // and a modal saying "no further details" under it hid it.
+  const parsed = parseDiagnostics(d.diagnostics);
+  const diagnostics = parsed.length > 0 ? parsed : [{ severity: 'error' as const, message }];
   const details: ActionErrorDetails = {
     what,
     stage,

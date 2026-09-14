@@ -318,8 +318,8 @@ export async function autoOrganize(
 		const node = projectNodes.find(n => n.id === nodeId);
 		const literals = (node as { portLiterals?: Record<string, unknown> } | undefined)?.portLiterals;
 		if (!node || !containerHasConfigStrip(node.nodeType, literals)) return 0;
-		const configCollapsed = (node.config as Record<string, unknown> | undefined)?.configCollapsed === true;
-		if (configCollapsed) return CONFIG_STRIP_BAR_PX;
+		const configOpen = (node.config as Record<string, unknown> | undefined)?.configOpen === true;
+		if (!configOpen) return CONFIG_STRIP_BAR_PX;
 		// The open strip grows with its field list: one row per written
 		// port literal, plus the loop knob rows. Same derivation as
 		// GroupNode's stripFields, so the reserved space follows the

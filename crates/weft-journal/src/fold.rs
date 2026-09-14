@@ -20,7 +20,7 @@
 //! and the row skipped. The engine refuses to resume over any of them;
 //! the display reads render what applied.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -162,13 +162,13 @@ impl Fold {
     }
 
     /// Complete review evidence, including finite stream termination and unused ports.
-    pub fn output_wires(&self) -> anyhow::Result<Vec<weft_core::run_spec::ExpectedWire>> {
+    pub fn output_wires(&self) -> anyhow::Result<Vec<weft_core::run_spec::OutputWire>> {
         let history = self.output_history.as_ref()
             .ok_or_else(|| anyhow::anyhow!("run {} was reconstructed without output history", self.color()))?;
         let mut ordinals = HashMap::new();
         Ok(history.iter().map(|output| {
             let ordinal = ordinals.entry((output.node.clone(), output.frames.clone(), output.port.clone())).or_insert(0u64);
-            let wire = weft_core::run_spec::ExpectedWire {
+            let wire = weft_core::run_spec::OutputWire {
                 node: output.node.clone(), frames: output.frames.clone(), port: output.port.clone(),
                 ordinal: *ordinal, closed: output.value.is_none(), error: output.error.clone(),
                 value: output.value.as_ref().map(|value| value.as_ref().clone()).unwrap_or(Value::Null),
@@ -875,12 +875,23 @@ impl Fold {
 
     /// The run's outputs: per node, what its last completed firing
     /// handed out.
+    /// The last completed output bag of every node at every place it
+    /// ran, keyed by the place (`one/@src:lib:clean.strip`): one file
+    /// included twice is two entries, never one overwriting the other.
+    /// Boundaries are the compiler's and hold nothing a person wrote,
+    /// so they are left out.
     pub fn final_outputs(&self) -> Value {
         let mut obj = serde_json::Map::new();
+        let boundary = |id: &str| self.project.nodes.iter().any(|n| n.id == id && n.group_boundary.is_some());
         for (node_id, execs) in &self.snap.executions {
-            if let Some(last) = execs.iter().rev().find(|e| e.status == NodeExecutionStatus::Completed) {
+            if boundary(node_id) { continue; }
+            let mut last_by_place: BTreeMap<Located, &weft_core::exec::NodeExecution> = BTreeMap::new();
+            for exec in execs.iter().filter(|e| e.status == NodeExecutionStatus::Completed) {
+                last_by_place.insert(Located::at(node_id, &exec.frames), exec);
+            }
+            for (place, last) in last_by_place {
                 if let Some(bag) = self.outputs.get(&last.id).filter(|b| !b.is_empty()) {
-                    obj.insert(node_id.clone(), Value::Object(owned_bag(bag)));
+                    obj.insert(place.to_string(), Value::Object(owned_bag(bag)));
                 }
             }
         }

@@ -128,13 +128,10 @@ fn resolve_string_verbatim() {
         resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).unwrap(),
         Resolved::Value(serde_json::json!("you are a helpful poet"))
     );
-    // A text-typed `@asset` reads the same way (pull-only is an EDITOR
-    // contract; the compile reads identically).
+    // A text-typed `@asset` is deferred like every asset: the build reads
+    // it, from anywhere on the machine, and the parse keeps the marker.
     let fr = asset_ref("p.txt", WeftType::Primitive(WeftPrimitive::String));
-    assert_eq!(
-        resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).unwrap(),
-        Resolved::Value(serde_json::json!("you are a helpful poet"))
-    );
+    assert_eq!(resolve(&fr, &crate::file_reader::CompileFs::disk(dir.path())).unwrap(), Resolved::Deferred);
 }
 
 #[test]
@@ -337,7 +334,7 @@ fn apply_asset_resolutions_names_every_unresolved_ref() {
     let errs = apply_asset_resolutions(&mut project, &std::collections::BTreeMap::new())
         .unwrap_err();
     assert_eq!(errs.len(), 2, "both unresolved refs named: {errs:?}");
-    assert!(errs.iter().all(|e| e.contains("not a synced asset")));
+    assert!(errs.iter().all(|e| e.contains("was not read by the build")));
 }
 
 #[test]
@@ -397,7 +394,7 @@ fn collect_runtime_key_refs_finds_storage_key_media_refs_only() {
 }
 
 #[test]
-fn collect_remote_text_refs_finds_text_typed_url_and_key_refs() {
+fn collect_text_refs_finds_text_typed_url_and_key_refs() {
     // A text-typed `@asset` from a URL or a stored key is the build
     // driver's to fetch; a file-typed one and a disk-path one are not.
     let src = serde_json::json!({
@@ -407,7 +404,7 @@ fn collect_remote_text_refs_finds_text_typed_url_and_key_refs() {
         "d": "@asset(\"assets/pic.png\", Image)"
     });
     let project = definition_with_config(src);
-    let refs = collect_remote_text_refs(&project);
+    let refs = collect_text_refs(&project);
     let paths: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
     assert_eq!(paths, ["https://ex.com/sys.txt", "project/11111111-2222-3333-4444-555555555555/f1"]);
     // Unfetched, it is a loud miss naming the URL.
@@ -575,7 +572,7 @@ g.input = @file("a.txt", TextAlias)
     let boundary = project.nodes.iter().find(|n| n.id == "g__in").unwrap();
     assert_eq!(boundary.port_literals["input"], serde_json::json!("local text"));
     assert!(boundary.file_refs.contains_key("input"));
-    let remote = crate::file_ref::collect_remote_text_refs(&project);
+    let remote = crate::file_ref::collect_text_refs(&project);
     assert_eq!(remote.len(), 1);
     assert!(matches!(&remote[0].ty, WeftType::Named { name, .. } if name == "LocalText"));
 }
@@ -652,7 +649,7 @@ fn an_included_ref_reads_from_the_root_and_a_climb_above_it_is_refused() {
     ).unwrap_err();
     // There is nothing above the project root a relative path could
     // mean, so a climb is refused before any read.
-    assert!(errs.iter().any(|e| e.message.contains("climbs above the project root")), "{errs:?}");
+    assert!(errs.iter().any(|e| e.message.contains("escapes the project root")), "{errs:?}");
 }
 
 /// A DEFERRED asset is never read by the compiler, so nothing refuses a

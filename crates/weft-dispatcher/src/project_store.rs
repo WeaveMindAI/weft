@@ -1102,6 +1102,12 @@ impl ProjectStoreOps for PostgresProjectStore {
             .bind(id.to_string()).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM trigger_bake WHERE project_id = $1")
             .bind(id.to_string()).execute(&mut *tx).await?;
+        // The version tree goes with the project (its runs cascade):
+        // versions left behind kept naming stored files for a project
+        // that no longer existed, and the same id registered again
+        // inherited a tree it never made.
+        sqlx::query("DELETE FROM project_version WHERE project_id = $1")
+            .bind(id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }

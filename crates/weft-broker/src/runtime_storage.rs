@@ -651,11 +651,12 @@ async fn admin_asset_references(
     State(state): State<Arc<BrokerState>>,
     headers: HeaderMap,
     Json(req): Json<Tenanted<weft_core::storage::AssetReferencesRequest>>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<weft_core::storage::AssetReferencesResponse>, ApiError> {
     control_plane(&state, &headers).await?;
-    store(&state)?.set_asset_references(&req.tenant, &req.inner.project, &req.inner.keys)
+    let missing = store(&state)?
+        .set_asset_references(&req.tenant, &req.inner.project, &req.inner.keys, &req.inner.kept)
         .await.map_err(map_err)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(weft_core::storage::AssetReferencesResponse { missing }))
 }
 
 async fn admin_upload_parts(

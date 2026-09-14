@@ -152,6 +152,8 @@ export interface Expected {
 }
 
 // SYNC: ExpectedWire <-> crates/weft-core/src/run_spec.rs ExpectedWire
+// `node` is the address a person types (`one.strip`, through the site
+// for a node in an included file); `frames` holds loop positions only.
 export interface ExpectedWire {
   ordinal?: number;
   closed?: boolean;

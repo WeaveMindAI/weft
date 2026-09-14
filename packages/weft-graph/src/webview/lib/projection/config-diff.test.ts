@@ -16,7 +16,7 @@ describe('diffConfigOps', () => {
 	});
 
 	it('layout/view keys never become source ops', () => {
-		const ops = diffConfigOps('n', { width: 300, height: 200, expanded: false, configCollapsed: true, parentId: 'G', textareaHeights: {} }, {}, false);
+		const ops = diffConfigOps('n', { width: 300, height: 200, expanded: false, configOpen: true, parentId: 'G', textareaHeights: {} }, {}, false);
 		expect(ops).toEqual([]);
 	});
 

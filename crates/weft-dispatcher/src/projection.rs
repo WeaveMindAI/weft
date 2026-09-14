@@ -1198,7 +1198,7 @@ mod tests {
         assert_eq!(by("node_started", "sink")["input"], json!({ "in": 10 }));
         assert_eq!(by("node_started", "sink")["closed_ports"], json!([]));
         let done = events.iter().find(|e| e["kind"] == "execution_completed").unwrap();
-        assert_eq!(done["outputs"], json!({ "src": { "out": 9, "flow": true }, "inner": { "out": 10 }, "g__in": { "x": 9 }, "g__out": { "y": 10 } }));
+        assert_eq!(done["outputs"], json!({ "src": { "out": 9, "flow": true }, "inner": { "out": 10 } }), "boundaries are not a person's nodes");
     }
 
     /// A gated-off group paints its boundary skipped with the reason,

@@ -14,12 +14,12 @@ import { formatConfigValue } from '../value-format';
 /// Keys that are view-state (layout file) or webview plumbing, never source.
 /// The ONE definition: the dispatch ladder and the duplicate-node path import
 /// this instead of re-listing the keys (a drifted third copy already emitted
-/// `configCollapsed` into source). `parentId` is non-source but is owned by
+/// `configOpen` into source). `parentId` is non-source but is owned by
 /// the layout file's scope re-key, not a live node merge, so VIEW_KEYS (the
 /// keys live-merged into the rendered node) excludes it.
 /// (The unconnected-access pin is node DATA, never a config key, so it
 /// needs no entry here.)
-export const NON_SOURCE_KEYS = new Set(['parentId', 'textareaHeights', 'width', 'height', 'expanded', 'configCollapsed']);
+export const NON_SOURCE_KEYS = new Set(['parentId', 'textareaHeights', 'width', 'height', 'expanded', 'configOpen']);
 
 /// View-state keys merged LIVE into the rendered node for instant feedback
 /// (resize/collapse/textarea), never sent as source. Everything in

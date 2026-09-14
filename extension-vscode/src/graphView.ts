@@ -1434,7 +1434,8 @@ export class GraphViewController {
       }
       // Inside the project a ref is spelled from the root, so it travels
       // with the project; outside, the absolute path is the only honest
-      // spelling.
+      // spelling: the file is read from where it sits and uploaded at
+      // compile, never copied onto the disk a second time.
       const refFor = (absolute: string): string => {
         const fromRoot = nodePath.relative(root, absolute);
         const inProject = !fromRoot.startsWith('..') && !nodePath.isAbsolute(fromRoot);

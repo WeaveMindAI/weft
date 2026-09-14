@@ -52,7 +52,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                 // dispatcher accepts either as "not drifted".
                 use weft_compiler::codegen::NodeSet;
                 match resolved {
-                    Ok(()) => (
+                    Ok(_) => (
                         weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced).ok(),
                         weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full).ok(),
                         weft_compiler::hash::compute_definition_hash(&def).ok(),

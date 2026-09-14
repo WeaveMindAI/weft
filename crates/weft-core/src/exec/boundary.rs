@@ -645,10 +645,16 @@ pub fn tear_down_scope(
     // The exits: wires leaving the scope, minus the ones into its own
     // Out and, for a call, into the site's Out (both were closed
     // outward already; a closure there would fire the Out a second
-    // time and record a refused call's exit as completed).
-    exits.edges.retain(|wire| project.edges.iter().any(|edge| edge.id == wire.id
-        && edge.target != boundary_out_id(&scope) && edge.target != boundary_out_id(group_id)
-        && project.nodes.iter().any(|node| node.id == edge.target && !node.scope.contains(&scope))));
+    // time and record a refused call's exit as completed). Leaving is
+    // decided by PLACE: the nodes of a file included by a site inside
+    // this scope are compiled at the top level, so by id alone a wire
+    // into that body looked like an exit, and the body's In woke up on
+    // the closure and completed before the site's own skip took the
+    // body down, leaving one node with two records.
+    let inside: HashSet<Located> = crate::project::selection::members_with_paths(project, &scope,
+        &crate::frames::call_path(frames).into_iter().map(str::to_string).collect::<Vec<_>>()).into_iter().collect();
+    exits.edges.retain(|wire| crate::project::selection::wire_ends(project, wire).is_some_and(|(_, target)|
+        target.id != boundary_out_id(&scope) && target.id != boundary_out_id(group_id) && !inside.contains(&target)));
     let exit_index = EdgeIndex::selected(project, exits);
     let members: Vec<&NodeDefinition> = members.into_iter()
         .filter(|node| edge_idx.admits(&node.id, frames)).collect();
@@ -1107,6 +1113,42 @@ mod tests {
         let at_b = vec![Frame::Call { site: "b".into() }];
         assert!(kicked.contains_key(&FiringLocation::new("B.n", at_b.clone())), "{kicked:?}");
         assert!(!emissions.iter().any(|e| e.pulse.target_node == "sb" || e.pulse.target_node == "b__out"), "the enclosing pass owns the outward closures: {emissions:?}");
+    }
+
+    /// A refused group that holds a call site: the wire from the group's
+    /// In into the site, and from there into the body, does not leave the
+    /// group, so the body's In receives no closure and gets its one
+    /// record from the site's teardown.
+    #[test]
+    fn a_refused_group_does_not_wake_the_body_of_a_site_inside_it() {
+        use crate::frames::Frame;
+        let mut project = called_project();
+        // Put site `a` inside a group `g`: g__in -> a__in.x replaces src -> a__in.x.
+        use crate::project::boundary_types as bt;
+        let boundary = |id: &str, ty: &str, role: &str| serde_json::from_value::<NodeDefinition>(json!({
+            "id": id, "nodeType": ty, "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+            "inputs": [{ "name": "x", "portType": "Number", "required": true }],
+            "outputs": [{ "name": "x", "portType": "Number", "required": true }],
+            "features": {}, "scope": [], "groupBoundary": { "groupId": "g", "role": role }, "requiresInfra": false, "images": []
+        })).unwrap();
+        project.nodes.push(boundary("g__in", bt::PASSTHROUGH, "In"));
+        project.nodes.push(boundary("g__out", bt::PASSTHROUGH, "Out"));
+        for id in ["a__in", "a__out"] {
+            project.nodes.iter_mut().find(|n| n.id == id).unwrap().scope.push("g".into());
+        }
+        project.edges.retain(|e| !(e.source == "src" && e.target == "a__in"));
+        project.edges.push(serde_json::from_value(json!({ "id": "g__in.x->a__in.x", "source": "g__in", "sourceHandle": "x", "target": "a__in", "targetHandle": "x" })).unwrap());
+        project.groups.push(serde_json::from_value(json!({ "id": "g", "kind": "group", "nodeIds": ["a__in", "a__out"] })).unwrap());
+        let edge_idx = EdgeIndex::build(&project);
+        let mut pulses = PulseTable::default();
+        let mut kicked = HashMap::new();
+        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "g", &vec![], Some(&SkipReason::DidNotFlow));
+        assert!(!emissions.iter().any(|e| e.pulse.target_node == "B__in"), "the body's In is under the group, not past it: {emissions:?}");
+        assert!(kicked.contains_key(&FiringLocation::new("a__in", vec![])), "{kicked:?}");
+        // The site's own skip then takes the body down under the call.
+        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::ScopeSkipped { scope: "g".into() }));
+        assert!(kicked.contains_key(&FiringLocation::new("B__in", vec![Frame::Call { site: "a".into() }])), "{kicked:?}");
+        assert!(!emissions.iter().any(|e| e.pulse.target_node == "B__in"), "{emissions:?}");
     }
 
     #[test]

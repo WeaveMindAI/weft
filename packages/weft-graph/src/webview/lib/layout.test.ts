@@ -116,9 +116,9 @@ describe('simplified-view position block (@slayout)', () => {
 	it('updateLayoutEntry under @slayout preserves size/collapse on a position-only move', () => {
 		// A simplified drag writes only x/y; the node's saved WxH + collapsed state
 		// must survive (the merge reads the prior entry under the SAME verb).
-		const code = 'G @slayout 0 0 400x300 collapsed configCollapsed';
+		const code = 'G @slayout 0 0 400x300 collapsed configOpen';
 		const moved = updateLayoutEntry(code, 'G', 5, 5, undefined, undefined, undefined, undefined, SIMPLIFIED_LAYOUT_VERB);
-		expect(parseLayoutCode(moved, SIMPLIFIED_LAYOUT_VERB).G).toEqual({ x: 5, y: 5, w: 400, h: 300, expanded: false, configCollapsed: true });
+		expect(parseLayoutCode(moved, SIMPLIFIED_LAYOUT_VERB).G).toEqual({ x: 5, y: 5, w: 400, h: 300, expanded: false, configOpen: true });
 	});
 
 	it('diffLayoutOps emits one op per verb when a node moves in BOTH blocks at once', () => {
@@ -147,20 +147,20 @@ describe('simplified-view position block (@slayout)', () => {
 });
 
 describe('layout round-trips', () => {
-	it('parse <-> serialize keeps every field, including configCollapsed', () => {
-		const code = 'a @layout 10 20\nG @layout 0 0 400x300 expanded\nL @layout 5 5 600x500 collapsed configCollapsed';
+	it('parse <-> serialize keeps every field, including configOpen', () => {
+		const code = 'a @layout 10 20\nG @layout 0 0 400x300 expanded\nL @layout 5 5 600x500 collapsed configOpen';
 		const map = parseLayoutCode(code);
-		expect(map.L).toEqual({ x: 5, y: 5, w: 600, h: 500, expanded: false, configCollapsed: true });
+		expect(map.L).toEqual({ x: 5, y: 5, w: 600, h: 500, expanded: false, configOpen: true });
 		expect(parseLayoutCode(serializeLayoutMap(map))).toEqual(map);
 	});
 
-	it('renameLayoutSubtree re-keys the subtree without losing configCollapsed', () => {
-		const code = 'G @layout 0 0 400x300 expanded\nG.L @layout 5 5 600x500 expanded configCollapsed';
+	it('renameLayoutSubtree re-keys the subtree without losing configOpen', () => {
+		const code = 'G @layout 0 0 400x300 expanded\nG.L @layout 5 5 600x500 expanded configOpen';
 		const renamed = parseLayoutCode(renameLayoutSubtree(code, 'G', 'R'));
-		expect(renamed['R.L']).toEqual({ x: 5, y: 5, w: 600, h: 500, expanded: true, configCollapsed: true });
+		expect(renamed['R.L']).toEqual({ x: 5, y: 5, w: 600, h: 500, expanded: true, configOpen: true });
 	});
 
-	it('diff + apply round-trips, configCollapsed changes included', () => {
+	it('diff + apply round-trips, configOpen changes included', () => {
 		const before = 'L @layout 5 5 600x500 expanded';
 		const after = updateLayoutEntry(before, 'L', 5, 5, 600, 500, true, true);
 		const undo = diffLayoutOps(after, before);
@@ -266,8 +266,8 @@ describe('the one layout writer (parse-modify-serialize)', () => {
 		expect(parseLayoutCode(applied).L).toEqual({ x: 5, y: 5 });
 	});
 
-	it('diff + apply round-trips cleared expanded and configCollapsed flags', () => {
-		const before = 'L @layout 5 5 600x500 expanded configCollapsed';
+	it('diff + apply round-trips cleared expanded and configOpen flags', () => {
+		const before = 'L @layout 5 5 600x500 expanded configOpen';
 		const after = 'L @layout 5 5';
 		const applied = applyLayoutOps(before, diffLayoutOps(before, after));
 		expect(parseLayoutCode(applied).L).toEqual({ x: 5, y: 5 });

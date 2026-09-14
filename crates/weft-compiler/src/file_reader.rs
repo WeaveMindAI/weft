@@ -59,27 +59,39 @@ pub trait FileReader {
     fn identity(&self, path: &Path) -> Result<PathBuf, String>;
 }
 
-/// The on-disk backing: today's behavior. Joins `relative` onto `base`,
-/// canonicalizes (resolving `..` and symlinks), rejects anything that escapes
-/// `root`, then reads the bytes.
+/// The on-disk backing. Joins `relative` onto `base`, rejects a
+/// spelling that climbs out of `root`, canonicalizes (resolving
+/// symlinks), rejects anything that lands outside `root`, then reads
+/// the bytes.
 ///
 /// The project tree is TRUSTED: this runs at build time on the user's own
 /// project, and referenced files are part of that project. The containment
 /// check guards against an accidental `../` typo pulling a file from outside
-/// the project into the build. It is robust for that: `canonicalize` resolves
-/// `..` and follows symlinks before the prefix check, so any path that lands
-/// outside `root` (including via a symlink) is rejected.
+/// the project into the build. It is robust for that: `canonicalize`
+/// resolves `..` and follows symlinks before the prefix check, so any
+/// path that lands outside `root` (including via a symlink) is rejected.
+/// (`@asset` is different: it may name a file anywhere on the machine
+/// by an absolute path, read from where it sits and uploaded at compile.)
 pub struct DiskFileReader;
 
 impl FileReader for DiskFileReader {
     fn resolve_and_read(&self, root: &Path, base: &Path, relative: &Path) -> Result<ResolvedFile, String> {
+        let escapes = || format!("path {relative:?} escapes the project root");
         let canonical_root = self.identity(root)?;
-        let identity = base
-            .join(relative)
+        // The rule is checked on the spelling, before the file is
+        // touched: a `../` that climbs out of the project is refused as
+        // such whether or not something is there (a typo'd path used to
+        // report "no such file" instead of the rule).
+        let base = self.identity(base)?;
+        let spelled = normalize_lexical(&base.join(relative)).ok_or_else(escapes)?;
+        if !spelled.starts_with(&canonical_root) {
+            return Err(escapes());
+        }
+        let identity = spelled
             .canonicalize()
             .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;
         if !identity.starts_with(&canonical_root) {
-            return Err(format!("path {relative:?} escapes the project root"));
+            return Err(escapes());
         }
         let content = std::fs::read_to_string(&identity)
             .map_err(|e| format!("path {relative:?} cannot be read: {e}"))?;

@@ -15,7 +15,7 @@ use crate::primitive::ExecutionSnapshot;
 use crate::project::{boundary_in_id, GroupBoundaryRole, GroupKind, ProjectDefinition};
 use crate::project::hash::ProgramIdentity;
 use crate::project::selection::{enclosing_loops, every_place, is_body, members_with_paths, source_place, RunSelection, SelectionBounds};
-use crate::run_spec::{ExpectedWire, RunSpec};
+use crate::run_spec::{OutputWire, RunSpec};
 use crate::Color;
 
 /// One complete result the parent retained. Its origin is already chosen;
@@ -49,7 +49,7 @@ pub fn starting_parameters(
     authored: &RunSelection,
     planned: &SeedPlan,
     outcomes: &BTreeMap<Located, SeedOutcome>,
-    history: &[ExpectedWire],
+    history: &[OutputWire],
 ) -> anyhow::Result<RunSpec> {
     let mut saved = spec.clone();
     if saved.fire.is_none() {
@@ -109,7 +109,7 @@ pub fn starting_parameters(
                 .and_then(|node| node.outputs.iter().find(|port| port.name == source_port))
                 .ok_or_else(|| anyhow::anyhow!("seed wire names undeclared output '{}.{source_port}'", source.id))?;
             let mut values = Vec::new();
-            for output in history.iter().filter(|output| Located::at(&output.node, &output.frames) == source
+            for output in history.iter().filter(|output| output.place() == source
                 && output.port == source_port && loop_indices(&output.frames).is_empty() && !output.closed) {
                 // Freeze the value delivered by this wire, including its field
                 // projection, rather than the source's enclosing object.
@@ -439,7 +439,7 @@ mod tests {
         ] {
             let authored = crate::run_spec::resolve_spec(&spec, &project).unwrap().selection;
             let planned = SeedPlan { origins: [(top(source), Color::nil())].into(), selection: authored.clone(), warnings: vec![] };
-            let history = vec![ExpectedWire { node: source.into(), port: "out".into(), value: json!("original input"), ..Default::default() }];
+            let history = vec![OutputWire { node: source.into(), port: "out".into(), value: json!("original input"), ..Default::default() }];
             let saved = starting_parameters(&project, &spec, &authored, &planned, &outcomes(&project), &history).unwrap();
             assert_eq!(saved.starting_inputs(&project)[&top(entry)]["in"], json!("original input"));
             assert_eq!(saved.target, spec.target);
@@ -448,7 +448,7 @@ mod tests {
         let whole = RunSpec::whole("whole");
         let authored = RunSelection::whole(&project);
         let planned = SeedPlan { origins: [(top("a"), Color::nil())].into(), selection: authored.clone(), warnings: vec![] };
-        let history = vec![ExpectedWire { node: "a".into(), port: "out".into(), value: json!("intermediate"), ..Default::default() }];
+        let history = vec![OutputWire { node: "a".into(), port: "out".into(), value: json!("intermediate"), ..Default::default() }];
         assert_eq!(starting_parameters(&project, &whole, &authored, &planned, &outcomes(&project), &history).unwrap(), whole);
     }
 
@@ -461,7 +461,7 @@ mod tests {
         let spec = RunSpec { from: [("b".into(), BTreeMap::new())].into(), ..RunSpec::whole("projected") };
         let authored = crate::run_spec::resolve_spec(&spec, &project).unwrap().selection;
         let planned = SeedPlan { origins: [(top("a"), Color::nil())].into(), selection: authored.clone(), warnings: vec![] };
-        let history = vec![ExpectedWire { node: "a".into(), port: "out".into(), value: json!({"field":"delivered"}), ..Default::default() }];
+        let history = vec![OutputWire { node: "a".into(), port: "out".into(), value: json!({"field":"delivered"}), ..Default::default() }];
         let saved = starting_parameters(&project, &spec, &authored, &planned, &outcomes(&project), &history).unwrap();
         assert_eq!(saved.from["b"]["in"], json!("delivered"));
     }
@@ -528,9 +528,9 @@ mod tests {
         let planned = SeedPlan { origins: roots.iter().map(|r| (r.clone(), Color::nil())).collect(), selection: authored.clone(), warnings: vec![] };
         let saved = starting_parameters(&project, &RunSpec::whole("case"), &authored, &planned, &old, &[]).unwrap();
         let spelled: BTreeSet<&str> = saved.from.keys().map(String::as_str).collect();
-        assert_eq!(spelled, ["src", "s", "s.__in", "s.free", "s.g", "s.g.x"].into_iter().collect(), "{spelled:?}");
+        assert_eq!(spelled, ["src", "s", "s.free", "s.g", "s.g.x"].into_iter().collect(), "{spelled:?}");
         assert_eq!(saved.from["s.free"]["v"], json!("kept"));
-        for (key, place) in [("s.__in", at("@f__in")), ("s.free", at("@f.free")), ("s.g", at("@f.g__in"))] {
+        for (key, place) in [("s.free", at("@f.free")), ("s.g", at("@f.g__in"))] {
             assert_eq!(crate::project::selection::start_node_at(&project, key).unwrap(), place, "{key}");
         }
     }
@@ -551,7 +551,7 @@ mod tests {
                 previous.get_mut(&top("a")).unwrap().used_backups.insert("in".into(), json!("original input"));
             }
             let planned = SeedPlan { origins: [(top("a"), Color::nil())].into(), selection: authored.clone(), warnings: Vec::new() };
-            let history = vec![ExpectedWire { node: "a".into(), port: "out".into(), value: json!("computed output"), ..Default::default() }];
+            let history = vec![OutputWire { node: "a".into(), port: "out".into(), value: json!("computed output"), ..Default::default() }];
             let saved = starting_parameters(&project, &spec, &authored, &planned, &previous, &history).unwrap();
             assert!(saved.from.contains_key("x"), "independent original root remains part of the run");
             assert!(!saved.from.contains_key("b"), "computed interior inputs must not be frozen");

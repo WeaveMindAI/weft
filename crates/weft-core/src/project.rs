@@ -821,8 +821,14 @@ mod address_tests {
         );
         // A body's own id addresses every call of it.
         assert_eq!(resolve_address(&p, "Auth.check"), ("Auth.check".into(), vec![]));
-        // A body's own boundary is spelled as the half under the site.
-        assert_eq!(address_of(&p, "@lib:auth__in", &["auth".into()]), "auth.__in");
+        // A boundary reads as its group; a body's boundary as its site.
+        assert_eq!(address_of(&p, "Auth__in", &["auth".into()]), "auth");
+        assert_eq!(address_of(&p, "Auth__out", &["auth".into()]), "auth");
+        assert_eq!(address_of(&p, "Auth.billing__in", &["auth".into()]), "auth.billing");
+        assert_eq!(address_of(&p, "Inner__out", &["auth".into(), "Auth.billing.inner".into()]), "auth.billing.inner");
+        assert_eq!(group_address(&p, "Auth", &["auth".into()]), "auth");
+        assert_eq!(group_address(&p, "Auth.billing", &["auth".into()]), "auth.billing");
+        // The internal spelling still resolves, for the machinery.
         assert_eq!(resolve_address(&p, "auth.__in"), ("Auth__in".into(), vec!["auth".into()]));
         // And back again.
         for spelled in ["plain", "auth.check", "auth.billing.inner.deep", "auth.billing.inner"] {
@@ -832,13 +838,32 @@ mod address_tests {
     }
 }
 
+/// The way a person writes the group `group_id` running under
+/// `call_path`: a body is the site that calls it (`one` for the file
+/// `one` includes), any other group its own address.
+pub fn group_address(project: &ProjectDefinition, group_id: &str, call_path: &[String]) -> String {
+    match call_path.split_last() {
+        Some((site, above)) if selection::is_body(project, group_id) => address_of(project, site, above),
+        _ => address_of(project, group_id, call_path),
+    }
+}
+
 /// The inverse of [`resolve_address`]: the way a person writes the node
 /// `id` running under `call_path`. `Auth.check` under `["auth"]` is
 /// `auth.check`; `Inner.deep` under `["auth", "Auth.billing.inner"]` is
 /// `auth.billing.inner.deep`. A site id after the first, and the node's
 /// id, are scoped under the body they sit in, so that body's prefix
 /// comes off each. With no call path the id is its own address.
+///
+/// A group's In and Out boundaries are the compiler's, nobody wrote
+/// them, so they read as the group itself (`gate`, `one.counting`); a
+/// body's boundaries read as the site that called it (`one`). What
+/// happened at the boundary (entered, left, skipped) is the record's
+/// kind, not its name.
 pub fn address_of(project: &ProjectDefinition, id: &str, call_path: &[String]) -> String {
+    if let Some(group) = project.groups.iter().find(|g| id == boundary_in_id(&g.id) || id == boundary_out_id(&g.id)) {
+        return group_address(project, &group.id, call_path);
+    }
     let Some((first, rest)) = call_path.split_first() else { return id.to_string() };
     let local = |scoped: &str| -> String {
         // The body a site or node sits in: the prefix its scope chain

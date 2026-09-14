@@ -103,12 +103,12 @@ checks nothing. A file-typed `@asset` from a URL is checked the same way when
 the worker fetches it at run time, and one picked from stored files against
 the kind the upload recorded.
 
-With a text type (`String`, `Number`, a JSON shape) `@asset` reads inline
-exactly like `@file` and differs only in being read-only. In the editor, the
-badge next to the field flips a text-backed value between `@file` and
-`@asset`, and nothing else. From a URL or a stored file there is no text on
-disk to read, so the value is fetched once at build and cast; the graph shows
-the source, not the text.
+With a text type (`String`, `Number`, a JSON shape) `@asset` puts the
+file's text in the value, like `@file`, with two differences: it is
+read-only, and the file may sit anywhere (a path outside the project,
+a URL, a stored file), since the build reads it, once, and casts it; the
+graph shows the source, not the text. In the editor, the badge next to
+the field flips a text-backed value between `@file` and `@asset`.
 
 Several files go in a list, which is how a port that takes many (an
 email's attachments, the media on an LLM call) is written:
@@ -138,7 +138,8 @@ is written: `@asset("assets/logo.png", Image)` names the same file from
 a relative path could mean, so `../` out of the project is refused. A file
 outside the project is named where it sits, by an absolute path or one
 under `~` (your home directory, expanded at compile), and only for local
-runs. An `@include` path is the one exception: it is relative to the file
+runs; that is what the editor's file picker writes for a file picked from
+outside, so a large file is never copied into the project. An `@include` path is the one exception: it is relative to the file
 that writes it, the way an import is, so `@include("../lib/auth.weft")`
 reaches a sibling folder.
 

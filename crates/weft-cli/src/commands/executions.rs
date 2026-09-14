@@ -115,11 +115,18 @@ impl EventsFilter {
     /// through a site.
     pub fn resolve_node(&mut self, project: &weft_core::ProjectDefinition) -> anyhow::Result<()> {
         if let Some(spelled) = &self.node {
+            if let Some((group, _)) = spelled.rsplit_once("__in").or_else(|| spelled.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
+                anyhow::bail!("'{spelled}' is a group boundary the compiler made; name the group, `--node {group}`, and its rows come with it");
+            }
+            if let Some((group, _)) = spelled.rsplit_once(".__in").or_else(|| spelled.rsplit_once(".__out")).filter(|(_, rest)| rest.is_empty()) {
+                anyhow::bail!("'{spelled}' is a boundary the compiler made; name the site, `--node {group}`, and its rows come with it");
+            }
             let (id, call_path) = weft_core::project::resolve_address(project, spelled);
             if call_path.is_empty() {
                 if let Some(node) = project.nodes.iter().find(|n| n.id == id) {
                     if weft_core::project::selection::enclosing_body(project, node).is_some() {
-                        anyhow::bail!("'{spelled}' is inside an included file; name it through the site that includes the file, like `site.{}`", id.rsplit('.').next().unwrap_or(&id));
+                        anyhow::bail!("'{spelled}' is inside an included file; name it through the site that includes the file, like `site.{}`",
+                            weft_core::project::address_of(project, &id, &["site".into()]).trim_start_matches("site."));
                     }
                 }
             }
@@ -139,7 +146,10 @@ impl EventsFilter {
     pub fn keeps(&self, row: &serde_json::Value) -> bool {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
-        let node_ok = self.node.as_deref().is_none_or(|n| row_node(row) == Some(n));
+        // `--node gate` names the group: its own two boundaries are
+        // its rows too.
+        let node_ok = self.node.as_deref().is_none_or(|n| row_node(row).is_some_and(|id|
+            id == n || id == weft_core::project::boundary_in_id(n) || id == weft_core::project::boundary_out_id(n)));
         let call_ok = self.call_path.is_empty() || {
             let frames: weft_core::frames::LoopFrames = row
                 .get("frames")
@@ -260,7 +270,7 @@ pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {resp}"))?;
     let kept: Vec<serde_json::Value> = arr.iter().filter(|row| filter.keeps(row))
-        .map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => row.clone() })
+        .filter_map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => Some(row.clone()) })
         .collect();
     if ctx.json_out(&kept)? {
         return Ok(());
@@ -278,20 +288,89 @@ pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow
     Ok(())
 }
 
-/// The row with its node named the way the program reads: a node of an
-/// included file through the site its call frames say (`one.strip`),
-/// so two calls of one file read apart. The frames stay, for the loop
-/// iteration.
-pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefinition) -> serde_json::Value {
+/// The row with everything it names spelled the way the program
+/// reads: a node of an included file through the site its call frames
+/// say (`one.strip`), so two calls of one file read apart; a group's
+/// boundary as the group (`gate`), with `boundary=in|out` saying which
+/// end; the call frames, a loop's id, a skip's scope, the run's
+/// subgraph, the seed's origins and the completion's outputs the same
+/// way. The loop frames stay, for the iteration.
+///
+/// `None` for a row of an included file's own boundary: the site's
+/// boundary carries the same values under the same name (`one`), and
+/// the hop between the two is the compiler's, not a person's.
+pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefinition) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    use weft_core::frames::{call_path, Frame, Located, LoopFrames};
+    use weft_core::project::{address_of, group_address, selection::is_body};
+    let boundary_group = |id: &str| project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref());
+    let boundary_of = |id: &str| boundary_group(id)
+        .map(|b| match b.role { weft_core::project::GroupBoundaryRole::In => "in", weft_core::project::GroupBoundaryRole::Out => "out" });
+    let spell_place = |place: &Located| address_of(project, &place.id, &place.path);
+    let spell_frames = |frames: &LoopFrames| -> Vec<Value> {
+        let mut above: Vec<String> = Vec::new();
+        frames.iter().map(|frame| match frame {
+            Frame::Loop { index } => serde_json::json!({ "index": index }),
+            Frame::Call { site } => {
+                let spelled = address_of(project, site, &above);
+                above.push(site.clone());
+                serde_json::json!({ "site": spelled })
+            }
+        }).collect()
+    };
+    let frames: LoopFrames = row.get("frames").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
+    let path: Vec<String> = call_path(&frames).into_iter().map(str::to_string).collect();
     let key = ["node", "node_id"].into_iter().find(|key| row.get(key).and_then(|v| v.as_str()).is_some());
     if let Some(key) = key {
-        let frames: weft_core::frames::LoopFrames = row.get("frames")
-            .and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
-        let path: Vec<String> = weft_core::frames::call_path(&frames).into_iter().map(str::to_string).collect();
         let id = row[key].as_str().unwrap_or_default().to_string();
-        row[key] = serde_json::Value::String(weft_core::project::address_of(project, &id, &path));
+        if boundary_group(&id).is_some_and(|b| is_body(project, &b.group_id)) { return None; }
+        row[key] = Value::String(address_of(project, &id, &path));
+        if let Some(role) = boundary_of(&id) { row["boundary"] = Value::String(role.into()); }
     }
-    row
+    if !frames.is_empty() {
+        row["frames"] = Value::Array(spell_frames(&frames));
+    }
+    // A loop's lifecycle rows name the loop and the frames around it.
+    let parent_frames: LoopFrames = row.get("parent_frames").and_then(|f| serde_json::from_value(f.clone()).ok()).unwrap_or_default();
+    if let Some(group) = row.get("group_id").and_then(|g| g.as_str()).map(str::to_string) {
+        let parent_path: Vec<String> = call_path(&parent_frames).into_iter().map(str::to_string).collect();
+        row["group_id"] = Value::String(group_address(project, &group, &parent_path));
+    }
+    if !parent_frames.is_empty() {
+        row["parent_frames"] = Value::Array(spell_frames(&parent_frames));
+    }
+    if let Some(scope) = row.get("reason").and_then(|r| r.get("scope")).and_then(|s| s.as_str()).map(str::to_string) {
+        // A site is refused in its caller's frames, one above the
+        // call frame its body's rows carry.
+        let scope_path = if path.last() == Some(&scope) { &path[..path.len() - 1] } else { &path[..] };
+        row["reason"]["scope"] = Value::String(group_address(project, &scope, scope_path));
+    }
+    // A place list or map (`subgraph`, `seed.origins`, `outputs`): each
+    // key spelled, boundaries folded into their group.
+    let places = |value: &Value| -> Vec<(Located, Value)> {
+        match value {
+            Value::Array(items) => items.iter().filter_map(|i| serde_json::from_value::<Located>(i.clone()).ok().map(|p| (p, Value::Null))).collect(),
+            Value::Object(map) => map.iter().filter_map(|(k, v)| serde_json::from_str::<Located>(&format!("\"{k}\"")).ok().map(|p| (p, v.clone()))).collect(),
+            _ => Vec::new(),
+        }
+    };
+    if let Some(subgraph) = row.get("subgraph").cloned() {
+        let mut seen = std::collections::BTreeSet::new();
+        row["subgraph"] = Value::Array(places(&subgraph).into_iter()
+            .filter(|(place, _)| boundary_of(&place.id).is_none())
+            .map(|(place, _)| spell_place(&place)).filter(|s| seen.insert(s.clone())).map(Value::String).collect());
+    }
+    for key in ["outputs", "origins"] {
+        let holder = if key == "origins" { row.get_mut("seed") } else { Some(&mut row) };
+        let Some(holder) = holder else { continue };
+        if let Some(map) = holder.get(key).cloned().filter(|v| v.is_object()) {
+            let spelled: serde_json::Map<String, Value> = places(&map).into_iter()
+                .filter(|(place, _)| boundary_of(&place.id).is_none())
+                .map(|(place, v)| (spell_place(&place), v)).collect();
+            holder[key] = Value::Object(spelled);
+        }
+    }
+    Some(row)
 }
 
 pub async fn clean(

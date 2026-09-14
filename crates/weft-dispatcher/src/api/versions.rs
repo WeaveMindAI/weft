@@ -468,7 +468,7 @@ async fn settled_colors(
 struct SeededFrom {
     color: Color,
     outcomes: BTreeMap<Located, SeedOutcome>,
-    outputs: Vec<weft_core::run_spec::ExpectedWire>,
+    outputs: Vec<weft_core::run_spec::OutputWire>,
 }
 
 async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -> Result<SeededFrom, ApiError> {
@@ -478,7 +478,7 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
     let snapshot = sources[&run.color].snapshot();
     let outputs = sources[&run.color].output_wires().map_err(|e| internal("seed outputs", e))?;
     let live_nodes: BTreeSet<Located> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
-        .map(|wire| Located::at(&wire.node, &wire.frames)).collect();
+        .map(|wire| wire.place()).collect();
     let mut identities = BTreeMap::new();
     let mut outcomes = BTreeMap::new();
     for place in inheritable_nodes(definition, snapshot) {
@@ -655,8 +655,13 @@ pub async fn run(
     // Named the way the program reads them (`one.strip` for a node of
     // an included file under the site `one`).
     let spell = |place: &Located| weft_core::project::address_of(&project, &place.id, &place.path);
-    let entry_node = kicks
-        .first()
+    // Among the kicks, the first ordinary root in the program's own
+    // order (a trigger that does not fire is kicked too, and it is a
+    // poor name for a run started by hand).
+    let order = |node: &str| project.nodes.iter().position(|n| n.id == node).unwrap_or(usize::MAX);
+    let is_trigger = |node: &str| project.nodes.iter().any(|n| n.id == node && n.features.is_trigger);
+    let entry_node = kicks.iter()
+        .min_by_key(|k| (!k.firing, is_trigger(&k.node), k.frames.len(), order(&k.node)))
         .map(|k| spell(&Located::at(&k.node, &k.frames)))
         .or_else(|| resolved.provided.iter().find_map(|p| p.consumers.first().map(|(n, _)| n.clone())))
         .or_else(|| stale.iter().next().map(spell))
@@ -682,7 +687,8 @@ pub async fn run(
     // so holds a pooled connection while it runs. Everything expensive
     // this handler does, the seed fold above and the response below,
     // stays outside it.
-    let stale_vec: Vec<String> = stale.iter().map(spell).collect();
+    // A group's boundaries spell as the group, so a set dedupes them.
+    let stale_vec: Vec<String> = stale.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
     let (version, moved) = with_tree_lock(&state, &project_id, || async {
         // Head is read again in here. The one read outside chose the
         // seed, which is this run's own business; the version's PARENT
@@ -763,8 +769,8 @@ pub async fn run(
         ));
     }
 
-    let ran: Vec<String> = resolved.selection.nodes.iter().map(spell).collect();
-    let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect()).unwrap_or_default();
+    let ran: Vec<String> = resolved.selection.nodes.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
+    let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect::<BTreeSet<_>>().into_iter().collect()).unwrap_or_default();
     Ok(Json(VersionRunResponse {
         color,
         version: version.version,

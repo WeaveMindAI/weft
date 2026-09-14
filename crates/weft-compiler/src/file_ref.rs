@@ -107,7 +107,11 @@ pub fn parse_marker(raw: &str) -> Option<Result<FileRef, String>> {
         }
         (Some(t), _) => match WeftType::parse(t.trim()) {
             Some(ty) => ty,
-            None => return Some(Err(format!("{name}: invalid type {:?}", t.trim()))),
+            None => return Some(Err(format!(
+                "{name}: invalid type {:?}; a file kind is Image, Video, Audio or Blob, a text kind \
+                 is String, Number, Boolean, JsonDict, JsonList or a JSON shape",
+                t.trim()
+            ))),
         },
     };
     // A file type on an asset names ONE kind: `File`/`Media` would leave
@@ -172,8 +176,11 @@ fn marker_text(file_ref: &FileRef) -> String {
 /// the type). Every other ref (both markers, text-typed, from a project
 /// file) reads + casts inline at parse.
 pub fn is_deferred_ref(file_ref: &FileRef) -> bool {
+    // Every `@asset`, whatever its type or source: an asset may sit
+    // anywhere on the machine, and the parse's reader is walled to the
+    // project. The build driver reads it (a file kind through the asset
+    // sync, a text kind straight from disk) and substitutes the value.
     file_ref.marker == FileMarker::Asset
-        && (file_ref.ty.references_file() || is_url_ref(file_ref) || is_runtime_key_ref(file_ref))
 }
 
 /// The type a written constant has, for the type check and the cast: a
@@ -286,11 +293,12 @@ pub fn collect_runtime_key_refs(
     collect_refs(project, |r| is_runtime_key_ref(r) && r.ty.references_file())
 }
 
-/// Collect every TEXT-typed `@asset` whose source is a URL or a stored-file
-/// key: nothing on disk to read at parse, so the build driver fetches the
-/// bytes, casts them to the declared type through [`resolve_text_bytes`],
-/// and puts the value into the same map. Deduplicated by path.
-pub fn collect_remote_text_refs(
+/// Collect every TEXT-typed `@asset`: a URL, a stored-file key, or a disk
+/// path (in the project or anywhere on the machine). The parse reads none
+/// of them; the build driver fetches or reads the bytes, casts them to the
+/// declared type through [`resolve_text_bytes`], and puts the value into
+/// the same map. Deduplicated by path.
+pub fn collect_text_refs(
     project: &weft_core::project::ProjectDefinition,
 ) -> Vec<FileRef> {
     collect_refs(project, |r| !r.ty.references_file())
@@ -456,7 +464,7 @@ fn spell_from_root(mut file_ref: FileRef, home: Option<&std::path::Path>) -> Res
     } else {
         crate::file_reader::normalize_lexical(written).ok_or_else(|| {
             format!(
-                "{}({:?}) climbs above the project root: a path is relative to the project, wherever it is written",
+                "{}({:?}) escapes the project root: a path is relative to the project, wherever it is written",
                 file_ref.marker.directive(),
                 file_ref.path
             )
@@ -607,8 +615,8 @@ pub fn apply_asset_resolutions(
                 file_ref.path, file_ref.ty
             )),
             None => missing.push(format!(
-                "@asset({:?}, {}) is not a synced asset (missing file, or the build ran \
-                 without the asset sync)",
+                "@asset({:?}, {}) was not read by the build (missing file, or the build ran \
+                 without the asset step)",
                 file_ref.path, file_ref.ty
             )),
         }
@@ -637,8 +645,10 @@ pub fn apply_asset_resolutions(
 /// Deduplicated by path, first declared type wins (the type only picks the
 /// marker kind; the bytes are the identity, and the sync checks them
 /// against that kind).
+/// The file-kind `@asset`s on disk: what the asset sync hashes and
+/// uploads. A text kind is read and inlined instead (`collect_text_refs`).
 pub fn collect_asset_refs(project: &weft_core::project::ProjectDefinition) -> Vec<FileRef> {
-    collect_refs(project, |r| !is_url_ref(r) && !is_runtime_key_ref(r))
+    collect_refs(project, |r| !is_url_ref(r) && !is_runtime_key_ref(r) && r.ty.references_file())
 }
 
 #[cfg(test)]

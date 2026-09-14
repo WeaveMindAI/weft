@@ -405,21 +405,29 @@ impl RunSelection {
         }
         let mut edges = BTreeSet::new();
         let mut boundary_ports: BTreeMap<Located, BTreeSet<String>> = BTreeMap::new();
-        // A boundary port is used when a selected consumer reads it. Walk
-        // backward through boundary chains without admitting other ports.
+        // A boundary port is used when a node of the run writes it or a
+        // selected consumer reads it. The consumer side walks backward
+        // through boundary chains without admitting other ports. The
+        // producer side matters for a port nobody downstream reads: the
+        // node that fills it runs (a node fires when its inputs arrive,
+        // whatever happens to its result), so the value reaches the
+        // boundary and stops there. Carrying only the read ports left
+        // such a boundary with no live input at all, recorded as skipped
+        // at the start of a run its members completed, and re-run by
+        // every seeded run after (a skip is not reused).
         let mut pending: Vec<(&Edge, Located, Located)> = nodes.iter()
             .filter(|place| !is_ordinary_boundary(project, &place.id))
             .flat_map(|place| incoming(project, place)).collect();
         for place in nodes.iter().filter(|place| is_ordinary_boundary(project, &place.id)) {
+            let node = project.nodes.iter().find(|n| n.id == place.id).expect("selected node exists");
+            for (edge, source, wire) in incoming(project, place)
+                .filter(|(_, source, _)| nodes.contains(source) || suppliers.contains(source))
+            {
+                boundary_ports.entry(place.clone()).or_default().insert(edge.target_handle.as_deref().unwrap_or("default").into());
+                pending.push((edge, source, wire));
+            }
             let terminal = !outgoing(project, place).any(|(_, target, _)| nodes.contains(&target));
             if terminal {
-                let node = project.nodes.iter().find(|n| n.id == place.id).expect("selected node exists");
-                for (edge, source, wire) in incoming(project, place)
-                    .filter(|(_, source, _)| nodes.contains(source) || suppliers.contains(source))
-                {
-                    boundary_ports.entry(place.clone()).or_default().insert(edge.target_handle.as_deref().unwrap_or("default").into());
-                    pending.push((edge, source, wire));
-                }
                 boundary_ports.entry(place.clone()).or_default().extend(node.port_literals.keys().cloned());
             }
         }
@@ -809,6 +817,19 @@ mod tests {
         assert_eq!(before.boundary_ports[&top("g__in")], names(&["x", "_should_flow"]));
         assert!(!before.edges.contains(&top("g__in.x->b.in")));
         assert!(!before.edges.contains(&top("unrelated.out->g__in.y")));
+    }
+
+    /// A group output nobody downstream reads is still carried up to
+    /// the group's Out when the node that fills it is in the run: the
+    /// Out is not a root with every input closed, and its record is
+    /// the group completing, not a skip.
+    #[test]
+    fn a_boundary_carries_every_port_a_node_of_the_run_writes() {
+        let project = program();
+        let whole = RunSelection::whole(&project);
+        assert!(whole.edges.contains(&top("c.out->g__out.result")), "{:?}", whole.edges);
+        assert!(whole.boundary_ports[&top("g__out")].contains("result"));
+        assert!(!whole.roots(&project).contains(&top("g__out")), "a fed Out is not a root: {:?}", whole.roots(&project));
     }
 
     #[test]

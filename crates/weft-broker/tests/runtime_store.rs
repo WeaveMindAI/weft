@@ -937,15 +937,15 @@ async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_acces
     let old = asset_via(&s, &bucket, "t1", "p1", 1).await;
     let current = asset_via(&s, &bucket, "t1", "p1", 2).await;
     let old_key = weft_core::storage::key::parse_key(&old.key).unwrap();
-    s.set_asset_references("t1", "p1", &[old.key.clone(), current.key.clone()]).await.unwrap();
+    s.set_asset_references("t1", "p1", &[old.key.clone(), current.key.clone()], &[]).await.unwrap();
     clock.advance(Duration::from_secs(400 * 86400));
     assert_eq!(s.sweep_expired().await.unwrap(), 0, "current source may be idle for months");
 
-    s.set_asset_references("t1", "p1", std::slice::from_ref(&current.key)).await.unwrap();
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&current.key), &[]).await.unwrap();
     let deadline = s.meta(&old_key).await.unwrap().expires_at_unix.unwrap();
     assert_eq!(deadline, clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64);
     clock.advance(Duration::from_secs(20 * 86400));
-    s.set_asset_references("t1", "p1", std::slice::from_ref(&current.key)).await.unwrap();
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&current.key), &[]).await.unwrap();
     assert_eq!(s.meta(&old_key).await.unwrap().expires_at_unix, Some(deadline), "sync is not file access");
 
     get_via(&s, &bucket, &old_key, None).await.unwrap();
@@ -968,7 +968,7 @@ async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: PgPool) {
     let published = asset_via(&s, &bucket, "t1", "p1", 2).await;
     let orphan_key = weft_core::storage::key::parse_key(&orphan.key).unwrap();
     assert_eq!(orphan.expires_at_unix, Some(clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64));
-    s.set_asset_references("t1", "p1", std::slice::from_ref(&published.key)).await.unwrap();
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&published.key), &[]).await.unwrap();
     let published_key = weft_core::storage::key::parse_key(&published.key).unwrap();
     assert_eq!(s.meta(&published_key).await.unwrap().expires_at_unix, None, "publishing clears the countdown");
     assert_eq!(s.meta(&orphan_key).await.unwrap().expires_at_unix, orphan.expires_at_unix, "the orphan's countdown runs on");
@@ -983,9 +983,9 @@ async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_suppor
     let (s, bucket, clock) = store(&pool).await;
     let file = asset_via(&s, &bucket, "t1", "p1", 1).await;
     let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
-    s.set_asset_references("t1", "p1", &[]).await.unwrap();
+    s.set_asset_references("t1", "p1", &[], &[]).await.unwrap();
     assert_eq!(s.meta(&parsed).await.unwrap().keep_ttl_secs, Some(DEFAULT_KEEP_TTL_SECS));
-    s.set_asset_references("t1", "p1", std::slice::from_ref(&file.key)).await.unwrap();
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&file.key), &[]).await.unwrap();
     let meta = s.meta(&parsed).await.unwrap();
     assert_eq!(meta.expires_at_unix, None);
     assert_eq!(meta.keep_ttl_secs, None);
@@ -1005,10 +1005,10 @@ async fn asset_lifetime_is_walled_and_preserves_node_selected_ttls(pool: PgPool)
     let generated = put_via(&s, &bucket, &w, &StorageScope::Execution, "image/png", "generated.png",
         Some(KeepTtl::Secs { secs: 60 }), &big(), body(b"png")).await.unwrap();
     for forbidden in [&sibling.key, &foreign.key, &generated.key] {
-        assert!(matches!(s.set_asset_references("t1", "p1", std::slice::from_ref(forbidden)).await,
+        assert!(matches!(s.set_asset_references("t1", "p1", std::slice::from_ref(forbidden), &[]).await,
             Err(RuntimeStoreError::Denied(_))));
     }
-    s.set_asset_references("t1", "p1", &[]).await.unwrap();
+    s.set_asset_references("t1", "p1", &[], &[]).await.unwrap();
     for unaffected in [&sibling, &foreign, &generated] {
         let parsed = weft_core::storage::key::parse_key(&unaffected.key).unwrap();
         let meta = s.meta(&parsed).await.unwrap();
@@ -1019,12 +1019,26 @@ async fn asset_lifetime_is_walled_and_preserves_node_selected_ttls(pool: PgPool)
     assert!(s.meta(&own).await.unwrap().expires_at_unix.is_some());
 }
 
+/// A kept file (one an older version names) that is gone is reported,
+/// not fatal: the build's own file is pinned and the missing key comes
+/// back so the caller can say which version lost it.
+#[sqlx::test]
+async fn asset_lifetime_missing_kept_file_is_reported_and_pins_the_rest(pool: PgPool) {
+    let (s, bucket, _) = store(&pool).await;
+    let own = asset_via(&s, &bucket, "t1", "p1", 1).await;
+    let gone = format!("t1/asset/p1/{}", "f".repeat(64));
+    let missing = s.set_asset_references("t1", "p1", std::slice::from_ref(&own.key), std::slice::from_ref(&gone)).await.unwrap();
+    assert_eq!(missing, vec![gone]);
+    let parsed = weft_core::storage::key::parse_key(&own.key).unwrap();
+    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, None, "the build's own file is pinned");
+}
+
 #[sqlx::test]
 async fn asset_lifetime_missing_current_file_does_not_retire_other_files(pool: PgPool) {
     let (s, bucket, _) = store(&pool).await;
     let own = asset_via(&s, &bucket, "t1", "p1", 1).await;
     let missing = format!("t1/asset/p1/{}", "f".repeat(64));
-    assert!(matches!(s.set_asset_references("t1", "p1", &[missing]).await,
+    assert!(matches!(s.set_asset_references("t1", "p1", &[missing], &[]).await,
         Err(RuntimeStoreError::NotFound(_))));
     // The failed publish touched nothing: the upload keeps the countdown
     // it started with, neither cleared nor restarted.

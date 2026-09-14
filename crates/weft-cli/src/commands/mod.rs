@@ -190,7 +190,9 @@ impl Ctx {
                 // a second `error` phase with a flattened message
                 // and overwrite the structured one in its store.
                 if !progress.has_emitted_error() {
-                    progress.error(&format!("{e}"));
+                    // The whole chain: a context alone ("update project
+                    // asset lifetimes") hides the cause the reader needs.
+                    progress.error(&format!("{e:#}"));
                 }
                 Err(anyhow::Error::new(crate::progress::Reported(e)))
             }

@@ -1838,14 +1838,19 @@ impl RuntimeStore {
     /// default access-renewed TTL once; repeated syncs never restart it.
     /// Reintroducing an existing asset clears that countdown. Only asset rows
     /// in this tenant/project participate; node-created files are untouched.
+    ///
+    /// `keys` must all be present (a missing one fails the update and
+    /// changes nothing); `kept` are pinned when present and handed back
+    /// when not, so a version whose blob is gone never blocks a build.
     pub async fn set_asset_references(
         &self,
         tenant: &str,
         project: &str,
         keys: &[String],
-    ) -> StoreResult<()> {
+        kept: &[String],
+    ) -> StoreResult<Vec<String>> {
         let prefix = ParsedKey::asset_prefix(tenant, project).map_err(RuntimeStoreError::Invalid)?;
-        for key in keys {
+        for key in keys.iter().chain(kept) {
             let parsed = weft_core::storage::key::parse_key(key).map_err(RuntimeStoreError::Invalid)?;
             if !key.starts_with(&prefix) || !weft_core::storage::is_content_hash(&parsed.id) {
                 return Err(RuntimeStoreError::Denied(
@@ -1867,6 +1872,9 @@ impl RuntimeStore {
         if let Some(missing) = keys.iter().find(|key| !available.contains(key.as_str())) {
             return Err(RuntimeStoreError::NotFound(missing.clone()));
         }
+        let (kept_present, missing): (Vec<String>, Vec<String>) = kept.iter().cloned()
+            .partition(|key| available.contains(key.as_str()));
+        let pinned: Vec<String> = keys.iter().cloned().chain(kept_present).collect();
         sqlx::query(&format!(
             "UPDATE runtime_file SET \
                  expires_at_unix = CASE WHEN key = ANY($2) THEN NULL \
@@ -1877,12 +1885,12 @@ impl RuntimeStore {
             expiry_honoring_links("$3")
         ))
         .bind(&pattern)
-        .bind(keys)
+        .bind(&pinned)
         .bind(self.clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64)
         .bind(DEFAULT_KEEP_TTL_SECS as i64)
         .execute(&mut *tx).await.context("update project asset lifetimes")?;
         tx.commit().await.context("commit project asset lifetimes")?;
-        Ok(())
+        Ok(missing)
     }
 
     /// List every ACTIVE file under a key prefix (a scope, or a whole tenant). The

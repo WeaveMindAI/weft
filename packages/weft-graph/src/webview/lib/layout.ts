@@ -4,7 +4,7 @@
 // source stays clean, and it's a frontend concern (where boxes sit on a
 // canvas), so it stays in the webview rather than going through the Rust
 // edit-server. Format, one entry per line:
-//   scopedId @layout x y [WxH] [expanded|collapsed] [configCollapsed]
+//   scopedId @layout x y [WxH] [expanded|collapsed] [configOpen]
 
 import { bareRecord } from './types';
 
@@ -17,7 +17,7 @@ export interface LayoutEntry {
   /// Loop-specific: whether the loop's config strip is collapsed
   /// inside the expanded box. Persists across reloads alongside
   /// `expanded`. Ignored for non-loop containers.
-  configCollapsed?: boolean;
+  configOpen?: boolean;
 }
 
 // ── Per-project view mode ────────────────────────────────────────────────
@@ -68,7 +68,7 @@ export type LayoutVerb = typeof LAYOUT_VERB | typeof SIMPLIFIED_LAYOUT_VERB;
 /** The one entry-line pattern for a verb: parsing and rewriting share it, so
  *  a line is "a layout entry" by exactly one definition. */
 function entryRe(verb: LayoutVerb): RegExp {
-  return new RegExp(`^(.+?)\\s+${verb}\\s+(-?\\d+(?:\\.\\d+)?)\\s+(-?\\d+(?:\\.\\d+)?)(?:\\s+(\\d+(?:\\.\\d+)?)x(\\d+(?:\\.\\d+)?))?(?:\\s+(collapsed|expanded))?(?:\\s+(configCollapsed))?\\s*$`);
+  return new RegExp(`^(.+?)\\s+${verb}\\s+(-?\\d+(?:\\.\\d+)?)\\s+(-?\\d+(?:\\.\\d+)?)(?:\\s+(\\d+(?:\\.\\d+)?)x(\\d+(?:\\.\\d+)?))?(?:\\s+(collapsed|expanded))?(?:\\s+(configOpen))?\\s*$`);
 }
 
 function matchToEntry(match: RegExpMatchArray): [string, LayoutEntry] {
@@ -80,7 +80,7 @@ function matchToEntry(match: RegExpMatchArray): [string, LayoutEntry] {
   }
   if (state === 'expanded') entry.expanded = true;
   if (state === 'collapsed') entry.expanded = false;
-  if (configState === 'configCollapsed') entry.configCollapsed = true;
+  if (configState === 'configOpen') entry.configOpen = true;
   return [scopedId, entry];
 }
 
@@ -155,7 +155,7 @@ function terminated(lines: string[]): string {
 
 /** Update or insert a layout entry. Returns the new layoutCode.
  *
- *  `undefined` for `w`/`h`/`expanded`/`configCollapsed` means "leave whatever
+ *  `undefined` for `w`/`h`/`expanded`/`configOpen` means "leave whatever
  *  is already persisted", NOT "clear it". This matters because position-only
  *  updates (a drag, an ELK reflow moving a NEIGHBOUR node) call this without
  *  knowing the node's size/collapse state; a destructive rewrite would strip
@@ -172,7 +172,7 @@ export function updateLayoutEntry(
   w?: number | null,
   h?: number | null,
   expanded?: boolean | null,
-  configCollapsed?: boolean | null,
+  configOpen?: boolean | null,
   verb: LayoutVerb = LAYOUT_VERB,
 ): string {
   return rewriteVerbEntries(layoutCode, verb, (map) => {
@@ -189,11 +189,11 @@ export function updateLayoutEntry(
       );
     }
     const mergedExpanded = expanded === undefined ? prior?.expanded : expanded ?? undefined;
-    const mergedConfigCollapsed = configCollapsed === undefined ? prior?.configCollapsed : configCollapsed ?? undefined;
+    const mergedConfigOpen = configOpen === undefined ? prior?.configOpen : configOpen ?? undefined;
     if (mergedW !== undefined) entry.w = mergedW;
     if (mergedH !== undefined) entry.h = mergedH;
     if (mergedExpanded !== undefined) entry.expanded = mergedExpanded;
-    if (mergedConfigCollapsed !== undefined) entry.configCollapsed = mergedConfigCollapsed;
+    if (mergedConfigOpen !== undefined) entry.configOpen = mergedConfigOpen;
     map[scopedId] = entry;
   });
 }
@@ -214,12 +214,12 @@ export function removeLayoutEntryEveryView(layoutCode: string, scopedId: string)
   return removeLayoutEntry(removeLayoutEntry(layoutCode, scopedId, LAYOUT_VERB), scopedId, SIMPLIFIED_LAYOUT_VERB);
 }
 
-function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?: boolean | null, configCollapsed?: boolean | null, verb: LayoutVerb = LAYOUT_VERB): string {
+function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?: boolean | null, configOpen?: boolean | null, verb: LayoutVerb = LAYOUT_VERB): string {
   let s = `${verb} ${Math.round(x)} ${Math.round(y)}`;
   if (w !== undefined && h !== undefined) s += ` ${Math.round(w)}x${Math.round(h)}`;
   if (expanded === true) s += ' expanded';
   if (expanded === false) s += ' collapsed';
-  if (configCollapsed === true) s += ' configCollapsed';
+  if (configOpen === true) s += ' configOpen';
   return s;
 }
 
@@ -227,7 +227,7 @@ function formatLayoutStr(x: number, y: number, w?: number, h?: number, expanded?
  *  entry). The inverse of `parseLayoutCode` for that verb. */
 export function serializeLayoutMap(map: Record<string, LayoutEntry>, verb: LayoutVerb = LAYOUT_VERB): string {
   return Object.entries(map)
-    .map(([id, e]) => `${id} ${formatLayoutStr(e.x, e.y, e.w, e.h, e.expanded ?? undefined, e.configCollapsed ?? undefined, verb)}`)
+    .map(([id, e]) => `${id} ${formatLayoutStr(e.x, e.y, e.w, e.h, e.expanded ?? undefined, e.configOpen ?? undefined, verb)}`)
     .join('\n');
 }
 
@@ -373,7 +373,7 @@ export function applyLayoutOps(layoutCode: string, ops: LayoutOp[]): string {
       // dropped a size round-trips (undo of a resize restores "no explicit
       // size" instead of resurrecting the resized one).
       const e = op.entry;
-      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w ?? null, e.h ?? null, e.expanded ?? null, e.configCollapsed ?? null, op.verb ?? LAYOUT_VERB);
+      code = updateLayoutEntry(code, op.id, e.x, e.y, e.w ?? null, e.h ?? null, e.expanded ?? null, e.configOpen ?? null, op.verb ?? LAYOUT_VERB);
     } else if (op.op === 'removeEntry') {
       code = removeLayoutEntry(code, op.id, op.verb ?? LAYOUT_VERB);
     } else {
@@ -416,5 +416,5 @@ export function diffLayoutOps(from: string, to: string): LayoutOp[] {
 
 function sameEntry(a: LayoutEntry, b: LayoutEntry): boolean {
   return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h
-    && a.expanded === b.expanded && a.configCollapsed === b.configCollapsed;
+    && a.expanded === b.expanded && a.configOpen === b.configOpen;
 }

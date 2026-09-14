@@ -38,13 +38,13 @@ pub async fn run(ctx: Ctx, name: String, color: Option<String>, expect: Vec<Stri
     }
     let rows = super::versions::replay_rows(&client, &run.color).await?;
     let mut expected = super::versions::output_wires(&client, &project_id, &run.color).await?;
-    // `--expect` is spelled from the top (`triage.last`); the run's
-    // nodes are the compiled ids. The project's definition maps one to
-    // the other; outside a project the spelling is the id.
-    let definition = ctx.project().ok().and_then(|p| weft_compiler::hash::load_enriched_project(p).ok().map(|(d, _)| d));
+    // `--expect` and the run's node list are both spelled from the top
+    // (`triage.last`, `one.strip` through its site).
     for node in &expect {
-        let id = definition.as_ref().map(|d| weft_core::project::resolve_address(d, node).0).unwrap_or_else(|| node.clone());
-        if !expected.nodes.contains(&id) { bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.color)); }
+        if let Some((group, _)) = node.rsplit_once("__in").or_else(|| node.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
+            bail!("cannot focus '{node}': it is a group boundary the compiler made; name the group, `--expect {group}`");
+        }
+        if !expected.nodes.contains(node) { bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.color)); }
     }
     expected.focus = expect.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let facts = outside_facts(&rows);

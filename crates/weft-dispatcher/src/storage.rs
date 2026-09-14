@@ -183,8 +183,8 @@ pub async fn set_asset_references(
     state: &DispatcherState,
     tenant: &str,
     references: weft_core::storage::AssetReferencesRequest,
-) -> Result<()> {
-    post_admin_unit(
+) -> Result<weft_core::storage::AssetReferencesResponse> {
+    post_admin(
         state,
         "/v1/storage/admin/asset-references",
         "update asset lifetimes",

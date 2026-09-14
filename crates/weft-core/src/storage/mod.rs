@@ -789,10 +789,33 @@ pub struct Tenanted<T> {
 /// scope keys and adds the authenticated tenant before forwarding to storage.
 /// An empty set retires every
 /// asset; retirement starts a TTL instead of deleting files old runs need.
+///
+/// `keys` are this build's own files and must all be there (the build
+/// just uploaded them). `kept` are files an older version of the project
+/// still names: kept alive when present, reported back when gone, since
+/// a version whose blob expired or was removed must not stop the next
+/// build from publishing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssetReferencesRequest {
     pub project: String,
     pub keys: Vec<String>,
+    #[serde(default)]
+    pub kept: Vec<String>,
+}
+
+/// The broker's answer to an asset references update: the `kept` keys
+/// that no longer exist, so the dispatcher can say which version lost
+/// a file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetReferencesResponse {
+    pub missing: Vec<String>,
+}
+
+/// The dispatcher's answer to a publish: one warning per version that
+/// names a stored file that no longer exists, for the person to read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetsPublished {
+    pub warnings: Vec<String>,
 }
 
 /// `POST /v1/storage/admin/list-prefix`: the files under one scope-boundary

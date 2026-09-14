@@ -509,7 +509,9 @@ a file type names one kind: `Image`, `Video`, `Audio`, or `Blob` (never
 A file-typed `@asset` resolves through the build's asset sync
 (hash-addressed storage; the source keeps one line, never a blob), and the
 sync checks the file's bytes against the declared kind (an `Image` over an
-mp3 fails the build; `Blob` checks nothing). A list of markers feeds
+mp3 fails the build; `Blob` checks nothing). A text-typed `@asset` is read
+once at build from wherever its path points, in the project or anywhere on
+the machine, and its text is inlined. A list of markers feeds
 multi-file ports. `@asset` sources may also be an outside path, an `http(s)`
 URL, or a stored file's key; a text-typed one from a URL or a key is
 fetched at build.

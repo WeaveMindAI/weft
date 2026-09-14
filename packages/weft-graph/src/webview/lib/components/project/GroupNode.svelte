@@ -125,7 +125,9 @@
 	// the header, ports, and the simplified square; the scoped style block restates
 	// the same hex (see the SYNC note on GROUP_COLOR/LOOP_COLOR in colors.ts).
 	const containerColor = $derived(isLoop ? LOOP_COLOR : GROUP_COLOR);
-	const configCollapsed = $derived((data.config?.configCollapsed as boolean) ?? false);
+	// The config strip starts collapsed; opening it is what the layout
+	// file records (`configOpen`), so a fresh loop shows the thin bar.
+	const configCollapsed = $derived(!((data.config?.configOpen as boolean) ?? false));
 
 	/// Field definitions for the loop config strip. over and carry no
 	/// longer live in the strip: their values are derived from the per-port
@@ -174,7 +176,7 @@
 		const nextCollapsed = !configCollapsed;
 		const nextMinH = computeMinHeightFor(inputs.length, outputs.length, nextCollapsed);
 		data.onUpdate({
-			config: { ...data.config, configCollapsed: nextCollapsed, height: nextMinH },
+			config: { ...data.config, configOpen: !nextCollapsed, height: nextMinH },
 			resized: true,
 		});
 	}
@@ -412,11 +414,16 @@
 		const visibleOutputs = numOutputs + (isLoop ? 1 : 0);
 		const portsBlock = Math.max(visibleInputs, visibleOutputs) * 30 + 24;
 		const headerArea = 44;
-		const bodyMin = 220; // breathing room for at least a couple of child nodes
 		const configArea = hasConfigStrip
 			? (collapsed ? CONFIG_STRIP_BAR_PX : configStripOpenPx(stripFields.length))
 			: 0;
-		return headerArea + configArea + portsBlock + bodyMin;
+		// The chrome only (header, strip, port rows), floored at the
+		// container's own minimum. The layout engine fits the body to the
+		// children; a breathing-room allowance here used to re-grow the
+		// box right after a reflow had fitted it (closing the config strip
+		// left a band of empty space at the bottom until the loop was
+		// collapsed and reopened).
+		return Math.max(expandedContainerMinPx(false).h, headerArea + configArea + portsBlock);
 	}
 
 	function computeMinHeight(numInputs: number, numOutputs: number): number {

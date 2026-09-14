@@ -194,7 +194,11 @@ pub struct Expected {
     pub wires: Vec<ExpectedWire>,
 }
 
-/// One ordered output item or closure at a node and loop position.
+/// One ordered output item or closure at a node and loop position, as
+/// an example file shows it: `node` is the address a person types
+/// (`one.strip`, through the site for a node in an included file) and
+/// `frames` holds the loop positions only. `ExpectedWire::spell` makes
+/// one from the journal's `OutputWire`.
 // SYNC: ExpectedWire <-> packages/weft-graph/src/run-spec.ts ExpectedWire
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -210,6 +214,46 @@ pub struct ExpectedWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub value: Value,
+}
+
+/// One ordered output item or closure as the journal holds it: the
+/// node's compiled id under its full frame stack (call and loop
+/// frames). What seeding reads; `ExpectedWire::spell` is what a person
+/// reads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OutputWire {
+    pub node: String,
+    pub frames: LoopFrames,
+    pub port: String,
+    pub ordinal: u64,
+    pub closed: bool,
+    pub error: Option<String>,
+    pub value: Value,
+}
+
+impl OutputWire {
+    /// The node at the call this output belongs to.
+    pub fn place(&self) -> Located {
+        Located::at(&self.node, &self.frames)
+    }
+}
+
+impl ExpectedWire {
+    /// The wire as an example file spells it: the node's address
+    /// through its sites, the loop positions kept, the call frames
+    /// folded into the address.
+    pub fn spell(project: &ProjectDefinition, wire: &OutputWire) -> Self {
+        let place = wire.place();
+        Self {
+            node: crate::project::address_of(project, &place.id, &place.path),
+            port: wire.port.clone(),
+            frames: wire.frames.iter().filter(|frame| frame.loop_index().is_some()).cloned().collect(),
+            ordinal: wire.ordinal,
+            closed: wire.closed,
+            error: wire.error.clone(),
+            value: wire.value.clone(),
+        }
+    }
 }
 
 impl RunSpec {
@@ -478,10 +522,11 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
             }
             continue;
         }
+        // A group's boundaries spell as the group: a set names it once.
         let downstream: Vec<String> = RunSelection::downstream(project, std::slice::from_ref(trigger)).into_iter()
             .filter(|place| place != trigger && selection.nodes.contains(place))
             .map(|place| spell(&place))
-            .collect();
+            .collect::<BTreeSet<_>>().into_iter().collect();
         let why = match fired {
             Some(fired) => format!("only '{}' fires in this run", spell(fired)),
             None => "a run started by hand fires no trigger".to_string(),

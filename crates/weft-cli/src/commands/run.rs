@@ -78,6 +78,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     let compiled = super::ensure::compile_project(ctx, progress)?;
     validate_run(&compiled.definition, spec.as_ref(), &args)?;
     let node_set = args.node_set.unwrap_or(weft_compiler::codegen::NodeSet::Full);
+    let definition = compiled.definition.clone();
     let handle = super::ensure::register_compiled(ctx, progress, node_set, compiled).await?;
     if !ctx.json() {
         println!("registered {} ({})", handle.name, handle.id);
@@ -121,7 +122,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     if args.detach || ctx.json() {
         return Ok(());
     }
-    super::follow::follow_color(&handle.client, &color).await?;
+    super::follow::follow_color(&handle.client, &color, Some(&definition)).await?;
     Ok(())
 }
 

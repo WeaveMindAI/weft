@@ -305,7 +305,7 @@
 			node.position.x, node.position.y,
 			w, h,
 			cfg?.expanded as boolean | undefined ?? undefined,
-			cfg?.configCollapsed as boolean | undefined ?? undefined,
+			cfg?.configOpen as boolean | undefined ?? undefined,
 			verb);
 	}
 
@@ -831,15 +831,15 @@
 				const persistedDim = (key: string): unknown =>
 					key === 'width' ? layoutEntry?.w
 						: key === 'height' ? layoutEntry?.h
-						: key === 'configCollapsed' ? layoutEntry?.configCollapsed
+						: key === 'configOpen' ? layoutEntry?.configOpen
 						: layoutEntry?.expanded;
 				let needsLayout = false;
 				for (const [key, value] of Object.entries(cfg)) {
-					if (['width', 'height', 'expanded', 'configCollapsed'].includes(key)) {
+					if (['width', 'height', 'expanded', 'configOpen'].includes(key)) {
 						// Only a CHANGED layout key needs a layout write: a field edit
 						// re-sends the full config including unchanged dims, and treating
 						// mere presence as a change churns the layout file + history on a
-						// keystroke. `configCollapsed` (the loop config strip) is a layout
+						// keystroke. `configOpen` (the loop config strip) is a layout
 						// key too, so it rides the same changed-not-present gate.
 						if (value !== persistedDim(key)) needsLayout = true;
 					}
@@ -1099,7 +1099,7 @@
 	// the `let nodes = $state.raw(buildNodes(...))` initializer, where reading
 	// `nodes` would hit its temporal dead zone (the "Loading graph..." crash). At
 	// init there is nothing measured yet, so the caller passes `[]`.
-	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configCollapsed?: boolean }>, liveNodes: Node[] = []): Node[] {
+	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configOpen?: boolean }>, liveNodes: Node[] = []): Node[] {
 		// Pure merge step: overlay each node's layout entry (width/height/expanded)
 		// onto its config UP FRONT, so the structural parse (which carries none of
 		// this view-state) plus the layout file produce one merged node list. The
@@ -1114,7 +1114,7 @@
 				if (e.w !== undefined) cfg.width = e.w;
 				if (e.h !== undefined) cfg.height = e.h;
 				if (e.expanded !== undefined) cfg.expanded = e.expanded;
-				if (e.configCollapsed !== undefined) cfg.configCollapsed = e.configCollapsed;
+				if (e.configOpen !== undefined) cfg.configOpen = e.configOpen;
 				return { ...n, config: cfg };
 			}) as typeof projectNodes;
 		}
@@ -3096,7 +3096,7 @@
 				next = renameLayoutSubtree(next, m.oldKey, m.newKey);
 				if (m.dx !== 0 || m.dy !== 0) {
 					const e = parseLayoutCode(next)[m.newKey];
-					if (e) next = updateLayoutEntry(next, m.newKey, e.x + m.dx, e.y + m.dy, e.w, e.h, e.expanded ?? null, e.configCollapsed ?? null);
+					if (e) next = updateLayoutEntry(next, m.newKey, e.x + m.dx, e.y + m.dy, e.w, e.h, e.expanded ?? null, e.configOpen ?? null);
 				}
 			}
 			return next;

@@ -113,7 +113,8 @@ async fn finite_supplied_streams_freeze_and_run_without_the_original_producer() 
         let color = color_of(&out)?;
         SettledRun::observe(project.dispatcher(), color).await?.completed()?
             .assert_untouched("nums")?.assert_input("out", "data", &expected)?;
-        project.weft(&["freeze", name, &color.to_string(), "--expect", "doubler__out"]).await?;
+        // The loop's gathered list is frozen as the loop's own output.
+        project.weft(&["freeze", name, &color.to_string(), "--expect", "doubler"]).await?;
         let accepted = std::fs::read_to_string(project.dir().join(format!("examples/{name}.json")))?;
         let out = project.weft(&["run", name, "--json"]).await?;
         let replay = color_of(&out)?;

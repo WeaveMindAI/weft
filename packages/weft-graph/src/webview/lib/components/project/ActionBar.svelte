@@ -313,12 +313,11 @@
 		| { kind: 'building'; cancelling: boolean }
 		| { kind: 'pending'; message: string }
 		| { kind: 'stop_execution' }
-		// `plainRun`: the one-click Run that fires every root. Off in a
-		// project whose triggers are the entry point (the trigger
-		// lifecycle is the button there); the spec menu beside it stays,
-		// since a spec supplies its own starting values and runs as an
-		// ordinary one-shot whatever the project's entry point is.
-		| { kind: 'run'; enabled: boolean; plainRun: boolean };
+		// The one-click Run that fires every root. Off (slot absent) in a
+		// project whose triggers are the entry point: the trigger
+		// lifecycle is the button there, and the spec menu rides on THAT
+		// button (see `specMenuHost`) so the chevron is never stranded.
+		| { kind: 'run'; enabled: boolean };
 
 	type TriggerSlotState =
 		| { kind: 'absent' }
@@ -413,27 +412,38 @@
 		// one-shot, so the button comes back beside the trigger
 		// lifecycle. The spec menu is there either way: a saved
 		// example runs the project from its own starting values.
-		const plainRun = !triggerSlotVisible || runTargetsAvoidTriggers;
-		// Source-derived gate: Run is only legal once the infra it
-		// would touch is Running. An aimed run consults only ITS
-		// subgraph's infra nodes (per-node status); the ordinary run
-		// touches everything, so the whole-graph rollup gates it. This
-		// is defense-in-depth on top of the dispatcher's own scoped
-		// pre-flight: the dispatcher gate fails when the project is
-		// unregistered (status fetch errors out), so we re-derive from
-		// the parsed graph + last-known per-node/rollup state.
+		if (triggerSlotVisible && !runTargetsAvoidTriggers) return { kind: 'absent' };
+		return { kind: 'run', enabled: runEnabled };
+	});
+
+	// Source-derived gate: Run is only legal once the infra it
+	// would touch is Running. An aimed run consults only ITS
+	// subgraph's infra nodes (per-node status); the ordinary run
+	// touches everything, so the whole-graph rollup gates it. This
+	// is defense-in-depth on top of the dispatcher's own scoped
+	// pre-flight: the dispatcher gate fails when the project is
+	// unregistered (status fetch errors out), so we re-derive from
+	// the parsed graph + last-known per-node/rollup state. The spec
+	// menu shares the gate: a saved example runs as an ordinary
+	// one-shot from its own starting values.
+	const runEnabled = $derived.by(() => {
 		const infraReady = (runTargetCount ?? 0) > 0
 			? runTargetsInfraReady
 			: !hasInfra || backend.infraRollup === 'running';
-		return {
-			kind: 'run',
-			enabled:
-				!verbsBlocked
-				&& nodeCount > 0
-				&& infraReady
-				&& isVerbAvailable('run'),
-			plainRun,
-		};
+		return !verbsBlocked && nodeCount > 0 && infraReady && isVerbAvailable('run');
+	});
+
+	// Where the spec menu chevron lives. It is glued to the right of
+	// the project's main button: Run when the one-click Run is up,
+	// otherwise the trigger lifecycle button (Activate / Reactivate /
+	// Deactivate). During a spinner state (building, activating...)
+	// there is no button to glue to and every verb is blocked, so the
+	// menu is hidden rather than stranded beside the spinner.
+	const specMenuHost = $derived.by((): 'run' | 'trigger' | 'none' => {
+		if (middleSlot.kind === 'run') return 'run';
+		if (middleSlot.kind !== 'absent') return 'none';
+		const k = triggerSlot.kind;
+		return k === 'inactive_fresh' || k === 'reactivate' || k === 'active' ? 'trigger' : 'none';
 	});
 
 	const triggerSlot = $derived.by((): TriggerSlotState => {
@@ -748,26 +758,32 @@
 		</button>
 	{:else if slot.kind === 'run' && onRun}
 		<div class="relative flex items-stretch">
-			{#if slot.plainRun}
-				<button
-					class="{btn} {btnDisabled} px-6 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-r-none"
-					onclick={onRun}
-					disabled={!slot.enabled}
-				>
-					<Play class="w-3.5 h-3.5" />
-					<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
-				</button>
-			{/if}
-			<!-- The Run menu: the project's specs, "Run this group" when the
-			     user stands inside one, and the dialog for a one-off. The bar
-			     sits at the bottom of the screen, so the menu opens UPWARD
-			     and the chevron points up while closed, down while open (it
-			     is then the thing to click to close it). Without a Run
-			     button beside it the chevron is a rounded button of its own. -->
 			<button
-				class="{btn} {btnDisabled} px-1.5 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 {slot.plainRun ? 'rounded-l-none border-l border-l-zinc-700' : ''}"
-				onclick={() => { specMenuOpen = !specMenuOpen; if (specMenuOpen) onOpenSpecMenu?.(); }}
+				class="{btn} {btnDisabled} px-6 bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 rounded-r-none"
+				onclick={onRun}
 				disabled={!slot.enabled}
+			>
+				<Play class="w-3.5 h-3.5" />
+				<span class={labelCss}>{runLabel(runTargetCount ?? 0)}</span>
+			</button>
+			{@render specMenu('bg-zinc-900 border-zinc-900 text-white shadow hover:bg-zinc-800 border-l-zinc-700')}
+		</div>
+	{/if}
+{/snippet}
+
+<!-- The spec menu chevron and its dropdown: the project's specs, "Run
+     this group" when the user stands inside one, and the dialog for a
+     one-off. Glued to the right edge of its host button (the host drops
+     its right rounding, the chevron its left one), painted in the
+     host's colors. The bar sits at the bottom of the screen, so the
+     menu opens UPWARD and the chevron points up while closed, down
+     while open (it is then the thing to click to close it). Must be
+     rendered inside a `relative` wrapper with its host. -->
+{#snippet specMenu(hostCss: string)}
+			<button
+				class="{btn} {btnDisabled} px-1.5 rounded-l-none border-l {hostCss}"
+				onclick={() => { specMenuOpen = !specMenuOpen; if (specMenuOpen) onOpenSpecMenu?.(); }}
+				disabled={!runEnabled}
 				title={specMenuOpen ? 'Close' : 'Run a saved example, this group, or a one-off'}
 			>
 				<ChevronUp class="w-3.5 h-3.5 transition-transform {specMenuOpen ? 'rotate-180' : ''}" />
@@ -794,8 +810,6 @@
 					</button>
 				</div>
 			{/if}
-		</div>
-	{/if}
 {/snippet}
 
 {#snippet triggerSlotButton(slot: TriggerSlotState)}
@@ -811,18 +825,23 @@
 	{:else if slot.kind === 'pending'}
 		{@render workingButton(slot.message)}
 	{:else if slot.kind === 'active'}
-		<button
-			class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700"
-			onclick={onDeactivate}
-			disabled={!slot.canDeactivate}
-		>
-			<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
-			<span class={labelCss}>Deactivate</span>
-			<span class="flex h-2 w-2 relative ml-1">
-				<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-				<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-			</span>
-		</button>
+		<div class="relative flex items-stretch">
+			<button
+				class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
+				onclick={onDeactivate}
+				disabled={!slot.canDeactivate}
+			>
+				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+				<span class={labelCss}>Deactivate</span>
+				<span class="flex h-2 w-2 relative ml-1">
+					<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+					<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+				</span>
+			</button>
+			{#if specMenuHost === 'trigger'}
+				{@render specMenu('bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 border-l-emerald-500')}
+			{/if}
+		</div>
 	{:else if slot.kind === 'activating'}
 		{@render workingButton(
 			'Activating...',
@@ -850,25 +869,35 @@
 			<span class="px-2 py-1 rounded-md bg-zinc-100 text-zinc-600 border border-zinc-200 text-[11px] font-medium capitalize">
 				{slot.mode}
 			</span>
-			<button
-				class="{btn} {btnDisabled} bg-zinc-900 text-white hover:bg-zinc-800"
-				onclick={onReactivate}
-				disabled={!slot.enabled}
-				title="Reactivate; choose how to handle preserved state"
-			>
-				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-				<span class={labelCss}>Reactivate</span>
-			</button>
+			<div class="relative flex items-stretch">
+				<button
+					class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
+					onclick={onReactivate}
+					disabled={!slot.enabled}
+					title="Reactivate; choose how to handle preserved state"
+				>
+					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+					<span class={labelCss}>Reactivate</span>
+				</button>
+				{#if specMenuHost === 'trigger'}
+					{@render specMenu('bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 border-l-zinc-700')}
+				{/if}
+			</div>
 		</div>
 	{:else}
-		<button
-			class="{btn} {btnDisabled} bg-zinc-900 text-white hover:bg-zinc-800"
-			onclick={onActivate}
-			disabled={!slot.enabled}
-		>
-			<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-			<span class={labelCss}>Activate</span>
-		</button>
+		<div class="relative flex items-stretch">
+			<button
+				class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
+				onclick={onActivate}
+				disabled={!slot.enabled}
+			>
+				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+				<span class={labelCss}>Activate</span>
+			</button>
+			{#if specMenuHost === 'trigger'}
+				{@render specMenu('bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800 border-l-zinc-700')}
+			{/if}
+		</div>
 	{/if}
 {/snippet}
 
