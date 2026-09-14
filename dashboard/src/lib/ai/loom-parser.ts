@@ -481,6 +481,25 @@ function isBrickKind(s: string): s is BrickKind {
 	return (BRICK_KINDS as readonly string[]).includes(s);
 }
 
+/** An attribute token is an identifier followed by `:`, or a bracket group. */
+const ATTR_TOKEN_RE = /^[A-Za-z][A-Za-z0-9_.-]*:/;
+
+/** `key=` where `key:` was meant. The most common way to mistype an attribute. */
+const BARE_EQUALS_RE = /^([A-Za-z][A-Za-z0-9_.-]*)=/;
+
+function isAttrToken(t: string): boolean {
+	if (t.startsWith('[') && t.endsWith(']')) return true;
+	return ATTR_TOKEN_RE.test(t);
+}
+
+/** Report `key="value"` tokens instead of absorbing them as positional text. */
+function reportBareEquals(tokens: string[], state: ParseState, lineNum: number): void {
+	for (const t of tokens) {
+		const m = BARE_EQUALS_RE.exec(t);
+		if (m) state.errors.push({ line: lineNum, message: `Unknown attribute syntax '${m[1]}='. Did you mean '${m[1]}:'?` });
+	}
+}
+
 // Bricks that can contain nested children.
 const NESTABLE_BRICKS: ReadonlySet<BrickKind> = new Set<BrickKind>([
 	'columns', 'card', 'tabs', 'tab', 'feature-grid', 'faq', 'stats',
@@ -664,6 +683,7 @@ function parseThemeBody(state: ParseState): RunnerTheme {
 function parsePhase(state: ParseState): SetupPhase | null {
 	const rawLine = state.lines[state.pos];
 	const trimmed = rawLine.trim();
+	const lineNum = state.pos + 1;
 	state.pos++;
 	const rest = trimmed.slice('phase'.length).trim();
 	const hasBlock = rest.endsWith('{');
@@ -671,8 +691,9 @@ function parsePhase(state: ParseState): SetupPhase | null {
 	const tokens = tokenizeLine(cleaned);
 	const title = tokens[0] ? parseQuotedString(tokens[0]) : 'Untitled';
 	const remaining = tokens.slice(1);
-	const positionalDesc = remaining[0] && !remaining[0].includes(':') ? parseQuotedString(remaining[0]) : undefined;
-	const attrs = parseAttributes(remaining.filter(t => t.includes(':')));
+	const positionalDesc = remaining[0] && !isAttrToken(remaining[0]) ? parseQuotedString(remaining[0]) : undefined;
+	const attrs = parseAttributes(remaining.filter(isAttrToken));
+	reportBareEquals(remaining, state, lineNum);
 	const description = positionalDesc ?? attrs.description;
 
 	const phase: SetupPhase = {
@@ -763,15 +784,19 @@ function parseBrick(state: ParseState, lineNum: number): Brick | null {
 		return null;
 	}
 
-	// Positional content: anything before the first `key:` token is positional.
+	// Split attributes from positional content. A token counts as an attribute
+	// only if it *starts* with `key:`; testing for a colon anywhere would read a
+	// positional string that merely contains one ("Runs 9:00 to 17:00") as an
+	// attribute and split it at the wrong place, losing the text entirely.
 	const rest = tokens.slice(1);
 	const positional: string[] = [];
 	const attrTokens: string[] = [];
 	for (const t of rest) {
-		if (t.includes(':') && !t.startsWith('[')) attrTokens.push(t);
-		else if (t.startsWith('[') && t.endsWith(']')) attrTokens.push(t);
+		if (isAttrToken(t)) attrTokens.push(t);
+		else if (BARE_EQUALS_RE.test(t)) continue; // reported below, never silently absorbed
 		else positional.push(parseQuotedString(t));
 	}
+	reportBareEquals(rest, state, lineNum);
 	const attrs = parseAttributes(attrTokens);
 
 	const props: Record<string, unknown> = { ...attrs };
