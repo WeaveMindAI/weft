@@ -40,11 +40,17 @@ runs:
         TAG: ${{ inputs.tag }}
       shell: bash
       run: |
-        set -uo pipefail
+        # `shell: bash` runs this under `-e`, and `set -uo pipefail`
+        # does not lift it: a failing publish then exits the step on
+        # the capture line, before the store's answer is printed or
+        # read, which is how two stores failed with an empty log. The
+        # capture below has to survive a non-zero exit.
+        set +e -uo pipefail
         # The output is wanted whichever way this goes: on success it is
         # the log, on failure it is the evidence for the check below.
         out="$(bash -c "$PUBLISH" 2>&1)"
         code=$?
+        set -e
         printf '%s\n' "$out"
         if [ "$code" -ne 0 ]; then
           # Narrow on purpose. A pattern that matched loosely would
